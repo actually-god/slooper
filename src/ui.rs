@@ -716,13 +716,11 @@ pub struct App {
     /// Script instances backing `fx_rows` (None on plugin rows; same order).
     fx_live: Vec<Vec<Option<std::sync::Arc<fx::Instance>>>>,
     fx_window: Option<usize>,
-    /// (track, chain row) whose plugin parameter window is open.
-    vst_edit: Option<(usize, usize)>,
     /// Live X11 editor windows for CHAIN plugins, keyed (track, row).
     /// v0.10: adding a plugin effect opens the plugin's own GUI straight
     /// away; this map keeps those windows alive and reaped like the synth
-    /// editors. `vst_edit` (the slider window) is only the fallback for
-    /// plugins without a custom editor.
+    /// editors. v0.11 R3: hosted plugins have NO slider-window fallback --
+    /// their own window is the only parameter surface.
     fx_vst_editors:
         std::collections::HashMap<(usize, usize), crate::vstedit::EditorWindow>,
     /// Scan of all VST folders (lazy on first window open, manual Rescan).
@@ -980,7 +978,6 @@ impl App {
             fx_rows,
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
-            vst_edit: None,
             fx_vst_editors: std::collections::HashMap::new(),
             vst_scan: Vec::new(),
             vst_scanned: false,
@@ -1442,9 +1439,6 @@ impl App {
         if self.fx_editor.as_ref().is_some_and(|ed| ed.loop_i == i) {
             self.fx_editor = None;
         }
-        if self.vst_edit.is_some_and(|(t, _)| t == i) {
-            self.vst_edit = None;
-        }
         let sr = self.sample_rate.max(48_000);
         let mut live: Vec<Option<std::sync::Arc<fx::Instance>>> = Vec::new();
         let mut slots: Vec<FxSlot> = Vec::new();
@@ -1538,14 +1532,12 @@ impl App {
                                 self.fx_vst_editors.insert((i, row), w);
                             }
                             Err(err2) => {
+                                // v0.11 R3: no slider window for plugins.
                                 self.vst_note =
-                                    format!("{}: GUI {err2} \u{2014} using sliders", e.name);
-                                self.vst_edit = Some((i, row));
+                                    format!("{}: GUI {err2} \u{2014} no window to open", e.name);
                             }
                         }
                     }
-                } else if !entry.params().is_empty() {
-                    self.vst_edit = Some((i, row));
                 }
             }
             Err(err) => self.vst_note = format!("{}: {err}", e.name),
@@ -1579,20 +1571,10 @@ impl App {
         self.save_config();
     }
 
-    /// Plugin sliders live on the shared param store; mirror them back into
-    /// the chain row so the next config/project save persists them.
-    fn vst_row_params_sync(&mut self, t: usize, row: usize) {
-        if let Some(ChainRow::Vst { params, entry: Some(e), .. }) =
-            self.fx_rows.get_mut(t).and_then(|r| r.get_mut(row))
-        {
-            *params = (0..e.params().len()).map(|k| e.params().get(k)).collect();
-        }
-    }
-
     /// Open (or reopen) the child editor window for loop `i`'s chain slot
     /// `row`. Effects that export a custom GUI get their own canvas;
-    /// everything else gets the auto slider window. Params ride the same
-    /// live instance the sliders used to sit next to on the loop row.
+    /// (v0.11 R3: plugin rows are handled by vst_row_gui; hosted
+    /// plugins never receive an auto slider window.)
     fn open_fx_editor(&mut self, i: usize, row: usize) {
         self.fx_editor = None; // closing an old window frees its GUI state
         let Some(stem) = (match self.fx_rows[i].get(row) {
@@ -2380,17 +2362,28 @@ impl App {
         self.track_synth_params[t].clear();
         self.rebuild_track_synth(t);
         // v0.10 STANDARD: a plugin instrument opens its own GUI the moment
-        // it is bound; the slider window appears only as the fallback when
-        // the plugin has no editor or the editor refuses to open.
-        if !stem.is_empty() && !self.auto_open_synth_gui(t) && vst_synth_decode(stem).is_some() {
-            self.synth_win = Some(t);
-        }
+        // it is bound. v0.11 R3: hosted plugins never fall back to a slider
+        // window -- the plugin's own GUI is the only parameter surface.
+        let gui = if !stem.is_empty() && vst_synth_decode(stem).is_some() {
+            Some(self.auto_open_synth_gui(t))
+        } else {
+            None
+        };
         self.save_config();
-        self.status = format!(
+        // auto_open_synth_gui records why it failed in the status line; keep
+        // that visible alongside the binding message.
+        let gui_note = if gui == Some(false) {
+            std::mem::replace(&mut self.status, String::new())
+        } else {
+            String::new()
+        };
+        let bind_msg = format!(
             "track {}: synth {}",
             t + 1,
             if stem.is_empty() { "default (piano)" } else { stem }
         );
+        self.status =
+            if gui_note.is_empty() { bind_msg } else { format!("{bind_msg} \u{2014} {gui_note}") };
     }
 
     /// Recreate every bound synth plus the shared default piano instance
@@ -3777,12 +3770,14 @@ impl App {
             self.synth_win = None;
             return;
         };
-        // A hosted VST3 instrument gets the plugin's own sliders instead of
-        // the script param list.
-        if let Some(SynthHandle::Vst(entry)) =
-            self.track_synth_inst[t].as_ref().map(|h| h.as_ref())
-        {
-            self.vsti_synth_window(ui, t, entry.clone());
+        // v0.11 R3: hosted VST instruments never reach this window -- their
+        // own GUI is the only parameter surface, so this is the SCRIPT
+        // synth slider window only.
+        if matches!(
+            self.track_synth_inst[t].as_ref().map(|h| h.as_ref()),
+            Some(SynthHandle::Vst(_))
+        ) {
+            self.synth_win = None;
             return;
         }
         let Some(desc) = self.synth_registry.desc(&stem).cloned() else {
@@ -3948,73 +3943,20 @@ impl App {
         }
     }
 
-    /// Slider window for a track bound to a hosted VST instrument.
-    fn vsti_synth_window(
-        &mut self,
-        ui: &mut egui::Ui,
-        t: usize,
-        entry: std::sync::Arc<crate::vsthost::RtStageEntry>,
-    ) {
-        let mut open = true;
-        egui::Window::new(format!("\u{266a} {} \u{b7} track {}", entry.name(), t + 1))
-            .id(egui::Id::new(("synthwin", t)))
-            .open(&mut open)
-            .default_size([340.0, 340.0])
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "hosted VST instrument \u{2014} sliders set the plugin's own \
-                         parameters; MIDI clips on this track play it",
-                    )
-                    .weak()
-                    .small(),
-                );
-                // Custom editor hosting: VST2 editors run in their own
-                // X11 window driven by effEditIdle (docs/PLUGINS.md).
-                if entry.has_editor() {
-                    let editing = self.vst_editors.contains_key(&t);
-                    let label = if editing {
-                        "\u{23f9} close plugin window"
-                    } else {
-                        "\u{1f5bc} open plugin window"
-                    };
-                    if ui.button(label).clicked() {
-                        if editing {
-                            self.vst_editors.remove(&t);
-                        } else if let Some(h) = entry.vst2_handle() {
-                            let pth = entry.path().to_string_lossy().into_owned();
-                            match crate::vstedit::open_editor(&h, pth.as_str(), entry.name()) {
-                                Ok(w) => {
-                                    self.status = format!(
-                                        "{}: opening plugin window \u{2014} if the plugin \
-                                         cannot draw it, the sliders below take over",
-                                        entry.name()
-                                    );
-                                    self.vst_editors.insert(t, w);
-                                }
-                                Err(e) => self.status = format!("plugin GUI: {e}"),
-                            }
-                        } else {
-                            self.status = "VST3 editor hosting is not available yet \
-                                           (the realtime engine owns the plugin; see \
-                                           docs/PLUGINS.md)"
-                                .into();
-                        }
-                    }
-                }
-                vst_param_sliders(ui, &entry);
-            });
-        if !open {
-            self.synth_win = None;
-        }
-    }
-
     /// v0.10 STANDARD: binding a plugin instrument opens the plugin's own
-    /// editor window immediately — no slider window step. Returns false
-    /// when the plugin advertises no editor or the editor refuses to open
-    /// (the caller then falls back to the slider window, and a refused
-    /// editor is what `reap_vst_editors` turns back into sliders).
+    /// editor window immediately. v0.11 R3: hosted plugins have no slider
+    /// window at all -- the plugin's GUI is the only parameter surface.
+    /// Returns false when the plugin advertises no editor or the editor
+    /// refuses to open (a refused editor is reaped by `reap_vst_editors`
+    /// and the status line names the reason).
     fn auto_open_synth_gui(&mut self, t: usize) -> bool {
+        // v0.11 double-open guard: a second effEditOpen against the same
+        // live instance while an editor is open races two toolkit editor
+        // states (and silently leaked the first container when the map
+        // entry was replaced). Retire any old window FIRST.
+        if let Some(mut w) = self.vst_editors.remove(&t) {
+            w.close();
+        }
         let Some(arc) = self.track_synth_inst[t].clone() else {
             return false;
         };
@@ -4040,14 +3982,31 @@ impl App {
                 true
             }
             Err(e) => {
-                self.status = format!("plugin GUI: {e} \u{2014} using sliders");
+                self.status = format!("plugin GUI: {e} \u{2014} closed");
                 false
             }
+    }
+    }
+
+    /// v0.11 R3: the track-row GUI button for a hosted plugin. Clicking
+    /// while the plugin window is still alive closes it (this also makes a
+    /// second effEditOpen against the same live instance structurally
+    /// impossible); clicking with no live window opens it.
+    fn toggle_synth_gui(&mut self, t: usize) {
+        if self.vst_editors.get(&t).is_some_and(|w| !w.is_closed()) {
+            if let Some(mut w) = self.vst_editors.remove(&t) {
+                w.close();
+            }
+            self.status = format!("track {}: plugin window closed", t + 1);
+            return;
         }
+        // Drop any dead handle before opening the replacement.
+        self.vst_editors.remove(&t);
+        self.auto_open_synth_gui(t);
     }
 
     /// Chain-slot counterpart: click a plugin row and the plugin's own GUI
-    /// opens (a second click closes it). Slider window only as fallback.
+    /// opens (a second click closes it).
     fn vst_row_gui(&mut self, t: usize, row: usize) {
         if self.fx_vst_editors.remove(&(t, row)).is_some() {
             return; // toggle closed
@@ -4067,11 +4026,14 @@ impl App {
                         self.fx_vst_editors.insert((t, row), w);
                         return;
                     }
-                    Err(e) => self.status = format!("plugin GUI: {e} \u{2014} using sliders"),
+                    Err(e) => self.status = format!("plugin GUI: {e} \u{2014} closed"),
                 }
             }
         }
-        self.vst_edit = Some((t, row));
+        // v0.11 R3: hosted plugins get NO slider window. A plugin with no
+        // drawable editor keeps its current parameter values.
+        self.status =
+            format!("{}: this plugin has no window to open \u{2014} its controls are not editable", entry.name());
     }
 
     /// Close editor windows that are user-closed, failed, or whose track
@@ -4119,9 +4081,10 @@ impl App {
             self.vst_editors.remove(&t);
         }
         if refused {
-            self.status = "plugin editor could not draw (or refused to open) \u{2014} the \
-                           sliders set this plugin's parameters instead"
-                .into();
+            self.status =
+                "plugin editor could not draw \u{2014} its own window is the only \
+                 parameter surface, so close and re-open it to retry"
+                    .into();
         }
     }
 
@@ -5175,9 +5138,6 @@ impl App {
         if self.fx_window.is_some() {
             effects_window(ui, self);
         }
-        if self.vst_edit.is_some() {
-            vst_params_window(ui, self);
-        }
         if self.fx_editor.is_some() {
             self.fx_editor_window(ui);
         }
@@ -5942,13 +5902,27 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             app.synth_registry.rescan();
             app.status = "synths re-scanned".into();
         }
-        if app.track_synth_inst[t].is_some()
-            && ui
-                .small_button("sliders")
-                .on_hover_text("This synth's parameters")
-                .clicked()
-        {
-            app.synth_win = Some(t);
+        if app.track_synth_inst[t].is_some() {
+            // v0.11 R3: hosted plugins are plug-and-play -- this button
+            // opens the plugin's OWN window (never a slider panel). Script
+            // synths keep their parameter sliders.
+            let is_vst = app
+                .track_synth[t]
+                .as_deref()
+                .is_some_and(|s| vst_synth_decode(s).is_some());
+            let label = if is_vst { "GUI" } else { "sliders" };
+            let hover = if is_vst {
+                "Open this plugin's own window (its controls live inside it)"
+            } else {
+                "This synth's parameters"
+            };
+            if ui.small_button(label).on_hover_text(hover).clicked() {
+                if is_vst {
+                    app.toggle_synth_gui(t);
+                } else {
+                    app.synth_win = Some(t);
+                }
+            }
         }
     });
 }
@@ -7347,7 +7321,7 @@ fn level_parse(kind: u8, s: &str) -> Option<u8> {
 }
 
 /// One small chip per mixer-chain slot on the track header; clicking opens
-/// that slot's controls (script editor window or plugin slider window).
+/// that slot's controls (script editor window; plugins open their own).
 fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
     let mut open_slot: Option<usize> = None;
     for (k, row) in app.fx_rows[i].clone().iter().enumerate() {
@@ -8051,72 +8025,6 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
             );
         });
     app.fx_window = if open { Some(loop_i) } else { None };
-}
-
-/// Plugin parameter sliders shared by the chain slot window and the VSTi
-/// synth window. Returns true when the user moved anything.
-fn vst_param_sliders(ui: &mut egui::Ui, e: &crate::vsthost::RtStageEntry) -> bool {
-    let writable: Vec<(usize, String)> = e
-        .descs()
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| d.writable)
-        .map(|(k, d)| (k, d.name.clone()))
-        .collect();
-    if writable.is_empty() {
-        ui.label(RichText::new("(no controllable parameters)").weak().small());
-        return false;
-    }
-    let mut changed = false;
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (k, name) in writable {
-                let mut v = e.params().get(k);
-                let r = ui.add(
-                    egui::Slider::new(&mut v, 0.0..=1.0)
-                        .text(name)
-                        .show_value(false)
-                        .custom_formatter(|x, _| format!("{:.0}%", x * 100.0)),
-                );
-                if r.changed() {
-                    e.set_param(k, v);
-                    changed = true;
-                }
-            }
-        });
-    changed
-}
-
-/// Slider window for one plugin chain slot.
-fn vst_params_window(ui: &mut egui::Ui, app: &mut App) {
-    let Some((t, row)) = app.vst_edit else { return };
-    let Some(entry) = app
-        .fx_rows
-        .get(t)
-        .and_then(|r| r.get(row))
-        .and_then(|r| match r {
-            ChainRow::Vst { entry, .. } => entry.clone(),
-            _ => None,
-        })
-    else {
-        app.vst_edit = None;
-        return;
-    };
-    let mut open = true;
-    let mut changed = false;
-    egui::Window::new(RichText::new(format!("{} — track {}", entry.name(), t + 1)).strong())
-        .id(egui::Id::new(("vstedit", t, row)))
-        .open(&mut open)
-        .default_size([360.0, 320.0])
-        .show(ui, |ui| {
-            changed = vst_param_sliders(ui, &entry);
-        });
-    if changed {
-        app.vst_row_params_sync(t, row);
-        app.fx_save_pending = true;
-    }
-    app.vst_edit = if open { Some((t, row)) } else { None };
 }
 
 /// Small ↑/↓ reorder button with a DRAWN arrow. egui's default font stack
@@ -10502,13 +10410,10 @@ mod tests {
         // (thread joined) below BEFORE the temp plugin dir disappears.
         app.fx_vst_editors.insert((0, 0), editor);
         if !painted {
-            // Refusal path: the reap frame must fall back to sliders.
+            // v0.11 R3 refusal path: an editor that never painted leaves NO
+            // window of any kind behind (hosted plugins get no slider panel).
             frame(&mut app, &ctx, vec![]);
-            assert_eq!(
-                app.vst_edit,
-                Some((0, 0)),
-                "a refused editor must fall back to the slider window"
-            );
+            assert!(app.fx_vst_editors.is_empty(), "refused editor must be reaped");
         }
         // Persisted state must survive a config round-trip.
         app.save_config();
