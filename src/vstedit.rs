@@ -132,14 +132,31 @@ extern "C" fn x_error_noop(_display: *mut c_void, _event: *mut c_void) -> c_int 
     0
 }
 
-const STRUCTURE_NOTIFY_MASK: u64 = 1 << 20;
+// X11 event masks (X.h). v0.11 NOTE: this constant used to read `1 << 20`,
+// which is SubstructureRedirectMask -- the container never actually
+// received StructureNotify events, and WM-driven resizes went unnoticed
+// (close-button handling survived only because ClientMessage delivery is
+// not mask-gated). 1 << 17 is the real StructureNotifyMask.
+const STRUCTURE_NOTIFY_MASK: u64 = 1 << 17;
+const KEY_PRESS_MASK: u64 = 1 << 0;
+const KEY_RELEASE_MASK: u64 = 1 << 1;
+const FOCUS_CHANGE_MASK: u64 = 1 << 21;
 // X protocol event codes (XSendEvent(7X)): 17 DestroyNotify, 18 UnmapNotify,
 // 21 ReparentNotify, 22 ConfigureNotify, 33 ClientMessage. (An earlier
 // comment block here called 18 "ReparentNotify" — 18 is UnmapNotify.)
+const EVENT_KEY_PRESS: i32 = 2;
+const EVENT_KEY_RELEASE: i32 = 3;
+const EVENT_FOCUS_IN: i32 = 9;
+const EVENT_FOCUS_OUT: i32 = 10;
+const EVENT_EXPOSE: i32 = 12;
 const EVENT_DESTROY_NOTIFY: i32 = 17;
 const EVENT_REPARENT_NOTIFY: i32 = 21;
 const EVENT_CONFIGURE_NOTIFY: i32 = 22;
 const EVENT_CLIENT_MESSAGE: i32 = 33;
+
+// VST2.4 editor resize negotiation (aeff.h).
+const EFF_EDIT_CAN_SIZE: i32 = 79;
+const EFF_EDIT_SIZE: i32 = 78;
 
 /// Distinctive container background. The "did the plugin paint?" probe
 /// compares pixels against THIS, never against black: the old probe
@@ -236,13 +253,44 @@ unsafe fn is_viewable(d: *mut Display, win: XWindow) -> bool {
 /// dropped before the match, and the close button did nothing (the
 /// "cannot close plugin window" report). XNextEvent blocking is not a
 /// risk either: the caller only calls it while `XPending > 0`.
-unsafe fn drain_events(d: *mut Display, win: XWindow, wm_protocols: Atom, wm_delete: Atom) -> bool {
+/// Pump the container's event queue. Returns true when the user closed
+/// the editor. `resized` collects the newest CONTAINER size change (the
+/// window manager's answer to the user dragging the frame). Keyboard and
+/// focus events are forwarded to the plugin's top child window with
+/// `send_event=True`: child-window toolkits (JUCE and friends) sit behind
+/// an unmanaged X window that never receives the WM's focus, so without
+/// this relay their editors are click-but-not-type deaf (v0.11 R1b).
+unsafe fn drain_events(
+    d: *mut Display,
+    win: XWindow,
+    wm_protocols: Atom,
+    wm_delete: Atom,
+    resized: &mut Option<(u32, u32)>,
+) -> bool {
     let mut drained = 0;
     while XPending(d) > 0 && drained < 256 {
         let mut ev = [0u64; 24];
         XNextEvent(d, &mut ev);
         drained += 1;
         match (ev[0] as u32) as i32 {
+            EVENT_KEY_PRESS | EVENT_KEY_RELEASE | EVENT_FOCUS_IN | EVENT_FOCUS_OUT => {
+                // Relay to the plugin's own top window (XKeyEvent window
+                // field lives at byte 32 -> ev[4]; send_event at byte 16).
+                if let Some((k, _, _)) = first_sized_child(d, win) {
+                    ev[4] = k;
+                    ev[2] = 1;
+                    XSendEvent(d, k, 0, 0, ev.as_ptr());
+                }
+            }
+            EVENT_CONFIGURE_NOTIFY if ev[5] == win => {
+                // XConfigureEvent: window@40 -> ev[5], width@64 -> ev[8],
+                // height@72 -> ev[9]. Only OUR window's resizes.
+                *resized = Some((ev[8] as u32, ev[9] as u32));
+            }
+            EVENT_EXPOSE => {
+                // Direct-draw plugins run their OWN Xlib connection and
+                // receive their own Expose events; nothing to relay.
+            }
             EVENT_CLIENT_MESSAGE => {
                 // XClientMessageEvent on x86_64: message_type atom
                 // (unsigned long) at byte 40 -> ev[5]; data.l[0]
@@ -531,6 +579,8 @@ enum Phase {
         last_size: (i32, i32),
         since_rect: u32,
         dead_streak: u32,
+        /// Container size last reported by the window manager (R1b).
+        last_container: (u32, u32),
     },
     Done,
 }
@@ -621,7 +671,14 @@ impl Editor {
                     // The user can hit the close button while we are
                     // still verifying: honour it instead of holding a
                     // doomed window.
-                    if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete) {
+                    let mut _resized = None;
+                    if drain_events(
+                        self.d,
+                        self.win,
+                        self.wm_protocols,
+                        self.wm_delete,
+                        &mut _resized,
+                    ) {
                         self.teardown(false);
                         return;
                     }
@@ -650,6 +707,7 @@ impl Editor {
                             last_size: (0, 0),
                             since_rect: 0,
                             dead_streak: 0,
+                            last_container: (0, 0),
                         };
                         return;
                     }
@@ -667,12 +725,73 @@ impl Editor {
                     ref mut last_size,
                     ref mut since_rect,
                     ref mut dead_streak,
+                    ref mut last_container,
                 } => {
                     // Dispatch X events (close button / window
                     // destruction); bounded per step.
-                    if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete) {
+                    let mut resized = None;
+                    if drain_events(
+                        self.d,
+                        self.win,
+                        self.wm_protocols,
+                        self.wm_delete,
+                        &mut resized,
+                    ) {
                         self.teardown(false);
                         return;
+                    }
+                    // v0.11 R1b: the user dragged the editor frame (or the
+                    // WM auto-maximised it). Route that through the plugin:
+                    // VST2.4 editors with effEditCanSizeWindow take it as
+                    // effEditSize; stubborn child-window toolkits get the
+                    // child resized plus a synthetic ConfigureNotify so
+                    // their layout code runs. Without this the plugin kept
+                    // painting its old size inside a new-size frame --
+                    // clipped or sentinel-coloured strips (the "GUIs don't
+                    // fully work" report).
+                    if let Some((w, h)) = resized {
+                        if (w, h) != *last_container
+                            && w >= 8
+                            && h >= 8
+                            && (last_container.0 != 0 || (w, h) != (640, 420))
+                        {
+                            *last_container = (w, h);
+                            let can = {
+                                let _loader = crate::vsthost::vst_loader_lock();
+                                self.handle.dispatch(
+                                    EFF_EDIT_CAN_SIZE,
+                                    0,
+                                    0,
+                                    ptr::null_mut(),
+                                    0.0,
+                                ) != 0
+                                    // aeff.h (VST 2.4): 'value' = new width,
+                                // 'opt' = new height; returns 1 if handled.
+                                && self.handle.dispatch(
+                                    EFF_EDIT_SIZE,
+                                    0,
+                                    w as isize,
+                                    ptr::null_mut(),
+                                    h as f32,
+                                ) != 0
+                            };
+                            if !can {
+                                if let Some((k, _, _)) = first_sized_child(self.d, self.win) {
+                                    XResizeWindow(self.d, k, w as i32, h as i32);
+                                    // Synthetic ConfigureNotify for the child.
+                                    let mut cn = [0u64; 24];
+                                    cn[0] = EVENT_CONFIGURE_NOTIFY as u64;
+                                    cn[2] = 1; // send_event
+                                    cn[3] = self.d as u64; // display
+                                    cn[4] = k; // event window
+                                    cn[5] = k; // window
+                                    cn[8] = w as u64;
+                                    cn[9] = h as u64;
+                                    XSendEvent(self.d, k, 0, 0, cn.as_ptr());
+                                    XFlush(self.d);
+                                }
+                            }
+                        }
                     }
                     let kids = count_children_local(self.d, self.win);
                     self.shared.children.store(kids, Ordering::SeqCst);
@@ -713,7 +832,15 @@ impl Editor {
     /// `make_editor`: issuing these before `effEditOpen` breaks plugin
     /// window mapping).
     unsafe fn decorate(&mut self) {
-        XSelectInput(self.d, self.win, STRUCTURE_NOTIFY_MASK);
+        // v0.11 R1b: StructureNotify for WM resizes, plus keyboard/focus
+        // so `drain_events` can relay input to the plugin's child window.
+        // Exposure is NOT selected: direct-draw plugins listen on their own
+        // connection and synthetic Expose floods confuse them.
+        XSelectInput(
+            self.d,
+            self.win,
+            STRUCTURE_NOTIFY_MASK | KEY_PRESS_MASK | KEY_RELEASE_MASK | FOCUS_CHANGE_MASK,
+        );
         if let Ok(cname) = CString::new(format!("slooper \u{2014} {}", self.title)) {
             XStoreName(self.d, self.win, cname.as_ptr());
         }

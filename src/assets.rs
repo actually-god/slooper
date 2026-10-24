@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audio_io::IMPORT_EXTENSIONS;
+use crate::automation::Automation;
 use crate::midipat::Pattern;
 
 /// One decoded audio asset. `path` is where it is stored (or will be stored:
@@ -30,6 +31,8 @@ pub struct Asset {
     pub dirty: bool,
     /// MIDI patterns live here (`data` stays empty); audio assets are None.
     pub pattern: Option<Arc<Pattern>>,
+    /// Automation curves live here (v0.11); audio/MIDI assets are None.
+    pub automation: Option<Arc<Automation>>,
 }
 
 impl Asset {
@@ -45,7 +48,7 @@ impl Asset {
         data: Arc<[f32]>,
         dirty: bool,
     ) -> Asset {
-        Asset { id, name, path, data, dirty, pattern: None }
+        Asset { id, name, path, data, dirty, pattern: None, automation: None }
     }
 
     /// MIDI pattern asset (imported .mid, MIDI recording, piano roll).
@@ -56,11 +59,26 @@ impl Asset {
         pattern: Arc<Pattern>,
         dirty: bool,
     ) -> Asset {
-        Asset { id, name, path, data: Arc::from(Vec::new().into_boxed_slice()), dirty, pattern: Some(pattern) }
+        Asset { id, name, path, data: Arc::from(Vec::new().into_boxed_slice()), dirty, pattern: Some(pattern), automation: None }
+    }
+
+    /// Automation asset (v0.11): a curve + target, stored as `.slauto` JSON.
+    pub fn automation_asset(
+        id: u32,
+        name: String,
+        path: PathBuf,
+        curve: Arc<Automation>,
+        dirty: bool,
+    ) -> Asset {
+        Asset { id, name, path, data: Arc::from(Vec::new().into_boxed_slice()), dirty, pattern: None, automation: Some(curve) }
     }
 
     pub fn is_midi(&self) -> bool {
         self.pattern.is_some()
+    }
+
+    pub fn is_auto(&self) -> bool {
+        self.automation.is_some()
     }
 }
 
@@ -74,6 +92,8 @@ pub struct RackFile {
     pub path: PathBuf,
     /// True for .mid/.midi entries (the rack's MIDI section).
     pub is_midi: bool,
+    /// True for `.slauto` automation assets (v0.11).
+    pub is_auto: bool,
 }
 
 /// True when a file's extension is a format the import pipeline decodes.
@@ -81,6 +101,11 @@ pub fn is_audio_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| IMPORT_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// True when a file is a slooper automation asset (`.slauto` JSON).
+pub fn is_auto_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("slauto"))
 }
 
 /// True when a file is a Standard MIDI File the pattern decoder accepts.
@@ -99,12 +124,13 @@ pub fn scan_folder(dir: &Path) -> Result<Vec<RackFile>, String> {
     for entry in rd.flatten() {
         let p = entry.path();
         let is_midi = p.is_file() && is_midi_file(&p);
-        if p.is_file() && (is_audio_file(&p) || is_midi) {
+        let is_auto = p.is_file() && is_auto_file(&p);
+        if p.is_file() && (is_audio_file(&p) || is_midi || is_auto) {
             let name = p
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            files.push(RackFile { name, path: p, is_midi });
+            files.push(RackFile { name, path: p, is_midi, is_auto });
         }
     }
     files.sort_by_key(|f| f.name.to_lowercase());
@@ -155,6 +181,7 @@ mod tests {
             name: "a".into(),
             path: PathBuf::from("/x/a.mid"),
             is_midi: true,
+            is_auto: false,
         };
         assert!(rf.is_midi);
     }
