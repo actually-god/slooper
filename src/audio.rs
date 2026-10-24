@@ -298,6 +298,8 @@ pub enum Cmd {
     },
     /// Replace the MIDI pattern table (indexed in parallel with `assets`).
     SetMidiAssets(Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>),
+    /// v0.11 R5: automation asset table (parallel to assets).
+    SetAutoAssets(Arc<Vec<Option<Arc<crate::automation::Automation>>>>),
     /// Bind/unbind one track's synthesizer (scripted synth or VSTi).
     SetTrackSynth {
         i: usize,
@@ -1730,6 +1732,7 @@ fn run(
                 engine.set_project(assets, arr, len);
             }
             Ok(Cmd::SetMidiAssets(midi)) => engine.set_midi_assets(midi),
+        Ok(Cmd::SetAutoAssets(auto)) => engine.set_auto_assets(auto),
             Ok(Cmd::SetTrackSynth { i, synth }) => {
                 engine.set_track_synth(i.min(MAX_LOOPS - 1), synth)
             }
