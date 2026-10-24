@@ -61,6 +61,14 @@ vst2 = { path = "vendor/vst2" }
 [workspace]
 members = ["vendor/vst2"]
 
+# SLOOPER PATCH (v0.11): winit 0.30.13's X11 backend panics (panic=abort ->
+# whole DAW dies) when libX11's input-context focus plumbing reports a stale
+# error during WM focus churn - reproduced by closing and re-opening a hosted
+# plugin editor window (see v11 pin + coredump analysis). vendor/winit turns
+# those IM errors into log lines; nothing else differs from the release.
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+
 [profile.release]
 lto = true
 codegen-units = 1
