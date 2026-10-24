@@ -11138,6 +11138,75 @@ mod tests {
         assert!(app.assets.last().unwrap().name.contains("roll-2"));
     }
 
+    /// v0.11 R5 pin: the automation manager buffer -> asset -> clip ->
+    /// file round-trip, in-place overwrite, and the write-recorder path
+    /// (arm -> move track volume -> stop -> asset + red clip).
+    #[test]
+    fn v11_automation_manager_roundtrip_and_write_rec() {
+        use crate::automation::{Node, Shape, TARGET_TRACK_PAN, TARGET_TRACK_VOL};
+        let mut app = headless_app("autoedit");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sample_rate = 48_000;
+
+        // --- manager: new curve -> save as new asset -------------------
+        app.open_auto_editor(None);
+        let mut ed = app.auto_edit.take().expect("editor opened");
+        ed.target = TARGET_TRACK_PAN.to_string();
+        ed.nodes = vec![
+            Node { t: 0, v: 0.0, s: Shape::Linear },
+            Node { t: 48_000, v: 1.0, s: Shape::Smooth },
+        ];
+        let before = app.assets.len();
+        app.auto_commit(&mut ed, 1, false);
+        app.auto_edit = Some(ed);
+        assert_eq!(app.assets.len(), before + 1);
+        let k = app.assets.len() - 1;
+        let a = &app.assets[k];
+        assert!(a.is_auto());
+        assert!(a.path.to_string_lossy().ends_with(".slauto"));
+        let placed = app.arr.tracks[1]
+            .lanes
+            .iter()
+            .any(|l| l.clips.iter().any(|c| c.asset as usize == k));
+        assert!(placed, "manager save must drop a clip on the track");
+        let txt = std::fs::read_to_string(&a.path).unwrap();
+        let back = crate::automation::Automation::from_json(&txt).unwrap();
+        assert_eq!(back.target, TARGET_TRACK_PAN);
+        assert!((back.eval(24_000) - 0.5).abs() < 0.02);
+
+        // --- overwrite in place -----------------------------------------
+        app.open_auto_editor(Some(k));
+        let mut ed = app.auto_edit.take().unwrap();
+        assert_eq!(ed.asset, Some(k));
+        ed.nodes[0].v = 0.25;
+        app.auto_commit(&mut ed, 1, true);
+        let txt = std::fs::read_to_string(&app.assets[k].path).unwrap();
+        let back = crate::automation::Automation::from_json(&txt).unwrap();
+        assert!((back.nodes[0].v - 0.25).abs() < 1e-6);
+        assert_eq!(app.assets.len(), before + 1, "overwrite adds nothing");
+
+        // --- write recording ---------------------------------------------
+        app.auto_rec[0] = crate::ui::AutoRecState {
+            armed: true,
+            target: None,
+            start: 0,
+            nodes: vec![],
+        };
+        app.set_trk_vol(0, 100);
+        app.set_trk_vol(0, 60);
+        let n_before = app.assets.len();
+        app.toggle_auto_rec(0); // stop + bounce
+        assert_eq!(app.assets.len(), n_before + 1);
+        let a = app.assets.last().unwrap();
+        assert!(a.is_auto());
+        assert_eq!(a.automation.as_ref().unwrap().target, TARGET_TRACK_VOL);
+        assert!(app.arr.tracks[0]
+            .lanes
+            .iter()
+            .any(|l| l.clips.iter().any(|c| c.asset as usize == app.assets.len() - 1)));
+    }
+
     /// Item 3+4 regression pins: opening the roll with a MIDI asset
     /// SELECTED (clip or rack) edits that asset in place, the wheel scrolls
     /// the note grid in the conventional direction (wheel up = view up =
