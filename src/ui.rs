@@ -6576,7 +6576,14 @@ fn lane_row(
             egui::pos2(cx0, rect.min.y + 1.0),
             egui::pos2(cx1, rect.max.y - 1.0),
         );
-        draw_asset_clip(ui, app, c.asset, (c.cut, c.avail(alen)), cres, COL_CLIP, sel);
+        // Paint window = the VISIBLE slice of the source (span ∩ data),
+        // never the full `avail`: passing avail made the whole remaining
+        // asset scale into the trimmed rect, i.e. the content STRETCHED
+        // when the user dragged an edge (the "clips stretch instead of
+        // clip" report). Content now stays anchored per-sample; the trim
+        // hides it exactly like the engine does.
+        let vlen = c.span(alen).min(c.avail(alen));
+        draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres, COL_CLIP, sel);
         // Extended-past-data tail: silence, hatched dark so it reads as
         // "clip is longer than its source".
         let dend = x_of(x0, c.data_end(alen), sr, px);
@@ -8744,6 +8751,189 @@ mod tests {
             pressed: down,
             modifiers: Default::default(),
         }
+    }
+
+    /// v11 pin ("clips STRETCH instead of clip when the length is
+    /// changed"): trimming a clip edge must anchor the content per-sample
+    /// and hide the rest — never rescale it into the new rect. A pattern
+    /// with a note at tick 0 and one at 90 % of the pattern: after a tail
+    /// trim past half, only the FIRST note may still be painted, and its
+    /// x position must not have moved. The bug: the paint window was
+    /// `(cut, avail)` while the rect covered `span`, so the whole
+    /// remainder scaled into the trimmed rect (both notes always visible,
+    /// squished).
+    #[test]
+    fn v11_clip_trim_clips_paint_without_stretch() {
+        let mut app = headless_app("v11stretch");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let mut pat = crate::midipat::Pattern::new(120);
+        pat.len_ticks = 32 * 480; // 16 s at 120 BPM = 640 px @ 40 px/s
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 120,
+        });
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 72,
+            vel: 100,
+            press: 0,
+            start: (pat.len_ticks as f32 * 0.9) as u32,
+            len: 120,
+        });
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::midi(
+            a,
+            "two-note".into(),
+            std::path::PathBuf::from("/tmp/two-note.mid"),
+            std::sync::Arc::new(pat),
+            false,
+        ));
+        app.px_per_sec = 40.0;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        app.last_click_track = Some(0);
+        app.snap_on = false;
+
+        // Mini piano-roll bars: the unselected/selected note-bar colors.
+        let note_bars = |app: &mut App| -> Vec<f32> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let shapes = std::mem::take(&mut out.shapes);
+            out.textures_delta.clear();
+            shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Rect(r) => {
+                        let (cr, cg, cb, ca) = r.fill.to_tuple();
+                        let blue = ca == 255
+                            && ((cr.abs_diff(120) < 8 && cg.abs_diff(205) < 8 && cb == 255)
+                                || (cr.abs_diff(180) < 8 && cg.abs_diff(235) < 8 && cb == 255));
+                        (blue && r.rect.width() >= 1.0 && r.rect.height() <= 6.0)
+                            .then_some(r.rect.min.x)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let before = note_bars(&mut app);
+        assert_eq!(before.len(), 2, "both notes painted before the trim: {before:?}");
+        let (n0, n1) = (
+            before.iter().copied().reduce(f32::min).unwrap(),
+            before.iter().copied().fold(f32::MIN, f32::max),
+        );
+
+
+        // Grab the clip's right edge (selected body rect) and trim ~200 px.
+        let sel_rgb = {
+            let c = crate::ui::COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let body = painted_rects(&mut app, &ctx, sel_rgb)
+            .into_iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("clip body painted");
+        let cy = body.center().y;
+        drag_pt(&mut app, &ctx, egui::pos2(body.max.x - 2.0, cy), egui::pos2(body.max.x - 160.0, cy));
+        let cl = app.arr.tracks[0].lanes[0].clips[0];
+        let alen = app.asset_len(a);
+        assert!(cl.end(alen) - cl.pos <= alen * 4 / 5 + 1, "tail drag must trim away >= 20 %: {cl:?}");
+
+        let after = note_bars(&mut app);
+        assert_eq!(after.len(), 1, "the 90 % note is CLIPPED out, not squeezed in: {after:?}");
+        assert!(
+            (after[0] - n0.min(n1)).abs() < 2.0,
+            "the surviving note sits at the SAME pixel (anchored, not stretched): {} vs {}",
+            after[0],
+            n0.min(n1)
+        );
+    }
+
+    /// v11 pin, audio half: a one-shot burst at the END of the asset must
+    /// vanish when the tail is trimmed, not be stretched to stay visible.
+    #[test]
+    fn v11_audio_trim_clips_waveform_without_stretch() {
+        let mut app = headless_app("v11wave");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // 8 s: silent for 75 %, loud burst in the last quarter.
+        let n = 48_000 * 8;
+        let mut data = vec![0.0f32; n];
+        for (i, v) in data.iter_mut().enumerate().skip(n * 3 / 4) {
+            *v = ((i % 20) as f32 * 0.6).sin().min(1.0);
+        }
+        let data: std::sync::Arc<[f32]> = data.into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "burst".into(),
+            std::path::PathBuf::from("/tmp/burst-test.wav"),
+            data,
+            false,
+        ));
+        app.px_per_sec = 40.0;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        app.last_click_track = Some(0);
+        app.snap_on = false;
+
+        // Tall waveform strokes = burst columns (peak-normalized to ~full
+        // lane height) in the selected-clip waveform color; grid hairlines
+        // are tall too but a different color, and silence paints ~zero-
+        // extent strokes.
+        let tall = |app: &mut App| -> usize {
+            let (wr, wg, wb, _) = crate::ui::COL_CLIP_SEL.to_tuple();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let shapes = std::mem::take(&mut out.shapes);
+            out.textures_delta.clear();
+            shapes
+                .iter()
+                .filter(|cs| match &cs.shape {
+                    egui::epaint::Shape::LineSegment { points, stroke } => {
+                        let (r, g, b, _) = stroke.color.to_tuple();
+                        (points[1].y - points[0].y).abs() > 8.0
+                            && r.abs_diff(wr) < 8
+                            && g.abs_diff(wg) < 8
+                            && b.abs_diff(wb) < 8
+                    }
+                    _ => false,
+                })
+                .count()
+        };
+        assert!(tall(&mut app) > 10, "burst columns painted before the trim");
+        let sel_rgb = {
+            let c = crate::ui::COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let body = painted_rects(&mut app, &ctx, sel_rgb)
+            .into_iter()
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("clip body painted");
+        let cy = body.center().y;
+        drag_pt(&mut app, &ctx, egui::pos2(body.max.x - 2.0, cy), egui::pos2(body.max.x - 170.0, cy));
+        let cl = app.arr.tracks[0].lanes[0].clips[0];
+        let alen = app.asset_len(a);
+        assert!(cl.end(alen) < cl.pos + alen * 7 / 10, "trim must end before the burst: {cl:?}");
+        assert_eq!(tall(&mut app), 0, "trimmed-away burst must NOT be stretched into view");
     }
 
     /// SETTINGS must dock to the LEFT of the asset rack (add-order test:
