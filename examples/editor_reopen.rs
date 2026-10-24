@@ -34,7 +34,7 @@ fn main() {
         }
         let handle = entry.vst2_handle().expect("vst2 handle");
         for cycle in 1..=3u32 {
-            let mut win = slooper::vstedit::open_editor(&handle, &path, entry.name())
+            let win = slooper::vstedit::open_editor(&handle, &path, entry.name())
                 .unwrap_or_else(|e| panic!("open_editor cycle {cycle}: {e}"));
             // Wait for the verdict (painted / refused / closed).
             let mut waited = 0u32;

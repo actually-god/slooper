@@ -255,6 +255,32 @@ struct MidiRecState {
     evs: Vec<(u64, u8, u8, u8, u8)>,
 }
 
+/// v0.11 R5: per-track write-automation recorder (FL's "write" mode).
+/// Arming one starts the transport; from then on, every move of a control
+/// is captured as curve nodes — the FIRST control moved owns the take, so
+/// one asset always automates exactly one target.
+#[derive(Clone, Default)]
+struct AutoRecState {
+    armed: bool,
+    target: Option<String>,
+    start: u64,
+    nodes: Vec<crate::automation::Node>,
+}
+
+/// v0.11 R5: the automation manager window's editing state.
+struct AutoEdit {
+    /// Existing asset being edited in place (None = unsaved new curve).
+    asset: Option<usize>,
+    name: String,
+    target: String,
+    len_samples: i64,
+    nodes: Vec<crate::automation::Node>,
+    sel: usize,
+    /// Node index being dragged on the canvas (gesture armed on press).
+    drag: Option<usize>,
+    changed: bool,
+}
+
 /// Floating piano-roll editor (the top-bar "Piano roll" window). Notes are
 /// drawn on the metronome grid exactly like the timeline: drag on empty
 /// space draws a note, drag on a note moves its whole selection, drag a
@@ -706,6 +732,9 @@ pub struct App {
     /// editor thread before the plugin may be unloaded (`src/vstedit.rs`).
     vst_editors: std::collections::HashMap<usize, crate::vstedit::EditorWindow>,
     midi_rec: Vec<MidiRecState>,
+    /// v0.11 R5: write-automation recorders + open automation manager.
+    auto_rec: Vec<AutoRecState>,
+    auto_edit: Option<Box<AutoEdit>>,
     piano_roll: Option<Box<PianoRoll>>,
 
     // --- per-track effects framework ---
@@ -973,6 +1002,8 @@ impl App {
             synth_win: None,
             vst_editors: std::collections::HashMap::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
+            auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
+            auto_edit: None,
             piano_roll: None,
             fx_registry,
             fx_rows,
@@ -1415,6 +1446,7 @@ impl App {
     fn set_trk_vol(&mut self, i: usize, v: u8) {
         self.trk_vol[i] = v;
         self.backend.engine.set_loop_vol(i, vol_amp(v));
+        self.note_auto(i, crate::automation::TARGET_TRACK_VOL, vol_amp(v));
     }
 
     /// Set loop `i`'s gain trim from a MIDI-range value (0..=127).
@@ -1428,6 +1460,7 @@ impl App {
     fn set_trk_pan(&mut self, i: usize, v: u8) {
         self.trk_pan[i] = v;
         self.backend.engine.set_loop_pan(i, pan01(v));
+        self.note_auto(i, crate::automation::TARGET_TRACK_PAN, pan01(v));
     }
 
     /// Rebuild loop `i`'s live effect chain from its window rows and hand it
@@ -1709,9 +1742,10 @@ impl App {
     fn asset_len(&self, id: u32) -> u64 {
         self.assets
             .get(id as usize)
-            .map(|a| match &a.pattern {
-                Some(pat) => pat.len_samples(self.sample_rate.max(1)),
-                None => a.data.len() as u64,
+            .map(|a| match (&a.pattern, &a.automation) {
+                (Some(pat), _) => pat.len_samples(self.sample_rate.max(1)),
+                (None, Some(auto)) => auto.len_samples.max(0) as u64,
+                (None, None) => a.data.len() as u64,
             })
             .unwrap_or(0)
     }
@@ -1735,6 +1769,12 @@ impl App {
         // MIDI patterns audition through the default synth instead.
         if self.assets.get(k).is_some_and(|a| a.is_midi()) {
             self.audition_pattern(k);
+            return;
+        }
+        // v0.11 R5: an automation curve is data, not sound — open its
+        // editor instead of pretending to play it.
+        if self.assets.get(k).is_some_and(|a| a.is_auto()) {
+            self.open_auto_editor(Some(k));
             return;
         }
         if !self.preview_enabled {
@@ -1870,6 +1910,10 @@ impl App {
         let midi: Arc<Vec<Option<Arc<Pattern>>>> =
             Arc::new(self.assets.iter().map(|a| a.pattern.clone()).collect());
         self.backend.cmd(Cmd::SetMidiAssets(midi));
+        // v0.11 R5: automation curves ride the same parallel-indexed table.
+        let auto: Arc<Vec<Option<Arc<crate::automation::Automation>>>> =
+            Arc::new(self.assets.iter().map(|a| a.automation.clone()).collect());
+        self.backend.cmd(Cmd::SetAutoAssets(auto));
         // v0.10: a MIDI clip landing on an unbound track gives that track
         // its own piano instance (dedicated, never the shared fallback).
         for t in 0..MAX_LOOPS {
@@ -2126,6 +2170,8 @@ impl App {
             .parse::<u32>()
             .unwrap_or(120)
             .clamp(20, 300);
+        // v0.11 R5: tempo is automatable (curve wins while it sounds).
+        self.note_auto(0, crate::automation::TARGET_MASTER_TEMPO, bpm as f32);
         self.backend.cmd(Cmd::SetMetro {
             on: self.metro_on,
             bpm,
@@ -2373,7 +2419,7 @@ impl App {
         // auto_open_synth_gui records why it failed in the status line; keep
         // that visible alongside the binding message.
         let gui_note = if gui == Some(false) {
-            std::mem::replace(&mut self.status, String::new())
+            std::mem::take(&mut self.status)
         } else {
             String::new()
         };
@@ -2400,6 +2446,606 @@ impl App {
         for t in 0..MAX_LOOPS {
             self.rebuild_track_synth(t);
         }
+    }
+
+    /// v0.11 R5: capture one control move for an armed write-automation
+    /// take. Global (`master.*`) controls record into the first armed
+    /// track; track controls into their own track's armed recorder. The
+    /// first control moved claims the take; moving a different control
+    /// afterwards is refused (one asset = one target).
+    fn note_auto(&mut self, i: usize, target: &str, v: f32) {
+        let ti = if target.starts_with("master.") {
+            self.auto_rec.iter().position(|r| r.armed)
+        } else if self.auto_rec.get(i).is_some_and(|r| r.armed) {
+            Some(i)
+        } else {
+            None
+        };
+        let Some(ti) = ti else { return };
+        let r = &mut self.auto_rec[ti];
+        match &r.target {
+            None => r.target = Some(target.to_string()),
+            Some(t) if t == target => {}
+            Some(t) => {
+                self.status =
+                    format!("automation: already recording \u{201c}{t}\u{201d} on track {} \u{2014} stop first", ti + 1);
+                return;
+            }
+        }
+        let trel = self.backend.engine.pos().saturating_sub(r.start) as i64;
+        // Throttle: skip a sample of an unchanged value (a slider sitting
+        // still must not burn a node every frame).
+        if let Some(last) = r.nodes.last() {
+            if (last.v - v).abs() < 1e-4 && (trel - last.t) < (self.sample_rate.max(1) as i64 / 50) {
+                return;
+            }
+        }
+        r.nodes.push(crate::automation::Node { t: trel, v, s: crate::automation::Shape::Linear });
+    }
+
+    /// Arm / stop-and-bounce write automation on track `i` (mirrors
+    /// [`App::toggle_midi_rec`]).
+    fn toggle_auto_rec(&mut self, i: usize) {
+        if self.sample_rate == 0 {
+            self.status = "automation rec: wait for the audio engine".into();
+            return;
+        }
+        if self.auto_rec[i].armed {
+            self.commit_auto_rec(i);
+        } else {
+            for r in self.auto_rec.iter_mut() {
+                r.armed = false;
+            }
+            self.auto_rec[i] = AutoRecState {
+                armed: true,
+                target: None,
+                start: self.backend.engine.pos(),
+                nodes: Vec::new(),
+            };
+            if !self.backend.engine.transport_on() {
+                self.backend.cmd(Cmd::PlayAll);
+            }
+            self.status = format!(
+                "track {}: automation recording \u{2014} MOVE the control you want to capture",
+                i + 1
+            );
+        }
+    }
+
+    /// Turn an armed take into a saved `.slauto` asset + clip (like the
+    /// MIDI take bounce).
+    fn commit_auto_rec(&mut self, i: usize) {
+        let st = std::mem::take(&mut self.auto_rec[i]);
+        if st.target.is_none() || st.nodes.len() < 2 {
+            self.status = "automation rec: no control moved (nothing captured)".into();
+            return;
+        }
+        let target = st.target.clone().unwrap_or_default();
+        let sr = self.sample_rate.max(1) as i64;
+        let last = st.nodes.last().map(|n| n.t).unwrap_or(1);
+        let len = last.max(sr / 4);
+        let mut auto = crate::automation::Automation {
+            target: target.clone(),
+            len_samples: len,
+            nodes: st.nodes.clone(),
+        };
+        auto.normalize(0, f32::INFINITY);
+        // Unique file name in the primary rack folder.
+        let dir = self.primary_folder();
+        let base = format!("auto-t{}", i + 1);
+        let mut n = 1u32;
+        let path = loop {
+            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+            let p = dir.join(format!("{name}.slauto"));
+            if !p.exists() {
+                break p;
+            }
+            n += 1;
+        };
+        match std::fs::write(&path, auto.to_json().unwrap_or_default()) {
+            Ok(()) => {}
+            Err(e) => {
+                self.status = format!("automation rec: {e}");
+                return;
+            }
+        }
+        let id = self.assets.len() as u32;
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.assets.push(Asset::automation_asset(id, name.clone(), path, Arc::new(auto), false));
+        let pos = snap_start(st.start, self.snap_unit());
+        let nl0 = self.arr.tracks[i].lanes.len();
+        let lane = self.arr.place_auto(i, Clip::new(id, pos), len as u64);
+        self.grow_for_lanes(i, nl0);
+        if let Some(f) = self.rack.first_mut() {
+            f.rescan();
+        }
+        self.push_project();
+        self.save_config();
+        self.status = format!(
+            "track {}: automation take on {} \u{2192} clip \u{201c}{name}\u{201d} (lane {})",
+            i + 1,
+            crate::automation::describe_target(&target),
+            lane + 1
+        );
+    }
+
+    /// Instant constant-value automation asset placed at the playhead
+    /// (the "flat" branch of the right-click menu).
+    fn create_flat_auto_asset(&mut self, track: usize, target: &str, v: f32) {
+        if self.sample_rate == 0 {
+            self.status = "automation: wait for the audio engine".into();
+            return;
+        }
+        let len = (self.sample_rate * 2) as i64;
+        let auto = crate::automation::Automation::flat(target, v, len);
+        let dir = self.primary_folder();
+        let mut n = 1u32;
+        let path = loop {
+            let p = dir.join(format!("auto-{n}.slauto"));
+            if !p.exists() {
+                break p;
+            }
+            n += 1;
+        };
+        if let Err(e) = std::fs::write(&path, auto.to_json().unwrap_or_default()) {
+            self.status = format!("automation: {e}");
+            return;
+        }
+        let id = self.assets.len() as u32;
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.assets.push(Asset::automation_asset(id, name.clone(), path, Arc::new(auto), false));
+        let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
+        let nl0 = self.arr.tracks[track].lanes.len();
+        let lane = self.arr.place_auto(track, Clip::new(id, pos), len as u64);
+        self.grow_for_lanes(track, nl0);
+        if let Some(f) = self.rack.first_mut() {
+            f.rescan();
+        }
+        self.push_project();
+        self.status = format!(
+            "\u{201c}{name}\u{201d} = flat {} at {v:.3} \u{2192} track {} lane {} \u{b7} edit it from the rack or the automation button",
+            crate::automation::describe_target(target),
+            track + 1,
+            lane + 1
+        );
+    }
+
+    /// Open the automation manager editing asset `k` (None = fresh curve).
+    fn open_auto_editor(&mut self, k: Option<usize>) {
+        let (name, target, len, nodes) = match k.and_then(|k| self.assets.get(k)).map(|a| a.automation.clone()) {
+            Some(Some(a)) => (
+                self.assets[k.unwrap()].name.clone(),
+                a.target.clone(),
+                a.len_samples,
+                a.nodes.clone(),
+            ),
+            _ => (
+                "automation".into(),
+                crate::automation::TARGET_TRACK_VOL.to_string(),
+                (self.sample_rate.max(1) * 2) as i64,
+                vec![
+                    crate::automation::Node { t: 0, v: 1.0, s: crate::automation::Shape::Linear },
+                    crate::automation::Node {
+                        t: (self.sample_rate.max(1) * 2) as i64,
+                        v: 1.0,
+                        s: crate::automation::Shape::Linear,
+                    },
+                ],
+            ),
+        };
+        self.auto_edit = Some(Box::new(AutoEdit {
+            asset: k,
+            name,
+            target,
+            len_samples: len.max(1),
+            nodes,
+            sel: 0,
+            drag: None,
+            changed: false,
+        }));
+    }
+
+    /// v0.11 R5: the automation manager — the curve editor for automation
+    /// assets (opened from the rack, a clip, or the toolbar button). Nodes
+    /// are created by clicking, moved by dragging, deleted by right-click;
+    /// the node editor shows ABSOLUTE values (seconds + the target's own
+    /// units), never percentages, and every axis has numeric entry.
+    fn auto_window(&mut self, ui: &mut egui::Ui) {
+        use crate::automation::{Automation, Node, Shape};
+        let Some(mut ed) = self.auto_edit.take() else { return };
+        let sr = self.sample_rate.max(1) as f64;
+        let track = self.selected;
+        let targets = auto_targets(self, track);
+        let mut action: u8 = 0; // 1=save new, 2=overwrite, 3=cancel
+
+        let mut open = true;
+        egui::Window::new("Automation")
+            .default_pos([190.0, 320.0])
+            .default_width(620.0)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                let (rmin, rmax) = crate::automation::target_range(&ed.target);
+                let len = ed.len_samples.max(1);
+                ui.horizontal(|ui| {
+                    ui.label("target");
+                    let cur = targets
+                        .iter()
+                        .find(|(id, _)| id == &ed.target)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| ed.target.clone());
+                    egui::ComboBox::from_id_salt("auto_target")
+                        .selected_text(cur)
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (id, label) in &targets {
+                                if ui.selectable_value(&mut ed.target, id.clone(), label).changed()
+                                {
+                                    ed.changed = true;
+                                }
+                            }
+                        });
+                    ui.label("length (s)");
+                    let mut secs = ed.len_samples as f64 / sr;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut secs)
+                                .speed(0.05)
+                                .range(0.05..=600.0),
+                        )
+                        .changed()
+                    {
+                        ed.len_samples = ((secs * sr) as i64).max((sr / 10.0) as i64);
+                        ed.changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("name");
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut ed.name).desired_width(160.0))
+                        .changed()
+                    {
+                        ed.changed = true;
+                    }
+                    ui.label(
+                        RichText::new("click = add node \u{b7} drag = move \u{b7} right-click = delete")
+                            .weak()
+                            .italics(),
+                    );
+                });
+
+                // ---- the curve canvas ------------------------------------
+                let (rect, resp) =
+                    ui.allocate_at_least(egui::vec2(596.0, 240.0), egui::Sense::click_and_drag());
+                let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
+                let y_of = |v: f32| {
+                    rect.max.y
+                        - ((v - rmin) / (rmax - rmin).max(1e-9)).clamp(0.0, 1.0) * rect.height()
+                };
+                let t_of = |x: f32| {
+                    (((x - rect.min.x) / rect.width()) as f64 * len as f64)
+                        .round()
+                        .clamp(0.0, len as f64) as i64
+                };
+                let v_of = |y: f32| {
+                    let f = ((rect.max.y - y) / rect.height()) as f64;
+                    (rmin as f64 + f.clamp(0.0, 1.0) * (rmax - rmin).max(1e-9) as f64) as f32
+                };
+                ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));
+                ui.painter().rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.0, Color32::from_gray(60)),
+                    egui::StrokeKind::Inside,
+                );
+                // grid with ABSOLUTE value labels (the FL difference)
+                for gi in 1..8 {
+                    let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
+                    ui.painter().line_segment(
+                        [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                        egui::Stroke::new(1.0, Color32::from_gray(35)),
+                    );
+                    let gt = len as f64 * gi as f64 / 8.0;
+                    ui.painter().text(
+                        egui::pos2(gx + 2.0, rect.max.y - 8.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{:.2}s", gt / sr),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_gray(110),
+                    );
+                }
+                for gi in 1..4 {
+                    let gv = rmin + (rmax - rmin) * gi as f32 / 4.0;
+                    let gy = y_of(gv);
+                    ui.painter().line_segment(
+                        [egui::pos2(rect.min.x, gy), egui::pos2(rect.max.x, gy)],
+                        egui::Stroke::new(1.0, Color32::from_gray(35)),
+                    );
+                    ui.painter().text(
+                        egui::pos2(rect.min.x + 2.0, gy - 6.0),
+                        egui::Align2::LEFT_CENTER,
+                        format_gv(gv),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_gray(110),
+                    );
+                }
+                // the curve
+                let sample = Automation {
+                    target: ed.target.clone(),
+                    len_samples: len,
+                    nodes: ed.nodes.clone(),
+                };
+                let mut pts: Vec<egui::Pos2> = Vec::new();
+                let steps = (rect.width() / 2.0).max(2.0) as i64;
+                for i in 0..=steps {
+                    let t = (len as f64 * i as f64 / steps as f64) as i64;
+                    pts.push(egui::pos2(x_of(t), y_of(sample.eval(t))));
+                }
+                if pts.len() > 1 {
+                    // translucent fill under the curve (area = "how much
+                    // of the range the curve holds")
+                    let mut area = pts.clone();
+                    area.push(egui::pos2(pts.last().unwrap().x, rect.max.y));
+                    area.push(egui::pos2(pts[0].x, rect.max.y));
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        area,
+                        Color32::from_rgba_premultiplied(255, 120, 120, 36),
+                        egui::Stroke::NONE,
+                    ));
+                    for w in pts.windows(2) {
+                        ui.painter().line_segment(
+                            [w[0], w[1]],
+                            egui::Stroke::new(1.6, Color32::from_rgb(255, 120, 120)),
+                        );
+                    }
+                }
+                // nodes
+                for (idx, n) in ed.nodes.iter().enumerate() {
+                    let c = egui::pos2(x_of(n.t), y_of(n.v));
+                    let sel = idx == ed.sel;
+                    ui.painter().circle_filled(
+                        c,
+                        if sel { 5.0 } else { 3.5 },
+                        if sel { Color32::from_rgb(255, 210, 120) } else { Color32::from_rgb(255, 120, 120) },
+                    );
+                    if sel {
+                        ui.painter().circle(c, 8.0, Color32::TRANSPARENT, egui::Stroke::new(1.0, Color32::from_rgb(255, 210, 120)));
+                        ui.painter().text(
+                            egui::pos2(c.x + 10.0, c.y - 10.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{:.3} @ {:.2}s", n.v, n.t as f64 / sr),
+                            egui::FontId::proportional(10.0),
+                            Color32::from_rgb(255, 220, 150),
+                        );
+                    }
+                }
+                // gestures
+                if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
+                    let hit = nearest_auto_node(&ed.nodes, pos, x_of, y_of);
+                    match hit {
+                        Some(idx) => {
+                            ed.sel = idx;
+                            ed.drag = Some(idx);
+                        }
+                        None => {
+                            let (t, v) = (t_of(pos.x), v_of(pos.y));
+                            let at = ed
+                                .nodes
+                                .iter()
+                                .position(|n| n.t > t)
+                                .unwrap_or(ed.nodes.len());
+                            ed.nodes.insert(
+                                at,
+                                Node { t, v, s: Shape::Linear },
+                            );
+                            ed.sel = at;
+                            ed.drag = Some(at);
+                            ed.changed = true;
+                        }
+                    }
+                }
+                if resp.dragged() {
+                    if let Some(idx) = ed.drag {
+                        let lo = if idx > 0 { ed.nodes.get(idx - 1).map(|q| q.t + 1) } else { None };
+                        let hi = ed.nodes.get(idx + 1).map(|q| q.t - 1);
+                        if let Some(n) = ed.nodes.get_mut(idx) {
+                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                let mut t = t_of(pos.x);
+                                if let Some(l) = lo {
+                                    t = t.max(l);
+                                }
+                                if let Some(h) = hi {
+                                    t = t.min(h);
+                                }
+                                n.t = t.clamp(0, len);
+                                n.v = v_of(pos.y).clamp(rmin.min(n.v), rmax.max(n.v));
+                                ed.changed = true;
+                            }
+                        }
+                    }
+                }
+                if resp.secondary_clicked() {
+                    let pos = ui.input(|i| i.pointer.interact_pos()).unwrap();
+                    if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                        if ed.nodes.len() > 1 {
+                            ed.nodes.remove(idx);
+                            ed.sel = ed.sel.min(ed.nodes.len().saturating_sub(1));
+                            ed.drag = None;
+                            ed.changed = true;
+                        }
+                    }
+                }
+                if !ui.input(|i| i.pointer.any_down()) {
+                    ed.drag = None;
+                }
+                resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, right-click a node to delete it");
+
+                // ---- node editor ------------------------------------------
+                let mut resort: Option<i64> = None;
+                ui.horizontal(|ui| {
+                    if let Some(n) = ed.nodes.get_mut(ed.sel) {
+                        let mut ts = n.t as f64 / sr;
+                        ui.label(format!("node {}", ed.sel + 1));
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut ts)
+                                    .speed(0.01)
+                                    .suffix(" s")
+                                    .range(0.0..=len as f64 / sr),
+                            )
+                            .changed()
+                        {
+                            n.t = (ts * sr).round().clamp(0.0, len as f64) as i64;
+                            resort = Some(n.t);
+                            ed.changed = true;
+                        }
+                        let mut vv = n.v;
+                        if ui
+                            .add(egui::DragValue::new(&mut vv).speed(0.002).range(rmin..=rmax))
+                            .changed()
+                        {
+                            n.v = vv;
+                            ed.changed = true;
+                        }
+                        egui::ComboBox::from_id_salt("auto_shape")
+                            .selected_text(n.s.label())
+                            .show_ui(ui, |ui| {
+                                for sh in Shape::ALL {
+                                    if ui.selectable_value(&mut n.s, sh, sh.label()).changed() {
+                                        ed.changed = true;
+                                    }
+                                }
+                            });
+                        if ui.button("delete").clicked() && ed.nodes.len() > 1 {
+                            ed.nodes.remove(ed.sel);
+                            ed.sel = ed.sel.saturating_sub(1);
+                            ed.changed = true;
+                        }
+                    } else {
+                        ui.label("no node selected \u{2014} click the curve to add one");
+                    }
+                });
+                if let Some(tt) = resort {
+                    ed.nodes.sort_by_key(|n| n.t);
+                    ed.sel = ed.nodes.iter().position(|n| n.t == tt).unwrap_or(ed.sel);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save as new asset + clip").clicked() {
+                        action = 1;
+                    }
+                    if ed.asset.is_some() && ui.button("Save (overwrite asset)").clicked() {
+                        action = 2;
+                    }
+                    if ui.button("Close").clicked() {
+                        action = 3;
+                    }
+                    if ed.changed {
+                        ui.label(RichText::new("unsaved").weak().italics());
+                    }
+                });
+            });
+        if action == 1 || action == 2 {
+            self.auto_commit(&mut ed, track, action == 2);
+        }
+        // Save keeps the editor open on the (now-saved) buffer; Close or
+        // the window X discards unsaved edits like the piano roll.
+        self.auto_edit = if action == 3 || !open { None } else { Some(ed) };
+    }
+
+    /// Persist the automation manager buffer: overwrite the source asset
+    /// in place, or save a new `.slauto` + clip on `track` at the playhead.
+    fn auto_commit(&mut self, ed: &mut AutoEdit, track: usize, overwrite: bool) {
+        use crate::automation::Automation;
+        let mut auto = Automation {
+            target: ed.target.clone(),
+            len_samples: ed.len_samples.max(1),
+            nodes: ed.nodes.clone(),
+        };
+        auto.normalize(0, f32::INFINITY);
+        let json = match auto.to_json() {
+            Ok(j) => j,
+            Err(_) => {
+                self.status = "automation: serialize failed".into();
+                return;
+            }
+        };
+        if overwrite {
+            let mut saved_name: Option<String> = None;
+            if let Some(k) = ed.asset {
+                if let Some(a) = self.assets.get_mut(k) {
+                    a.automation = Some(std::sync::Arc::new(auto.clone()));
+                    if std::fs::write(&a.path, &json).is_ok() {
+                        a.dirty = false;
+                        saved_name = Some(a.name.clone());
+                    }
+                }
+            }
+            match saved_name {
+                Some(nm) => {
+                    ed.changed = false;
+                    self.push_project();
+                    self.status = format!("automation \u{201c}{nm}\u{201d} saved");
+                }
+                // File vanished (renamed rack?): save out a fresh one.
+                None => {
+                    self.create_auto_asset_named(&auto, &json, &ed.name, track);
+                    ed.changed = false;
+                }
+            }
+            return;
+        }
+        self.create_auto_asset_named(&auto, &json, &ed.name, track);
+        ed.changed = false;
+    }
+
+    fn create_auto_asset_named(
+        &mut self,
+        auto: &crate::automation::Automation,
+        json: &str,
+        name: &str,
+        track: usize,
+    ) {
+        let dir = self.primary_folder();
+        let base: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
+            .collect();
+        let base = if base.trim_matches('-').is_empty() { "automation".to_string() } else { base.trim_matches('-').to_string() };
+        let mut n = 1u32;
+        let path = loop {
+            let fname = if n == 1 { format!("{base}.slauto") } else { format!("{base}-{n}.slauto") };
+            let p = dir.join(fname);
+            if !p.exists() {
+                break p;
+            }
+            n += 1;
+        };
+        if let Err(e) = std::fs::write(&path, json) {
+            self.status = format!("automation: {e}");
+            return;
+        }
+        let id = self.assets.len() as u32;
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.assets.push(Asset::automation_asset(
+            id,
+            name.clone(),
+            path,
+            std::sync::Arc::new(auto.clone()),
+            false,
+        ));
+        let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
+        let nl0 = self.arr.tracks[track].lanes.len();
+        let lane = self.arr.place_auto(track, Clip::new(id, pos), auto.len_samples as u64);
+        self.grow_for_lanes(track, nl0);
+        if let Some(f) = self.rack.first_mut() {
+            f.rescan();
+        }
+        self.push_project();
+        self.status = format!(
+            "automation \u{201c}{name}\u{201d} \u{2192} track {} lane {} \u{b7} {} on the clip edits it",
+            track + 1,
+            lane + 1,
+            "\u{270e}"
+        );
     }
 
     /// Arm/disarm MIDI pattern recording on a track. Arming starts the
@@ -3928,8 +4574,13 @@ impl App {
                             .step_by(1.0)
                             .custom_formatter(|n, _| note_name(n.round().clamp(0.0, 127.0) as u8));
                     }
-                    if ui.add(sl).changed() {
+                    let resp = ui.add(sl);
+                    resp.context_menu(|ui| {
+                        auto_menu(ui, self, t, &format!("synth:{k}"), nv);
+                    });
+                    if resp.changed() {
                         inst.set_param(k, nv);
+                        self.note_auto(t, &format!("synth:{k}"), nv);
                         dirty = true;
                     }
                 }
@@ -4159,6 +4810,34 @@ impl App {
         if let Some(k) = self.assets.iter().position(|a| !a.dirty && a.path == path) {
             self.sel_asset = Some(k);
             return Some(k);
+        }
+        if crate::assets::is_auto_file(path) {
+            return match std::fs::read_to_string(path)
+                .map_err(|e| format!("{}: {e}", path.display()))
+                .and_then(|s| crate::automation::Automation::from_json(&s))
+            {
+                Ok(auto) => {
+                    let id = self.assets.len() as u32;
+                    let name = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.assets.push(Asset::automation_asset(
+                        id,
+                        name,
+                        path.to_path_buf(),
+                        std::sync::Arc::new(auto),
+                        false,
+                    ));
+                    self.sel_asset = Some(id as usize);
+                    self.push_project();
+                    Some(id as usize)
+                }
+                Err(e) => {
+                    self.status = e;
+                    None
+                }
+            };
         }
         if crate::assets::is_midi_file(path) {
             return match Pattern::load_mid(path) {
@@ -4417,6 +5096,22 @@ impl App {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect();
+            if let Some(auto) = a.automation.clone() {
+                // v0.11 R5: automation assets round-trip as .slauto JSON.
+                let p = audio_dir.join(format!(
+                    "{:03}-{}.slauto",
+                    a.id,
+                    if stem.is_empty() { "automation".to_string() } else { stem }
+                ));
+                match std::fs::write(&p, auto.to_json().unwrap_or_default()) {
+                    Ok(()) => {
+                        a.path = p;
+                        a.dirty = false;
+                    }
+                    Err(e) => self.status = format!("save: {e}"),
+                }
+                continue;
+            }
             if let Some(pat) = a.pattern.clone() {
                 // Pattern assets round-trip as Standard MIDI Files.
                 let p = audio_dir.join(format!(
@@ -4492,6 +5187,25 @@ impl App {
         let mut missing = 0usize;
         for (i, pa) in pr.assets.iter().enumerate() {
             let found = project::resolve_asset(&pa.file, &dirs);
+            // v0.11 R5: automation curves load straight from .slauto JSON.
+            if let Some(fp) = found.clone().filter(|p| crate::assets::is_auto_file(p.as_path())) {
+                match std::fs::read_to_string(&fp)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| crate::automation::Automation::from_json(&s))
+                {
+                    Ok(auto) => {
+                        assets.push(Asset::automation_asset(
+                            i as u32,
+                            pa.name.clone(),
+                            fp,
+                            Arc::new(auto),
+                            false,
+                        ));
+                        continue;
+                    }
+                    Err(_) => missing += 1,
+                }
+            }
             // MIDI pattern assets have their own decoder (.mid).
             if found.as_deref().is_some_and(crate::assets::is_midi_file) {
                 let fp = found.unwrap_or_default();
@@ -5144,6 +5858,9 @@ impl App {
         if self.piano_roll.is_some() {
             self.piano_roll_window(ui);
         }
+        if self.auto_edit.is_some() {
+            self.auto_window(ui);
+        }
         let sw = self.synth_win;
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
@@ -5315,12 +6032,170 @@ fn base_name(p: &str) -> String {
         .unwrap_or_else(|| p.trim().to_string())
 }
 
-/// Rack row snapshot: (folder path, [(file name, path, is_midi)], error).
-type RackRow = (String, Vec<(String, PathBuf, bool)>, Option<String>);
+/// Label for a curve value: trim meaningless decimals but keep absolute
+/// digits (the user reads/enters real values, not percentages).
+fn format_gv(v: f32) -> String {
+    if v.abs() >= 100.0 || v == v.round() {
+        format!("{:.0}", v)
+    } else if v.abs() >= 1.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.3}")
+    }
+}
+
+/// Canvas hit-test: node index within 8 px of `pos`, if any.
+fn nearest_auto_node(
+    nodes: &[crate::automation::Node],
+    pos: egui::Pos2,
+    x_of: impl Fn(i64) -> f32,
+    y_of: impl Fn(f32) -> f32,
+) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for (idx, n) in nodes.iter().enumerate() {
+        let d = (x_of(n.t) - pos.x).powi(2) + (y_of(n.v) - pos.y).powi(2);
+        if d < 64.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, idx));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// v0.11 R5: the right-click menu shared by every automatable widget
+/// (mixer levels, mute, master, tempo, script synth parameters).
+/// "Record" arms a write take with this target pre-set; "flat" drops an
+/// instant constant curve at the current value onto the track's playhead.
+fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) {
+    let armed = app.auto_rec.iter().any(|r| r.armed);
+    if ui
+        .button(format!("\u{25cf} Record automation of {}", crate::automation::describe_target(target)))
+        .on_hover_text("Arms write automation on this track and starts the transport: every move of this control becomes a curve node.")
+        .clicked()
+    {
+        if armed {
+            ui.label("already recording \u{2014} stop it first");
+            return;
+        }
+        for r in app.auto_rec.iter_mut() {
+            r.armed = false;
+        }
+        app.auto_rec[track] = AutoRecState {
+            armed: true,
+            target: Some(target.to_string()),
+            start: app.backend.engine.pos(),
+            nodes: vec![crate::automation::Node { t: 0, v: current, s: crate::automation::Shape::Linear }],
+        };
+        if !app.backend.engine.transport_on() {
+            app.backend.cmd(Cmd::PlayAll);
+        }
+        app.status = format!(
+            "track {}: recording automation of {}",
+            track + 1,
+            crate::automation::describe_target(target)
+        );
+        ui.close();
+    }
+    if ui
+        .button(format!("\u{2500} Flat asset at {current:.3}"))
+        .on_hover_text("Create an automation asset holding this exact value; edit its curve later in the automation manager.")
+        .clicked()
+    {
+        app.create_flat_auto_asset(track, target, current);
+        ui.close();
+    }
+}
+
+/// Target id list for one track: the fixed per-track controls, the bound
+/// synth's parameters (script or plugin — plugin parameters carry the
+/// NAMES the plugin publishes through its parameter description, the
+/// documented host-visible value system), the FX chain rows, and the two
+/// global controls.
+fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
+    let mut out = vec![
+        (
+            crate::automation::TARGET_TRACK_VOL.to_string(),
+            "track volume (linear)".to_string(),
+        ),
+        (
+            crate::automation::TARGET_TRACK_PAN.to_string(),
+            "track pan (0=L, 0.5=C, 1=R)".to_string(),
+        ),
+        (
+            crate::automation::TARGET_TRACK_MUTE.to_string(),
+            "track mute (\u{2265}0.5 = muted)".to_string(),
+        ),
+    ];
+    // The track's instrument: script synths expose their descriptor's
+    // parameter labels; plugins expose the NAMES THEY PUBLISH through the
+    // API's parameter description — the documented host-visible value
+    // system, exactly what the user asked to be reachable.
+    let stem = app.track_synth.get(t).cloned().flatten().unwrap_or_default();
+    if !stem.is_empty() {
+        if let Some(d) = app.synth_registry.desc(&stem) {
+            for (k, pd) in d.params.iter().enumerate() {
+                out.push((format!("synth:{k}"), format!("synth \u{b7} {}", pd.label)));
+            }
+        } else if let Some(Some(h)) = app.track_synth_inst.get(t) {
+            if let SynthHandle::Vst(e) = h.as_ref() {
+                for (k, d) in e.descs().iter().enumerate() {
+                    if d.writable {
+                        out.push((format!("synth:{k}"), format!("synth \u{b7} {}", d.name)));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rows) = app.fx_rows.get(t) {
+        for (r, row) in rows.iter().enumerate() {
+            match row {
+                ChainRow::Vst { entry: Some(e), name, .. } => {
+                    for (k, d) in e.descs().iter().enumerate() {
+                        if d.writable {
+                            out.push((format!("fx:{r}:{k}"), format!("{name} \u{b7} {}", d.name)));
+                        }
+                    }
+                }
+                ChainRow::Vst { name, params, .. } => {
+                    for k in 0..params.len() {
+                        out.push((format!("fx:{r}:{k}"), format!("{name} \u{b7} param {k}")));
+                    }
+                }
+                ChainRow::Script { stem, params } => {
+                    let d = app.fx_registry.desc(stem);
+                    match d {
+                        Some(d) => {
+                            let nm = d.name.clone();
+                            for (k, pd) in d.params.iter().enumerate() {
+                                out.push((format!("fx:{r}:{k}"), format!("{nm} \u{b7} {}", pd.label)));
+                            }
+                        }
+                        None => {
+                            for k in 0..params.len() {
+                                out.push((format!("fx:{r}:{k}"), format!("{stem} \u{b7} param {k}")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.push((
+        crate::automation::TARGET_MASTER_VOL.to_string(),
+        "master volume (linear)".to_string(),
+    ));
+    out.push((
+        crate::automation::TARGET_MASTER_TEMPO.to_string(),
+        "tempo (BPM)".to_string(),
+    ));
+    out
+}
+
+/// Rack row snapshot: (folder path, [(file name, path, is_midi, is_auto)], error).
+type RackRow = (String, Vec<(String, PathBuf, bool, bool)>, Option<String>);
 
 /// One rack file row: click = load + audition, drag = place a clip.
 /// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
-fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &Path, midi: bool) {
+fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &Path, kind: u8) {
     let sel = app
         .sel_asset
         .is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
@@ -5334,7 +6209,7 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
     );
     // Right-edge kind badge (audio vs MIDI). Painted into the row's own
     // rect, so it costs no layout width and never wraps the name.
-    rack_kind_badge(ui, row.rect, midi);
+    rack_kind_badge(ui, row.rect, kind);
     // ONE click_and_drag response for the row: a separate drag-sense
     // overlay on top would CAPTURE the press and kill clicked().
     let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, name)), Sense::click_and_drag());
@@ -5355,11 +6230,15 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
     row.on_hover_text(format!(
         "{} \u{b7} {} \u{b7} click to audition (preview), drag onto a lane to place a clip{}",
         fp.display(),
-        if midi { "MIDI pattern" } else { "audio" },
-        if midi {
-            " \u{b7} plays through the track's synth"
-        } else {
-            ""
+        match kind {
+            1 => "MIDI pattern",
+            2 => "automation curve",
+            _ => "audio",
+        },
+        match kind {
+            1 => " \u{b7} plays through the track's synth",
+            2 => " \u{b7} drives the control it targets, on the track it sits on",
+            _ => "",
         }
     ));
 }
@@ -5368,11 +6247,13 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
 /// "AUDIO" / blue "MIDI" (the same blue the MREC button uses, so MIDI
 /// assets read as MIDI everywhere). Painted into the row rect after the
 /// button — no layout width, no wrapping risk (the justified-label trap).
-fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, midi: bool) {
-    let (txt, col) = if midi {
-        ("MIDI", Color32::from_rgb(150, 200, 255))
-    } else {
-        ("AUDIO", Color32::from_rgb(210, 175, 120))
+fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
+    // v0.11 R5: automation is the third kind and wears red, matching its
+    // red clips on the grid.
+    let (txt, col) = match kind {
+        1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
+        2 => ("AUTO", Color32::from_rgb(255, 120, 120)),
+        _ => ("AUDIO", Color32::from_rgb(210, 175, 120)),
     };
     ui.painter().text(
         egui::pos2(row.max.x - 5.0, row.center().y),
@@ -5426,7 +6307,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                             f.path.clone(),
                             f.files
                                 .iter()
-                                .map(|r| (r.name.clone(), r.path.clone(), r.is_midi))
+                                .map(|r| (r.name.clone(), r.path.clone(), r.is_midi, r.is_auto))
                                 .collect(),
                             f.err.clone(),
                         )
@@ -5466,13 +6347,18 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     // additionally carries a kind badge.
                     let audio: Vec<(String, PathBuf)> = files
                         .iter()
-                        .filter(|(_, _, m)| !*m)
-                        .map(|(n, p, _)| (n.clone(), p.clone()))
+                        .filter(|(_, _, m, a)| !*m && !*a)
+                        .map(|(n, p, _, _)| (n.clone(), p.clone()))
                         .collect();
                     let midis: Vec<(String, PathBuf)> = files
                         .iter()
-                        .filter(|(_, _, m)| *m)
-                        .map(|(n, p, _)| (n.clone(), p.clone()))
+                        .filter(|(_, _, m, _)| *m)
+                        .map(|(n, p, _, _)| (n.clone(), p.clone()))
+                        .collect();
+                    let autos: Vec<(String, PathBuf)> = files
+                        .iter()
+                        .filter(|(_, _, _, a)| *a)
+                        .map(|(n, p, _, _)| (n.clone(), p.clone()))
                         .collect();
                     if !audio.is_empty() {
                         ui.label(
@@ -5483,7 +6369,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         );
                     }
                     for (name, fp) in audio {
-                        rack_file_row(ui, app, fi, &name, &fp, false);
+                        rack_file_row(ui, app, fi, &name, &fp, 0);
                     }
                     if !midis.is_empty() {
                         ui.label(
@@ -5494,7 +6380,18 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         );
                     }
                     for (name, fp) in midis {
-                        rack_file_row(ui, app, fi, &name, &fp, true);
+                        rack_file_row(ui, app, fi, &name, &fp, 1);
+                    }
+                    if !autos.is_empty() {
+                        ui.label(
+                            RichText::new("AUTOMATION")
+                                .weak()
+                                .small()
+                                .color(Color32::from_rgb(255, 120, 120)),
+                        );
+                    }
+                    for (name, fp) in autos {
+                        rack_file_row(ui, app, fi, &name, &fp, 2);
                     }
                 }
                 if let Some(fi) = rescan {
@@ -5520,21 +6417,26 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
 
                 // Project-only assets: recordings with no rack folder,
                 // dirty edits, and files whose folder was removed.
-                let mut extra: Vec<(usize, String, bool, bool)> = Vec::new();
+                let mut extra: Vec<(usize, String, bool, u8)> = Vec::new();
                 for (k, a) in app.assets.iter().enumerate() {
                     let in_rack = app
                         .rack
                         .iter()
                         .any(|f| f.files.iter().any(|r| r.path == a.path && !a.dirty));
                     if !in_rack {
-                        extra.push((k, a.name.clone(), a.dirty, a.pattern.is_some()));
+                        extra.push((
+                            k,
+                            a.name.clone(),
+                            a.dirty,
+                            if a.is_auto() { 2u8 } else if a.is_midi() { 1 } else { 0 },
+                        ));
                     }
                 }
                 if !extra.is_empty() {
                     ui.add_space(3.0);
                     ui.separator();
                     ui.label(RichText::new("project assets").weak().small());
-                    for (k, name, dirty, midi) in extra {
+                    for (k, name, dirty, kind) in extra {
                         let sel = app.sel_asset == Some(k);
                         let w = ui.available_width();
                         let row = ui.add_sized(
@@ -5544,7 +6446,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 RichText::new(format!("{}{}", name, if dirty { " *" } else { "" })).small(),
                             ),
                         );
-                        rack_kind_badge(ui, row.rect, midi);
+                        rack_kind_badge(ui, row.rect, kind);
                         // Merged click+drag response (see rack rows above).
                         let dr = ui.interact(row.rect, ui.id().with(("assetdrag", k)), Sense::click_and_drag());
                         if dr.clicked() {
@@ -5641,6 +6543,8 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             .changed()
         {
             app.master_midi = mv.clamp(0, 127) as u8;
+            let amp = vol_amp(app.master_midi);
+            app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
             app.levels_dirty = true;
         }
         if ui
@@ -5794,6 +6698,8 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             )
             .clicked()
         {
+            // v0.11 R5: mute rides automation too (1 = muted).
+            app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 0.0 } else { 1.0 });
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
         }
         let mrec = app.midi_rec[t].armed;
@@ -5811,6 +6717,21 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             .clicked()
         {
             app.toggle_midi_rec(t);
+        }
+        // v0.11 R5: write-automation arm (mirrors MREC for MIDI).
+        let arec = app.auto_rec[t].armed;
+        if ui
+            .small_button(RichText::new(if arec { "A\u{25a0}" } else { "AREC" }).color(if arec {
+                Color32::from_rgb(255, 130, 130)
+            } else {
+                Color32::from_rgb(200, 160, 160)
+            }))
+            .on_hover_text(
+                "Automation record: while armed, MOVE any control on this track                  \u{2014} the first one touched becomes the target and its moves                  are captured as an automation curve. Stop (button again) and the                  take becomes a red automation asset + clip at the playhead.",
+            )
+            .clicked()
+        {
+            app.toggle_auto_rec(t);
         }
         if ui
             .small_button("+")
@@ -5931,6 +6852,28 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
 /// actions, loop and zoom.
 fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
     ui.horizontal(|ui| {
+        if ui
+            .button(RichText::new("\u{270e} Automation").strong())
+            .on_hover_text(
+                "Open the automation manager (curve editor). With a red                  automation clip selected (or an AUTO asset picked in the                  rack) it OPENS THAT curve; otherwise it starts a fresh one                  \u{2014} save creates a new asset + clip. Right-click any                  automatable control to record or create one.",
+            )
+            .clicked()
+            && app.auto_edit.is_none()
+        {
+            let edit = app
+                .sel_clips
+                .first()
+                .filter(|_| app.sel_clips.len() == 1)
+                .and_then(|(t, k, c)| {
+                    let cl = app.arr.tracks.get(*t)?.lanes.get(*k)?.clips.get(*c)?;
+                    Some(cl.asset as usize)
+                })
+                .or_else(|| {
+                    let r = app.sel_asset?;
+                    app.assets.get(r).filter(|a| a.is_auto()).map(|_| r)
+                });
+            app.open_auto_editor(edit);
+        }
         if ui
             .button(RichText::new("\u{266b} Piano roll").strong())
             .on_hover_text(
@@ -6504,6 +7447,23 @@ fn lane_row(
             )
         })
         .collect();
+    // v0.11 R5: double-clicking a red automation clip opens its curve in
+    // the automation manager (like double-clicking a MIDI clip region).
+    if resp.double_clicked() {
+        let pt = ui
+            .input(|i| i.pointer.interact_pos())
+            .unwrap_or(rect.center());
+        for (c, _name) in clips.iter() {
+            let alen = app.asset_len(c.asset);
+            if app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto())
+                && pt.x >= x_of(x0, c.pos, sr, px)
+                && pt.x <= x_of(x0, c.end(alen), sr, px)
+            {
+                app.open_auto_editor(Some(c.asset as usize));
+                break;
+            }
+        }
+    }
     // Edge zones become trim/extend handles on ANY clip (grabbing an edge
     // selects the clip on the way — the old "only selected clips resize"
     // rule made the feature undiscoverable and read as broken).
@@ -6557,7 +7517,10 @@ fn lane_row(
         // clip" report). Content now stays anchored per-sample; the trim
         // hides it exactly like the engine does.
         let vlen = c.span(alen).min(c.avail(alen));
-        draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres, COL_CLIP, sel);
+        // v0.11 R5: automation clips are the third kind and wear red.
+        let is_auto = app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto());
+        let fill = if is_auto { Color32::from_rgb(170, 70, 74) } else { COL_CLIP };
+        draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres, fill, sel);
         // Extended-past-data tail: silence, hatched dark so it reads as
         // "clip is longer than its source".
         let dend = x_of(x0, c.data_end(alen), sr, px);
@@ -7081,6 +8044,50 @@ fn draw_asset_clip(
         p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
         return;
     }
+    // v0.11 R5: automation clips preview as the actual curve (red),
+    // sampled through the same trim window the audio preview uses.
+    if let Some(auto) = app.assets.get(asset as usize).and_then(|a| a.automation.clone()) {
+        if rect.width() >= 4.0 {
+            let (cut, wlen) = win;
+            let wlen = wlen.max(1);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for n in auto.nodes.iter() {
+                lo = lo.min(n.v);
+                hi = hi.max(n.v);
+            }
+            if hi - lo <= 0.0 {
+                lo -= 0.5;
+                hi += 0.5;
+            }
+            let col = if sel {
+                Color32::from_rgb(255, 190, 190)
+            } else {
+                Color32::from_rgb(255, 130, 130)
+            };
+            let steps = (rect.width() / 2.0).max(2.0) as i64;
+            let h = rect.height().max(6.0);
+            let mut prev: Option<egui::Pos2> = None;
+            for i in 0..=steps {
+                let frac = i as f64 / steps as f64;
+                let t = (cut as f64 + frac * wlen as f64) as i64;
+                let v = auto.eval(t);
+                let x = rect.min.x + (frac * rect.width() as f64) as f32;
+                let y = rect.max.y - (v - lo) / (hi - lo) * (h - 3.0) - 1.5;
+                let pt = egui::pos2(x, y);
+                if let Some(q) = prev {
+                    p.line_segment([q, pt], egui::Stroke::new(1.4, col));
+                }
+                prev = Some(pt);
+            }
+        }
+        let stroke = if sel {
+            egui::Stroke::new(2.0, COL_CLIP_SEL)
+        } else {
+            egui::Stroke::new(1.0, fill)
+        };
+        p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+        return;
+    }
     if rect.width() >= 4.0 {
         let alen = app.asset_len(asset).max(1);
         let (cut, wlen) = win;
@@ -7237,6 +8244,16 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                 Slider::new(&mut v, 0..=127).show_value(false),
             )
             .on_hover_text(hover);
+        // v0.11 R5: right-click = automation menu (vol/pan; gain stays
+        // manual-only — it is a trim, and volume already covers it).
+        if kind != KIND_GAIN {
+            let (tgt, cur) = if kind == KIND_VOL {
+                (crate::automation::TARGET_TRACK_VOL, vol_amp(midi))
+            } else {
+                (crate::automation::TARGET_TRACK_PAN, pan01(midi))
+            };
+            r.clone().context_menu(|ui| auto_menu(ui, app, i, tgt, cur));
+        }
         if r.changed() {
             match kind {
                 KIND_VOL => app.set_trk_vol(i, v),

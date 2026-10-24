@@ -39,8 +39,8 @@ fn main() {
         // RT stand-in: process() in a tight loop like a 64-frame block.
         let e2 = entry.clone();
         let s2 = stop.clone();
-        let rt = std::thread::spawn(move || {
-            let mut inp = vec![0.001f32; 480];
+        let _rt = std::thread::spawn(move || {
+            let inp = vec![0.001f32; 480];
             let mut out = vec![0.0f32; 480];
             while !s2.load(Ordering::Relaxed) {
                 e2.process(&inp, &mut out);
@@ -48,7 +48,7 @@ fn main() {
             }
         });
         for cycle in 1..=4u32 {
-            let mut win = slooper::vstedit::open_editor(&handle, &path, entry.name())
+            let win = slooper::vstedit::open_editor(&handle, &path, entry.name())
                 .unwrap_or_else(|e| panic!("open_editor cycle {cycle}: {e}"));
             let mut waited = 0u32;
             while !win.painted() && !win.is_closed() && !win.open_failed() && waited < 9000 {
