@@ -16,6 +16,7 @@
 //! - [`ui`]: the egui front-end (used by the binary).
 
 pub mod arrange;
+pub mod automation;
 pub mod assets;
 pub mod audio;
 pub mod audio_io;

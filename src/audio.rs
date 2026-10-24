@@ -205,6 +205,36 @@ pub type OutSel = (String, u8);
 pub type AssetTable = Vec<Arc<[f32]>>;
 
 /// Commands from the GUI to the audio manager thread.
+/// Scratchpad for one control-rate automation pass (v0.11 R5). `None`
+/// means "no clip sounds on this track for this target" — the manual
+/// control keeps its value. Plugin-parameter targets do not appear here:
+/// they are written straight onto the live instances.
+struct AutoOut {
+    vol: [Option<f32>; MAX_LOOPS],
+    pan: [Option<f32>; MAX_LOOPS],
+    muted: [bool; MAX_LOOPS],
+    master_vol: Option<f32>,
+    tempo: Option<u32>,
+}
+
+impl AutoOut {
+    fn new() -> AutoOut {
+        AutoOut {
+            vol: core::array::from_fn(|_| None),
+            pan: core::array::from_fn(|_| None),
+            muted: [false; MAX_LOOPS],
+            master_vol: None,
+            tempo: None,
+        }
+    }
+}
+
+impl Default for AutoOut {
+    fn default() -> AutoOut {
+        AutoOut::new()
+    }
+}
+
 pub enum Cmd {
     /// Re-enumerate remote audio ports and send them back.
     Refresh,
@@ -569,6 +599,9 @@ pub struct Engine {
     /// hold `None`); pushed together with the project by the GUI.
     midi: std::sync::Mutex<Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>>,
     midi_gen: AtomicU64,
+    /// v0.11 R5: automation asset table (parallel to `assets`) + gen.
+    auto: std::sync::Mutex<Arc<Vec<Option<Arc<crate::automation::Automation>>>>>,
+    auto_gen: AtomicU64,
     /// Per-track synth bindings (scripted or VSTi) + the fallback instance
     /// (bundled piano) used by unbound tracks.
     synths: std::sync::Mutex<Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]>>,
@@ -652,6 +685,8 @@ impl Engine {
             arr_gen: AtomicU64::new(0),
             midi: std::sync::Mutex::new(Arc::new(Vec::new())),
             midi_gen: AtomicU64::new(0),
+            auto: std::sync::Mutex::new(Arc::new(Vec::new())),
+            auto_gen: AtomicU64::new(0),
             synths: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
             synths_gen: AtomicU64::new(0),
             default_synth: std::sync::Mutex::new(None),
@@ -947,6 +982,18 @@ impl Engine {
     }
     pub fn midi_gen(&self) -> u64 {
         self.midi_gen.load(Ordering::Relaxed)
+    }
+
+    /// v0.11 R5: replace the automation asset table (parallel to `assets`).
+    pub fn set_auto_assets(&self, auto: Arc<Vec<Option<Arc<crate::automation::Automation>>>>) {
+        *self.auto.lock().unwrap() = auto;
+        self.auto_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn auto_assets(&self) -> Arc<Vec<Option<Arc<crate::automation::Automation>>>> {
+        self.auto.lock().unwrap().clone()
+    }
+    pub fn auto_gen(&self) -> u64 {
+        self.auto_gen.load(Ordering::Relaxed)
     }
 
     /// Bind/unbind one track's synthesizer (unbound tracks fall back to the
@@ -1581,6 +1628,8 @@ fn run(
         dflt_synth: engine.default_synth(),
         midi_cache: engine.midi(),
         midi_cache_gen: engine.midi_gen(),
+        auto_cache: engine.auto_assets(),
+        auto_cache_gen: engine.auto_gen(),
         midi_ev: Vec::new(),
         // One row per track, EXACTLY like trk_bufs: `render_midi_block`
         // indexes `midi_scratch[t]` the moment the first note stages, and an
@@ -2753,6 +2802,9 @@ struct Proc {
     trk_bufs: Vec<Vec<f32>>,
     mon_buf: Vec<f32>,
     vst_tmp: Vec<f32>,
+    /// v0.11 R5: automation asset table refresh pair.
+    auto_cache: Arc<Vec<Option<Arc<crate::automation::Automation>>>>,
+    auto_cache_gen: u64,
     /// MIDI pattern table (parallel to `assets`; refreshed on `midi_gen`).
     midi_cache: Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>,
     midi_cache_gen: u64,
@@ -2862,6 +2914,73 @@ impl Proc {
 
     /// Build this block's clip windows for the timeline span `[p0, p0 + n)`.
     /// `entries` is reused across blocks (cleared, never re-allocated).
+    /// One control-rate automation pass (v0.11 R5). Returns the per-track
+    /// mixer overrides and applies plugin-parameter targets straight to the
+    /// live instances (atomic mirrors; `set_param_rt` never blocks).
+    /// Later clips win over earlier ones, matching FL's "last voice" rule.
+    fn eval_automation(&self, p0: u64) -> AutoOut {
+        let mut out = AutoOut::new();
+        if self.auto_cache_gen == 0 {
+            return out;
+        }
+        let pos = p0 as i64;
+        for (t, track) in self.arr.tracks.iter().enumerate() {
+            if !self.engine.track_on(t) {
+                continue;
+            }
+            for lane in &track.lanes {
+                for cl in &lane.clips {
+                    let Some(Some(a)) = self.auto_cache.get(cl.asset as usize).cloned() else {
+                        continue;
+                    };
+                    let rel = (pos - cl.pos as i64 + cl.cut as i64).rem_euclid(a.len_samples.max(1));
+                    let v = a.eval(rel);
+                    match a.target.as_str() {
+                        crate::automation::TARGET_TRACK_VOL => out.vol[t] = Some(v),
+                        crate::automation::TARGET_TRACK_PAN => out.pan[t] = Some(v),
+                        crate::automation::TARGET_TRACK_MUTE => out.muted[t] = v >= 0.5,
+                        crate::automation::TARGET_MASTER_VOL => out.master_vol = Some(v),
+                        crate::automation::TARGET_MASTER_TEMPO => {
+                            out.tempo = Some((v.round() as i64).clamp(20, 300) as u32)
+                        }
+                        other => {
+                            let _ = self.route_plugin_param(t, other, v);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Write one automated value to a `synth:<idx>` / `fx:<row>:<idx>`
+    /// target on track `t`. False for unknown or malformed ids.
+    fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> bool {
+        if let Some(idx) = target.strip_prefix("synth:") {
+            let Ok(idx) = idx.parse::<usize>() else { return false };
+            let Some(Some(handle)) = self.synths_cache.get(t).cloned() else { return false };
+            match handle.as_ref() {
+                SynthHandle::Script(i) => i.set_param(idx, v),
+                SynthHandle::Vst(e) => e.set_param_rt(idx, v),
+            }
+            return true;
+        }
+        if let Some(rest) = target.strip_prefix("fx:") {
+            let Some((row_s, idx_s)) = rest.split_once(':') else { return false };
+            let (Ok(row), Ok(idx)) = (row_s.parse::<usize>(), idx_s.parse::<usize>()) else {
+                return false;
+            };
+            let Some(tf) = self.fx_cache.get(t) else { return false };
+            let Some(slot) = tf.slots().get(row) else { return false };
+            match &slot.kind {
+                FxKind::Scripted { inst, .. } => inst.set_param(idx, v),
+                FxKind::Vst(e) => e.set_param_rt(idx, v),
+            }
+            return true;
+        }
+        false
+    }
+
     fn collect_clips(&self, p0: u64, n: usize, entries: &mut Vec<ClipEntry>) {
         entries.clear();
         let span_end = p0.saturating_add(n as u64);
@@ -3022,6 +3141,13 @@ impl ProcessHandler for Proc {
             if let Ok(m) = self.engine.midi.try_lock() {
                 self.midi_cache = m.clone();
                 self.midi_cache_gen = mg;
+            }
+        }
+        let ag = self.engine.auto_gen();
+        if ag != self.auto_cache_gen {
+            if let Ok(a) = self.engine.auto.try_lock() {
+                self.auto_cache = a.clone();
+                self.auto_cache_gen = ag;
             }
         }
         // Pick up edited effect chains (user action only; try_lock so the
@@ -3202,6 +3328,28 @@ impl ProcessHandler for Proc {
             false
         };
 
+        // --- automation assets (v0.11 R5) --------------------------------
+        // Control-rate pass: every automation clip sounding at this block's
+        // start position writes its ABSOLUTE curve value once, overriding
+        // the manual control it targets (a curve wins over the knob it
+        // rides while it sounds — FL semantics). Plugin-parameter targets
+        // land directly on the live instances' atomics.
+        let auto = if transport { self.eval_automation(p0) } else { AutoOut::default() };
+        for t in 0..MAX_LOOPS {
+            if let Some(v) = auto.vol[t] {
+                amp[t] =
+                    v * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
+            }
+            if let Some(pn) = auto.pan[t] {
+                let (l, r) = pan_gains(pn);
+                pgl[t] = l;
+                pgr[t] = r;
+            }
+            if auto.muted[t] {
+                amp[t] = 0.0;
+            }
+        }
+
         // Cache this cycle's input buffers (raw pointers are stable). Only
         // the connected slots are kept, compacted to the front, so the sample
         // loop iterates the live ones with no per-sample null checks.
@@ -3252,17 +3400,21 @@ impl ProcessHandler for Proc {
         }
         let ins = &in_bufs[..nin];
 
-        let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let g = f32::from_bits(self.gain.load(Ordering::Relaxed))
+            * auto.master_vol.unwrap_or(1.0);
 
         // Metronome grid on the timeline: click k at timeline sample
         // `k * sub_len` (sub = clicks per beat). Track the grid index last
         // emitted so playhead crossings — while playing OR while scrubbing —
         // fire exactly one click each. Re-anchored on transport starts and
         // seeks (the position jump itself must not burst-fire).
-        let metro_bpm = self
-            .engine
-            .metro_bpm
-            .load(Ordering::Relaxed)
+        let metro_bpm = auto
+            .tempo
+            .or_else(|| {
+                let b = self.engine.metro_bpm.load(Ordering::Relaxed);
+                Some(b)
+            })
+            .unwrap_or(120)
             .clamp(20, 300)
             .max(1);
         let metro_sub = self.engine.metro_sub.load(Ordering::Relaxed).clamp(1, 16);

@@ -907,6 +907,22 @@ impl RtStageEntry {
         }
     }
 
+    /// v0.11 R5 automation write: same effect as [`Self::set_param`] but
+    /// NEVER blocks -- safe to call from the realtime thread. The atomic
+    /// param mirror (which VST2's audio path polls directly) always takes
+    /// the value; the VST3 controller push rides `try_lock`, and a lock
+    /// contention just means the next write wins.
+    pub fn set_param_rt(&self, index: usize, value: f32) {
+        self.params.set(index, value);
+        if let Some(d) = self.descs.get(index) {
+            if let Ok(mut guard) = self.control.try_lock() {
+                if let Some(c) = guard.as_mut() {
+                    c.set_parameter(d.id, value.clamp(0.0, 1.0) as f64);
+                }
+            }
+        }
+    }
+
     /// Feed one channel voice message (raw status byte with channel low
     /// nibble). Audio thread only — same contract as [`Self::process`];
     /// the message is delivered at the start of the next internal block.
