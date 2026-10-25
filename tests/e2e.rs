@@ -2109,3 +2109,114 @@ fn e2e_vst2_effect_not_silent() {
         "VST2 effect muted the track (peak {peak}) — effOpen regression?"
     );
 }
+
+/// v13 AC3.1: the user drags a NEW sample onto the sampler while MIDI is
+/// actively playing. The patch must change live — the v0.12 report ("the
+/// sampler only picks up a new sample after a restart") must never return.
+/// Repro shape: asset A (loud) is bound, notes fire every 250 ms; while the
+/// transport runs, a second asset B (near-silent) lands in the rack (same
+/// Cmd::SetProject push `ensure_asset` performs) and param 0 is set (what
+/// the synth-window drop zone does). Output must fall to B's level without
+/// any stop/restart.
+#[test]
+fn e2e_v13_sampler_patch_swap_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("samp_swap", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // Sampler on track 0, asset 0 = a loud flat buffer (0.9 DC).
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("sampler", sr as f64, &[0.0, 48.0, 1.0])
+        .expect("bundled sampler must compile and load");
+    b.cmd(Cmd::SetTrackSynth {
+        i: 0,
+        synth: Some(Arc::new(slooper::audio::SynthHandle::Script(inst.clone()))),
+    });
+
+    // 12 short notes, one every 250 ms — events keep arriving for 3 s, so
+    // "actively playing MIDI" for the whole swap window.
+    let mut pat = slooper::midipat::Pattern::new(120);
+    let step = (0.25 * 2.0 * slooper::midipat::PPQ as f64) as u32;
+    for i in 0..12u32 {
+        pat.notes.push(slooper::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 110,
+            press: 0,
+            start: i * step,
+            len: step / 2,
+        });
+    }
+    pat.len_ticks = 12 * step;
+    pat.sort();
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+    let loud: Arc<[f32]> = Arc::from(vec![0.9f32; 4096]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![loud.clone()]),
+        arr: Arc::new(arr.clone()),
+        len: (sr as u64) * 4,
+    });
+    b.cmd(Cmd::SetLoop(false));
+    std::thread::sleep(Duration::from_millis(150));
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 2400).map(|p| p > 0.3).unwrap_or(false),
+        Duration::from_secs(5),
+        "asset A (loud) audible while notes fire",
+    );
+
+    // Mid-playback: the rack gains asset 1 (a near-silent take) and the
+    // user drops it on the sampler — exactly the two host-side effects of
+    // `ensure_asset` + the drop zone's set_param.
+    let quiet: Arc<[f32]> = Arc::from(vec![0.02f32; 4096]);
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![loud, quiet]),
+        arr: Arc::new(arr),
+        len: (sr as u64) * 4,
+    });
+    std::thread::sleep(Duration::from_millis(250)); // manager applies SetProject
+    inst.set_param(0, 1.0); // the drop
+
+    std::thread::sleep(Duration::from_millis(400));
+    let win = read_ring(&ring, &widx, (sr as usize) / 4, Duration::from_millis(500))
+        .expect("swap window");
+    let peak = win.iter().fold(0f32, |m, s| m.max(s.abs()));
+    b.cmd(Cmd::StopAll);
+    assert!(
+        peak < 0.15,
+        "sampler kept playing the OLD sample after a live patch swap: peak {peak} \
+         (asset B is 0.02) — the drop did not reach the live synth"
+    );
+    let _ = active;
+}
