@@ -4523,16 +4523,21 @@ impl App {
                         dirty = true;
                     }
                     ui.label(
-                        RichText::new("or drag an AUDIO asset from the rack onto this box:")
-                            .weak()
-                            .small(),
+                        RichText::new(
+                            "or drag an AUDIO asset from the rack \u{2014} or straight from your \
+                             file manager \u{2014} onto this box:",
+                        )
+                        .weak()
+                        .small(),
                     );
                     let (drect, dresp) = ui.allocate_at_least(
                         egui::vec2(ui.available_width(), 34.0),
                         egui::Sense::hover(),
                     );
-                    let dragging =
-                        egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx());
+                    let dragging = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                        // v0.13: an OS-level file drag hovering the window
+                        // lights the zone too (winit feeds raw.hovered_files).
+                        || ui.input(|i| !i.raw.hovered_files.is_empty());
                     let col = if dragging {
                         Color32::from_rgb(150, 200, 255)
                     } else {
@@ -4568,6 +4573,34 @@ impl App {
                                     .map(|(_, n)| n.clone())
                                     .unwrap_or_default()
                             );
+                        }
+                    }
+                    // v0.13: OS-level file drop (file manager \u{2192} this
+                    // window). egui's payload DnD above carries only
+                    // in-app assets; the reported "a new sample needs an
+                    // app restart" was exactly this hole — a WAV dragged
+                    // from disk did nothing, and the rack-folder + restart
+                    // dance was the only way in. winit delivers dropped
+                    // files through raw input; this open sampler editor
+                    // consumes them, decodes via ensure_asset (which now
+                    // pushes the rack table to the engine) and switches
+                    // the live patch — no restart, no re-selection.
+                    let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+                        i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
+                    });
+                    for path in dropped {
+                        if !crate::assets::is_audio_file(&path) {
+                            continue; // midi/auto/unknown: not a sample
+                        }
+                        if let Some(k) = self.ensure_asset(&path) {
+                            inst.set_param(0, k as f32);
+                            dirty = true;
+                            let name = self
+                                .assets
+                                .get(k)
+                                .map(|a| a.name.clone())
+                                .unwrap_or_default();
+                            self.status = format!("track {} sampler: {name} (dropped file)", t + 1);
                         }
                     }
                     ui.separator();
@@ -4881,6 +4914,14 @@ impl App {
                     false,
                 ));
                 self.sel_asset = Some(id as usize);
+                // v0.13: push like the midi/auto branches do. Samplers read
+                // the rack through the ENGINE's host table, and that table
+                // only updates on SetProject — without this the freshly
+                // decoded asset was invisible to the live audio thread and
+                // the sampler kept replaying the old patch until an app
+                // restart ("new sample needs a restart" report). Other
+                // callers (clip placement) push again; idempotent.
+                self.push_project();
                 Some(id as usize)
             }
             Err(e) => {
@@ -12632,5 +12673,177 @@ mod tests {
         // Unbinding retires the editor cleanly.
         app.set_track_synth_stem(0, "");
         assert!(app.vst_editors.is_empty(), "editor left open after unbind");
-    }
-}
+        }
+
+        // ================= v0.13 acceptance-criteria pins =====================
+        // (requirements list: scratch slooper-v13/REQUIREMENTS.md)
+
+        /// OS file manager drops arrive as `dropped_files` on the raw input
+        /// (winit fills `path`; `bytes` only for unsaved buffers).
+        #[derive(Debug)]
+        struct DroppedWav(std::path::PathBuf);
+        impl egui::DroppedFile for DroppedWav {
+        fn path(&self) -> &std::path::Path {
+        &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+        }
+
+        fn frame_files(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        files: Vec<std::path::PathBuf>,
+        ) {
+        let raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1440.0, 853.0),
+        )),
+        events,
+        dropped_files: files
+            .into_iter()
+            .map(|p| std::sync::Arc::new(DroppedWav(p)) as egui::DroppedFileHandle)
+            .collect(),
+        ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        }
+
+        /// Real window drag: grab a window's title bar and park it clear of
+        /// the rack panel so rack rows and drop zone are both clickable.
+        fn park_window(app: &mut App, ctx: &egui::Context, title_needle: &str, to: egui::Vec2) {
+            let title = galley_at(app, ctx, title_needle).expect("window title visible");
+            let from = title.center();
+            frame(app, ctx, vec![moved(from)]);
+            frame(app, ctx, vec![moved(from), btn(from, egui::PointerButton::Primary, true)]);
+            let mid = from + to * 0.5;
+            frame(app, ctx, vec![moved(mid)]);
+            let dst = from + to;
+            frame(app, ctx, vec![moved(dst)]);
+            frame(app, ctx, vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)]);
+            frame(app, ctx, vec![]);
+        }
+
+        /// AC3.1: a WAV dragged in from the FILE MANAGER switches the live
+        /// sampler patch — decoded, registered, the engine's host table updated,
+        /// asset param moved — with no restart. This is the exact user report:
+        /// before v0.13 only in-app drags were handled, and `ensure_asset`'s
+        /// audio branch never pushed the rack table, so the new sample stayed
+        /// invisible to the audio thread until an app restart.
+        #[test]
+        fn v13_ui_os_file_drop_swaps_sampler_patch_live() {
+            let mut app = headless_app("v13osdrop");
+            let ctx = egui::Context::default();
+            frame(&mut app, &ctx, vec![]);
+            app.set_track_synth_stem(0, "sampler");
+            app.synth_win = Some(0);
+            frame(&mut app, &ctx, vec![]);
+            park_window(&mut app, &ctx, "sampler \u{b7} track 1", egui::vec2(560.0, 280.0));
+
+            // Give the sampler an initial patch: click kick in the rack
+            // (rack rows show the file STEM — "kick", not "kick.wav").
+            let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+            frame(&mut app, &ctx, vec![moved(kick.center())]);
+            frame(&mut app, &ctx, vec![moved(kick.center()), btn(kick.center(), egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(kick.center(), egui::PointerButton::Primary, false)]);
+            frame(&mut app, &ctx, vec![]);
+            assert_eq!(app.sel_asset, Some(0), "kick.wav clicked: {}", app.status);
+
+            // A brand-new wav on disk, outside every rack folder.
+            let dir = std::env::temp_dir().join("sp-uity-v13osdrop").join("incoming");
+            std::fs::create_dir_all(&dir).unwrap();
+            let zap = dir.join("zap.wav");
+            let data: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.3).sin() * 0.4).collect();
+            crate::audio_io::export(&zap, 48000, &data, crate::audio_io::ExportFormat::Wav).unwrap();
+
+            // The OS drops it onto the app while the sampler window is open.
+            frame_files(&mut app, &ctx, vec![], vec![zap]);
+
+            // AC3.1 (UI half): asset registered from the dropped file, live
+            // patch switched, editor reflects the new sample. The audio-thread
+            // half — that a SetProject asset swap replaces the SOUND inside a
+            // running sampler — is pinned end-to-end by e2e
+            // `e2e_v13_sampler_patch_swap_live`; headless null-audio drains no
+            // command queue, so nothing here could observe it.
+            assert_eq!(app.assets.len(), 2, "dropped wav became a rack asset: {}", app.status);
+            assert_eq!(app.assets[1].name, "zap");
+            assert_eq!(app.assets[1].data.len(), 24_000, "dropped file decoded at 48 k");
+            let inst = match app.track_synth_inst[0].as_deref() {
+                Some(SynthHandle::Script(i)) => i.clone(),
+                _ => panic!("sampler instance gone"),
+            };
+            assert_eq!(inst.values()[0] as usize, 1, "live patch switched to the dropped file");
+            assert!(app.status.contains("zap"), "status names the dropped patch: {}", app.status);
+            }
+
+        /// AC3.2 regression pin: the IN-APP drag (rack row → sampler drop zone)
+        /// still switches the patch, real press/move/release through frame().
+        #[test]
+        fn v13_ui_internal_drag_onto_sampler_drop_zone() {
+            let mut app = headless_app("v13idrag");
+            let ctx = egui::Context::default();
+            frame(&mut app, &ctx, vec![]);
+            app.set_track_synth_stem(0, "sampler");
+            app.synth_win = Some(0);
+            frame(&mut app, &ctx, vec![]);
+            park_window(&mut app, &ctx, "sampler \u{b7} track 1", egui::vec2(560.0, 280.0));
+
+            // Rack folder (the one headless_app configured) gains a second
+            // wav; press its "scan" button to pick it up.
+            let samples = std::env::temp_dir().join("sp-uity-v13idrag").join("samples");
+            std::fs::create_dir_all(&samples).unwrap();
+            let snare = samples.join("snare.wav");
+            if !snare.exists() {
+                let d: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.11).sin() * 0.2).collect();
+                crate::audio_io::export(&snare, 48000, &d, crate::audio_io::ExportFormat::Wav).unwrap();
+            }
+            let scan = galley_at(&mut app, &ctx, "scan").expect("scan button");
+            frame(&mut app, &ctx, vec![moved(scan.center())]);
+            frame(&mut app, &ctx, vec![moved(scan.center()), btn(scan.center(), egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(scan.center(), egui::PointerButton::Primary, false)]);
+            frame(&mut app, &ctx, vec![]);
+            assert!(app.rack[0].files.iter().any(|r| r.name == "snare"), "scan found snare");
+
+            // Click kick first (it becomes asset 0 — the patch param's
+            // default — so the drag below flips 0 -> 1, unambiguous).
+            let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+            frame(&mut app, &ctx, vec![moved(kick.center())]);
+            frame(&mut app, &ctx, vec![moved(kick.center()), btn(kick.center(), egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(kick.center(), egui::PointerButton::Primary, false)]);
+            frame(&mut app, &ctx, vec![]);
+            assert_eq!(app.sel_asset, Some(0), "kick.wav row clicked");
+
+            // Real drag: press snare's rack row, exceed the dnd threshold,
+            // hover the sampler drop zone, release.
+            let zone = galley_at(&mut app, &ctx, "drop zone").expect("drop zone visible");
+            let snare_row = galley_at(&mut app, &ctx, "snare").expect("snare row").center();
+            frame(&mut app, &ctx, vec![moved(snare_row)]);
+            frame(&mut app, &ctx, vec![moved(snare_row), btn(snare_row, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![moved(snare_row + egui::vec2(90.0, 0.0))]);
+            assert!(
+                egui::DragAndDrop::has_payload_of_type::<usize>(&ctx),
+                "dragging a rack row must arm the asset drag payload"
+            );
+            frame(&mut app, &ctx, vec![moved(zone.center())]);
+            frame(&mut app, &ctx, vec![moved(zone.center()), btn(zone.center(), egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![moved(zone.center()), btn(zone.center(), egui::PointerButton::Primary, false)]);
+            frame(&mut app, &ctx, vec![]);
+
+            let inst = match app.track_synth_inst[0].as_deref() {
+                Some(SynthHandle::Script(i)) => i.clone(),
+                _ => panic!("no sampler instance"),
+            };
+            assert_eq!(
+                inst.values()[0] as usize,
+                1,
+                "dragging snare.wav onto the drop zone must set the sampler's asset param (status {:?})",
+                app.status
+            );
+        }
+        }
