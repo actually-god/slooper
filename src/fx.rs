@@ -1911,6 +1911,56 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// v13 R2 AC2.3: DC-carrying transients must not leave a wash. Drum
+    /// impacts, finger snaps and fast note changes carry DC/sub-20 Hz
+    /// energy; every comb in the FDN runs feedback up to 0.95 (≈20 dB gain
+    /// at DC) and both wet feeds copy the dry signal, so before the wet-path
+    /// DC blockers a click train left ~-43 dBFS of DC-heavy residue THREE
+    /// SECONDS after the sound ended — the audible "static" users reported
+    /// after abrupt input changes. Cathedral params, DC-biased half-sine
+    /// clicks: the tail must return to silence.
+    #[test]
+    fn v13_space_echo_dc_transients_leave_no_wash() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v13dcwash");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        // Cathedral: echo low, verb full, decay 0.95 (worst DC gain).
+        let cath = [0.32f32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0];
+        let inst = reg.create_instance("space_echo", 48000.0, &cath).expect("echo instance");
+        let mut out: Vec<f32> = Vec::with_capacity(8 * 48000);
+        for s in 0..8 * 48000 {
+            let mut x = 0.0f32;
+            if s < 2 * 48000 {
+                let off = (s % 12000) as f32; // one impact every 250 ms
+                if off < 288.0 {
+                    x = (-off / 38.0).exp()
+                        * (2.0 * std::f32::consts::PI * 120.0 * off / 48000.0).sin();
+                }
+            }
+            out.push(inst.process_private(x));
+        }
+        let win = |a: usize, b: usize| -> (f32, f32) {
+            let t = &out[a * 48000..b * 48000];
+            let n = t.len() as f32;
+            let mean = t.iter().sum::<f32>() / n;
+            let rms = (t.iter().map(|v| v * v).sum::<f32>() / n).sqrt();
+            (mean, rms)
+        };
+        // The room must still be ALIVE just after the last click.
+        let (_, alive) = win(2, 3);
+        assert!(alive > 1e-4, "wet tail vanished too (rms {alive})");
+        // 4 s after the sound ended: no DC, no wash. (Pre-fix this window
+        // measured mean +0.0064 / rms 0.0070 — 30x over both bounds.)
+        let (mean, rms) = win(4, 6);
+        assert!(mean.abs() < 2e-4, "tail DC after transients: {mean}");
+        assert!(rms < 5e-4, "tail wash after transients: rms {rms}");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn user_presets_folder_prefix_and_roundtrip() {
         let dir = std::env::temp_dir().join(format!("sp-userpresets-{}", std::process::id()));

@@ -206,6 +206,13 @@ struct SpaceEcho {
     /// fed AIR-ROLLED sound, and raw dry/echo fizz into the comb bank is
     /// where the "tinny" starts — filter before ringing, not after.
     verb_lp: f64,
+    /// DC blockers on the two wet-path injections (see [`HP_FC`]): one on
+    /// the reverb feed (dry + echo copies), one on the echo read before it
+    /// re-enters the feedback loop and the wet echo tap.
+    verb_blk: DcBlock,
+    echo_blk: DcBlock,
+    /// DC-blocker pole (see [`HP_FC`]); constant per instance.
+    r_hp: f64,
     /// comb lengths at sr=44.1 kHz; scaled by sr and by a 0.9..1.1 "room"
     /// spread so the two banks don't share modes.
     mix: f64,
@@ -246,6 +253,9 @@ impl SpaceEcho {
             vphase: 0.0,
             ap,
             verb_lp: 0.0,
+            verb_blk: DcBlock::ZERO,
+            echo_blk: DcBlock::ZERO,
+            r_hp: one_c(HP_FC, sr),
             mix: 0.4,
             out: 1.0,
             gui_open: AtomicU32::new(0),
@@ -272,6 +282,42 @@ fn one_c(fc_hz: f64, sr: f64) -> f64 {
     // one-pole lowpass coefficient
     (-(core::f64::consts::TAU * fc_hz.max(20.0) / sr)).exp()
 }
+
+/// One-pole DC blocker (high-pass) state: previous input and output.
+#[derive(Clone, Copy)]
+struct DcBlock {
+    px: f64,
+    py: f64,
+}
+
+impl DcBlock {
+    const ZERO: DcBlock = DcBlock { px: 0.0, py: 0.0 };
+    /// y[n] = r·y[n-1] + x[n] - x[n-1] — the classic DC blocker: flat above
+    /// the corner, -20 dB/oct below it, so it removes DC and subsonic mud
+    /// without coloring the audible band (corner ~28 Hz).
+    #[inline]
+    fn run(&mut self, x: f64, r: f64) -> f64 {
+        let y = r * (self.py + x - self.px);
+        self.px = x;
+        self.py = y;
+        if !y.is_finite() {
+            *self = DcBlock::ZERO;
+            return 0.0;
+        }
+        y
+    }
+}
+
+/// DC-blocker corner in Hz. Drum impacts, finger snaps and fast staccato
+/// carry real DC/sub-20 Hz energy; every comb in the FDN has a feedback of
+/// up to 0.95, which is ~20 dB of gain at DC, and both wet feeds include a
+/// copy of the dry signal — without this filter every abrupt change pumps a
+/// DC thump through the room that washes for seconds (the "static" a dense
+/// transient left behind: a click train measured at ~-43 dBFS of DC-heavy
+/// residue 3 s after the sound ended). Real reverb units HP the wet path at
+/// 30-80 Hz for exactly this reason.
+const HP_FC: f64 = 28.0;
+
 
 extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32 {
     if state.is_null() {
@@ -311,6 +357,10 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     let d = (time_s * sr * w).clamp(1.0, (st.delay.buf.len() - 4) as f64);
 
     let echoed = st.delay.read(d);
+    // DC-block the echo read once: it feeds both the damped feedback loop
+    // and the wet echo tap, so the loop can never circulate subsonic mud
+    // (and the audible slap carries none).
+    let echoed = st.echo_blk.run(echoed, st.r_hp);
     // damped feedback loop
     st.tone_lp = echoed * (1.0 - st.tone_c) + st.tone_lp * st.tone_c;
     if !st.tone_lp.is_finite() {
@@ -327,7 +377,11 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     // now voices the entire wet path). Filtering before the comb bank is
     // what separates "air" from "tin can" — filters after the ring can
     // only dull everything together.
-    st.verb_lp = (echoed * 0.6 + x * 0.4) * 0.45 * (1.0 - st.tone_c)
+    // Feed the room DC-BLOCKED (see [`HP_FC`]): this path carries a copy of
+    // the DRY signal, so without it every drum impact or snap injects its
+    // DC/subsonic content into 8 combs running at up to 0.95 feedback and
+    // the room answers with a mud wash that outlives the note by seconds.
+    st.verb_lp = st.verb_blk.run(echoed * 0.6 + x * 0.4, st.r_hp) * 0.45 * (1.0 - st.tone_c)
         + st.verb_lp * st.tone_c;
     if !st.verb_lp.is_finite() {
         st.verb_lp = 0.0;
