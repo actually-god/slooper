@@ -518,7 +518,8 @@ pub struct RtStageEntry {
     /// button; the slider panel remains the fallback for GUI-less plugins.
     has_editor: bool,
     /// VST2 only: raw `AEffect` dispatcher for editor hosting (see
-    /// `src/vstedit.rs`). VST3 editors are not hosted (docs/PLUGINS.md).
+    /// `src/vstedit.rs`). VST3 editors host a shadow instance instead —
+    /// [`RtStageEntry::open_vst3_editor`].
     vst2: Option<Vst2Handle>,
 }
 
@@ -892,6 +893,37 @@ impl RtStageEntry {
     /// Shared parameter cell (slider positions read from here).
     pub fn params(&self) -> &Arc<VstParams> {
         &self.params
+    }
+
+    /// Which plugin generation this entry hosts.
+    pub fn kind(&self) -> VstKind {
+        self.spec.1
+    }
+
+    /// v0.12: open this VST3 plugin's own editor window. The sounding
+    /// instance is confined to the `vst3-host` realtime runner, so the
+    /// window hosts a SHADOW instance of the same plugin (see
+    /// `vstedit::Editor3`): never processes audio, primed from the live
+    /// parameter cells, and its every edit writes back through those same
+    /// cells — the slider path, generation bump and all. `sample_rate`
+    /// must match the one the plugin was opened with.
+    pub fn open_vst3_editor(&self, sample_rate: u32) -> Result<crate::vstedit::EditorWindow, String> {
+        if !matches!(self.spec.1, VstKind::V3) {
+            return Err("not a VST3 plugin".into());
+        }
+        if !self.has_editor {
+            return Err("plugin advertises no editor window".into());
+        }
+        let path = self.spec.0.to_string_lossy().into_owned();
+        let initial: Vec<(u32, f64)> = self
+            .descs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.writable)
+            .map(|(i, d)| (d.id, self.params.get(i) as f64))
+            .collect();
+        let ids: Vec<u32> = self.descs.iter().map(|d| d.id).collect();
+        crate::vstedit::open_vst3_editor(&path, &self.name, sample_rate, initial, ids, self.params.clone())
     }
 
     /// UI side: update one parameter (normalized) and push it to the

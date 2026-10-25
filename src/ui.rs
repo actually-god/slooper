@@ -1537,6 +1537,23 @@ impl App {
         self.save_config();
     }
 
+    /// v0.12: open a hosted plugin's own editor window, generation-aware.
+    /// VST2 embeds the LIVE instance (dispatcher handle); VST3 hosts a
+    /// shadow editor instance on the same control thread — see
+    /// `RtStageEntry::open_vst3_editor`. Both return the same handle type,
+    /// so reaping and toggling never care which generation is behind.
+    fn plugin_window_open(
+        &mut self,
+        entry: &std::sync::Arc<crate::vsthost::RtStageEntry>,
+    ) -> Result<crate::vstedit::EditorWindow, String> {
+        if let Some(h) = entry.vst2_handle() {
+            let pth = entry.path().to_string_lossy().into_owned();
+            crate::vstedit::open_editor(&h, &pth, entry.name())
+        } else {
+            entry.open_vst3_editor(self.sample_rate.max(48_000))
+        }
+    }
+
     /// Open a plugin from the scan list and append it to track `i`'s chain.
     fn add_fx_plugin(&mut self, i: usize, e: &crate::vsthost::VstEntry) {
         let sr = self.sample_rate.max(48_000);
@@ -1558,17 +1575,14 @@ impl App {
                 // add; the slider window appears only if there is no editor
                 // or it refuses to draw.
                 if entry.has_editor() {
-                    if let Some(h) = entry.vst2_handle() {
-                        let pth = entry.path().to_string_lossy().into_owned();
-                        match crate::vstedit::open_editor(&h, &pth, entry.name()) {
-                            Ok(w) => {
-                                self.fx_vst_editors.insert((i, row), w);
-                            }
-                            Err(err2) => {
-                                // v0.11 R3: no slider window for plugins.
-                                self.vst_note =
-                                    format!("{}: GUI {err2} \u{2014} no window to open", e.name);
-                            }
+                    match self.plugin_window_open(&entry) {
+                        Ok(w) => {
+                            self.fx_vst_editors.insert((i, row), w);
+                        }
+                        Err(err2) => {
+                            // v0.11 R3: no slider window for plugins.
+                            self.vst_note =
+                                format!("{}: GUI {err2} \u{2014} no window to open", e.name);
                         }
                     }
                 }
@@ -4618,15 +4632,7 @@ impl App {
         if !entry.has_editor() {
             return false;
         }
-        let Some(h) = entry.vst2_handle() else {
-            self.status = format!(
-                "{}: no VST2 editor handle (VST3 editor hosting unsupported)",
-                entry.name()
-            );
-            return false;
-        };
-        let pth = entry.path().to_string_lossy().into_owned();
-        match crate::vstedit::open_editor(&h, &pth, entry.name()) {
+        match self.plugin_window_open(&entry) {
             Ok(w) => {
                 self.status = format!("{}: plugin window opened", entry.name());
                 self.vst_editors.insert(t, w);
@@ -4636,7 +4642,7 @@ impl App {
                 self.status = format!("plugin GUI: {e} \u{2014} closed");
                 false
             }
-    }
+        }
     }
 
     /// v0.11 R3: the track-row GUI button for a hosted plugin. Clicking
@@ -4669,16 +4675,13 @@ impl App {
             return;
         };
         if entry.has_editor() {
-            if let Some(h) = entry.vst2_handle() {
-                let pth = entry.path().to_string_lossy().into_owned();
-                match crate::vstedit::open_editor(&h, &pth, entry.name()) {
-                    Ok(w) => {
-                        self.status = format!("{}: plugin window opened", entry.name());
-                        self.fx_vst_editors.insert((t, row), w);
-                        return;
-                    }
-                    Err(e) => self.status = format!("plugin GUI: {e} \u{2014} closed"),
+            match self.plugin_window_open(&entry) {
+                Ok(w) => {
+                    self.status = format!("{}: plugin window opened", entry.name());
+                    self.fx_vst_editors.insert((t, row), w);
+                    return;
                 }
+                Err(e) => self.status = format!("plugin GUI: {e} \u{2014} closed"),
             }
         }
         // v0.11 R3: hosted plugins get NO slider window. A plugin with no
@@ -11515,6 +11518,87 @@ mod tests {
         drop(editors);
         drop(app);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.12 R2 through the REAL UI path: chain window → "+ VST plugin" →
+    /// pick the VST3 wolf-shaper → the plugin's own window must open AND
+    /// paint. This is the click sequence the user performs; the VST3 path
+    /// (shadow editor instance) reaches parity with VST2 here or it fails.
+    #[test]
+    fn v12_ui_chain_click_vst3_opens_own_window() {
+        if std::env::var("SLOOPER_VST_SMOKE").unwrap_or_default() != "1"
+            || !crate::vstedit::x11_available()
+        {
+            eprintln!("skip: SLOOPER_VST_SMOKE=1 + X11 required");
+            return;
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let vst3dir = format!("{home}/.vst3");
+        if !std::path::Path::new(&format!("{vst3dir}/wolf-shaper.vst3")).exists() {
+            eprintln!("skip: wolf-shaper.vst3 not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sp-v12v3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = headless_app("v12v3pin");
+        // Isolate the default scan dirs; scan ONLY the VST3 folder so the
+        // picker lists one wolf-shaper entry and nothing else can win.
+        std::env::set_var("HOME", &dir);
+        app.vst_dirs = vec![vst3dir.clone()];
+        let ctx = egui::Context::default();
+
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "FX").expect("FX chip painted on the mixer");
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.fx_window, Some(0), "chip opens the chain window");
+
+        frame(&mut app, &ctx, vec![]);
+        let q =
+            label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
+        frame(&mut app, &ctx, vec![moved(q)]);
+        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]); // popup paints next frame
+        // Picker rows carry vendor text, so match by substring (the pin
+        // helper for exactly this is the v0.7 galley scanner).
+        let d = galley_at(&mut app, &ctx, "Wolf Shaper")
+            .map(|r| r.center())
+            .expect("VST3 row listed in picker");
+        frame(&mut app, &ctx, vec![moved(d)]);
+        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, false)]);
+        std::env::set_var("HOME", &home);
+
+        assert!(
+            matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. })),
+            "VST3 loaded into the chain slot"
+        );
+        // v0.12: the plugin's OWN window opened on add and PAINTS (the
+        // shadow-instance path end to end: load, attach, verify, decorate).
+        let mut editor = app
+            .fx_vst_editors
+            .remove(&(0, 0))
+            .expect("v0.10 standard: adding an editor-capable plugin opens its own window");
+        let t0 = std::time::Instant::now();
+        loop {
+            if editor.painted() || editor.open_failed() || editor.is_closed() {
+                break;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(15),
+                "VST3 editor never painted and never refused"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(editor.painted(), "VST3 window from the UI path never painted");
+        // Everything closes while the plugin file still exists (v0.10 rule:
+        // never pull a .vst3 bundle out from under a live editor).
+        editor.close();
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(app);
     }
 
     // ================= v0.7 acceptance-criteria pins ======================

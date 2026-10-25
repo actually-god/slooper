@@ -40,10 +40,14 @@
 //! there in rotation (verify + idle) as state machines rather than
 //! blocking loops, so several editors coexist.
 //!
-//! VST3 editors are not hosted through this module: the `vst3-host`
-//! realtime runner confines the plugin to its processing thread, and the
-//! crate's own `EmbeddedEditor` rejects Wayland window handles; see
-//! docs/PLUGINS.md "VSTi custom GUIs" for the full diagnosis.
+//! VST3 editors ARE hosted here since v0.12 — but not through the running
+//! instance: the `vst3-host` realtime runner confines the plugin to its
+//! processing thread. The runner owns the sounding instance; the editor
+//! embeds a SHADOW instance of the same plugin (see `Editor3` below),
+//! which never processes audio and reports its edits back into the shared
+//! parameter cells. The crate's own `EmbeddedEditor` is unused: it wants
+//! an egui parent window, while slooper hosts every generation in its own
+//! verified-paint X11 container.
 
 use std::ffi::{c_void, CString};
 use std::os::raw::c_int;
@@ -554,8 +558,11 @@ thread_local! {
 }
 
 /// One step for every open editor; retires finished ones. Called by the
-/// VST GUI thread between jobs — never from another thread.
+/// VST GUI thread between jobs — never from another thread. Serves both
+/// generations: VST2 state machines get `effEditIdle`, VST3 shadow
+/// editors get `service_run_loop` (same 30 ms cadence both expect).
 pub fn pump_editors() {
+    pump_vst3_editors();
     REG.with(|reg| {
         let mut eds = reg.borrow_mut();
         for e in eds.iter_mut() {
@@ -877,6 +884,412 @@ impl Drop for Editor {
         // Every retire path runs teardown() before removal from REG;
         // this is the belt for any path that forgets — never leak the
         // display, and never leave the container alive without an owner.
+        if !matches!(self.phase, Phase::Done) {
+            self.teardown(true);
+        }
+    }
+}
+
+// ------------------------------------------------------------ VST3 editors
+//
+// The sounding VST3 instance lives inside the `vst3-host` realtime
+// runner, and the crate confines it to the processing thread — no editor
+// API reaches it from the UI side. So the editor hosts a SHADOW instance:
+// the same plugin loaded again on the GUI thread, never processing audio,
+// primed with the live parameter cells' current values. Every gesture the
+// plugin's own UI reports (IComponentHandler::performEdit, drained via
+// `get_parameter_changes`) is written into the SAME `VstParams` cell the
+// sliders and automation write — generation bump, RT pick-up, sound
+// changes: the identical path a slider move takes. Reverse sync (RT
+// automation moving the open GUI's knobs) is deliberately out of scope
+// for v0.12; docs/PLUGINS.md says so.
+
+struct Editor3 {
+    /// The shadow instance, owned by the GUI thread. `Option` so
+    /// teardown can retire it under the loader lock exactly once.
+    plugin: Option<vst3_host::Plugin>,
+    /// VST3 parameter ids in `VstParams`-cell order: cell index =
+    /// position, value = id (`performEdit` reports ids).
+    ids: Vec<u32>,
+    params: Arc<crate::vsthost::VstParams>,
+    d: *mut Display,
+    win: XWindow,
+    title: String,
+    wm_protocols: Atom,
+    wm_delete: Atom,
+    phase: Phase,
+    shared: Shared,
+    dbg: bool,
+}
+
+/// Open a VST3 plugin's own editor window. Mirrors [`open_editor`] exactly
+/// from the caller's side — same handle type, same verified-paint rule
+/// (nothing appears within ~3 s means refused: container destroyed,
+/// `open_failed` set, honest slider-less status), same WM-close behaviour,
+/// same GUI-thread ownership. `initial` carries (id, normalized value)
+/// pairs copied from the sounding instance's parameter cells; `ids` is the
+/// cell-order id list used to route the plugin's edits back.
+pub fn open_vst3_editor(
+    path: &str,
+    title: &str,
+    sample_rate: u32,
+    initial: Vec<(u32, f64)>,
+    ids: Vec<u32>,
+    params: Arc<crate::vsthost::VstParams>,
+) -> Result<EditorWindow, String> {
+    if !x11_available() {
+        return Err("no X11 display (VST3 editors need X11/XWayland)".into());
+    }
+    let shared = Shared::new();
+    let title = title.to_string();
+    let path_h = path.to_string();
+    let path_j = path.to_string();
+    let s2 = shared.clone();
+    crate::vsthost::on_gui_thread(move || {
+        REG3.with(|reg| {
+            // SAFETY: runs on the GUI thread, the sole owner of all
+            // editor state (see module docs).
+            if let Some(e) =
+                unsafe { make_editor3(path_j, title, sample_rate, initial, ids, params, s2) }
+            {
+                reg.borrow_mut().push(e);
+            }
+        });
+    })?;
+    Ok(EditorWindow {
+        path: path_h,
+        stop: shared.stop.clone(),
+        closed: shared.closed.clone(),
+        open_failed: shared.open_failed.clone(),
+        painted: shared.painted.clone(),
+        children: shared.children.clone(),
+        width: shared.width.clone(),
+        height: shared.height.clone(),
+        xid: shared.xid.clone(),
+    })
+}
+
+thread_local! {
+    static REG3: std::cell::RefCell<Vec<Editor3>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Route every edit the plugin UI reported into the shared parameter
+/// cells (slider path: atomic write + generation bump). Free function: it
+/// borrows the plugin and the cells separately (the state machine holds
+/// the plugin mutably while pumping).
+fn drain_param_edits3(plugin: &vst3_host::Plugin, ids: &[u32], params: &crate::vsthost::VstParams) {
+    route_param_edits3(plugin.get_parameter_changes(), ids, params);
+}
+
+/// The host half of VST3 editor→sound sync: an edit reported as
+/// (parameter id, normalized value) lands in the `VstParams` CELL with
+/// that id; unknown ids are dropped. Ids and cells are separate spaces —
+/// the plugin speaks ids, automation and sliders speak cell indices.
+pub(crate) fn route_param_edits3(
+    changes: Vec<(u32, f64)>,
+    ids: &[u32],
+    params: &crate::vsthost::VstParams,
+) {
+    for (id, value) in changes {
+        if let Some(cell) = ids.iter().position(|x| *x == id) {
+            params.set(cell, value as f32);
+        }
+    }
+}
+
+/// Advance every open VST3 editor one step; called by `pump_editors` on
+/// the shared GUI-thread cadence — `service_run_loop` IS the VST3 editor's
+/// idle pump (timers + X fds registered with the host frame).
+fn pump_vst3_editors() {
+    REG3.with(|reg| {
+        let mut eds = reg.borrow_mut();
+        for e in eds.iter_mut() {
+            if e.shared.stop.load(Ordering::SeqCst) {
+                if !matches!(e.phase, Phase::Done) {
+                    e.teardown(false);
+                }
+                continue;
+            }
+            e.step();
+        }
+        eds.retain(|e| !matches!(e.phase, Phase::Done));
+    });
+}
+
+/// Load the shadow instance, size and map a BARE container (the VST2 rule
+/// applies to every plugin toolkit we have measured: WM property requests
+/// before the attach break child-window mapping), attach the editor view,
+/// and hand back the state machine. `None` retires with the failure flags
+/// already set on `shared`.
+unsafe fn make_editor3(
+    path: String,
+    title: String,
+    sample_rate: u32,
+    initial: Vec<(u32, f64)>,
+    ids: Vec<u32>,
+    params: Arc<crate::vsthost::VstParams>,
+    shared: Shared,
+) -> Option<Editor3> {
+    let d = XOpenDisplay(ptr::null());
+    if d.is_null() {
+        shared.open_failed.store(true, Ordering::SeqCst);
+        shared.closed.store(true, Ordering::SeqCst);
+        return None;
+    }
+    let fail = |d: *mut Display, win: Option<XWindow>| -> Option<Editor3> {
+        if let Some(w) = win {
+            XDestroySubwindows(d, w);
+            XDestroyWindow(d, w);
+        }
+        XCloseDisplay(d);
+        shared.open_failed.store(true, Ordering::SeqCst);
+        shared.closed.store(true, Ordering::SeqCst);
+        None
+    };
+    // Shadow instantiation runs under the process-wide loader lock, on
+    // the GUI thread — the same discipline as every other plugin load
+    // (unsynchronized toolkit globals).
+    let mut plugin = {
+        let _loader = crate::vsthost::vst_loader_lock();
+        match vst3_host::simple::load_plugin_with_settings(
+            &path,
+            sample_rate as f64,
+            crate::vsthost::VST_BLOCK,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
+                    eprintln!("[vstedit3] {title}: shadow load failed: {e}");
+                }
+                return fail(d, None);
+            }
+        }
+    };
+    // Prime from the sounding instance BEFORE the view exists, so the
+    // editor paints its real current state, and adopt the preferred size.
+    for (id, v) in &initial {
+        let _ = plugin.set_parameter(*id, *v);
+    }
+    let (w0, h0) = plugin
+        .get_editor_size()
+        .unwrap_or((720, 480));
+    let (w0, h0) = (w0.clamp(200, 3840), h0.clamp(150, 2160));
+    // The container opens at exactly this size — publish it now; the
+    // Live phase keeps it honest against the attached view.
+    shared.width.store(w0, Ordering::SeqCst);
+    shared.height.store(h0, Ordering::SeqCst);
+    let root = root_window(d);
+    let win = XCreateSimpleWindow(d, root, 0, 0, w0, h0, 0, CONTAINER_BG, CONTAINER_BG);
+    shared.xid.store(win as usize, Ordering::SeqCst);
+    let wm_delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
+    let wm_protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
+    XMapWindow(d, win);
+    XSync(d, 0);
+    {
+        let _loader = crate::vsthost::vst_loader_lock();
+        if let Err(e) = plugin.open_editor(vst3_host::WindowHandle::from_x11(win as u32)) {
+            if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
+                eprintln!("[vstedit3] {title}: open_editor refused: {e}");
+            }
+            return fail(d, Some(win));
+        }
+    }
+    let dbg = std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some();
+    if dbg {
+        eprintln!("[vstedit3] {title}: view attached to {win:#x} ({w0}x{h0})");
+    }
+    Some(Editor3 {
+        plugin: Some(plugin),
+        ids,
+        params,
+        d,
+        win,
+        title,
+        wm_protocols,
+        wm_delete,
+        phase: Phase::Verify { it: 0 },
+        shared,
+        dbg,
+    })
+}
+
+impl Editor3 {
+    /// One pump: X events, `service_run_loop`, editor→host parameter
+    /// drain, size tracking.
+    fn step(&mut self) {
+        unsafe {
+            let Some(plugin) = self.plugin.as_mut() else {
+                self.teardown(true);
+                return;
+            };
+            match self.phase {
+                Phase::Done => {}
+                Phase::Verify { it } => {
+                    let mut _resized = None;
+                    if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete, &mut _resized)
+                    {
+                        self.teardown(false);
+                        return;
+                    }
+                    plugin.service_run_loop();
+                    drain_param_edits3(plugin, &self.ids, &self.params);
+                    // Steinberg's X11 view creates a real child window;
+                    // the same live-child / painted-pixel verdict as VST2.
+                    let child_live = first_sized_child(self.d, self.win)
+                        .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k));
+                    let px = container_painted(self.d, self.win);
+                    if self.dbg && (it < 3 || it % 10 == 0) {
+                        let (kid, w, h) =
+                            first_sized_child(self.d, self.win).unwrap_or((0, 0, 0));
+                        eprintln!(
+                            "[vstedit3] verify {it}: child=({kid:x} {w}x{h}) px={px} live={child_live}"
+                        );
+                    }
+                    if child_live || px {
+                        // Views sometimes only commit their real rect once
+                        // mapped: take the attached size before the borrow
+                        // of the plugin is dropped for decorate/resize.
+                        let attached = match plugin.attached_editor_size() {
+                            Ok(Some((w, h))) if w > 0 && h > 0 => Some((w, h)),
+                            _ => None,
+                        };
+                        self.shared.painted.store(true, Ordering::SeqCst);
+                        self.decorate();
+                        self.phase = match attached {
+                            Some((w, h)) => {
+                                self.shared.width.store(w, Ordering::SeqCst);
+                                self.shared.height.store(h, Ordering::SeqCst);
+                                XResizeWindow(self.d, self.win, w, h);
+                                Phase::Live {
+                                    last_size: (w, h),
+                                    since_rect: 0,
+                                    dead_streak: 0,
+                                    last_container: (0, 0),
+                                }
+                            }
+                            None => Phase::Live {
+                                last_size: (0, 0),
+                                since_rect: 0,
+                                dead_streak: 0,
+                                last_container: (0, 0),
+                            },
+                        };
+                        return;
+                    }
+                    if it >= 100 {
+                        self.teardown(true);
+                    } else {
+                        self.phase = Phase::Verify { it: it + 1 };
+                    }
+                }
+                Phase::Live {
+                    ref mut last_size,
+                    ref mut since_rect,
+                    ref mut dead_streak,
+                    ref mut last_container,
+                } => {
+                    let mut resized = None;
+                    if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete, &mut resized)
+                    {
+                        self.teardown(false);
+                        return;
+                    }
+                    plugin.service_run_loop();
+                    drain_param_edits3(plugin, &self.ids, &self.params);
+                    let kids = count_children_local(self.d, self.win);
+                    self.shared.children.store(kids, Ordering::SeqCst);
+                    // The plugin may request a size change (e.g. the
+                    // view only commits its real rect once mapped).
+                    if let Some((w, h)) = plugin.take_editor_resize_request() {
+                        if w > 0 && h > 0 {
+                            XResizeWindow(self.d, self.win, w, h);
+                        }
+                    }
+                    // The window manager resized our frame: ask the view
+                    // to relayout into it (R1b parity with VST2).
+                    if let Some((w, h)) = resized {
+                        if (w, h) != *last_container && w >= 8 && h >= 8 {
+                            *last_container = (w, h);
+                            let _ = plugin.resize_editor(w as i32, h as i32);
+                        }
+                    }
+                    // Dead-editor watchdog (same patience as VST2).
+                    let alive = first_sized_child(self.d, self.win)
+                        .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k))
+                        || container_painted(self.d, self.win);
+                    *dead_streak = if alive { 0 } else { *dead_streak + 1 };
+                    if *dead_streak > 120 {
+                        self.teardown(true);
+                        return;
+                    }
+                    // Track the view size; keep the container to it.
+                    *since_rect += 1;
+                    if *since_rect >= 16 {
+                        *since_rect = 0;
+                        if let Ok(Some((w, h))) = plugin.attached_editor_size() {
+                            if w > 0 && h > 0 {
+                                self.shared.width.store(w, Ordering::SeqCst);
+                                self.shared.height.store(h, Ordering::SeqCst);
+                                if (w, h) != *last_size {
+                                    *last_size = (w, h);
+                                    XResizeWindow(self.d, self.win, w, h);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+        /// Name + WM close protocol + event selection — only after the view
+    /// proved itself (see the bare-container rule in `make_editor3`).
+    unsafe fn decorate(&mut self) {
+        XSelectInput(
+            self.d,
+            self.win,
+            STRUCTURE_NOTIFY_MASK | KEY_PRESS_MASK | KEY_RELEASE_MASK | FOCUS_CHANGE_MASK,
+        );
+        if let Ok(cname) = CString::new(format!("slooper \u{2014} {}", self.title)) {
+            XStoreName(self.d, self.win, cname.as_ptr());
+        }
+        let mut protocols = [self.wm_delete];
+        XSetWMProtocols(self.d, self.win, protocols.as_mut_ptr(), 1);
+        XFlush(self.d);
+    }
+
+    /// Detach the view, retire the shadow instance under the loader lock,
+    /// destroy the container, mark the handle retired.
+    fn teardown(&mut self, refused: bool) {
+        unsafe {
+            // View first, plugin second — close_editor must run before
+            // the instance tears down.
+            let plugin = self.plugin.take();
+            if let Some(mut p) = plugin {
+                {
+                    let _loader = crate::vsthost::vst_loader_lock();
+                    let _ = p.close_editor();
+                }
+                // Plugin drop tears the instance down; keep it on this
+                // thread under the loader lock like every other teardown.
+                drop(p);
+            }
+            if !self.d.is_null() {
+                XDestroySubwindows(self.d, self.win);
+                XDestroyWindow(self.d, self.win);
+                XFlush(self.d);
+                XCloseDisplay(self.d);
+                self.d = ptr::null_mut();
+            }
+            self.shared.open_failed.store(refused, Ordering::SeqCst);
+            self.shared.closed.store(true, Ordering::SeqCst);
+            self.phase = Phase::Done;
+        }
+    }
+}
+
+impl Drop for Editor3 {
+    fn drop(&mut self) {
         if !matches!(self.phase, Phase::Done) {
             self.teardown(true);
         }
@@ -1218,5 +1631,131 @@ mod tests {
         assert_eq!(fails, Vec::<String>::new(), "editors that never painted");
         assert!(opened >= 3, "expected the installed VST2 editors, got {opened}");
         eprintln!("[v102] {opened} VST2 editors painted through the shared GUI thread");
+    }
+
+    // ===================== v0.12 acceptance pins =====================
+
+    /// R4 (host half, always on): VST3 editor edits speak PARAMETER IDS;
+    /// the shared cells are addressed by index. The route must map id →
+    /// cell exactly and drop unknown ids — this is what makes moving a knob
+    /// in a hosted VST3 window change the sound (the plugin-side half,
+    /// `get_parameter_changes`, is fed by `IComponentHandler::performEdit`).
+    #[test]
+    fn v12_vst3_param_routing_maps_ids_to_cells() {
+        use crate::vsthost::{VstParamDesc, VstParams};
+        let descs = [
+            VstParamDesc { id: 5, name: "a".into(), default: 0.0, writable: true },
+            VstParamDesc { id: 9, name: "b".into(), default: 0.0, writable: true },
+        ];
+        let params = VstParams::new(&descs);
+        let ids: Vec<u32> = descs.iter().map(|d| d.id).collect();
+        let g0 = params.generation();
+        route_param_edits3(vec![(9, 0.42), (777, 0.5)], &ids, &params);
+        assert_eq!(params.get(1).to_bits(), (0.42f32).to_bits(), "id 9 → cell 1");
+        assert_eq!(params.get(0).to_bits(), 0.0f32.to_bits(), "id 5 untouched");
+        assert!(params.generation() > g0, "cell write must bump the generation (RT pick-up)");
+        // Unknown ids alone: no cell moves, no generation churn.
+        let g1 = params.generation();
+        route_param_edits3(vec![(12345, 0.9)], &ids, &params);
+        assert_eq!(params.generation(), g1, "unknown id must not churn the cells");
+    }
+
+    /// Shared live gate for the VST3 editor pins.
+    fn vst3_smoke_gate() -> Option<std::path::PathBuf> {
+        if std::env::var("SLOOPER_VST_SMOKE").unwrap_or_default() != "1" || !x11_available() {
+            return None;
+        }
+        let p = dirs_home().join(".vst3/wolf-shaper.vst3");
+        p.exists().then_some(p)
+    }
+
+    /// R2: a hosted VST3 plugin's OWN window must reach PAINTED through
+    /// the same verified-paint machinery as VST2 (shadow instance inside):
+    /// editor child mapped with real geometry, no blank panel on refusal,
+    /// clean teardown on close.
+    #[test]
+    fn v12_vst3_editor_paints() {
+        let Some(path) = vst3_smoke_gate() else {
+            eprintln!("skip: SLOOPER_VST_SMOKE=1 + ~/.vst3/wolf-shaper.vst3 required");
+            return;
+        };
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("wolf-shaper VST3 loads");
+        let entry = &load.entry;
+        assert!(entry.has_editor(), "wolf-shaper VST3 advertises an editor");
+        let mut win = entry.open_vst3_editor(48_000).expect("shadow editor opens");
+        let mut waited = 0u32;
+        while !win.painted() && !win.is_closed() && waited < 8_000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        assert!(win.painted(), "VST3 editor never painted ({} ms)", waited);
+        assert!(win.editor_size().0 > 0, "no editor size negotiated");
+        win.close();
+        assert!(win.is_closed(), "closed editor must retire");
+    }
+
+    /// R3: the window manager's close button works on VST3 windows too
+    /// (WM_DELETE lands in the container's pump → view detached, container
+    /// destroyed, handle retired — the historical VST2 "uncloseable panel"
+    /// bug must not be reimported with the new generation).
+    #[test]
+    fn v12_vst3_wm_delete_closes_editor() {
+        let Some(path) = vst3_smoke_gate() else {
+            eprintln!("skip: gated");
+            return;
+        };
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("loads");
+        let entry = &load.entry;
+        let win = entry.open_vst3_editor(48_000).expect("opens");
+        let mut waited = 0u32;
+        while !win.painted() && !win.is_closed() && waited < 8_000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        assert!(win.painted(), "paint first");
+        let xid = win.xid();
+        assert_ne!(xid, 0, "container XID published");
+        assert!(request_wm_delete(xid), "WM_DELETE injected");
+        let mut closed = 0u32;
+        while !win.is_closed() && closed < 5_000 {
+            std::thread::sleep(Duration::from_millis(50));
+            closed += 50;
+        }
+        assert!(win.is_closed(), "WM close must retire a VST3 editor");
+    }
+
+    /// R3: the v0.11 crash report (close + reopen killed the program)
+    /// must NOT be reimported along the VST3 path — the exact user cycle,
+    /// three times, WM-close each round.
+    #[test]
+    fn v12_vst3_editor_reopen_cycles() {
+        let Some(path) = vst3_smoke_gate() else {
+            eprintln!("skip: gated");
+            return;
+        };
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("loads");
+        let entry = &load.entry;
+        for cycle in 0..3 {
+            let mut win = entry.open_vst3_editor(48_000).expect("open cycle");
+            let mut waited = 0u32;
+            while !win.painted() && !win.is_closed() && waited < 8_000 {
+                std::thread::sleep(Duration::from_millis(100));
+                waited += 100;
+            }
+            assert!(win.painted(), "cycle {cycle}: never painted");
+            assert!(request_wm_delete(win.xid()), "cycle {cycle}: delete sent");
+            let mut closed = 0u32;
+            while !win.is_closed() && closed < 5_000 {
+                std::thread::sleep(Duration::from_millis(50));
+                closed += 50;
+            }
+            assert!(win.is_closed(), "cycle {cycle}: WM close ignored");
+            // Explicit close AFTER the WM close retired it: must be a
+            // no-op, never a double-free of view or container.
+            win.close();
+        }
     }
 }
