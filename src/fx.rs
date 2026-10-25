@@ -2086,6 +2086,140 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v14 user report: after v0.13 killed the DC wash, bright presets still
+    /// answered every drum impact / snap with HIGH-PITCHED glitches around
+    /// the transient — the room kept receiving the raw edge of the input
+    /// (dry + echo copies at full tone brightness), the echo line re-injected
+    /// the stored click into the comb bank at each round-trip, and the wet
+    /// tap's DC blocker re-differentiated its edge on every repeat. Fixes:
+    /// the room is now fed from the DAMPED loop state through an air-roll
+    /// cap, the DC blocker lives inside the loop (plain-copy tap), and the
+    /// comb bank carries air absorption.
+    ///
+    /// Pin: three deterministic white-noise snaps (LCG — bit-exact across
+    /// runs) through the brightest shipped preset; per-snap HF (first-
+    /// difference) energy in the 10–60 ms and 150–300 ms post-snap windows.
+    /// Pre-fix the same windows measured −67.9 dBFS and −34.4 dBFS (worst
+    /// snap) — ~5–10 dB of high-pitched residue per impact. Thresholds sit
+    /// between: passes at −77.7/−40.4, fails the old build by ≥4.6 dB.
+    #[test]
+    fn v14_space_echo_snap_glitch_quiet_bright_room() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v14snapglitch");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        // Brightest shipped flavor: tone 8000, damp 1100, decay 0.9, verb 0.65.
+        let bright = [0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 1100.0, 1.9, 0.65, 0.3, 1.0];
+        let inst = reg
+            .create_instance("space_echo", 48000.0, &bright)
+            .expect("bright room instance");
+        let sr = 48000usize;
+        let hits: [usize; 3] = [600usize, 1800, 3000].map(|ms| ms * sr / 1000);
+        let mut out: Vec<f32> = Vec::with_capacity(55 * sr / 10);
+        let mut s = 12345u64;
+        for i in 0..55 * sr / 10 {
+            let mut x = 0.0f32;
+            for &h in &hits {
+                if i >= h {
+                    let off = i - h;
+                    if off < sr / 1667 {
+                        // 0.6 ms white-noise snap (LCG, deterministic — same
+                        // recurrence as the offline probe that set the bounds)
+                        s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+                        x += 0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0);
+                    }
+                    if off < sr / 20 {
+                        x += 0.6
+                            * (-(off as f32) / (0.006 * sr as f32)).exp()
+                            * (2.0 * std::f32::consts::PI * 52.0 * off as f32 / sr as f32).sin();
+                    }
+                }
+            }
+            out.push(inst.process_private(x));
+        }
+        let hf_db = |a: usize, b: usize| -> f64 {
+            let t = &out[a..b];
+            let e: f64 =
+                t[1..].iter().zip(&t[..t.len() - 1]).map(|(u, v)| (*u as f64 - *v as f64).powi(2)).sum::<f64>()
+                    / (t.len() - 1) as f64;
+            10.0 * e.max(1e-18).log10()
+        };
+        for &h in &hits[1..] {
+            // Skip the first snap: the room starts cold there.
+            let early = hf_db(h + sr / 100, h + sr * 6 / 100);
+            let plateau = hf_db(h + sr * 15 / 100, h + sr * 3 / 10);
+            assert!(early < -73.0, "post-snap fizz 10-60 ms too bright: {early:.1} dBFS");
+            assert!(plateau < -38.5, "snap plateau 150-300 ms too bright: {plateau:.1} dBFS");
+        }
+        // The room must still be ALIVE: broadband tail after the last snap.
+        let tail = &out[7 * sr / 2..9 * sr / 2];
+        let rms = (tail.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / tail.len() as f64).sqrt();
+        assert!(rms > 5e-6, "bright room tail vanished: rms {rms:.2e}");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v14 companion pin for the FAST bright echo (0.15 s, feedback 0.90,
+    /// tone 8 kHz) — the dub-style setting where every round-trip re-reads
+    /// the stored snap edge and, pre-fix, re-injected it into the comb bank
+    /// at full brightness: post-snap HF settled into a bright tick flutter
+    /// at the echo period (machine-gun "brrt" after each impact). Fed from
+    /// the damped loop state now, so the repeats enter the room as dark as
+    /// they audibly decay. Pre-fix windows measured −37.0 / −55.1 dBFS;
+    /// post-fix −48.2 / −65.7 — thresholds split the difference with ≥3 dB
+    /// margin on both sides.
+    #[test]
+    fn v14_space_echo_fast_echo_no_tick_flutter() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v14tickflutter");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let fast = [0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 900.0, 1.5, 0.6, 0.35, 1.0];
+        let inst = reg
+            .create_instance("space_echo", 48000.0, &fast)
+            .expect("fast echo instance");
+        let sr = 48000usize;
+        let hits: [usize; 2] = [600usize, 2200].map(|ms| ms * sr / 1000);
+        let mut out: Vec<f32> = Vec::with_capacity(5 * sr);
+        let mut s = 12345u64;
+        for i in 0..5 * sr {
+            let mut x = 0.0f32;
+            for &h in &hits {
+                if i >= h {
+                    let off = i - h;
+                    if off < sr / 1667 {
+                        s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+                        x += 0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0);
+                    }
+                    if off < sr / 20 {
+                        x += 0.6
+                            * (-(off as f32) / (0.006 * sr as f32)).exp()
+                            * (2.0 * std::f32::consts::PI * 52.0 * off as f32 / sr as f32).sin();
+                    }
+                }
+            }
+            out.push(inst.process_private(x));
+        }
+        let hf_db = |a: usize, b: usize| -> f64 {
+            let t = &out[a..b];
+            let e: f64 =
+                t[1..].iter().zip(&t[..t.len() - 1]).map(|(u, v)| (*u as f64 - *v as f64).powi(2)).sum::<f64>()
+                    / (t.len() - 1) as f64;
+            10.0 * e.max(1e-18).log10()
+        };
+        let h0 = hits[1];
+        let w1 = hf_db(h0 + 3 * sr / 10, h0 + 6 * sr / 10);
+        let w2 = hf_db(h0 + 6 * sr / 10, h0 + 16 * sr / 10);
+        assert!(w1 < -44.0, "post-snap flutter window 1 too bright: {w1:.1} dBFS");
+        assert!(w2 < -62.0, "post-snap flutter window 2 too bright: {w2:.1} dBFS");
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn user_presets_folder_prefix_and_roundtrip() {
         let dir = std::env::temp_dir().join(format!("sp-userpresets-{}", std::process::id()));

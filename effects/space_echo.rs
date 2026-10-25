@@ -116,6 +116,12 @@ struct Comb {
     /// second stage of the TWO-POLE loop damping (12 dB/oct rolloff —
     /// one-pole left an icy 4–8 kHz residue that read as "tinny")
     lp2: f64,
+    /// fixed AIR-ABSORPTION pole in the loop (see [`AIR_FC`]): the user
+    /// damping knob may legitimately pass full treble, and then a stored
+    /// click edge recirculates bright and the bank re-rings it as a
+    /// high-pitched tick train after every transient. Air always eats
+    /// treble faster than the room decays — model it separately.
+    lp3: f64,
     /// base delay in samples and modulation depth/phase offset
     base: f64,
     depth: f64,
@@ -133,10 +139,10 @@ impl Comb {
         // WHINE (user report, 2026-10). At this depth the modes smear into
         // bands and the row of resonators becomes a wash.
         let depth = (base * 0.006).clamp(2.0, 12.0);
-        Self { buf: vec![0.0; n], idx: 0, lp: 0.0, lp2: 0.0, base, depth, off }
+        Self { buf: vec![0.0; n], idx: 0, lp: 0.0, lp2: 0.0, lp3: 0.0, base, depth, off }
     }
     #[inline]
-    fn process(&mut self, x: f64, fb: f64, damp_c: f64, phase: f64, room: f64) -> f64 {
+    fn process(&mut self, x: f64, fb: f64, damp_c: f64, air_c: f64, phase: f64, room: f64) -> f64 {
         // `room` stretches the delay with the decay knob: bigger room =
         // longer combs = lower, denser modes; a fixed bank heard as a boxy
         // midrange "cathedral-prison" ring no matter how long the decay.
@@ -149,11 +155,19 @@ impl Comb {
         let out = self.buf[i0] + (self.buf[i1] - self.buf[i0]) * fr;
         self.lp = out * (1.0 - damp_c) + self.lp * damp_c;
         self.lp2 = self.lp * (1.0 - damp_c) + self.lp2 * damp_c;
-        if !self.lp2.is_finite() {
+        // Fixed air-absorption pole in SERIES with the user damping: even at
+        // full-brightness damp, several kHz and up lose a step every loop
+        // round, so a recirculated click EDGE (kick snap re-read from the
+        // echo line at each echo period) decays out of the bank in a few
+        // passes instead of ticking at the recirculation rate. The damp
+        // knob still voices everything below the air band.
+        self.lp3 = self.lp2 * (1.0 - air_c) + self.lp3 * air_c;
+        if !self.lp3.is_finite() {
             self.lp = 0.0;
             self.lp2 = 0.0;
+            self.lp3 = 0.0;
         }
-        self.buf[self.idx] = x + self.lp2 * fb;
+        self.buf[self.idx] = x + self.lp3 * fb;
         self.idx = (self.idx + 1) % n;
         if !out.is_finite() {
             return 0.0;
@@ -318,6 +332,21 @@ impl DcBlock {
 /// 30-80 Hz for exactly this reason.
 const HP_FC: f64 = 28.0;
 
+/// Fixed air-absorption corner in the comb loops (see [`Comb::lp3`]).
+/// Measured root cause (2026-11 "high-pitched glitches around percussive
+/// sounds"): a kick/snap edge is stored in the echo line and re-read at
+/// every echo round-trip; that feed keeps the comb bank re-ringing the
+/// bright edge, and with the damp knob at its bright end nothing in the
+/// loop ate treble per pass — so the edge ticked at the recirculation rate
+/// (HF burst −31 dBFS 145–225 ms after the hit vs −85 dB mid-tail,
+/// Practice-Hall preset; near-zero for dark presets, matching the report
+/// that only bright settings glitch). Real rooms always absorb treble
+/// faster than they decay; one always-on pole models that floor.
+const AIR_FC: f64 = 6500.0;
+
+/// Room-feed brightness cap in Hz (see the feed comment in `process`).
+const FEED_CAP_FC: f64 = 4200.0;
+
 
 extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32 {
     if state.is_null() {
@@ -356,17 +385,24 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     let w = 1.0 + wobble * 0.01 * st.phase.sin();
     let d = (time_s * sr * w).clamp(1.0, (st.delay.buf.len() - 4) as f64);
 
-    let echoed = st.delay.read(d);
-    // DC-block the echo read once: it feeds both the damped feedback loop
-    // and the wet echo tap, so the loop can never circulate subsonic mud
-    // (and the audible slap carries none).
-    let echoed = st.echo_blk.run(echoed, st.r_hp);
+    let echoed_raw = st.delay.read(d);
+    // The DC blocker (see [`HP_FC`]) belongs INSIDE the loop, on the signal
+    // that re-enters feedback — never on the wet tap. On the read side it
+    // acts as a differentiator across the stored click step: every repeat
+    // of a transient re-sprouted a 2x edge spike at full tap level no
+    // matter how damped the loop was (the "high-pitched tick on each
+    // repeat after a drum hit"). Inside the loop it still cannot
+    // accumulate: the filter's output feeds the damped state, so subsonic
+    // content is drained once per round, and the tap hears the plain
+    // delayed copy — DC and all, exactly like the input it came from.
+    let damped_in = st.echo_blk.run(echoed_raw, st.r_hp);
     // damped feedback loop
-    st.tone_lp = echoed * (1.0 - st.tone_c) + st.tone_lp * st.tone_c;
+    st.tone_lp = damped_in * (1.0 - st.tone_c) + st.tone_lp * st.tone_c;
     if !st.tone_lp.is_finite() {
         st.tone_lp = 0.0;
     }
     st.delay.write(x + st.tone_lp * fb);
+    let echoed = echoed_raw;
 
     // ---- FDN reverb in parallel with the echo (fed from echo + dry) ----
     // 0.45 feed: rooms need the reverb to read as the ROOM, not as a faint
@@ -381,13 +417,32 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     // the DRY signal, so without it every drum impact or snap injects its
     // DC/subsonic content into 8 combs running at up to 0.95 feedback and
     // the room answers with a mud wash that outlives the note by seconds.
-    st.verb_lp = st.verb_blk.run(echoed * 0.6 + x * 0.4, st.r_hp) * 0.45 * (1.0 - st.tone_c)
-        + st.verb_lp * st.tone_c;
+    //
+    // FEED SOURCE = the damped loop state `tone_lp`, never the raw delay
+    // read. The delay line stores an input click as a hard step, and the
+    // loop's tone pole filters on the WRITE side: every round-trip re-reads
+    // the SAME stored discontinuity at full edge level, so a raw feed
+    // re-injected full edge energy into the bank at each echo period — a
+    // high-pitched tick train no loop or feed pole can chase, because each
+    // tick arrives fresh, past every filter (measured −30 dBFS HF bursts at
+    // 145/225 ms after a snap under the bright presets, immaterial to any
+    // comb-loop treatment). tone_lp is the echo loop's own damped state —
+    // repeats now enter the room exactly as bright (and no brighter) as
+    // they audibly decay in the echo.
+    //
+    // The feed pre-damp is additionally CAPPED at FEED_CAP_FC (min with the
+    // tone knob): real rooms are fed air-rolled sound, and even the dry
+    // copy must not hand the bank the input's raw edge. Below the cap the
+    // tone knob still voices the feed exactly as before.
+    let feed_c = st.tone_c.max(one_c(FEED_CAP_FC, sr));
+    st.verb_lp = st.verb_blk.run(st.tone_lp * 0.6 + x * 0.4, st.r_hp) * 0.45 * (1.0 - feed_c)
+        + st.verb_lp * feed_c;
     if !st.verb_lp.is_finite() {
         st.verb_lp = 0.0;
     }
     let verb_in = st.verb_lp;
     let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
+    let air_c = 1.0 - one_c(AIR_FC, sr);
     // Room stretch: decay 0.5 → 1.0× comb length, decay 0.95 → ~1.95×.
     // Long tails through SHORT combs are the boxy, metallic "cathedral
     // prison" ring — the modes have to actually descend for the room.
@@ -399,7 +454,7 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     }
     let mut sum = 0.0f64;
     for c in st.combs.iter_mut() {
-        sum += c.process(verb_in, decay, damp_c, st.vphase, room);
+        sum += c.process(verb_in, decay, damp_c, air_c, st.vphase, room);
     }
     let mut v = sum * 0.5;
     for a in st.ap.iter_mut() {
