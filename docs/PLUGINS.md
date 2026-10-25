@@ -96,22 +96,20 @@ this project (v10.2):
 
 - **No-GUI plugins** (`effFlagsHasEditor` clear) keep the automatic
   parameter-slider panel — that panel is always available, GUI or not.
-- **VST3 editors are not hosted yet.** Two blockers, both architectural:
-  1. slooper runs VST3 plugins on `vst3-host`'s realtime runner, which
-     confines the `IPlugin` to its processing thread, while VST3 editors
-     (`IPlugView::attached`) must be created and serviced on the host's
-     main thread with `IComponent`/`IEditController` access; the crate's
-     `RtControl` exposes no editor bridge.
-  2. `vst3-host`'s own `EmbeddedEditor` needs the host window's
-     `RawWindowHandle` and **rejects Wayland handles** (VST3.8 requires an
-     `IWaylandHost` compositor proxy, not the app surface), and slooper's
-     main window is egui/winit — an X11 handle only exists under
-     XWayland/X11.
-  The upgrade path is a non-realtime editor thread owning a second
-  `IPluginView` on a container window (mirroring our VST2 module), plus
-  parameter-change synchronization via `IEditController::setComponentHandler`
-  and `Plugin::service_host_requests`. Until then VST3 instruments load and
-  play, but only expose sliders.
+- **VST3 editor windows (since v0.12)** open the plugin's own GUI, the
+  same as VST2 — but behind it sits a deliberate workaround: the sounding
+  instance lives on `vst3-host`'s realtime runner, which confines it to
+  the processing thread, so the window hosts a **shadow instance** of the
+  same plugin. The shadow never processes audio, is primed with the live
+  parameter values when it opens, and every edit it reports
+  (`IComponentHandler::performEdit`) is routed into the same parameter
+  cells the sliders and automation write — knob moves change the sound
+  through exactly the slider path. One direction is open-loop: automation
+  or slider moves update the SOUND but do not move knobs inside an
+  already-open VST3 window (close and reopen to see current values).
+  The shadow lives on the shared plugin GUI thread inside the same
+  verified-paint X11 container as VST2 editors: refused editors never
+  leave a blank panel, WM close always retires the window.
 - The `effEditOpen` **return value is advisory**: the VST2 spec says 0
   means success, but many toolkits (VSTGUI-based plugins like Wolf Shaper
   or Dragonfly) return 1 as a "true" success flag. Trusting the number
