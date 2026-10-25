@@ -129,6 +129,9 @@ pub fn prepare_effects_dir(cfg_dir: Option<&str>) -> PathBuf {
     // The user-preset folder lives beside the scripts and is (re)created at
     // every launch — plugins find it ready-made the first time they save.
     let _ = ensure_user_presets_dir(&dir);
+    // v0.13: factory presets are part of that folder now — write the ones
+    // the user does not have (existing files are never touched).
+    seed_builtin_presets(&dir);
     dir
 }
 
@@ -142,6 +145,12 @@ pub fn prepare_effects_dir(cfg_dir: Option<&str>) -> PathBuf {
 // marker: a plugin lists and reads ONLY files starting with its own
 // `{stem}-`, so one folder serves every effect. Content is flat JSON:
 // `{"plugin": stem, "name": preset, "params": {"label": value, …}}`.
+//
+// Since v0.13 the BUILT-IN presets live in this same folder too: they are
+// ordinary JSON files seeded once at first launch
+// (`seed_builtin_presets`), so one list, one loader and one delete path
+// cover factory and user presets alike. Writers' guide: `docs/USAGE.md`
+// (section "Presets").
 
 /// Folder name (fixed by convention) inside the effects location.
 pub const USER_PRESET_DIR: &str = "user presets";
@@ -213,11 +222,23 @@ pub fn list_user_presets(fx_dir: &Path, stem: &str) -> Vec<String> {
     out
 }
 
-/// Built-in default presets, shipped with the program (v0.10) — these do
-/// NOT live in the user-preset folder and are always available. Each is a
-/// (name, [(param label, value)]) pair; unknown labels in a re-compiled
-/// effect script are simply skipped by the loader, so presets can never
-/// brick an editor.
+/// Built-in ("factory") presets shipped with the program — SINCE v0.13
+/// THESE ARE SEEDED INTO THE USER PRESET FOLDER as ordinary preset files
+/// (`seed_builtin_presets`), so they appear in the same list as the user's
+/// own presets and load/save/delete exactly like them. This table is the
+/// seed source only; treat the seeded JSON files as the live copies.
+///
+/// Shape: `(preset name, [(param label, value)])` — labels must match the
+/// effect script's `EffectParamV1` labels. Unknown labels are skipped by
+/// the loader, so an effect re-compiled with renamed params can never be
+/// bricked by a stale preset. Values are clamped to each param's declared
+/// range on load. The full format + rules for writing your own:
+/// `docs/USAGE.md` (section "Presets").
+///
+/// Seeding rule (same ownership discipline as effect scripts): a preset
+/// file is written ONLY if absent — user edits always survive, a deleted
+/// factory preset stays deleted, and a hand-written file that merely
+/// shares a name is never touched.
 pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)>)> {
     // EQ band order: type 0 off, 1 low shelf, 2 high shelf, 3 peak,
     // 4 low pass, 5 high pass, 6 notch, 7 band pass.
@@ -235,9 +256,27 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
         v.push((leak("out".into()), out));
         v
     }
+    // space_echo params in PARAMS order; labels are the script's:
+    // time, feedback, tone, wobble, rate, decay, damp, mix, out, echo, verb.
+    fn se(v: [f32; 11]) -> Vec<(&'static str, f32)> {
+        const L: [&str; 11] =
+            ["time", "feedback", "tone", "wobble", "rate", "decay", "damp", "mix", "out", "echo", "verb"];
+        L.iter().zip(v).map(|(l, x)| (leak_str(l), x)).collect()
+    }
+    fn leak_str(s: &str) -> &'static str {
+        Box::leak(s.to_string().into_boxed_str())
+    }
     match stem {
+        // ---------------------------------------------------------------- EQ
+        // Every preset sets ALL 26 params (6 bands x {type,freq,gain,Q} +
+        // mix + out), so loading one is deterministic from any starting
+        // point. Band types: 0 off, 1 low shelf, 2 high shelf, 3 peak,
+        // 4 low pass, 5 high pass, 6 notch, 7 band pass.
         "parametric_eq" => vec![
             (
+                // Old-radio bandwidth: high-pass at 300 Hz and a low-pass
+                // at 3.5 kHz fence in everything, two presence peaks
+                // (1.5/2.5 kHz) add the "talking-in-a-can" honk.
                 "Radio filter",
                 eq(
                     &[
@@ -253,6 +292,9 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
                 ),
             ),
             (
+                // Venue curve for playback: warm shelf under 100 Hz, a
+                // cut at 250 Hz to remove box, lift on the detail bands
+                // (4k presence, 8k air) and a gentle high shelf.
                 "Concert hall",
                 eq(
                     &[
@@ -268,6 +310,9 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
                 ),
             ),
             (
+                // Voice chain: high-pass the rumble, -3 dB mud cut at
+                // 200 Hz, two presence lifts (2.5/5 kHz) for intelligence,
+                // slight de-esser at 8 kHz, low-pass at 90 Hz.
                 "Podcast voice",
                 eq(
                     &[
@@ -283,6 +328,9 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
                 ),
             ),
             (
+                // +6 dB low shelf at 120 Hz with a small upper-bass bump;
+                // the mids stay honest, a light 10 kHz shelf keeps it from
+                // going muddy.
                 "Bass boost",
                 eq(
                     &[
@@ -298,6 +346,8 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
                 ),
             ),
             (
+                // Cracked cassette: low-passed at 150 Hz and high-passed
+                // at 4 kHz (the shell), a +4 dB midrange honk at 1 kHz.
                 "Lo-fi tape",
                 eq(
                     &[
@@ -313,6 +363,8 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
                 ),
             ),
             (
+                // Air band only: +1.5 dB at 4 kHz, +4 dB at 9 kHz, +3 dB
+                // shelf from 12 kHz; everything below untouched.
                 "Treble sparkle",
                 eq(
                     &[
@@ -328,8 +380,81 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
                 ),
             ),
         ],
+        // ---------------------------------------------------- echo + reverb
+        // Room presets run echo LOW and verb FULL so the FDN tail (not the
+        // slap) carries the space; time/feedback shape the early slap,
+        // decay/damp set tail length/colour, mix is the wet level.
+        // (The effect's own canvas also draws these five as a preset row —
+        // the script copy lives in effects/space_echo.rs `PRESETS`.)
+        "space_echo" => vec![
+            // The classic dub-style echo: 380 ms slap, moderate feedback,
+            // no wobble; verb barely open. This is the old default sound.
+            ("Echo", se([0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5])),
+            // Tiny bright room: 70 ms first reflection, tight decay —
+            // more "close walls" than an effect.
+            ("Practice Hall", se([0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0])),
+            // Medium hall, a touch of slap before the tail.
+            ("Auditorium", se([0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0])),
+            // The warm classic: 200 ms slap, longish damped tail.
+            ("Opera House", se([0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0])),
+            // Vast and dark: slow slap, 0.95 feedback, heavy air damping —
+            // the tail outlives everything.
+            ("Cathedral", se([0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0])),
+        ],
         _ => Vec::new(),
     }
+}
+
+/// Every stem that ships factory presets.
+pub const BUILTIN_PRESET_STEMS: [&str; 2] = ["parametric_eq", "space_echo"];
+
+/// Marker file (inside the user-preset folder) recording that the factory
+/// presets have already been seeded once. Its presence means "this folder
+/// belongs to the user now": deletions stay deleted and edits stay edited
+/// across launches and upgrades. Delete it (or the folder) to restore the
+/// starter set — that is the documented recovery, see `docs/PLUGINS.md`.
+pub const FACTORY_SEED_MARKER: &str = ".factory-seeded";
+
+/// Merge the factory presets into the USER preset folder (v0.13 — presets
+/// are not a separate system any more, they are ordinary preset files).
+///
+/// The whole set is seeded ONCE, into a folder without the marker; from
+/// then on the folder is user territory: files are never rewritten, a
+/// deleted factory preset stays deleted, and foreign files are untouched.
+/// Returns how many files were created (0 whenever the marker is present).
+pub fn seed_builtin_presets(fx_dir: &Path) -> usize {
+    let dir = match ensure_user_presets_dir(fx_dir) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let marker = dir.join(FACTORY_SEED_MARKER);
+    if marker.exists() {
+        return 0;
+    }
+    let mut written = 0usize;
+    for stem in BUILTIN_PRESET_STEMS {
+        for (name, pairs) in builtin_presets(stem) {
+            let path = user_preset_path(fx_dir, stem, name);
+            if path.exists() {
+                continue; // a hand-made file under that name is the user's
+            }
+            let params: Vec<(String, f32)> =
+                pairs.into_iter().map(|(l, v)| (l.to_string(), v)).collect();
+            if let Ok(json) = preset_to_json(stem, name, &params) {
+                if std::fs::write(dir.join(path.file_name().unwrap()), json).is_ok() {
+                    written += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::write(
+        &marker,
+        "factory presets seeded once (slooper v0.13+). This file marks the\n\
+         preset folder as user-owned: nothing rewrites or re-adds files any\n\
+         more. Delete it (or the folder) and restart to restore the starter\n\
+         set. Format of the preset files: see docs/PLUGINS.md (Presets).\n",
+    );
+    written
 }
 
 /// Delete a preset. Missing file counts as success (idempotent).
@@ -2024,11 +2149,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert!(names.contains(&"Concert hall"), "concert hall preset missing: {names:?}");
         assert!(defs.len() >= 5, "a decent starter set: {names:?}");
         for (name, pairs) in &defs {
-            assert_eq!(pairs.len(), 26, "{name}: one value per EQ param");
+            assert!(!pairs.is_empty(), "{name}: empty param list");
             let mut labels: Vec<&str> = pairs.iter().map(|(l, _)| *l).collect();
             labels.sort_unstable();
             labels.dedup();
-            assert_eq!(labels.len(), 26, "{name}: labels unique");
+            assert_eq!(labels.len(), pairs.len(), "{name}: labels unique");
             for (label, v) in pairs {
                 assert!(v.is_finite(), "{name}/{label} not finite");
                 if label.ends_with("type") {
@@ -2036,7 +2161,12 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 }
             }
         }
-        assert!(builtin_presets("space_echo").is_empty(), "other effects stay preset-free");
+        // v0.13: the echo+reverb rooms shipped with the program too (they
+        // used to live only in the script's canvas; now the whole family is
+        // seeded into the user preset folder).
+        let se = builtin_presets("space_echo");
+        assert_eq!(se.len(), 5, "five shipped rooms: {se:?}");
+        assert_eq!(se[0].1.len(), 11, "every room sets all eleven params");
     }
 
     /// AC5.2: a default preset lands on a REAL compiled EQ instance —
@@ -2094,4 +2224,64 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ===================== v0.13 acceptance pins =====================
+
+    /// AC1.1/AC1.2/AC1.5: factory presets are ordinary files in the USER
+    /// preset folder after seeding — same list, same loader, same delete —
+    /// and the seeding obeys the ownership rule: seeded ONCE, then the
+    /// folder is user territory (edits and deletions survive everything).
+    #[test]
+    fn v13_fx_factory_presets_merge_into_user_folder() {
+        let dir = temp_dir("v13seedpresets");
+        // AC1.1: prepare_effects_dir (the launch path) seeds factory AND
+        // user presets into one folder, and one list shows every name.
+        std::env::set_var("SLOOPER_EFFECTS_DIR", &dir);
+        let dir = prepare_effects_dir(None);
+        let names = list_user_presets(&dir, "parametric_eq");
+        for want in
+            ["Radio filter", "Concert hall", "Podcast voice", "Bass boost", "Lo-fi tape", "Treble sparkle"]
+        {
+            assert!(names.iter().any(|n| n == want), "factory '{want}' not in the preset list: {names:?}");
+        }
+        assert_eq!(list_user_presets(&dir, "space_echo").len(), 5, "five rooms listed");
+        // AC1.2: a seeded file is real, parseable, and loads through the
+        // ordinary user-preset loader path.
+        let p = user_preset_path(&dir, "parametric_eq", "Podcast voice");
+        let parsed = preset_from_json(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(parsed.len(), 26, "one value per EQ param");
+        assert!(parsed.iter().any(|(l, v)| l == "B3 gain" && (*v - 3.0).abs() < 1e-6));
+        // A user preset saved under a NEW name joins the same list.
+        std::fs::write(user_preset_path(&dir, "parametric_eq", "My thing"), "{\"params\":{\"mix\":0.5}}")
+            .unwrap();
+        let after = list_user_presets(&dir, "parametric_eq");
+        assert!(after.contains(&"My thing".to_string()) && after.contains(&"Bass boost".to_string()));
+
+        // AC1.5 ownership: after the one-time seed NOTHING is rewritten and
+        // NOTHING is re-added — user edits and deletions are permanent…
+        std::fs::write(&p, "{\"params\":{\"mix\":0.25}}").unwrap();
+        delete_user_preset(&dir, "parametric_eq", "Bass boost").unwrap();
+        assert_eq!(seed_builtin_presets(&dir), 0, "seeded folder is never re-touched");
+        assert_eq!(prepare_effects_dir(None), dir, "launch path is idempotent");
+        std::env::remove_var("SLOOPER_EFFECTS_DIR");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("0.25"), "user edit was rewritten");
+        assert!(!list_user_presets(&dir, "parametric_eq").contains(&"Bass boost".to_string()));
+        // …while a brand-new folder (no marker) does get the starter set,
+        // and an existing hand-written file under a factory name survives.
+        let dir2 = temp_dir("v13seedpresets2");
+        std::fs::create_dir_all(user_presets_dir(&dir2)).unwrap();
+        std::fs::write(user_preset_path(&dir2, "parametric_eq", "Bass boost"), "{\"params\":{\"mix\":0.7}}")
+            .unwrap();
+        assert_eq!(seed_builtin_presets(&dir2), 10, "11 factory presets minus the hand-written one");
+        assert_eq!(
+            std::fs::read_to_string(user_preset_path(&dir2, "parametric_eq", "Bass boost")).unwrap(),
+            "{\"params\":{\"mix\":0.7}}",
+            "a hand-made file under a factory name must never be overwritten"
+        );
+        // A foreign file in the folder is never touched either.
+        std::fs::write(user_presets_dir(&dir).join("other-thing.json"), "x").unwrap();
+        seed_builtin_presets(&dir);
+        assert_eq!(std::fs::read_to_string(user_presets_dir(&dir).join("other-thing.json")).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
 }
