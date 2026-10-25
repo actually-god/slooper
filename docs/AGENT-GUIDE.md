@@ -70,8 +70,9 @@ src/            application source (Rust 2021 edition)
                   relay via generation counter (VST2 via the patched
                   vendor/vst2 crate, VST3 via vst3-host; plugin libraries
                   are NEVER dlclosed)
-  vstedit.rs      VST2 editor hosting (effEditOpen/Idle/GetRect/Close over
-                  an X11 plug/replug container window, idle pump thread;
+  vstedit.rs      VST2 + VST3 editor hosting (effEditOpen/Idle/GetRect/Close
+                  over an X11 plug/replug container window, idle pump thread;
+                  VST3 hosts a shadow instance of the plugin since v0.12;
                   see PLUGINS.md)
   project.rs      `.slooper` save format (versioned JSON), projects-dir
                   listing, audio re-resolution by file name
