@@ -596,29 +596,9 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
             }
         }
     });
-    // v0.10: built-in default presets (radio filter, concert hall, ...)
-    // ship with the program and appear right under the user preset row.
-    let defaults = fx::builtin_presets(&ed.stem);
-    if !defaults.is_empty() {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("defaults").weak().small());
-            egui::ComboBox::from_id_salt("fx_default_preset")
-                .selected_text("apply a built-in preset\u{25be}")
-                .show_ui(ui, |ui| {
-                    // Snapshot so the closure doesn't borrow `ed`.
-                    let items: Vec<(&str, Vec<(&str, f32)>)> =
-                        defaults.iter().map(|(n, p)| (*n, p.clone())).collect();
-                    for (name, pairs) in items {
-                        if ui.selectable_label(false, name).clicked() {
-                            let n = ed.apply_labeled(&pairs);
-                            ed.preset_msg =
-                                format!("default preset \"{name}\" applied ({n} params)");
-                            ui.close();
-                        }
-                    }
-                });
-        });
-    }
+    // v0.13: built-in presets no longer live in a separate row — they are
+    // seeded into the user-preset folder (fx::seed_builtin_presets) and
+    // arrive in the very combo above, load/save/delete like any preset.
     if !ed.preset_msg.is_empty() {
         ui.label(RichText::new(&ed.preset_msg).weak().small());
     }
