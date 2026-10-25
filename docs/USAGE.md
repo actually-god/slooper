@@ -206,7 +206,11 @@ Each track plays its MIDI clips through its own **synth binding** (the
   damper behaviour) built from the open TimGM6mb soundfont — not a synthetic
   model; any track without an explicit binding falls back to it.
 - **sampler** — a bundled script that plays any rack asset pitched around a
-  **root note** (the slider shows `C3`-style note names).
+  **root note** (the slider shows `C3`-style note names). Pick a patch from
+  its dropdown, or **drag any audio file onto its drop zone** — from the
+  asset rack *or straight from your file manager*: the file is decoded,
+  joins the rack, and replaces the live patch immediately, even while the
+  track plays and MIDI streams in (no restart, no re-selection).
 - **other script synths** — plain Rust files in
   `~/.local/share/slooper/synths`, compiled on first load (⟳ re-scans);
   they share the preset/param machinery of effect scripts.
@@ -490,6 +494,38 @@ to use custom effects. Keep `process()` allocation-free and non-blocking —
 it runs in the realtime audio path. Script **synths** follow the same
 pattern (`synths/synth_api.rs`); the bundled `piano.rs` and `sampler.rs`
 are the reference implementations.
+
+### Presets
+
+Every effect editor carries the same preset strip, and there is exactly
+**one preset format**: a flat JSON file in
+`<effects folder>/user presets/` named `{plugin stem}-{preset name}.json`
+(the stem prefix is the ownership marker — each plugin lists only its own
+files, so one folder serves them all). Content::
+
+    {"plugin": "parametric_eq", "name": "Podcast voice",
+     "params": {"mix": 1.0, "B1 freq": 90.0, ...}}
+
+Labels are the exact `EffectParamV1` labels from the script's `info()`, and
+values are the parameter's **native units** — the same numbers the plugin's
+own sliders show and `set_param()` takes (Hz for a freq, dB for a gain,
+0..=1 wherever the script declares that range). On load, values are clamped
+to each parameter's declared range, entries whose label the plugin doesn't
+know are skipped, and parameters the file omits keep their current values —
+so a preset never bricks a plugin that later gains or renames parameters.
+(Files written by the strip are ordered in parameter order, so even a
+hand-edit that shuffles labels still lands sensibly: label matches always
+beat the positional pass.)
+
+**The built-in presets are ordinary files in that folder.** On first launch
+slooper seeds its factory presets (Radio filter, Cathedral, …) there once;
+after that they are *yours* — edit one and overwrite it, delete one for
+good, add your own beside it. Nothing is ever rewritten or resurrected. So
+to build a preset by hand (or from a script/agent): copy any `.json` in
+that folder, adjust labels/values, give it a fresh `{stem}-…` name — it
+appears in that plugin's list immediately, no restart needed. The factory
+sources with their per-band reasoning live in `src/fx.rs`
+(`builtin_presets()`).
 
 ## Latency compensation
 
