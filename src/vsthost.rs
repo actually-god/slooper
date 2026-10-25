@@ -1321,6 +1321,44 @@ mod tests {
         let _ = checked;
     }
 
+    /// v0.12 coverage hole: `every_local_instrument_makes_sound` pins the
+    /// instrument path, but NO test ever fed audio through an installed
+    /// VST3 EFFECT — the user's "silence in my effect chain" report had no
+    /// matrix behind it. Feed noise through every local VST3 effect; a
+    /// plugin that swallows all input (dead output bus, failed activate)
+    /// fails here with the path named.
+    #[test]
+    fn v12_local_vst3_effects_pass_audio() {
+        let found = scan(&default_vst_dirs());
+        let mut checked = 0;
+        for e in found.iter().filter(|e| e.error.is_none() && !e.instrument) {
+            if !e.path.extension().is_some_and(|x| x == "vst3") {
+                continue; // VST2 effects are pinned by v10_local_vst2_effect_passes_audio
+            }
+            let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else { continue };
+            let mut rng = 12345u32;
+            let mut peak = 0.0f32;
+            for _ in 0..60 {
+                let mut input = [0.0f32; 512];
+                for x in input.iter_mut() {
+                    rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    *x = (((rng >> 16) as f32) / 32768.0 - 1.0) * 0.25;
+                }
+                let mut out = [0.0f32; 512];
+                load.entry.process(&input, &mut out);
+                peak = peak.max(out.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+            }
+            assert!(
+                peak > 1e-4,
+                "{}: VST3 effect swallowed all input (silent output bus?)",
+                e.path.display()
+            );
+            checked += 1;
+        }
+        // Informational: CI has no effects installed.
+        let _ = checked;
+    }
+
     // ===================== v0.10 acceptance pins =====================
 
     /// AC2.4: drop-in install layout. A folder may contain loose `.so`

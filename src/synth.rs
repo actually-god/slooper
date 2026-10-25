@@ -38,8 +38,14 @@ pub const BUNDLED: &[(&str, &str)] = &[
         include_str!("../synths/THIRD-PARTY-NOTICES.md"),
     ),
 ];
-/// Bump when a bundled script changes, so shipped fixes replace the user
-/// folder's copy (with a `.bak` backup) instead of freezing at first seed.
+/// The stamp `// slooper-synth-version: N` on line 2 of every bundled
+/// script marks it as OURS (an unstamped same-named file is a hand-edited
+/// user file and is never overwritten). Since v0.12 the seed update itself
+/// is CONTENT-compared — this constant no longer gates anything at runtime
+/// (the exact-match gate froze the sampler fix out of every install; see
+/// `v12_seed_stale_stamp_updates_despite_version_skew`), so it lives only
+/// for the tests that assert the shipped scripts stay stamped.
+#[cfg(test)]
 const BUNDLED_VERSION: &str = "6";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
@@ -101,11 +107,19 @@ pub fn seed_folder(dir: &Path) {
                 // a hand-edited piano.rs is the user's file. The stamp lives
                 // on line 2 (line 1 is the `==== slooper ==` banner), so
                 // scan the header block, not just the first line.
+                // The v0.12 gate dropped its second condition — "the bundled
+                // copy carries the exact current BUNDLED_VERSION string":
+                // per-file stamps drift from that folder-wide constant, and
+                // every drift silently froze the file on every existing
+                // install (the sampler live-resync fix shipped at stamp 4 vs
+                // global 6 and never reached a single machine — the v0.12
+                // "sampler requires a restart" report). Bundled text is ours
+                // by construction: stamped file + content difference updates.
                 let stamped = cur
                     .lines()
                     .take(4)
                     .any(|l| l.contains("slooper-synth-version:"))
-                    && src.contains(&format!("slooper-synth-version: {BUNDLED_VERSION}"));
+                    && src.contains("slooper-synth-version:");
                 if stamped && cur != *src {
                     let bak = dir.join(format!("{name}.bak"));
                     let _ = std::fs::write(&bak, cur);
@@ -653,6 +667,48 @@ mod tests {
             "// my custom synth\n"
         );
         assert!(!dir.join("sampler.rs.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v12_seed_stale_stamp_updates_despite_version_skew() {
+        // v0.12 "sampler still requires a restart for every new sample":
+        // the sampler's live-resync fix shipped in v0.10 with SCRIPT stamp 4,
+        // but the folder-wide BUNDLED_VERSION was bumped later, and the old
+        // update gate also required the bundled copy to carry the EXACT
+        // global version string — so the update was rejected forever and
+        // every install holding a stamp-3 sampler kept the pre-fix script.
+        // The on-disk stamp marks the file as OURS; a content difference is
+        // the only staleness signal that actually works.
+        let dir = std::env::temp_dir().join("sp-synth-seed-skew");
+        let _ = std::fs::remove_dir_all(&dir);
+        seed_folder(&dir);
+        let sampler = dir.join("sampler.rs");
+        let bundled = std::fs::read_to_string(&sampler).unwrap();
+        // Simulate an older install: still stamped, body predates the fix.
+        let stale: String = bundled
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 1 {
+                    "// slooper-synth-version: 0".to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let stale = stale.replace("data_ptr", "resync_deferred");
+        assert_ne!(stale, bundled, "fixture must differ from the bundled script");
+        std::fs::write(&sampler, &stale).unwrap();
+        seed_folder(&dir);
+        let upd = std::fs::read_to_string(&sampler).unwrap();
+        assert_eq!(
+            upd, bundled,
+            "stale stamped sampler.rs was never updated (version-skew gate)"
+        );
+        assert!(dir.join("sampler.rs.bak").exists(), "old copy not backed up");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
