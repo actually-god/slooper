@@ -213,11 +213,11 @@ Each track plays its MIDI clips through its own **synth binding** (the
 - **VSTi** — any scanned VST2/VST3 *instrument* appears as
   *name (VSTi)* and is played by the track's MIDI clips.
 
-**sliders** opens the synth's parameter window. For a bound VST2 with a
-GUI, the sliders window also offers **open plugin window** — the native
-editor runs in its own OS window (requires an X11 display; XWayland
-counts). VST3 instruments load and play but currently expose sliders only.
-Details in [PLUGINS.md](PLUGINS.md).
+The button on a plugin-bound track reads **GUI**: it opens (and toggles)
+the plugin's OWN window — every hosted generation, VST2 and VST3 alike
+(requires an X11 display; XWayland counts). Plugins without a drawable
+editor say so in the status line; script synths keep the **sliders**
+window. Details and design notes in [PLUGINS.md](PLUGINS.md).
 
 The preview path is the same: piano-roll and rack auditions of MIDI go
 through the *picked track's* synth + chain, so what you audition is what

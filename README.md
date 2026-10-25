@@ -115,7 +115,8 @@ guide](docs/AGENT-GUIDE.md)
   chain is a single ordered list mixing runtime-compiled **Rust effect
   scripts** (hot-compiled with rustc, per-effect sliders, scripted custom
   GUIs, user presets) and binary **VST2 / VST3 plugins** (parameter sliders,
-  native VST2 editor windows). **Plugins used as instruments** can be bound
+  native plugin editor windows for both generations). **Plugins used as
+  instruments** can be bound
   as the track's synth and played by its MIDI clips. Live and in export
   renders.
 - **Global loop region** — a **loop** toggle plus mode dropdown on the grid
