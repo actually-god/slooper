@@ -279,6 +279,11 @@ struct AutoEdit {
     /// Node index being dragged on the canvas (gesture armed on press).
     drag: Option<usize>,
     changed: bool,
+    /// v0.15: MIDI manager recording — raw moves of the picked bindings
+    /// draw the curve (as % of the target's range) instead of acting.
+    rec: bool,
+    /// Engine position when REC was armed (nodes stamp relative to it).
+    rec_start: i64,
 }
 
 /// Floating piano-roll editor (the top-bar "Piano roll" window). Notes are
@@ -598,7 +603,6 @@ pub struct App {
     trk_vol: [u8; MAX_LOOPS],
     trk_gain: [u8; MAX_LOOPS],
     trk_pan: [u8; MAX_LOOPS],
-    lv_edit: HashMap<(u8, usize), String>,
     /// Last track selection propagated to the audio engine (input
     /// monitoring follows the selected track's chain/gain/pan).
     sel_sent: usize,
@@ -735,7 +739,27 @@ pub struct App {
     /// v0.11 R5: write-automation recorders + open automation manager.
     auto_rec: Vec<AutoRecState>,
     auto_edit: Option<Box<AutoEdit>>,
+    /// v0.15: bindings picked as automation-manager record sources
+    /// (action slot + bind). While the manager is open these are MUTED in
+    /// the main window; with REC armed their raw values draw the curve.
+    auto_mgr_rec: Vec<(usize, MidiBind)>,
+    /// v0.15: the "select value" bind popup is open (auto_pick_window).
+    auto_pick_open: bool,
     piano_roll: Option<Box<PianoRoll>>,
+    /// v0.15: desktop-style right-click popup for automatable values whose
+    /// widget cannot host an egui context menu (FX-script bridge sliders,
+    /// the bpm text box): (track, target, current value, screen pos).
+    value_menu: Option<(usize, String, f32, egui::Pos2)>,
+    /// v0.15: "Set value" dialog (track, target, input text in USER units).
+    value_dialog: Option<(usize, String, String)>,
+    /// v0.15: focus + arm the "Set value" text box once, when it opens.
+    value_dialog_focus: bool,
+    /// v0.15: the mini menu only closes on clicks after its opening frame.
+    value_menu_armed: bool,
+    /// v0.15: last-frame rect of the bpm text box — the ui_root input pass
+    /// swallows right-presses inside it so the automation popup, not the
+    /// text-edit cut/copy/paste menu, answers.
+    bpm_rect: Option<egui::Rect>,
 
     // --- per-track effects framework ---
     fx_registry: fx::Registry,
@@ -935,7 +959,6 @@ impl App {
             trk_vol,
             trk_gain,
             trk_pan,
-            lv_edit: HashMap::new(),
             sel_sent: usize::MAX,
             levels_dirty: false,
             selected: 0,
@@ -1004,6 +1027,13 @@ impl App {
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
             auto_edit: None,
+            auto_mgr_rec: Vec::new(),
+            auto_pick_open: false,
+            value_menu: None,
+            value_dialog: None,
+            value_dialog_focus: false,
+            value_menu_armed: false,
+            bpm_rect: None,
             piano_roll: None,
             fx_registry,
             fx_rows,
@@ -1229,18 +1259,32 @@ impl App {
         // "return early while any box has focus" meant Ctrl+C/V silently
         // died the moment the user had ever touched the bpm/quantize/name
         // boxes (the reported "copy/paste does nothing").
-        let (ccopy, cpaste) = ctx.input(|i| {
+        let (ccopy, ccut, cpaste) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(egui::Key::C),
+                i.modifiers.command && i.key_pressed(egui::Key::X),
                 i.modifiers.command && i.key_pressed(egui::Key::V),
             )
         });
-        if ccopy || cpaste {
+        if ccopy || ccut || cpaste {
             // While the piano roll owns the keyboard these keys belong to
             // the ROLL (handled in `piano_roll_window`) — never clips.
             if !self.piano_roll.as_ref().is_some_and(|r| r.focused) {
                 if ccopy {
                     self.clipboard_copy();
+                }
+                if ccut {
+                    // v0.15: Ctrl+X — the cut that was always missing.
+                    if self.sel_clips.is_empty() {
+                        self.status = "cut: select clips first".into();
+                    } else {
+                        self.clipboard_copy();
+                        self.delete_selection();
+                        self.status = format!(
+                            "cut {} clip(s) \u{b7} Ctrl+V pastes at the playhead",
+                            self.clipboard.as_ref().map(|c| c.items.len()).unwrap_or(0)
+                        );
+                    }
                 }
                 if cpaste {
                     self.clipboard_paste();
@@ -1656,6 +1700,9 @@ impl App {
         let mut closed = false;
         if let Some(ed) = self.fx_editor.as_mut() {
             closed = !crate::fxgui::window(ui, ed);
+            if let Some((k, v, pos)) = ed.ctx_menu.take() {
+                self.value_menu = Some((ed.loop_i, format!("fx:{}:{}", ed.slot, k), v, pos));
+            }
             let pend = std::mem::take(&mut ed.pending);
             if !pend.is_empty() {
                 if let Some(ChainRow::Script { params, .. }) =
@@ -2624,6 +2671,117 @@ impl App {
         );
     }
 
+    /// v0.15: apply a "Set value" dialog entry to the control it belongs
+    /// to. `txt` is USER units (dB for volume/gain, -100..100 for pan, BPM,
+    /// 0..100 % for plugin params) — the 1:1 semantics the requirement
+    /// demands (typed -6 = -6 dB, NOT a MIDI position).
+    fn apply_user_value(&mut self, track: usize, target: &str, txt: &str) -> bool {
+        use crate::automation::*;
+        let Some(v) = value_user_parse(target, txt) else {
+            self.status = format!("set value: \u{201c}{txt}\u{201d} is not a number");
+            return false;
+        };
+        let track = track.min(self.n_tracks - 1);
+        match target {
+            TARGET_TRACK_VOL => {
+                // v came from value_user_parse: dB -> linear. Back to dB
+                // for the fader: typed -12 = -12 dB (0 = +0 dB).
+                let m = vol_midi(if v <= 0.0 { f32::NEG_INFINITY } else { 20.0 * v.log10() });
+                self.set_trk_vol(track, m);
+                self.levels_dirty = true;
+            }
+            TARGET_PSEUDO_GAIN => {
+                // v is linear (parse mapped dB -> linear); back to dB.
+                let db = if v <= 0.0 { -80.0 } else { 20.0 * v.log10() };
+                let m = (GAIN_UNITY_MIDI as f32 + db / 0.215).round().clamp(0.0, 127.0) as u8;
+                self.set_trk_gain(track, m);
+                self.levels_dirty = true;
+            }
+            TARGET_TRACK_PAN => {
+                self.set_trk_pan(track, (v * 127.0).round() as u8);
+                self.levels_dirty = true;
+            }
+            TARGET_TRACK_MUTE => {
+                let want_on = v < 0.5;
+                if self.backend.engine.track_on(track) != want_on {
+                    self.backend.cmd(Cmd::ToggleTrackOn { i: track });
+                }
+            }
+            TARGET_MASTER_VOL => {
+                self.master_midi =
+                    vol_midi(if v <= 0.0 { f32::NEG_INFINITY } else { 20.0 * v.log10() });
+                self.levels_dirty = true;
+            }
+            TARGET_MASTER_TEMPO => {
+                self.metro_bpm = format!("{:.0}", v.clamp(20.0, 300.0));
+                self.send_metro();
+                self.save_config();
+            }
+            t if t.starts_with("synth:") => {
+                let k: usize = t["synth:".len()..].parse().unwrap_or(0);
+                let Some(Some(h)) = self.track_synth_inst.get(track).cloned() else {
+                    self.status = "set value: this track has no instrument".into();
+                    return false;
+                };
+                match h.as_ref() {
+                    SynthHandle::Script(i) => i.set_param(k, v),
+                    SynthHandle::Vst(e) => e.set_param(k, v),
+                }
+                self.track_synth_params[track] = match h.as_ref() {
+                    SynthHandle::Script(i) => i.values(),
+                    SynthHandle::Vst(_) => self.track_synth_params[track].clone(),
+                };
+                self.save_config();
+            }
+            t if t.starts_with("fx:") => {
+                let rest = &t["fx:".len()..];
+                let Some((r, i)) = rest.split_once(':') else { return false };
+                let (Ok(r), Ok(i)) = (r.parse::<usize>(), i.parse::<usize>()) else {
+                    return false;
+                };
+                let applied = if let Some(ChainRow::Script { params, stem, .. }) =
+                    self.fx_rows[track].get_mut(r)
+                {
+                    if let Some(p) = params.get_mut(i) {
+                        *p = v;
+                        if let Some(Some(inst)) = self.fx_live[track].get(r).cloned() {
+                            inst.set_param(i, v);
+                        }
+                        let _ = stem;
+                        self.fx_save_pending = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else if let Some(ChainRow::Vst { entry: Some(e), params, .. }) =
+                    self.fx_rows[track].get_mut(r)
+                {
+                    e.set_param(i, v);
+                    if let Some(p) = params.get_mut(i) {
+                        *p = v;
+                    }
+                    self.fx_save_pending = true;
+                    true
+                } else {
+                    false
+                };
+                if !applied {
+                    self.status = "set value: chain slot not found".into();
+                    return false;
+                }
+            }
+            other => {
+                self.status = format!("set value: unknown target {other}");
+                return false;
+            }
+        }
+        let name =
+            if target == TARGET_PSEUDO_GAIN { "track gain".to_string() } else { describe_target(target) };
+        self.status =
+            format!("set {name} = {txt} {}", value_unit_label(target));
+        true
+    }
+
     /// Open the automation manager editing asset `k` (None = fresh curve).
     fn open_auto_editor(&mut self, k: Option<usize>) {
         let (name, target, len, nodes) = match k.and_then(|k| self.assets.get(k)).map(|a| a.automation.clone()) {
@@ -2633,19 +2791,50 @@ impl App {
                 a.len_samples,
                 a.nodes.clone(),
             ),
-            _ => (
-                "automation".into(),
-                crate::automation::TARGET_TRACK_VOL.to_string(),
-                (self.sample_rate.max(1) * 2) as i64,
-                vec![
-                    crate::automation::Node { t: 0, v: 1.0, s: crate::automation::Shape::Linear },
-                    crate::automation::Node {
-                        t: (self.sample_rate.max(1) * 2) as i64,
-                        v: 1.0,
-                        s: crate::automation::Shape::Linear,
-                    },
-                ],
-            ),
+            _ => {
+                // v0.15: a FRESH curve spans the SELECTED clips when any
+                // are selected, else the LONGEST track in the arrangement
+                // (the "same amount of measures" requirement).
+                let end_of = |c: &Clip| {
+                    c.pos as i64 + c.play_len.unwrap_or(0) as i64
+                };
+                let sel_end = self
+                    .sel_clips
+                    .iter()
+                    .filter_map(|(t, k2, c)| {
+                        self.arr.tracks.get(*t)?.lanes.get(*k2)?.clips.get(*c)
+                    })
+                    .map(end_of)
+                    .max()
+                    .unwrap_or(0);
+                let longest = self
+                    .arr
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.lanes.iter())
+                    .flat_map(|l| l.clips.iter())
+                    .map(end_of)
+                    .max()
+                    .unwrap_or(0);
+                let len = if sel_end > 0 {
+                    sel_end
+                } else {
+                    longest.max((self.sample_rate.max(1) * 2) as i64)
+                };
+                (
+                    "automation".into(),
+                    crate::automation::TARGET_TRACK_VOL.to_string(),
+                    len,
+                    vec![
+                        crate::automation::Node { t: 0, v: 1.0, s: crate::automation::Shape::Linear },
+                        crate::automation::Node {
+                            t: len,
+                            v: 1.0,
+                            s: crate::automation::Shape::Linear,
+                        },
+                    ],
+                )
+            }
         };
         self.auto_edit = Some(Box::new(AutoEdit {
             asset: k,
@@ -2656,6 +2845,8 @@ impl App {
             sel: 0,
             drag: None,
             changed: false,
+            rec: false,
+            rec_start: 0,
         }));
     }
 
@@ -2664,6 +2855,93 @@ impl App {
     /// are created by clicking, moved by dragging, deleted by right-click;
     /// the node editor shows ABSOLUTE values (seconds + the target's own
     /// units), never percentages, and every axis has numeric entry.
+    /// v0.15: the "select value" popup — a rendering of the selected
+    /// track, its mixer values and the header values, where EVERY
+    /// automatable value carries a translucent overlay button. Clicking
+    /// one binds the open automation curve to that value; the curve's
+    /// min/max rescale to the new output's limits automatically.
+    fn auto_pick_window(&mut self, ui: &mut egui::Ui) {
+        if !self.auto_pick_open || self.auto_edit.is_none() {
+            return;
+        }
+        let track = self.selected.min(self.n_tracks.saturating_sub(1));
+        let targets = auto_targets(self, track);
+        let mut pick: Option<(String, String)> = None;
+        let mut open = true;
+        egui::Window::new("Select value to automate")
+            .id(egui::Id::new("auto_pick"))
+            .default_pos([520.0, 160.0])
+            .default_width(360.0)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "track {} \u{b7} bpm {} \u{b7} master {} \u{b7} metro {} \u{b7} click the \
+                         overlay on the value this curve should drive",
+                        track + 1,
+                        self.metro_bpm,
+                        db_num(vol_amp(self.master_midi)),
+                        if self.metro_on { "on" } else { "off" },
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.separator();
+                for (id, label) in &targets {
+                    let frac = target_preview_frac(self, track, id);
+                    let full = ui.available_width();
+                    let (bar, _) = ui.allocate_at_least(egui::vec2(full, 20.0), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
+                    p.rect_filled(
+                        egui::Rect::from_min_size(
+                            bar.min,
+                            egui::vec2(bar.width() * frac.clamp(0.0, 1.0), bar.height()),
+                        ),
+                        2.0,
+                        Color32::from_rgb(96, 104, 132),
+                    );
+                    p.text(
+                        bar.min + egui::vec2(5.0, bar.height() / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(226, 226, 232),
+                    );
+                    // Translucent overlay ADDED LAST: it sits on top and
+                    // takes the click — the "semi-transparent button".
+                    let btn = ui.put(
+                        bar,
+                        egui::Button::new(RichText::new("").small())
+                            .fill(Color32::from_rgba_premultiplied(255, 120, 120, 24))
+                            .min_size(egui::vec2(full, 20.0)),
+                    );
+                    if btn.on_hover_text(format!("bind this curve to {label}")).clicked() {
+                        pick = Some((id.clone(), label.clone()));
+                    }
+                }
+            });
+        if let Some((id, label)) = pick {
+            if let Some(ed) = self.auto_edit.as_mut() {
+                // min/max follow the selected output: rescale the shape.
+                let (omin, omax) = crate::automation::target_range(&ed.target);
+                let (nmin, nmax) = crate::automation::target_range(&id);
+                for n in ed.nodes.iter_mut() {
+                    let f =
+                        ((n.v - omin) / (omax - omin).max(1e-9)).clamp(0.0, 1.0);
+                    n.v = nmin + f * (nmax - nmin);
+                }
+                ed.target = id;
+                ed.changed = true;
+            }
+            self.auto_pick_open = false;
+            self.status = format!("automation now drives {label}");
+        }
+        if !open {
+            self.auto_pick_open = false;
+        }
+    }
+
     fn auto_window(&mut self, ui: &mut egui::Ui) {
         use crate::automation::{Automation, Node, Shape};
         let Some(mut ed) = self.auto_edit.take() else { return };
@@ -2692,8 +2970,19 @@ impl App {
                         .width(240.0)
                         .show_ui(ui, |ui| {
                             for (id, label) in &targets {
+                                // v0.15: switching outputs RESCALES the
+                                // curve — the asset's min/max follow the
+                                // selected output's limits automatically.
+                                let (omin, omax) = crate::automation::target_range(&ed.target);
                                 if ui.selectable_value(&mut ed.target, id.clone(), label).changed()
                                 {
+                                    let (nmin, nmax) =
+                                        crate::automation::target_range(&ed.target);
+                                    for n in ed.nodes.iter_mut() {
+                                        let f = ((n.v - omin) / (omax - omin).max(1e-9))
+                                            .clamp(0.0, 1.0);
+                                        n.v = nmin + f * (nmax - nmin);
+                                    }
                                     ed.changed = true;
                                 }
                             }
@@ -2725,6 +3014,95 @@ impl App {
                             .weak()
                             .italics(),
                     );
+                });
+
+                // ---- v0.15: MIDI record sources -------------------------
+                // Pick any bindings configured in Settings -> MIDI
+                // Bindings. While this manager is open the picked bindings
+                // are MUTED in the main window (they never fire their
+                // action); with REC armed their raw moves draw the curve
+                // as a percentage of the target's range (0 = min,
+                // 127 = max: 0 -> -inf, 127 -> +6 dB on volume).
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("record:").weak());
+                    let mut any = false;
+                    for (i, bd) in self.midi_binds.iter().enumerate() {
+                        let Some(b) = bd else { continue };
+                        any = true;
+                        let mut on = self.auto_mgr_rec.iter().any(|(s, _)| *s == i);
+                        let tb = ui
+                            .toggle_value(
+                                &mut on,
+                                format!("{} \u{2190} {}", MidiAction::ALL[i].label(), b.label()),
+                            )
+                            .on_hover_text(if on {
+                                "MUTED in the main window while the automation manager is open \u{2014} \
+                                 its moves draw the curve instead"
+                            } else {
+                                "record this binding's moves into the curve"
+                            });
+                        if tb.changed() {
+                            if on {
+                                if !self.auto_mgr_rec.iter().any(|(s, _)| *s == i) {
+                                    self.auto_mgr_rec.push((i, *b));
+                                }
+                            } else {
+                                self.auto_mgr_rec.retain(|(s, _)| *s != i);
+                            }
+                        }
+                    }
+                    if !any {
+                        ui.label(
+                            RichText::new(
+                                "no MIDI bindings yet \u{2014} set them in Settings",
+                            )
+                            .weak()
+                            .italics(),
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let recbtn = ui.button(if ed.rec {
+                        RichText::new("\u{25a0} stop").strong()
+                    } else {
+                        RichText::new("\u{25cf} record").strong()
+                    });
+                    if recbtn.on_hover_text(
+                        "arm the manager recorder: raw knob moves from the picked bindings \
+                         become curve nodes (percent of the target's min/max range)",
+                    ).clicked()
+                    {
+                        if ed.rec {
+                            ed.rec = false;
+                        } else {
+                            ed.rec = true;
+                            ed.rec_start = self.backend.engine.pos() as i64;
+                            // Recording APPENDS (never clears): nothing the
+                            // user drew can be destroyed by arming a take.
+                            ed.changed = true;
+                            if !self.backend.engine.transport_on() {
+                                self.backend.cmd(Cmd::PlayAll);
+                            }
+                        }
+                    }
+                    if ed.rec {
+                        ui.label(
+                            RichText::new("recording \u{2014} move a picked binding")
+                                .weak()
+                                .italics(),
+                        );
+                    }
+                    if ui
+                        .button("Select value\u{2026}")
+                        .on_hover_text(
+                            "choose which value this curve drives: a rendering of the \
+                             track, its mixer, and the header values, each with a bind \
+                             overlay",
+                        )
+                        .clicked()
+                    {
+                        self.auto_pick_open = true;
+                    }
                 });
 
                 // ---- the curve canvas ------------------------------------
@@ -2854,6 +3232,30 @@ impl App {
                             ed.sel = at;
                             ed.drag = Some(at);
                             ed.changed = true;
+                        }
+                    }
+                }
+                // v0.15: arm the drag on PRESS-and-move. clicked() only
+                // fires on release-without-move, so a press straight into
+                // a drag used to move nothing at all.
+                // v0.15: arm the drag at PRESS time (directly on a node).
+                // clicked() only fires on release-without-move, so the old
+                // "arm on click" code never let a press flow into a drag.
+                let just_pressed =
+                    resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+                if just_pressed {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                            ed.sel = idx;
+                            ed.drag = Some(idx);
+                        }
+                    }
+                }
+                if resp.drag_started() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                            ed.sel = idx;
+                            ed.drag = Some(idx);
                         }
                     }
                 }
@@ -5580,6 +5982,56 @@ impl App {
                             // the same value; matching d1 later rejected every
                             // sweep message from controllers that re-use
                             // numbers mid-sweep.
+                            let mut mgr_muted = false;
+                            // v0.15 automation manager: a picked record
+                            // source is MUTED in the main window while the
+                            // manager is open; with REC armed its raw value
+                            // draws the curve (percent of the target range:
+                            // 0 = min = -inf, 127 = max = +6 dB on volume).
+                            let mgr_slot = self.auto_mgr_rec.iter().find(|(slot, b)| {
+                                if MidiAction::ALL[*slot].is_continuous() {
+                                    b.same_axis(&bind)
+                                } else {
+                                    *b == bind
+                                }
+                            });
+                            if mgr_slot.is_some() && self.auto_edit.is_some() {
+                                if let Some(ed) = self.auto_edit.as_mut() {
+                                    if ed.rec {
+                                        let raw = match &msg {
+                                            MidiMsg::ControlChange { value, .. } => Some(*value),
+                                            MidiMsg::NoteOn { velocity, .. } => Some(*velocity),
+                                            _ => None,
+                                        };
+                                        if let Some(raw) = raw {
+                                            let (rmin, rmax) =
+                                                crate::automation::target_range(&ed.target);
+                                            let v =
+                                                rmin + (raw as f32 / 127.0) * (rmax - rmin);
+                                            let trel = self
+                                                .backend
+                                                .engine
+                                                .pos()
+                                                .saturating_sub(ed.rec_start.max(0) as u64)
+                                                as i64;
+                                            let skip = ed.nodes.last().is_some_and(|last| {
+                                                (last.v - v).abs() < 1e-4
+                                                    && (trel - last.t)
+                                                        < (self.sample_rate.max(1) as i64 / 50)
+                                            });
+                                            if !skip {
+                                                ed.nodes.push(crate::automation::Node {
+                                                    t: trel,
+                                                    v,
+                                                    s: crate::automation::Shape::Linear,
+                                                });
+                                                ed.changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                mgr_muted = true;
+                            }
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
@@ -5627,6 +6079,56 @@ impl App {
                             // calibration so the control's full physical
                             // travel maps onto the full program range (and
                             // inverted wiring is corrected).
+                            let mut mgr_muted = false;
+                            // v0.15 automation manager: a picked record
+                            // source is MUTED in the main window while the
+                            // manager is open; with REC armed its raw value
+                            // draws the curve (percent of the target range:
+                            // 0 = min = -inf, 127 = max = +6 dB on volume).
+                            let mgr_slot = self.auto_mgr_rec.iter().find(|(slot, b)| {
+                                if MidiAction::ALL[*slot].is_continuous() {
+                                    b.same_axis(&bind)
+                                } else {
+                                    *b == bind
+                                }
+                            });
+                            if mgr_slot.is_some() && self.auto_edit.is_some() {
+                                if let Some(ed) = self.auto_edit.as_mut() {
+                                    if ed.rec {
+                                        let raw = match &msg {
+                                            MidiMsg::ControlChange { value, .. } => Some(*value),
+                                            MidiMsg::NoteOn { velocity, .. } => Some(*velocity),
+                                            _ => None,
+                                        };
+                                        if let Some(raw) = raw {
+                                            let (rmin, rmax) =
+                                                crate::automation::target_range(&ed.target);
+                                            let v =
+                                                rmin + (raw as f32 / 127.0) * (rmax - rmin);
+                                            let trel = self
+                                                .backend
+                                                .engine
+                                                .pos()
+                                                .saturating_sub(ed.rec_start.max(0) as u64)
+                                                as i64;
+                                            let skip = ed.nodes.last().is_some_and(|last| {
+                                                (last.v - v).abs() < 1e-4
+                                                    && (trel - last.t)
+                                                        < (self.sample_rate.max(1) as i64 / 50)
+                                            });
+                                            if !skip {
+                                                ed.nodes.push(crate::automation::Node {
+                                                    t: trel,
+                                                    v,
+                                                    s: crate::automation::Shape::Linear,
+                                                });
+                                                ed.changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                mgr_muted = true;
+                            }
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
@@ -5636,6 +6138,9 @@ impl App {
                                 _ => None,
                             };
                             for i in 0..N_ACTIONS {
+                                if mgr_muted {
+                                    break;
+                                }
                                 let Some(b) = self.midi_binds[i] else {
                                     continue;
                                 };
@@ -5783,6 +6288,8 @@ impl App {
         // flick reports PIXELS.
         let mut zoom_ln = 0.0f32;
         let mut pan = 0.0f32;
+        let bpm_rect = self.bpm_rect;
+        let mut rmb_bpm: Option<egui::Pos2> = None;
         // While the pointer sits over an open piano-roll canvas its
         // ctrl/alt-wheel gestures belong to the ROLL (time / row zoom) —
         // leave those events for `piano_roll_window`'s own router.
@@ -5797,6 +6304,17 @@ impl App {
             });
         ui.ctx().input_mut(|i| {
             i.events.retain(|e| match e {
+                egui::Event::PointerButton { button: egui::PointerButton::Secondary, pressed: true, pos, .. } => {
+                    // v0.15: right-click on the bpm box answers with the
+                    // automation menu, not the text-edit copy/paste menu —
+                    // swallow the press and open it ourselves.
+                    if bpm_rect.is_some_and(|r| r.contains(*pos)) {
+                        rmb_bpm = Some(*pos);
+                        false
+                    } else {
+                        true
+                    }
+                }
                 egui::Event::MouseWheel {
                     unit,
                     delta,
@@ -5837,6 +6355,11 @@ impl App {
         }
         if pan != 0.0 {
             self.hscroll = (self.hscroll - pan).max(0.0);
+        }
+        if let Some(pos) = rmb_bpm {
+            let cur = self.metro_bpm.trim().parse::<f32>().unwrap_or(self.bpm() as f32);
+            self.value_menu =
+                Some((self.selected, crate::automation::TARGET_MASTER_TEMPO.to_string(), cur, pos));
         }
 
         // Master volume: same -inf..=+6 dB MIDI mapping as every track.
@@ -5904,10 +6427,117 @@ impl App {
         }
         if self.auto_edit.is_some() {
             self.auto_window(ui);
+            self.auto_pick_window(ui);
         }
         let sw = self.synth_win;
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
+        }
+        self.value_popups(ui);
+    }
+
+    /// v0.15: the two right-click popups every automatable value answers
+    /// with — the desktop-style mini menu (for widgets that cannot host an
+    /// egui context menu: the bpm box, FX-script bridge sliders) and the
+    /// "Set value" dialog (1:1 user units).
+    fn value_popups(&mut self, ui: &mut egui::Ui) {
+        // ---- mini menu at the click point ----
+        if let Some((track, target, current, pos)) = self.value_menu.clone() {
+            // One frame after opening: the right-click that OPENED it must
+            // not also count as the click-away that closes it.
+            let armed = self.value_menu_armed;
+            self.value_menu_armed = true;
+            let mut done = false;
+            let resp = egui::Window::new(crate::automation::describe_target(&target))
+                .id(egui::Id::new("value_menu"))
+                .fixed_pos(pos)
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    let tgt = target.clone();
+                    done = value_menu_items(ui, self, track, &tgt, current);
+                });
+            if let Some(r) = resp {
+                let rect = r.response.rect;
+                let click_elsewhere = armed
+                    && ui.ctx().input(|i| {
+                        (i.pointer.button_clicked(egui::PointerButton::Primary)
+                            || i.pointer.button_clicked(egui::PointerButton::Secondary)
+                            || i.key_pressed(egui::Key::Escape))
+                            && !rect.expand(4.0)
+                                .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
+                    });
+                if done || click_elsewhere {
+                    self.value_menu = None;
+                    self.value_menu_armed = false;
+                }
+            }
+        } else {
+            self.value_menu_armed = false;
+        }
+        // ---- Set value dialog ----
+        if let Some((track, target, mut txt)) = self.value_dialog.clone() {
+            let unit = value_unit_label(&target);
+            let title = if target == TARGET_PSEUDO_GAIN {
+                "track gain".to_string()
+            } else {
+                crate::automation::describe_target(&target)
+            };
+            let mut apply = false;
+            let mut cancel = false;
+            let mut open = true;
+            egui::Window::new(format!("Set value \u{b7} {title}"))
+                .id(egui::Id::new("value_dialog"))
+                .default_pos([420.0, 300.0])
+                .default_size([280.0, 90.0])
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Value in {unit} \u{b7} Enter applies, Esc cancels"
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    let re = ui.add_sized(
+                        egui::vec2(240.0, 22.0),
+                        egui::TextEdit::singleline(&mut txt).font(egui::TextStyle::Monospace),
+                    );
+                    if self.value_dialog_focus {
+                        re.request_focus();
+                        self.value_dialog_focus = false;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    // Persist the LIVE edit buffer: egui writes the in-progress
+                    // text back into `txt` every frame, and the next frame
+                    // clones it fresh from self.value_dialog — without storing
+                    // it here, each keystroke would be reset before the next.
+                    if let Some(d) = self.value_dialog.as_mut() {
+                        d.2 = txt.clone();
+                    }
+                    if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            if apply {
+                if self.apply_user_value(track, &target, &txt) {
+                    self.value_dialog = None;
+                }
+            } else if cancel || !open {
+                self.value_dialog = None;
+            }
         }
     }
 }
@@ -5947,7 +6577,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
             };
             ui.heading(RichText::new(title).strong());
             let status = match &app.client_name {
-                Some(name) => format!("{} @ {} Hz", name, app.sample_rate),
+                Some(_) => format!("{} Hz \u{b7} {}", app.sample_rate, app.status),
                 None => app.status.clone(),
             };
             ui.label(RichText::new(status).weak());
@@ -6007,7 +6637,8 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                         .horizontal_align(egui::Align::Center)
                         .font(egui::TextStyle::Monospace),
                 )
-                .on_hover_text("Grid tempo 20..300 BPM. Press Enter to apply.");
+                .on_hover_text("Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.");
+            app.bpm_rect = Some(bpm_rt.rect);
             if bpm_rt.lost_focus() {
                 app.send_metro();
             }
@@ -6105,47 +6736,149 @@ fn nearest_auto_node(
     best.map(|(_, i)| i)
 }
 
-/// v0.11 R5: the right-click menu shared by every automatable widget
-/// (mixer levels, mute, master, tempo, script synth parameters).
-/// "Record" arms a write take with this target pre-set; "flat" drops an
-/// instant constant curve at the current value onto the track's playhead.
-fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) {
-    let armed = app.auto_rec.iter().any(|r| r.armed);
+/// v0.15: the right-click menu shared by every automatable widget (mixer
+/// levels, mute, master, tempo, synth / chain parameters) — exactly two
+/// actions, like a desktop context menu: "Set value" (typed 1:1 in the
+/// target's USER unit, replacing the old always-on text box) and "Create
+/// automation asset" (a flat curve at the current value, editable later in
+/// the automation manager).
+fn value_menu_items(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) -> bool {
     if ui
-        .button(format!("\u{25cf} Record automation of {}", crate::automation::describe_target(target)))
-        .on_hover_text("Arms write automation on this track and starts the transport: every move of this control becomes a curve node.")
+        .button(format!("Set value   [{}]", value_user_display(target, current)))
+        .on_hover_text(format!(
+            "Type an exact value ({}). Enter applies. Volume is dB: 0 = +0 dB, -20 = -20 dB.",
+            value_unit_label(target)
+        ))
         .clicked()
     {
-        if armed {
-            ui.label("already recording \u{2014} stop it first");
-            return;
-        }
-        for r in app.auto_rec.iter_mut() {
-            r.armed = false;
-        }
-        app.auto_rec[track] = AutoRecState {
-            armed: true,
-            target: Some(target.to_string()),
-            start: app.backend.engine.pos(),
-            nodes: vec![crate::automation::Node { t: 0, v: current, s: crate::automation::Shape::Linear }],
-        };
-        if !app.backend.engine.transport_on() {
-            app.backend.cmd(Cmd::PlayAll);
-        }
-        app.status = format!(
-            "track {}: recording automation of {}",
-            track + 1,
-            crate::automation::describe_target(target)
-        );
+        app.value_dialog =
+            Some((track, target.to_string(), value_user_display(target, current)));
+        app.value_dialog_focus = true;
         ui.close();
+        return true;
     }
     if ui
-        .button(format!("\u{2500} Flat asset at {current:.3}"))
-        .on_hover_text("Create an automation asset holding this exact value; edit its curve later in the automation manager.")
+        .button("Create automation asset")
+        .on_hover_text(
+            "Create a red automation asset holding this exact value and place it at the \
+             playhead; edit its curve any time in the automation manager.",
+        )
         .clicked()
     {
         app.create_flat_auto_asset(track, target, current);
         ui.close();
+        return true;
+    }
+    false
+}
+
+/// Rough current position of a target, 0..1, for the bind popup's faux
+/// strips (display only — the popup binds by TARGET ID, not by this).
+fn target_preview_frac(app: &App, track: usize, id: &str) -> f32 {
+    use crate::automation::*;
+    let g = |v: &[u8]| v.get(track).map(|m| *m as f32 / 127.0).unwrap_or(0.5);
+    match id {
+        TARGET_TRACK_VOL => g(&app.trk_vol),
+        TARGET_PSEUDO_GAIN => g(&app.trk_gain),
+        TARGET_TRACK_PAN => g(&app.trk_pan),
+        TARGET_TRACK_MUTE => {
+            if app.backend.engine.track_on(track) {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        TARGET_MASTER_VOL => app.master_midi as f32 / 127.0,
+        TARGET_MASTER_TEMPO => {
+            let bpm: f32 = app.metro_bpm.trim().parse().unwrap_or(120.0);
+            ((bpm - 20.0) / 280.0).clamp(0.0, 1.0)
+        }
+        _ => {
+            // synth:/fx: rows — read the live value when reachable.
+            if let Some(rest) = id.strip_prefix("synth:") {
+                let k: usize = rest.parse().unwrap_or(0);
+                return app
+                    .track_synth_params
+                    .get(track)
+                    .and_then(|p| p.get(k).copied())
+                    .unwrap_or(0.5);
+            }
+            if let Some(rest) = id.strip_prefix("fx:") {
+                let mut it = rest.split(':');
+                if let (Some(r), Some(i)) = (it.next().and_then(|v| v.parse::<usize>().ok()), it.next().and_then(|v| v.parse::<usize>().ok())) {
+                    if let Some(ChainRow::Script { params, .. }) =
+                        app.fx_rows.get(track).and_then(|rows| rows.get(r))
+                    {
+                        return params.get(i).copied().unwrap_or(0.5);
+                    }
+                }
+            }
+            0.5
+        }
+    }
+}
+
+/// Legacy name kept for existing call sites.
+fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) {
+    let _ = value_menu_items(ui, app, track, target, current);
+}
+
+/// Unit label a "Set value" dialog shows for a target.
+fn value_unit_label(target: &str) -> &'static str {
+    match target {
+        crate::automation::TARGET_TRACK_VOL
+        | crate::automation::TARGET_MASTER_VOL
+        | TARGET_PSEUDO_GAIN => "dB",
+        crate::automation::TARGET_TRACK_PAN => "-100..+100",
+        crate::automation::TARGET_MASTER_TEMPO => "BPM",
+        crate::automation::TARGET_TRACK_MUTE => "0 / 1",
+        _ => "%",
+    }
+}
+
+/// Pseudo-target id for the manual-only gain trim (no automation domain).
+const TARGET_PSEUDO_GAIN: &str = "track.gain";
+
+/// Internal target value -> user-unit display string (volume/gain in dB so
+/// typing 0 means +0 dB; plugin/synth params in 0..100 %).
+fn value_user_display(target: &str, v: f32) -> String {
+    use crate::automation::*;
+    match target {
+        TARGET_TRACK_VOL | TARGET_MASTER_VOL | TARGET_PSEUDO_GAIN => db_num(v),
+        TARGET_TRACK_PAN => format!("{}", (v * 200.0 - 100.0).round() as i32),
+        TARGET_MASTER_TEMPO => format!("{v:.0}"),
+        TARGET_TRACK_MUTE => format!("{v:.0}"),
+        _ => format!("{:.1}", v * 100.0),
+    }
+}
+
+/// Parse a user-entered value into the target's INTERNAL unit. Volume/gain
+/// are typed in dB (0 dB -> 1.0 linear, -20 -> 0.1, "-inf" -> 0); pan in
+/// -100..+100; tempo raw BPM; plugin/synth params in 0..100 percent.
+fn value_user_parse(target: &str, s: &str) -> Option<f32> {
+    use crate::automation::*;
+    let t: String = s.trim().to_ascii_lowercase().replace('\u{2212}', "-");
+    let t = t.strip_suffix("db").unwrap_or(&t).trim().to_string();
+    match target {
+        TARGET_TRACK_VOL | TARGET_MASTER_VOL | TARGET_PSEUDO_GAIN => {
+            if t == "-inf" {
+                return Some(0.0);
+            }
+            let db: f32 = t.parse().ok()?;
+            if !db.is_finite() {
+                return None;
+            }
+            Some(10f32.powf(db / 20.0).clamp(0.0, 2.0))
+        }
+        TARGET_TRACK_PAN => {
+            let p: f32 = t.parse().ok()?;
+            Some(((p.clamp(-100.0, 100.0) + 100.0) / 200.0).clamp(0.0, 1.0))
+        }
+        TARGET_MASTER_TEMPO | TARGET_TRACK_MUTE => t.parse().ok(),
+        _ => {
+            let p: f32 = t.parse().ok()?;
+            Some((p / 100.0).clamp(0.0, 1.0))
+        }
     }
 }
 
@@ -6541,56 +7274,53 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
 /// level with its track, and clips/waveforms get the grid's full height.
 /// Master output section at the TOP of the mixer dock — it lives in the
 /// band between the panel header and the Track 1 strip (level with the
-/// timeline grid header). ONE compact row: "master" label, peak meter,
-/// editable dB text box, slider, raw MIDI readout and a "0" zeroize
-/// button — the band is only ~30 px tall, so a second row would spill
-/// onto Track 1's widgets (a two-row version did: click stealing). The
-/// scratch edit lives in `lv_edit` under the sentinel track index so it
-/// can't collide with a track.
+/// timeline grid header). ONE compact row: "master" label, slider, dB
+/// readout, "0" zeroize and the peak meter — the band is only ~30 px
+/// tall, so a second row would spill onto Track 1's widgets (a two-row
+/// version did: click stealing). v0.15: the dB text box became a plain
+/// readout; exact entry moved to right-click → Set value.
 fn master_strip(ui: &mut egui::Ui, app: &mut App) {
-    const MASTER_IDX: usize = usize::MAX;
     ui.spacing_mut().item_spacing.x = 5.0;
     ui.label(RichText::new("master").strong().small());
     {
-        let mut mtxt = app
-            .lv_edit
-            .get(&(KIND_VOL, MASTER_IDX))
-            .cloned()
-            .unwrap_or_else(|| db_num(vol_amp(app.master_midi)));
-        let mrt = ui
-            .add(
-                egui::TextEdit::singleline(&mut mtxt)
-                    .desired_width(46.0)
-                    .horizontal_align(egui::Align::Center)
-                    .font(egui::TextStyle::Monospace),
-            )
-            .on_hover_text("Master level in dB (e.g. -6.5). Press Enter to apply.");
-        if mrt.has_focus() {
-            app.lv_edit.insert((KIND_VOL, MASTER_IDX), mtxt.clone());
-        } else {
-            app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
-        }
-        if mrt.lost_focus() && ui.input(|u| u.key_pressed(egui::Key::Enter)) {
-            if let Some(v) = level_parse(KIND_VOL, &mtxt) {
-                app.master_midi = v;
-                app.levels_dirty = true;
-            }
-            app.lv_edit.remove(&(KIND_VOL, MASTER_IDX));
-        }
+        // v0.15: no text box — right-click opens Set value / Create
+        // automation asset, matching every other automatable value.
         let mut mv = app.master_midi as i16;
-        if ui
+        let msl = ui
             .add_sized(
                 egui::vec2(44.0, 18.0),
                 Slider::new(&mut mv, 0..=127).show_value(false),
             )
-            .on_hover_text("Master volume: -inf .. +6 dB")
-            .changed()
-        {
+            .on_hover_text("Master volume: -inf .. +6 dB. Right-click for exact entry and automation.");
+        let mvr = ui
+            .add_sized(
+                egui::vec2(50.0, 18.0),
+                egui::Label::new(
+                    RichText::new(format!("{:>5}", db_num(vol_amp(app.master_midi))))
+                        .monospace()
+                        .small(),
+                )
+                .selectable(false)
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text("dB");
+        if msl.changed() {
             app.master_midi = mv.clamp(0, 127) as u8;
             let amp = vol_amp(app.master_midi);
             app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
             app.levels_dirty = true;
         }
+        let mmenu = |ui: &mut egui::Ui, app: &mut App| {
+            auto_menu(
+                ui,
+                app,
+                app.selected,
+                crate::automation::TARGET_MASTER_VOL,
+                vol_amp(app.master_midi),
+            )
+        };
+        msl.context_menu(|ui| mmenu(ui, app));
+        mvr.context_menu(|ui| mmenu(ui, app));
         if ui
             .small_button(RichText::new("0").monospace())
             .on_hover_text("Reset master volume to 0 dB")
@@ -6697,6 +7427,13 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
                             .layout(egui::Layout::top_down(egui::Align::Min)),
                         |ui| mixer_strip(ui, app, t),
                     );
+                    // v0.15: hairline under each strip — consecutive
+                    // strips used to melt into one wall of controls.
+                    ui.painter().hline(
+                        r.x_range(),
+                        r.max.y + TRACK_SEP_HIT * 0.5,
+                        egui::Stroke::new(1.0, Color32::from_gray(48)),
+                    );
                 }
                 y += th + TRACK_SEP_HIT;
             }
@@ -6715,7 +7452,7 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
     ui.horizontal(|ui| {
         let head = ui
             .selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong())
-            .on_hover_text("Click to select \u{b7} right-click this track's grid clears its clips");
+            .on_hover_text("Click to select \u{b7} right-click this track's grid for its menu (copy / paste / clear)");
         if head.clicked() {
             app.selected = t;
         }
@@ -6734,14 +7471,22 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         {
             app.toggle_record(t);
         }
-        if ui
+        let mute_resp = ui
             .small_button(if on { "on" } else { "mute" })
             .on_hover_text(
                 "While the transport runs, a muted track contributes nothing \
-                 (its clips stay on the timeline)",
-            )
-            .clicked()
-        {
+                 (its clips stay on the timeline). Right-click for automation.",
+            );
+        mute_resp.context_menu(|ui| {
+            auto_menu(
+                ui,
+                app,
+                t,
+                crate::automation::TARGET_TRACK_MUTE,
+                if on { 0.0 } else { 1.0 },
+            );
+        });
+        if mute_resp.clicked() {
             // v0.11 R5: mute rides automation too (1 = muted).
             app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 0.0 } else { 1.0 });
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
@@ -6896,6 +7641,9 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
 /// actions, loop and zoom.
 fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
     ui.horizontal(|ui| {
+        // v0.15: this row is dense — give the toggles/combos a real gutter
+        // so "…new recordings" and "quantize" stop running together.
+        ui.spacing_mut().item_spacing.x = 8.0;
         if ui
             .button(RichText::new("\u{270e} Automation").strong())
             .on_hover_text(
@@ -8010,17 +8758,98 @@ fn lane_row(
             }
         }
     }
-    // Right-click anywhere in the track's grid clears its clips — the old
-    // header gesture (headers moved to the mixer). Read from the global
-    // pointer state: 0.36 has no secondary-only Sense, and a click-sensing
-    // overlay would steal primary clicks from the widgets underneath.
-    let rmb = ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
-    if rmb
-        && ui
-            .input(|i| i.pointer.hover_pos())
-            .is_some_and(|p| rect.contains(p))
-    {
+    // v0.15: right-click opens a menu — clip actions on a clip, track
+    // actions on empty grid. The old "right-click anywhere clears this
+    // track" gesture destroyed a whole track on one accidental press and
+    // blocked every discovery path a context menu should own.
+    resp.clone().context_menu(|ui| {
+        grid_context_menu(ui, app, t, k, &clips, rect, x0, sr, px);
+    });
+}
+
+/// v0.15: the grid right-click menu. On a clip: Copy / Cut / Duplicate /
+/// Delete (operating on the selection — the clip is selected first if it
+/// is not part of it). On empty grid: Paste here. Both: Select all and an
+/// explicit (safe) "Clear this track".
+fn grid_context_menu(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    t: usize,
+    k: usize,
+    clips: &[(Clip, String)],
+    rect: egui::Rect,
+    x0: f32,
+    sr: f64,
+    px: f64,
+) {
+    let hit: Option<usize> = ui
+        .input(|i| i.pointer.interact_pos())
+        .filter(|p| rect.contains(*p))
+        .and_then(|p| {
+            let pos = s_at(x0, p.x, sr, px);
+            clips
+                .iter()
+                .position(|(c, _)| pos >= c.pos && pos < c.end(app.asset_len(c.asset)))
+        });
+    if let Some(ci) = hit {
+        let id = (t, k, ci);
+        if !app.is_sel(id) {
+            app.select_one(id);
+        }
+        if ui.button("Copy  (Ctrl+C)").clicked() {
+            app.clipboard_copy();
+            ui.close();
+        }
+        if ui.button("Cut  (Ctrl+X)").clicked() {
+            app.clipboard_copy();
+            app.delete_selection();
+            ui.close();
+        }
+        if ui.button("Duplicate  (Ctrl+D)").clicked() {
+            app.duplicate_selection();
+            ui.close();
+        }
+        if ui.button("Delete  (Del)").clicked() {
+            app.delete_selection();
+            ui.close();
+        }
+        if app.assets.get(clips[ci].0.asset as usize).is_some_and(|a| a.is_auto())
+            && ui.button("Edit automation curve").clicked()
+        {
+            app.open_auto_editor(Some(clips[ci].0.asset as usize));
+            ui.close();
+        }
+        ui.separator();
+    } else {
+        let has = app.clipboard.is_some();
+        let mut pasted = false;
+        ui.add_enabled_ui(has, |ui| {
+            if ui
+                .button("Paste here  (Ctrl+V)")
+                .on_hover_text(if has {
+                    "Pastes at the playhead on this track (child lanes open when busy)"
+                } else {
+                    "clipboard is empty \u{2014} Copy a clip first"
+                })
+                .clicked()
+            {
+                app.last_click_track = Some(t);
+                app.clipboard_paste();
+                pasted = true;
+            }
+        });
+        if pasted {
+            ui.close();
+        }
+        ui.separator();
+    }
+    if ui.button("Select all clips").clicked() {
+        app.select_all_clips();
+        ui.close();
+    }
+    if ui.button("Clear this track's clips").clicked() {
         app.clear_track(t);
+        ui.close();
     }
 }
 
@@ -8225,79 +9054,59 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         _ => app.trk_pan[i],
     };
     let hover = match kind {
-        KIND_VOL => "Track playback volume: -inf…+6 dB (0 dB = three-quarters). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
-        KIND_GAIN => "Track gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
-        _ => "Track pan: -100 = hard left, 0 = centre, +100 = hard right (equal power across the L/R outputs). The number at the right is the raw MIDI value. Bind it to a MIDI knob in Settings → MIDI bindings → per track.",
+        KIND_VOL => "Track playback volume: -inf…+6 dB (0 dB = three-quarters). Right-click for exact entry and automation.",
+        KIND_GAIN => "Track gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Right-click for exact entry.",
+        _ => "Track pan: -100 = hard left, 0 = centre, +100 = hard right. Right-click for exact entry and automation.",
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(RichText::new(label).monospace().small());
-        // Editable value box (number only), centred text, flush against the
-        // slider.
-        let key = (kind, i);
-        let mut txt = app
-            .lv_edit
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| level_display(kind, midi));
-        let rt = ui
-            .add(
-                egui::TextEdit::singleline(&mut txt)
-                    .desired_width(46.0)
-                    .horizontal_align(egui::Align::Center)
-                    .font(egui::TextStyle::Monospace),
-            )
-            .on_hover_text(match kind {
-                KIND_PAN => "Pan position -100..=100 (0 = centre). Press Enter to apply.",
-                _ => "Level in dB (e.g. -6.5). Press Enter to apply.",
-            });
-        // The unit is plain text outside the box — the box holds numbers
-        // only, so typing never has to fight the "dB" suffix.
-        if kind != KIND_PAN {
-            ui.add(
-                egui::Label::new(RichText::new("dB").monospace().weak().small()).selectable(false),
-            );
-        }
-        if rt.has_focus() {
-            app.lv_edit.insert(key, txt.clone());
-        } else {
-            app.lv_edit.remove(&key);
-        }
-        if rt.lost_focus() && ui.input(|u| u.key_pressed(egui::Key::Enter)) {
-            if let Some(v) = level_parse(kind, &txt) {
-                match kind {
-                    KIND_VOL => app.set_trk_vol(i, v),
-                    KIND_GAIN => app.set_trk_gain(i, v),
-                    _ => app.set_trk_pan(i, v),
-                }
-                app.levels_dirty = true;
-            }
-            app.lv_edit.remove(&key);
-        }
-        // Slider: raw MIDI range, no value bubble (the box shows the value).
-        // Sized to the text box's height so the slider track sits exactly at
-        // the text's vertical centre — the rows were misaligned when the
-        // slider kept its own taller default height. Leave room for the
-        // raw-value readout and the reset button.
+        // v0.15: the editable text box is GONE — right-click (slider OR
+        // value) opens Set value / Create automation asset. Fixed-width
+        // label + value columns keep every slider the same length, so the
+        // three tracks of a strip line up (they never did with boxes whose
+        // text made rows differ).
+        ui.add_sized(
+            egui::vec2(30.0, 18.0),
+            egui::Label::new(RichText::new(label).monospace().small()).selectable(false),
+        );
         let mut v = midi;
-        let sw = (ui.available_width() - if kind == KIND_PAN { 56.0 } else { 76.0 }).max(30.0);
-        let bh = rt.rect.height();
+        let sw = (ui.available_width() - 86.0).max(30.0);
         let r = ui
             .add_sized(
-                egui::vec2(sw, bh),
+                egui::vec2(sw, 18.0),
                 Slider::new(&mut v, 0..=127).show_value(false),
             )
             .on_hover_text(hover);
-        // v0.11 R5: right-click = automation menu (vol/pan; gain stays
-        // manual-only — it is a trim, and volume already covers it).
-        if kind != KIND_GAIN {
-            let (tgt, cur) = if kind == KIND_VOL {
-                (crate::automation::TARGET_TRACK_VOL, vol_amp(midi))
-            } else {
-                (crate::automation::TARGET_TRACK_PAN, pan01(midi))
-            };
-            r.clone().context_menu(|ui| auto_menu(ui, app, i, tgt, cur));
-        }
+        let vr = ui.add_sized(
+            egui::vec2(52.0, 18.0),
+            egui::Label::new(
+                RichText::new(if kind == KIND_PAN {
+                    format!("{:>4}", pan_text(midi))
+                } else {
+                    format!(
+                        "{:>5}",
+                        db_num(match kind {
+                            KIND_VOL => vol_amp(midi),
+                            KIND_GAIN => gain_amp(midi),
+                            _ => 1.0,
+                        })
+                    )
+                })
+                .monospace()
+                .small(),
+            )
+            .selectable(false)
+            .sense(egui::Sense::click()),
+        );
+        ui.add(
+            egui::Label::new(
+                RichText::new(if kind == KIND_PAN { "" } else { "dB" })
+                    .monospace()
+                    .weak()
+                    .small(),
+            )
+            .selectable(false),
+        );
         if r.changed() {
             match kind {
                 KIND_VOL => app.set_trk_vol(i, v),
@@ -8306,11 +9115,40 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
             }
             app.levels_dirty = true;
         }
-        ui.add(
-            egui::Label::new(RichText::new(format!("{v:>3}")).monospace().weak().small())
-                .selectable(false),
-        )
-        .on_hover_text("Raw MIDI value (0..=127) sent by a bound knob.");
+        // v0.15: right-click either the slider or its value readout — both
+        // answer the automation menu (vol/pan; gain is a manual trim).
+        let menu = |ui: &mut egui::Ui, app: &mut App| match kind {
+            KIND_VOL => auto_menu(
+                ui,
+                app,
+                i,
+                crate::automation::TARGET_TRACK_VOL,
+                vol_amp(midi),
+            ),
+            KIND_GAIN => {
+                if ui
+                    .button(format!(
+                        "Set value   [{} dB]",
+                        db_num(gain_amp(midi)).trim_start_matches('+')
+                    ))
+                    .clicked()
+                {
+                    app.value_dialog =
+                        Some((i, TARGET_PSEUDO_GAIN.to_string(), db_num(gain_amp(midi))));
+                    app.value_dialog_focus = true;
+                    ui.close();
+                }
+            }
+            _ => auto_menu(
+                ui,
+                app,
+                i,
+                crate::automation::TARGET_TRACK_PAN,
+                pan01(midi),
+            ),
+        };
+        r.context_menu(|ui| menu(ui, app));
+        vr.context_menu(|ui| menu(ui, app));
         // Reset this strip straight to its "0" position.
         if ui
             .small_button(RichText::new("0").monospace())
@@ -9955,7 +10793,7 @@ mod tests {
     /// Drives the real egui DnD plugin end to end — this is the regression
     /// test for "dragging from the rack dropped nothing".
     #[test]
-    fn rack_drag_drops_a_clip_and_header_rmb_clears() {
+    fn rack_drag_drops_a_clip_and_grid_rmb_menus() {
         let mut app = headless_app("drop");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]); // layout pass
@@ -10018,29 +10856,26 @@ mod tests {
             "clip placed on track 2 \u{b7} track \u{b7} drag its edges to trim"
         );
 
-        // Right-click the Track-1 header (probe the small header band): it
-        // must clear the clip.
-        let mut cleared = false;
-        // Right-click now lives on the track's grid strip (headers moved to
-        // the mixer): sweep the drop lane's vertical neighbourhood.
-        for y in (214..=300).step_by(3) {
-            let p = egui::pos2(500.0, y as f32);
-            frame(
-                &mut app,
-                &ctx,
-                vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
-            );
-            frame(
-                &mut app,
-                &ctx,
-                vec![btn(p, egui::PointerButton::Secondary, false)],
-            );
-            if total(&app) == 0 {
-                cleared = true;
-                break;
-            }
+        // v0.15: right-clicking the grid no longer destroys the track — it
+        // opens the clip menu, and deletion moved behind an explicit item.
+        let p = egui::pos2(500.0, 240.0);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+        assert_eq!(total(&app), 1, "right-click kept the clips (no more instant clear)");
+        // Right on the clip body: the clip menu opens.
+        if galley_at(&mut app, &ctx, "Duplicate").is_some() {
+            let del = galley_at(&mut app, &ctx, "Delete").expect("Delete item").center();
+            frame(&mut app, &ctx, vec![moved(del), btn(del, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(del, egui::PointerButton::Primary, false)]);
+            assert_eq!(total(&app), 0, "menu Delete removed the clip");
+        } else {
+            // Right-click landed on empty grid: the track menu with an
+            // explicit Clear item must be there instead.
+            let cl = galley_at(&mut app, &ctx, "Clear this track").expect("Clear item").center();
+            frame(&mut app, &ctx, vec![moved(cl), btn(cl, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(cl, egui::PointerButton::Primary, false)]);
+            assert_eq!(total(&app), 0, "menu Clear emptied the track");
         }
-        assert!(cleared, "right-click on the track header cleared its clips");
     }
 
     #[test]
@@ -10621,11 +11456,13 @@ mod tests {
         assert_eq!(app.preview_secs_f(), 600.0, "clamped");
     }
 
-    /// Master volume grew the per-track row widgets: an editable dB box
-    /// and a "0" zeroize button resetting to 0 dB.
+    /// v0.15 pin: the master row's dB text box is gone (a plain readout
+    /// now); right-click answers the two-item menu, and "Set value" opens
+    /// the dialog that applies 1:1 dB (typed -12 = -12 dB). The "0"
+    /// zeroize button still resets to 0 dB.
     #[test]
-    fn master_volume_has_text_box_and_zero_button() {
-        let mut app = headless_app("mastervol");
+    fn v15_ui_master_set_value_dialog() {
+        let mut app = headless_app("v15mastervol");
         let ctx = egui::Context::default();
         app.master_midi = 50;
         frame(&mut app, &ctx, vec![]);
@@ -10633,44 +11470,293 @@ mod tests {
         // master strip — panels draw in add order and the master strip
         // precedes every track strip inside the mixer.
         let z = label_center(&mut app, &ctx, "0").expect("a \"0\" button is painted");
-        frame(
-            &mut app,
-            &ctx,
-            vec![moved(z), btn(z, egui::PointerButton::Primary, true)],
-        );
-        frame(
-            &mut app,
-            &ctx,
-            vec![btn(z, egui::PointerButton::Primary, false)],
-        );
-        assert_eq!(
-            app.master_midi, VOL_UNITY_MIDI,
-            "zeroize resets master to 0 dB"
+        frame(&mut app, &ctx, vec![moved(z), btn(z, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(z, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.master_midi, VOL_UNITY_MIDI, "zeroize resets master to 0 dB");
+
+        // Right-click the dB readout: the two-item menu opens.
+        let want = format!("{:>5}", db_num(vol_amp(app.master_midi)));
+        let cp = label_center(&mut app, &ctx, &want)
+            .expect("master dB readout is painted")
+            .to_vec2();
+        let p = egui::pos2(cp.x, cp.y);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+        let sv = galley_at(&mut app, &ctx, "Set value").expect("Set value item is painted");
+        assert!(
+            galley_at(&mut app, &ctx, "Create automation asset").is_some(),
+            "the menu also offers Create automation asset"
         );
 
-        // Editable box: click exactly on the painted dB value, type, commit.
-        let want = db_num(vol_amp(app.master_midi));
-        let p = label_center(&mut app, &ctx, &want).expect("master volume box is painted");
-        frame(
-            &mut app,
-            &ctx,
-            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
-        );
-        frame(
-            &mut app,
-            &ctx,
-            vec![btn(p, egui::PointerButton::Primary, false)],
-        );
-        frame(&mut app, &ctx, vec![egui::Event::Text("9".into())]);
-        assert!(
-            app.lv_edit.contains_key(&(KIND_VOL, usize::MAX)),
-            "click+type holds a scratch edit on the master box"
-        );
+        // Clicking Set value opens the dialog bound to master.vol.
+        let sv = sv.center();
+        frame(&mut app, &ctx, vec![moved(sv), btn(sv, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(sv, egui::PointerButton::Primary, false)]);
+        assert!(app.value_dialog.is_some(), "Set value opens the dialog");
+        assert_eq!(app.value_dialog.as_ref().unwrap().1, "master.vol");
+
+        // Type -12 and commit: 1:1 dB semantics (NOT MIDI 12, NOT -12/127).
         type_into_focused(&mut app, &ctx, "-12");
+        assert_eq!(app.master_midi, vol_midi(-12.0), "typed dB value applies to master 1:1");
+        assert!(app.value_dialog.is_none(), "dialog closes on apply");
+    }
+
+    /// v0.15: a fresh automation curve spans the SELECTED clips, else the
+    /// longest track in the arrangement.
+    #[test]
+    fn v15_auto_open_spans_selection_then_longest_track() {
+        let mut app = headless_app("v15autolen");
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        let mk = |pos: u64, len: u64| Clip {
+            asset: a,
+            pos,
+            cut: 0,
+            play_len: Some(len),
+            gain: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+        };
+        app.arr.insert(0, 0, mk(0, 192_000));
+        app.arr.insert(1, 0, mk(0, 48_000));
+        app.open_auto_editor(None);
         assert_eq!(
-            app.master_midi,
-            vol_midi(-12.0),
-            "typed dB value applies to master"
+            app.auto_edit.as_ref().unwrap().len_samples as i64,
+            192_000,
+            "fresh curve spans the LONGEST track"
+        );
+        app.auto_edit = None;
+        app.select_one((1, 0, 0));
+        app.open_auto_editor(None);
+        assert_eq!(
+            app.auto_edit.as_ref().unwrap().len_samples as i64,
+            48_000,
+            "with a selection the curve spans the SELECTED clip"
+        );
+    }
+
+    /// v0.15 pin: pressing on a node and dragging MOVES it (the old code
+    /// armed the drag only on clicked(), which never fires once you move).
+    #[test]
+    fn v15_auto_canvas_press_drag_moves_node() {
+        let mut app = headless_app("v15autodrag");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.open_auto_editor(None);
+        frame(&mut app, &ctx, vec![]);
+        let n0 = app.auto_edit.as_ref().unwrap().nodes.len();
+        // Find the curve canvas: a click inside adds exactly one node.
+        let mut cp = None;
+        'outer: for y in (380i32..=560).step_by(6) {
+            for x in (260i32..=700).step_by(40) {
+                let p = egui::pos2(x as f32, y as f32);
+                frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+                frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+                let n = app.auto_edit.as_ref().unwrap().nodes.len();
+                if n == n0 + 1 {
+                    cp = Some(p);
+                    break 'outer;
+                }
+                // Undo a hit that landed on a node instead (selects, no add).
+                assert!(n == n0, "click never deletes nodes");
+            }
+        }
+        let p = cp.expect("automation canvas is clickable (adds a node)");
+        let before_t = {
+            let ed = app.auto_edit.as_ref().unwrap();
+            ed.nodes[ed.sel].t
+        };
+        // Press on that spot (a node now sits there) and DRAG right.
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        for dx in [12, 30, 60] {
+            frame(&mut app, &ctx, vec![moved(egui::pos2(p.x + dx as f32, p.y))]);
+        }
+        let end = egui::pos2(p.x + 60.0, p.y);
+        frame(&mut app, &ctx, vec![btn(end, egui::PointerButton::Primary, false)]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.nodes.len(), n0 + 1, "the drag moved the node, added none");
+        let moved_t = ed.nodes[ed.sel].t;
+        assert!(
+            moved_t > before_t + 1000,
+            "press-drag slid the node right: {before_t} -> {moved_t}"
+        );
+    }
+
+    /// v0.15: picked bindings are MUTED in the main window while the
+    /// manager is open, and with REC armed their raw values draw the curve
+    /// as PERCENT of the target's limits (0 = -inf, 127 = +6 dB).
+    #[test]
+    fn v15_auto_mgr_rec_mutes_and_scales_percent() {
+        let mut app = headless_app("v15mgrrec");
+        let ctx = egui::Context::default();
+        let slot = MidiAction::ALL
+            .iter()
+            .position(|a| *a == MidiAction::VolLoop(0))
+            .unwrap();
+        let bind = crate::midi::MidiBind { ty: 1, ch: 0, d1: 20 };
+        app.midi_binds[slot] = Some(bind);
+        app.open_auto_editor(None);
+        app.auto_mgr_rec = vec![(slot, bind)];
+        {
+            let ed = app.auto_edit.as_mut().unwrap();
+            ed.rec = true;
+            ed.rec_start = 0;
+            ed.nodes.clear();
+        }
+        let cc = |v: u8| crate::audio::Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0, 20, v] });
+        app.handle_evt(cc(0));
+        app.handle_evt(cc(127));
+        frame(&mut app, &ctx, vec![]);
+        let vs: Vec<f32> = app.auto_edit.as_ref().unwrap().nodes.iter().map(|n| n.v).collect();
+        assert_eq!(vs.len(), 2, "two recorded nodes: {vs:?}");
+        assert!(vs[0].abs() < 1e-6, "MIDI 0 = range min (0 linear = -inf), got {}", vs[0]);
+        assert!((vs[1] - 2.0).abs() < 1e-6, "MIDI 127 = range max (+6 dB = 2.0), got {}", vs[1]);
+        assert_eq!(app.trk_vol[0], VOL_UNITY_MIDI, "recorded binding never touched the fader");
+
+        // Manager open but REC off: still MUTED (its action must not fire).
+        app.auto_edit.as_mut().unwrap().rec = false;
+        app.handle_evt(cc(64));
+        assert_eq!(app.trk_vol[0], VOL_UNITY_MIDI, "binding stays muted while the manager is open");
+
+        // Manager CLOSED: the same message drives the fader again.
+        app.auto_edit = None;
+        app.handle_evt(cc(64));
+        assert_eq!(app.trk_vol[0], 64, "binding works normally when the manager is closed");
+    }
+
+    /// v0.15: the "select value" popup lists the track, its mixer and the
+    /// header values under translucent bind buttons; binding rescales the
+    /// curve's min/max to the new output's limits.
+    #[test]
+    fn v15_auto_pick_binds_and_rescales() {
+        use crate::automation::{Node, Shape};
+        let mut app = headless_app("v15autopick");
+        let ctx = egui::Context::default();
+        app.open_auto_editor(None);
+        {
+            let ed = app.auto_edit.as_mut().unwrap();
+            ed.target = crate::automation::TARGET_TRACK_VOL.to_string();
+            ed.nodes = vec![
+                Node { t: 0, v: 0.0, s: Shape::Linear },
+                Node { t: 96_000, v: 2.0, s: Shape::Linear },
+            ];
+        }
+        app.auto_pick_open = true;
+        frame(&mut app, &ctx, vec![]);
+        // The metronome/bpm value lives in the header block of the popup.
+        let row = galley_at(&mut app, &ctx, "tempo").expect("tempo row painted in the popup");
+        click_pt(&mut app, &ctx, row.center());
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.target, crate::automation::TARGET_MASTER_TEMPO, "bind switched the target");
+        assert!(
+            (ed.nodes[0].v - 20.0).abs() < 1e-3 && (ed.nodes[1].v - 300.0).abs() < 1e-3,
+            "min/max rescaled to the bpm limits: {:?}",
+            ed.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
+        );
+        assert!(!app.auto_pick_open, "popup closes after binding");
+    }
+
+    /// v0.15 pin: right-clicking a track's grid no longer wipes the track.
+    /// A menu opens instead, and clearing takes an explicit click.
+    #[test]
+    fn v15_ui_rmb_grid_menu_no_destructive_clear() {
+        let mut app = headless_app("v15rmbgrid");
+        let ctx = egui::Context::default();
+        app.arr.insert(0, 0, Clip::new(0, 48_000));
+        let n = |a: &App| -> usize {
+            a.arr.tracks.iter().map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>()).sum()
+        };
+        // Sweep the grid right of the clip until a track menu opens.
+        let mut menu = None;
+        for y in (120..=340).step_by(4) {
+            let p = egui::pos2(700.0, y as f32);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+            assert_eq!(n(&app), 1, "right-click never wipes the track instantly");
+            if let Some(g) = galley_at(&mut app, &ctx, "Clear this track") {
+                menu = Some(g.center());
+                break;
+            }
+        }
+        let clear = menu.expect("right-click opens a grid menu with an explicit Clear");
+        frame(&mut app, &ctx, vec![moved(clear), btn(clear, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(clear, egui::PointerButton::Primary, false)]);
+        assert_eq!(n(&app), 0, "explicit Clear empties the row");
+    }
+
+    /// v0.15 pin: clip right-click carries Copy/Cut; the grid right-click
+    /// pastes at the playhead (Ctrl+X now cuts as well as Ctrl+C copies).
+    #[test]
+    fn v15_ui_clip_menu_copy_cut_paste() {
+        let mut app = headless_app("v15copy");
+        let ctx = egui::Context::default();
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        frame(&mut app, &ctx, vec![]);
+        // Find the clip by its painted body color and click its centre.
+        let body = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let rects = painted_rects(&mut app, &ctx, body);
+        let cp = rects[0].center();
+        click_pt(&mut app, &ctx, cp);
+        assert!(!app.sel_clips.is_empty(), "click selected the clip");
+        frame(&mut app, &ctx, vec![moved(cp), btn(cp, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Secondary, false)]);
+        assert!(galley_at(&mut app, &ctx, "Copy").is_some(), "clip menu offers Copy");
+        assert!(galley_at(&mut app, &ctx, "Cut").is_some(), "clip menu offers Cut");
+        let copy = galley_at(&mut app, &ctx, "Copy").unwrap().center();
+        frame(&mut app, &ctx, vec![moved(copy), btn(copy, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(copy, egui::PointerButton::Primary, false)]);
+        assert!(app.clipboard.is_some(), "Copy fills the clipboard");
+        // Ctrl+X cuts the same selection.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::X, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(app.status.contains("cut"), "Ctrl+X cuts: {}", app.status);
+        // Grid right-click offers Paste back in.
+        let mut paste = None;
+        for y in (120..=340).step_by(4) {
+            let p = egui::pos2(700.0, y as f32);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+            if let Some(g) = galley_at(&mut app, &ctx, "Paste here") {
+                paste = Some(g.center());
+                break;
+            }
+        }
+        let paste = paste.expect("grid menu offers Paste here");
+        frame(&mut app, &ctx, vec![moved(paste), btn(paste, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(paste, egui::PointerButton::Primary, false)]);
+        assert!(
+            app.arr.tracks.iter().any(|t| t.lanes.iter().any(|l| !l.clips.is_empty())),
+            "Paste put the clip back"
+        );
+    }
+
+    /// v0.15 pin: the value readouts beside sliders are display-only —
+    /// clicking one focuses no text edit (the old side box is gone).
+    #[test]
+    fn v15_ui_value_readouts_are_not_editable() {
+        let mut app = headless_app("v15noreadout");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, &format!("{:>5}", db_num(vol_amp(VOL_UNITY_MIDI))))
+            .expect("a dB readout is painted");
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            ctx.memory(|m| m.focused().is_none()),
+            "clicking a readout must not open a text edit"
         );
     }
 
