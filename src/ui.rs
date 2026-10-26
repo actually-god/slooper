@@ -521,20 +521,46 @@ fn home_dir() -> PathBuf {
 /// and hosted plugins are the same kind of slot — FL Studio's mixer model —
 /// so a plugin can sit anywhere in the chain and a track can host as many
 /// as the user likes.
-#[derive(Clone)]
 pub enum ChainRow {
     /// Bundled/user effect script.
     Script { stem: String, params: Vec<f32> },
     /// Hosted plugin. `entry` is None until it is opened at the engine
-    /// sample rate (startup/Ready); `params` carries the latest snapshot
-    /// for persistence and reopen-after-failure.
+    /// sample rate (startup/Ready) or until an async load started by
+    /// `add_fx_plugin` lands; `params` carries the latest snapshot
+    /// for persistence and reopen-after-failure. `open_rx` (v16) is the
+    /// completion channel of a load running on the plugin GUI thread —
+    /// the UI thread never blocks on instantiation.
     Vst {
         path: String,
         kind: crate::vsthost::VstKind,
         name: String,
         params: Vec<f32>,
         entry: Option<Arc<crate::vsthost::RtStageEntry>>,
+        open_rx: Option<std::sync::mpsc::Receiver<Result<Arc<crate::vsthost::RtStageEntry>, String>>>,
     },
+}
+
+/// Hand-written `Clone` (v16): `Receiver` is not `Clone`, and the only
+/// clone sites are per-frame read snapshots of the row list for drawing.
+/// The snapshot never needs the completion channel — the real rows in
+/// `App::fx_rows` keep it and `poll_vst_opens` drains it.
+impl Clone for ChainRow {
+    fn clone(&self) -> Self {
+        match self {
+            ChainRow::Script { stem, params } => ChainRow::Script {
+                stem: stem.clone(),
+                params: params.clone(),
+            },
+            ChainRow::Vst { path, kind, name, params, entry, .. } => ChainRow::Vst {
+                path: path.clone(),
+                kind: *kind,
+                name: name.clone(),
+                params: params.clone(),
+                entry: entry.clone(),
+                open_rx: None,
+            },
+        }
+    }
 }
 
 /// Plugin-instrument synth bindings reuse the `track_synth` stem table with
@@ -766,6 +792,12 @@ pub struct App {
     vst_dirs: Vec<String>,
     /// One-line feedback under the folder row.
     vst_note: String,
+    /// v16: completion channel of a folder scan running on the plugin GUI
+    /// thread (the first chain-window open must not freeze the UI).
+    vst_scan_rx: Option<std::sync::mpsc::Receiver<Vec<crate::vsthost::VstEntry>>>,
+    /// v16: chain rows (track, row) awaiting their load completion, then
+    /// the v0.10 auto-open of the plugin's own GUI.
+    vst_pending_gui: Vec<(usize, usize)>,
     fx_editor: Option<Box<crate::fxgui::FxEditor>>,
     fx_dir_edit: String,
     fx_note: String,
@@ -830,6 +862,7 @@ impl App {
                                         name: name.clone(),
                                         params: params.clone(),
                                         entry: None,
+                                        open_rx: None,
                                     })
                                 }
                             })
@@ -1023,6 +1056,8 @@ impl App {
             fx_window: None,
             fx_vst_editors: std::collections::HashMap::new(),
             vst_scan: Vec::new(),
+            vst_scan_rx: None,
+            vst_pending_gui: Vec::new(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
             vst_note: String::new(),
@@ -1521,10 +1556,12 @@ impl App {
                         live.push(None);
                     }
                 }
-                ChainRow::Vst { path, kind, name, params, entry } => {
+                ChainRow::Vst { path, kind, name, params, entry, open_rx } => {
                     // Open lazily (first rebuild after load, or after the
-                    // folder rescan dropped a failed load).
-                    if entry.is_none() {
+                    // folder rescan dropped a failed load). v16: rows with
+                    // a live `open_rx` are loading on the plugin thread —
+                    // never block the UI thread on them.
+                    if entry.is_none() && open_rx.is_none() {
                         let p = std::path::Path::new(path);
                         if p.is_file() || p.is_dir() {
                             match crate::vsthost::open(p, *kind, sr, Some(params)) {
@@ -1580,41 +1617,115 @@ impl App {
         }
     }
 
-    /// Open a plugin from the scan list and append it to track `i`'s chain.
+    /// Open a plugin from the scan list and append it to track `i`'s
+    /// chain. v16: instantiation runs on the plugin GUI thread — the click
+    /// returns immediately, the row shows "loading", and `poll_vst_opens`
+    /// lands the entry (then the v0.10 rule kicks in: the plugin's own
+    /// GUI opens when the load finishes).
     fn add_fx_plugin(&mut self, i: usize, e: &crate::vsthost::VstEntry) {
         let sr = self.sample_rate.max(48_000);
-        match crate::vsthost::open(&e.path, e.kind, sr, None) {
-            Ok(load) => {
-                let entry = load.entry.clone();
-                self.vst_note = format!("added {}", e.name);
-                self.fx_rows[i].push(ChainRow::Vst {
-                    path: e.path.to_string_lossy().into_owned(),
-                    kind: e.kind,
-                    name: e.name.clone(),
-                    params: Vec::new(),
-                    entry: Some(load.entry),
-                });
-                let row = self.fx_rows[i].len() - 1;
-                self.rebuild_fx(i);
-                self.save_config();
-                // v0.10 standard: the plugin's own GUI opens immediately on
-                // add; the slider window appears only if there is no editor
-                // or it refuses to draw.
-                if entry.has_editor() {
-                    match self.plugin_window_open(&entry) {
-                        Ok(w) => {
-                            self.fx_vst_editors.insert((i, row), w);
+        let rx = crate::vsthost::open_async(&e.path, e.kind, sr, None);
+        self.vst_note = format!("{}: loading…", e.name);
+        self.fx_rows[i].push(ChainRow::Vst {
+            path: e.path.to_string_lossy().into_owned(),
+            kind: e.kind,
+            name: e.name.clone(),
+            params: Vec::new(),
+            entry: None,
+            open_rx: Some(rx),
+        });
+        let row = self.fx_rows[i].len() - 1;
+        self.vst_pending_gui.push((i, row));
+        self.rebuild_fx(i);
+        self.save_config();
+    }
+
+    /// v16: drain the completion channels of async plugin loads (started
+    /// by [`Self::add_fx_plugin`]) and of the folder scan. Called from the
+    /// per-tick `logic`, never blocking: every channel is `try_recv`.
+    /// Returns true when anything landed (forces a repaint).
+    fn poll_vst_opens(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = self.vst_scan_rx.as_ref() {
+            if let Ok(entries) = rx.try_recv() {
+                let n = entries.iter().filter(|e| e.error.is_none()).count();
+                self.vst_scan = entries;
+                self.vst_scanned = true;
+                self.vst_scan_rx = None;
+                self.vst_note = format!("{n} plugin(s) ready");
+                changed = true;
+            }
+        }
+        let mut finished: Vec<usize> = Vec::new();
+        for i in 0..MAX_LOOPS {
+            let mut opened = false;
+            for row in self.fx_rows[i].iter_mut() {
+                if let ChainRow::Vst { name, entry, open_rx, .. } = row {
+                    if let Some(rx) = open_rx.as_ref() {
+                        match rx.try_recv() {
+                            Ok(Ok(e)) => {
+                                *entry = Some(e);
+                                opened = true;
+                            }
+                            Ok(Err(err)) => {
+                                self.vst_note = format!("{name}: {err}");
+                                opened = true;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                // Loader job vanished (row removed while
+                                // loading) — treat as not loaded.
+                                opened = true;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
                         }
-                        Err(err2) => {
-                            // v0.11 R3: no slider window for plugins.
-                            self.vst_note =
-                                format!("{}: GUI {err2} \u{2014} no window to open", e.name);
+                        if opened {
+                            *open_rx = None;
                         }
                     }
                 }
             }
-            Err(err) => self.vst_note = format!("{}: {err}", e.name),
+            if opened {
+                finished.push(i);
+            }
         }
+        for i in finished {
+            self.rebuild_fx(i);
+            self.save_config();
+            changed = true;
+            // v0.10 standard, now applied on completion: a freshly added
+            // plugin opens its own GUI. Rows the user moved/removed, rows
+            // whose plugin has no editor, and rows whose instance already
+            // has a window (the v0.11 double-open guard) are skipped.
+            let mut keep: Vec<(usize, usize)> = Vec::new();
+            while let Some((t, row)) = self.vst_pending_gui.pop() {
+                if t != i {
+                    keep.push((t, row));
+                    continue;
+                }
+                let plan = match self.fx_rows.get(t).and_then(|rows| rows.get(row)) {
+                    Some(ChainRow::Vst { path, entry: Some(e), .. }) if e.has_editor() => {
+                        let already = self
+                            .fx_vst_editors
+                            .values()
+                            .chain(self.vst_editors.values())
+                            .any(|w| w.path() == path.as_str());
+                        (!already).then(|| (e.clone(), path.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((entry, _)) = plan {
+                    match self.plugin_window_open(&entry) {
+                        Ok(w) => {
+                            self.fx_vst_editors.insert((t, row), w);
+                            self.status = format!("{}: plugin window opened", entry.name());
+                        }
+                        Err(err) => self.status = format!("plugin GUI: {err} \u{2014} closed"),
+                    }
+                }
+            }
+            self.vst_pending_gui = keep;
+        }
+        changed
     }
 
     fn remove_fx_row(&mut self, i: usize, k: usize) {
@@ -2238,7 +2349,10 @@ impl App {
 
     /// Rescan the system folders plus the user's extra folders. Loads every
     /// plugin once (metadata), so it runs on explicit click / first window
-    /// open, never per frame.
+    /// open, never per frame. v16: the loading itself runs on the plugin
+    /// GUI thread (it dlopens and instantiates EVERY plugin — seconds on
+    /// the old UI-thread path, and it also bound plugin toolkit globals to
+    /// the wrong thread); completion lands in `poll_vst_opens`.
     fn vst_rescan(&mut self) {
         let mut dirs = crate::vsthost::default_vst_dirs();
         for d in &self.vst_dirs {
@@ -2250,22 +2364,15 @@ impl App {
         // v0.10 drop-in Windows plugins: if yabridge is installed and any
         // scan folder contains .dll files, wrap them into native .so
         // wrappers first — then the normal scan below picks them up like
-        // any other plugin (docs/PLUGINS.md).
+        // any other plugin (docs/PLUGINS.md). Fast no-op without .dlls.
         if crate::vsthost::yabridge_available() {
             if let Some(msg) = crate::vsthost::yabridge_sync(&dirs) {
                 self.status = msg.clone();
                 eprintln!("[slooper] {msg}");
             }
         }
-        let t0 = std::time::Instant::now();
-        self.vst_scan = crate::vsthost::scan(&dirs);
-        self.vst_scanned = true;
-        let n = self.vst_scan.iter().filter(|e| e.error.is_none()).count();
-        self.vst_note = format!(
-            "{n} plugin(s) from {} folder(s) in {:.1}s",
-            dirs.len(),
-            t0.elapsed().as_secs_f32()
-        );
+        self.vst_note = format!("scanning {} folder(s)…", dirs.len());
+        self.vst_scan_rx = Some(crate::vsthost::scan_async(dirs));
     }
 
     /// Persist every user-facing setting (bindings, mixer, grid, rack,
@@ -2355,7 +2462,7 @@ impl App {
                                 stem: stem.clone(),
                                 params: params.clone(),
                             },
-                            ChainRow::Vst { path, kind, name, params, entry: _ } => {
+                            ChainRow::Vst { path, kind, name, params, entry: _, open_rx: _ } => {
                                 ChainSave::Vst {
                                     path: path.clone(),
                                     kind: kind.tag().to_string(),
@@ -5477,7 +5584,7 @@ impl App {
                             stem: stem.clone(),
                             params: params.clone(),
                         },
-                        ChainRow::Vst { path, kind, name, params, entry: _ } => ChainSave::Vst {
+                        ChainRow::Vst { path, kind, name, params, entry: _, open_rx: _ } => ChainSave::Vst {
                             path: path.clone(),
                             kind: kind.tag().to_string(),
                             name: name.clone(),
@@ -5760,7 +5867,14 @@ impl App {
                     }
                     ChainSave::Vst { path, kind, name, params } => {
                         let kind = crate::vsthost::VstKind::parse(&kind)?;
-                        Some(ChainRow::Vst { path, kind, name, params, entry: None })
+                        Some(ChainRow::Vst {
+                            path,
+                            kind,
+                            name,
+                            params,
+                            entry: None,
+                            open_rx: None,
+                        })
                     }
                 })
                 .collect();
@@ -6223,6 +6337,12 @@ impl eframe::App for App {
         // before the held-drop below, so `effEditClose` always precedes
         // plugin teardown.
         self.reap_vst_editors();
+
+        // v16: land async plugin work (chain loads, folder scan) without
+        // ever blocking this thread on plugin instantiation.
+        if self.poll_vst_opens() {
+            ctx.request_repaint();
+        }
 
         // Late VST releases: plugins replaced or removed since the last
         // tick drop here, so destructors (and the VST3 teardown the runner
@@ -9639,7 +9759,7 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
 /// scan; rejected scripts and the plugin folder manager sit below.
 fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     let Some(loop_i) = app.fx_window else { return };
-    if !app.vst_scanned {
+    if !app.vst_scanned && app.vst_scan_rx.is_none() {
         app.vst_rescan();
     }
     let mut open = true;
@@ -9681,7 +9801,14 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                             if resp.clicked() {
                                 act = Some((0, k));
                             }
-                            if matches!(row, ChainRow::Vst { entry: None, .. }) {
+                            if matches!(row, ChainRow::Vst { entry: None, open_rx: Some(_), .. }) {
+                                // v16: loading on the plugin thread — the
+                                // UI stayed live; the entry lands via
+                                // `poll_vst_opens` and repaints.
+                                ui.label(
+                                    RichText::new("loading…").weak().small(),
+                                );
+                            } else if matches!(row, ChainRow::Vst { entry: None, .. }) {
                                 ui.label(
                                     RichText::new("× not loaded (Rescan Plugins below)")
                                         .color(Color32::from_rgb(220, 120, 120))
@@ -9762,11 +9889,13 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                     .show_ui(ui, |ui| {
                         if app.vst_scan.is_empty() {
                             ui.label(
-                                RichText::new(
-                                    "no plugins found — add the folder your plugins live \
+                                RichText::new(if app.vst_scan_rx.is_some() {
+                                    "scanning plugin folders\u{2026}"
+                                } else {
+                                    "no plugins found \u{2014} add the folder your plugins live \
                                      in (drag-and-drop installs included) and press \
-                                     Rescan Plugins below",
-                                )
+                                     Rescan Plugins below"
+                                })
                                 .weak()
                                 .small(),
                             );
@@ -12745,8 +12874,19 @@ mod tests {
             c
         };
 
-        // The first window frame ran the sync scan; open the plugin picker.
-        frame(&mut app, &ctx, vec![]);
+        // v16: the folder scan runs on the plugin GUI thread (it dlopens
+        // every plugin) — pump frames until `poll_vst_opens` lands it.
+        let mut scanned = false;
+        for _ in 0..200 {
+            frame(&mut app, &ctx, vec![]);
+            if app.vst_scanned {
+                scanned = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(scanned, "async folder scan must land");
+        // Open the plugin picker.
         let q = label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
         frame(&mut app, &ctx, vec![moved(q)]);
         frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
@@ -12756,12 +12896,21 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(d)]);
         frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, false)]);
+        // v16: instantiation itself is async too — the click only queued
+        // the open job. Pump until the entry lands (then the auto-opened
+        // plugin window is already in `fx_vst_editors`).
+        let mut loaded = false;
+        for _ in 0..400 {
+            frame(&mut app, &ctx, vec![]);
+            loaded = matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. }));
+            if loaded {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         std::env::set_var("HOME", &home);
-        assert!(
-            matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. })),
-            "picked plugin loaded into a chain slot"
-        );
-        assert!(app.vst_note.contains("added"), "{}", app.vst_note);
+        assert!(loaded, "picked plugin loaded into a chain slot");
+        assert!(app.vst_note.contains("loaded"), "{}", app.vst_note);
         // v0.10 standard: adding an editor-capable plugin opens the plugin's
         // OWN window right away. Let the editor thread settle (painted, or a
         // clean refusal) BEFORE the temp plugin dir is removed: plugins load
@@ -12849,7 +12998,17 @@ mod tests {
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
         assert_eq!(app.fx_window, Some(0), "chip opens the chain window");
 
-        frame(&mut app, &ctx, vec![]);
+        // v16: scan + load are async (plugin GUI thread) — pump frames.
+        let mut scanned = false;
+        for _ in 0..200 {
+            frame(&mut app, &ctx, vec![]);
+            if app.vst_scanned {
+                scanned = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(scanned, "async folder scan must land");
         let q =
             label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
         frame(&mut app, &ctx, vec![moved(q)]);
@@ -12864,12 +13023,18 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(d)]);
         frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, false)]);
+        let mut loaded = false;
+        for _ in 0..400 {
+            frame(&mut app, &ctx, vec![]);
+            loaded = matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. }));
+            if loaded {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         std::env::set_var("HOME", &home);
 
-        assert!(
-            matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. })),
-            "VST3 loaded into the chain slot"
-        );
+        assert!(loaded, "VST3 loaded into the chain slot");
         // v0.12: the plugin's OWN window opened on add and PAINTS (the
         // shadow-instance path end to end: load, attach, verify, decorate).
         let mut editor = app

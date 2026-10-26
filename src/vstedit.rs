@@ -54,7 +54,7 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::vsthost::Vst2Handle;
 
@@ -134,6 +134,30 @@ extern "C" fn x_error_noop(_display: *mut c_void, _event: *mut c_void) -> c_int 
     // X races (a plugin window vanishing mid-query) must never kill the
     // host; standard practice for plugin wrappers.
     0
+}
+
+/// Install the process-wide no-op X error handler (v16). The default
+/// Xlib handler calls `exit()` — a `BadMatch` from an editor-window race
+/// (XGetImage on a just-destroyed window — reproduced in the v16 perf
+/// probe) took the whole app down. Plugin hosting runs on a dedicated
+/// thread with dozens of foreign windows under a WM/compositor; a dead
+/// window must be a no-op, not a funeral. Idempotent; called before any
+/// editor display is created.
+fn install_x_error_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        XSetErrorHandler(Some(x_error_noop));
+    });
+}
+
+/// Live editor windows across both generations (the pump thread reads
+/// this through `vsthost::gui_tx` to pick its tick: fast while editors
+/// exist, idle-cost-zero while none do).
+static EDITORS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// How many plugin editor windows the GUI thread is serving right now.
+pub fn editors_active() -> usize {
+    EDITORS_ACTIVE.load(Ordering::Relaxed)
 }
 
 // X11 event masks (X.h). v0.11 NOTE: this constant used to read `1 << 20`,
@@ -353,9 +377,16 @@ pub fn request_wm_delete(xid: u64) -> bool {
 /// proof the plugin painted DIRECTLY on the container (VSTGUI-style
 /// editors never create a child window, so child polling alone
 /// false-negatives them).
+///
+/// v16: guarded — an unmapped/0×0 window answers `XGetImage` with
+/// `BadMatch`, and even with the no-op error handler installed the probe
+/// is pointless there; skip the round-trip instead.
 unsafe fn container_painted(d: *mut Display, win: XWindow) -> bool {
     const ALL_PLANES: u64 = !0u64;
     const Z_PIXMAP: c_int = 2;
+    if !is_viewable(d, win) {
+        return false;
+    }
     let img = XGetImage(d, win, 0, 0, 24, 24, ALL_PLANES, Z_PIXMAP);
     if img.is_null() {
         return false;
@@ -490,6 +521,10 @@ impl EditorWindow {
     /// plugin instance may be dropped safely afterwards. Idempotent.
     pub fn close(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // v16: wake the pump thread immediately. Without the post the
+        // hand-off waits a full idle tick (≥30 ms, the old fixed cadence);
+        // with it, close settles on the next iteration.
+        crate::vsthost::post(move || ());
         for _ in 0..500 {
             if self.closed.load(Ordering::SeqCst) {
                 return;
@@ -584,13 +619,23 @@ enum Phase {
     Verify { it: u32 },
     Live {
         last_size: (i32, i32),
-        since_rect: u32,
-        dead_streak: u32,
         /// Container size last reported by the window manager (R1b).
         last_container: (u32, u32),
     },
     Done,
 }
+
+/// v16: window-system housekeeping (child tree, paint watchdog, plugin
+/// rect) runs on a timer, not per pump step. At the old 30 ms tick the
+/// per-step XQueryTree/XGetWindowAttributes/XGetImage storm was ~0.2-1 ms
+/// per editor every step — with the 6 ms responsiveness tick it would
+/// dominate, and healthy editors do not need 160 Hz existence checks.
+const HOUSEKEEPING: Duration = Duration::from_millis(500);
+/// ~4 s of housekeeping ticks without proof of life means the editor
+/// died (same patience as the old 120 × 30 ms step counting).
+const DEAD_TICKS_PATIENCE: u32 = 8;
+/// Verify patience: real time for the plugin to show a window.
+const VERIFY_PATIENCE: Duration = Duration::from_secs(3);
 
 struct Editor {
     handle: Vst2Handle,
@@ -602,6 +647,9 @@ struct Editor {
     phase: Phase,
     shared: Shared,
     dbg: bool,
+    created: Instant,
+    house: Instant,
+    dead_ticks: u32,
 }
 
 /// Create the container, map it, and dispatch `effEditOpen` — all on the
@@ -614,6 +662,7 @@ unsafe fn make_editor(handle: Vst2Handle, title: &str, shared: Shared) -> Option
     // editors never map the window while XInitThreads has been called).
     // Our plugin-side Xlib use is strictly the GUI thread; the UI thread
     // only opens short-lived independent connections (WM-delete probes).
+    install_x_error_handler();
     let d = XOpenDisplay(ptr::null());
     if d.is_null() {
         shared.open_failed.store(true, Ordering::SeqCst);
@@ -648,6 +697,7 @@ unsafe fn make_editor(handle: Vst2Handle, title: &str, shared: Shared) -> Option
     // The VST2 spec says 0 == success, but plenty of toolkits return a
     // "true" flag (1) for a SUCCESSFUL open — the verification below is
     // the real judge: if the plugin draws, it opened, whatever it said.
+    EDITORS_ACTIVE.fetch_add(1, Ordering::Relaxed);
     Some(Editor {
         handle,
         d,
@@ -658,6 +708,9 @@ unsafe fn make_editor(handle: Vst2Handle, title: &str, shared: Shared) -> Option
         phase: Phase::Verify { it: 0 },
         shared,
         dbg,
+        created: Instant::now(),
+        house: Instant::now(),
+        dead_ticks: 0,
     })
 }
 
@@ -712,14 +765,13 @@ impl Editor {
                         self.decorate();
                         self.phase = Phase::Live {
                             last_size: (0, 0),
-                            since_rect: 0,
-                            dead_streak: 0,
                             last_container: (0, 0),
                         };
                         return;
                     }
-                    // 100 steps at the 30 ms cadence ~ 3 s of patience.
-                    if it >= 100 {
+                    // v16: real-time patience (the pump tick changed with
+                    // the responsiveness pass; step counting did not).
+                    if self.created.elapsed() >= VERIFY_PATIENCE {
                         // No live editor appeared: close cleanly so NO
                         // blank panel is left behind; the UI falls back
                         // to the slider panel.
@@ -728,12 +780,7 @@ impl Editor {
                         self.phase = Phase::Verify { it: it + 1 };
                     }
                 }
-                Phase::Live {
-                    ref mut last_size,
-                    ref mut since_rect,
-                    ref mut dead_streak,
-                    ref mut last_container,
-                } => {
+                Phase::Live { ref mut last_size, ref mut last_container } => {
                     // Dispatch X events (close button / window
                     // destruction); bounded per step.
                     let mut resized = None;
@@ -800,24 +847,31 @@ impl Editor {
                             }
                         }
                     }
-                    let kids = count_children_local(self.d, self.win);
-                    self.shared.children.store(kids, Ordering::SeqCst);
-                    // Dead-editor watchdog: nothing viewable for ~4 s
-                    // straight means the editor crashed or tore itself
-                    // down — close cleanly instead of keeping a dead
-                    // sentinel panel around.
-                    let alive = first_sized_child(self.d, self.win)
-                        .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k))
-                        || container_painted(self.d, self.win);
-                    *dead_streak = if alive { 0 } else { *dead_streak + 1 };
-                    if *dead_streak > 120 {
-                        self.teardown(true);
-                        return;
-                    }
-                    // Periodic rect + size handling; the plugin owns its size.
-                    *since_rect += 1;
-                    if *since_rect >= 16 {
-                        *since_rect = 0;
+                    // The plugin's editor event loop runs here — this is
+                    // what the fast tick buys: mouse/key/timer service at
+                    // ~1/EDITOR_TICK_MS instead of the old 33 Hz.
+                    self.handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
+                    // Window-system housekeeping on a timer (v16): child
+                    // count for the UI, the dead-editor watchdog, and the
+                    // plugin's preferred rect. Healthy editors do not
+                    // need four X round-trips per pump step.
+                    if self.house.elapsed() >= HOUSEKEEPING {
+                        self.house = Instant::now();
+                        let kids = count_children_local(self.d, self.win);
+                        self.shared.children.store(kids, Ordering::SeqCst);
+                        // Dead-editor watchdog: nothing viewable for
+                        // ~4 s straight means the editor crashed or tore
+                        // itself down — close cleanly instead of keeping
+                        // a dead sentinel panel around.
+                        let alive = first_sized_child(self.d, self.win)
+                            .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k))
+                            || container_painted(self.d, self.win);
+                        self.dead_ticks = if alive { 0 } else { self.dead_ticks + 1 };
+                        if self.dead_ticks > DEAD_TICKS_PATIENCE {
+                            self.teardown(true);
+                            return;
+                        }
+                        // Rect + size handling; the plugin owns its size.
                         if let Some((w, h)) = edit_rect_locked(&self.handle) {
                             self.shared.width.store(w, Ordering::SeqCst);
                             self.shared.height.store(h, Ordering::SeqCst);
@@ -827,8 +881,6 @@ impl Editor {
                             }
                         }
                     }
-                    // The plugin's editor event loop runs here.
-                    self.handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
                 }
             }
         }
@@ -862,6 +914,9 @@ impl Editor {
     fn teardown(&mut self, refused: bool) {
         unsafe {
             if !self.d.is_null() {
+                // v16: one pump tick faster for the whole app if this was
+                // the last open editor (lets the idle tick take over).
+                EDITORS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
                 {
                     let _loader = crate::vsthost::vst_loader_lock();
                     self.handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
@@ -920,6 +975,9 @@ struct Editor3 {
     phase: Phase,
     shared: Shared,
     dbg: bool,
+    created: Instant,
+    house: Instant,
+    dead_ticks: u32,
 }
 
 /// Open a VST3 plugin's own editor window. Mirrors [`open_editor`] exactly
@@ -1030,6 +1088,7 @@ unsafe fn make_editor3(
     params: Arc<crate::vsthost::VstParams>,
     shared: Shared,
 ) -> Option<Editor3> {
+    install_x_error_handler();
     let d = XOpenDisplay(ptr::null());
     if d.is_null() {
         shared.open_failed.store(true, Ordering::SeqCst);
@@ -1098,6 +1157,7 @@ unsafe fn make_editor3(
     if dbg {
         eprintln!("[vstedit3] {title}: view attached to {win:#x} ({w0}x{h0})");
     }
+    EDITORS_ACTIVE.fetch_add(1, Ordering::Relaxed);
     Some(Editor3 {
         plugin: Some(plugin),
         ids,
@@ -1110,6 +1170,9 @@ unsafe fn make_editor3(
         phase: Phase::Verify { it: 0 },
         shared,
         dbg,
+        created: Instant::now(),
+        house: Instant::now(),
+        dead_ticks: 0,
     })
 }
 
@@ -1160,44 +1223,30 @@ impl Editor3 {
                                 self.shared.width.store(w, Ordering::SeqCst);
                                 self.shared.height.store(h, Ordering::SeqCst);
                                 XResizeWindow(self.d, self.win, w, h);
-                                Phase::Live {
-                                    last_size: (w, h),
-                                    since_rect: 0,
-                                    dead_streak: 0,
-                                    last_container: (0, 0),
-                                }
+                                Phase::Live { last_size: (w, h), last_container: (0, 0) }
                             }
-                            None => Phase::Live {
-                                last_size: (0, 0),
-                                since_rect: 0,
-                                dead_streak: 0,
-                                last_container: (0, 0),
-                            },
+                            None => Phase::Live { last_size: (0, 0), last_container: (0, 0) },
                         };
                         return;
                     }
-                    if it >= 100 {
+                    if self.created.elapsed() >= VERIFY_PATIENCE {
                         self.teardown(true);
                     } else {
                         self.phase = Phase::Verify { it: it + 1 };
                     }
                 }
-                Phase::Live {
-                    ref mut last_size,
-                    ref mut since_rect,
-                    ref mut dead_streak,
-                    ref mut last_container,
-                } => {
+                Phase::Live { ref mut last_size, ref mut last_container } => {
                     let mut resized = None;
                     if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete, &mut resized)
                     {
                         self.teardown(false);
                         return;
                     }
+                    // The VST3 message pump: this IS the editor's idle
+                    // service (timers + registered X fds), and the edit
+                    // drain is the slider path back into the sound.
                     plugin.service_run_loop();
                     drain_param_edits3(plugin, &self.ids, &self.params);
-                    let kids = count_children_local(self.d, self.win);
-                    self.shared.children.store(kids, Ordering::SeqCst);
                     // The plugin may request a size change (e.g. the
                     // view only commits its real rect once mapped).
                     if let Some((w, h)) = plugin.take_editor_resize_request() {
@@ -1213,19 +1262,22 @@ impl Editor3 {
                             let _ = plugin.resize_editor(w as i32, h as i32);
                         }
                     }
-                    // Dead-editor watchdog (same patience as VST2).
-                    let alive = first_sized_child(self.d, self.win)
-                        .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k))
-                        || container_painted(self.d, self.win);
-                    *dead_streak = if alive { 0 } else { *dead_streak + 1 };
-                    if *dead_streak > 120 {
-                        self.teardown(true);
-                        return;
-                    }
-                    // Track the view size; keep the container to it.
-                    *since_rect += 1;
-                    if *since_rect >= 16 {
-                        *since_rect = 0;
+                    // Housekeeping on a timer (v16, VST2 parity): the
+                    // watchdog and view-size tracking are not per-step
+                    // operations.
+                    if self.house.elapsed() >= HOUSEKEEPING {
+                        self.house = Instant::now();
+                        let kids = count_children_local(self.d, self.win);
+                        self.shared.children.store(kids, Ordering::SeqCst);
+                        let alive = first_sized_child(self.d, self.win)
+                            .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k))
+                            || container_painted(self.d, self.win);
+                        self.dead_ticks = if alive { 0 } else { self.dead_ticks + 1 };
+                        if self.dead_ticks > DEAD_TICKS_PATIENCE {
+                            self.teardown(true);
+                            return;
+                        }
+                        // Track the view size; keep the container to it.
                         if let Ok(Some((w, h))) = plugin.attached_editor_size() {
                             if w > 0 && h > 0 {
                                 self.shared.width.store(w, Ordering::SeqCst);
@@ -1275,6 +1327,7 @@ impl Editor3 {
                 drop(p);
             }
             if !self.d.is_null() {
+                EDITORS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
                 XDestroySubwindows(self.d, self.win);
                 XDestroyWindow(self.d, self.win);
                 XFlush(self.d);
