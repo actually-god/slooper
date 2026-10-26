@@ -7394,6 +7394,11 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
 /// One track's mixer strip: select / record / mute / child lanes, then the
 /// vol-gain-pan stack and the FX chain chips.
 fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
+    // v0.15 UI pass: strips live on fixed rects shared with the grid.
+    // Anything that does not fit must CLIP, never bleed onto the
+    // neighbour (the ghosted "Track 6" report).
+    let strip_rect = ui.max_rect();
+    ui.shrink_clip_rect(strip_rect);
     let sel = app.selected == t;
     let rec = app.backend.engine.rec_state_of(t) == TR_REC;
     let on = app.backend.engine.track_on(t);
@@ -7494,10 +7499,39 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         }
         ui.label(RichText::new(format!("{clips}c/{nl}L")).weak().small());
     });
-    for kind in [KIND_VOL, KIND_GAIN, KIND_PAN] {
-        level_row(ui, app, t, kind);
+    level_row(ui, app, t, KIND_VOL);
+    // v0.15 UI pass: a one-lane track is 96px tall — the old stack of six
+    // rows overflowed it and painted over the track below. Optional rows
+    // now ask for room first; the leftovers fold into a popup.
+    let room = ui.available_height();
+    if room >= 92.0 {
+        level_row(ui, app, t, KIND_GAIN);
+        level_row(ui, app, t, KIND_PAN);
+        strip_fx_row(ui, app, t);
+        strip_synth_row(ui, app, t);
+    } else {
+        if room >= 70.0 {
+            level_row(ui, app, t, KIND_PAN);
+        }
+        if ui.available_height() >= 20.0 {
+            ui.horizontal(|ui| {
+                let more = ui.small_button("\u{2026} more").on_hover_text(
+                    "This strip is short \u{2014} click for gain, pan, FX and synth",
+                );
+                egui::Popup::menu(&more)
+                    .show(|ui| {
+                        level_row(ui, app, t, KIND_GAIN);
+                        level_row(ui, app, t, KIND_PAN);
+                        strip_fx_row(ui, app, t);
+                        strip_synth_row(ui, app, t);
+                    });
+            });
+        }
     }
-    ui.horizontal(|ui| {
+}
+
+/// FX-chain row of a mixer strip (also rendered inside the "more" menu).
+fn strip_fx_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         if ui
             .small_button("FX")
             .on_hover_text("This track's mixer chain: effects scripts and VST plugins in one ordered list")
@@ -7506,8 +7540,10 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             app.fx_window = Some(t);
         }
         fx_buttons(ui, app, t);
-    });
-    ui.horizontal(|ui| {
+}
+
+/// Synth-pick row of a mixer strip (also rendered inside the "more" menu).
+fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // Per-track synthesizer for MIDI clips (default: bundled piano;
         // scanned VST instruments can be bound as "vst:<path>").
         let cur = app.track_synth[t].clone().unwrap_or_default();
@@ -7584,8 +7620,8 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 }
             }
         }
-    });
 }
+
 
 /// The toolbar row above the timeline: quantize / snap controls, asset
 /// actions, loop and zoom.
@@ -12483,7 +12519,13 @@ mod tests {
         let ctx = egui::Context::default();
 
         frame(&mut app, &ctx, vec![]);
-        let p = label_center(&mut app, &ctx, "FX").expect("FX chip painted on the mixer");
+        // v0.15: on the default short track the FX row folds into the
+        // "more" popup \u{2014} open it first, then take the chip.
+        let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
+        frame(&mut app, &ctx, vec![moved(m)]);
+        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        let p = label_center(&mut app, &ctx, "FX").expect("FX chip in the more popup");
         frame(&mut app, &ctx, vec![moved(p)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
@@ -12607,7 +12649,13 @@ mod tests {
         let ctx = egui::Context::default();
 
         frame(&mut app, &ctx, vec![]);
-        let p = label_center(&mut app, &ctx, "FX").expect("FX chip painted on the mixer");
+        // v0.15: on the default short track the FX row folds into the
+        // "more" popup \u{2014} open it first, then take the chip.
+        let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
+        frame(&mut app, &ctx, vec![moved(m)]);
+        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        let p = label_center(&mut app, &ctx, "FX").expect("FX chip in the more popup");
         frame(&mut app, &ctx, vec![moved(p)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
