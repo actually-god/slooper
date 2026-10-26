@@ -60,6 +60,10 @@ pub struct FxEditor {
     /// Param rides requested by the GUI since the last flush (the UI layer
     /// mirrors them into the persisted chain rows).
     pub pending: Vec<(usize, f32)>,
+    /// v0.15: an auto-slider row was right-clicked: (param, current value,
+    /// screen pos). The UI layer turns this into the Set value / Create
+    /// automation asset mini menu (this crate cannot see `App`).
+    pub ctx_menu: Option<(usize, f32, egui::Pos2)>,
     // --- user presets (files in `<fx_dir>/user presets/`, see fx.rs) ---
     fx_dir: PathBuf,
     /// Preset names owned by this stem, refreshed on open/save/delete.
@@ -105,6 +109,7 @@ impl FxEditor {
             last: 0.0,
             frame_no: 0,
             pending: Vec::new(),
+            ctx_menu: None,
             fx_dir,
             preset_list,
             preset_sel: None,
@@ -788,6 +793,13 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 sl = sl.logarithmic(true);
             }
             let r = ui.add_sized(Vec2::new(150.0, 0.0), sl).on_hover_text(format!("{:.2} … {:.2}", p.min, p.max));
+            // v0.15: right-click hands the request to the UI layer, which
+            // shows Set value / Create automation asset for `fx:<row>:<k>`.
+            if r.secondary_clicked() {
+                if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
+                    ed.ctx_menu = Some((k, v, pp));
+                }
+            }
             ui.label(&p.label);
             ui.label(RichText::new(format!("{v:.2}")).monospace().small());
             if r.changed() {
