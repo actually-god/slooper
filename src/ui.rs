@@ -45,11 +45,11 @@ use crate::audio::{
 };
 use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, TrackFxSave};
 use crate::fx;
-use crate::midipat::{Pattern, PPQ};
 use crate::midi::{hex, note_name, scale_axis, MidiAction, MidiBind, MidiMsg};
-use crate::synth;
+use crate::midipat::{Pattern, PPQ};
 use crate::project::{self, ProjAsset, ProjClip, ProjMetro, ProjQuantize, ProjTrack, Project};
 use crate::quantize::{self, snap_start};
+use crate::synth;
 
 /// Keys a user may plausibly bind to a shortcut.
 const KEY_CANDIDATES: [egui::Key; 51] = [
@@ -327,14 +327,27 @@ enum RollGesture {
     /// tail follows the pointer until release). `off` = seconds between
     /// the grabbed point and the note start; `base` = that note's start
     /// tick at grab time (the group moves by the pointer's snapped delta).
-    Move { idx: usize, off: f64, base: u32, fresh: bool },
+    Move {
+        idx: usize,
+        off: f64,
+        base: u32,
+        fresh: bool,
+    },
     /// Drag one note's edge: `edge` 0 = head (moves start, end pinned),
     /// 1 = tail (end follows the pointer). `t0`/`end0` = note boundaries
     /// in seconds at grab time.
-    Resize { idx: usize, edge: u8, t0: f64, end0: f64 },
+    Resize {
+        idx: usize,
+        edge: u8,
+        t0: f64,
+        end0: f64,
+    },
     /// Rubber-band box from `from` to the pointer. `add` keeps the
     /// previous selection (Ctrl/Shift held at press).
-    Marquee { from: egui::Pos2, add: bool },
+    Marquee {
+        from: egui::Pos2,
+        add: bool,
+    },
 }
 
 /// In-flight three-step calibration for one continuous (knob) MIDI binding.
@@ -536,7 +549,8 @@ pub enum ChainRow {
         name: String,
         params: Vec<f32>,
         entry: Option<Arc<crate::vsthost::RtStageEntry>>,
-        open_rx: Option<std::sync::mpsc::Receiver<Result<Arc<crate::vsthost::RtStageEntry>, String>>>,
+        open_rx:
+            Option<std::sync::mpsc::Receiver<Result<Arc<crate::vsthost::RtStageEntry>, String>>>,
     },
 }
 
@@ -551,7 +565,14 @@ impl Clone for ChainRow {
                 stem: stem.clone(),
                 params: params.clone(),
             },
-            ChainRow::Vst { path, kind, name, params, entry, .. } => ChainRow::Vst {
+            ChainRow::Vst {
+                path,
+                kind,
+                name,
+                params,
+                entry,
+                ..
+            } => ChainRow::Vst {
                 path: path.clone(),
                 kind: *kind,
                 name: name.clone(),
@@ -782,8 +803,7 @@ pub struct App {
     /// away; this map keeps those windows alive and reaped like the synth
     /// editors. v0.11 R3: hosted plugins have NO slider-window fallback --
     /// their own window is the only parameter surface.
-    fx_vst_editors:
-        std::collections::HashMap<(usize, usize), crate::vstedit::EditorWindow>,
+    fx_vst_editors: std::collections::HashMap<(usize, usize), crate::vstedit::EditorWindow>,
     /// Scan of all VST folders (lazy on first window open, manual Rescan).
     vst_scan: Vec<crate::vsthost::VstEntry>,
     vst_scanned: bool,
@@ -854,7 +874,12 @@ impl App {
                                     stem: stem.clone(),
                                     params: params.clone(),
                                 }),
-                                ChainSave::Vst { path, kind, name, params } => {
+                                ChainSave::Vst {
+                                    path,
+                                    kind,
+                                    name,
+                                    params,
+                                } => {
                                     let kind = crate::vsthost::VstKind::parse(kind)?;
                                     Some(ChainRow::Vst {
                                         path: path.clone(),
@@ -952,7 +977,12 @@ impl App {
         let mut track_synth_params: Vec<Vec<f32>> = Vec::with_capacity(MAX_LOOPS);
         let mut track_synth_inst: Vec<Option<Arc<SynthHandle>>> = Vec::with_capacity(MAX_LOOPS);
         for t in 0..MAX_LOOPS {
-            let stem = cfg.track_synth.get(t).cloned().flatten().filter(|s| !s.is_empty());
+            let stem = cfg
+                .track_synth
+                .get(t)
+                .cloned()
+                .flatten()
+                .filter(|s| !s.is_empty());
             track_synth.push(stem);
             track_synth_params.push(cfg.track_synth_params.get(t).cloned().unwrap_or_default());
             track_synth_inst.push(None);
@@ -1548,7 +1578,8 @@ impl App {
                     let vals = fx::seed_values(params, &desc);
                     *params = vals.clone();
                     if let Some(inst) =
-                        self.fx_registry.create_instance(stem, self.sample_rate as f64, &vals)
+                        self.fx_registry
+                            .create_instance(stem, self.sample_rate as f64, &vals)
                     {
                         slots.push(FxSlot::scripted(inst.clone(), desc));
                         live.push(Some(inst));
@@ -1556,7 +1587,14 @@ impl App {
                         live.push(None);
                     }
                 }
-                ChainRow::Vst { path, kind, name, params, entry, open_rx } => {
+                ChainRow::Vst {
+                    path,
+                    kind,
+                    name,
+                    params,
+                    entry,
+                    open_rx,
+                } => {
                     // Open lazily (first rebuild after load, or after the
                     // folder rescan dropped a failed load). v16: rows with
                     // a live `open_rx` are loading on the plugin thread —
@@ -1594,7 +1632,10 @@ impl App {
     /// Append a script effect to track `i`'s chain (duplicates allowed —
     /// FL lets the same effect sit in two slots).
     fn add_fx_script(&mut self, i: usize, stem: &str) {
-        self.fx_rows[i].push(ChainRow::Script { stem: stem.to_string(), params: Vec::new() });
+        self.fx_rows[i].push(ChainRow::Script {
+            stem: stem.to_string(),
+            params: Vec::new(),
+        });
         self.rebuild_fx(i);
         self.fx_save_pending = true;
         self.save_config();
@@ -1660,11 +1701,18 @@ impl App {
         for i in 0..MAX_LOOPS {
             let mut opened = false;
             for row in self.fx_rows[i].iter_mut() {
-                if let ChainRow::Vst { name, entry, open_rx, .. } = row {
+                if let ChainRow::Vst {
+                    name,
+                    entry,
+                    open_rx,
+                    ..
+                } = row
+                {
                     if let Some(rx) = open_rx.as_ref() {
                         match rx.try_recv() {
                             Ok(Ok(e)) => {
                                 *entry = Some(e);
+                                self.vst_note = format!("{name}: loaded");
                                 opened = true;
                             }
                             Ok(Err(err)) => {
@@ -1674,6 +1722,7 @@ impl App {
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                 // Loader job vanished (row removed while
                                 // loading) — treat as not loaded.
+                                self.vst_note = format!("{name}: loader gone");
                                 opened = true;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1703,7 +1752,11 @@ impl App {
                     continue;
                 }
                 let plan = match self.fx_rows.get(t).and_then(|rows| rows.get(row)) {
-                    Some(ChainRow::Vst { path, entry: Some(e), .. }) if e.has_editor() => {
+                    Some(ChainRow::Vst {
+                        path,
+                        entry: Some(e),
+                        ..
+                    }) if e.has_editor() => {
                         let already = self
                             .fx_vst_editors
                             .values()
@@ -1742,11 +1795,7 @@ impl App {
         if k >= n {
             return;
         }
-        let j = if dir < 0 {
-            k.wrapping_sub(1)
-        } else {
-            k + 1
-        };
+        let j = if dir < 0 { k.wrapping_sub(1) } else { k + 1 };
         if j >= n {
             return;
         }
@@ -1960,7 +2009,10 @@ impl App {
         let secs = end as f64 / self.sample_rate as f64;
         let nm = a.name.clone();
         self.preview_playing = Some(key);
-        self.backend.cmd(Cmd::PreviewPlay { id: k as u32, samples });
+        self.backend.cmd(Cmd::PreviewPlay {
+            id: k as u32,
+            samples,
+        });
         self.status = format!("previewing {nm} ({secs:.1} s)");
     }
 
@@ -2163,9 +2215,13 @@ impl App {
         let mut n = 0usize;
         // Reverse order: inserting at c+1 never disturbs earlier indices.
         for (t, k, c) in ids.into_iter().rev() {
-            let Some(cl) = self.arr.tracks[t].lanes[k].clips.get(c) else { continue };
+            let Some(cl) = self.arr.tracks[t].lanes[k].clips.get(c) else {
+                continue;
+            };
             let alen = self.asset_len(cl.asset);
-            let Some((l, r)) = cl.split_at(ph, alen) else { continue };
+            let Some((l, r)) = cl.split_at(ph, alen) else {
+                continue;
+            };
             let lane = &mut self.arr.tracks[t].lanes[k];
             lane.clips[c] = l;
             lane.clips.insert(c + 1, r);
@@ -2210,7 +2266,8 @@ impl App {
                         }],
                     });
                     let nm = a.name.clone();
-                    self.status = format!("copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead");
+                    self.status =
+                        format!("copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead");
                 }
             } else {
                 self.status = "nothing to copy \u{b7} select a clip first".into();
@@ -2244,9 +2301,7 @@ impl App {
             .collect();
         let n = items.len();
         self.clipboard = Some(Clipboard { items });
-        self.status = format!(
-            "copied {n} clip(s) \u{b7} Ctrl+V pastes the group at the playhead"
-        );
+        self.status = format!("copied {n} clip(s) \u{b7} Ctrl+V pastes the group at the playhead");
     }
 
     /// Ctrl+V: paste the clipboard group at the playhead on the target
@@ -2268,9 +2323,15 @@ impl App {
         // with the table by remove_asset_at's remap; paste trusts it.
         for it in &cb.items {
             let t = (t_target + it.t_off).min(self.n_tracks - 1);
-            let alen = self.assets.get(it.asset as usize).map(|a| a.samples()).unwrap_or(0);
+            let alen = self
+                .assets
+                .get(it.asset as usize)
+                .map(|a| a.samples())
+                .unwrap_or(0);
             let span = it.play_len.unwrap_or(alen.saturating_sub(it.cut)).max(1);
-            let nl0 = *base_lanes.entry(t).or_insert(self.arr.tracks[t].lanes.len());
+            let nl0 = *base_lanes
+                .entry(t)
+                .or_insert(self.arr.tracks[t].lanes.len());
             let lane = self.arr.place_auto(
                 t,
                 Clip {
@@ -2462,14 +2523,19 @@ impl App {
                                 stem: stem.clone(),
                                 params: params.clone(),
                             },
-                            ChainRow::Vst { path, kind, name, params, entry: _, open_rx: _ } => {
-                                ChainSave::Vst {
-                                    path: path.clone(),
-                                    kind: kind.tag().to_string(),
-                                    name: name.clone(),
-                                    params: params.clone(),
-                                }
-                            }
+                            ChainRow::Vst {
+                                path,
+                                kind,
+                                name,
+                                params,
+                                entry: _,
+                                open_rx: _,
+                            } => ChainSave::Vst {
+                                path: path.clone(),
+                                kind: kind.tag().to_string(),
+                                name: name.clone(),
+                                params: params.clone(),
+                            },
                         })
                         .collect()
                 })
@@ -2487,7 +2553,13 @@ impl App {
 
     /// Primary rack folder (where recordings are written); "" when none.
     fn primary_folder(&self) -> PathBuf {
-        PathBuf::from(self.rack.first().map(|f| f.path.trim()).unwrap_or("").to_string())
+        PathBuf::from(
+            self.rack
+                .first()
+                .map(|f| f.path.trim())
+                .unwrap_or("")
+                .to_string(),
+        )
     }
 
     /// (Re)create track `t`'s synth instance from its binding and push it
@@ -2545,7 +2617,10 @@ impl App {
         if let Some(mut w) = self.vst_editors.remove(&t) {
             w.close();
         }
-        self.backend.cmd(Cmd::SetTrackSynth { i: t, synth: inst.clone() });
+        self.backend.cmd(Cmd::SetTrackSynth {
+            i: t,
+            synth: inst.clone(),
+        });
         self.track_synth_inst[t] = inst;
         true
     }
@@ -2561,7 +2636,11 @@ impl App {
 
     /// Bind a synth stem (or "" = default piano) to a track; persistent.
     fn set_track_synth_stem(&mut self, t: usize, stem: &str) {
-        self.track_synth[t] = if stem.is_empty() { None } else { Some(stem.to_string()) };
+        self.track_synth[t] = if stem.is_empty() {
+            None
+        } else {
+            Some(stem.to_string())
+        };
         self.track_synth_params[t].clear();
         self.rebuild_track_synth(t);
         // v0.10 STANDARD: a plugin instrument opens its own GUI the moment
@@ -2583,10 +2662,17 @@ impl App {
         let bind_msg = format!(
             "track {}: synth {}",
             t + 1,
-            if stem.is_empty() { "default (piano)" } else { stem }
+            if stem.is_empty() {
+                "default (piano)"
+            } else {
+                stem
+            }
         );
-        self.status =
-            if gui_note.is_empty() { bind_msg } else { format!("{bind_msg} \u{2014} {gui_note}") };
+        self.status = if gui_note.is_empty() {
+            bind_msg
+        } else {
+            format!("{bind_msg} \u{2014} {gui_note}")
+        };
     }
 
     /// Recreate every bound synth plus the shared default piano instance
@@ -2633,11 +2719,16 @@ impl App {
         // Throttle: skip a sample of an unchanged value (a slider sitting
         // still must not burn a node every frame).
         if let Some(last) = r.nodes.last() {
-            if (last.v - v).abs() < 1e-4 && (trel - last.t) < (self.sample_rate.max(1) as i64 / 50) {
+            if (last.v - v).abs() < 1e-4 && (trel - last.t) < (self.sample_rate.max(1) as i64 / 50)
+            {
                 return;
             }
         }
-        r.nodes.push(crate::automation::Node { t: trel, v, s: crate::automation::Shape::Linear });
+        r.nodes.push(crate::automation::Node {
+            t: trel,
+            v,
+            s: crate::automation::Shape::Linear,
+        });
     }
 
     /// Arm / stop-and-bounce write automation on track `i` (mirrors
@@ -2692,7 +2783,11 @@ impl App {
         let base = format!("auto-t{}", i + 1);
         let mut n = 1u32;
         let path = loop {
-            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+            let name = if n == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            };
             let p = dir.join(format!("{name}.slauto"));
             if !p.exists() {
                 break p;
@@ -2707,8 +2802,17 @@ impl App {
             }
         }
         let id = self.assets.len() as u32;
-        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.assets.push(Asset::automation_asset(id, name.clone(), path, Arc::new(auto), false));
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.assets.push(Asset::automation_asset(
+            id,
+            name.clone(),
+            path,
+            Arc::new(auto),
+            false,
+        ));
         let pos = snap_start(st.start, self.snap_unit());
         let nl0 = self.arr.tracks[i].lanes.len();
         let lane = self.arr.place_auto(i, Clip::new(id, pos), len as u64);
@@ -2749,8 +2853,17 @@ impl App {
             return;
         }
         let id = self.assets.len() as u32;
-        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.assets.push(Asset::automation_asset(id, name.clone(), path, Arc::new(auto), false));
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.assets.push(Asset::automation_asset(
+            id,
+            name.clone(),
+            path,
+            Arc::new(auto),
+            false,
+        ));
         let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
         let lane = self.arr.place_auto(track, Clip::new(id, pos), len as u64);
@@ -2782,14 +2895,20 @@ impl App {
             TARGET_TRACK_VOL => {
                 // v came from value_user_parse: dB -> linear. Back to dB
                 // for the fader: typed -12 = -12 dB (0 = +0 dB).
-                let m = vol_midi(if v <= 0.0 { f32::NEG_INFINITY } else { 20.0 * v.log10() });
+                let m = vol_midi(if v <= 0.0 {
+                    f32::NEG_INFINITY
+                } else {
+                    20.0 * v.log10()
+                });
                 self.set_trk_vol(track, m);
                 self.levels_dirty = true;
             }
             TARGET_PSEUDO_GAIN => {
                 // v is linear (parse mapped dB -> linear); back to dB.
                 let db = if v <= 0.0 { -80.0 } else { 20.0 * v.log10() };
-                let m = (GAIN_UNITY_MIDI as f32 + db / 0.215).round().clamp(0.0, 127.0) as u8;
+                let m = (GAIN_UNITY_MIDI as f32 + db / 0.215)
+                    .round()
+                    .clamp(0.0, 127.0) as u8;
                 self.set_trk_gain(track, m);
                 self.levels_dirty = true;
             }
@@ -2804,8 +2923,11 @@ impl App {
                 }
             }
             TARGET_MASTER_VOL => {
-                self.master_midi =
-                    vol_midi(if v <= 0.0 { f32::NEG_INFINITY } else { 20.0 * v.log10() });
+                self.master_midi = vol_midi(if v <= 0.0 {
+                    f32::NEG_INFINITY
+                } else {
+                    20.0 * v.log10()
+                });
                 self.levels_dirty = true;
             }
             TARGET_MASTER_TEMPO => {
@@ -2831,7 +2953,9 @@ impl App {
             }
             t if t.starts_with("fx:") => {
                 let rest = &t["fx:".len()..];
-                let Some((r, i)) = rest.split_once(':') else { return false };
+                let Some((r, i)) = rest.split_once(':') else {
+                    return false;
+                };
                 let (Ok(r), Ok(i)) = (r.parse::<usize>(), i.parse::<usize>()) else {
                     return false;
                 };
@@ -2849,8 +2973,11 @@ impl App {
                     } else {
                         false
                     }
-                } else if let Some(ChainRow::Vst { entry: Some(e), params, .. }) =
-                    self.fx_rows[track].get_mut(r)
+                } else if let Some(ChainRow::Vst {
+                    entry: Some(e),
+                    params,
+                    ..
+                }) = self.fx_rows[track].get_mut(r)
                 {
                     e.set_param(i, v);
                     if let Some(p) = params.get_mut(i) {
@@ -2871,16 +2998,21 @@ impl App {
                 return false;
             }
         }
-        let name =
-            if target == TARGET_PSEUDO_GAIN { "track gain".to_string() } else { describe_target(target) };
-        self.status =
-            format!("set {name} = {txt} {}", value_unit_label(target));
+        let name = if target == TARGET_PSEUDO_GAIN {
+            "track gain".to_string()
+        } else {
+            describe_target(target)
+        };
+        self.status = format!("set {name} = {txt} {}", value_unit_label(target));
         true
     }
 
     /// Open the automation manager editing asset `k` (None = fresh curve).
     fn open_auto_editor(&mut self, k: Option<usize>) {
-        let (name, target, len, nodes) = match k.and_then(|k| self.assets.get(k)).map(|a| a.automation.clone()) {
+        let (name, target, len, nodes) = match k
+            .and_then(|k| self.assets.get(k))
+            .map(|a| a.automation.clone())
+        {
             Some(Some(a)) => (
                 self.assets[k.unwrap()].name.clone(),
                 a.target.clone(),
@@ -2891,15 +3023,11 @@ impl App {
                 // v0.15: a FRESH curve spans the SELECTED clips when any
                 // are selected, else the LONGEST track in the arrangement
                 // (the "same amount of measures" requirement).
-                let end_of = |c: &Clip| {
-                    c.pos as i64 + c.play_len.unwrap_or(0) as i64
-                };
+                let end_of = |c: &Clip| c.pos as i64 + c.play_len.unwrap_or(0) as i64;
                 let sel_end = self
                     .sel_clips
                     .iter()
-                    .filter_map(|(t, k2, c)| {
-                        self.arr.tracks.get(*t)?.lanes.get(*k2)?.clips.get(*c)
-                    })
+                    .filter_map(|(t, k2, c)| self.arr.tracks.get(*t)?.lanes.get(*k2)?.clips.get(*c))
                     .map(end_of)
                     .max()
                     .unwrap_or(0);
@@ -2922,7 +3050,11 @@ impl App {
                     crate::automation::TARGET_TRACK_VOL.to_string(),
                     len,
                     vec![
-                        crate::automation::Node { t: 0, v: 1.0, s: crate::automation::Shape::Linear },
+                        crate::automation::Node {
+                            t: 0,
+                            v: 1.0,
+                            s: crate::automation::Shape::Linear,
+                        },
                         crate::automation::Node {
                             t: len,
                             v: 1.0,
@@ -2986,7 +3118,8 @@ impl App {
                 for (id, label) in &targets {
                     let frac = target_preview_frac(self, track, id);
                     let full = ui.available_width();
-                    let (bar, _) = ui.allocate_at_least(egui::vec2(full, 20.0), egui::Sense::hover());
+                    let (bar, _) =
+                        ui.allocate_at_least(egui::vec2(full, 20.0), egui::Sense::hover());
                     let p = ui.painter();
                     p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
                     p.rect_filled(
@@ -3012,7 +3145,10 @@ impl App {
                             .fill(Color32::from_rgba_premultiplied(255, 120, 120, 24))
                             .min_size(egui::vec2(full, 20.0)),
                     );
-                    if btn.on_hover_text(format!("bind this curve to {label}")).clicked() {
+                    if btn
+                        .on_hover_text(format!("bind this curve to {label}"))
+                        .clicked()
+                    {
                         pick = Some((id.clone(), label.clone()));
                     }
                 }
@@ -3023,8 +3159,7 @@ impl App {
                 let (omin, omax) = crate::automation::target_range(&ed.target);
                 let (nmin, nmax) = crate::automation::target_range(&id);
                 for n in ed.nodes.iter_mut() {
-                    let f =
-                        ((n.v - omin) / (omax - omin).max(1e-9)).clamp(0.0, 1.0);
+                    let f = ((n.v - omin) / (omax - omin).max(1e-9)).clamp(0.0, 1.0);
                     n.v = nmin + f * (nmax - nmin);
                 }
                 ed.target = id;
@@ -3040,7 +3175,9 @@ impl App {
 
     fn auto_window(&mut self, ui: &mut egui::Ui) {
         use crate::automation::{Automation, Node, Shape};
-        let Some(mut ed) = self.auto_edit.take() else { return };
+        let Some(mut ed) = self.auto_edit.take() else {
+            return;
+        };
         let sr = self.sample_rate.max(1) as f64;
         let track = self.selected;
         let targets = auto_targets(self, track);
@@ -3519,12 +3656,26 @@ impl App {
         let dir = self.primary_folder();
         let base: String = name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
             .collect();
-        let base = if base.trim_matches('-').is_empty() { "automation".to_string() } else { base.trim_matches('-').to_string() };
+        let base = if base.trim_matches('-').is_empty() {
+            "automation".to_string()
+        } else {
+            base.trim_matches('-').to_string()
+        };
         let mut n = 1u32;
         let path = loop {
-            let fname = if n == 1 { format!("{base}.slauto") } else { format!("{base}-{n}.slauto") };
+            let fname = if n == 1 {
+                format!("{base}.slauto")
+            } else {
+                format!("{base}-{n}.slauto")
+            };
             let p = dir.join(fname);
             if !p.exists() {
                 break p;
@@ -3536,7 +3687,10 @@ impl App {
             return;
         }
         let id = self.assets.len() as u32;
-        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         self.assets.push(Asset::automation_asset(
             id,
             name.clone(),
@@ -3546,7 +3700,9 @@ impl App {
         ));
         let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
-        let lane = self.arr.place_auto(track, Clip::new(id, pos), auto.len_samples as u64);
+        let lane = self
+            .arr
+            .place_auto(track, Clip::new(id, pos), auto.len_samples as u64);
         self.grow_for_lanes(track, nl0);
         if let Some(f) = self.rack.first_mut() {
             f.rescan();
@@ -3610,19 +3766,31 @@ impl App {
         let at = self.backend.engine.pos();
         let mut evs: Vec<(u64, u8, u8, u8, u8)> = Vec::with_capacity(1);
         match *msg {
-            MidiMsg::NoteOn { channel, note, velocity } if velocity > 0 => {
+            MidiMsg::NoteOn {
+                channel,
+                note,
+                velocity,
+            } if velocity > 0 => {
                 evs.push((at, 3, channel, note, velocity));
             }
             MidiMsg::NoteOn { channel, note, .. } | MidiMsg::NoteOff { channel, note, .. } => {
                 evs.push((at, 0, channel, note, 0));
             }
-            MidiMsg::ControlChange { channel, number, value } => {
+            MidiMsg::ControlChange {
+                channel,
+                number,
+                value,
+            } => {
                 evs.push((at, 1, channel, number, value));
             }
             MidiMsg::ChannelPressure { channel, pressure } => {
                 evs.push((at, 2, channel, 0, pressure));
             }
-            MidiMsg::PolyPressure { channel, note, pressure } => {
+            MidiMsg::PolyPressure {
+                channel,
+                note,
+                pressure,
+            } => {
                 evs.push((at, 4, channel, note, pressure));
             }
             _ => return, // PC / pitch bend / sysex: not part of the pattern model
@@ -3723,7 +3891,11 @@ impl App {
         let base = format!("midi-t{}", t + 1);
         let mut n = 1u32;
         let path = loop {
-            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+            let name = if n == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            };
             let p = dir.join(format!("{name}.mid"));
             if !p.exists() {
                 break p;
@@ -3741,7 +3913,8 @@ impl App {
             .unwrap_or_default();
         let pat = Arc::new(pat);
         let len = pat.len_samples(self.sample_rate.max(1));
-        self.assets.push(Asset::midi(id, name.clone(), path, pat, false));
+        self.assets
+            .push(Asset::midi(id, name.clone(), path, pat, false));
         let pos = snap_start(start, self.snap_unit());
         let nl0 = self.arr.tracks[t].lanes.len();
         let lane = self.arr.place_auto(t, Clip::new(id, pos), len);
@@ -3752,7 +3925,11 @@ impl App {
         }
         self.push_project();
         self.save_config();
-        self.status = format!("track {}: MIDI take → clip in lane {} (“{name}”)", t + 1, lane + 1);
+        self.status = format!(
+            "track {}: MIDI take → clip in lane {} (“{name}”)",
+            t + 1,
+            lane + 1
+        );
     }
 
     /// The default script synth instance used when no track is picked for
@@ -3774,7 +3951,13 @@ impl App {
         for note in pat.notes.iter() {
             let s0 = pat.ticks_to_samples(note.start, sr);
             ev.push((s0, 3, note.ch, note.note, note.vel));
-            ev.push((s0 + pat.ticks_to_samples(note.len, sr).max(1), 0, note.ch, note.note, 0));
+            ev.push((
+                s0 + pat.ticks_to_samples(note.len, sr).max(1),
+                0,
+                note.ch,
+                note.note,
+                0,
+            ));
         }
         for m in pat.ccs.iter() {
             ev.push((pat.ticks_to_samples(m.at, sr), 1, m.ch, m.num, m.val));
@@ -3813,10 +3996,8 @@ impl App {
     /// and the note-placement preview when the user drops a note).
     fn audition_note(&mut self, note: u8) {
         let sr = self.sample_rate.max(1);
-        let ev: Vec<(u64, u8, u8, u8, u8)> = vec![
-            (0, 3, 0, note, 100),
-            ((sr as u64) / 3, 0, 0, note, 0),
-        ];
+        let ev: Vec<(u64, u8, u8, u8, u8)> =
+            vec![(0, 3, 0, note, 100), ((sr as u64) / 3, 0, 0, note, 0)];
         match self.audition_render(&ev, 0.6) {
             Some(buf) => {
                 // Additive (v0.10): repeated note taps stack like a real
@@ -3848,15 +4029,22 @@ impl App {
             return;
         }
         if self.preview_playing.as_deref() == Some(self.assets[id].name.as_str()) {
-            self.backend.cmd(Cmd::PreviewStop { id: Some(id as u32) });
+            self.backend.cmd(Cmd::PreviewStop {
+                id: Some(id as u32),
+            });
             self.preview_playing = None;
             return;
         }
-        let Some(pat) = self.assets[id].pattern.clone() else { return };
+        let Some(pat) = self.assets[id].pattern.clone() else {
+            return;
+        };
         match self.render_pattern_preview(&pat) {
             Some(buf) => {
                 let name = self.assets[id].name.clone();
-                self.backend.cmd(Cmd::PreviewPlay { id: id as u32, samples: buf });
+                self.backend.cmd(Cmd::PreviewPlay {
+                    id: id as u32,
+                    samples: buf,
+                });
                 self.preview_playing = Some(name);
             }
             None => self.status = "preview: no synth available".into(),
@@ -4035,8 +4223,7 @@ impl App {
         if wheel_dx != 0.0 {
             // Plain wheel: horizontal = a quarter beat per line notch,
             // vertical = two rows per notch (pitch scroll).
-            roll.scroll_sec =
-                (roll.scroll_sec - wheel_dx as f64 * 0.25 * sec_per_beat).max(0.0);
+            roll.scroll_sec = (roll.scroll_sec - wheel_dx as f64 * 0.25 * sec_per_beat).max(0.0);
         }
         if wheel_dy != 0.0 {
             roll.vscroll_px = (roll.vscroll_px + wheel_dy * roll.row_h * 2.0)
@@ -4758,15 +4945,13 @@ impl App {
             // and title-bar logic never have to re-scan stale geometry.
             let rect = win.response.rect;
             roll.win_rect = Some(rect);
-            if let Some(click) =
-                ui.ctx().input(|i| {
-                    if i.pointer.button_clicked(egui::PointerButton::Primary) {
-                        i.pointer.hover_pos()
-                    } else {
-                        None
-                    }
-                })
-            {
+            if let Some(click) = ui.ctx().input(|i| {
+                if i.pointer.button_clicked(egui::PointerButton::Primary) {
+                    i.pointer.hover_pos()
+                } else {
+                    None
+                }
+            }) {
                 roll.focused = rect.contains(click);
             }
         }
@@ -4843,9 +5028,7 @@ impl App {
         // canvas response, so without this a no-travel click sticks the
         // roll in Move and every later press is ignored. Runs AFTER the
         // window paints so a real drag's drag_stopped() commits first.
-        if !matches!(roll.gesture, RollGesture::None)
-            && !ui.ctx().input(|i| i.pointer.any_down())
-        {
+        if !matches!(roll.gesture, RollGesture::None) && !ui.ctx().input(|i| i.pointer.any_down()) {
             roll.gesture = RollGesture::None;
             roll.drag_notes.clear();
         }
@@ -4904,7 +5087,8 @@ impl App {
             .unwrap_or_default();
         let pat = Arc::new(pat.clone());
         let len = pat.len_samples(self.sample_rate.max(1));
-        self.assets.push(Asset::midi(id, name.clone(), path, pat, false));
+        self.assets
+            .push(Asset::midi(id, name.clone(), path, pat, false));
         let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
         let track = track.min(self.n_tracks - 1);
         let nl0 = self.arr.tracks[track].lanes.len();
@@ -4990,7 +5174,11 @@ impl App {
                         .find(|(k, _)| *k == cur)
                         .map(|(_, n)| n.clone())
                         .unwrap_or_else(|| "\u{2014} no sample \u{2014}".to_string());
-                    ui.label(RichText::new(format!("sample: {cur_name}")).strong().small());
+                    ui.label(
+                        RichText::new(format!("sample: {cur_name}"))
+                            .strong()
+                            .small(),
+                    );
                     let mut picked = None;
                     egui::ComboBox::from_id_salt(("sampler_asset_pick", t))
                         .width(240.0)
@@ -5084,7 +5272,11 @@ impl App {
                     // pushes the rack table to the engine) and switches
                     // the live patch — no restart, no re-selection.
                     let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
-                        i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect()
+                        i.raw
+                            .dropped_files
+                            .iter()
+                            .map(|f| f.path().to_path_buf())
+                            .collect()
                     });
                     for path in dropped {
                         if !crate::assets::is_audio_file(&path) {
@@ -5199,10 +5391,15 @@ impl App {
         if self.fx_vst_editors.remove(&(t, row)).is_some() {
             return; // toggle closed
         }
-        let Some(entry) = self.fx_rows.get(t).and_then(|r| r.get(row)).and_then(|r| match r {
-            ChainRow::Vst { entry, .. } => entry.clone(),
-            _ => None,
-        }) else {
+        let Some(entry) = self
+            .fx_rows
+            .get(t)
+            .and_then(|r| r.get(row))
+            .and_then(|r| match r {
+                ChainRow::Vst { entry, .. } => entry.clone(),
+                _ => None,
+            })
+        else {
             return;
         };
         if entry.has_editor() {
@@ -5217,8 +5414,10 @@ impl App {
         }
         // v0.11 R3: hosted plugins get NO slider window. A plugin with no
         // drawable editor keeps its current parameter values.
-        self.status =
-            format!("{}: this plugin has no window to open \u{2014} its controls are not editable", entry.name());
+        self.status = format!(
+            "{}: this plugin has no window to open \u{2014} its controls are not editable",
+            entry.name()
+        );
     }
 
     /// Close editor windows that are user-closed, failed, or whose track
@@ -5242,11 +5441,7 @@ impl App {
             self.fx_vst_editors.remove(&k);
         }
         for (t, w) in self.vst_editors.iter() {
-            let cur = match self
-                .track_synth_inst
-                .get(*t)
-                .and_then(|slot| slot.as_ref())
-            {
+            let cur = match self.track_synth_inst.get(*t).and_then(|slot| slot.as_ref()) {
                 Some(arc) => match arc.as_ref() {
                     crate::audio::SynthHandle::Vst(e) => {
                         Some(e.path().to_string_lossy().into_owned())
@@ -5266,10 +5461,9 @@ impl App {
             self.vst_editors.remove(&t);
         }
         if refused {
-            self.status =
-                "plugin editor could not draw \u{2014} its own window is the only \
+            self.status = "plugin editor could not draw \u{2014} its own window is the only \
                  parameter surface, so close and re-open it to retry"
-                    .into();
+                .into();
         }
     }
 
@@ -5381,8 +5575,13 @@ impl App {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    self.assets
-                        .push(Asset::midi(id, name, path.to_path_buf(), Arc::new(pat), false));
+                    self.assets.push(Asset::midi(
+                        id,
+                        name,
+                        path.to_path_buf(),
+                        Arc::new(pat),
+                        false,
+                    ));
                     self.sel_asset = Some(id as usize);
                     self.push_project();
                     Some(id as usize)
@@ -5571,9 +5770,10 @@ impl App {
                 fx: self.fx_rows[t]
                     .iter()
                     .filter_map(|r| match r {
-                        ChainRow::Script { stem, params } => {
-                            Some(TrackFxSave { stem: stem.clone(), params: params.clone() })
-                        }
+                        ChainRow::Script { stem, params } => Some(TrackFxSave {
+                            stem: stem.clone(),
+                            params: params.clone(),
+                        }),
                         ChainRow::Vst { .. } => None,
                     })
                     .collect(),
@@ -5584,7 +5784,14 @@ impl App {
                             stem: stem.clone(),
                             params: params.clone(),
                         },
-                        ChainRow::Vst { path, kind, name, params, entry: _, open_rx: _ } => ChainSave::Vst {
+                        ChainRow::Vst {
+                            path,
+                            kind,
+                            name,
+                            params,
+                            entry: _,
+                            open_rx: _,
+                        } => ChainSave::Vst {
                             path: path.clone(),
                             kind: kind.tag().to_string(),
                             name: name.clone(),
@@ -5674,7 +5881,11 @@ impl App {
                 let p = audio_dir.join(format!(
                     "{:03}-{}.slauto",
                     a.id,
-                    if stem.is_empty() { "automation".to_string() } else { stem }
+                    if stem.is_empty() {
+                        "automation".to_string()
+                    } else {
+                        stem
+                    }
                 ));
                 match std::fs::write(&p, auto.to_json().unwrap_or_default()) {
                     Ok(()) => {
@@ -5690,7 +5901,11 @@ impl App {
                 let p = audio_dir.join(format!(
                     "{:03}-{}.mid",
                     a.id,
-                    if stem.is_empty() { "pattern".to_string() } else { stem }
+                    if stem.is_empty() {
+                        "pattern".to_string()
+                    } else {
+                        stem
+                    }
                 ));
                 if let Err(e) = pat.save_mid(&p) {
                     self.status = format!("save: {e}");
@@ -5761,7 +5976,10 @@ impl App {
         for (i, pa) in pr.assets.iter().enumerate() {
             let found = project::resolve_asset(&pa.file, &dirs);
             // v0.11 R5: automation curves load straight from .slauto JSON.
-            if let Some(fp) = found.clone().filter(|p| crate::assets::is_auto_file(p.as_path())) {
+            if let Some(fp) = found
+                .clone()
+                .filter(|p| crate::assets::is_auto_file(p.as_path()))
+            {
                 match std::fs::read_to_string(&fp)
                     .map_err(|e| e.to_string())
                     .and_then(|s| crate::automation::Automation::from_json(&s))
@@ -5784,7 +6002,13 @@ impl App {
                 let fp = found.unwrap_or_default();
                 match Pattern::load_mid(&fp) {
                     Ok(pat) => {
-                        assets.push(Asset::midi(i as u32, pa.name.clone(), fp, Arc::new(pat), false));
+                        assets.push(Asset::midi(
+                            i as u32,
+                            pa.name.clone(),
+                            fp,
+                            Arc::new(pat),
+                            false,
+                        ));
                         continue;
                     }
                     Err(_) => missing += 1,
@@ -5856,16 +6080,22 @@ impl App {
             } else {
                 pt.fx
                     .iter()
-                    .map(|s| ChainSave::Fx { stem: s.stem.clone(), params: s.params.clone() })
+                    .map(|s| ChainSave::Fx {
+                        stem: s.stem.clone(),
+                        params: s.params.clone(),
+                    })
                     .collect()
             };
             self.fx_rows[t] = chain_src
                 .into_iter()
                 .filter_map(|s| match s {
-                    ChainSave::Fx { stem, params } => {
-                        Some(ChainRow::Script { stem, params })
-                    }
-                    ChainSave::Vst { path, kind, name, params } => {
+                    ChainSave::Fx { stem, params } => Some(ChainRow::Script { stem, params }),
+                    ChainSave::Vst {
+                        path,
+                        kind,
+                        name,
+                        params,
+                    } => {
                         let kind = crate::vsthost::VstKind::parse(&kind)?;
                         Some(ChainRow::Vst {
                             path,
@@ -5883,18 +6113,11 @@ impl App {
         self.assets = assets;
         self.arr = arr;
         // The saved project carries its own configured track count.
-        self.n_tracks = pr
-            .n_tracks
-            .unwrap_or(16)
-            .clamp(1, MAX_LOOPS) as usize;
+        self.n_tracks = pr.n_tracks.unwrap_or(16).clamp(1, MAX_LOOPS) as usize;
         // Per-track synths (missing slots fall back to the default piano).
         for t in 0..MAX_LOOPS {
             self.track_synth[t] = pr.track_synths.get(t).cloned().flatten();
-            self.track_synth_params[t] = pr
-                .track_synth_params
-                .get(t)
-                .cloned()
-                .unwrap_or_default();
+            self.track_synth_params[t] = pr.track_synth_params.get(t).cloned().unwrap_or_default();
         }
         self.rebuild_all_synths();
         // Heights are a per-session view; the new arrangement starts fresh.
@@ -6187,8 +6410,7 @@ impl App {
                                         if let Some(raw) = raw {
                                             let (rmin, rmax) =
                                                 crate::automation::target_range(&ed.target);
-                                            let v =
-                                                rmin + (raw as f32 / 127.0) * (rmax - rmin);
+                                            let v = rmin + (raw as f32 / 127.0) * (rmax - rmin);
                                             let trel = self
                                                 .backend
                                                 .engine
@@ -6393,14 +6615,15 @@ impl App {
             .piano_roll
             .as_ref()
             .and_then(|r| r.canvas_rect)
-            .is_some_and(|r| {
-                ui.ctx()
-                    .pointer_hover_pos()
-                    .is_some_and(|p| r.contains(p))
-            });
+            .is_some_and(|r| ui.ctx().pointer_hover_pos().is_some_and(|p| r.contains(p)));
         ui.ctx().input_mut(|i| {
             i.events.retain(|e| match e {
-                egui::Event::PointerButton { button: egui::PointerButton::Secondary, pressed: true, pos, .. } => {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    pos,
+                    ..
+                } => {
                     // v0.15: right-click on the bpm box answers with the
                     // automation menu, not the text-edit copy/paste menu —
                     // swallow the press and open it ourselves.
@@ -6417,8 +6640,7 @@ impl App {
                     modifiers,
                     ..
                 } => {
-                    if (modifiers.command || modifiers.ctrl) && !(over_roll && !modifiers.shift)
-                    {
+                    if (modifiers.command || modifiers.ctrl) && !(over_roll && !modifiers.shift) {
                         let s = match unit {
                             egui::MouseWheelUnit::Line => ZOOM_WHEEL_LINE,
                             _ => ZOOM_WHEEL_PX,
@@ -6453,9 +6675,17 @@ impl App {
             self.hscroll = (self.hscroll - pan).max(0.0);
         }
         if let Some(pos) = rmb_bpm {
-            let cur = self.metro_bpm.trim().parse::<f32>().unwrap_or(self.bpm() as f32);
-            self.value_menu =
-                Some((self.selected, crate::automation::TARGET_MASTER_TEMPO.to_string(), cur, pos));
+            let cur = self
+                .metro_bpm
+                .trim()
+                .parse::<f32>()
+                .unwrap_or(self.bpm() as f32);
+            self.value_menu = Some((
+                self.selected,
+                crate::automation::TARGET_MASTER_TEMPO.to_string(),
+                cur,
+                pos,
+            ));
         }
 
         // Master volume: same -inf..=+6 dB MIDI mapping as every track.
@@ -6560,7 +6790,8 @@ impl App {
                         (i.pointer.button_clicked(egui::PointerButton::Primary)
                             || i.pointer.button_clicked(egui::PointerButton::Secondary)
                             || i.key_pressed(egui::Key::Escape))
-                            && !rect.expand(4.0)
+                            && !rect
+                                .expand(4.0)
                                 .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
                     });
                 if done || click_elsewhere {
@@ -6591,11 +6822,9 @@ impl App {
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.label(
-                        RichText::new(format!(
-                            "Value in {unit} \u{b7} Enter applies, Esc cancels"
-                        ))
-                        .weak()
-                        .small(),
+                        RichText::new(format!("Value in {unit} \u{b7} Enter applies, Esc cancels"))
+                            .weak()
+                            .small(),
                     );
                     let re = ui.add_sized(
                         egui::vec2(240.0, 22.0),
@@ -6733,7 +6962,9 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                         .horizontal_align(egui::Align::Center)
                         .font(egui::TextStyle::Monospace),
                 )
-                .on_hover_text("Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.");
+                .on_hover_text(
+                    "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
+                );
             app.bpm_rect = Some(bpm_rt.rect);
             if bpm_rt.lost_focus() {
                 app.send_metro();
@@ -6838,17 +7069,29 @@ fn nearest_auto_node(
 /// target's USER unit, replacing the old always-on text box) and "Create
 /// automation asset" (a flat curve at the current value, editable later in
 /// the automation manager).
-fn value_menu_items(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) -> bool {
+fn value_menu_items(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    track: usize,
+    target: &str,
+    current: f32,
+) -> bool {
     if ui
-        .button(format!("Set value   [{}]", value_user_display(target, current)))
+        .button(format!(
+            "Set value   [{}]",
+            value_user_display(target, current)
+        ))
         .on_hover_text(format!(
             "Type an exact value ({}). Enter applies. Volume is dB: 0 = +0 dB, -20 = -20 dB.",
             value_unit_label(target)
         ))
         .clicked()
     {
-        app.value_dialog =
-            Some((track, target.to_string(), value_user_display(target, current)));
+        app.value_dialog = Some((
+            track,
+            target.to_string(),
+            value_user_display(target, current),
+        ));
         app.value_dialog_focus = true;
         ui.close();
         return true;
@@ -6901,7 +7144,10 @@ fn target_preview_frac(app: &App, track: usize, id: &str) -> f32 {
             }
             if let Some(rest) = id.strip_prefix("fx:") {
                 let mut it = rest.split(':');
-                if let (Some(r), Some(i)) = (it.next().and_then(|v| v.parse::<usize>().ok()), it.next().and_then(|v| v.parse::<usize>().ok())) {
+                if let (Some(r), Some(i)) = (
+                    it.next().and_then(|v| v.parse::<usize>().ok()),
+                    it.next().and_then(|v| v.parse::<usize>().ok()),
+                ) {
                     if let Some(ChainRow::Script { params, .. }) =
                         app.fx_rows.get(track).and_then(|rows| rows.get(r))
                     {
@@ -7004,7 +7250,12 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
     // parameter labels; plugins expose the NAMES THEY PUBLISH through the
     // API's parameter description — the documented host-visible value
     // system, exactly what the user asked to be reachable.
-    let stem = app.track_synth.get(t).cloned().flatten().unwrap_or_default();
+    let stem = app
+        .track_synth
+        .get(t)
+        .cloned()
+        .flatten()
+        .unwrap_or_default();
     if !stem.is_empty() {
         if let Some(d) = app.synth_registry.desc(&stem) {
             for (k, pd) in d.params.iter().enumerate() {
@@ -7023,7 +7274,11 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
     if let Some(rows) = app.fx_rows.get(t) {
         for (r, row) in rows.iter().enumerate() {
             match row {
-                ChainRow::Vst { entry: Some(e), name, .. } => {
+                ChainRow::Vst {
+                    entry: Some(e),
+                    name,
+                    ..
+                } => {
                     for (k, d) in e.descs().iter().enumerate() {
                         if d.writable {
                             out.push((format!("fx:{r}:{k}"), format!("{name} \u{b7} {}", d.name)));
@@ -7041,12 +7296,18 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
                         Some(d) => {
                             let nm = d.name.clone();
                             for (k, pd) in d.params.iter().enumerate() {
-                                out.push((format!("fx:{r}:{k}"), format!("{nm} \u{b7} {}", pd.label)));
+                                out.push((
+                                    format!("fx:{r}:{k}"),
+                                    format!("{nm} \u{b7} {}", pd.label),
+                                ));
                             }
                         }
                         None => {
                             for k in 0..params.len() {
-                                out.push((format!("fx:{r}:{k}"), format!("{stem} \u{b7} param {k}")));
+                                out.push((
+                                    format!("fx:{r}:{k}"),
+                                    format!("{stem} \u{b7} param {k}"),
+                                ));
                             }
                         }
                     }
@@ -7087,7 +7348,11 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
     rack_kind_badge(ui, row.rect, kind);
     // ONE click_and_drag response for the row: a separate drag-sense
     // overlay on top would CAPTURE the press and kill clicked().
-    let dr = ui.interact(row.rect, ui.id().with(("rackdrag", fi, name)), Sense::click_and_drag());
+    let dr = ui.interact(
+        row.rect,
+        ui.id().with(("rackdrag", fi, name)),
+        Sense::click_and_drag(),
+    );
     if dr.clicked() {
         // Click = select + audition (asset preview).
         if let Some(k) = app.ensure_asset(fp) {
@@ -7150,9 +7415,14 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("ASSET RACK").strong());
-                if ui.button("+ folder").on_hover_text("Add an audio folder to the rack").clicked()
+                if ui
+                    .button("+ folder")
+                    .on_hover_text("Add an audio folder to the rack")
+                    .clicked()
                 {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Add rack folder").pick_folder()
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title("Add rack folder")
+                        .pick_folder()
                     {
                         let mut f = RackFolder::new(p.to_string_lossy().into_owned());
                         f.rescan();
@@ -7172,197 +7442,256 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     .small(),
                 );
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                // Snapshot so rows can call &mut App methods (ensure_asset).
-                let snap: Vec<RackRow> = app
-                    .rack
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.path.clone(),
-                            f.files
-                                .iter()
-                                .map(|r| (r.name.clone(), r.path.clone(), r.is_midi, r.is_auto))
-                                .collect(),
-                            f.err.clone(),
-                        )
-                    })
-                    .collect();
-                let mut rescan = None;
-                let mut browse = None;
-                let mut rm = None;
-                for (fi, (path, files, err)) in snap.into_iter().enumerate() {
-                    ui.add_space(3.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let tag = if fi == 0 { " [primary]" } else { "" };
-                        ui.label(
-                            RichText::new(format!("{}{}", base_name(&path), tag))
-                                .strong()
-                                .small(),
-                        )
-                        .on_hover_text(format!("{}{}", path, if fi == 0 { " (primary — recordings are stored here)" } else { "" }));
-                        if ui.small_button("scan").clicked() {
-                            rescan = Some(fi);
-                        }
-                        if ui.small_button("...").on_hover_text("Change folder").clicked() {
-                            browse = Some(fi);
-                        }
-                        if ui.small_button("x").on_hover_text("Remove from rack").clicked() {
-                            rm = Some(fi);
-                        }
-                    });
-                    if let Some(e) = err {
-                        ui.label(RichText::new(format!("× {}", e)).color(Color32::from_rgb(220, 120, 120)).small());
-                    }
-                    // Two sections per folder: AUDIO then MIDI clips.
-                    // Section headers show whenever a section has entries
-                    // (previously only when BOTH did, so a folder of pure
-                    // MIDI files carried no label at all), and every row
-                    // additionally carries a kind badge.
-                    let audio: Vec<(String, PathBuf)> = files
-                        .iter()
-                        .filter(|(_, _, m, a)| !*m && !*a)
-                        .map(|(n, p, _, _)| (n.clone(), p.clone()))
-                        .collect();
-                    let midis: Vec<(String, PathBuf)> = files
-                        .iter()
-                        .filter(|(_, _, m, _)| *m)
-                        .map(|(n, p, _, _)| (n.clone(), p.clone()))
-                        .collect();
-                    let autos: Vec<(String, PathBuf)> = files
-                        .iter()
-                        .filter(|(_, _, _, a)| *a)
-                        .map(|(n, p, _, _)| (n.clone(), p.clone()))
-                        .collect();
-                    if !audio.is_empty() {
-                        ui.label(
-                            RichText::new("audio")
-                                .weak()
-                                .small()
-                                .color(Color32::from_rgb(210, 175, 120)),
-                        );
-                    }
-                    for (name, fp) in audio {
-                        rack_file_row(ui, app, fi, &name, &fp, 0);
-                    }
-                    if !midis.is_empty() {
-                        ui.label(
-                            RichText::new("MIDI")
-                                .weak()
-                                .small()
-                                .color(Color32::from_rgb(150, 200, 255)),
-                        );
-                    }
-                    for (name, fp) in midis {
-                        rack_file_row(ui, app, fi, &name, &fp, 1);
-                    }
-                    if !autos.is_empty() {
-                        ui.label(
-                            RichText::new("AUTOMATION")
-                                .weak()
-                                .small()
-                                .color(Color32::from_rgb(255, 120, 120)),
-                        );
-                    }
-                    for (name, fp) in autos {
-                        rack_file_row(ui, app, fi, &name, &fp, 2);
-                    }
-                }
-                if let Some(fi) = rescan {
-                    if let Some(f) = app.rack.get_mut(fi) {
-                        f.rescan();
-                    }
-                }
-                if let Some(fi) = browse {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Rack folder").pick_folder() {
-                        app.rack[fi].path = p.to_string_lossy().into_owned();
-                        app.rack[fi].rescan();
-                        app.save_config();
-                    }
-                }
-                if let Some(fi) = rm {
-                    if app.rack.len() > 1 || fi != 0 {
-                        app.rack.remove(fi);
-                    } else {
-                        app.rack.clear();
-                    }
-                    app.save_config();
-                }
-
-                // Project-only assets: recordings with no rack folder,
-                // dirty edits, and files whose folder was removed.
-                let mut extra: Vec<(usize, String, bool, u8)> = Vec::new();
-                for (k, a) in app.assets.iter().enumerate() {
-                    let in_rack = app
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Snapshot so rows can call &mut App methods (ensure_asset).
+                    let snap: Vec<RackRow> = app
                         .rack
                         .iter()
-                        .any(|f| f.files.iter().any(|r| r.path == a.path && !a.dirty));
-                    if !in_rack {
-                        extra.push((
-                            k,
-                            a.name.clone(),
-                            a.dirty,
-                            if a.is_auto() { 2u8 } else if a.is_midi() { 1 } else { 0 },
-                        ));
-                    }
-                }
-                if !extra.is_empty() {
-                    ui.add_space(3.0);
-                    ui.separator();
-                    ui.label(RichText::new("project assets").weak().small());
-                    for (k, name, dirty, kind) in extra {
-                        let sel = app.sel_asset == Some(k);
-                        let w = ui.available_width();
-                        let row = ui.add_sized(
-                            egui::vec2(w, 20.0),
-                            egui::Button::selectable(
-                                sel,
-                                RichText::new(format!("{}{}", name, if dirty { " *" } else { "" })).small(),
-                            ),
-                        );
-                        rack_kind_badge(ui, row.rect, kind);
-                        // Merged click+drag response (see rack rows above).
-                        let dr = ui.interact(row.rect, ui.id().with(("assetdrag", k)), Sense::click_and_drag());
-                        if dr.clicked() {
-                            app.sel_asset = Some(k);
-                            app.preview_asset(k);
-                        }
-                        if dr.drag_started() {
-                            dr.dnd_set_drag_payload(k);
-                        }
-                        row.on_hover_text("part of this project (not a rack file) — draggable");
-                    }
-                }
-
-                // ---- selected-asset toolbar ----
-                ui.add_space(6.0);
-                ui.separator();
-                match app.sel_asset {
-                    Some(k) if k < app.assets.len() => {
-                        let (nm, secs) = (
-                            app.assets[k].name.clone(),
-                            app.asset_len(k as u32) as f64 / app.sample_rate.max(1) as f64,
-                        );
-                        ui.label(RichText::new(format!("asset: {}", nm)).small());
-                        ui.label(RichText::new(format!("{:.2} s", secs)).weak().small());
+                        .map(|f| {
+                            (
+                                f.path.clone(),
+                                f.files
+                                    .iter()
+                                    .map(|r| (r.name.clone(), r.path.clone(), r.is_midi, r.is_auto))
+                                    .collect(),
+                                f.err.clone(),
+                            )
+                        })
+                        .collect();
+                    let mut rescan = None;
+                    let mut browse = None;
+                    let mut rm = None;
+                    for (fi, (path, files, err)) in snap.into_iter().enumerate() {
+                        ui.add_space(3.0);
+                        ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.small_button("Quantize").on_hover_text(format!("Snap the content to the {} grid", SUBDIVISIONS[app.q_sub].1)).clicked() {
-                                app.transform_asset(k, 0);
+                            let tag = if fi == 0 { " [primary]" } else { "" };
+                            ui.label(
+                                RichText::new(format!("{}{}", base_name(&path), tag))
+                                    .strong()
+                                    .small(),
+                            )
+                            .on_hover_text(format!(
+                                "{}{}",
+                                path,
+                                if fi == 0 {
+                                    " (primary — recordings are stored here)"
+                                } else {
+                                    ""
+                                }
+                            ));
+                            if ui.small_button("scan").clicked() {
+                                rescan = Some(fi);
                             }
-                            if ui.small_button("Trim").on_hover_text("Clip silence off the start and end").clicked() {
-                                app.transform_asset(k, 1);
+                            if ui
+                                .small_button("...")
+                                .on_hover_text("Change folder")
+                                .clicked()
+                            {
+                                browse = Some(fi);
                             }
-                            if ui.small_button("Remove").on_hover_text("Remove this asset and its clips").clicked() {
-                                app.remove_asset_at(k);
+                            if ui
+                                .small_button("x")
+                                .on_hover_text("Remove from rack")
+                                .clicked()
+                            {
+                                rm = Some(fi);
                             }
                         });
+                        if let Some(e) = err {
+                            ui.label(
+                                RichText::new(format!("× {}", e))
+                                    .color(Color32::from_rgb(220, 120, 120))
+                                    .small(),
+                            );
+                        }
+                        // Two sections per folder: AUDIO then MIDI clips.
+                        // Section headers show whenever a section has entries
+                        // (previously only when BOTH did, so a folder of pure
+                        // MIDI files carried no label at all), and every row
+                        // additionally carries a kind badge.
+                        let audio: Vec<(String, PathBuf)> = files
+                            .iter()
+                            .filter(|(_, _, m, a)| !*m && !*a)
+                            .map(|(n, p, _, _)| (n.clone(), p.clone()))
+                            .collect();
+                        let midis: Vec<(String, PathBuf)> = files
+                            .iter()
+                            .filter(|(_, _, m, _)| *m)
+                            .map(|(n, p, _, _)| (n.clone(), p.clone()))
+                            .collect();
+                        let autos: Vec<(String, PathBuf)> = files
+                            .iter()
+                            .filter(|(_, _, _, a)| *a)
+                            .map(|(n, p, _, _)| (n.clone(), p.clone()))
+                            .collect();
+                        if !audio.is_empty() {
+                            ui.label(
+                                RichText::new("audio")
+                                    .weak()
+                                    .small()
+                                    .color(Color32::from_rgb(210, 175, 120)),
+                            );
+                        }
+                        for (name, fp) in audio {
+                            rack_file_row(ui, app, fi, &name, &fp, 0);
+                        }
+                        if !midis.is_empty() {
+                            ui.label(
+                                RichText::new("MIDI")
+                                    .weak()
+                                    .small()
+                                    .color(Color32::from_rgb(150, 200, 255)),
+                            );
+                        }
+                        for (name, fp) in midis {
+                            rack_file_row(ui, app, fi, &name, &fp, 1);
+                        }
+                        if !autos.is_empty() {
+                            ui.label(
+                                RichText::new("AUTOMATION")
+                                    .weak()
+                                    .small()
+                                    .color(Color32::from_rgb(255, 120, 120)),
+                            );
+                        }
+                        for (name, fp) in autos {
+                            rack_file_row(ui, app, fi, &name, &fp, 2);
+                        }
                     }
-                    _ => {
-                        ui.label(RichText::new("select an asset to quantize, trim or remove").weak().small());
+                    if let Some(fi) = rescan {
+                        if let Some(f) = app.rack.get_mut(fi) {
+                            f.rescan();
+                        }
                     }
-                }
-            });
+                    if let Some(fi) = browse {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_title("Rack folder")
+                            .pick_folder()
+                        {
+                            app.rack[fi].path = p.to_string_lossy().into_owned();
+                            app.rack[fi].rescan();
+                            app.save_config();
+                        }
+                    }
+                    if let Some(fi) = rm {
+                        if app.rack.len() > 1 || fi != 0 {
+                            app.rack.remove(fi);
+                        } else {
+                            app.rack.clear();
+                        }
+                        app.save_config();
+                    }
+
+                    // Project-only assets: recordings with no rack folder,
+                    // dirty edits, and files whose folder was removed.
+                    let mut extra: Vec<(usize, String, bool, u8)> = Vec::new();
+                    for (k, a) in app.assets.iter().enumerate() {
+                        let in_rack = app
+                            .rack
+                            .iter()
+                            .any(|f| f.files.iter().any(|r| r.path == a.path && !a.dirty));
+                        if !in_rack {
+                            extra.push((
+                                k,
+                                a.name.clone(),
+                                a.dirty,
+                                if a.is_auto() {
+                                    2u8
+                                } else if a.is_midi() {
+                                    1
+                                } else {
+                                    0
+                                },
+                            ));
+                        }
+                    }
+                    if !extra.is_empty() {
+                        ui.add_space(3.0);
+                        ui.separator();
+                        ui.label(RichText::new("project assets").weak().small());
+                        for (k, name, dirty, kind) in extra {
+                            let sel = app.sel_asset == Some(k);
+                            let w = ui.available_width();
+                            let row = ui.add_sized(
+                                egui::vec2(w, 20.0),
+                                egui::Button::selectable(
+                                    sel,
+                                    RichText::new(format!(
+                                        "{}{}",
+                                        name,
+                                        if dirty { " *" } else { "" }
+                                    ))
+                                    .small(),
+                                ),
+                            );
+                            rack_kind_badge(ui, row.rect, kind);
+                            // Merged click+drag response (see rack rows above).
+                            let dr = ui.interact(
+                                row.rect,
+                                ui.id().with(("assetdrag", k)),
+                                Sense::click_and_drag(),
+                            );
+                            if dr.clicked() {
+                                app.sel_asset = Some(k);
+                                app.preview_asset(k);
+                            }
+                            if dr.drag_started() {
+                                dr.dnd_set_drag_payload(k);
+                            }
+                            row.on_hover_text("part of this project (not a rack file) — draggable");
+                        }
+                    }
+
+                    // ---- selected-asset toolbar ----
+                    ui.add_space(6.0);
+                    ui.separator();
+                    match app.sel_asset {
+                        Some(k) if k < app.assets.len() => {
+                            let (nm, secs) = (
+                                app.assets[k].name.clone(),
+                                app.asset_len(k as u32) as f64 / app.sample_rate.max(1) as f64,
+                            );
+                            ui.label(RichText::new(format!("asset: {}", nm)).small());
+                            ui.label(RichText::new(format!("{:.2} s", secs)).weak().small());
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button("Quantize")
+                                    .on_hover_text(format!(
+                                        "Snap the content to the {} grid",
+                                        SUBDIVISIONS[app.q_sub].1
+                                    ))
+                                    .clicked()
+                                {
+                                    app.transform_asset(k, 0);
+                                }
+                                if ui
+                                    .small_button("Trim")
+                                    .on_hover_text("Clip silence off the start and end")
+                                    .clicked()
+                                {
+                                    app.transform_asset(k, 1);
+                                }
+                                if ui
+                                    .small_button("Remove")
+                                    .on_hover_text("Remove this asset and its clips")
+                                    .clicked()
+                                {
+                                    app.remove_asset_at(k);
+                                }
+                            });
+                        }
+                        _ => {
+                            ui.label(
+                                RichText::new("select an asset to quantize, trim or remove")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                    }
+                });
         });
 }
 
@@ -7389,7 +7718,9 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
                 egui::vec2(44.0, 18.0),
                 Slider::new(&mut mv, 0..=127).show_value(false),
             )
-            .on_hover_text("Master volume: -inf .. +6 dB. Right-click for exact entry and automation.");
+            .on_hover_text(
+                "Master volume: -inf .. +6 dB. Right-click for exact entry and automation.",
+            );
         let mvr = ui
             .add_sized(
                 egui::vec2(50.0, 18.0),
@@ -7666,13 +7997,12 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 let more = ui.small_button("\u{2026} more").on_hover_text(
                     "This strip is short \u{2014} click for gain, pan, FX and synth",
                 );
-                egui::Popup::menu(&more)
-                    .show(|ui| {
-                        level_row(ui, app, t, KIND_GAIN);
-                        level_row(ui, app, t, KIND_PAN);
-                        strip_fx_row(ui, app, t);
-                        strip_synth_row(ui, app, t);
-                    });
+                egui::Popup::menu(&more).show(|ui| {
+                    level_row(ui, app, t, KIND_GAIN);
+                    level_row(ui, app, t, KIND_PAN);
+                    strip_fx_row(ui, app, t);
+                    strip_synth_row(ui, app, t);
+                });
             });
         }
     }
@@ -7680,96 +8010,99 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
 
 /// FX-chain row of a mixer strip (also rendered inside the "more" menu).
 fn strip_fx_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
-        if ui
-            .small_button("FX")
-            .on_hover_text("This track's mixer chain: effects scripts and VST plugins in one ordered list")
-            .clicked()
-        {
-            app.fx_window = Some(t);
-        }
-        fx_buttons(ui, app, t);
+    if ui
+        .small_button("FX")
+        .on_hover_text(
+            "This track's mixer chain: effects scripts and VST plugins in one ordered list",
+        )
+        .clicked()
+    {
+        app.fx_window = Some(t);
+    }
+    fx_buttons(ui, app, t);
 }
 
 /// Synth-pick row of a mixer strip (also rendered inside the "more" menu).
 fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
-        // Per-track synthesizer for MIDI clips (default: bundled piano;
-        // scanned VST instruments can be bound as "vst:<path>").
-        let cur = app.track_synth[t].clone().unwrap_or_default();
-        let stems = app.synth_registry.stems();
-        let show = if cur.is_empty() {
-            "piano".to_string()
-        } else if let Some((_, p)) = vst_synth_decode(&cur) {
-            let name = app
-                .vst_scan
-                .iter()
-                .find(|e| e.path.to_string_lossy() == p)
-                .map(|e| e.name.clone())
-                .unwrap_or_else(|| {
-                    std::path::Path::new(p)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.to_string())
-                });
-            format!("{name} (VSTi)")
-        } else {
-            cur.clone()
-        };
-        let mut rescan = false;
-        egui::ComboBox::from_id_salt(("synthpick", t))
-            .selected_text(RichText::new(format!("\u{266a} {show}")))
-            .show_ui(ui, |ui| {
-                let mut tmp = cur.clone();
-                ui.selectable_value(&mut tmp, String::new(), "default (piano)");
-                for stem in &stems {
-                    ui.selectable_value(&mut tmp, stem.clone(), stem.as_str());
-                }
-                if !app.vst_scanned {
-                    app.vst_rescan();
-                }
-                for e in app.vst_scan.clone() {
-                    if !e.instrument || e.error.is_some() {
-                        continue;
-                    }
-                    let val = vst_synth_encode(e.kind, &e.path.to_string_lossy());
-                    ui.selectable_value(&mut tmp, val, format!("\u{266a} {} (VSTi)", e.name));
-                }
-                if ui.small_button("\u{21bb}").on_hover_text("Re-scan the synths folder").clicked()
-                {
-                    rescan = true;
-                }
-                if tmp != cur {
-                    // (set_track_synth_stem auto-opens the plugin's GUI)
-                    app.set_track_synth_stem(t, &tmp);
-                }
+    // Per-track synthesizer for MIDI clips (default: bundled piano;
+    // scanned VST instruments can be bound as "vst:<path>").
+    let cur = app.track_synth[t].clone().unwrap_or_default();
+    let stems = app.synth_registry.stems();
+    let show = if cur.is_empty() {
+        "piano".to_string()
+    } else if let Some((_, p)) = vst_synth_decode(&cur) {
+        let name = app
+            .vst_scan
+            .iter()
+            .find(|e| e.path.to_string_lossy() == p)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string())
             });
-        if rescan {
-            app.synth_registry.rescan();
-            app.status = "synths re-scanned".into();
-        }
-        if app.track_synth_inst[t].is_some() {
-            // v0.11 R3: hosted plugins are plug-and-play -- this button
-            // opens the plugin's OWN window (never a slider panel). Script
-            // synths keep their parameter sliders.
-            let is_vst = app
-                .track_synth[t]
-                .as_deref()
-                .is_some_and(|s| vst_synth_decode(s).is_some());
-            let label = if is_vst { "GUI" } else { "sliders" };
-            let hover = if is_vst {
-                "Open this plugin's own window (its controls live inside it)"
-            } else {
-                "This synth's parameters"
-            };
-            if ui.small_button(label).on_hover_text(hover).clicked() {
-                if is_vst {
-                    app.toggle_synth_gui(t);
-                } else {
-                    app.synth_win = Some(t);
+        format!("{name} (VSTi)")
+    } else {
+        cur.clone()
+    };
+    let mut rescan = false;
+    egui::ComboBox::from_id_salt(("synthpick", t))
+        .selected_text(RichText::new(format!("\u{266a} {show}")))
+        .show_ui(ui, |ui| {
+            let mut tmp = cur.clone();
+            ui.selectable_value(&mut tmp, String::new(), "default (piano)");
+            for stem in &stems {
+                ui.selectable_value(&mut tmp, stem.clone(), stem.as_str());
+            }
+            if !app.vst_scanned {
+                app.vst_rescan();
+            }
+            for e in app.vst_scan.clone() {
+                if !e.instrument || e.error.is_some() {
+                    continue;
                 }
+                let val = vst_synth_encode(e.kind, &e.path.to_string_lossy());
+                ui.selectable_value(&mut tmp, val, format!("\u{266a} {} (VSTi)", e.name));
+            }
+            if ui
+                .small_button("\u{21bb}")
+                .on_hover_text("Re-scan the synths folder")
+                .clicked()
+            {
+                rescan = true;
+            }
+            if tmp != cur {
+                // (set_track_synth_stem auto-opens the plugin's GUI)
+                app.set_track_synth_stem(t, &tmp);
+            }
+        });
+    if rescan {
+        app.synth_registry.rescan();
+        app.status = "synths re-scanned".into();
+    }
+    if app.track_synth_inst[t].is_some() {
+        // v0.11 R3: hosted plugins are plug-and-play -- this button
+        // opens the plugin's OWN window (never a slider panel). Script
+        // synths keep their parameter sliders.
+        let is_vst = app.track_synth[t]
+            .as_deref()
+            .is_some_and(|s| vst_synth_decode(s).is_some());
+        let label = if is_vst { "GUI" } else { "sliders" };
+        let hover = if is_vst {
+            "Open this plugin's own window (its controls live inside it)"
+        } else {
+            "This synth's parameters"
+        };
+        if ui.small_button(label).on_hover_text(hover).clicked() {
+            if is_vst {
+                app.toggle_synth_gui(t);
+            } else {
+                app.synth_win = Some(t);
             }
         }
+    }
 }
-
 
 /// The toolbar row above the timeline: quantize / snap controls, asset
 /// actions, loop and zoom.
@@ -8084,7 +8417,10 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
             }
         }
         if (cl.gain != 1.0 || cl.fade_in > 0 || cl.fade_out > 0)
-            && ui.button("reset").on_hover_text("Unity gain, no fades").clicked()
+            && ui
+                .button("reset")
+                .on_hover_text("Unity gain, no fades")
+                .clicked()
         {
             if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                 cl.gain = 1.0;
@@ -8381,7 +8717,10 @@ fn lane_row(
             .unwrap_or(rect.center());
         for (c, _name) in clips.iter() {
             let alen = app.asset_len(c.asset);
-            if app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto())
+            if app
+                .assets
+                .get(c.asset as usize)
+                .is_some_and(|a| a.is_auto())
                 && pt.x >= x_of(x0, c.pos, sr, px)
                 && pt.x <= x_of(x0, c.end(alen), sr, px)
             {
@@ -8444,18 +8783,22 @@ fn lane_row(
         // hides it exactly like the engine does.
         let vlen = c.span(alen).min(c.avail(alen));
         // v0.11 R5: automation clips are the third kind and wear red.
-        let is_auto = app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto());
-        let fill = if is_auto { Color32::from_rgb(170, 70, 74) } else { COL_CLIP };
+        let is_auto = app
+            .assets
+            .get(c.asset as usize)
+            .is_some_and(|a| a.is_auto());
+        let fill = if is_auto {
+            Color32::from_rgb(170, 70, 74)
+        } else {
+            COL_CLIP
+        };
         draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres, fill, sel);
         // Extended-past-data tail: silence, hatched dark so it reads as
         // "clip is longer than its source".
         let dend = x_of(x0, c.data_end(alen), sr, px);
         if dend < cx1 - 0.5 {
             ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(dend.max(cres.min.x), cres.min.y),
-                    cres.max,
-                ),
+                egui::Rect::from_min_max(egui::pos2(dend.max(cres.min.x), cres.min.y), cres.max),
                 0.0,
                 Color32::from_rgba_premultiplied(10, 10, 14, 160),
             );
@@ -8712,10 +9055,7 @@ fn lane_row(
                             let items: Vec<(usize, usize, usize, u64)> = ids
                                 .iter()
                                 .filter_map(|(tt, kk, cc)| {
-                                    let p = app
-                                        .arr
-                                        .tracks[*tt]
-                                        .lanes[*kk]
+                                    let p = app.arr.tracks[*tt].lanes[*kk]
                                         .clips
                                         .get(*cc)
                                         .map(|c| c.pos)?;
@@ -8748,8 +9088,7 @@ fn lane_row(
                                 app.sel_anchor = None;
                             }
                             app.scrub_drag = true;
-                            app.marquee_pending =
-                                Some((t, k, pt.x, add, app.sel_clips.clone()));
+                            app.marquee_pending = Some((t, k, pt.x, add, app.sel_clips.clone()));
                             app.backend.cmd(Cmd::Seek { pos });
                         }
                     }
@@ -8797,7 +9136,11 @@ fn lane_row(
                         let new_len = cand - r.pos0;
                         let avail = alen.saturating_sub(r.cut0);
                         let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
-                        cl.play_len = if new_len == avail { None } else { Some(new_len) };
+                        cl.play_len = if new_len == avail {
+                            None
+                        } else {
+                            Some(new_len)
+                        };
                     } else {
                         let orig_start = r.pos0.saturating_sub(r.cut0);
                         if (cand as i64 - orig_start as i64).abs() <= (unit / 2).max(1) as i64 {
@@ -8808,15 +9151,18 @@ fn lane_row(
                         cand = cand.max(orig_start).min(r.end0.saturating_sub(unit));
                         // cand may sit LEFT of pos0 (re-exposing cut audio):
                         // signed math, u64 would wrap (debug panics).
-                        let new_cut =
-                            (r.cut0 as i64 + (cand as i64 - r.pos0 as i64)).clamp(0, alen as i64)
-                                as u64;
+                        let new_cut = (r.cut0 as i64 + (cand as i64 - r.pos0 as i64))
+                            .clamp(0, alen as i64) as u64;
                         let new_len = r.end0 - cand;
                         let avail = alen.saturating_sub(new_cut);
                         let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
                         cl.pos = cand;
                         cl.cut = new_cut;
-                        cl.play_len = if new_len >= avail { None } else { Some(new_len) };
+                        cl.play_len = if new_len >= avail {
+                            None
+                        } else {
+                            Some(new_len)
+                        };
                     }
                 }
             } else if let Some(d) = app.drag_clip.clone() {
@@ -8831,8 +9177,7 @@ fn lane_row(
                 // Single-clip drag: vertical pointer travel moves the clip
                 // between its track's lanes (groups stay horizontal-only).
                 if let Some(l0) = d.lane0 {
-                    let dl =
-                        ((pt.y - rect.center().y) / rect.height().max(1.0)).round() as i64;
+                    let dl = ((pt.y - rect.center().y) / rect.height().max(1.0)).round() as i64;
                     let (tt, cur, cc, _) = d.items[0];
                     let nl = app.arr.tracks[tt].lanes.len() as i64;
                     let target = (l0 as i64 + dl).clamp(0, nl - 1) as usize;
@@ -8859,9 +9204,7 @@ fn lane_row(
             }
         }
     }
-    if resp.drag_stopped()
-        && (app.drag_clip.take().is_some() || app.clip_resize.take().is_some())
-    {
+    if resp.drag_stopped() && (app.drag_clip.take().is_some() || app.clip_resize.take().is_some()) {
         app.push_project();
     }
     if resp.clicked() && !resp.dragged() && !app.scrub_drag && app.drag_clip.is_none() {
@@ -8957,7 +9300,10 @@ fn grid_context_menu(
             app.delete_selection();
             ui.close();
         }
-        if app.assets.get(clips[ci].0.asset as usize).is_some_and(|a| a.is_auto())
+        if app
+            .assets
+            .get(clips[ci].0.asset as usize)
+            .is_some_and(|a| a.is_auto())
             && ui.button("Edit automation curve").clicked()
         {
             app.open_auto_editor(Some(clips[ci].0.asset as usize));
@@ -9014,7 +9360,11 @@ fn draw_asset_clip(
     p.rect_filled(rect, 2.0, fill.linear_multiply(0.45));
     // MIDI clips preview as an approximate piano roll (FL-style): every
     // note is a small bar; pitch maps to the clip's vertical extent.
-    if let Some(pat) = app.assets.get(asset as usize).and_then(|a| a.pattern.clone()) {
+    if let Some(pat) = app
+        .assets
+        .get(asset as usize)
+        .and_then(|a| a.pattern.clone())
+    {
         if rect.width() >= 4.0 {
             let (cut, wlen) = win;
             let wlen = wlen.max(1);
@@ -9034,7 +9384,8 @@ fn draw_asset_clip(
                 }
                 let s0 = note.start as f64 / lt * alen as f64;
                 let s1 = (note.start + note.len.max(1)) as f64 / lt * alen as f64;
-                let x0 = rect.min.x + ((s0 - cut as f64).max(0.0) / wlen as f64 * rect.width() as f64) as f32;
+                let x0 = rect.min.x
+                    + ((s0 - cut as f64).max(0.0) / wlen as f64 * rect.width() as f64) as f32;
                 let x1 = rect.min.x
                     + ((s1.min((cut + wlen) as f64) - cut as f64).max(0.0) / wlen as f64
                         * rect.width() as f64) as f32;
@@ -9063,7 +9414,11 @@ fn draw_asset_clip(
     }
     // v0.11 R5: automation clips preview as the actual curve (red),
     // sampled through the same trim window the audio preview uses.
-    if let Some(auto) = app.assets.get(asset as usize).and_then(|a| a.automation.clone()) {
+    if let Some(auto) = app
+        .assets
+        .get(asset as usize)
+        .and_then(|a| a.automation.clone())
+    {
         if rect.width() >= 4.0 {
             let (cut, wlen) = win;
             let wlen = wlen.max(1);
@@ -9283,13 +9638,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                     ui.close();
                 }
             }
-            _ => auto_menu(
-                ui,
-                app,
-                i,
-                crate::automation::TARGET_TRACK_PAN,
-                pan01(midi),
-            ),
+            _ => auto_menu(ui, app, i, crate::automation::TARGET_TRACK_PAN, pan01(midi)),
         };
         r.context_menu(|ui| menu(ui, app));
         vr.context_menu(|ui| menu(ui, app));
@@ -9324,7 +9673,10 @@ fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
         let (label, ok) = match row {
             ChainRow::Script { stem, .. } => {
                 let d = app.fx_registry.desc(stem);
-                (d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()), d.is_some())
+                (
+                    d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
+                    d.is_some(),
+                )
             }
             ChainRow::Vst { name, entry, .. } => (name.clone(), entry.is_some()),
         };
@@ -10606,7 +10958,9 @@ mod tests {
         // 3 s of sine: v07 clip tests need an asset comfortably longer
         // than the clips they drag (30 k samples) so a 200 px edge drag
         // at the default 160 px/s trims well past the asserted delta.
-        let data: Vec<f32> = (0..144_000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let data: Vec<f32> = (0..144_000)
+            .map(|i| (i as f32 * 0.05).sin() * 0.5)
+            .collect();
         crate::audio_io::export(
             &samples.join("kick.wav"),
             48000,
@@ -10623,9 +10977,9 @@ mod tests {
         let mut app = App::new(Backend::start());
         app.drain_events(); // discard the null-audio notice
         app.sample_rate = 48_000; // null audio never sends Evt::Ready
-        // Same wiring Evt::Ready performs in the real app: shared default
-        // piano instance + per-track bindings into the engine, so engine
-        // paths like bounce_track_preview have their fallback voice.
+                                  // Same wiring Evt::Ready performs in the real app: shared default
+                                  // piano instance + per-track bindings into the engine, so engine
+                                  // paths like bounce_track_preview have their fallback voice.
         app.rebuild_all_synths();
         // rebuild_all_synths sends SetDefaultSynth through the manager
         // queue (async). Tests call engine paths SYNCHRONOUSLY, so apply
@@ -10740,12 +11094,15 @@ mod tests {
                 .collect()
         };
         let before = note_bars(&mut app);
-        assert_eq!(before.len(), 2, "both notes painted before the trim: {before:?}");
+        assert_eq!(
+            before.len(),
+            2,
+            "both notes painted before the trim: {before:?}"
+        );
         let (n0, n1) = (
             before.iter().copied().reduce(f32::min).unwrap(),
             before.iter().copied().fold(f32::MIN, f32::max),
         );
-
 
         // Grab the clip's right edge (selected body rect) and trim ~200 px.
         let sel_rgb = {
@@ -10758,13 +11115,25 @@ mod tests {
             .max_by(|a, b| a.area().total_cmp(&b.area()))
             .expect("clip body painted");
         let cy = body.center().y;
-        drag_pt(&mut app, &ctx, egui::pos2(body.max.x - 2.0, cy), egui::pos2(body.max.x - 160.0, cy));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(body.max.x - 2.0, cy),
+            egui::pos2(body.max.x - 160.0, cy),
+        );
         let cl = app.arr.tracks[0].lanes[0].clips[0];
         let alen = app.asset_len(a);
-        assert!(cl.end(alen) - cl.pos <= alen * 4 / 5 + 1, "tail drag must trim away >= 20 %: {cl:?}");
+        assert!(
+            cl.end(alen) - cl.pos <= alen * 4 / 5 + 1,
+            "tail drag must trim away >= 20 %: {cl:?}"
+        );
 
         let after = note_bars(&mut app);
-        assert_eq!(after.len(), 1, "the 90 % note is CLIPPED out, not squeezed in: {after:?}");
+        assert_eq!(
+            after.len(),
+            1,
+            "the 90 % note is CLIPPED out, not squeezed in: {after:?}"
+        );
         assert!(
             (after[0] - n0.min(n1)).abs() < 2.0,
             "the surviving note sits at the SAME pixel (anchored, not stretched): {} vs {}",
@@ -10842,11 +11211,23 @@ mod tests {
             .max_by(|a, b| a.area().total_cmp(&b.area()))
             .expect("clip body painted");
         let cy = body.center().y;
-        drag_pt(&mut app, &ctx, egui::pos2(body.max.x - 2.0, cy), egui::pos2(body.max.x - 170.0, cy));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(body.max.x - 2.0, cy),
+            egui::pos2(body.max.x - 170.0, cy),
+        );
         let cl = app.arr.tracks[0].lanes[0].clips[0];
         let alen = app.asset_len(a);
-        assert!(cl.end(alen) < cl.pos + alen * 7 / 10, "trim must end before the burst: {cl:?}");
-        assert_eq!(tall(&mut app), 0, "trimmed-away burst must NOT be stretched into view");
+        assert!(
+            cl.end(alen) < cl.pos + alen * 7 / 10,
+            "trim must end before the burst: {cl:?}"
+        );
+        assert_eq!(
+            tall(&mut app),
+            0,
+            "trimmed-away burst must NOT be stretched into view"
+        );
     }
 
     /// SETTINGS must dock to the LEFT of the asset rack (add-order test:
@@ -10974,21 +11355,53 @@ mod tests {
         let p = egui::pos2(700.0, 246.0);
         frame(&mut app, &ctx, vec![moved(p)]);
         frame(&mut app, &ctx, vec![moved(p)]);
-        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
-        assert_eq!(total(&app), 1, "right-click kept the clips (no more instant clear)");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Secondary, false)],
+        );
+        assert_eq!(
+            total(&app),
+            1,
+            "right-click kept the clips (no more instant clear)"
+        );
         // Right on the clip body: the clip menu opens.
         if galley_at(&mut app, &ctx, "Duplicate").is_some() {
-            let del = galley_at(&mut app, &ctx, "Delete").expect("Delete item").center();
-            frame(&mut app, &ctx, vec![moved(del), btn(del, egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(del, egui::PointerButton::Primary, false)]);
+            let del = galley_at(&mut app, &ctx, "Delete")
+                .expect("Delete item")
+                .center();
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(del), btn(del, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(del, egui::PointerButton::Primary, false)],
+            );
             assert_eq!(total(&app), 0, "menu Delete removed the clip");
         } else {
             // Right-click landed on empty grid: the track menu with an
             // explicit Clear item must be there instead.
-            let cl = galley_at(&mut app, &ctx, "Clear this track").expect("Clear item").center();
-            frame(&mut app, &ctx, vec![moved(cl), btn(cl, egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(cl, egui::PointerButton::Primary, false)]);
+            let cl = galley_at(&mut app, &ctx, "Clear this track")
+                .expect("Clear item")
+                .center();
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(cl), btn(cl, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(cl, egui::PointerButton::Primary, false)],
+            );
             assert_eq!(total(&app), 0, "menu Clear emptied the track");
         }
     }
@@ -11013,11 +11426,7 @@ mod tests {
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         let len = app.asset_len(a);
         app.loop_mode = 1;
-        app.arr.insert(
-            0,
-            0,
-            Clip::new(a, 48_000),
-        );
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
         assert_eq!(
             app.loop_region_eff(),
             (0, 48_000 + len),
@@ -11056,7 +11465,10 @@ mod tests {
         // dB semantics live in value_user_parse / value_user_display.
         use crate::automation::{TARGET_TRACK_PAN, TARGET_TRACK_VOL};
         assert_eq!(db_num(vol_amp(0)), "-inf");
-        assert_eq!(value_user_display(TARGET_TRACK_VOL, vol_amp(VOL_UNITY_MIDI)), "+0.0");
+        assert_eq!(
+            value_user_display(TARGET_TRACK_VOL, vol_amp(VOL_UNITY_MIDI)),
+            "+0.0"
+        );
         assert_eq!(value_user_display(TARGET_TRACK_VOL, vol_amp(127)), "+6.0");
         // Typed values are 1:1 dB and round-trip through the fader.
         let db = |t: &str| {
@@ -11266,6 +11678,16 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// v16: one async-plumbing tick for headless pins — exactly the
+    /// per-tick drains `logic()` runs for plugin work (editor reaping +
+    /// `poll_vst_opens` landing async loads/scans), without an eframe
+    /// `Frame`. Pump loops that wait for plugin results must call it;
+    /// `frame()` alone only paints.
+    fn logic_tick(app: &mut App) {
+        app.reap_vst_editors();
+        app.poll_vst_opens();
+    }
+
     /// The regression test for "Ctrl+C copies, Ctrl+V pastes nothing":
     /// copy must remember the selected clip's asset and paste must place a
     /// new clip at the playhead on the last-clicked track.
@@ -11295,7 +11717,11 @@ mod tests {
                 key_ev(egui::Key::C, egui::Modifiers::COMMAND),
             ],
         );
-        assert_eq!(app.clipboard.as_ref().map(|c| c.items[0].asset), Some(a), "Ctrl+C remembered the asset");
+        assert_eq!(
+            app.clipboard.as_ref().map(|c| c.items[0].asset),
+            Some(a),
+            "Ctrl+C remembered the asset"
+        );
         frame_keys(
             &mut app,
             &ctx,
@@ -11316,7 +11742,7 @@ mod tests {
         let mut app = headless_app("clipflow");
         let ctx = egui::Context::default();
         frame_keys(&mut app, &ctx, vec![]); // layout pass
-        // 1. Rack DnD drop onto a lane (same recipe as the DnD pin test).
+                                            // 1. Rack DnD drop onto a lane (same recipe as the DnD pin test).
         let mut y_row = None;
         for y in (96..220).step_by(3) {
             let p = egui::pos2(40.0, y as f32);
@@ -11325,7 +11751,11 @@ mod tests {
                 &ctx,
                 vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
             );
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
             if app.sel_asset.is_some() {
                 y_row = Some(y as f32);
                 break;
@@ -11379,7 +11809,11 @@ mod tests {
                 btn(r, egui::PointerButton::Primary, true),
             ],
         );
-        frame_keys(&mut app, &ctx, vec![btn(r, egui::PointerButton::Primary, false)]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![btn(r, egui::PointerButton::Primary, false)],
+        );
 
         // 4. Ctrl+V -> a second clip exists.
         frame_keys(
@@ -11594,9 +12028,20 @@ mod tests {
         // master strip — panels draw in add order and the master strip
         // precedes every track strip inside the mixer.
         let z = label_center(&mut app, &ctx, "0").expect("a \"0\" button is painted");
-        frame(&mut app, &ctx, vec![moved(z), btn(z, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(z, egui::PointerButton::Primary, false)]);
-        assert_eq!(app.master_midi, VOL_UNITY_MIDI, "zeroize resets master to 0 dB");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(z), btn(z, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(z, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.master_midi, VOL_UNITY_MIDI,
+            "zeroize resets master to 0 dB"
+        );
 
         // Right-click the dB readout: the two-item menu opens.
         let want = format!("{:>5}", db_num(vol_amp(app.master_midi)));
@@ -11604,8 +12049,16 @@ mod tests {
             .expect("master dB readout is painted")
             .to_vec2();
         let p = egui::pos2(cp.x, cp.y);
-        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Secondary, false)],
+        );
         let sv = galley_at(&mut app, &ctx, "Set value").expect("Set value item is painted");
         assert!(
             galley_at(&mut app, &ctx, "Create automation asset").is_some(),
@@ -11614,14 +12067,26 @@ mod tests {
 
         // Clicking Set value opens the dialog bound to master.vol.
         let sv = sv.center();
-        frame(&mut app, &ctx, vec![moved(sv), btn(sv, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(sv, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(sv), btn(sv, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(sv, egui::PointerButton::Primary, false)],
+        );
         assert!(app.value_dialog.is_some(), "Set value opens the dialog");
         assert_eq!(app.value_dialog.as_ref().unwrap().1, "master.vol");
 
         // Type -12 and commit: 1:1 dB semantics (NOT MIDI 12, NOT -12/127).
         type_into_focused(&mut app, &ctx, "-12");
-        assert_eq!(app.master_midi, vol_midi(-12.0), "typed dB value applies to master 1:1");
+        assert_eq!(
+            app.master_midi,
+            vol_midi(-12.0),
+            "typed dB value applies to master 1:1"
+        );
         assert!(app.value_dialog.is_none(), "dialog closes on apply");
     }
 
@@ -11674,8 +12139,16 @@ mod tests {
         'outer: for y in (380i32..=560).step_by(6) {
             for x in (260i32..=700).step_by(40) {
                 let p = egui::pos2(x as f32, y as f32);
-                frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
-                frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![btn(p, egui::PointerButton::Primary, false)],
+                );
                 let n = app.auto_edit.as_ref().unwrap().nodes.len();
                 if n == n0 + 1 {
                     cp = Some(p);
@@ -11691,14 +12164,30 @@ mod tests {
             ed.nodes[ed.sel].t
         };
         // Press on that spot (a node now sits there) and DRAG right.
-        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
         for dx in [12, 30, 60] {
-            frame(&mut app, &ctx, vec![moved(egui::pos2(p.x + dx as f32, p.y))]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(egui::pos2(p.x + dx as f32, p.y))],
+            );
         }
         let end = egui::pos2(p.x + 60.0, p.y);
-        frame(&mut app, &ctx, vec![btn(end, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(end, egui::PointerButton::Primary, false)],
+        );
         let ed = app.auto_edit.as_ref().unwrap();
-        assert_eq!(ed.nodes.len(), n0 + 1, "the drag moved the node, added none");
+        assert_eq!(
+            ed.nodes.len(),
+            n0 + 1,
+            "the drag moved the node, added none"
+        );
         let moved_t = ed.nodes[ed.sel].t;
         assert!(
             moved_t > before_t + 1000,
@@ -11717,7 +12206,11 @@ mod tests {
             .iter()
             .position(|a| *a == MidiAction::VolLoop(0))
             .unwrap();
-        let bind = crate::midi::MidiBind { ty: 1, ch: 0, d1: 20 };
+        let bind = crate::midi::MidiBind {
+            ty: 1,
+            ch: 0,
+            d1: 20,
+        };
         app.midi_binds[slot] = Some(bind);
         app.open_auto_editor(None);
         app.auto_mgr_rec = vec![(slot, bind)];
@@ -11727,25 +12220,53 @@ mod tests {
             ed.rec_start = 0;
             ed.nodes.clear();
         }
-        let cc = |v: u8| crate::audio::Evt::Midi(crate::audio::RawMidiMsg { bytes: vec![0xB0, 20, v] });
+        let cc = |v: u8| {
+            crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+                bytes: vec![0xB0, 20, v],
+            })
+        };
         app.handle_evt(cc(0));
         app.handle_evt(cc(127));
         frame(&mut app, &ctx, vec![]);
-        let vs: Vec<f32> = app.auto_edit.as_ref().unwrap().nodes.iter().map(|n| n.v).collect();
+        let vs: Vec<f32> = app
+            .auto_edit
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.v)
+            .collect();
         assert_eq!(vs.len(), 2, "two recorded nodes: {vs:?}");
-        assert!(vs[0].abs() < 1e-6, "MIDI 0 = range min (0 linear = -inf), got {}", vs[0]);
-        assert!((vs[1] - 2.0).abs() < 1e-6, "MIDI 127 = range max (+6 dB = 2.0), got {}", vs[1]);
-        assert_eq!(app.trk_vol[0], VOL_UNITY_MIDI, "recorded binding never touched the fader");
+        assert!(
+            vs[0].abs() < 1e-6,
+            "MIDI 0 = range min (0 linear = -inf), got {}",
+            vs[0]
+        );
+        assert!(
+            (vs[1] - 2.0).abs() < 1e-6,
+            "MIDI 127 = range max (+6 dB = 2.0), got {}",
+            vs[1]
+        );
+        assert_eq!(
+            app.trk_vol[0], VOL_UNITY_MIDI,
+            "recorded binding never touched the fader"
+        );
 
         // Manager open but REC off: still MUTED (its action must not fire).
         app.auto_edit.as_mut().unwrap().rec = false;
         app.handle_evt(cc(64));
-        assert_eq!(app.trk_vol[0], VOL_UNITY_MIDI, "binding stays muted while the manager is open");
+        assert_eq!(
+            app.trk_vol[0], VOL_UNITY_MIDI,
+            "binding stays muted while the manager is open"
+        );
 
         // Manager CLOSED: the same message drives the fader again.
         app.auto_edit = None;
         app.handle_evt(cc(64));
-        assert_eq!(app.trk_vol[0], 64, "binding works normally when the manager is closed");
+        assert_eq!(
+            app.trk_vol[0], 64,
+            "binding works normally when the manager is closed"
+        );
     }
 
     /// v0.15: the "select value" popup lists the track, its mixer and the
@@ -11761,8 +12282,16 @@ mod tests {
             let ed = app.auto_edit.as_mut().unwrap();
             ed.target = crate::automation::TARGET_TRACK_VOL.to_string();
             ed.nodes = vec![
-                Node { t: 0, v: 0.0, s: Shape::Linear },
-                Node { t: 96_000, v: 2.0, s: Shape::Linear },
+                Node {
+                    t: 0,
+                    v: 0.0,
+                    s: Shape::Linear,
+                },
+                Node {
+                    t: 96_000,
+                    v: 2.0,
+                    s: Shape::Linear,
+                },
             ];
         }
         app.auto_pick_open = true;
@@ -11771,7 +12300,11 @@ mod tests {
         let row = galley_at(&mut app, &ctx, "tempo").expect("tempo row painted in the popup");
         click_pt(&mut app, &ctx, row.center());
         let ed = app.auto_edit.as_ref().unwrap();
-        assert_eq!(ed.target, crate::automation::TARGET_MASTER_TEMPO, "bind switched the target");
+        assert_eq!(
+            ed.target,
+            crate::automation::TARGET_MASTER_TEMPO,
+            "bind switched the target"
+        );
         assert!(
             (ed.nodes[0].v - 20.0).abs() < 1e-3 && (ed.nodes[1].v - 300.0).abs() < 1e-3,
             "min/max rescaled to the bpm limits: {:?}",
@@ -11788,14 +12321,26 @@ mod tests {
         let ctx = egui::Context::default();
         app.arr.insert(0, 0, Clip::new(0, 48_000));
         let n = |a: &App| -> usize {
-            a.arr.tracks.iter().map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>()).sum()
+            a.arr
+                .tracks
+                .iter()
+                .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+                .sum()
         };
         // Sweep the grid right of the clip until a track menu opens.
         let mut menu = None;
         for y in (120..=340).step_by(4) {
             let p = egui::pos2(700.0, y as f32);
-            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Secondary, false)],
+            );
             assert_eq!(n(&app), 1, "right-click never wipes the track instantly");
             if let Some(g) = galley_at(&mut app, &ctx, "Clear this track") {
                 menu = Some(g.center());
@@ -11803,8 +12348,16 @@ mod tests {
             }
         }
         let clear = menu.expect("right-click opens a grid menu with an explicit Clear");
-        frame(&mut app, &ctx, vec![moved(clear), btn(clear, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(clear, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(clear), btn(clear, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(clear, egui::PointerButton::Primary, false)],
+        );
         assert_eq!(n(&app), 0, "explicit Clear empties the row");
     }
 
@@ -11828,13 +12381,35 @@ mod tests {
         let cp = rects[0].center();
         click_pt(&mut app, &ctx, cp);
         assert!(!app.sel_clips.is_empty(), "click selected the clip");
-        frame(&mut app, &ctx, vec![moved(cp), btn(cp, egui::PointerButton::Secondary, true)]);
-        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Secondary, false)]);
-        assert!(galley_at(&mut app, &ctx, "Copy").is_some(), "clip menu offers Copy");
-        assert!(galley_at(&mut app, &ctx, "Cut").is_some(), "clip menu offers Cut");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(cp), btn(cp, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(cp, egui::PointerButton::Secondary, false)],
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "Copy").is_some(),
+            "clip menu offers Copy"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "Cut").is_some(),
+            "clip menu offers Cut"
+        );
         let copy = galley_at(&mut app, &ctx, "Copy").unwrap().center();
-        frame(&mut app, &ctx, vec![moved(copy), btn(copy, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(copy, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(copy), btn(copy, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(copy, egui::PointerButton::Primary, false)],
+        );
         assert!(app.clipboard.is_some(), "Copy fills the clipboard");
         // Ctrl+X cuts the same selection.
         frame_keys(
@@ -11850,18 +12425,37 @@ mod tests {
         let mut paste = None;
         for y in (120..=340).step_by(4) {
             let p = egui::pos2(700.0, y as f32);
-            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Secondary, false)],
+            );
             if let Some(g) = galley_at(&mut app, &ctx, "Paste here") {
                 paste = Some(g.center());
                 break;
             }
         }
         let paste = paste.expect("grid menu offers Paste here");
-        frame(&mut app, &ctx, vec![moved(paste), btn(paste, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(paste, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(paste), btn(paste, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(paste, egui::PointerButton::Primary, false)],
+        );
         assert!(
-            app.arr.tracks.iter().any(|t| t.lanes.iter().any(|l| !l.clips.is_empty())),
+            app.arr
+                .tracks
+                .iter()
+                .any(|t| t.lanes.iter().any(|l| !l.clips.is_empty())),
             "Paste put the clip back"
         );
     }
@@ -11873,10 +12467,22 @@ mod tests {
         let mut app = headless_app("v15noreadout");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        let p = label_center(&mut app, &ctx, &format!("{:>5}", db_num(vol_amp(VOL_UNITY_MIDI))))
-            .expect("a dB readout is painted");
-        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        let p = label_center(
+            &mut app,
+            &ctx,
+            &format!("{:>5}", db_num(vol_amp(VOL_UNITY_MIDI))),
+        )
+        .expect("a dB readout is painted");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(
             ctx.memory(|m| m.focused().is_none()),
@@ -11999,7 +12605,15 @@ mod tests {
         app.arr.insert(
             2,
             0,
-            Clip { asset: 0, pos: 9_600, cut: 480, play_len: Some(2_400), gain: 1.0, fade_in: 0, fade_out: 0 },
+            Clip {
+                asset: 0,
+                pos: 9_600,
+                cut: 480,
+                play_len: Some(2_400),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
         );
         app.sel_clips = vec![(0, 0, 0), (2, 0, 0)];
         app.clipboard_copy();
@@ -12259,7 +12873,11 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(start), btn_btn(start, true)]);
         frame(&mut app, &ctx, vec![moved(egui::pos2(x0 + 30.0, y))]);
         frame(&mut app, &ctx, vec![moved(egui::pos2(x0 + 70.0, y))]);
-        frame(&mut app, &ctx, vec![btn_btn(egui::pos2(x0 + 70.0, y), false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn_btn(egui::pos2(x0 + 70.0, y), false)],
+        );
         let n_notes = app.piano_roll.as_ref().unwrap().pat.notes.len();
         assert_eq!(n_notes, 1, "drag draws exactly one note");
         // Fresh draw stretches the note to the pointer (FL-style).
@@ -12279,7 +12897,10 @@ mod tests {
             let pat = app.piano_roll.as_ref().unwrap().pat.clone();
             let buf = app.render_pattern_preview(&pat).expect("preview render");
             let peak = buf.iter().fold(0f32, |m, s| m.max(s.abs()));
-            assert!(peak > 1e-3, "preview through the default synth must make sound, peak {peak}");
+            assert!(
+                peak > 1e-3,
+                "preview through the default synth must make sound, peak {peak}"
+            );
         }
         app.drain_events();
         let pv = find_galley(&mut app, &ctx, "\u{25b6} preview")
@@ -12400,7 +13021,12 @@ mod tests {
         use crate::automation::{
             TARGET_MASTER_TEMPO, TARGET_TRACK_MUTE, TARGET_TRACK_PAN, TARGET_TRACK_VOL,
         };
-        for tgt in [TARGET_TRACK_PAN, TARGET_MASTER_TEMPO, TARGET_TRACK_MUTE, "fx.3.p0"] {
+        for tgt in [
+            TARGET_TRACK_PAN,
+            TARGET_MASTER_TEMPO,
+            TARGET_TRACK_MUTE,
+            "fx.3.p0",
+        ] {
             for bad in ["nan", "NaN", "inf", "-inf", "+inf"] {
                 assert!(
                     value_user_parse(tgt, bad).is_none(),
@@ -12430,16 +13056,31 @@ mod tests {
         let slot = (0..MidiAction::ALL.len())
             .find(|i| MidiAction::ALL[*i].is_continuous())
             .expect("a continuous binding slot");
-        app.auto_mgr_rec = vec![(slot, MidiBind { ty: 1, ch: 0, d1: 42 })];
+        app.auto_mgr_rec = vec![(
+            slot,
+            MidiBind {
+                ty: 1,
+                ch: 0,
+                d1: 42,
+            },
+        )];
         app.open_auto_editor(None);
         {
             let ed = app.auto_edit.as_mut().unwrap();
             ed.len_samples = 48_000; // one second
             ed.rec = true;
             ed.rec_start = 0;
-            ed.nodes = vec![Node { t: 0, v: 0.5, s: Shape::Linear }];
+            ed.nodes = vec![Node {
+                t: 0,
+                v: 0.5,
+                s: Shape::Linear,
+            }];
         }
-        let cc = |v| Evt::Midi(RawMidiMsg { bytes: vec![0xB0, 42, v] });
+        let cc = |v| {
+            Evt::Midi(RawMidiMsg {
+                bytes: vec![0xB0, 42, v],
+            })
+        };
         app.backend.engine.seek_to(24_000);
         app.handle_evt(cc(80));
         let n1 = app.auto_edit.as_ref().unwrap().nodes.len();
@@ -12467,8 +13108,16 @@ mod tests {
             let mut ed = app.auto_edit.take().unwrap();
             ed.target = TARGET_TRACK_VOL.to_string();
             ed.nodes = vec![
-                Node { t: 0, v: 0.3, s: Shape::Linear },
-                Node { t: 48_000, v: 0.6, s: Shape::Linear },
+                Node {
+                    t: 0,
+                    v: 0.3,
+                    s: Shape::Linear,
+                },
+                Node {
+                    t: 48_000,
+                    v: 0.6,
+                    s: Shape::Linear,
+                },
             ];
             app.auto_commit(&mut ed, 0, false);
         }
@@ -12509,7 +13158,10 @@ mod tests {
 
         // Deleting the clipboard's own asset leaves nothing to paste.
         app.remove_asset_at(k1 - 1);
-        assert!(app.clipboard.is_none(), "clipboard must empty with its asset");
+        assert!(
+            app.clipboard.is_none(),
+            "clipboard must empty with its asset"
+        );
     }
 
     /// v0.15 bug-hunt pin: deleting assets while the automation manager
@@ -12527,8 +13179,16 @@ mod tests {
             let mut ed = app.auto_edit.take().unwrap();
             ed.target = TARGET_TRACK_VOL.to_string();
             ed.nodes = vec![
-                Node { t: 0, v: 0.3, s: Shape::Linear },
-                Node { t: 48_000, v: 0.6, s: Shape::Linear },
+                Node {
+                    t: 0,
+                    v: 0.3,
+                    s: Shape::Linear,
+                },
+                Node {
+                    t: 48_000,
+                    v: 0.6,
+                    s: Shape::Linear,
+                },
             ];
             app.auto_commit(&mut ed, 0, false);
         }
@@ -12543,7 +13203,10 @@ mod tests {
             Some(k1 - 1),
             "id must slide with the table"
         );
-        assert_eq!(app.auto_edit.as_ref().and_then(|e| e.asset), Some(app.assets.len() - 1));
+        assert_eq!(
+            app.auto_edit.as_ref().and_then(|e| e.asset),
+            Some(app.assets.len() - 1)
+        );
 
         // Editor open on the deleted asset itself -> manager closes.
         let k = app.assets.len() - 1;
@@ -12568,8 +13231,16 @@ mod tests {
         let mut ed = app.auto_edit.take().expect("editor opened");
         ed.target = TARGET_TRACK_PAN.to_string();
         ed.nodes = vec![
-            Node { t: 0, v: 0.0, s: Shape::Linear },
-            Node { t: 48_000, v: 1.0, s: Shape::Smooth },
+            Node {
+                t: 0,
+                v: 0.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: 48_000,
+                v: 1.0,
+                s: Shape::Smooth,
+            },
         ];
         let before = app.assets.len();
         app.auto_commit(&mut ed, 1, false);
@@ -12615,10 +13286,10 @@ mod tests {
         let a = app.assets.last().unwrap();
         assert!(a.is_auto());
         assert_eq!(a.automation.as_ref().unwrap().target, TARGET_TRACK_VOL);
-        assert!(app.arr.tracks[0]
-            .lanes
+        assert!(app.arr.tracks[0].lanes.iter().any(|l| l
+            .clips
             .iter()
-            .any(|l| l.clips.iter().any(|c| c.asset as usize == app.assets.len() - 1)));
+            .any(|c| c.asset as usize == app.assets.len() - 1)));
     }
 
     /// Item 3+4 regression pins: opening the roll with a MIDI asset
@@ -12646,7 +13317,11 @@ mod tests {
             let hit = out.shapes.iter().find_map(|cs| {
                 if let egui::epaint::Shape::Text(t) = &cs.shape {
                     let txt = t.galley.text();
-                    let m = if exact { txt == needle } else { txt.contains(needle) };
+                    let m = if exact {
+                        txt == needle
+                    } else {
+                        txt.contains(needle)
+                    };
                     if m {
                         return Some(t.pos);
                     }
@@ -12705,7 +13380,11 @@ mod tests {
         frame(&mut app, &ctx, vec![btn_btn(btn, false)]);
         {
             let roll = app.piano_roll.as_ref().expect("roll opened");
-            assert_eq!(roll.edit_asset, Some(id), "opens the SELECTED asset for editing");
+            assert_eq!(
+                roll.edit_asset,
+                Some(id),
+                "opens the SELECTED asset for editing"
+            );
             assert_eq!(roll.pat.notes.len(), 1, "asset notes loaded into the roll");
         }
         for _ in 0..8 {
@@ -12715,7 +13394,12 @@ mod tests {
         // Wheel direction over the canvas: positive delta (wheel up /
         // scroll-up) raises vscroll_px — the direction the lo/hi note
         // culling and the keyboard strip already move.
-        let canvas = app.piano_roll.as_ref().unwrap().canvas_rect.expect("canvas rect");
+        let canvas = app
+            .piano_roll
+            .as_ref()
+            .unwrap()
+            .canvas_rect
+            .expect("canvas rect");
         let c = canvas.center();
         let wheel = |dy: f32| egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Line,
@@ -12756,7 +13440,15 @@ mod tests {
             app.status
         );
         assert_eq!(app.assets.len(), n_assets, "no new asset minted");
-        assert_eq!(app.assets[id as usize].pattern.as_ref().unwrap().notes.len(), 2);
+        assert_eq!(
+            app.assets[id as usize]
+                .pattern
+                .as_ref()
+                .unwrap()
+                .notes
+                .len(),
+            2
+        );
         let back = Pattern::load_mid(&app.assets[id as usize].path).unwrap();
         assert_eq!(back.notes.len(), 2, "the .mid on disk was rewritten");
 
@@ -12840,69 +13532,117 @@ mod tests {
         // "more" popup \u{2014} open it first, then take the chip.
         let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
         frame(&mut app, &ctx, vec![moved(m)]);
-        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, false)],
+        );
         let p = label_center(&mut app, &ctx, "FX").expect("FX chip in the more popup");
         frame(&mut app, &ctx, vec![moved(p)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
-        assert_eq!(app.fx_window, Some(0), "chip opens the track's chain window");
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.fx_window,
+            Some(0),
+            "chip opens the track's chain window"
+        );
 
         // One text scan per frame (the plugin row label carries vendor
         // text, so match by substring, like the old VST window pin did).
-        let find_contains = |app: &mut App, ctx: &egui::Context, want: &str| -> Option<egui::Pos2> {
-            let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1440.0, 853.0),
-                )),
-                ..Default::default()
-            };
-            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
-            let mut c = None;
-            for cs in &out.shapes {
-                if let egui::epaint::Shape::Text(t) = &cs.shape {
-                    if t.galley.text().contains(want) {
-                        c = Some(t.pos + t.galley.rect.center().to_vec2());
-                        break;
+        let find_contains =
+            |app: &mut App, ctx: &egui::Context, want: &str| -> Option<egui::Pos2> {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 853.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+                let mut c = None;
+                for cs in &out.shapes {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        if t.galley.text().contains(want) {
+                            c = Some(t.pos + t.galley.rect.center().to_vec2());
+                            break;
+                        }
                     }
                 }
-            }
-            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
-            drop(prims);
-            out.textures_delta.clear();
-            c
-        };
+                let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+                drop(prims);
+                out.textures_delta.clear();
+                c
+            };
 
         // v16: the folder scan runs on the plugin GUI thread (it dlopens
         // every plugin) — pump frames until `poll_vst_opens` lands it.
         let mut scanned = false;
-        for _ in 0..200 {
+        for _ in 0..800 {
             frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
             if app.vst_scanned {
                 scanned = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
-        assert!(scanned, "async folder scan must land");
+        assert!(
+            scanned,
+            "async folder scan must land (note: {:?}, pending: {})",
+            app.vst_note,
+            app.vst_scan_rx.is_some()
+        );
         // Open the plugin picker.
-        let q = label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
+        let q =
+            label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
         frame(&mut app, &ctx, vec![moved(q)]);
-        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]); // the popup paints on the next frame
         let d = find_contains(&mut app, &ctx, "Dragonfly").expect("scanned plugin row listed");
         frame(&mut app, &ctx, vec![moved(d)]);
-        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, false)],
+        );
         // v16: instantiation itself is async too — the click only queued
         // the open job. Pump until the entry lands (then the auto-opened
         // plugin window is already in `fx_vst_editors`).
         let mut loaded = false;
         for _ in 0..400 {
             frame(&mut app, &ctx, vec![]);
-            loaded = matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. }));
+            logic_tick(&mut app);
+            loaded = matches!(
+                &app.fx_rows[0].first(),
+                Some(ChainRow::Vst { entry: Some(_), .. })
+            );
             if loaded {
                 break;
             }
@@ -12938,8 +13678,14 @@ mod tests {
         if !painted {
             // v0.11 R3 refusal path: an editor that never painted leaves NO
             // window of any kind behind (hosted plugins get no slider panel).
+            // Reaping lives in the per-tick drains — drive them, not paint.
+            logic_tick(&mut app);
             frame(&mut app, &ctx, vec![]);
-            assert!(app.fx_vst_editors.is_empty(), "refused editor must be reaped");
+            logic_tick(&mut app);
+            assert!(
+                app.fx_vst_editors.is_empty(),
+                "refused editor must be reaped"
+            );
         }
         // Persisted state must survive a config round-trip.
         app.save_config();
@@ -12990,43 +13736,85 @@ mod tests {
         // "more" popup \u{2014} open it first, then take the chip.
         let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
         frame(&mut app, &ctx, vec![moved(m)]);
-        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, false)],
+        );
         let p = label_center(&mut app, &ctx, "FX").expect("FX chip in the more popup");
         frame(&mut app, &ctx, vec![moved(p)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
         assert_eq!(app.fx_window, Some(0), "chip opens the chain window");
 
         // v16: scan + load are async (plugin GUI thread) — pump frames.
         let mut scanned = false;
-        for _ in 0..200 {
+        for _ in 0..800 {
             frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
             if app.vst_scanned {
                 scanned = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
-        assert!(scanned, "async folder scan must land");
+        assert!(
+            scanned,
+            "async folder scan must land (note: {:?}, pending: {})",
+            app.vst_note,
+            app.vst_scan_rx.is_some()
+        );
         let q =
             label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker in chain window");
         frame(&mut app, &ctx, vec![moved(q)]);
-        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]); // popup paints next frame
-        // Picker rows carry vendor text, so match by substring (the pin
-        // helper for exactly this is the v0.7 galley scanner).
+                                       // Picker rows carry vendor text, so match by substring (the pin
+                                       // helper for exactly this is the v0.7 galley scanner).
         let d = galley_at(&mut app, &ctx, "Wolf Shaper")
             .map(|r| r.center())
             .expect("VST3 row listed in picker");
         frame(&mut app, &ctx, vec![moved(d)]);
-        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(d, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, false)],
+        );
         let mut loaded = false;
         for _ in 0..400 {
             frame(&mut app, &ctx, vec![]);
-            loaded = matches!(&app.fx_rows[0].first(), Some(ChainRow::Vst { entry: Some(_), .. }));
+            logic_tick(&mut app);
+            loaded = matches!(
+                &app.fx_rows[0].first(),
+                Some(ChainRow::Vst { entry: Some(_), .. })
+            );
             if loaded {
                 break;
             }
@@ -13052,12 +13840,208 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(editor.painted(), "VST3 window from the UI path never painted");
+        assert!(
+            editor.painted(),
+            "VST3 window from the UI path never painted"
+        );
         // Everything closes while the plugin file still exists (v0.10 rule:
         // never pull a .vst3 bundle out from under a live editor).
         editor.close();
         let _ = std::fs::remove_dir_all(&dir);
         drop(app);
+    }
+
+    // =============== v16 responsiveness pass pins (UI) ===================
+    // (AC4/AC5: the UI thread must NEVER dlopen — instantiation and the
+    // folder scan run on the plugin GUI thread; clicks return immediately
+    // and results land per tick via `poll_vst_opens`. The v0.15 code
+    // loaded plugins synchronously inside the click handler, freezing
+    // every window mid-frame: the "buttons are unresponsive" report.)
+
+    /// v16 helper: fresh app whose (isolated) HOME/plugin folder holds
+    /// exactly ONE scannable VST2. `None` = skip without the plugin.
+    /// Returns (app, temp dir, REAL home) — the caller restores HOME.
+    fn v16_plugin_env(tag: &str) -> Option<(App, std::path::PathBuf, String)> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plugin = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
+        if !plugin.is_file() {
+            eprintln!("skip v16 ui pin: no VST2 test plugin installed");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("sp-v16{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&plugin, dir.join("dfhall.so")).unwrap();
+        let mut app = headless_app(&format!("v16{tag}"));
+        std::env::set_var("HOME", &dir);
+        app.vst_dirs = vec![dir.to_string_lossy().into_owned()];
+        Some((app, dir, home))
+    }
+
+    /// v16 helper: open track 0's chain window through the real clicks
+    /// ("\u{2026} more" popup → "FX" chip).
+    fn v16_open_chain(app: &mut App, ctx: &egui::Context) {
+        frame(app, ctx, vec![]);
+        let m = label_center(app, ctx, "\u{2026} more").expect("more button on the strip");
+        frame(app, ctx, vec![moved(m)]);
+        frame(app, ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
+        frame(app, ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        let p = label_center(app, ctx, "FX").expect("FX chip in the more popup");
+        frame(app, ctx, vec![moved(p)]);
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.fx_window, Some(0), "chip opens the chain window");
+    }
+
+    /// AC5 pin: the folder scan must never touch the UI thread. Proof by
+    /// construction — `vst_rescan()` returns with the job STILL in flight
+    /// (`vst_scan_rx` full, `vst_scanned` false, and the call itself
+    /// unmeasurably short), and the completed list then lands via poll.
+    /// v0.15 ran every plugin's dlopen+instantiate inside the window's
+    /// paint: multi-second full-app freeze on first chain-window open.
+    #[test]
+    fn v16_ui_scan_first_open_nonblocking() {
+        let Some((mut app, dir, real_home)) = v16_plugin_env("scan") else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        v16_open_chain(&mut app, &ctx);
+        // Window open must NOT have run a synchronous scan.
+        assert!(!app.vst_scanned, "opening the window must not scan inline");
+        // Deterministic core: rescan() may only QUEUE the job. (The job
+        // dlopens the plugin on the GUI thread; measuring this call is
+        // exactly the v0.15 freeze.)
+        app.vst_scanned = false;
+        app.vst_scan_rx = None;
+        let t0 = std::time::Instant::now();
+        app.vst_rescan();
+        let dt = t0.elapsed();
+        assert!(
+            app.vst_scan_rx.is_some(),
+            "rescan must hand back a pending scan channel"
+        );
+        assert!(!app.vst_scanned, "rescan must not complete the scan inline");
+        assert!(
+            dt < std::time::Duration::from_millis(50),
+            "vst_rescan blocked the UI thread for {dt:?} — it must only post the job"
+        );
+        // ... and the completed list must arrive through the poll path.
+        let mut landed = false;
+        for _ in 0..400 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.vst_scanned {
+                landed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::env::set_var("HOME", &real_home);
+        assert!(landed, "async scan must land via poll_vst_opens");
+        assert!(
+            app.vst_scan
+                .iter()
+                .any(|e| e.path.to_string_lossy().contains("dfhall.so") && e.error.is_none()),
+            "scan list must carry the plugin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AC4 pin: clicking a plugin row in the chain window returns with
+    /// the load STILL in flight (row shows loading, instance absent) —
+    /// the freeze window where v0.15 ate clicks is structurally gone.
+    /// The entry then lands via poll and the v0.10 auto-open still runs.
+    #[test]
+    fn v16_ui_add_vst_plugin_nonblocking() {
+        let Some((mut app, dir, real_home)) = v16_plugin_env("add") else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        v16_open_chain(&mut app, &ctx);
+        // Wait for the async scan to land, then drive the real picker.
+        let mut scanned = false;
+        for _ in 0..800 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.vst_scanned {
+                scanned = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(scanned, "scan must land before the picker can list");
+        let q = label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker");
+        frame(&mut app, &ctx, vec![moved(q)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]); // popup paints next frame
+        let d = galley_at(&mut app, &ctx, "Dragonfly")
+            .map(|r| r.center())
+            .expect("plugin row listed in picker");
+        frame(&mut app, &ctx, vec![moved(d)]);
+        let t0 = std::time::Instant::now();
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, false)],
+        );
+        let click_frame = t0.elapsed();
+        // THE pin: the click's frame is a queue-and-return — no plugin
+        // ever instantiated on this thread — and the row is visibly
+        // pending while the GUI thread does the work.
+        assert!(
+            click_frame < std::time::Duration::from_millis(150),
+            "the add click blocked the frame loop for {:?}",
+            click_frame
+        );
+        assert!(
+            matches!(
+                &app.fx_rows[0].first(),
+                Some(ChainRow::Vst {
+                    entry: None,
+                    open_rx: Some(_),
+                    ..
+                })
+            ),
+            "add must return while the load is still in flight"
+        );
+        assert!(app.vst_note.contains("loading"), "{}", app.vst_note);
+        // Now the entry lands, the note flips to loaded, and the plugin's
+        // own GUI auto-opens (v0.10 rule, preserved on the async path).
+        let mut loaded = false;
+        for _ in 0..400 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            loaded = matches!(
+                &app.fx_rows[0].first(),
+                Some(ChainRow::Vst { entry: Some(_), .. })
+            );
+            if loaded {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(loaded, "async load must land via poll_vst_opens");
+        assert!(app.vst_note.contains("loaded"), "{}", app.vst_note);
+        std::env::set_var("HOME", &real_home);
+        // Everything closes while the plugin file still exists.
+        let editors: Vec<_> = app.fx_vst_editors.drain().collect();
+        drop(editors);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ================= v0.7 acceptance-criteria pins ======================
@@ -13165,17 +14149,40 @@ mod tests {
     }
 
     fn click_pt(app: &mut App, ctx: &egui::Context, p: egui::Pos2) {
-        frame(app, ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
         frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
     }
 
     fn click_mod(app: &mut App, ctx: &egui::Context, p: egui::Pos2, m: egui::Modifiers) {
-        frame(app, ctx, vec![egui::Event::ModifiersChanged(m), moved(p), btn(p, egui::PointerButton::Primary, true)]);
-        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false), egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::ModifiersChanged(m),
+                moved(p),
+                btn(p, egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            app,
+            ctx,
+            vec![
+                btn(p, egui::PointerButton::Primary, false),
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            ],
+        );
     }
 
     fn drag_pt(app: &mut App, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
-        frame(app, ctx, vec![moved(from), btn(from, egui::PointerButton::Primary, true)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
         // A 1 px nudge starts the drag: the first motion frame past the
         // press only arms egui's drag machinery, and canvases that commit
         // every drag frame (piano roll) silently swallow a big first jump.
@@ -13219,7 +14226,11 @@ mod tests {
         // AC1.4 the roll follows the MAIN metronome bpm (no own control).
         app.metro_bpm = String::from("97");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.piano_roll.as_ref().unwrap().pat.bpm, 97, "roll bpm = main bpm");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().pat.bpm,
+            97,
+            "roll bpm = main bpm"
+        );
 
         // AC1.6 both scrollbars move the view. Make content scrollable.
         {
@@ -13246,8 +14257,15 @@ mod tests {
         // the transport behind the roll.
         let before = app.backend.engine.transport_on();
         click_pt(&mut app, &ctx, egui::pos2(c.min.x + 300.0, c.min.y + 60.0));
-        assert!(app.piano_roll.as_ref().unwrap().focused, "click focuses the roll");
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Space, egui::Modifiers::NONE)]);
+        assert!(
+            app.piano_roll.as_ref().unwrap().focused,
+            "click focuses the roll"
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Space, egui::Modifiers::NONE)],
+        );
         assert_eq!(
             app.backend.engine.transport_on(),
             before,
@@ -13259,7 +14277,12 @@ mod tests {
         // stored full-frame rect (title bar included); hard-coded screen
         // coordinates drifted the moment the window layout moved.
         let mut closed = false;
-        let wr = app.piano_roll.as_ref().unwrap().win_rect.expect("roll frame rect");
+        let wr = app
+            .piano_roll
+            .as_ref()
+            .unwrap()
+            .win_rect
+            .expect("roll frame rect");
         for dx in [6.0f32, 12.0, 18.0, 24.0] {
             for dy in [11.0f32, 16.0] {
                 click_pt(&mut app, &ctx, egui::pos2(wr.max.x - dx, wr.min.y + dy));
@@ -13294,8 +14317,22 @@ mod tests {
             r.scroll_sec = 0.0;
             r.vscroll_px = 0.0;
             r.pat.notes = vec![
-                crate::midipat::Note { ch: 0, note: 48, vel: 100, press: 0, start: 480, len: 480 },
-                crate::midipat::Note { ch: 0, note: 50, vel: 100, press: 0, start: 960, len: 480 },
+                crate::midipat::Note {
+                    ch: 0,
+                    note: 48,
+                    vel: 100,
+                    press: 0,
+                    start: 480,
+                    len: 480,
+                },
+                crate::midipat::Note {
+                    ch: 0,
+                    note: 50,
+                    vel: 100,
+                    press: 0,
+                    start: 960,
+                    len: 480,
+                },
             ];
         }
         frame(&mut app, &ctx, vec![]);
@@ -13308,9 +14345,21 @@ mod tests {
         // Anchor on the stored frame rect — a shape-scan title position
         // goes stale as soon as the window's first-use auto-placement
         // settles, and the click then lands outside the moved window.
-        let wr = app.piano_roll.as_ref().unwrap().win_rect.expect("roll frame rect");
-        click_pt(&mut app, &ctx, egui::pos2(wr.min.x + wr.width() * 0.5, wr.min.y + 10.0));
-        assert!(app.piano_roll.as_ref().unwrap().focused, "title click focuses the roll");
+        let wr = app
+            .piano_roll
+            .as_ref()
+            .unwrap()
+            .win_rect
+            .expect("roll frame rect");
+        click_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(wr.min.x + wr.width() * 0.5, wr.min.y + 10.0),
+        );
+        assert!(
+            app.piano_roll.as_ref().unwrap().focused,
+            "title click focuses the roll"
+        );
 
         // AC8.4 click / ctrl+click / shift+click / marquee box on notes.
         let b0 = egui::pos2(x_of(480) + 40.0, y_of(48) + 4.0);
@@ -13322,11 +14371,23 @@ mod tests {
             "plain click selects one note"
         );
         click_mod(&mut app, &ctx, b1, egui::Modifiers::COMMAND);
-        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 2, "ctrl+click toggles in");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes.len(),
+            2,
+            "ctrl+click toggles in"
+        );
         click_mod(&mut app, &ctx, b0, egui::Modifiers::SHIFT);
-        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 2, "shift+click runs from anchor");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes.len(),
+            2,
+            "shift+click runs from anchor"
+        );
         click_mod(&mut app, &ctx, b1, egui::Modifiers::COMMAND);
-        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 1, "ctrl+click toggles out");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes.len(),
+            1,
+            "ctrl+click toggles out"
+        );
         // Ctrl+drag a rubber band on empty canvas replaces the selection.
         let from = egui::pos2(gx0 + 10.0, y_of(60) + 4.0);
         let to = egui::pos2(x_of(1440) + 20.0, y_of(46) + 4.0);
@@ -13340,8 +14401,19 @@ mod tests {
             ],
         );
         frame(&mut app, &ctx, vec![moved(from + (to - from) * 0.5)]);
-        frame(&mut app, &ctx, vec![moved(to), egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(to),
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         assert_eq!(
             app.piano_roll.as_ref().unwrap().sel_notes.len(),
             2,
@@ -13359,7 +14431,11 @@ mod tests {
                 key_ev(egui::Key::A, egui::Modifiers::COMMAND),
             ],
         );
-        assert_eq!(app.piano_roll.as_ref().unwrap().sel_notes.len(), 2, "Ctrl+A selects all");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes.len(),
+            2,
+            "Ctrl+A selects all"
+        );
         frame_keys(
             &mut app,
             &ctx,
@@ -13368,7 +14444,11 @@ mod tests {
                 key_ev(egui::Key::C, egui::Modifiers::COMMAND),
             ],
         );
-        assert_eq!(app.roll_clip.as_ref().map(|v| v.len()), Some(2), "Ctrl+C copies the notes");
+        assert_eq!(
+            app.roll_clip.as_ref().map(|v| v.len()),
+            Some(2),
+            "Ctrl+C copies the notes"
+        );
         frame_keys(
             &mut app,
             &ctx,
@@ -13377,7 +14457,11 @@ mod tests {
                 key_ev(egui::Key::V, egui::Modifiers::COMMAND),
             ],
         );
-        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes.len(), 4, "Ctrl+V pastes at the playhead");
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().pat.notes.len(),
+            4,
+            "Ctrl+V pastes at the playhead"
+        );
 
         // AC1.7 drag the RIGHT edge of note 0 outward: len grows, start
         // fixed (loop-area-handle style). Press 2 px INSIDE the boundary
@@ -13388,7 +14472,10 @@ mod tests {
         let after = app.piano_roll.as_ref().unwrap().pat.notes[0];
         assert_eq!(after.start, n0.start, "tail drag pins the start");
         let dl = after.len as f64 - n0.len as f64;
-        assert!((dl - 96.0).abs() < 10.0, "80px tail drag \u{2248} +96 ticks, got {dl}");
+        assert!(
+            (dl - 96.0).abs() < 10.0,
+            "80px tail drag \u{2248} +96 ticks, got {dl}"
+        );
 
         // AC1.7 head drag: start moves, end pinned.
         let n0 = after;
@@ -13412,16 +14499,35 @@ mod tests {
                 key_ev(egui::Key::A, egui::Modifiers::COMMAND),
             ],
         );
-        let before: Vec<u32> = app.piano_roll.as_ref().unwrap().pat.notes.iter().map(|n| n.start).collect();
+        let before: Vec<u32> = app
+            .piano_roll
+            .as_ref()
+            .unwrap()
+            .pat
+            .notes
+            .iter()
+            .map(|n| n.start)
+            .collect();
         let nb = app.piano_roll.as_ref().unwrap().pat.notes[0];
         let pb = egui::pos2(
             x_of(nb.start) + (((nb.len as f64 / 960.0) * 800.0) * 0.5) as f32,
             y_of(nb.note as i32) + 4.0,
         );
         drag_pt(&mut app, &ctx, pb, pb + egui::vec2(160.0, 0.0));
-        let movedv: Vec<u32> = app.piano_roll.as_ref().unwrap().pat.notes.iter().map(|n| n.start).collect();
+        let movedv: Vec<u32> = app
+            .piano_roll
+            .as_ref()
+            .unwrap()
+            .pat
+            .notes
+            .iter()
+            .map(|n| n.start)
+            .collect();
         let d0 = movedv[0] as i64 - before[0] as i64;
-        assert!((d0 - 192).abs() < 10, "160px group drag \u{2248} +192 ticks, got {d0}");
+        assert!(
+            (d0 - 192).abs() < 10,
+            "160px group drag \u{2248} +192 ticks, got {d0}"
+        );
         for (b, m) in before.iter().zip(movedv.iter()) {
             assert_eq!(*m as i64 - *b as i64, d0, "group moves rigidly");
         }
@@ -13497,9 +14603,17 @@ mod tests {
         // AC5.2 trim from the tail (right edge inward). At 160 px/s a
         // 200 px pull removes ~60 k samples, comfortably past the 30 k
         // assertion floor (the old 58 px drag only cut ~17 k).
-        drag_pt(&mut app, &ctx, egui::pos2(r0.max.x - 2.0, cy), egui::pos2(r0.max.x - 200.0, cy));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(r0.max.x - 2.0, cy),
+            egui::pos2(r0.max.x - 200.0, cy),
+        );
         let c1 = clp!();
-        assert!(c1.end(alen) - c1.pos < span0 - 30_000 && c1.cut == 0, "tail drag shortens and keeps the head: {c1:?}");
+        assert!(
+            c1.end(alen) - c1.pos < span0 - 30_000 && c1.cut == 0,
+            "tail drag shortens and keeps the head: {c1:?}"
+        );
 
         // AC5.2 trim from the head (left edge inward): pos AND cut move.
         frame(&mut app, &ctx, vec![]);
@@ -13507,9 +14621,17 @@ mod tests {
             .into_iter()
             .max_by(|a, b| a.area().total_cmp(&b.area()))
             .expect("clip after trim");
-        drag_pt(&mut app, &ctx, egui::pos2(r1.min.x + 2.0, cy), egui::pos2(r1.min.x + 60.0, cy));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(r1.min.x + 2.0, cy),
+            egui::pos2(r1.min.x + 60.0, cy),
+        );
         let c2 = clp!();
-        assert!(c2.pos > c1.pos && c2.cut > 0 && c2.end(alen) == c1.end(alen), "head drag cuts into the audio: {c2:?} vs {c1:?}");
+        assert!(
+            c2.pos > c1.pos && c2.cut > 0 && c2.end(alen) == c1.end(alen),
+            "head drag cuts into the audio: {c2:?} vs {c1:?}"
+        );
 
         // AC5.3 head back leftward: re-exposes the cut audio.
         frame(&mut app, &ctx, vec![]);
@@ -13517,7 +14639,12 @@ mod tests {
             .into_iter()
             .max_by(|a, b| a.area().total_cmp(&b.area()))
             .expect("clip after head trim");
-        drag_pt(&mut app, &ctx, egui::pos2(r2.min.x + 2.0, cy), egui::pos2(r2.min.x - 40.0, cy));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(r2.min.x + 2.0, cy),
+            egui::pos2(r2.min.x - 40.0, cy),
+        );
         let c3 = clp!();
         assert!(c3.cut < c2.cut, "outward head drag re-exposes audio");
 
@@ -13529,7 +14656,12 @@ mod tests {
             .expect("clip before extend");
         // +240 px, not +200: at 160 px/s the release must land PAST the
         // asset end (200 px hits it exactly → play_len returns to None).
-        drag_pt(&mut app, &ctx, egui::pos2(r3.max.x - 2.0, cy), egui::pos2(r3.max.x + 240.0, cy));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(r3.max.x - 2.0, cy),
+            egui::pos2(r3.max.x + 240.0, cy),
+        );
         let c4 = clp!();
         let avail4 = alen - c4.cut;
         assert!(
@@ -13547,7 +14679,11 @@ mod tests {
         let lbl = galley_at(&mut app, &ctx, "snap").expect("snap label in header");
         // The clickable box sits AFTER the 4-glyph "snap" label (its own
         // label is ""), so aim right of the text, not at its middle.
-        click_pt(&mut app, &ctx, egui::pos2(lbl.center().x + 20.0, lbl.center().y));
+        click_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(lbl.center().x + 20.0, lbl.center().y),
+        );
         assert!(!app.snap_on, "header checkbox toggles snap off");
         assert_eq!(app.snap_unit(), 1.0, "snap off = one sample");
     }
@@ -13564,9 +14700,45 @@ mod tests {
         // around them. NOTE: Clip::new's second arg is the POSITION, so
         // the old "length" numbers stacked all three at the same x; the
         // timeline length goes in play_len.
-        app.arr.insert(0, 0, Clip { asset: a, pos: 60_000, cut: 0, play_len: Some(40_000), gain: 1.0, fade_in: 0, fade_out: 0 });
-        app.arr.insert(0, 0, Clip { asset: a, pos: 130_000, cut: 0, play_len: Some(40_000), gain: 1.0, fade_in: 0, fade_out: 0 });
-        app.arr.insert(0, 0, Clip { asset: a, pos: 200_000, cut: 0, play_len: Some(40_000), gain: 1.0, fade_in: 0, fade_out: 0 });
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: a,
+                pos: 60_000,
+                cut: 0,
+                play_len: Some(40_000),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+        );
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: a,
+                pos: 130_000,
+                cut: 0,
+                play_len: Some(40_000),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+        );
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: a,
+                pos: 200_000,
+                cut: 0,
+                play_len: Some(40_000),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+        );
         frame(&mut app, &ctx, vec![]);
         let body = {
             let c = COL_CLIP.linear_multiply(0.45);
@@ -13584,14 +14756,22 @@ mod tests {
         click_pt(&mut app, &ctx, rects[0].center());
         assert_eq!(app.sel_clips.len(), 1, "plain click = one clip");
         click_mod(&mut app, &ctx, rects[2].center(), egui::Modifiers::COMMAND);
-        assert_eq!(app.sel_clips.len(), 2, "ctrl+click toggles a second clip in");
+        assert_eq!(
+            app.sel_clips.len(),
+            2,
+            "ctrl+click toggles a second clip in"
+        );
         click_mod(&mut app, &ctx, rects[2].center(), egui::Modifiers::COMMAND);
         assert!(app.sel_clips.len() == 1, "ctrl+click again toggles it out");
         click_mod(&mut app, &ctx, rects[2].center(), egui::Modifiers::COMMAND);
 
         // AC8.2 shift+click selects the same-lane run from the anchor.
         click_mod(&mut app, &ctx, rects[0].center(), egui::Modifiers::SHIFT);
-        assert_eq!(app.sel_clips.len(), 3, "shift+click extends to the whole run");
+        assert_eq!(
+            app.sel_clips.len(),
+            3,
+            "shift+click extends to the whole run"
+        );
 
         // AC8.3 dragging a box on the empty lane area selects every clip
         // it intersects.
@@ -13599,7 +14779,11 @@ mod tests {
         let from = egui::pos2(rects[0].min.x - 60.0, y);
         let to = egui::pos2(rects[2].max.x + 40.0, y);
         drag_pt(&mut app, &ctx, from, to);
-        assert_eq!(app.sel_clips.len(), 3, "selection box selects all intersected clips");
+        assert_eq!(
+            app.sel_clips.len(),
+            3,
+            "selection box selects all intersected clips"
+        );
     }
 
     /// AC3.1 the sampler root note renders as standard note notation.
@@ -13617,9 +14801,7 @@ mod tests {
             let Some(a) = ch.next() else { return false };
             a.is_ascii_uppercase() && matches!(a, 'A'..='G') && {
                 let rest: String = ch.collect();
-                let (acc, num): (String, String) = rest
-                    .chars()
-                    .partition(|c| *c == '#');
+                let (acc, num): (String, String) = rest.chars().partition(|c| *c == '#');
                 !num.is_empty()
                     && num.chars().all(|c| c.is_ascii_digit())
                     && acc.chars().all(|c| c == '#')
@@ -13707,12 +14889,25 @@ mod tests {
         frame_keys(&mut app, &ctx, vec![]);
 
         // Property strip for exactly one selected clip.
-        assert!(has_text(&mut app, &ctx, "clip: sine"), "strip names the clip");
-        assert!(has_text(&mut app, &ctx, "fade in"), "fade-in slider present");
-        assert!(has_text(&mut app, &ctx, "fade out"), "fade-out slider present");
+        assert!(
+            has_text(&mut app, &ctx, "clip: sine"),
+            "strip names the clip"
+        );
+        assert!(
+            has_text(&mut app, &ctx, "fade in"),
+            "fade-in slider present"
+        );
+        assert!(
+            has_text(&mut app, &ctx, "fade out"),
+            "fade-out slider present"
+        );
 
         // S splits at the playhead.
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::S, egui::Modifiers::NONE)],
+        );
         let lane = &app.arr.tracks[0].lanes[0];
         assert_eq!(lane.clips.len(), 2, "S split the clip");
         assert_eq!(lane.clips[1].pos, 48_000);
@@ -13720,13 +14915,24 @@ mod tests {
         assert_eq!(lane.clips[0].play_len, Some(48_000));
 
         // Playhead at a clip boundary is not inside anything: no-op.
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
-        assert_eq!(app.arr.tracks[0].lanes[0].clips.len(), 2, "edge is not a split");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::S, egui::Modifiers::NONE)],
+        );
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips.len(),
+            2,
+            "edge is not a split"
+        );
 
         // No selection: the strip is gone.
         app.sel_clips.clear();
         frame_keys(&mut app, &ctx, vec![]);
-        assert!(!has_text(&mut app, &ctx, "clip: sine"), "strip hides without a selection");
+        assert!(
+            !has_text(&mut app, &ctx, "clip: sine"),
+            "strip hides without a selection"
+        );
     }
 
     // ===================== v0.10 acceptance pins =====================
@@ -13774,22 +14980,25 @@ mod tests {
         ));
         app.arr.insert(33, 0, Clip::new(0, 0));
         app.push_project();
-        assert!(app
-            .arr
-            .tracks[33]
-            .lanes
-            .iter()
-            .any(|l| !l.clips.is_empty()));
+        assert!(app.arr.tracks[33].lanes.iter().any(|l| !l.clips.is_empty()));
         // Null-audio backends drop commands (no manager thread), so mirror
         // the project onto the engine handle directly — exactly what the
         // manager does with SetProject.
         app.backend.engine.set_project(
-            std::sync::Arc::new(app.assets.iter().map(|a| a.data.clone()).collect::<Vec<_>>()),
+            std::sync::Arc::new(
+                app.assets
+                    .iter()
+                    .map(|a| a.data.clone())
+                    .collect::<Vec<_>>(),
+            ),
             std::sync::Arc::new(app.arr.clone()),
             app.total_len(),
         );
         let out = app.backend.engine.render_project().expect("render");
-        assert!(out.iter().any(|x| x.abs() > 0.05), "clip on track 34 sounds");
+        assert!(
+            out.iter().any(|x| x.abs() > 0.05),
+            "clip on track 34 sounds"
+        );
     }
 
     /// AC6.2/8.4 UI side: the rack's audition state resets when the
@@ -13878,7 +15087,6 @@ mod tests {
         assert!(app.track_synth[1].as_deref() == Some("sampler"));
     }
 
-
     /// AC8.4: clicking a rack row that is auditioning stops ONLY that
     /// asset's preview voices; other assets keep playing (the engine half
     /// is pinned by v10_preview_voices_retire_and_stop_clears — here the
@@ -13910,15 +15118,24 @@ mod tests {
 
         // Audition kick through the UI, then hat through the UI.
         app.preview_asset(0);
-        assert_eq!(app.preview_playing.as_deref(), Some("/tmp/kick.wav".to_string().as_str()));
+        assert_eq!(
+            app.preview_playing.as_deref(),
+            Some("/tmp/kick.wav".to_string().as_str())
+        );
         app.preview_asset(1);
-        assert_eq!(app.preview_playing.as_deref(), Some("/tmp/hat.wav".to_string().as_str()));
+        assert_eq!(
+            app.preview_playing.as_deref(),
+            Some("/tmp/hat.wav".to_string().as_str())
+        );
 
         // Toggle kick OFF (click while its highlight is current after the
         // hat finished flag-wise is not the flow; simulate the row click
         // for the CURRENTLY highlighted asset):
         app.preview_asset(1);
-        assert!(app.preview_playing.is_none(), "re-click stops the highlight");
+        assert!(
+            app.preview_playing.is_none(),
+            "re-click stops the highlight"
+        );
 
         // Engine-side per-id isolation (what the toggle command routes to):
         app.backend.engine.stop_preview_id(0);
@@ -13963,20 +15180,21 @@ mod tests {
         let m = app.ensure_asset(&samples.join("roll.mid")).unwrap();
         assert_eq!(app.assets.len(), 4);
         for (lane, asset) in [(0usize, a0), (1, a1), (2, a2), (3, m)] {
-            app.arr.insert(0, lane, Clip::new(asset as u32, (lane as u64) * 4800));
+            app.arr
+                .insert(0, lane, Clip::new(asset as u32, (lane as u64) * 4800));
         }
-        let sel = app
-            .arr
-            .tracks
-            .iter()
-            .enumerate()
-            .flat_map(|(t, tr)| {
-                tr.lanes.iter().enumerate().flat_map(move |(k, l)| {
-                    l.clips.iter().enumerate().map(move |(c, _)| (t, k, c))
+        let sel =
+            app.arr
+                .tracks
+                .iter()
+                .enumerate()
+                .flat_map(|(t, tr)| {
+                    tr.lanes.iter().enumerate().flat_map(move |(k, l)| {
+                        l.clips.iter().enumerate().map(move |(c, _)| (t, k, c))
+                    })
                 })
-            })
-            .find(|(t, k, c)| app.arr.tracks[*t].lanes[*k].clips[*c].asset as usize == m)
-            .unwrap();
+                .find(|(t, k, c)| app.arr.tracks[*t].lanes[*k].clips[*c].asset as usize == m)
+                .unwrap();
         app.sel_clips = vec![sel];
         app.sel_asset = Some(a2);
 
@@ -14023,13 +15241,17 @@ mod tests {
         for tr in app.arr.tracks.iter() {
             for l in tr.lanes.iter() {
                 for c in l.clips.iter() {
-                    assert!((c.asset as usize) < app.assets.len(), "clip holds a dead id");
+                    assert!(
+                        (c.asset as usize) < app.assets.len(),
+                        "clip holds a dead id"
+                    );
                 }
             }
         }
         if let Some(r) = app.piano_roll.as_ref() {
             assert!(
-                r.edit_asset.is_none_or(|id| (id as usize) < app.assets.len()),
+                r.edit_asset
+                    .is_none_or(|id| (id as usize) < app.assets.len()),
                 "roll kept a stale edit_asset id after delete: {:?}",
                 r.edit_asset
             );
@@ -14058,12 +15280,15 @@ mod tests {
         let mut app = headless_app("bindgui");
         // Script synth: never an editor, never the slider fallback.
         app.set_track_synth_stem(0, "piano");
-        assert!(app.vst_editors.is_empty(), "a script synth opened an editor");
+        assert!(
+            app.vst_editors.is_empty(),
+            "a script synth opened an editor"
+        );
         assert_ne!(app.synth_win, Some(0), "slider window for a script synth");
         assert!(app.track_synth_inst[0].is_some(), "script instance bound");
 
-        let plugin = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".vst/amsynth_vst.so");
+        let plugin =
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".vst/amsynth_vst.so");
         if std::env::var_os("SLOOPER_VST_SMOKE").is_none() || !plugin.exists() {
             eprintln!("skip: SLOOPER_VST_SMOKE unset or no amsynth");
             return;
@@ -14075,193 +15300,306 @@ mod tests {
         let stem = format!("vst2:{}", plugin.display());
         app.set_track_synth_stem(0, &stem);
         // Editor-first: bound, editor open, NO slider window.
-        assert!(app.track_synth_inst[0].is_some(), "plugin instance bound: {}", app.status);
+        assert!(
+            app.track_synth_inst[0].is_some(),
+            "plugin instance bound: {}",
+            app.status
+        );
         assert!(
             app.vst_editors.contains_key(&0),
             "editor did not open at bind time: status {:?}",
             app.status
         );
-        assert_ne!(app.synth_win, Some(0), "slider window opened beside the editor");
+        assert_ne!(
+            app.synth_win,
+            Some(0),
+            "slider window opened beside the editor"
+        );
         // The window must still be alive after frames (watchdog keeps it).
         let ctx = egui::Context::default();
         for _ in 0..6 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(app.vst_editors.contains_key(&0), "editor vanished after bind");
+        assert!(
+            app.vst_editors.contains_key(&0),
+            "editor vanished after bind"
+        );
         // Unbinding retires the editor cleanly.
         app.set_track_synth_stem(0, "");
         assert!(app.vst_editors.is_empty(), "editor left open after unbind");
-        }
+    }
 
-        // ================= v0.13 acceptance-criteria pins =====================
-        // (requirements list: scratch slooper-v13/REQUIREMENTS.md)
+    // ================= v0.13 acceptance-criteria pins =====================
+    // (requirements list: scratch slooper-v13/REQUIREMENTS.md)
 
-        /// OS file manager drops arrive as `dropped_files` on the raw input
-        /// (winit fills `path`; `bytes` only for unsaved buffers).
-        #[derive(Debug)]
-        struct DroppedWav(std::path::PathBuf);
-        impl egui::DroppedFile for DroppedWav {
+    /// OS file manager drops arrive as `dropped_files` on the raw input
+    /// (winit fills `path`; `bytes` only for unsaved buffers).
+    #[derive(Debug)]
+    struct DroppedWav(std::path::PathBuf);
+    impl egui::DroppedFile for DroppedWav {
         fn path(&self) -> &std::path::Path {
-        &self.0
+            &self.0
         }
         fn bytes(&self) -> Result<Vec<u8>, String> {
-        std::fs::read(&self.0).map_err(|e| e.to_string())
+            std::fs::read(&self.0).map_err(|e| e.to_string())
         }
-        }
+    }
 
-        fn frame_files(
+    fn frame_files(
         app: &mut App,
         ctx: &egui::Context,
         events: Vec<egui::Event>,
         files: Vec<std::path::PathBuf>,
-        ) {
+    ) {
         let raw = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1440.0, 853.0),
-        )),
-        events,
-        dropped_files: files
-            .into_iter()
-            .map(|p| std::sync::Arc::new(DroppedWav(p)) as egui::DroppedFileHandle)
-            .collect(),
-        ..Default::default()
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            events,
+            dropped_files: files
+                .into_iter()
+                .map(|p| std::sync::Arc::new(DroppedWav(p)) as egui::DroppedFileHandle)
+                .collect(),
+            ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
         let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
         drop(prims);
         out.textures_delta.clear();
+    }
+
+    /// Real window drag: grab a window's title bar and park it clear of
+    /// the rack panel so rack rows and drop zone are both clickable.
+    fn park_window(app: &mut App, ctx: &egui::Context, title_needle: &str, to: egui::Vec2) {
+        let title = galley_at(app, ctx, title_needle).expect("window title visible");
+        let from = title.center();
+        frame(app, ctx, vec![moved(from)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        let mid = from + to * 0.5;
+        frame(app, ctx, vec![moved(mid)]);
+        let dst = from + to;
+        frame(app, ctx, vec![moved(dst)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)],
+        );
+        frame(app, ctx, vec![]);
+    }
+
+    /// AC3.1: a WAV dragged in from the FILE MANAGER switches the live
+    /// sampler patch — decoded, registered, the engine's host table updated,
+    /// asset param moved — with no restart. This is the exact user report:
+    /// before v0.13 only in-app drags were handled, and `ensure_asset`'s
+    /// audio branch never pushed the rack table, so the new sample stayed
+    /// invisible to the audio thread until an app restart.
+    #[test]
+    fn v13_ui_os_file_drop_swaps_sampler_patch_live() {
+        let mut app = headless_app("v13osdrop");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        park_window(
+            &mut app,
+            &ctx,
+            "sampler \u{b7} track 1",
+            egui::vec2(560.0, 280.0),
+        );
+
+        // Give the sampler an initial patch: click kick in the rack
+        // (rack rows show the file STEM — "kick", not "kick.wav").
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        frame(&mut app, &ctx, vec![moved(kick.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.sel_asset, Some(0), "kick.wav clicked: {}", app.status);
+
+        // A brand-new wav on disk, outside every rack folder.
+        let dir = std::env::temp_dir()
+            .join("sp-uity-v13osdrop")
+            .join("incoming");
+        std::fs::create_dir_all(&dir).unwrap();
+        let zap = dir.join("zap.wav");
+        let data: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.3).sin() * 0.4).collect();
+        crate::audio_io::export(&zap, 48000, &data, crate::audio_io::ExportFormat::Wav).unwrap();
+
+        // The OS drops it onto the app while the sampler window is open.
+        frame_files(&mut app, &ctx, vec![], vec![zap]);
+
+        // AC3.1 (UI half): asset registered from the dropped file, live
+        // patch switched, editor reflects the new sample. The audio-thread
+        // half — that a SetProject asset swap replaces the SOUND inside a
+        // running sampler — is pinned end-to-end by e2e
+        // `e2e_v13_sampler_patch_swap_live`; headless null-audio drains no
+        // command queue, so nothing here could observe it.
+        assert_eq!(
+            app.assets.len(),
+            2,
+            "dropped wav became a rack asset: {}",
+            app.status
+        );
+        assert_eq!(app.assets[1].name, "zap");
+        assert_eq!(
+            app.assets[1].data.len(),
+            24_000,
+            "dropped file decoded at 48 k"
+        );
+        let inst = match app.track_synth_inst[0].as_deref() {
+            Some(SynthHandle::Script(i)) => i.clone(),
+            _ => panic!("sampler instance gone"),
+        };
+        assert_eq!(
+            inst.values()[0] as usize,
+            1,
+            "live patch switched to the dropped file"
+        );
+        assert!(
+            app.status.contains("zap"),
+            "status names the dropped patch: {}",
+            app.status
+        );
+    }
+
+    /// AC3.2 regression pin: the IN-APP drag (rack row → sampler drop zone)
+    /// still switches the patch, real press/move/release through frame().
+    #[test]
+    fn v13_ui_internal_drag_onto_sampler_drop_zone() {
+        let mut app = headless_app("v13idrag");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        park_window(
+            &mut app,
+            &ctx,
+            "sampler \u{b7} track 1",
+            egui::vec2(560.0, 280.0),
+        );
+
+        // Rack folder (the one headless_app configured) gains a second
+        // wav; press its "scan" button to pick it up.
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v13idrag")
+            .join("samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        let snare = samples.join("snare.wav");
+        if !snare.exists() {
+            let d: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.11).sin() * 0.2).collect();
+            crate::audio_io::export(&snare, 48000, &d, crate::audio_io::ExportFormat::Wav).unwrap();
         }
+        let scan = galley_at(&mut app, &ctx, "scan").expect("scan button");
+        frame(&mut app, &ctx, vec![moved(scan.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(scan.center()),
+                btn(scan.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(scan.center(), egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.rack[0].files.iter().any(|r| r.name == "snare"),
+            "scan found snare"
+        );
 
-        /// Real window drag: grab a window's title bar and park it clear of
-        /// the rack panel so rack rows and drop zone are both clickable.
-        fn park_window(app: &mut App, ctx: &egui::Context, title_needle: &str, to: egui::Vec2) {
-            let title = galley_at(app, ctx, title_needle).expect("window title visible");
-            let from = title.center();
-            frame(app, ctx, vec![moved(from)]);
-            frame(app, ctx, vec![moved(from), btn(from, egui::PointerButton::Primary, true)]);
-            let mid = from + to * 0.5;
-            frame(app, ctx, vec![moved(mid)]);
-            let dst = from + to;
-            frame(app, ctx, vec![moved(dst)]);
-            frame(app, ctx, vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)]);
-            frame(app, ctx, vec![]);
-        }
+        // Click kick first (it becomes asset 0 — the patch param's
+        // default — so the drag below flips 0 -> 1, unambiguous).
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        frame(&mut app, &ctx, vec![moved(kick.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.sel_asset, Some(0), "kick.wav row clicked");
 
-        /// AC3.1: a WAV dragged in from the FILE MANAGER switches the live
-        /// sampler patch — decoded, registered, the engine's host table updated,
-        /// asset param moved — with no restart. This is the exact user report:
-        /// before v0.13 only in-app drags were handled, and `ensure_asset`'s
-        /// audio branch never pushed the rack table, so the new sample stayed
-        /// invisible to the audio thread until an app restart.
-        #[test]
-        fn v13_ui_os_file_drop_swaps_sampler_patch_live() {
-            let mut app = headless_app("v13osdrop");
-            let ctx = egui::Context::default();
-            frame(&mut app, &ctx, vec![]);
-            app.set_track_synth_stem(0, "sampler");
-            app.synth_win = Some(0);
-            frame(&mut app, &ctx, vec![]);
-            park_window(&mut app, &ctx, "sampler \u{b7} track 1", egui::vec2(560.0, 280.0));
+        // Real drag: press snare's rack row, exceed the dnd threshold,
+        // hover the sampler drop zone, release.
+        let zone = galley_at(&mut app, &ctx, "drop zone").expect("drop zone visible");
+        let snare_row = galley_at(&mut app, &ctx, "snare")
+            .expect("snare row")
+            .center();
+        frame(&mut app, &ctx, vec![moved(snare_row)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(snare_row),
+                btn(snare_row, egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(snare_row + egui::vec2(90.0, 0.0))],
+        );
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<usize>(&ctx),
+            "dragging a rack row must arm the asset drag payload"
+        );
+        frame(&mut app, &ctx, vec![moved(zone.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(zone.center()),
+                btn(zone.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(zone.center()),
+                btn(zone.center(), egui::PointerButton::Primary, false),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
 
-            // Give the sampler an initial patch: click kick in the rack
-            // (rack rows show the file STEM — "kick", not "kick.wav").
-            let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
-            frame(&mut app, &ctx, vec![moved(kick.center())]);
-            frame(&mut app, &ctx, vec![moved(kick.center()), btn(kick.center(), egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(kick.center(), egui::PointerButton::Primary, false)]);
-            frame(&mut app, &ctx, vec![]);
-            assert_eq!(app.sel_asset, Some(0), "kick.wav clicked: {}", app.status);
-
-            // A brand-new wav on disk, outside every rack folder.
-            let dir = std::env::temp_dir().join("sp-uity-v13osdrop").join("incoming");
-            std::fs::create_dir_all(&dir).unwrap();
-            let zap = dir.join("zap.wav");
-            let data: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.3).sin() * 0.4).collect();
-            crate::audio_io::export(&zap, 48000, &data, crate::audio_io::ExportFormat::Wav).unwrap();
-
-            // The OS drops it onto the app while the sampler window is open.
-            frame_files(&mut app, &ctx, vec![], vec![zap]);
-
-            // AC3.1 (UI half): asset registered from the dropped file, live
-            // patch switched, editor reflects the new sample. The audio-thread
-            // half — that a SetProject asset swap replaces the SOUND inside a
-            // running sampler — is pinned end-to-end by e2e
-            // `e2e_v13_sampler_patch_swap_live`; headless null-audio drains no
-            // command queue, so nothing here could observe it.
-            assert_eq!(app.assets.len(), 2, "dropped wav became a rack asset: {}", app.status);
-            assert_eq!(app.assets[1].name, "zap");
-            assert_eq!(app.assets[1].data.len(), 24_000, "dropped file decoded at 48 k");
-            let inst = match app.track_synth_inst[0].as_deref() {
-                Some(SynthHandle::Script(i)) => i.clone(),
-                _ => panic!("sampler instance gone"),
-            };
-            assert_eq!(inst.values()[0] as usize, 1, "live patch switched to the dropped file");
-            assert!(app.status.contains("zap"), "status names the dropped patch: {}", app.status);
-            }
-
-        /// AC3.2 regression pin: the IN-APP drag (rack row → sampler drop zone)
-        /// still switches the patch, real press/move/release through frame().
-        #[test]
-        fn v13_ui_internal_drag_onto_sampler_drop_zone() {
-            let mut app = headless_app("v13idrag");
-            let ctx = egui::Context::default();
-            frame(&mut app, &ctx, vec![]);
-            app.set_track_synth_stem(0, "sampler");
-            app.synth_win = Some(0);
-            frame(&mut app, &ctx, vec![]);
-            park_window(&mut app, &ctx, "sampler \u{b7} track 1", egui::vec2(560.0, 280.0));
-
-            // Rack folder (the one headless_app configured) gains a second
-            // wav; press its "scan" button to pick it up.
-            let samples = std::env::temp_dir().join("sp-uity-v13idrag").join("samples");
-            std::fs::create_dir_all(&samples).unwrap();
-            let snare = samples.join("snare.wav");
-            if !snare.exists() {
-                let d: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.11).sin() * 0.2).collect();
-                crate::audio_io::export(&snare, 48000, &d, crate::audio_io::ExportFormat::Wav).unwrap();
-            }
-            let scan = galley_at(&mut app, &ctx, "scan").expect("scan button");
-            frame(&mut app, &ctx, vec![moved(scan.center())]);
-            frame(&mut app, &ctx, vec![moved(scan.center()), btn(scan.center(), egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(scan.center(), egui::PointerButton::Primary, false)]);
-            frame(&mut app, &ctx, vec![]);
-            assert!(app.rack[0].files.iter().any(|r| r.name == "snare"), "scan found snare");
-
-            // Click kick first (it becomes asset 0 — the patch param's
-            // default — so the drag below flips 0 -> 1, unambiguous).
-            let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
-            frame(&mut app, &ctx, vec![moved(kick.center())]);
-            frame(&mut app, &ctx, vec![moved(kick.center()), btn(kick.center(), egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(kick.center(), egui::PointerButton::Primary, false)]);
-            frame(&mut app, &ctx, vec![]);
-            assert_eq!(app.sel_asset, Some(0), "kick.wav row clicked");
-
-            // Real drag: press snare's rack row, exceed the dnd threshold,
-            // hover the sampler drop zone, release.
-            let zone = galley_at(&mut app, &ctx, "drop zone").expect("drop zone visible");
-            let snare_row = galley_at(&mut app, &ctx, "snare").expect("snare row").center();
-            frame(&mut app, &ctx, vec![moved(snare_row)]);
-            frame(&mut app, &ctx, vec![moved(snare_row), btn(snare_row, egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![moved(snare_row + egui::vec2(90.0, 0.0))]);
-            assert!(
-                egui::DragAndDrop::has_payload_of_type::<usize>(&ctx),
-                "dragging a rack row must arm the asset drag payload"
-            );
-            frame(&mut app, &ctx, vec![moved(zone.center())]);
-            frame(&mut app, &ctx, vec![moved(zone.center()), btn(zone.center(), egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![moved(zone.center()), btn(zone.center(), egui::PointerButton::Primary, false)]);
-            frame(&mut app, &ctx, vec![]);
-
-            let inst = match app.track_synth_inst[0].as_deref() {
-                Some(SynthHandle::Script(i)) => i.clone(),
-                _ => panic!("no sampler instance"),
-            };
-            assert_eq!(
+        let inst = match app.track_synth_inst[0].as_deref() {
+            Some(SynthHandle::Script(i)) => i.clone(),
+            _ => panic!("no sampler instance"),
+        };
+        assert_eq!(
                 inst.values()[0] as usize,
                 1,
                 "dragging snare.wav onto the drop zone must set the sampler's asset param (status {:?})",
                 app.status
             );
-        }
-        }
+    }
+}

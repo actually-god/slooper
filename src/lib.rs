@@ -16,10 +16,10 @@
 //! - [`ui`]: the egui front-end (used by the binary).
 
 pub mod arrange;
-pub mod automation;
 pub mod assets;
 pub mod audio;
 pub mod audio_io;
+pub mod automation;
 pub mod config;
 pub mod fx;
 pub mod fxgui;
@@ -30,9 +30,9 @@ pub mod project;
 pub mod quantize;
 pub mod samples808;
 pub mod synth;
-pub mod vsthost;
-pub mod vstedit;
 pub mod synth_api;
 pub mod ui;
+pub mod vstedit;
+pub mod vsthost;
 
 pub use midi::{MidiAction, MidiBind, MidiMsg};

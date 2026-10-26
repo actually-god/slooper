@@ -54,7 +54,11 @@ struct FxRing {
 
 impl FxRing {
     fn with_capacity(cap: usize) -> Self {
-        Self { buf: vec![0.0f32; cap], head: 0, count: 0 }
+        Self {
+            buf: vec![0.0f32; cap],
+            head: 0,
+            count: 0,
+        }
     }
     #[inline]
     fn len(&self) -> usize {
@@ -689,8 +693,7 @@ pub fn gui_heartbeat() -> u64 {
 }
 
 fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
-    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<GuiJob>> =
-        std::sync::OnceLock::new();
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<GuiJob>> = std::sync::OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<GuiJob>();
         std::thread::Builder::new()
@@ -725,7 +728,7 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
                     if stats {
                         window += 1;
                         pump_ms += t0.elapsed().as_secs_f64() * 1000.0;
-                        if window % 100 == 0 {
+                        if window.is_multiple_of(100) {
                             let dt = t_window.elapsed().as_secs_f64().max(0.001);
                             eprintln!(
                                 "[vst-stats] tick={tick}ms avg={:.2}ms rate={:.1}Hz editors={}",
@@ -746,7 +749,9 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
 
 /// Run `f` on the VST GUI thread and block the caller for its result.
 /// Never call from a GUI job (deadlock); no job ever does.
-pub fn on_gui_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+pub fn on_gui_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
     let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
     gui_tx()
         .send(Box::new(move || {
@@ -775,7 +780,11 @@ pub fn open_async(
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
     post(move || {
-        let _ = tx.send(open(&path, kind, sample_rate, saved.as_deref()).map(|l| l.entry));
+        // `open_inner` DIRECTLY: this closure already runs on the GUI
+        // thread, and `open` would proxy its result back to this very
+        // thread — waiting on ourselves = the v16 pump freeze this pin
+        // caught ("picked plugin never loaded").
+        let _ = tx.send(open_inner(&path, kind, sample_rate, saved.as_deref()).map(|l| l.entry));
     });
     rx
 }
@@ -803,16 +812,26 @@ pub fn open(
 ) -> Result<VstLoad, String> {
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
-    on_gui_thread(move || {
-        let _loader = vst_loader_lock();
-        let entry = match kind {
-            VstKind::V3 => open_v3(&path, sample_rate, saved.as_deref())?,
-            VstKind::V2 => open_v2(&path, sample_rate, saved.as_deref())?,
-        };
-        Ok(VstLoad {
-            entry: Arc::new(entry),
-        })
-    })?
+    on_gui_thread(move || open_inner(&path, kind, sample_rate, saved.as_deref()))?
+}
+
+/// [`open`]'s body. Runs ON the VST GUI thread (the proxy above, or a
+/// GUI-thread job). NEVER call the proxying [`open`] from a GUI job —
+/// it would wait for a result posted to the blocked thread itself.
+fn open_inner(
+    path: &Path,
+    kind: VstKind,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+) -> Result<VstLoad, String> {
+    let _loader = vst_loader_lock();
+    let entry = match kind {
+        VstKind::V3 => open_v3(path, sample_rate, saved)?,
+        VstKind::V2 => open_v2(path, sample_rate, saved)?,
+    };
+    Ok(VstLoad {
+        entry: Arc::new(entry),
+    })
 }
 
 fn stage_buf() -> Vec<f32> {
@@ -903,7 +922,9 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
             }
         }
     }
-    let ps = plugin.get_parameters().map_err(|e| format!("params: {e}"))?;
+    let ps = plugin
+        .get_parameters()
+        .map_err(|e| format!("params: {e}"))?;
     let descs: Vec<VstParamDesc> = ps
         .iter()
         .take(VST_MAX_PARAMS)
@@ -924,7 +945,9 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     let out_ch = plugin.output_channel_count().max(1);
     // Checked before the plugin moves into the realtime runner.
     let has_editor = plugin.has_editor();
-    plugin.start_processing().map_err(|e| format!("start: {e}"))?;
+    plugin
+        .start_processing()
+        .map_err(|e| format!("start: {e}"))?;
     let (mut runner, control) = RealtimePluginRunner::new(plugin, 256);
     runner.start().map_err(|e| format!("run: {e}"))?;
     let bufs = AudioBuffers::new(out_ch, out_ch, VST_BLOCK, sample_rate as f64);
@@ -951,8 +974,8 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         host::{HostBuffer, PluginLoader},
         plugin::{Plugin, PluginParameters},
     };
-    let mut loader =
-        PluginLoader::load(path, Arc::new(Mutex::new(StubHost))).map_err(|e| format!("load: {e}"))?;
+    let mut loader = PluginLoader::load(path, Arc::new(Mutex::new(StubHost)))
+        .map_err(|e| format!("load: {e}"))?;
     let mut inst = loader.instance().map_err(|e| format!("instance: {e}"))?;
     let info = inst.get_info();
     if info.inputs > 2 || info.outputs > 2 {
@@ -1067,7 +1090,10 @@ impl RtStageEntry {
     /// parameter cells, and its every edit writes back through those same
     /// cells — the slider path, generation bump and all. `sample_rate`
     /// must match the one the plugin was opened with.
-    pub fn open_vst3_editor(&self, sample_rate: u32) -> Result<crate::vstedit::EditorWindow, String> {
+    pub fn open_vst3_editor(
+        &self,
+        sample_rate: u32,
+    ) -> Result<crate::vstedit::EditorWindow, String> {
         if !matches!(self.spec.1, VstKind::V3) {
             return Err("not a VST3 plugin".into());
         }
@@ -1083,7 +1109,14 @@ impl RtStageEntry {
             .map(|(i, d)| (d.id, self.params.get(i) as f64))
             .collect();
         let ids: Vec<u32> = self.descs.iter().map(|d| d.id).collect();
-        crate::vstedit::open_vst3_editor(&path, &self.name, sample_rate, initial, ids, self.params.clone())
+        crate::vstedit::open_vst3_editor(
+            &path,
+            &self.name,
+            sample_rate,
+            initial,
+            ids,
+            self.params.clone(),
+        )
     }
 
     /// UI side: update one parameter (normalized) and push it to the
@@ -1252,9 +1285,10 @@ impl RtStageEntry {
                                 controller: d1,
                                 value: d2,
                             }),
-                            0xC0 => {
-                                c.send_midi(MidiEvent::ProgramChange { channel: ch, program: d1 })
-                            }
+                            0xC0 => c.send_midi(MidiEvent::ProgramChange {
+                                channel: ch,
+                                program: d1,
+                            }),
                             0xD0 => c.send_midi(MidiEvent::ChannelAftertouch {
                                 channel: ch,
                                 pressure: d1,
@@ -1411,8 +1445,18 @@ mod tests {
     #[test]
     fn params_store_and_signal() {
         let descs = vec![
-            VstParamDesc { id: 0, name: "a".into(), default: 0.25, writable: true },
-            VstParamDesc { id: 1, name: "b".into(), default: 0.75, writable: true },
+            VstParamDesc {
+                id: 0,
+                name: "a".into(),
+                default: 0.25,
+                writable: true,
+            },
+            VstParamDesc {
+                id: 1,
+                name: "b".into(),
+                default: 0.75,
+                writable: true,
+            },
         ];
         let p = VstParams::new(&descs);
         assert_eq!(p.get(0), 0.25);
@@ -1496,7 +1540,9 @@ mod tests {
             if !e.path.extension().is_some_and(|x| x == "vst3") {
                 continue; // VST2 instruments are covered by the smoke test
             }
-            let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else { continue };
+            let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else {
+                continue;
+            };
             load.entry.note_on(0, 60, 110);
             let mut peak = 0.0f32;
             // ~1 second at 48k in ring-sized chunks.
@@ -1532,7 +1578,9 @@ mod tests {
             if !e.path.extension().is_some_and(|x| x == "vst3") {
                 continue; // VST2 effects are pinned by v10_local_vst2_effect_passes_audio
             }
-            let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else { continue };
+            let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else {
+                continue;
+            };
             let mut rng = 12345u32;
             let mut peak = 0.0f32;
             for _ in 0..60 {
@@ -1588,18 +1636,28 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|e| e.name.as_str()).collect();
         // All three native forms enumerated, sidecar included; the raw .dll
         // is NOT probed (that would dlopen PE bytes and always fail).
-        assert!(found.iter().any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("so")),
-            "loose .so missing: {names:?}");
         assert!(
-            found.iter().any(|e| e.path.to_string_lossy().contains("synth.dll.so")),
+            found
+                .iter()
+                .any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("so")),
+            "loose .so missing: {names:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|e| e.path.to_string_lossy().contains("synth.dll.so")),
             "yabridge sidecar not scanned: {names:?}"
         );
         assert!(
-            found.iter().any(|e| e.path.to_string_lossy().contains("Nested.vst")),
+            found
+                .iter()
+                .any(|e| e.path.to_string_lossy().contains("Nested.vst")),
             "bundle dir layout not scanned: {names:?}"
         );
         assert!(
-            !found.iter().any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("dll")),
+            !found
+                .iter()
+                .any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("dll")),
             "raw .dll must never be dlopen'd by scan"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1619,8 +1677,208 @@ mod tests {
         }
         let load = open(&p, VstKind::V2, 48_000, None).expect("open wolf-shaper effect");
         assert_eq!(load.entry.spec().1, VstKind::V2);
-        assert!(!load.entry.descs().is_empty(), "effect exposes its parameters");
+        assert!(
+            !load.entry.descs().is_empty(),
+            "effect exposes its parameters"
+        );
         assert!(load.entry.vst2_handle().is_some(), "editor-capable handle");
     }
 
+    // ================= v16 responsiveness pass pins ======================
+    // (requirements list: scratch slooper-v16/REQUIREMENTS.md)
+
+    /// v16 helper: a local plugin for the RT pins — VST3 wolf-shaper
+    /// preferred (waveshaper, no internal latency), else VST2 Dragonfly.
+    /// `None` when nothing is installed (CI skip).
+    fn v16_test_plugin() -> Option<(PathBuf, VstKind)> {
+        let found = scan(&default_vst_dirs());
+        let pick = |needle: &str, kind: VstKind| -> Option<(PathBuf, VstKind)> {
+            found
+                .iter()
+                .find(|e| e.error.is_none() && e.path.to_string_lossy().contains(needle))
+                .map(|e| (e.path.clone(), kind))
+        };
+        pick("wolf-shaper", VstKind::V3).or_else(|| pick("Dragonfly", VstKind::V2))
+    }
+
+    /// v16 helper: GUI-pump iterations per second over a sampling window
+    /// (the pump thread ticks once per loop; `gui_heartbeat` counts them).
+    fn v16_pump_rate(sample_ms: u64) -> f64 {
+        let t0 = std::time::Instant::now();
+        let h0 = gui_heartbeat();
+        std::thread::sleep(std::time::Duration::from_millis(sample_ms));
+        let dt = t0.elapsed().as_secs_f64().max(0.001);
+        (gui_heartbeat() - h0) as f64 / dt
+    }
+
+    /// AC1 pin (SMOKE, real editor on X11): the pump tick IS the plugin
+    /// UI's input/framerate — idle stays on the cheap 30 ms tick, and a
+    /// painted editor switches the loop to the fast EDITOR_TICK cadence
+    /// (measured ≥100 Hz, target ~150). The old fixed 30 ms tick measured
+    /// 27–33 Hz: exactly the "inputs are delayed, framerate is low" report.
+    #[test]
+    fn v16_vsthost_fast_pump_when_editors() {
+        if std::env::var("SLOOPER_VST_SMOKE").unwrap_or_default() != "1"
+            || !crate::vstedit::x11_available()
+        {
+            eprintln!("skip AC1: SLOOPER_VST_SMOKE=1 + X11 required");
+            return;
+        }
+        let idle = v16_pump_rate(700);
+        assert!(
+            idle <= 40.0,
+            "idle pump must stay on the cheap 30 ms tick (≤40 Hz), got {idle:.1} Hz"
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::path::Path::new(&home).join(".vst/DragonflyHallReverb-vst.so");
+        if !path.is_file() {
+            eprintln!("skip AC1: Dragonfly VST2 not installed");
+            return;
+        }
+        let load = open(&path, VstKind::V2, 48_000, None).expect("open dragonfly");
+        let h = load.entry.vst2_handle().expect("vst2 handle");
+        let mut editor =
+            crate::vstedit::open_editor(&h, &path.to_string_lossy(), "v16-ac1").expect("editor");
+        let t0 = std::time::Instant::now();
+        while !editor.painted() && !editor.open_failed() && !editor.is_closed() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(12),
+                "editor never painted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            editor.painted(),
+            "AC1 needs a PAINTED editor to measure the fast tick"
+        );
+        let fast = v16_pump_rate(1000);
+        assert!(
+            fast >= 100.0,
+            "with a painted editor the pump must run ≥100 Hz (EDITOR_TICK_MS = {EDITOR_TICK_MS}), got {fast:.1} Hz"
+        );
+        editor.close();
+        drop(editor);
+        let after = v16_pump_rate(700);
+        assert!(
+            after <= 40.0,
+            "pump must fall back to the idle tick once the editor closes, got {after:.1} Hz"
+        );
+        drop(load);
+    }
+
+    /// AC6 pin: the v16 bulk ring is a transparent, allocation-free
+    /// sample pipe, and `flush()` truly empties the live pipeline. The
+    /// ring itself is pinned directly (deterministic, plugin-free); the
+    /// plugin-backed part pins finite passthrough and the post-flush
+    /// echo-carry reset. (Deliberately no cross-instance / cross-schedule
+    /// byte equality: plugin cores are stateful and carry process-global
+    /// JUCE singletons — that is plugin behaviour, not ring behaviour.)
+    #[test]
+    fn v16_vst_rt_ring_determinism() {
+        // -- FxRing: exact FIFO under arbitrary push/drain patterns.
+        let mut r = FxRing::with_capacity(1000);
+        let stream: Vec<f32> = (0..5000).map(|i| i as f32 * 0.001).collect();
+        let mut out: Vec<f32> = Vec::new();
+        let mut off = 0usize;
+        let mut n = 0usize;
+        let pattern = [137usize, 3, 999, 512, 1000, 1, 777, 250, 512, 64];
+        while off < stream.len() {
+            let take = pattern[n % pattern.len()].min(stream.len() - off);
+            // never overfill: fully drain first when a push might overflow
+            if r.len() + take > 1000 {
+                let mut d = vec![0.0f32; 512];
+                loop {
+                    let got = r.drain_into(&mut d[..512.min(r.len())]);
+                    if got == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&d[..got]);
+                }
+            }
+            r.push_slice(&stream[off..off + take]);
+            off += take;
+            n += 1;
+            let mut d = vec![0.0f32; 300];
+            loop {
+                let got = r.drain_into(&mut d);
+                if got == 0 {
+                    break;
+                }
+                out.extend_from_slice(&d[..got]);
+            }
+        }
+        assert_eq!(out.len(), stream.len(), "no samples lost or duplicated");
+        assert!(
+            out.iter().zip(stream.iter()).all(|(a, b)| a == b),
+            "ring stream must be byte-exact"
+        );
+
+        // Overflow keeps the newest window, in order.
+        let mut r = FxRing::with_capacity(16);
+        let big: Vec<f32> = (0..40).map(|i| i as f32).collect();
+        r.push_slice(&big);
+        assert_eq!(r.len(), 16);
+        let mut tail = vec![0.0f32; 16];
+        r.drain_into(&mut tail);
+        assert_eq!(&tail[..], &big[24..], "overflow keeps the newest window");
+        r.push_slice(&[1.0, 2.0, 3.0]);
+        r.clear();
+        assert_eq!(r.len(), 0, "clear empties");
+
+        // -- Plugin-backed: finite passthrough + post-flush echo reset.
+        let Some((path, kind)) = v16_test_plugin() else {
+            eprintln!("skip AC6 plugin half: no local test plugin");
+            return;
+        };
+        const N: usize = 512 * 24;
+        let sig: Vec<f32> = (0..N)
+            .map(|i| (i as f32 * 0.037).sin() * 0.4 + (i as f32 * 0.011).cos() * 0.2)
+            .collect();
+        let load = open(&path, kind, 48_000, None).expect("open test plugin");
+        let mut out = vec![0.0f32; N];
+        {
+            let mut o = vec![0.0f32; 512];
+            for (k, w) in sig.chunks(512).enumerate() {
+                load.entry.process(w, &mut o);
+                out[k * 512..k * 512 + 512].copy_from_slice(&o);
+            }
+        }
+        assert!(out.iter().all(|v| v.is_finite()), "output must stay finite");
+        assert!(
+            out.iter().any(|v| *v != 0.0),
+            "signal must actually pass through"
+        );
+
+        // Ragged feed must stay finite too (ring must not glitch shapes).
+        let cycle = [
+            100usize, 700, 37, 1000, 512, 40, 903, 256, 640, 512, 96, 2000,
+        ];
+        let mut off = 0usize;
+        let mut ci = 0usize;
+        let mut left = N;
+        while left > 0 {
+            let n = cycle[ci % cycle.len()].min(left);
+            let mut o = vec![0.0f32; n];
+            load.entry.process(&sig[off..off + n], &mut o);
+            assert!(
+                o.iter().all(|v| v.is_finite()),
+                "ragged block {ci} produced non-finite"
+            );
+            off += n;
+            left -= n;
+            ci += 1;
+        }
+
+        // flush() empties every ring: the very next (sub-block) call is
+        // answered by the echo carry — the exact input samples.
+        load.entry.flush();
+        let probe = vec![0.125f32; 100];
+        let mut po = vec![9.0f32; 100];
+        load.entry.process(&probe, &mut po);
+        assert!(
+            po.iter().all(|v| (*v - 0.125).abs() < 1e-9),
+            "after flush the pipeline is empty: the echo carry must return the input at once"
+        );
+        drop(load);
+    }
 }

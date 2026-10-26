@@ -126,7 +126,10 @@ impl FxEditor {
     pub fn size_hint(&self) -> (f32, f32) {
         match &self.custom {
             Some(c) => c.gui.size_hint(),
-            None => (360.0, (28.0 * self.desc.params.len() as f32 + 56.0).clamp(80.0, 460.0)),
+            None => (
+                360.0,
+                (28.0 * self.desc.params.len() as f32 + 56.0).clamp(80.0, 460.0),
+            ),
         }
     }
 }
@@ -191,7 +194,10 @@ fn cstr(p: *const c_char) -> String {
     if p.is_null() {
         return String::new();
     }
-    unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("").to_string()
+    unsafe { CStr::from_ptr(p) }
+        .to_str()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn norm(v: f32, min: f32, max: f32, curve: f32) -> f32 {
@@ -203,7 +209,9 @@ fn norm(v: f32, min: f32, max: f32, curve: f32) -> f32 {
         // log scale
         ((v / min).ln() / (max / min).ln()).clamp(0.0, 1.0)
     } else {
-        ((v - min) / (max - min)).powf(if curve > 0.0 { curve } else { 1.0 }).clamp(0.0, 1.0)
+        ((v - min) / (max - min))
+            .powf(if curve > 0.0 { curve } else { 1.0 })
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -235,8 +243,10 @@ extern "C" fn tr_line(
     a: f32,
 ) {
     let br = unsafe { &mut *(ctx as *mut Bridge) };
-    br.painter()
-        .line_segment([br.pos(x0, y0), br.pos(x1, y1)], Stroke::new(stroke_w(width), rgba(r, g, b, a)));
+    br.painter().line_segment(
+        [br.pos(x0, y0), br.pos(x1, y1)],
+        Stroke::new(stroke_w(width), rgba(r, g, b, a)),
+    );
 }
 
 extern "C" fn tr_polyline(
@@ -261,7 +271,9 @@ extern "C" fn tr_polyline(
     // joins it continuously instead of drawing 799 separate butt-capped
     // sticks (which is what made the response curve look faceted).
     let path = egui::epaint::PathShape {
-        points: (0..n as usize).map(|i| br.pos(pts[i * 2], pts[i * 2 + 1])).collect(),
+        points: (0..n as usize)
+            .map(|i| br.pos(pts[i * 2], pts[i * 2 + 1]))
+            .collect(),
         closed: closed != 0,
         fill: Color32::TRANSPARENT,
         stroke: stroke.into(),
@@ -269,12 +281,34 @@ extern "C" fn tr_polyline(
     br.ui.painter().add(path);
 }
 
-extern "C" fn tr_rect_filled(ctx: *mut c_void, x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32, a: f32) {
+extern "C" fn tr_rect_filled(
+    ctx: *mut c_void,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) {
     let br = unsafe { &mut *(ctx as *mut Bridge) };
-    br.painter().rect_filled(br.rect(x, y, w, h), 1.0, rgba(r, g, b, a));
+    br.painter()
+        .rect_filled(br.rect(x, y, w, h), 1.0, rgba(r, g, b, a));
 }
 
-extern "C" fn tr_rect_stroke(ctx: *mut c_void, x: f32, y: f32, w: f32, h: f32, width: f32, r: f32, g: f32, b: f32, a: f32) {
+extern "C" fn tr_rect_stroke(
+    ctx: *mut c_void,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    width: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) {
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     br.ui.painter().rect_stroke(
         br.rect(x, y, w, h),
@@ -306,14 +340,22 @@ extern "C" fn tr_text(
         2 => Align2::RIGHT_CENTER,
         _ => Align2::LEFT_CENTER,
     };
-    br.painter().text(br.pos(x, y), a2, s, FontId::proportional(size.clamp(6.0, 128.0)), rgba(r, g, b, a));
+    br.painter().text(
+        br.pos(x, y),
+        a2,
+        s,
+        FontId::proportional(size.clamp(6.0, 128.0)),
+        rgba(r, g, b, a),
+    );
 }
 
 extern "C" fn tr_text_width(ctx: *mut c_void, size: f32, s: *const c_char) -> f32 {
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let s = cstr(s);
     let font = FontId::proportional(size.clamp(6.0, 128.0));
-    let g = br.ui.fonts_mut(|f| f.layout_no_wrap(s, font, Color32::WHITE));
+    let g = br
+        .ui
+        .fonts_mut(|f| f.layout_no_wrap(s, font, Color32::WHITE));
     g.size().x
 }
 
@@ -369,8 +411,16 @@ extern "C" fn tr_knob(
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let d = size.clamp(20.0, 256.0);
     let rect = Rect::from_min_size(br.pos(x, y), Vec2::new(d, d));
-    let id = Id::new(("fxknob", x as i32, y as i32, br.base.x as i32, br.base.y as i32));
-    let resp = br.ui.interact(rect, id, Sense::drag().union(Sense::hover()));
+    let id = Id::new((
+        "fxknob",
+        x as i32,
+        y as i32,
+        br.base.x as i32,
+        br.base.y as i32,
+    ));
+    let resp = br
+        .ui
+        .interact(rect, id, Sense::drag().union(Sense::hover()));
     let mut v = unsafe { *value };
     if resp.dragged() {
         // Vertical drag; full range in ~180 px, log/curve-aware so a nudge
@@ -384,11 +434,27 @@ extern "C" fn tr_knob(
     let rad = d * 0.34;
     let hovered = resp.hovered() || resp.dragged();
     let p = br.ui.painter();
-    p.circle_filled(c, rad, Color32::from_rgb(if hovered { 60 } else { 48 }, if hovered { 64 } else { 52 }, if hovered { 74 } else { 60 }));
-    p.circle_stroke(c, rad, Stroke::new(1.2, Color32::from_gray(if hovered { 170 } else { 110 })));
-    let ang = (std::f32::consts::FRAC_PI_4 * -3.0) + norm(v, min, max, curve) * (std::f32::consts::FRAC_PI_4 * 6.0);
+    p.circle_filled(
+        c,
+        rad,
+        Color32::from_rgb(
+            if hovered { 60 } else { 48 },
+            if hovered { 64 } else { 52 },
+            if hovered { 74 } else { 60 },
+        ),
+    );
+    p.circle_stroke(
+        c,
+        rad,
+        Stroke::new(1.2, Color32::from_gray(if hovered { 170 } else { 110 })),
+    );
+    let ang = (std::f32::consts::FRAC_PI_4 * -3.0)
+        + norm(v, min, max, curve) * (std::f32::consts::FRAC_PI_4 * 6.0);
     let dir = Vec2::angled(ang + std::f32::consts::FRAC_PI_2);
-    p.line_segment([c, c + dir * (rad * 0.92)], Stroke::new(1.6, Color32::from_rgb(150, 200, 255)));
+    p.line_segment(
+        [c, c + dir * (rad * 0.92)],
+        Stroke::new(1.6, Color32::from_rgb(150, 200, 255)),
+    );
     let label = cstr(label);
     if !label.is_empty() {
         p.text(
@@ -426,7 +492,9 @@ extern "C" fn tr_button(ctx: *mut c_void, x: f32, y: f32, w: f32, label: *const 
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let rect = Rect::from_min_size(br.pos(x, y), Vec2::new(w.max(24.0), 20.0));
     let label = cstr(label);
-    let r = with_no_wrap(br.ui, |ui| ui.put(rect, egui::Button::new(RichText::new(label).small())));
+    let r = with_no_wrap(br.ui, |ui| {
+        ui.put(rect, egui::Button::new(RichText::new(label).small()))
+    });
     if r.clicked() {
         1
     } else {
@@ -434,7 +502,13 @@ extern "C" fn tr_button(ctx: *mut c_void, x: f32, y: f32, w: f32, label: *const 
     }
 }
 
-extern "C" fn tr_checkbox(ctx: *mut c_void, x: f32, y: f32, label: *const c_char, on: *mut f32) -> u32 {
+extern "C" fn tr_checkbox(
+    ctx: *mut c_void,
+    x: f32,
+    y: f32,
+    label: *const c_char,
+    on: *mut f32,
+) -> u32 {
     if on.is_null() {
         return 0;
     }
@@ -556,7 +630,9 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
                 .and_then(|i| ed.preset_list.get(i).cloned())
                 .unwrap_or_else(|| String::from("select…"))
         };
-        let mut cb = ComboBox::from_id_salt("fx_user_preset").selected_text(status).width(150.0);
+        let mut cb = ComboBox::from_id_salt("fx_user_preset")
+            .selected_text(status)
+            .width(150.0);
         // An empty list simply offers an empty popup; the Load button is
         // the guarded path, so the combo itself stays enabled.
         let _ = &mut cb;
@@ -565,7 +641,10 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
             // `ed` while `load_user_preset` mutably borrows it.
             let names: Vec<String> = ed.preset_list.to_vec();
             for (i, name) in names.iter().enumerate() {
-                if ui.selectable_value(&mut ed.preset_sel, Some(i), name).clicked() {
+                if ui
+                    .selectable_value(&mut ed.preset_sel, Some(i), name)
+                    .clicked()
+                {
                     // Picking from the list loads it — one fewer click.
                     ed.load_user_preset(name);
                     ui.close();
@@ -587,14 +666,23 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
         }
         ui.add_sized(
             [110.0, 0.0],
-            TextEdit::singleline(&mut ed.preset_name).hint_text("new preset name").font(egui::TextStyle::Small),
+            TextEdit::singleline(&mut ed.preset_name)
+                .hint_text("new preset name")
+                .font(egui::TextStyle::Small),
         );
-        if ui.button(RichText::new("Save").small()).on_hover_text("save current settings as a new preset").clicked() {
+        if ui
+            .button(RichText::new("Save").small())
+            .on_hover_text("save current settings as a new preset")
+            .clicked()
+        {
             let name = std::mem::take(&mut ed.preset_name);
             ed.save_user_preset(&name);
         }
         let have_sel = ed.preset_sel.is_some();
-        if ui.add_enabled(have_sel, egui::Button::new(RichText::new("Delete").small())).clicked() {
+        if ui
+            .add_enabled(have_sel, egui::Button::new(RichText::new("Delete").small()))
+            .clicked()
+        {
             if let Some(i) = ed.preset_sel {
                 let n = ed.preset_list[i].clone();
                 ed.delete_user_preset(&n);
@@ -635,13 +723,12 @@ impl FxEditor {
             .enumerate()
             .map(|(k, p)| (p.label.clone(), self.inst.param(k)))
             .collect();
-        match fx::preset_to_json(&self.stem, &name, &params)
-            .and_then(|j| {
-                std::fs::create_dir_all(fx::user_presets_dir(&self.fx_dir))
-                    .map_err(|e| format!("could not create preset folder: {e}"))?;
-                std::fs::write(fx::user_preset_path(&self.fx_dir, &self.stem, &name), j)
-                    .map_err(|e| format!("could not write preset: {e}"))
-            }) {
+        match fx::preset_to_json(&self.stem, &name, &params).and_then(|j| {
+            std::fs::create_dir_all(fx::user_presets_dir(&self.fx_dir))
+                .map_err(|e| format!("could not create preset folder: {e}"))?;
+            std::fs::write(fx::user_preset_path(&self.fx_dir, &self.stem, &name), j)
+                .map_err(|e| format!("could not write preset: {e}"))
+        }) {
             Ok(()) => {
                 self.refresh_presets();
                 self.preset_sel = self.preset_list.iter().position(|n| *n == name);
@@ -661,7 +748,12 @@ impl FxEditor {
     pub fn apply_labeled(&mut self, pairs: &[(&str, f32)]) -> usize {
         let mut applied = 0usize;
         for (label, v) in pairs {
-            if let Some((k, p)) = self.desc.params.iter().enumerate().find(|(_, p)| p.label == *label)
+            if let Some((k, p)) = self
+                .desc
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.label == *label)
             {
                 let v = v.clamp(p.min.min(p.max), p.max.max(p.min));
                 self.inst.set_param(k, v);
@@ -696,7 +788,13 @@ impl FxEditor {
         }
         // …then label matches win over positional guesses.
         for (label, v) in &pairs {
-            if let Some((k, p)) = self.desc.params.iter().enumerate().find(|(_, p)| &p.label == label) {
+            if let Some((k, p)) = self
+                .desc
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, p)| &p.label == label)
+            {
                 let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
                 self.inst.set_param(k, v);
                 self.pending.push((k, v));
@@ -726,8 +824,14 @@ impl FxEditor {
 fn custom_ui(ui: &mut Ui, ed: &mut FxEditor, height: f32) {
     let w = (ui.available_width() - 8.0).max(220.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, height), Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, Color32::from_rgb(21, 23, 28));
-    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(58)), StrokeKind::Inside);
+    ui.painter()
+        .rect_filled(rect, 3.0, Color32::from_rgb(21, 23, 28));
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0, Color32::from_gray(58)),
+        StrokeKind::Inside,
+    );
 
     // Frame bookkeeping.
     let now = ed.t0.elapsed().as_secs_f64();
@@ -744,7 +848,10 @@ fn custom_ui(ui: &mut Ui, ed: &mut FxEditor, height: f32) {
         )
     });
     let inside = ptr.0.is_some_and(|p| rect.contains(p));
-    let (mx, my) = ptr.0.map(|p| (p.x - rect.min.x, p.y - rect.min.y)).unwrap_or((0.0, 0.0));
+    let (mx, my) = ptr
+        .0
+        .map(|p| (p.x - rect.min.x, p.y - rect.min.y))
+        .unwrap_or((0.0, 0.0));
     let frame = GuiFrameV1 {
         width: rect.width(),
         height: rect.height(),
@@ -772,7 +879,11 @@ fn custom_ui(ui: &mut Ui, ed: &mut FxEditor, height: f32) {
     let mut api = API_FNS;
     api.n_params = ed.inst.n_params() as u32;
     api.ctx = &mut bridge as *mut Bridge as *mut c_void;
-    unsafe { custom.gui.draw(custom.gs, ed.inst.state_ptr(), &frame, &api) };
+    unsafe {
+        custom
+            .gui
+            .draw(custom.gs, ed.inst.state_ptr(), &frame, &api)
+    };
 }
 
 /// The default editor: label | slider | value, one row per param.
@@ -785,28 +896,33 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
         ui.label(RichText::new("This effect has no parameters.").weak());
         return;
     }
-    egui::Grid::new(("fxauto", ed.loop_i, ed.slot)).num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-        for (k, p) in ed.desc.params.iter().enumerate() {
-            let mut v = ed.inst.param(k);
-            let mut sl = Slider::new(&mut v, p.min..=p.max);
-            if p.min > 0.0 && p.max / p.min > 50.0 {
-                sl = sl.logarithmic(true);
-            }
-            let r = ui.add_sized(Vec2::new(150.0, 0.0), sl).on_hover_text(format!("{:.2} … {:.2}", p.min, p.max));
-            // v0.15: right-click hands the request to the UI layer, which
-            // shows Set value / Create automation asset for `fx:<row>:<k>`.
-            if r.secondary_clicked() {
-                if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
-                    ed.ctx_menu = Some((k, v, pp));
+    egui::Grid::new(("fxauto", ed.loop_i, ed.slot))
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for (k, p) in ed.desc.params.iter().enumerate() {
+                let mut v = ed.inst.param(k);
+                let mut sl = Slider::new(&mut v, p.min..=p.max);
+                if p.min > 0.0 && p.max / p.min > 50.0 {
+                    sl = sl.logarithmic(true);
                 }
+                let r = ui
+                    .add_sized(Vec2::new(150.0, 0.0), sl)
+                    .on_hover_text(format!("{:.2} … {:.2}", p.min, p.max));
+                // v0.15: right-click hands the request to the UI layer, which
+                // shows Set value / Create automation asset for `fx:<row>:<k>`.
+                if r.secondary_clicked() {
+                    if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
+                        ed.ctx_menu = Some((k, v, pp));
+                    }
+                }
+                ui.label(&p.label);
+                ui.label(RichText::new(format!("{v:.2}")).monospace().small());
+                if r.changed() {
+                    ed.inst.set_param(k, v);
+                    ed.pending.push((k, v));
+                }
+                ui.end_row();
             }
-            ui.label(&p.label);
-            ui.label(RichText::new(format!("{v:.2}")).monospace().small());
-            if r.changed() {
-                ed.inst.set_param(k, v);
-                ed.pending.push((k, v));
-            }
-            ui.end_row();
-        }
-    });
+        });
 }

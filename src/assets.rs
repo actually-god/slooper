@@ -41,25 +41,29 @@ impl Asset {
     }
 
     /// Mono audio asset bound to a file (fresh imports / recordings).
-    pub fn audio(
-        id: u32,
-        name: String,
-        path: PathBuf,
-        data: Arc<[f32]>,
-        dirty: bool,
-    ) -> Asset {
-        Asset { id, name, path, data, dirty, pattern: None, automation: None }
+    pub fn audio(id: u32, name: String, path: PathBuf, data: Arc<[f32]>, dirty: bool) -> Asset {
+        Asset {
+            id,
+            name,
+            path,
+            data,
+            dirty,
+            pattern: None,
+            automation: None,
+        }
     }
 
     /// MIDI pattern asset (imported .mid, MIDI recording, piano roll).
-    pub fn midi(
-        id: u32,
-        name: String,
-        path: PathBuf,
-        pattern: Arc<Pattern>,
-        dirty: bool,
-    ) -> Asset {
-        Asset { id, name, path, data: Arc::from(Vec::new().into_boxed_slice()), dirty, pattern: Some(pattern), automation: None }
+    pub fn midi(id: u32, name: String, path: PathBuf, pattern: Arc<Pattern>, dirty: bool) -> Asset {
+        Asset {
+            id,
+            name,
+            path,
+            data: Arc::from(Vec::new().into_boxed_slice()),
+            dirty,
+            pattern: Some(pattern),
+            automation: None,
+        }
     }
 
     /// Automation asset (v0.11): a curve + target, stored as `.slauto` JSON.
@@ -70,7 +74,15 @@ impl Asset {
         curve: Arc<Automation>,
         dirty: bool,
     ) -> Asset {
-        Asset { id, name, path, data: Arc::from(Vec::new().into_boxed_slice()), dirty, pattern: None, automation: Some(curve) }
+        Asset {
+            id,
+            name,
+            path,
+            data: Arc::from(Vec::new().into_boxed_slice()),
+            dirty,
+            pattern: None,
+            automation: Some(curve),
+        }
     }
 
     pub fn is_midi(&self) -> bool {
@@ -105,7 +117,9 @@ pub fn is_audio_file(path: &Path) -> bool {
 
 /// True when a file is a slooper automation asset (`.slauto` JSON).
 pub fn is_auto_file(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("slauto"))
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("slauto"))
 }
 
 /// True when a file is a Standard MIDI File the pattern decoder accepts.
@@ -130,7 +144,12 @@ pub fn scan_folder(dir: &Path) -> Result<Vec<RackFile>, String> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            files.push(RackFile { name, path: p, is_midi, is_auto });
+            files.push(RackFile {
+                name,
+                path: p,
+                is_midi,
+                is_auto,
+            });
         }
     }
     files.sort_by_key(|f| f.name.to_lowercase());
@@ -147,7 +166,11 @@ pub struct RackFolder {
 
 impl RackFolder {
     pub fn new(path: impl Into<String>) -> Self {
-        RackFolder { path: path.into(), files: Vec::new(), err: None }
+        RackFolder {
+            path: path.into(),
+            files: Vec::new(),
+            err: None,
+        }
     }
 
     /// Re-scan this folder in place.

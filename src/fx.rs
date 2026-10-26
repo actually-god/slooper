@@ -30,8 +30,8 @@ mod api {
     include!("effect_api.rs");
 }
 pub use api::{
-    EffectGuiV1, EffectInfoV1, EffectParamV1, GuiApiV1, GuiFrameV1,
-    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
+    EffectGuiV1, EffectInfoV1, EffectParamV1, GuiApiV1, GuiFrameV1, SLOOPER_EFFECT_ABI,
+    SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
@@ -57,7 +57,10 @@ pub const TEMPLATE_FILE: &str = "template.rs";
 /// Written into brand-new effects folders so the child-GUI features are
 /// discoverable; never written over an existing (user-owned) copy.
 pub const EXAMPLES: &[(&str, &str)] = &[
-    ("parametric_eq.rs", include_str!("../effects/parametric_eq.rs")),
+    (
+        "parametric_eq.rs",
+        include_str!("../effects/parametric_eq.rs"),
+    ),
     ("space_echo.rs", include_str!("../effects/space_echo.rs")),
 ];
 
@@ -106,7 +109,9 @@ pub fn default_effects_dir() -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Resolve the effects folder and make it usable: create it when missing,
@@ -208,7 +213,9 @@ pub fn list_user_presets(fx_dir: &Path, stem: &str) -> Vec<String> {
     let prefix = format!("{stem}-");
     if let Ok(rd) = std::fs::read_dir(user_presets_dir(fx_dir)) {
         for e in rd.flatten() {
-            let Some(n) = e.file_name().to_str().map(str::to_string) else { continue };
+            let Some(n) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
             if let Some(rest) = n.strip_prefix(&prefix) {
                 if let Some(name) = rest.strip_suffix(".json") {
                     if !name.is_empty() {
@@ -259,8 +266,10 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
     // space_echo params in PARAMS order; labels are the script's:
     // time, feedback, tone, wobble, rate, decay, damp, mix, out, echo, verb.
     fn se(v: [f32; 11]) -> Vec<(&'static str, f32)> {
-        const L: [&str; 11] =
-            ["time", "feedback", "tone", "wobble", "rate", "decay", "damp", "mix", "out", "echo", "verb"];
+        const L: [&str; 11] = [
+            "time", "feedback", "tone", "wobble", "rate", "decay", "damp", "mix", "out", "echo",
+            "verb",
+        ];
         L.iter().zip(v).map(|(l, x)| (leak_str(l), x)).collect()
     }
     fn leak_str(s: &str) -> &'static str {
@@ -389,17 +398,42 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
         "space_echo" => vec![
             // The classic dub-style echo: 380 ms slap, moderate feedback,
             // no wobble; verb barely open. This is the old default sound.
-            ("Echo", se([0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5])),
+            (
+                "Echo",
+                se([
+                    0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5,
+                ]),
+            ),
             // Tiny bright room: 70 ms first reflection, tight decay —
             // more "close walls" than an effect.
-            ("Practice Hall", se([0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0])),
+            (
+                "Practice Hall",
+                se([
+                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0,
+                ]),
+            ),
             // Medium hall, a touch of slap before the tail.
-            ("Auditorium", se([0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0])),
+            (
+                "Auditorium",
+                se([
+                    0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0,
+                ]),
+            ),
             // The warm classic: 200 ms slap, longish damped tail.
-            ("Opera House", se([0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0])),
+            (
+                "Opera House",
+                se([
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0,
+                ]),
+            ),
             // Vast and dark: slow slap, 0.95 feedback, heavy air damping —
             // the tail outlives everything.
-            ("Cathedral", se([0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0])),
+            (
+                "Cathedral",
+                se([
+                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0,
+                ]),
+            ),
         ],
         _ => Vec::new(),
     }
@@ -611,13 +645,19 @@ fn seed_api(dir: &Path) {
 
 /// Any effect script in the folder (ignoring the API file and drafts)?
 fn has_scripts(dir: &Path) -> bool {
-    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
     for e in rd.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("rs") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         if stem != API_FILE.strip_suffix(".rs").unwrap_or(API_FILE)
             && !stem.starts_with('.')
             && !stem.starts_with('_')
@@ -706,7 +746,13 @@ unsafe impl Sync for Instance {}
 impl Instance {
     /// Create via the effect's `create`. `values` seeds the sliders
     /// (missing entries fall back to the defaults in `desc`).
-    fn new(fns: EffectFns, lib: Arc<LibHandle>, desc: &EffectDesc, sample_rate: f64, values: &[f32]) -> Option<Arc<Self>> {
+    fn new(
+        fns: EffectFns,
+        lib: Arc<LibHandle>,
+        desc: &EffectDesc,
+        sample_rate: f64,
+        values: &[f32],
+    ) -> Option<Arc<Self>> {
         let state = (fns.create)(sample_rate);
         if state.is_null() {
             return None;
@@ -805,7 +851,13 @@ impl Instance {
     /// this instance's current slider values. For offline renders, which
     /// must never share mutable state with the live audio thread.
     pub fn spawn_fresh(&self, desc: &EffectDesc) -> Option<Arc<Self>> {
-        Self::new(self.fns, self._lib.clone(), desc, self.sample_rate, &self.snapshot_params())
+        Self::new(
+            self.fns,
+            self._lib.clone(),
+            desc,
+            self.sample_rate,
+            &self.snapshot_params(),
+        )
     }
 
     /// Process one sample with this instance's own current slider values.
@@ -849,7 +901,11 @@ impl EffectGuiRef {
     pub fn size_hint(&self) -> (f32, f32) {
         let w = self.v.want_width;
         let h = self.v.want_height;
-        let w = if w.is_finite() && w >= 120.0 { w } else { 480.0 };
+        let w = if w.is_finite() && w >= 120.0 {
+            w
+        } else {
+            480.0
+        };
         let h = if h.is_finite() && h >= 90.0 { h } else { 320.0 };
         (w, h)
     }
@@ -914,7 +970,10 @@ unsafe impl Sync for Registry {}
 
 impl Registry {
     pub fn open(dir: PathBuf) -> Self {
-        Registry { dir, items: Vec::new() }
+        Registry {
+            dir,
+            items: Vec::new(),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -928,12 +987,18 @@ impl Registry {
 
     /// Valid effects in alphabetical stem order.
     pub fn stems(&self) -> Vec<String> {
-        self.items.iter().filter(|e| e.fns.is_some()).map(|e| e.stem.clone()).collect()
+        self.items
+            .iter()
+            .filter(|e| e.fns.is_some())
+            .map(|e| e.stem.clone())
+            .collect()
     }
 
     /// Loadable entry by stem.
     fn find(&self, stem: &str) -> Option<&EffectEntry> {
-        self.items.iter().find(|e| e.stem == stem && e.fns.is_some())
+        self.items
+            .iter()
+            .find(|e| e.stem == stem && e.fns.is_some())
     }
 
     pub fn desc(&self, stem: &str) -> Option<&EffectDesc> {
@@ -985,7 +1050,11 @@ impl Registry {
                     None => continue,
                 };
                 // Skip the generated contract and dot/underscore scratch files.
-                if stem == Path::new(API_FILE).file_stem().and_then(|s| s.to_str()).unwrap_or(API_FILE)
+                if stem
+                    == Path::new(API_FILE)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(API_FILE)
                     || stem.starts_with('_')
                     || stem.starts_with('.')
                 {
@@ -1002,7 +1071,14 @@ impl Registry {
     }
 
     fn compile_and_load(&self, stem: &str, src: &Path) -> EffectEntry {
-        let mk = |error: String| EffectEntry { stem: stem.to_string(), desc: None, fns: None, gui: None, error: Some(error), _lib: None };
+        let mk = |error: String| EffectEntry {
+            stem: stem.to_string(),
+            desc: None,
+            fns: None,
+            gui: None,
+            error: Some(error),
+            _lib: None,
+        };
         if !rustc_available() {
             return mk("rustc not found — install rust (or rustup) to compile effects".into());
         }
@@ -1021,7 +1097,14 @@ impl Registry {
             Err(e) => return mk(format!("could not load {}: {e}", so.display())),
         };
         match unsafe { validate(&lib.0) } {
-            Ok((desc, fns, gui)) => EffectEntry { stem: stem.to_string(), desc: Some(desc), fns: Some(fns), gui, error: None, _lib: Some(lib) },
+            Ok((desc, fns, gui)) => EffectEntry {
+                stem: stem.to_string(),
+                desc: Some(desc),
+                fns: Some(fns),
+                gui,
+                error: None,
+                _lib: Some(lib),
+            },
             Err(e) => mk(e),
         }
     }
@@ -1034,9 +1117,15 @@ impl Registry {
         let mut h = DefaultHasher::new();
         stem.hash(&mut h);
         meta.len().hash(&mut h);
-        meta.modified().map(|t| format!("{t:?}")).unwrap_or_default().hash(&mut h);
+        meta.modified()
+            .map(|t| format!("{t:?}"))
+            .unwrap_or_default()
+            .hash(&mut h);
         let stamp = h.finish();
-        Ok(self.dir.join(".build").join(format!("{stem}-{stamp:016x}.so")))
+        Ok(self
+            .dir
+            .join(".build")
+            .join(format!("{stem}-{stamp:016x}.so")))
     }
 
     /// Delete older artifacts of the same stem (best-effort; deleting a
@@ -1047,7 +1136,11 @@ impl Registry {
             let prefix = format!("{stem}-");
             for ent in rd.flatten() {
                 let p = ent.path();
-                let name = p.file_name().unwrap_or_else(|| OsStr::new("")).to_string_lossy().into_owned();
+                let name = p
+                    .file_name()
+                    .unwrap_or_else(|| OsStr::new(""))
+                    .to_string_lossy()
+                    .into_owned();
                 if name.starts_with(&prefix) && p != keep {
                     let _ = std::fs::remove_file(p);
                 }
@@ -1056,7 +1149,12 @@ impl Registry {
     }
 
     /// Create a live instance of a valid effect (null-create ⇒ None).
-    pub fn create_instance(&self, stem: &str, sample_rate: f64, values: &[f32]) -> Option<Arc<Instance>> {
+    pub fn create_instance(
+        &self,
+        stem: &str,
+        sample_rate: f64,
+        values: &[f32],
+    ) -> Option<Arc<Instance>> {
         let e = self.find(stem)?;
         let fns = e.fns?;
         let desc = e.desc.as_ref()?;
@@ -1069,7 +1167,10 @@ impl Registry {
     pub fn gui(&self, stem: &str) -> Option<EffectGuiRef> {
         let e = self.find(stem)?;
         let v = e.gui?;
-        Some(EffectGuiRef { v, _lib: e._lib.as_ref()?.clone() })
+        Some(EffectGuiRef {
+            v,
+            _lib: e._lib.as_ref()?.clone(),
+        })
     }
 }
 
@@ -1080,11 +1181,20 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("could not create build dir: {e}"))?;
     }
     let crate_name = sanitize_crate_name(
-        out.file_stem().and_then(|s| s.to_str()).unwrap_or("slooper_effect"),
+        out.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("slooper_effect"),
     );
     let tmp = out.with_extension("so.tmp");
     let output = Command::new("rustc")
-        .args(["--edition", "2021", "--crate-type", "cdylib", "-C", "opt-level=2"])
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "cdylib",
+            "-C",
+            "opt-level=2",
+        ])
         .arg("--crate-name")
         .arg(&crate_name)
         .arg("-o")
@@ -1107,7 +1217,11 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
 fn sanitize_crate_name(stem: &str) -> String {
     let mut s = String::from("fx_");
     for c in stem.chars() {
-        s.push(if c.is_ascii_alphanumeric() || c == '_' { c.to_ascii_lowercase() } else { '_' });
+        s.push(if c.is_ascii_alphanumeric() || c == '_' {
+            c.to_ascii_lowercase()
+        } else {
+            '_'
+        });
     }
     s
 }
@@ -1119,21 +1233,28 @@ fn sanitize_crate_name(stem: &str) -> String {
 unsafe fn validate(
     lib: &libloading::Library,
 ) -> Result<(EffectDesc, EffectFns, Option<&'static EffectGuiV1>), String> {
-    let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> =
-        lib.get(ENTRY).map_err(|_| "missing entry point slooper_effect_info — see template.rs".to_string())?;
+    let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> = lib
+        .get(ENTRY)
+        .map_err(|_| "missing entry point slooper_effect_info — see template.rs".to_string())?;
     let info = sym();
     if info.is_null() {
         return Err("slooper_effect_info returned null".into());
     }
     let d = &*info;
     if d.abi != ABI_VERSION {
-        return Err(format!("effect ABI version {} (this slooper speaks {ABI_VERSION})", d.abi));
+        return Err(format!(
+            "effect ABI version {} (this slooper speaks {ABI_VERSION})",
+            d.abi
+        ));
     }
     let name = read_cstr(d.name).ok_or("effect has no name — DESC.name must be text")?;
     let author = d.author.cast_non_null().and_then(read_cstr);
     let description = d.description.cast_non_null().and_then(read_cstr);
     if d.n_params as usize > MAX_PARAMS {
-        return Err(format!("effect declares {} params (max {MAX_PARAMS})", d.n_params));
+        return Err(format!(
+            "effect declares {} params (max {MAX_PARAMS})",
+            d.n_params
+        ));
     }
     if d.n_params > 0 && d.params.is_null() {
         return Err("n_params > 0 but the params array is null".into());
@@ -1142,8 +1263,17 @@ unsafe fn validate(
     for k in 0..d.n_params as usize {
         let p = &*d.params.add(k);
         let label = read_cstr(p.label).ok_or_else(|| format!("param {k} has no label"))?;
-        let (min, max) = if p.min <= p.max { (p.min, p.max) } else { (p.max, p.min) };
-        params.push(ParamDesc { label, min, max, default: p.default.clamp(min, max) });
+        let (min, max) = if p.min <= p.max {
+            (p.min, p.max)
+        } else {
+            (p.max, p.min)
+        };
+        params.push(ParamDesc {
+            label,
+            min,
+            max,
+            default: p.default.clamp(min, max),
+        });
     }
     let gui = match lib.get(GUI_ENTRY) {
         Ok(gsym) => {
@@ -1154,7 +1284,10 @@ unsafe fn validate(
             }
             let g = &*g;
             if g.abi != GUI_ABI_VERSION {
-                return Err(format!("child GUI ABI version {} (this slooper speaks {GUI_ABI_VERSION})", g.abi));
+                return Err(format!(
+                    "child GUI ABI version {} (this slooper speaks {GUI_ABI_VERSION})",
+                    g.abi
+                ));
             }
             // create/draw/destroy are non-nullable fn types in the shared
             // ABI file — a script cannot put null in them and compile, so
@@ -1165,8 +1298,17 @@ unsafe fn validate(
         Err(_) => None,
     };
     Ok((
-        EffectDesc { name, author, description, params },
-        EffectFns { create: d.create, destroy: d.destroy, process: d.process },
+        EffectDesc {
+            name,
+            author,
+            description,
+            params,
+        },
+        EffectFns {
+            create: d.create,
+            destroy: d.destroy,
+            process: d.process,
+        },
         gui,
     ))
 }
@@ -1182,7 +1324,14 @@ impl CastNonNull for *const core::ffi::c_char {
 }
 
 fn read_cstr(p: *const core::ffi::c_char) -> Option<String> {
-    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_str().ok().map(|s| s.to_string())).flatten()
+    (!p.is_null())
+        .then(|| {
+            unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        })
+        .flatten()
 }
 
 fn trim_head(s: &str, max: usize) -> String {
@@ -1219,12 +1368,20 @@ pub struct UiEntry {
 ///
 /// `saved` is the persisted chain for this loop (enabled order + values);
 /// pass an empty slice on rescan (the live list already carries state).
-pub fn merge_entries(existing: &[UiEntry], stems: &[String], saved: &[(String, Vec<f32>)]) -> Vec<UiEntry> {
+pub fn merge_entries(
+    existing: &[UiEntry],
+    stems: &[String],
+    saved: &[(String, Vec<f32>)],
+) -> Vec<UiEntry> {
     let mut out: Vec<UiEntry> = Vec::new();
     // Enabled block, in chain order: previous GUI list first (rescan), else
     // the saved config order (startup).
     let order: Vec<String> = if existing.iter().any(|e| e.enabled) {
-        existing.iter().filter(|e| e.enabled).map(|e| e.stem.clone()).collect()
+        existing
+            .iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.stem.clone())
+            .collect()
     } else {
         saved.iter().map(|(s, _)| s.clone()).collect()
     };
@@ -1237,16 +1394,33 @@ pub fn merge_entries(existing: &[UiEntry], stems: &[String], saved: &[(String, V
             .find(|e| e.stem == stem)
             .map(|e| e.params.clone())
             .filter(|p| !p.is_empty())
-            .or_else(|| saved.iter().find(|(s, _)| *s == stem).map(|(_, p)| p.clone()))
+            .or_else(|| {
+                saved
+                    .iter()
+                    .find(|(s, _)| *s == stem)
+                    .map(|(_, p)| p.clone())
+            })
             .unwrap_or_default();
-        out.push(UiEntry { stem, enabled: true, params });
+        out.push(UiEntry {
+            stem,
+            enabled: true,
+            params,
+        });
     }
     // Disabled block: everything valid that is not enabled, alphabetical
     // (`stems` arrives alphabetical).
     for s in stems {
         if !out.iter().any(|e| e.stem == *s) {
-            let keep = existing.iter().find(|e| &e.stem == s).map(|e| e.params.clone()).unwrap_or_default();
-            out.push(UiEntry { stem: s.clone(), enabled: false, params: keep });
+            let keep = existing
+                .iter()
+                .find(|e| &e.stem == s)
+                .map(|e| e.params.clone())
+                .unwrap_or_default();
+            out.push(UiEntry {
+                stem: s.clone(),
+                enabled: false,
+                params: keep,
+            });
         }
     }
     out
@@ -1261,7 +1435,11 @@ pub fn resort_entries(entries: &mut Vec<UiEntry>, stems: &[String]) {
     // the disabled half must come from `stems` fresh:
     for s in stems {
         if !v.iter().any(|e| e.stem == *s) {
-            v.push(UiEntry { stem: s.clone(), enabled: false, params: Vec::new() });
+            v.push(UiEntry {
+                stem: s.clone(),
+                enabled: false,
+                params: Vec::new(),
+            });
         }
     }
     *entries = v;
@@ -1270,7 +1448,12 @@ pub fn resort_entries(entries: &mut Vec<UiEntry>, stems: &[String]) {
 /// Swap `k` with the neighbouring enabled entry (chain reordering in the
 /// window). Returns true when the list changed.
 pub fn move_enabled(entries: &mut [UiEntry], k: usize, up: bool) -> bool {
-    let mut idx: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| e.enabled).map(|(i, _)| i).collect();
+    let mut idx: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.enabled)
+        .map(|(i, _)| i)
+        .collect();
     let pos = match idx.iter().position(|&i| i == k) {
         Some(p) => p,
         None => return false,
@@ -1297,7 +1480,13 @@ pub fn seed_values(saved: &[f32], desc: &EffectDesc) -> Vec<f32> {
     desc.params
         .iter()
         .enumerate()
-        .map(|(k, p)| saved.get(k).copied().unwrap_or(p.default).clamp(p.min, p.max))
+        .map(|(k, p)| {
+            saved
+                .get(k)
+                .copied()
+                .unwrap_or(p.default)
+                .clamp(p.min, p.max)
+        })
         .collect()
 }
 
@@ -1328,8 +1517,15 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, "// old stale copy\n").unwrap();
         seed_api(&dir);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), *src, "{name} not refreshed");
-        assert_eq!(std::fs::read_to_string(p.with_extension("rs.bak")).unwrap(), "// old stale copy\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            *src,
+            "{name} not refreshed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.with_extension("rs.bak")).unwrap(),
+            "// old stale copy\n"
+        );
         // A current copy is left untouched (and no spurious backup).
         let bak = p.with_extension("rs.bak");
         std::fs::remove_file(&bak).unwrap();
@@ -1343,10 +1539,20 @@ mod tests {
         // The repo copies (what PKGBUILD installs) must equal the embedded
         // sources the app writes/creates.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert_eq!(std::fs::read_to_string(root.join("effects/effect_api.rs")).unwrap(), API_SRC);
-        assert_eq!(std::fs::read_to_string(root.join("effects/template.rs")).unwrap(), TEMPLATE_SRC);
+        assert_eq!(
+            std::fs::read_to_string(root.join("effects/effect_api.rs")).unwrap(),
+            API_SRC
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("effects/template.rs")).unwrap(),
+            TEMPLATE_SRC
+        );
         for (name, src) in EXAMPLES {
-            assert_eq!(std::fs::read_to_string(root.join("effects").join(name)).unwrap(), *src, "{name} out of sync");
+            assert_eq!(
+                std::fs::read_to_string(root.join("effects").join(name)).unwrap(),
+                *src,
+                "{name} out of sync"
+            );
         }
     }
 
@@ -1363,16 +1569,39 @@ mod tests {
         reg.rescan();
         let want = ["template", "parametric_eq", "space_echo"];
         for name in want {
-            let it = reg.items().iter().find(|e| e.stem == name).unwrap_or_else(|| {
-                panic!("missing {name}: {:?}", reg.items().iter().map(|e| (&e.stem, e.error.clone())).collect::<Vec<_>>())
-            });
-            assert!(it.error.is_none(), "{name} failed to load: {}", it.error.clone().unwrap_or_default());
+            let it = reg
+                .items()
+                .iter()
+                .find(|e| e.stem == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {name}: {:?}",
+                        reg.items()
+                            .iter()
+                            .map(|e| (&e.stem, e.error.clone()))
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                it.error.is_none(),
+                "{name} failed to load: {}",
+                it.error.clone().unwrap_or_default()
+            );
         }
         assert_eq!(reg.desc("parametric_eq").unwrap().params.len(), 26);
         assert_eq!(reg.desc("space_echo").unwrap().params.len(), 11);
-        assert!(reg.gui("parametric_eq").is_some(), "EQ must expose a child GUI");
-        assert!(reg.gui("space_echo").is_some(), "space echo must expose a child GUI");
-        assert!(reg.gui("template").is_none(), "template keeps the auto slider window");
+        assert!(
+            reg.gui("parametric_eq").is_some(),
+            "EQ must expose a child GUI"
+        );
+        assert!(
+            reg.gui("space_echo").is_some(),
+            "space echo must expose a child GUI"
+        );
+        assert!(
+            reg.gui("template").is_none(),
+            "template keeps the auto slider window"
+        );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1457,7 +1686,9 @@ mod tests {
                 .create_instance(
                     stem,
                     48000.0,
-                    &[0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 2800.0, 1.0, 1.0, 0.0, 1.0],
+                    &[
+                        0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 2800.0, 1.0, 1.0, 0.0, 1.0,
+                    ],
                 )
                 .expect("echo instance");
             let _ = inst.process_private(1.0);
@@ -1477,7 +1708,8 @@ mod tests {
                     let cw = w.cos();
                     let (mut s1, mut s2) = (0.0f64, 0.0f64);
                     for (i, &v) in x.iter().enumerate() {
-                        let h = 0.5 - 0.5 * (core::f64::consts::TAU * i as f64 / (n as f64 - 1.0)).cos();
+                        let h = 0.5
+                            - 0.5 * (core::f64::consts::TAU * i as f64 / (n as f64 - 1.0)).cos();
                         let s0 = v * h + 2.0 * cw * s1 - s2;
                         s2 = s1;
                         s1 = s0;
@@ -1534,16 +1766,27 @@ mod tests {
             (peaks, conc, hm_e, hm_l)
         };
         let (peaks, conc, hm_e, hm_l) = probe(&dir, "space_echo");
-        println!("MODEPROBE current: peaks={peaks} concentration={conc:.1} hi/mid {hm_e:.3}→{hm_l:.3}");
+        println!(
+            "MODEPROBE current: peaks={peaks} concentration={conc:.1} hi/mid {hm_e:.3}→{hm_l:.3}"
+        );
         // Calibration (tilt-removed concentration): current bank ~7.5,
         // deliberately bunched combs through the same damping stack ~8.7,
         // the original unmodulated metallic bank (no damping, no diffusion)
         // far higher; density (peaks) and the hi/mid darkening below are
         // the primary guards — the tail must be a wash AND must lose
         // treble as it decays ("tinny" was the complaint).
-        assert!(peaks >= 5, "late tail empty? only {peaks} resonances visible");
-        assert!(conc < 12.0, "late tail metallic: one mode {conc:.1}x over its local envelope");
-        assert!(hm_l < hm_e * 0.65, "tail stays tinny: hi/mid {hm_e:.3} → {hm_l:.3} barely darkens");
+        assert!(
+            peaks >= 5,
+            "late tail empty? only {peaks} resonances visible"
+        );
+        assert!(
+            conc < 12.0,
+            "late tail metallic: one mode {conc:.1}x over its local envelope"
+        );
+        assert!(
+            hm_l < hm_e * 0.65,
+            "tail stays tinny: hi/mid {hm_e:.3} → {hm_l:.3} barely darkens"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1572,7 +1815,8 @@ mod tests {
                 let cw = w.cos();
                 let (mut s1, mut s2) = (0.0f64, 0.0f64);
                 for (i, &v) in x.iter().enumerate() {
-                    let h = 0.5 - 0.5 * (core::f64::consts::TAU * i as f64 / (n as f64 - 1.0)).cos();
+                    let h =
+                        0.5 - 0.5 * (core::f64::consts::TAU * i as f64 / (n as f64 - 1.0)).cos();
                     let s0 = v * h + 2.0 * cw * s1 - s2;
                     s2 = s1;
                     s1 = s0;
@@ -1584,45 +1828,81 @@ mod tests {
         // (a) sustain test: noise burst, then silence; RMS every 100 ms.
         // A self-oscillating tone shows as an RMS PLATEAU instead of decay.
         let sets: [(&str, [f32; 11]); 4] = [
-            ("default-Echo", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 1.0]),
-            ("cathedral", [0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0]),
-            ("verb-only-hot", [0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 16000.0, 1.0, 1.0, 0.0, 1.5]),
-            ("bright-damp-max", [0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 16000.0, 1.0, 1.0, 1.0, 1.5]),
+            (
+                "default-Echo",
+                [
+                    0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 1.0,
+                ],
+            ),
+            (
+                "cathedral",
+                [
+                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0,
+                ],
+            ),
+            (
+                "verb-only-hot",
+                [
+                    0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 16000.0, 1.0, 1.0, 0.0, 1.5,
+                ],
+            ),
+            (
+                "bright-damp-max",
+                [
+                    0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 16000.0, 1.0, 1.0, 1.0, 1.5,
+                ],
+            ),
         ];
         for (name, params) in sets {
-            let inst = reg.create_instance("space_echo", 48000.0, &params).expect("inst");
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &params)
+                .expect("inst");
             for _ in 0..4800 {
                 let _ = inst.process_private(rnd() as f32 * 0.3);
             }
             let mut rms = Vec::new();
             for _ in 0..40 {
-                let e: f64 = (0..4800).map(|_| {
-                    let y = inst.process_private(0.0) as f64;
-                    y * y
-                }).sum();
+                let e: f64 = (0..4800)
+                    .map(|_| {
+                        let y = inst.process_private(0.0) as f64;
+                        y * y
+                    })
+                    .sum();
                 rms.push((e / 4800.0).sqrt());
             }
             let head = rms[0].max(1e-12);
-            let ratios: Vec<String> = rms.iter().step_by(4).map(|r| format!("{:.2}", r / head)).collect();
+            let ratios: Vec<String> = rms
+                .iter()
+                .step_by(4)
+                .map(|r| format!("{:.2}", r / head))
+                .collect();
             println!("SUSTAIN {name}: ratios(0.4s steps) {ratios:?}");
             // late-window spectrum 1.6–2.6 s in: dominant peaks over local floor
             for _ in 0..28800 {
                 let _ = inst.process_private(0.0);
             }
-            let late: Vec<f64> = (0..48000).map(|_| inst.process_private(0.0) as f64).collect();
+            let late: Vec<f64> = (0..48000)
+                .map(|_| inst.process_private(0.0) as f64)
+                .collect();
             let mags = window_mags(&late);
             let mm: Vec<f64> = mags.iter().map(|m| m.1).collect();
-            let smooth: Vec<f64> = (0..mm.len()).map(|i| {
-                let lo = i.saturating_sub(3);
-                let hi = (i + 4).min(mm.len());
-                mm[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
-            }).collect();
+            let smooth: Vec<f64> = (0..mm.len())
+                .map(|i| {
+                    let lo = i.saturating_sub(3);
+                    let hi = (i + 4).min(mm.len());
+                    mm[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+                })
+                .collect();
             let mut peaks: Vec<(f64, f64)> = (1..mm.len() - 1)
                 .filter(|&i| mm[i] > mm[i - 1] && mm[i] >= mm[i + 1])
                 .map(|i| (mags[i].0, mm[i] / smooth[i].max(1e-30)))
                 .collect();
             peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let top: Vec<String> = peaks.iter().take(6).map(|(f, c)| format!("{f:.0}Hz x{c:.1}")).collect();
+            let top: Vec<String> = peaks
+                .iter()
+                .take(6)
+                .map(|(f, c)| format!("{f:.0}Hz x{c:.1}"))
+                .collect();
             let late_peak = late.iter().fold(0.0f64, |m, v| m.max(v.abs()));
             println!("LATE {name}: peak={late_peak:.2e} top-peaks {top:?}");
             drop(inst);
@@ -1630,12 +1910,18 @@ mod tests {
         // (b) tone sensitivity: echo tail hi/lo energy vs tone param.
         for tone in [200.0f32, 3600.0, 16000.0] {
             let inst = reg
-                .create_instance("space_echo", 48000.0, &[0.25, 0.9, tone, 0.0, 0.05, 0.5, 8000.0, 1.0, 1.0, 1.0, 0.0])
+                .create_instance(
+                    "space_echo",
+                    48000.0,
+                    &[0.25, 0.9, tone, 0.0, 0.05, 0.5, 8000.0, 1.0, 1.0, 1.0, 0.0],
+                )
                 .expect("inst");
             for _ in 0..2400 {
                 let _ = inst.process_private(rnd() as f32 * 0.5);
             }
-            let tail: Vec<f64> = (0..48000).map(|_| inst.process_private(0.0) as f64).collect();
+            let tail: Vec<f64> = (0..48000)
+                .map(|_| inst.process_private(0.0) as f64)
+                .collect();
             let mags = window_mags(&tail);
             let mean = |lo: usize, hi: usize| -> f64 {
                 mags[lo..hi].iter().map(|m| m.1).sum::<f64>() / (hi - lo) as f64
@@ -1671,13 +1957,35 @@ mod tests {
             (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).max(0.0).sqrt()
         };
         let sets: [(&str, [f32; 11]); 4] = [
-            ("user-opera", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0]),
-            ("opera-no-wob", [0.2, 0.42, 3800.0, 0.0, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0]),
-            ("opera-no-verb", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 0.0]),
-            ("opera-no-echo", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.0, 1.0]),
+            (
+                "user-opera",
+                [
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0,
+                ],
+            ),
+            (
+                "opera-no-wob",
+                [
+                    0.2, 0.42, 3800.0, 0.0, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0,
+                ],
+            ),
+            (
+                "opera-no-verb",
+                [
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 0.0,
+                ],
+            ),
+            (
+                "opera-no-echo",
+                [
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.0, 1.0,
+                ],
+            ),
         ];
         for (name, params) in sets {
-            let inst = reg.create_instance("space_echo", 48000.0, &params).expect("inst");
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &params)
+                .expect("inst");
             for i in 0..144000u64 {
                 let x = (core::f64::consts::TAU * 1000.0 * i as f64 / 48000.0).sin() * 0.4;
                 let _ = inst.process_private(x as f32);
@@ -1737,7 +2045,9 @@ mod tests {
             reg.create_instance(
                 "space_echo",
                 48000.0,
-                &[0.25, 0.5, 8000.0, 0.0, 0.05, 0.9, 8000.0, 1.0, 1.0, echo, verb],
+                &[
+                    0.25, 0.5, 8000.0, 0.0, 0.05, 0.9, 8000.0, 1.0, 1.0, echo, verb,
+                ],
             )
             .expect("echo instance")
         };
@@ -1746,12 +2056,21 @@ mod tests {
             // Samples 2800..11900: after the FDN fills (the diffuser chain's
             // group delay puts the first verb sample around 2700) and before
             // the first echo tap (0.25 s = 12000 samples).
-            (0..11900).skip(2800).map(|_| inst.process_private(0.0).abs()).sum()
+            (0..11900)
+                .skip(2800)
+                .map(|_| inst.process_private(0.0).abs())
+                .sum()
         };
         let echo_only = window_sum(&mk(1.0, 0.0));
         let verb_only = window_sum(&mk(0.0, 1.0));
-        assert!(echo_only < 1e-6, "echo-only must be silent before the first tap (sum {echo_only})");
-        assert!(verb_only > 1e-3, "verb-only must fill the pre-echo window (sum {verb_only})");
+        assert!(
+            echo_only < 1e-6,
+            "echo-only must be silent before the first tap (sum {echo_only})"
+        );
+        assert!(
+            verb_only > 1e-3,
+            "verb-only must fill the pre-echo window (sum {verb_only})"
+        );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1779,13 +2098,22 @@ mod tests {
             vals.extend_from_slice(&flat_off);
         }
         vals.extend_from_slice(&[1.0, 1.0]); // mix, out
-        // 1) defaults-equivalent cascade + impulse: finite, near pass-through.
-        let inst = reg.create_instance("parametric_eq", 48000.0, &vals).expect("eq");
+                                             // 1) defaults-equivalent cascade + impulse: finite, near pass-through.
+        let inst = reg
+            .create_instance("parametric_eq", 48000.0, &vals)
+            .expect("eq");
         // impulse + settle, then a sine; the pass-through must keep the
         // impulse energy at ~1 head, dead-silent tail, and unity sine gain.
-        let head: f32 = (0..240).map(|_| inst.process_private(1.0).abs()).fold(0.0, f32::max);
-        let tail: f32 = (0..4560).map(|_| inst.process_private(0.0).abs()).fold(0.0, f32::max);
-        assert!(head > 0.5 && tail < 0.05, "flat EQ impulse head {head} tail {tail}");
+        let head: f32 = (0..240)
+            .map(|_| inst.process_private(1.0).abs())
+            .fold(0.0, f32::max);
+        let tail: f32 = (0..4560)
+            .map(|_| inst.process_private(0.0).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            head > 0.5 && tail < 0.05,
+            "flat EQ impulse head {head} tail {tail}"
+        );
         let out: Vec<f32> = (0..48000)
             .map(|i| {
                 let x = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin() * 0.3;
@@ -1794,12 +2122,17 @@ mod tests {
             .collect();
         assert!(out.iter().all(|y| y.is_finite()), "non-finite EQ output");
         let peak = out.iter().fold(0.0f32, |a, y| a.max(y.abs()));
-        assert!((0.25..0.5).contains(&peak), "flat EQ must pass ~unity, peak {peak}");
+        assert!(
+            (0.25..0.5).contains(&peak),
+            "flat EQ must pass ~unity, peak {peak}"
+        );
         // 2) a +6 dB peaking band at 1 kHz must lift a 1 kHz sine by ~2×.
         let mut vals = vals.clone();
         vals[0] = 3.0; // peaking
         vals[2] = 6.0; // +6 dB
-        let inst = reg.create_instance("parametric_eq", 48000.0, &vals).unwrap();
+        let inst = reg
+            .create_instance("parametric_eq", 48000.0, &vals)
+            .unwrap();
         let mut sum = 0.0f64;
         let mut n = 0.0f64;
         for i in 0..48000u64 {
@@ -1813,7 +2146,10 @@ mod tests {
         }
         let rms = (sum / n).sqrt() as f32;
         let want = 0.707 * 10.0f32.powf(6.0 / 20.0); // sine RMS × gain
-        assert!((rms / want - 1.0).abs() < 0.04, "peaking +6 dB: rms {rms}, expected ~{want}");
+        assert!(
+            (rms / want - 1.0).abs() < 0.04,
+            "peaking +6 dB: rms {rms}, expected ~{want}"
+        );
         // 3) high-Q/high-gain shelves: impulse must DIE AWAY, not ring forever.
         let mut vals = vals.clone();
         vals[0] = 1.0; // low shelf
@@ -1822,14 +2158,23 @@ mod tests {
         vals[20] = 2.0; // high shelf
         vals[22] = 24.0;
         vals[23] = 8.0;
-        let inst = reg.create_instance("parametric_eq", 48000.0, &vals).unwrap();
+        let inst = reg
+            .create_instance("parametric_eq", 48000.0, &vals)
+            .unwrap();
         // A resonant shelf peaks ~tens of ms after the impulse (band build-up
         // + coefficient glide); the OLD clamped-alpha shelf kept ringing
         // forever instead. Head = first 100 ms, tail = the next 2.5 s.
-        let head: f32 = (0..4800).map(|_| inst.process_private(1.0).abs()).fold(0.0, f32::max);
-        let tail: f32 = (0..120000).map(|_| inst.process_private(0.0).abs()).fold(0.0, f32::max);
+        let head: f32 = (0..4800)
+            .map(|_| inst.process_private(1.0).abs())
+            .fold(0.0, f32::max);
+        let tail: f32 = (0..120000)
+            .map(|_| inst.process_private(0.0).abs())
+            .fold(0.0, f32::max);
         assert!(head > 1.0, "resonant shelf produced no response: {head}");
-        assert!(tail < head * 0.01, "shelf ringing forever: tail {tail} vs head {head}");
+        assert!(
+            tail < head * 0.01,
+            "shelf ringing forever: tail {tail} vs head {head}"
+        );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1838,31 +2183,49 @@ mod tests {
     fn sanitize_keeps_crate_names_legal() {
         assert_eq!(sanitize_crate_name("my-effect 2"), "fx_my_effect_2");
         assert_eq!(sanitize_crate_name("api"), "fx_api");
-        assert!(sanitize_crate_name("").chars().all(|c| c == '_' || c.is_alphanumeric()));
+        assert!(sanitize_crate_name("")
+            .chars()
+            .all(|c| c == '_' || c.is_alphanumeric()));
     }
 
     #[test]
     fn merge_and_resort_rules() {
-        let stems: Vec<String> = ["clean", "fuzz", "trem"].iter().map(|s| s.to_string()).collect();
+        let stems: Vec<String> = ["clean", "fuzz", "trem"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // Startup: saved order wins for the enabled block.
-        let saved = vec![("trem".to_string(), vec![0.5]), ("fuzz".to_string(), vec![])];
+        let saved = vec![
+            ("trem".to_string(), vec![0.5]),
+            ("fuzz".to_string(), vec![]),
+        ];
         let mut v = merge_entries(&[], &stems, &saved);
         assert_eq!(
-            v.iter().map(|e| (e.stem.as_str(), e.enabled)).collect::<Vec<_>>(),
+            v.iter()
+                .map(|e| (e.stem.as_str(), e.enabled))
+                .collect::<Vec<_>>(),
             vec![("trem", true), ("fuzz", true), ("clean", false)]
         );
         // Rescan keeps the live order and drops dead scripts.
-        v.push(UiEntry { stem: "gone".into(), enabled: true, params: vec![] });
+        v.push(UiEntry {
+            stem: "gone".into(),
+            enabled: true,
+            params: vec![],
+        });
         let mut v = merge_entries(&v, &stems, &[]);
         assert_eq!(
-            v.iter().map(|e| (e.stem.as_str(), e.enabled)).collect::<Vec<_>>(),
+            v.iter()
+                .map(|e| (e.stem.as_str(), e.enabled))
+                .collect::<Vec<_>>(),
             vec![("trem", true), ("fuzz", true), ("clean", false)]
         );
         // Toggle a disabled one on: snaps to the end of the enabled block.
         v.iter_mut().find(|e| e.stem == "clean").unwrap().enabled = true;
         resort_entries(&mut v, &stems);
         assert_eq!(
-            v.iter().map(|e| (e.stem.as_str(), e.enabled)).collect::<Vec<_>>(),
+            v.iter()
+                .map(|e| (e.stem.as_str(), e.enabled))
+                .collect::<Vec<_>>(),
             vec![("trem", true), ("fuzz", true), ("clean", true)]
         );
         // Disable the head of the chain: it drops to the disabled block,
@@ -1870,7 +2233,9 @@ mod tests {
         v[0].enabled = false;
         resort_entries(&mut v, &stems);
         assert_eq!(
-            v.iter().map(|e| (e.stem.as_str(), e.enabled)).collect::<Vec<_>>(),
+            v.iter()
+                .map(|e| (e.stem.as_str(), e.enabled))
+                .collect::<Vec<_>>(),
             vec![("fuzz", true), ("clean", true), ("trem", false)]
         );
     }
@@ -1879,16 +2244,25 @@ mod tests {
     fn move_enabled_walks_the_chain_order() {
         let mut v: Vec<UiEntry> = ["a", "b", "c", "d"]
             .iter()
-            .map(|s| UiEntry { stem: s.to_string(), enabled: *s != "c", params: vec![] })
+            .map(|s| UiEntry {
+                stem: s.to_string(),
+                enabled: *s != "c",
+                params: vec![],
+            })
             .collect();
         // v order: a(on) b(on) c(off) d(on) — enabled chain is a,b,d.
         assert!(move_enabled(&mut v, 3, true), "d moves up past b");
         assert_eq!(
-            v.iter().map(|e| (e.stem.as_str(), e.enabled)).collect::<Vec<_>>(),
+            v.iter()
+                .map(|e| (e.stem.as_str(), e.enabled))
+                .collect::<Vec<_>>(),
             vec![("a", true), ("d", true), ("c", false), ("b", true)]
         );
         assert!(!move_enabled(&mut v, 0, true), "head cannot go up");
-        assert!(!move_enabled(&mut v, 2, true), "disabled entries never move");
+        assert!(
+            !move_enabled(&mut v, 2, true),
+            "disabled entries never move"
+        );
     }
 
     #[test]
@@ -1898,8 +2272,18 @@ mod tests {
             author: None,
             description: None,
             params: vec![
-                ParamDesc { label: "a".into(), min: 0.0, max: 1.0, default: 0.25 },
-                ParamDesc { label: "b".into(), min: 0.0, max: 2.0, default: 1.0 },
+                ParamDesc {
+                    label: "a".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.25,
+                },
+                ParamDesc {
+                    label: "b".into(),
+                    min: 0.0,
+                    max: 2.0,
+                    default: 1.0,
+                },
             ],
         };
         assert_eq!(seed_values(&[0.9, 1.5, 9.0], &d), vec![0.9, 1.5]);
@@ -1920,11 +2304,18 @@ mod tests {
         std::fs::write(dir.join(TEMPLATE_FILE), TEMPLATE_SRC).unwrap();
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
-        assert_eq!(reg.stems(), vec!["template".to_string()], "errors: {:?}", reg.items().iter().map(|i| &i.error).collect::<Vec<_>>());
+        assert_eq!(
+            reg.stems(),
+            vec!["template".to_string()],
+            "errors: {:?}",
+            reg.items().iter().map(|i| &i.error).collect::<Vec<_>>()
+        );
         let desc = reg.desc("template").unwrap();
         assert_eq!(desc.name, "Template Tremolo");
         assert_eq!(desc.params.len(), 4);
-        let inst = reg.create_instance("template", 48000.0, &[0.0, 4.0, 1.0, 1.0]).expect("create");
+        let inst = reg
+            .create_instance("template", 48000.0, &[0.0, 4.0, 1.0, 1.0])
+            .expect("create");
         let mut p = [0.0f32; MAX_PARAMS];
         inst.read_params(&mut p);
         assert_eq!(p[0], 0.0);
@@ -2005,10 +2396,28 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         let stems = reg.stems();
-        assert!(stems.contains(&"plain".to_string()) && stems.contains(&"guied".to_string()), "{:?}", reg.items().iter().map(|i| (&i.stem, &i.error)).collect::<Vec<_>>());
-        assert!(reg.gui("plain").is_none(), "no GUI symbol must mean auto window");
-        assert!(reg.gui("guied").is_some(), "valid GUI symbol must produce a handle");
-        let err = reg.items().iter().find(|i| i.stem == "badgui").and_then(|i| i.error.clone()).unwrap();
+        assert!(
+            stems.contains(&"plain".to_string()) && stems.contains(&"guied".to_string()),
+            "{:?}",
+            reg.items()
+                .iter()
+                .map(|i| (&i.stem, &i.error))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            reg.gui("plain").is_none(),
+            "no GUI symbol must mean auto window"
+        );
+        assert!(
+            reg.gui("guied").is_some(),
+            "valid GUI symbol must produce a handle"
+        );
+        let err = reg
+            .items()
+            .iter()
+            .find(|i| i.stem == "badgui")
+            .and_then(|i| i.error.clone())
+            .unwrap();
         assert!(err.contains("GUI ABI"), "{err}");
         // Size hint falls back when the effect leaves it at zero.
         drop(reg);
@@ -2025,14 +2434,29 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         reg.rescan();
         // A missing compiler is an environment issue, not a code bug.
         if !rustc_available() {
-            assert!(reg.items().iter().all(|i| i.error.as_deref().unwrap_or("").contains("rustc")));
+            assert!(reg
+                .items()
+                .iter()
+                .all(|i| i.error.as_deref().unwrap_or("").contains("rustc")));
             std::fs::remove_dir_all(&dir).ok();
             return;
         }
         assert_eq!(reg.stems(), vec!["ok".to_string()]);
-        let errs: HashMap<_, _> = reg.items().iter().map(|i| (i.stem.clone(), i.error.clone().unwrap_or_default())).collect();
-        assert!(errs["broken"].contains("compile failed"), "{}", errs["broken"]);
-        assert!(errs["noinfo"].contains("slooper_effect_info"), "{}", errs["noinfo"]);
+        let errs: HashMap<_, _> = reg
+            .items()
+            .iter()
+            .map(|i| (i.stem.clone(), i.error.clone().unwrap_or_default()))
+            .collect();
+        assert!(
+            errs["broken"].contains("compile failed"),
+            "{}",
+            errs["broken"]
+        );
+        assert!(
+            errs["noinfo"].contains("slooper_effect_info"),
+            "{}",
+            errs["noinfo"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2053,8 +2477,12 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         // Cathedral: echo low, verb full, decay 0.95 (worst DC gain).
-        let cath = [0.32f32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0];
-        let inst = reg.create_instance("space_echo", 48000.0, &cath).expect("echo instance");
+        let cath = [
+            0.32f32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0,
+        ];
+        let inst = reg
+            .create_instance("space_echo", 48000.0, &cath)
+            .expect("echo instance");
         let mut out: Vec<f32> = Vec::with_capacity(8 * 48000);
         for s in 0..8 * 48000 {
             let mut x = 0.0f32;
@@ -2111,7 +2539,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         // Brightest shipped flavor: tone 8000, damp 1100, decay 0.9, verb 0.65.
-        let bright = [0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 1100.0, 1.9, 0.65, 0.3, 1.0];
+        let bright = [
+            0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 1100.0, 1.9, 0.65, 0.3, 1.0,
+        ];
         let inst = reg
             .create_instance("space_echo", 48000.0, &bright)
             .expect("bright room instance");
@@ -2141,21 +2571,31 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         }
         let hf_db = |a: usize, b: usize| -> f64 {
             let t = &out[a..b];
-            let e: f64 =
-                t[1..].iter().zip(&t[..t.len() - 1]).map(|(u, v)| (*u as f64 - *v as f64).powi(2)).sum::<f64>()
-                    / (t.len() - 1) as f64;
+            let e: f64 = t[1..]
+                .iter()
+                .zip(&t[..t.len() - 1])
+                .map(|(u, v)| (*u as f64 - *v as f64).powi(2))
+                .sum::<f64>()
+                / (t.len() - 1) as f64;
             10.0 * e.max(1e-18).log10()
         };
         for &h in &hits[1..] {
             // Skip the first snap: the room starts cold there.
             let early = hf_db(h + sr / 100, h + sr * 6 / 100);
             let plateau = hf_db(h + sr * 15 / 100, h + sr * 3 / 10);
-            assert!(early < -73.0, "post-snap fizz 10-60 ms too bright: {early:.1} dBFS");
-            assert!(plateau < -38.5, "snap plateau 150-300 ms too bright: {plateau:.1} dBFS");
+            assert!(
+                early < -73.0,
+                "post-snap fizz 10-60 ms too bright: {early:.1} dBFS"
+            );
+            assert!(
+                plateau < -38.5,
+                "snap plateau 150-300 ms too bright: {plateau:.1} dBFS"
+            );
         }
         // The room must still be ALIVE: broadband tail after the last snap.
         let tail = &out[7 * sr / 2..9 * sr / 2];
-        let rms = (tail.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / tail.len() as f64).sqrt();
+        let rms = (tail.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / tail.len() as f64)
+            .sqrt();
         assert!(rms > 5e-6, "bright room tail vanished: rms {rms:.2e}");
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2178,7 +2618,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let dir = temp_dir("v14tickflutter");
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
-        let fast = [0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 900.0, 1.5, 0.6, 0.35, 1.0];
+        let fast = [
+            0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 900.0, 1.5, 0.6, 0.35, 1.0,
+        ];
         let inst = reg
             .create_instance("space_echo", 48000.0, &fast)
             .expect("fast echo instance");
@@ -2206,16 +2648,25 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         }
         let hf_db = |a: usize, b: usize| -> f64 {
             let t = &out[a..b];
-            let e: f64 =
-                t[1..].iter().zip(&t[..t.len() - 1]).map(|(u, v)| (*u as f64 - *v as f64).powi(2)).sum::<f64>()
-                    / (t.len() - 1) as f64;
+            let e: f64 = t[1..]
+                .iter()
+                .zip(&t[..t.len() - 1])
+                .map(|(u, v)| (*u as f64 - *v as f64).powi(2))
+                .sum::<f64>()
+                / (t.len() - 1) as f64;
             10.0 * e.max(1e-18).log10()
         };
         let h0 = hits[1];
         let w1 = hf_db(h0 + 3 * sr / 10, h0 + 6 * sr / 10);
         let w2 = hf_db(h0 + 6 * sr / 10, h0 + 16 * sr / 10);
-        assert!(w1 < -44.0, "post-snap flutter window 1 too bright: {w1:.1} dBFS");
-        assert!(w2 < -62.0, "post-snap flutter window 2 too bright: {w2:.1} dBFS");
+        assert!(
+            w1 < -44.0,
+            "post-snap flutter window 1 too bright: {w1:.1} dBFS"
+        );
+        assert!(
+            w2 < -62.0,
+            "post-snap flutter window 2 too bright: {w2:.1} dBFS"
+        );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2227,7 +2678,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         std::fs::create_dir_all(&dir).unwrap();
         let d = ensure_user_presets_dir(&dir).unwrap();
         assert!(d.is_dir());
-        assert_eq!(d.file_name().unwrap(), std::ffi::OsStr::new(USER_PRESET_DIR));
+        assert_eq!(
+            d.file_name().unwrap(),
+            std::ffi::OsStr::new(USER_PRESET_DIR)
+        );
         // Ownership by prefix: only `{stem}-*.json` files belong to a plugin.
         std::fs::write(d.join("space_echo-Warm Room.json"), "{}").unwrap();
         std::fs::write(d.join("space_echo-Cathedral Big.json"), "{}").unwrap();
@@ -2235,7 +2689,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         std::fs::write(d.join("space_echo-notes.txt"), "").unwrap();
         std::fs::write(d.join("unowned.json"), "").unwrap();
         std::fs::write(d.join("space_echo-X.json"), "{}").unwrap();
-        assert_eq!(list_user_presets(&dir, "space_echo"), vec!["Cathedral Big", "Warm Room", "X"]);
+        assert_eq!(
+            list_user_presets(&dir, "space_echo"),
+            vec!["Cathedral Big", "Warm Room", "X"]
+        );
         assert_eq!(list_user_presets(&dir, "parametric_eq"), vec!["Warm Room"]);
         assert_eq!(list_user_presets(&dir, "nope"), Vec::<String>::new());
 
@@ -2266,7 +2723,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
 
         // Delete, and idempotent delete of a gone file.
         delete_user_preset(&dir, "space_echo", "Warm Room").unwrap();
-        assert_eq!(list_user_presets(&dir, "space_echo"), vec!["Cathedral Big", "X"]);
+        assert_eq!(
+            list_user_presets(&dir, "space_echo"),
+            vec!["Cathedral Big", "X"]
+        );
         delete_user_preset(&dir, "space_echo", "Warm Room").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2279,8 +2739,14 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     fn v10_eq_ships_default_presets() {
         let defs = builtin_presets("parametric_eq");
         let names: Vec<&str> = defs.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"Radio filter"), "radio filter preset missing: {names:?}");
-        assert!(names.contains(&"Concert hall"), "concert hall preset missing: {names:?}");
+        assert!(
+            names.contains(&"Radio filter"),
+            "radio filter preset missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"Concert hall"),
+            "concert hall preset missing: {names:?}"
+        );
         assert!(defs.len() >= 5, "a decent starter set: {names:?}");
         for (name, pairs) in &defs {
             assert!(!pairs.is_empty(), "{name}: empty param list");
@@ -2316,7 +2782,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let desc = reg.desc("parametric_eq").expect("desc").clone();
 
         let measure = |apply: bool, freq: f32| -> f32 {
-            let inst = reg.create_instance("parametric_eq", 48_000.0, &[]).expect("eq");
+            let inst = reg
+                .create_instance("parametric_eq", 48_000.0, &[])
+                .expect("eq");
             if apply {
                 let (_, pairs) = builtin_presets("parametric_eq")
                     .into_iter()
@@ -2324,8 +2792,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                     .unwrap();
                 // Exactly the fxgui label lookup (clamped, unknown skipped).
                 for (label, v) in &pairs {
-                    if let Some((k, p)) =
-                        desc.params.iter().enumerate().find(|(_, p)| p.label == *label)
+                    if let Some((k, p)) = desc
+                        .params
+                        .iter()
+                        .enumerate()
+                        .find(|(_, p)| p.label == *label)
                     {
                         inst.set_param(k, v.clamp(p.min, p.max));
                     }
@@ -2353,7 +2824,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             radio_lo < flat_lo / 4.0,
             "radio filter must gut 100 Hz: flat {flat_lo} vs {radio_lo}"
         );
-        assert!(radio_hi > radio_lo * 4.0, "…while keeping presence band (got {radio_hi})");
+        assert!(
+            radio_hi > radio_lo * 4.0,
+            "…while keeping presence band (got {radio_hi})"
+        );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2372,49 +2846,86 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         std::env::set_var("SLOOPER_EFFECTS_DIR", &dir);
         let dir = prepare_effects_dir(None);
         let names = list_user_presets(&dir, "parametric_eq");
-        for want in
-            ["Radio filter", "Concert hall", "Podcast voice", "Bass boost", "Lo-fi tape", "Treble sparkle"]
-        {
-            assert!(names.iter().any(|n| n == want), "factory '{want}' not in the preset list: {names:?}");
+        for want in [
+            "Radio filter",
+            "Concert hall",
+            "Podcast voice",
+            "Bass boost",
+            "Lo-fi tape",
+            "Treble sparkle",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "factory '{want}' not in the preset list: {names:?}"
+            );
         }
-        assert_eq!(list_user_presets(&dir, "space_echo").len(), 5, "five rooms listed");
+        assert_eq!(
+            list_user_presets(&dir, "space_echo").len(),
+            5,
+            "five rooms listed"
+        );
         // AC1.2: a seeded file is real, parseable, and loads through the
         // ordinary user-preset loader path.
         let p = user_preset_path(&dir, "parametric_eq", "Podcast voice");
         let parsed = preset_from_json(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(parsed.len(), 26, "one value per EQ param");
-        assert!(parsed.iter().any(|(l, v)| l == "B3 gain" && (*v - 3.0).abs() < 1e-6));
+        assert!(parsed
+            .iter()
+            .any(|(l, v)| l == "B3 gain" && (*v - 3.0).abs() < 1e-6));
         // A user preset saved under a NEW name joins the same list.
-        std::fs::write(user_preset_path(&dir, "parametric_eq", "My thing"), "{\"params\":{\"mix\":0.5}}")
-            .unwrap();
+        std::fs::write(
+            user_preset_path(&dir, "parametric_eq", "My thing"),
+            "{\"params\":{\"mix\":0.5}}",
+        )
+        .unwrap();
         let after = list_user_presets(&dir, "parametric_eq");
-        assert!(after.contains(&"My thing".to_string()) && after.contains(&"Bass boost".to_string()));
+        assert!(
+            after.contains(&"My thing".to_string()) && after.contains(&"Bass boost".to_string())
+        );
 
         // AC1.5 ownership: after the one-time seed NOTHING is rewritten and
         // NOTHING is re-added — user edits and deletions are permanent…
         std::fs::write(&p, "{\"params\":{\"mix\":0.25}}").unwrap();
         delete_user_preset(&dir, "parametric_eq", "Bass boost").unwrap();
-        assert_eq!(seed_builtin_presets(&dir), 0, "seeded folder is never re-touched");
+        assert_eq!(
+            seed_builtin_presets(&dir),
+            0,
+            "seeded folder is never re-touched"
+        );
         assert_eq!(prepare_effects_dir(None), dir, "launch path is idempotent");
         std::env::remove_var("SLOOPER_EFFECTS_DIR");
-        assert!(std::fs::read_to_string(&p).unwrap().contains("0.25"), "user edit was rewritten");
+        assert!(
+            std::fs::read_to_string(&p).unwrap().contains("0.25"),
+            "user edit was rewritten"
+        );
         assert!(!list_user_presets(&dir, "parametric_eq").contains(&"Bass boost".to_string()));
         // …while a brand-new folder (no marker) does get the starter set,
         // and an existing hand-written file under a factory name survives.
         let dir2 = temp_dir("v13seedpresets2");
         std::fs::create_dir_all(user_presets_dir(&dir2)).unwrap();
-        std::fs::write(user_preset_path(&dir2, "parametric_eq", "Bass boost"), "{\"params\":{\"mix\":0.7}}")
-            .unwrap();
-        assert_eq!(seed_builtin_presets(&dir2), 10, "11 factory presets minus the hand-written one");
+        std::fs::write(
+            user_preset_path(&dir2, "parametric_eq", "Bass boost"),
+            "{\"params\":{\"mix\":0.7}}",
+        )
+        .unwrap();
         assert_eq!(
-            std::fs::read_to_string(user_preset_path(&dir2, "parametric_eq", "Bass boost")).unwrap(),
+            seed_builtin_presets(&dir2),
+            10,
+            "11 factory presets minus the hand-written one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user_preset_path(&dir2, "parametric_eq", "Bass boost"))
+                .unwrap(),
             "{\"params\":{\"mix\":0.7}}",
             "a hand-made file under a factory name must never be overwritten"
         );
         // A foreign file in the folder is never touched either.
         std::fs::write(user_presets_dir(&dir).join("other-thing.json"), "x").unwrap();
         seed_builtin_presets(&dir);
-        assert_eq!(std::fs::read_to_string(user_presets_dir(&dir).join("other-thing.json")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(user_presets_dir(&dir).join("other-thing.json")).unwrap(),
+            "x"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }

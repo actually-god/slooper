@@ -24,20 +24,59 @@ pub const PACK_DIRNAME: &str = "808";
 
 /// Every pack file: (file name, embedded 16-bit / 44.1 kHz / mono WAV).
 pub const FILES: &[(&str, &[u8])] = &[
-    ("808-kick.wav", include_bytes!("../samples/808/808-kick.wav")),
+    (
+        "808-kick.wav",
+        include_bytes!("../samples/808/808-kick.wav"),
+    ),
     ("808-sub.wav", include_bytes!("../samples/808/808-sub.wav")),
-    ("808-snare.wav", include_bytes!("../samples/808/808-snare.wav")),
-    ("808-snare-long.wav", include_bytes!("../samples/808/808-snare-long.wav")),
-    ("808-clap.wav", include_bytes!("../samples/808/808-clap.wav")),
-    ("808-hat-closed.wav", include_bytes!("../samples/808/808-hat-closed.wav")),
-    ("808-hat-open.wav", include_bytes!("../samples/808/808-hat-open.wav")),
-    ("808-crash.wav", include_bytes!("../samples/808/808-crash.wav")),
-    ("808-cowbell.wav", include_bytes!("../samples/808/808-cowbell.wav")),
-    ("808-tom-low.wav", include_bytes!("../samples/808/808-tom-low.wav")),
-    ("808-tom-mid.wav", include_bytes!("../samples/808/808-tom-mid.wav")),
-    ("808-tom-high.wav", include_bytes!("../samples/808/808-tom-high.wav")),
-    ("808-rimshot.wav", include_bytes!("../samples/808/808-rimshot.wav")),
-    ("808-clave.wav", include_bytes!("../samples/808/808-clave.wav")),
+    (
+        "808-snare.wav",
+        include_bytes!("../samples/808/808-snare.wav"),
+    ),
+    (
+        "808-snare-long.wav",
+        include_bytes!("../samples/808/808-snare-long.wav"),
+    ),
+    (
+        "808-clap.wav",
+        include_bytes!("../samples/808/808-clap.wav"),
+    ),
+    (
+        "808-hat-closed.wav",
+        include_bytes!("../samples/808/808-hat-closed.wav"),
+    ),
+    (
+        "808-hat-open.wav",
+        include_bytes!("../samples/808/808-hat-open.wav"),
+    ),
+    (
+        "808-crash.wav",
+        include_bytes!("../samples/808/808-crash.wav"),
+    ),
+    (
+        "808-cowbell.wav",
+        include_bytes!("../samples/808/808-cowbell.wav"),
+    ),
+    (
+        "808-tom-low.wav",
+        include_bytes!("../samples/808/808-tom-low.wav"),
+    ),
+    (
+        "808-tom-mid.wav",
+        include_bytes!("../samples/808/808-tom-mid.wav"),
+    ),
+    (
+        "808-tom-high.wav",
+        include_bytes!("../samples/808/808-tom-high.wav"),
+    ),
+    (
+        "808-rimshot.wav",
+        include_bytes!("../samples/808/808-rimshot.wav"),
+    ),
+    (
+        "808-clave.wav",
+        include_bytes!("../samples/808/808-clave.wav"),
+    ),
 ];
 
 /// `$XDG_DATA_HOME/slooper` (default `~/.local/share/slooper`).

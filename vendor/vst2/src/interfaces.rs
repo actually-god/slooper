@@ -33,8 +33,15 @@ pub extern "C" fn process_replacing(
     let plugin = unsafe { (*effect).get_plugin() };
     let info = unsafe { (*effect).get_info() };
     let (input_count, output_count) = (info.inputs as usize, info.outputs as usize);
-    let mut buffer =
-        unsafe { AudioBuffer::from_raw(input_count, output_count, raw_inputs, raw_outputs, samples as usize) };
+    let mut buffer = unsafe {
+        AudioBuffer::from_raw(
+            input_count,
+            output_count,
+            raw_inputs,
+            raw_outputs,
+            samples as usize,
+        )
+    };
     plugin.process(&mut buffer);
 }
 
@@ -48,8 +55,15 @@ pub extern "C" fn process_replacing_f64(
     let plugin = unsafe { (*effect).get_plugin() };
     let info = unsafe { (*effect).get_info() };
     let (input_count, output_count) = (info.inputs as usize, info.outputs as usize);
-    let mut buffer =
-        unsafe { AudioBuffer::from_raw(input_count, output_count, raw_inputs, raw_outputs, samples as usize) };
+    let mut buffer = unsafe {
+        AudioBuffer::from_raw(
+            input_count,
+            output_count,
+            raw_inputs,
+            raw_outputs,
+            samples as usize,
+        )
+    };
     plugin.process_f64(&mut buffer);
 }
 
@@ -73,7 +87,11 @@ fn copy_string(dst: *mut c_void, src: &str, max: usize) -> isize {
 
         let dst = dst as *mut c_void;
         memset(dst, 0, max);
-        memcpy(dst, src.as_ptr() as *const c_void, min(max, src.as_bytes().len()));
+        memcpy(
+            dst,
+            src.as_ptr() as *const c_void,
+            min(max, src.as_bytes().len()),
+        );
     }
 
     1 // Success
@@ -119,7 +137,9 @@ pub extern "C" fn dispatch(
         Ok(OpCode::GetParameterDisplay) => {
             return copy_string(ptr, &params.get_parameter_text(index), MAX_PARAM_STR_LEN)
         }
-        Ok(OpCode::GetParameterName) => return copy_string(ptr, &params.get_parameter_name(index), MAX_PARAM_STR_LEN),
+        Ok(OpCode::GetParameterName) => {
+            return copy_string(ptr, &params.get_parameter_name(index), MAX_PARAM_STR_LEN)
+        }
 
         Ok(OpCode::SetSampleRate) => get_plugin().set_sample_rate(opt),
         Ok(OpCode::SetBlockSize) => get_plugin().set_block_size(value as i64),
@@ -202,9 +222,13 @@ pub extern "C" fn dispatch(
             get_plugin().process_events(unsafe { &*(ptr as *const api::Events) });
         }
         Ok(OpCode::CanBeAutomated) => return params.can_be_automated(index) as isize,
-        Ok(OpCode::StringToParameter) => return params.string_to_parameter(index, read_string(ptr)) as isize,
+        Ok(OpCode::StringToParameter) => {
+            return params.string_to_parameter(index, read_string(ptr)) as isize
+        }
 
-        Ok(OpCode::GetPresetName) => return copy_string(ptr, &params.get_preset_name(index), MAX_PRESET_NAME_LEN),
+        Ok(OpCode::GetPresetName) => {
+            return copy_string(ptr, &params.get_preset_name(index), MAX_PRESET_NAME_LEN)
+        }
 
         Ok(OpCode::GetInputInfo) => {
             if index >= 0 && index < get_plugin().get_info().inputs {
@@ -226,10 +250,16 @@ pub extern "C" fn dispatch(
             return get_plugin().get_info().category.into();
         }
 
-        Ok(OpCode::GetEffectName) => return copy_string(ptr, &get_plugin().get_info().name, MAX_VENDOR_STR_LEN),
+        Ok(OpCode::GetEffectName) => {
+            return copy_string(ptr, &get_plugin().get_info().name, MAX_VENDOR_STR_LEN)
+        }
 
-        Ok(OpCode::GetVendorName) => return copy_string(ptr, &get_plugin().get_info().vendor, MAX_VENDOR_STR_LEN),
-        Ok(OpCode::GetProductName) => return copy_string(ptr, &get_plugin().get_info().name, MAX_PRODUCT_STR_LEN),
+        Ok(OpCode::GetVendorName) => {
+            return copy_string(ptr, &get_plugin().get_info().vendor, MAX_VENDOR_STR_LEN)
+        }
+        Ok(OpCode::GetProductName) => {
+            return copy_string(ptr, &get_plugin().get_info().name, MAX_PRODUCT_STR_LEN)
+        }
         Ok(OpCode::GetVendorVersion) => return get_plugin().get_info().version as isize,
         Ok(OpCode::VendorSpecific) => return get_plugin().vendor_specific(index, value, ptr, opt),
         Ok(OpCode::CanDo) => {
@@ -280,8 +310,12 @@ pub extern "C" fn dispatch(
         Ok(OpCode::StartProcess) => get_plugin().start_process(),
         Ok(OpCode::StopProcess) => get_plugin().stop_process(),
 
-        Ok(OpCode::GetNumMidiInputs) => return unsafe { (*effect).get_info() }.midi_inputs as isize,
-        Ok(OpCode::GetNumMidiOutputs) => return unsafe { (*effect).get_info() }.midi_outputs as isize,
+        Ok(OpCode::GetNumMidiInputs) => {
+            return unsafe { (*effect).get_info() }.midi_inputs as isize
+        }
+        Ok(OpCode::GetNumMidiOutputs) => {
+            return unsafe { (*effect).get_info() }.midi_outputs as isize
+        }
 
         _ => {
             debug!("Unimplemented opcode ({:?})", opcode);
@@ -324,8 +358,12 @@ pub fn host_dispatch(
         }
 
         Ok(OpCode::GetVendorVersion) => return host.get_info().0,
-        Ok(OpCode::GetVendorString) => return copy_string(ptr, &host.get_info().1, MAX_VENDOR_STR_LEN),
-        Ok(OpCode::GetProductString) => return copy_string(ptr, &host.get_info().2, MAX_PRODUCT_STR_LEN),
+        Ok(OpCode::GetVendorString) => {
+            return copy_string(ptr, &host.get_info().1, MAX_VENDOR_STR_LEN)
+        }
+        Ok(OpCode::GetProductString) => {
+            return copy_string(ptr, &host.get_info().2, MAX_PRODUCT_STR_LEN)
+        }
         Ok(OpCode::ProcessEvents) => {
             host.process_events(unsafe { &*(ptr as *const api::Events) });
         }

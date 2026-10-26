@@ -12,10 +12,15 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(6);
     let only = std::env::var("PUMP_ONLY").unwrap_or_default();
-    let name = std::env::var("PUMP_NAME").unwrap_or_default().to_lowercase();
+    let name = std::env::var("PUMP_NAME")
+        .unwrap_or_default()
+        .to_lowercase();
     let found = scan(&default_vst_dirs());
-    let pick =
-        |k: VstKind| found.iter().find(|e| e.kind == k && (name.is_empty() || e.name.to_lowercase().contains(&name)));
+    let pick = |k: VstKind| {
+        found
+            .iter()
+            .find(|e| e.kind == k && (name.is_empty() || e.name.to_lowercase().contains(&name)))
+    };
 
     if !only.contains("v3") {
         if let Some(e) = pick(VstKind::V2) {

@@ -49,7 +49,15 @@ pub struct Clip {
 impl Clip {
     /// New untrimmed clip.
     pub fn new(asset: u32, pos: u64) -> Self {
-        Clip { asset, pos, cut: 0, play_len: None, gain: 1.0, fade_in: 0, fade_out: 0 }
+        Clip {
+            asset,
+            pos,
+            cut: 0,
+            play_len: None,
+            gain: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+        }
     }
     /// Samples of playable source left after `cut`.
     pub fn avail(&self, alen: u64) -> u64 {
@@ -78,7 +86,11 @@ impl Clip {
         if at <= self.pos || at >= self.end(alen) {
             return None;
         }
-        let left = Clip { play_len: Some(at - self.pos), fade_out: 0, ..*self };
+        let left = Clip {
+            play_len: Some(at - self.pos),
+            fade_out: 0,
+            ..*self
+        };
         let right = Clip {
             pos: at,
             cut: self.cut + (at - self.pos),
@@ -135,7 +147,9 @@ pub struct Track {
 
 impl Default for Track {
     fn default() -> Self {
-        Track { lanes: vec![Lane::default()] }
+        Track {
+            lanes: vec![Lane::default()],
+        }
     }
 }
 
@@ -170,7 +184,9 @@ impl Default for Arrangement {
 
 impl Arrangement {
     pub fn new() -> Self {
-        Arrangement { tracks: (0..MAX_LOOPS).map(|_| Track::default()).collect() }
+        Arrangement {
+            tracks: (0..MAX_LOOPS).map(|_| Track::default()).collect(),
+        }
     }
 
     /// Remove every clip and child lane from a track (back to one empty lane).
@@ -226,7 +242,13 @@ impl Arrangement {
         let pick = if !tr.lanes[0].occupied(pos, len) {
             0
         } else {
-            match tr.lanes.iter().enumerate().skip(1).find(|(_, l)| !l.occupied(pos, len)) {
+            match tr
+                .lanes
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, l)| !l.occupied(pos, len))
+            {
                 Some((k, _)) => k,
                 None => tr.add_lane(),
             }
@@ -300,7 +322,9 @@ impl Arrangement {
 
     /// True when any lane of any track holds a clip.
     pub fn is_empty(&self) -> bool {
-        self.tracks.iter().all(|t| t.lanes.iter().all(|l| l.clips.is_empty()))
+        self.tracks
+            .iter()
+            .all(|t| t.lanes.iter().all(|l| l.clips.is_empty()))
     }
 }
 
@@ -317,7 +341,10 @@ mod tests {
     fn fresh_arrangement() {
         let a = Arrangement::new();
         assert_eq!(a.tracks.len(), MAX_LOOPS);
-        assert!(a.tracks.iter().all(|t| t.lanes.len() == 1 && t.lanes[0].clips.is_empty()));
+        assert!(a
+            .tracks
+            .iter()
+            .all(|t| t.lanes.len() == 1 && t.lanes[0].clips.is_empty()));
         assert!(a.is_empty());
     }
 
@@ -410,7 +437,13 @@ mod tests {
         // A 1000-sample clip cut 100, split at 400: halves tile exactly,
         // the right half continues the source at the matching offset, and
         // play_len/None propagate.
-        let cl = Clip { asset: 3, pos: 1000, cut: 100, play_len: Some(1000), ..Clip::new(3, 1000) };
+        let cl = Clip {
+            asset: 3,
+            pos: 1000,
+            cut: 100,
+            play_len: Some(1000),
+            ..Clip::new(3, 1000)
+        };
         let alen = 5000;
         let (l, r) = cl.split_at(1400, alen).expect("inside");
         assert_eq!((l.pos, l.cut, l.play_len), (1000, 100, Some(400)));
@@ -418,7 +451,13 @@ mod tests {
         assert_eq!(l.end(alen) + r.span(alen), cl.end(alen)); // tile exactly
         assert_eq!(l.span(alen) + r.span(alen), cl.span(alen));
         // play_len None -> right None too (rest of source).
-        let cl2 = Clip { asset: 0, pos: 0, cut: 0, play_len: None, ..Clip::new(0, 0) };
+        let cl2 = Clip {
+            asset: 0,
+            pos: 0,
+            cut: 0,
+            play_len: None,
+            ..Clip::new(0, 0)
+        };
         let (_, r2) = cl2.split_at(200, 5000).unwrap();
         assert_eq!(r2.play_len, None);
         assert_eq!(r2.cut, 200);
@@ -449,12 +488,20 @@ mod tests {
         assert_eq!(cl.fade_at(1100, alen), 1.0); // after the ramp: unity
         assert!((cl.fade_at(1900, alen) - 0.5).abs() < 1e-6); // fade-out mid
         assert!((cl.fade_at(1999, alen) - 0.005).abs() < 1e-6); // ~0 at end
-        // Oversized fades clamp to half the span so they never cross.
-        let big = Clip { fade_in: 9999, fade_out: 9999, ..cl };
+                                                                // Oversized fades clamp to half the span so they never cross.
+        let big = Clip {
+            fade_in: 9999,
+            fade_out: 9999,
+            ..cl
+        };
         assert!((big.fade_at(1500, alen) - 1.0).abs() < 1e-9);
         assert!(big.fade_at(1499, alen) < 1.0 && big.fade_at(1501, alen) < 1.0);
         // No fades: unity everywhere inside.
-        let flat = Clip { fade_in: 0, fade_out: 0, ..cl };
+        let flat = Clip {
+            fade_in: 0,
+            fade_out: 0,
+            ..cl
+        };
         assert_eq!(flat.fade_at(1000, alen), 1.0);
         assert_eq!(flat.fade_at(1999, alen), 1.0);
     }

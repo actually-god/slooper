@@ -113,11 +113,7 @@ extern "C" {
         border: *mut u32,
         depth: *mut u32,
     ) -> c_int;
-    fn XGetWindowAttributes(
-        d: *mut Display,
-        w: XWindow,
-        attrs: *mut XWindowAttributes,
-    ) -> c_int;
+    fn XGetWindowAttributes(d: *mut Display, w: XWindow, attrs: *mut XWindowAttributes) -> c_int;
     fn XSetErrorHandler(
         handler: Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
     ) -> Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
@@ -616,7 +612,9 @@ pub fn pump_editors() {
 enum Phase {
     /// Waiting for the plugin to prove it painted — the per-frame form
     /// of what used to be `editor_main`'s verification loop.
-    Verify { it: u32 },
+    Verify {
+        it: u32,
+    },
     Live {
         last_size: (i32, i32),
         /// Container size last reported by the window manager (R1b).
@@ -742,7 +740,8 @@ impl Editor {
                         self.teardown(false);
                         return;
                     }
-                    self.handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
+                    self.handle
+                        .dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
                     // A child counts as a live editor only when MAPPED
                     // with real geometry: created-and-sized-but-unmapped
                     // children are what a mid-build crash leaves behind,
@@ -754,8 +753,7 @@ impl Editor {
                         .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k));
                     let px = container_painted(self.d, self.win);
                     if self.dbg && (it < 3 || it % 10 == 0) {
-                        let (kid, w, h) =
-                            first_sized_child(self.d, self.win).unwrap_or((0, 0, 0));
+                        let (kid, w, h) = first_sized_child(self.d, self.win).unwrap_or((0, 0, 0));
                         eprintln!(
                             "[vstedit] verify {it}: child=({kid:x} {w}x{h}) px={px} live={child_live}"
                         );
@@ -780,7 +778,10 @@ impl Editor {
                         self.phase = Phase::Verify { it: it + 1 };
                     }
                 }
-                Phase::Live { ref mut last_size, ref mut last_container } => {
+                Phase::Live {
+                    ref mut last_size,
+                    ref mut last_container,
+                } => {
                     // Dispatch X events (close button / window
                     // destruction); bounded per step.
                     let mut resized = None;
@@ -850,7 +851,8 @@ impl Editor {
                     // The plugin's editor event loop runs here — this is
                     // what the fast tick buys: mouse/key/timer service at
                     // ~1/EDITOR_TICK_MS instead of the old 33 Hz.
-                    self.handle.dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
+                    self.handle
+                        .dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
                     // Window-system housekeeping on a timer (v16): child
                     // count for the UI, the dead-editor watchdog, and the
                     // plugin's preferred rect. Healthy editors do not
@@ -919,7 +921,8 @@ impl Editor {
                 EDITORS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
                 {
                     let _loader = crate::vsthost::vst_loader_lock();
-                    self.handle.dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
+                    self.handle
+                        .dispatch(EFF_EDIT_CLOSE, 0, 0, ptr::null_mut(), 0.0);
                 }
                 XDestroySubwindows(self.d, self.win);
                 XDestroyWindow(self.d, self.win);
@@ -1129,9 +1132,7 @@ unsafe fn make_editor3(
     for (id, v) in &initial {
         let _ = plugin.set_parameter(*id, *v);
     }
-    let (w0, h0) = plugin
-        .get_editor_size()
-        .unwrap_or((720, 480));
+    let (w0, h0) = plugin.get_editor_size().unwrap_or((720, 480));
     let (w0, h0) = (w0.clamp(200, 3840), h0.clamp(150, 2160));
     // The container opens at exactly this size — publish it now; the
     // Live phase keeps it honest against the attached view.
@@ -1189,8 +1190,13 @@ impl Editor3 {
                 Phase::Done => {}
                 Phase::Verify { it } => {
                     let mut _resized = None;
-                    if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete, &mut _resized)
-                    {
+                    if drain_events(
+                        self.d,
+                        self.win,
+                        self.wm_protocols,
+                        self.wm_delete,
+                        &mut _resized,
+                    ) {
                         self.teardown(false);
                         return;
                     }
@@ -1202,8 +1208,7 @@ impl Editor3 {
                         .is_some_and(|(k, w, h)| w >= 8 && h >= 8 && is_viewable(self.d, k));
                     let px = container_painted(self.d, self.win);
                     if self.dbg && (it < 3 || it % 10 == 0) {
-                        let (kid, w, h) =
-                            first_sized_child(self.d, self.win).unwrap_or((0, 0, 0));
+                        let (kid, w, h) = first_sized_child(self.d, self.win).unwrap_or((0, 0, 0));
                         eprintln!(
                             "[vstedit3] verify {it}: child=({kid:x} {w}x{h}) px={px} live={child_live}"
                         );
@@ -1223,9 +1228,15 @@ impl Editor3 {
                                 self.shared.width.store(w, Ordering::SeqCst);
                                 self.shared.height.store(h, Ordering::SeqCst);
                                 XResizeWindow(self.d, self.win, w, h);
-                                Phase::Live { last_size: (w, h), last_container: (0, 0) }
+                                Phase::Live {
+                                    last_size: (w, h),
+                                    last_container: (0, 0),
+                                }
                             }
-                            None => Phase::Live { last_size: (0, 0), last_container: (0, 0) },
+                            None => Phase::Live {
+                                last_size: (0, 0),
+                                last_container: (0, 0),
+                            },
                         };
                         return;
                     }
@@ -1235,10 +1246,18 @@ impl Editor3 {
                         self.phase = Phase::Verify { it: it + 1 };
                     }
                 }
-                Phase::Live { ref mut last_size, ref mut last_container } => {
+                Phase::Live {
+                    ref mut last_size,
+                    ref mut last_container,
+                } => {
                     let mut resized = None;
-                    if drain_events(self.d, self.win, self.wm_protocols, self.wm_delete, &mut resized)
-                    {
+                    if drain_events(
+                        self.d,
+                        self.win,
+                        self.wm_protocols,
+                        self.wm_delete,
+                        &mut resized,
+                    ) {
                         self.teardown(false);
                         return;
                     }
@@ -1294,7 +1313,7 @@ impl Editor3 {
         }
     }
 
-        /// Name + WM close protocol + event selection — only after the view
+    /// Name + WM close protocol + event selection — only after the view
     /// proved itself (see the bare-container rule in `make_editor3`).
     unsafe fn decorate(&mut self) {
         XSelectInput(
@@ -1393,7 +1412,9 @@ unsafe fn first_sized_child(d: *mut Display, win: XWindow) -> Option<(XWindow, u
     for k in &list {
         let mut rr: XWindow = 0;
         let (mut x, mut y, mut w, mut h, mut b, mut depth) = (0, 0, 0u32, 0u32, 0u32, 0u32);
-        if XGetGeometry(d, *k, &mut rr, &mut x, &mut y, &mut w, &mut h, &mut b, &mut depth) != 0
+        if XGetGeometry(
+            d, *k, &mut rr, &mut x, &mut y, &mut w, &mut h, &mut b, &mut depth,
+        ) != 0
             && w > 0
             && h > 0
         {
@@ -1445,13 +1466,16 @@ mod tests {
         let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None)
             .expect("plugin loads");
         let entry = &load.entry;
-        assert!(entry.has_editor(), "{} advertises an editor", path.display());
+        assert!(
+            entry.has_editor(),
+            "{} advertises an editor",
+            path.display()
+        );
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win =
-            match open_editor(&h, &path.to_string_lossy(), "smoke") {
-                Ok(w) => w,
-                Err(e) => panic!("open_editor failed: {e}"),
-            };
+        let mut win = match open_editor(&h, &path.to_string_lossy(), "smoke") {
+            Ok(w) => w,
+            Err(e) => panic!("open_editor failed: {e}"),
+        };
         // Give the editor thread time to embed (verify) + pump.
         std::thread::sleep(Duration::from_millis(4200));
         // The invariant slooper guarantees: the window shows a LIVE
@@ -1476,7 +1500,9 @@ mod tests {
     }
 
     fn dirs_home() -> std::path::PathBuf {
-        std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default()
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
     }
 
     /// Shared gate for the live-X pins: explicit opt-in + X11 + a plugin.
@@ -1520,8 +1546,14 @@ mod tests {
             win.close();
             return;
         }
-        assert!(win.open_failed(), "unpainted editor must report open_failed");
-        assert!(win.is_closed(), "refused editor must destroy its window and exit");
+        assert!(
+            win.open_failed(),
+            "unpainted editor must report open_failed"
+        );
+        assert!(
+            win.is_closed(),
+            "refused editor must destroy its window and exit"
+        );
         assert_eq!(win.child_count(), 0, "no children may survive the refuse");
         win.close();
     }
@@ -1597,7 +1629,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             assert!(is_m, "mapped window must read viewable (offsets pinned)");
-            assert!(!is_viewable(d, unmapped), "unmapped window must NOT read viewable");
+            assert!(
+                !is_viewable(d, unmapped),
+                "unmapped window must NOT read viewable"
+            );
             // Garbage XID must fail closed, not crash.
             assert!(!is_viewable(d, 0x0F00_0000_0000_0001));
             XDestroyWindow(d, mapped);
@@ -1660,7 +1695,10 @@ mod tests {
             opened += 1;
         }
         assert_eq!(fails, Vec::<String>::new(), "editors that never painted");
-        assert!(opened >= 3, "expected the installed VST2 editors, got {opened}");
+        assert!(
+            opened >= 3,
+            "expected the installed VST2 editors, got {opened}"
+        );
         eprintln!("[v102] {opened} VST2 editors painted through the shared GUI thread");
     }
 
@@ -1675,20 +1713,41 @@ mod tests {
     fn v12_vst3_param_routing_maps_ids_to_cells() {
         use crate::vsthost::{VstParamDesc, VstParams};
         let descs = [
-            VstParamDesc { id: 5, name: "a".into(), default: 0.0, writable: true },
-            VstParamDesc { id: 9, name: "b".into(), default: 0.0, writable: true },
+            VstParamDesc {
+                id: 5,
+                name: "a".into(),
+                default: 0.0,
+                writable: true,
+            },
+            VstParamDesc {
+                id: 9,
+                name: "b".into(),
+                default: 0.0,
+                writable: true,
+            },
         ];
         let params = VstParams::new(&descs);
         let ids: Vec<u32> = descs.iter().map(|d| d.id).collect();
         let g0 = params.generation();
         route_param_edits3(vec![(9, 0.42), (777, 0.5)], &ids, &params);
-        assert_eq!(params.get(1).to_bits(), (0.42f32).to_bits(), "id 9 → cell 1");
+        assert_eq!(
+            params.get(1).to_bits(),
+            (0.42f32).to_bits(),
+            "id 9 → cell 1"
+        );
         assert_eq!(params.get(0).to_bits(), 0.0f32.to_bits(), "id 5 untouched");
-        assert!(params.generation() > g0, "cell write must bump the generation (RT pick-up)");
+        assert!(
+            params.generation() > g0,
+            "cell write must bump the generation (RT pick-up)"
+        );
         // Unknown ids alone: no cell moves, no generation churn.
         let g1 = params.generation();
         route_param_edits3(vec![(12345, 0.9)], &ids, &params);
-        assert_eq!(params.generation(), g1, "unknown id must not churn the cells");
+        assert_eq!(
+            params.generation(),
+            g1,
+            "unknown id must not churn the cells"
+        );
     }
 
     /// Shared live gate for the VST3 editor pins.
@@ -1736,8 +1795,8 @@ mod tests {
             eprintln!("skip: gated");
             return;
         };
-        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
-            .expect("loads");
+        let load =
+            crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None).expect("loads");
         let entry = &load.entry;
         let win = entry.open_vst3_editor(48_000).expect("opens");
         let mut waited = 0u32;
@@ -1766,8 +1825,8 @@ mod tests {
             eprintln!("skip: gated");
             return;
         };
-        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
-            .expect("loads");
+        let load =
+            crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None).expect("loads");
         let entry = &load.entry;
         for cycle in 0..3 {
             let mut win = entry.open_vst3_editor(48_000).expect("open cycle");
@@ -1787,6 +1846,126 @@ mod tests {
             // Explicit close AFTER the WM close retired it: must be a
             // no-op, never a double-free of view or container.
             win.close();
+        }
+    }
+
+    // ================= v16 responsiveness pass pins ======================
+
+    /// v16 helper: a real, PAINTED VST2 editor for the SMOKE pins, or
+    /// `None` (skip) when this host can't provide one.
+    fn v16_editor(tag: &str) -> Option<EditorWindow> {
+        if std::env::var("SLOOPER_VST_SMOKE").unwrap_or_default() != "1"
+            || std::env::var_os("DISPLAY").is_none()
+        {
+            eprintln!("skip: SLOOPER_VST_SMOKE=1 + DISPLAY required");
+            return None;
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
+        if !path.is_file() {
+            eprintln!("skip: Dragonfly VST2 not installed");
+            return None;
+        }
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None).ok()?;
+        let h = load.entry.vst2_handle()?;
+        let mut w = open_editor(&h, &path.to_string_lossy(), tag).ok()?;
+        let t0 = std::time::Instant::now();
+        while !w.painted()
+            && !w.open_failed()
+            && !w.is_closed()
+            && t0.elapsed() < std::time::Duration::from_secs(12)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !w.painted() {
+            eprintln!("skip: editor never painted");
+            w.close();
+            return None;
+        }
+        // Keep the instance alive next to its editor for the pin's whole
+        // lifetime (the plugin instance must outlive `open_editor`).
+        std::mem::forget(load);
+        Some(w)
+    }
+
+    /// AC2 pin (SMOKE): Live housekeeping (child count, editor rect,
+    /// painted probe, WM-watchdog) now runs on a ~500 ms timer instead of
+    /// every pump step — a healthy editor must survive several cycles.
+    /// The v10 crash this guards was exactly "housekeeping churn killed a
+    /// live editor"; with the 6 ms fast tick a per-step refresh would run
+    /// ~5x harder AND `XGetGeometry` storms on some plugins mis-reported
+    /// the child as gone.
+    #[test]
+    fn v16_vstedit_live_survives_housekeeping() {
+        let Some(mut w) = v16_editor("v16-ac2") else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !w.is_closed(),
+            "time-based housekeeping must not retire an editor that is alive"
+        );
+        assert!(w.painted(), "the editor must still be painting after 4 s");
+        w.close();
+    }
+
+    /// AC3 pin (SMOKE): `close()` posts a wakeup job, so the hand-off
+    /// lands on the next pump iteration instead of waiting out a full
+    /// idle tick plus scheduling jitter — must settle well under 150 ms.
+    #[test]
+    fn v16_vstedit_close_settles_fast() {
+        let Some(mut w) = v16_editor("v16-ac3") else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        w.close();
+        let dt = t0.elapsed();
+        assert!(w.is_closed(), "close() must settle the editor");
+        assert!(
+            dt < std::time::Duration::from_millis(150),
+            "close() settled in {} ms — the wakeup hand-off regressed",
+            dt.as_millis()
+        );
+    }
+
+    /// AC7 pin: the painted-probe `XGetImage` on an unmapped or garbage
+    /// window used to hit `BadMatch` and the Xlib DEFAULT handler killed
+    /// the process (core dump reproduced in the v16 probe). Now: the
+    /// no-op error handler is installed before any editor display, and
+    /// the probe is guarded by `is_viewable` — both must fail closed.
+    #[test]
+    fn v16_vstedit_survives_x_errors() {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("skip: no X11 display");
+            return;
+        }
+        unsafe {
+            install_x_error_handler();
+            let d = XOpenDisplay(ptr::null());
+            assert!(!d.is_null());
+            let root = root_window(d);
+            let win = XCreateSimpleWindow(d, root, 0, 0, 64, 48, 0, 0, 0);
+            XSync(d, 0);
+            // Created-but-unmapped: exactly the BadMatch case from the
+            // pump pin's core dump. Probe must answer false and LIVE.
+            assert!(
+                !container_painted(d, win),
+                "unmapped window must fail closed"
+            );
+            // Garbage XID: BadWindow on the attribute fetch — also live.
+            assert!(
+                !container_painted(d, 0x0F00_0000_0000_0001),
+                "bogus XID must fail closed"
+            );
+            // A WM_DELETE client message to a bogus window must be
+            // swallowed the same way.
+            assert!(request_wm_delete(0x0F00_0000_0000_0001), "send path ran");
+            XDestroyWindow(d, win);
+            XFlush(d);
+            XCloseDisplay(d);
         }
     }
 }

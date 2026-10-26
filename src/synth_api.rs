@@ -95,7 +95,8 @@ pub struct SynthInfoV1 {
     pub all_off: extern "C" fn(s: *mut core::ffi::c_void),
     pub cc: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, num: u8, val: u8),
     pub press: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, val: u8),
-    pub process: extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
+    pub process:
+        extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
 }
 
 unsafe impl Sync for SynthParamV1 {}

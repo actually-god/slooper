@@ -43,9 +43,9 @@ pub fn compute_hidden(
         // Card name via the device table first; fall back to the card key
         // embedded in the node name (`alsa_card.<key>` — the same form pactl
         // reports).
-        let card = dev_id.and_then(|id| devices.get(&id).cloned()).or_else(|| {
-            card_key_from_node(node_name).map(|k| format!("alsa_card.{k}"))
-        });
+        let card = dev_id
+            .and_then(|id| devices.get(&id).cloned())
+            .or_else(|| card_key_from_node(node_name).map(|k| format!("alsa_card.{k}")));
         if let Some(card) = card {
             if !enabled.contains(&card) {
                 hidden.insert(desc.clone());
@@ -217,8 +217,14 @@ Card #46
     #[test]
     fn devices_parse() {
         let d = parse_pw_devices(DEVICES);
-        assert_eq!(d.get(&49).map(String::as_str), Some("alsa_card.usb-MOTU_M2_M2MA08B8XA-00"));
-        assert_eq!(d.get(&50).map(String::as_str), Some("alsa_card.pci-0000_12_00.6"));
+        assert_eq!(
+            d.get(&49).map(String::as_str),
+            Some("alsa_card.usb-MOTU_M2_M2MA08B8XA-00")
+        );
+        assert_eq!(
+            d.get(&50).map(String::as_str),
+            Some("alsa_card.pci-0000_12_00.6")
+        );
     }
 
     const NODES: &str = r#"	id 61, type PipeWire:Interface:Node/3

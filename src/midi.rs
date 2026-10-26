@@ -7,16 +7,43 @@
 /// A parsed, owned MIDI message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MidiMsg {
-    NoteOn { channel: u8, note: u8, velocity: u8 },
-    NoteOff { channel: u8, note: u8, velocity: u8 },
-    PolyPressure { channel: u8, note: u8, pressure: u8 },
-    ControlChange { channel: u8, number: u8, value: u8 },
-    ProgramChange { channel: u8, program: u8 },
-    ChannelPressure { channel: u8, pressure: u8 },
-    PitchBend { channel: u8, value: i16 },
+    NoteOn {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    PolyPressure {
+        channel: u8,
+        note: u8,
+        pressure: u8,
+    },
+    ControlChange {
+        channel: u8,
+        number: u8,
+        value: u8,
+    },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
+    ChannelPressure {
+        channel: u8,
+        pressure: u8,
+    },
+    PitchBend {
+        channel: u8,
+        value: i16,
+    },
     SystemRealtime(u8),
     /// SysEx / system common — kept as raw bytes.
-    SystemCommon { data: Vec<u8> },
+    SystemCommon {
+        data: Vec<u8>,
+    },
 }
 
 impl MidiMsg {
@@ -30,7 +57,9 @@ impl MidiMsg {
         }
         // SysEx start/end and other system common.
         if b0 == 0xF0 || b0 == 0xF7 {
-            return Some(MidiMsg::SystemCommon { data: bytes.to_vec() });
+            return Some(MidiMsg::SystemCommon {
+                data: bytes.to_vec(),
+            });
         }
 
         let channel = b0 & 0x0F;
@@ -39,13 +68,39 @@ impl MidiMsg {
         let b2 = bytes.get(2).copied().unwrap_or(0);
 
         match kind {
-            0x8 => Some(MidiMsg::NoteOff { channel, note: b1, velocity: b2 }),
-            0x9 if b2 == 0 => Some(MidiMsg::NoteOff { channel, note: b1, velocity: 0 }),
-            0x9 => Some(MidiMsg::NoteOn { channel, note: b1, velocity: b2 }),
-            0xA => Some(MidiMsg::PolyPressure { channel, note: b1, pressure: b2 }),
-            0xB => Some(MidiMsg::ControlChange { channel, number: b1, value: b2 }),
-            0xC => Some(MidiMsg::ProgramChange { channel, program: b1 }),
-            0xD => Some(MidiMsg::ChannelPressure { channel, pressure: b1 }),
+            0x8 => Some(MidiMsg::NoteOff {
+                channel,
+                note: b1,
+                velocity: b2,
+            }),
+            0x9 if b2 == 0 => Some(MidiMsg::NoteOff {
+                channel,
+                note: b1,
+                velocity: 0,
+            }),
+            0x9 => Some(MidiMsg::NoteOn {
+                channel,
+                note: b1,
+                velocity: b2,
+            }),
+            0xA => Some(MidiMsg::PolyPressure {
+                channel,
+                note: b1,
+                pressure: b2,
+            }),
+            0xB => Some(MidiMsg::ControlChange {
+                channel,
+                number: b1,
+                value: b2,
+            }),
+            0xC => Some(MidiMsg::ProgramChange {
+                channel,
+                program: b1,
+            }),
+            0xD => Some(MidiMsg::ChannelPressure {
+                channel,
+                pressure: b1,
+            }),
             // Raw 14-bit value (LSB | MSB<<7), re-centered so 0 = no bend.
             0xE => Some(MidiMsg::PitchBend {
                 channel,
@@ -73,39 +128,53 @@ impl MidiMsg {
     /// Human-readable one-line description (channel, data, values).
     pub fn describe(&self) -> String {
         match self {
-            MidiMsg::NoteOn { channel, note, velocity } => format!(
+            MidiMsg::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => format!(
                 "ch {:02}  note {} ({})  vel {}",
                 channel + 1,
                 note_name(*note),
                 note,
                 velocity
             ),
-            MidiMsg::NoteOff { channel, note, velocity } => format!(
+            MidiMsg::NoteOff {
+                channel,
+                note,
+                velocity,
+            } => format!(
                 "ch {:02}  note {} ({})  vel {}",
                 channel + 1,
                 note_name(*note),
                 note,
                 velocity
             ),
-            MidiMsg::PolyPressure { channel, note, pressure } => format!(
+            MidiMsg::PolyPressure {
+                channel,
+                note,
+                pressure,
+            } => format!(
                 "ch {:02}  note {} ({})  press {}",
                 channel + 1,
                 note_name(*note),
                 note,
                 pressure
             ),
-            MidiMsg::ControlChange { channel, number, value } => format!(
+            MidiMsg::ControlChange {
+                channel,
+                number,
+                value,
+            } => format!(
                 "ch {:02}  CC {} ({})  val {}",
                 channel + 1,
                 number,
                 cc_name(*number),
                 value
             ),
-            MidiMsg::ProgramChange { channel, program } => format!(
-                "ch {:02}  program {} (bank-relative)",
-                channel + 1,
-                program
-            ),
+            MidiMsg::ProgramChange { channel, program } => {
+                format!("ch {:02}  program {} (bank-relative)", channel + 1, program)
+            }
             MidiMsg::ChannelPressure { channel, pressure } => {
                 format!("ch {:02}  press {}", channel + 1, pressure)
             }
@@ -113,10 +182,7 @@ impl MidiMsg {
                 format!("ch {:02}  bend {} (center 0)", channel + 1, value)
             }
             MidiMsg::SystemRealtime(code) => format!("real-time status 0x{:02X}", code),
-            MidiMsg::SystemCommon { data } => format!(
-                "sys common / sysex, {} bytes",
-                data.len()
-            ),
+            MidiMsg::SystemCommon { data } => format!("sys common / sysex, {} bytes", data.len()),
         }
     }
 }
@@ -184,11 +250,13 @@ pub fn cc_name(number: u8) -> &'static str {
         .iter()
         .find(|(n, _)| *n == number)
         .map(|(_, s)| *s)
-        .unwrap_or(if number < 32 || (40..=64).contains(&number) || (91..=120).contains(&number) {
-            "GENERIC"
-        } else {
-            "RESERVED"
-        })
+        .unwrap_or(
+            if number < 32 || (40..=64).contains(&number) || (91..=120).contains(&number) {
+                "GENERIC"
+            } else {
+                "RESERVED"
+            },
+        )
 }
 
 /// Space-separated uppercase hex, e.g. `90 3C 64`.
@@ -220,13 +288,23 @@ impl MidiBind {
     /// Extract a binding from a parsed message, if the type is bindable.
     pub fn from_msg(m: &MidiMsg) -> Option<MidiBind> {
         match m {
-            MidiMsg::NoteOn { channel, note, .. } => Some(MidiBind { ty: 0, ch: *channel, d1: *note }),
-            MidiMsg::ControlChange { channel, number, .. } => {
-                Some(MidiBind { ty: 1, ch: *channel, d1: *number })
-            }
-            MidiMsg::ProgramChange { channel, program } => {
-                Some(MidiBind { ty: 2, ch: *channel, d1: *program })
-            }
+            MidiMsg::NoteOn { channel, note, .. } => Some(MidiBind {
+                ty: 0,
+                ch: *channel,
+                d1: *note,
+            }),
+            MidiMsg::ControlChange {
+                channel, number, ..
+            } => Some(MidiBind {
+                ty: 1,
+                ch: *channel,
+                d1: *number,
+            }),
+            MidiMsg::ProgramChange { channel, program } => Some(MidiBind {
+                ty: 2,
+                ch: *channel,
+                d1: *program,
+            }),
             _ => None,
         }
     }
@@ -239,7 +317,12 @@ impl MidiBind {
     /// Short label for the settings UI, e.g. `CC 64 ch01`.
     pub fn label(&self) -> String {
         match self.ty {
-            0 => format!("NOTE {} ({}) ch{:02}", note_name(self.d1), self.d1, self.ch + 1),
+            0 => format!(
+                "NOTE {} ({}) ch{:02}",
+                note_name(self.d1),
+                self.d1,
+                self.ch + 1
+            ),
             1 => format!("CC {} ({}) ch{:02}", self.d1, cc_name(self.d1), self.ch + 1),
             _ => format!("PC {} ch{:02}", self.d1, self.ch + 1),
         }
@@ -417,7 +500,10 @@ impl MidiAction {
     /// the message's second data byte and keyboard bindings can never fire
     /// them (a key press carries no value).
     pub fn is_continuous(self) -> bool {
-        matches!(self, MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_))
+        matches!(
+            self,
+            MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_)
+        )
     }
 }
 
@@ -479,13 +565,21 @@ mod tests {
         let m = MidiMsg::parse(&[0x90, 60, 100]).unwrap();
         assert_eq!(
             m,
-            MidiMsg::NoteOn { channel: 0, note: 60, velocity: 100 }
+            MidiMsg::NoteOn {
+                channel: 0,
+                note: 60,
+                velocity: 100
+            }
         );
         // Note-on with velocity 0 is a note-off.
         let m = MidiMsg::parse(&[0x93, 64, 0]).unwrap();
         assert_eq!(
             m,
-            MidiMsg::NoteOff { channel: 3, note: 64, velocity: 0 }
+            MidiMsg::NoteOff {
+                channel: 3,
+                note: 64,
+                velocity: 0
+            }
         );
     }
 
@@ -494,26 +588,60 @@ mod tests {
         let m = MidiMsg::parse(&[0xB2, 7, 128]).unwrap();
         assert_eq!(
             m,
-            MidiMsg::ControlChange { channel: 2, number: 7, value: 128 }
+            MidiMsg::ControlChange {
+                channel: 2,
+                number: 7,
+                value: 128
+            }
         );
         let m = MidiMsg::parse(&[0xC4, 11]).unwrap();
-        assert_eq!(m, MidiMsg::ProgramChange { channel: 4, program: 11 });
+        assert_eq!(
+            m,
+            MidiMsg::ProgramChange {
+                channel: 4,
+                program: 11
+            }
+        );
     }
 
     #[test]
     fn pitch_bend_14bit() {
         // Centered: raw 0x2000 -> 0.
         let m = MidiMsg::parse(&[0xE0, 0x00, 0x40]).unwrap();
-        assert_eq!(m, MidiMsg::PitchBend { channel: 0, value: 0 });
+        assert_eq!(
+            m,
+            MidiMsg::PitchBend {
+                channel: 0,
+                value: 0
+            }
+        );
         // Max positive: raw 0x7FFF -> +8191.
         let m = MidiMsg::parse(&[0xE0, 0x7F, 0x7F]).unwrap();
-        assert_eq!(m, MidiMsg::PitchBend { channel: 0, value: 8191 });
+        assert_eq!(
+            m,
+            MidiMsg::PitchBend {
+                channel: 0,
+                value: 8191
+            }
+        );
         // One below center: raw 0x1FFF -> -1.
         let m = MidiMsg::parse(&[0xE0, 0xFF, 0x3F]).unwrap();
-        assert_eq!(m, MidiMsg::PitchBend { channel: 0, value: -1 });
+        assert_eq!(
+            m,
+            MidiMsg::PitchBend {
+                channel: 0,
+                value: -1
+            }
+        );
         // Min: raw 0x0000 -> -8192.
         let m = MidiMsg::parse(&[0xE0, 0x00, 0x00]).unwrap();
-        assert_eq!(m, MidiMsg::PitchBend { channel: 0, value: -8192 });
+        assert_eq!(
+            m,
+            MidiMsg::PitchBend {
+                channel: 0,
+                value: -8192
+            }
+        );
     }
 
     #[test]
@@ -566,7 +694,14 @@ mod tests {
         // NOTE ON: note number binds, velocity is ignored.
         let note = MidiMsg::parse(&[0x90, 60, 100]).unwrap();
         let b = MidiBind::from_msg(&note).unwrap();
-        assert_eq!(b, MidiBind { ty: 0, ch: 0, d1: 60 });
+        assert_eq!(
+            b,
+            MidiBind {
+                ty: 0,
+                ch: 0,
+                d1: 60
+            }
+        );
         assert!(b.matches(&note));
         assert!(b.matches(&MidiMsg::parse(&[0x90, 60, 3]).unwrap())); // same note, new vel
         assert!(!b.matches(&MidiMsg::parse(&[0x91, 60, 3]).unwrap())); // other channel
@@ -575,7 +710,14 @@ mod tests {
         // CC: controller number binds, value is ignored (pedals/knobs).
         let cc = MidiMsg::parse(&[0xB1, 7, 128]).unwrap();
         let bcc = MidiBind::from_msg(&cc).unwrap();
-        assert_eq!(bcc, MidiBind { ty: 1, ch: 1, d1: 7 });
+        assert_eq!(
+            bcc,
+            MidiBind {
+                ty: 1,
+                ch: 1,
+                d1: 7
+            }
+        );
         assert!(bcc.matches(&MidiMsg::parse(&[0xB1, 7, 0]).unwrap())); // any value
         assert!(!bcc.matches(&MidiMsg::parse(&[0xB2, 7, 0]).unwrap())); // other channel
         assert!(!bcc.matches(&note)); // different type
@@ -583,7 +725,14 @@ mod tests {
         // PC: program binds.
         let pc = MidiMsg::parse(&[0xC2, 11]).unwrap();
         let bpc = MidiBind::from_msg(&pc).unwrap();
-        assert_eq!(bpc, MidiBind { ty: 2, ch: 2, d1: 11 });
+        assert_eq!(
+            bpc,
+            MidiBind {
+                ty: 2,
+                ch: 2,
+                d1: 11
+            }
+        );
         assert!(bpc.matches(&pc));
 
         // Non-bindable types.

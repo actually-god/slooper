@@ -186,7 +186,11 @@ mod tests {
         }
         let out = trim_silence(&buf, sr).expect("content survives");
         // Content length ≈ the non-silent window; edges are faded to (near) zero.
-        assert!((out.len() as i64 - 28_800).abs() <= 8, "kept {} samples", out.len());
+        assert!(
+            (out.len() as i64 - 28_800).abs() <= 8,
+            "kept {} samples",
+            out.len()
+        );
         assert!(out[0].abs() < 1e-3, "head faded");
         assert!(out[out.len() - 1].abs() < 1e-3, "tail faded");
         // Pure silence yields None so the caller can keep the original.

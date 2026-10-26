@@ -92,7 +92,9 @@ pub fn seed_folder(dir: &Path) {
     let api = dir.join("synth_api.rs");
     // The shipped API file already carries the current version marker.
     let want_api = API_SRC.to_string();
-    let stale_api = std::fs::read_to_string(&api).map(|s| s != want_api).unwrap_or(true);
+    let stale_api = std::fs::read_to_string(&api)
+        .map(|s| s != want_api)
+        .unwrap_or(true);
     if stale_api && std::fs::write(&api, &want_api).is_ok() {
         // Version note only; scripts recompile on next rescan by mtime.
     }
@@ -278,7 +280,12 @@ impl Instance {
             description: None,
             params: vals
                 .iter()
-                .map(|v| SynthParamDesc { label: String::new(), min: *v, max: *v, default: *v })
+                .map(|v| SynthParamDesc {
+                    label: String::new(),
+                    min: *v,
+                    max: *v,
+                    default: *v,
+                })
                 .collect(),
         };
         Self::new(self.fns, self._lib.clone(), &desc, self.sample_rate, &vals)
@@ -362,7 +369,10 @@ unsafe impl Sync for Registry {}
 impl Registry {
     pub fn open(dir: PathBuf) -> Self {
         seed_folder(&dir);
-        let mut r = Registry { dir, items: Vec::new() };
+        let mut r = Registry {
+            dir,
+            items: Vec::new(),
+        };
         r.rescan();
         r
     }
@@ -372,7 +382,11 @@ impl Registry {
     }
 
     pub fn stems(&self) -> Vec<String> {
-        self.items.iter().filter(|e| e.fns.is_some()).map(|e| e.stem.clone()).collect()
+        self.items
+            .iter()
+            .filter(|e| e.fns.is_some())
+            .map(|e| e.stem.clone())
+            .collect()
     }
 
     pub fn desc(&self, stem: &str) -> Option<&SynthDesc> {
@@ -390,7 +404,9 @@ impl Registry {
     }
 
     fn find(&self, stem: &str) -> Option<&SynthEntry> {
-        self.items.iter().find(|e| e.stem == stem && e.fns.is_some())
+        self.items
+            .iter()
+            .find(|e| e.stem == stem && e.fns.is_some())
     }
 
     /// Create a live instance of `stem` (returns None on unknown/stem/reject).
@@ -424,7 +440,10 @@ impl Registry {
         }
         files.sort();
         for src in files {
-            let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = src
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let lib = build.join(format!("{stem}.so"));
             let entry = if needs_build(&src, &lib) {
                 match compile_synth(&src, &lib) {
@@ -479,17 +498,31 @@ fn compile_synth(src: &Path, out: &Path) -> Result<(), String> {
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("could not create build dir: {e}"))?;
     }
-    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("slooper_synth");
+    let stem = out
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slooper_synth");
     let crate_name = {
         let mut s = String::from("syn_");
         for c in stem.chars() {
-            s.push(if c.is_ascii_alphanumeric() || c == '_' { c.to_ascii_lowercase() } else { '_' });
+            s.push(if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            });
         }
         s
     };
     let tmp = out.with_extension("so.tmp");
     let output = Command::new("rustc")
-        .args(["--edition", "2021", "--crate-type", "cdylib", "-C", "opt-level=2"])
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "cdylib",
+            "-C",
+            "opt-level=2",
+        ])
         .arg("--crate-name")
         .arg(&crate_name)
         .arg("-o")
@@ -519,15 +552,14 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
         Ok(l) => Arc::new(LibHandle(std::mem::ManuallyDrop::new(l))),
         Err(e) => return reject(format!("load failed: {e}")),
     };
-    let sym: libloading::Symbol<extern "C" fn() -> *const SynthInfoV1> =
-        match lib.get(b"slooper_synth_info\0") {
-            Ok(s) => s,
-            Err(_) => {
-                return reject(
-                    "missing entry point slooper_synth_info — see the bundled synths".into(),
-                )
-            }
-        };
+    let sym: libloading::Symbol<extern "C" fn() -> *const SynthInfoV1> = match lib
+        .get(b"slooper_synth_info\0")
+    {
+        Ok(s) => s,
+        Err(_) => {
+            return reject("missing entry point slooper_synth_info — see the bundled synths".into())
+        }
+    };
     let info = sym();
     if info.is_null() {
         return reject("slooper_synth_info returned null".into());
@@ -546,7 +578,10 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
         if p.is_null() {
             return None;
         }
-        std::ffi::CStr::from_ptr(p).to_str().ok().map(|s| s.to_string())
+        std::ffi::CStr::from_ptr(p)
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
     };
     let name = match cstr(d.name) {
         Some(n) if !n.is_empty() => n,
@@ -571,13 +606,11 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
     let params = (0..d.n_params as usize)
         .filter(|_| !d.params.is_null())
         .map(|k| unsafe { &*d.params.add(k) })
-        .map(|p| {
-            SynthParamDesc {
-                label: cstr(p.label).unwrap_or_else(|| "p?".to_string()),
-                min: p.min,
-                max: p.max,
-                default: p.default,
-            }
+        .map(|p| SynthParamDesc {
+            label: cstr(p.label).unwrap_or_else(|| "p?".to_string()),
+            min: p.min,
+            max: p.max,
+            default: p.default,
         })
         .collect();
     let desc = SynthDesc {
@@ -646,7 +679,8 @@ mod tests {
         let cur = std::fs::read_to_string(&piano).unwrap();
         assert!(cur.contains(&format!("slooper-synth-version: {BUNDLED_VERSION}")));
         // An install from a previous app version: old content, still stamped.
-        let old = "// ============ slooper ==\n// slooper-synth-version: 0\n// old FM voice\n".to_string();
+        let old = "// ============ slooper ==\n// slooper-synth-version: 0\n// old FM voice\n"
+            .to_string();
         std::fs::write(&piano, &old).unwrap();
         // A hand-edited script (no stamp in the header) is the user's file.
         let mine = dir.join("sampler.rs");
@@ -700,7 +734,10 @@ mod tests {
             .join("\n")
             + "\n";
         let stale = stale.replace("data_ptr", "resync_deferred");
-        assert_ne!(stale, bundled, "fixture must differ from the bundled script");
+        assert_ne!(
+            stale, bundled,
+            "fixture must differ from the bundled script"
+        );
         std::fs::write(&sampler, &stale).unwrap();
         seed_folder(&dir);
         let upd = std::fs::read_to_string(&sampler).unwrap();
@@ -708,7 +745,10 @@ mod tests {
             upd, bundled,
             "stale stamped sampler.rs was never updated (version-skew gate)"
         );
-        assert!(dir.join("sampler.rs.bak").exists(), "old copy not backed up");
+        assert!(
+            dir.join("sampler.rs.bak").exists(),
+            "old copy not backed up"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -720,9 +760,7 @@ mod tests {
         assert!(stems.contains(&"sampler".to_string()), "stems: {stems:?}");
         // Give the host a rack asset (asset id 0) so the sampler has something
         // to play; with an empty table silence is correct behavior.
-        let sine: Arc<[f32]> = (0..4800)
-            .map(|i| (i as f32 * 0.05).sin() * 0.5)
-            .collect();
+        let sine: Arc<[f32]> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         set_host_assets(Arc::new(vec![sine]), 48_000);
         for stem in ["piano", "sampler"] {
             let inst = reg
@@ -752,8 +790,6 @@ mod tests {
         }
     }
 
-
-
     /// v0.8 item 2: "the sampler doesn't currently work" — beyond making
     /// sound, the sampler must PITCH the rack asset by the semitone
     /// distance from its root note: +12 st ⇒ exactly twice the rate.
@@ -764,7 +800,9 @@ mod tests {
             .map(|i| (i as f64 * 2.0 * std::f64::consts::TAU * 200.0 / 48000.0).sin() as f32 * 0.5)
             .collect();
         set_host_assets(Arc::new(vec![sine]), 48_000);
-        let inst = reg.create_instance("sampler", 48_000.0, &[]).expect("sampler");
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[])
+            .expect("sampler");
         let desc = reg.desc("sampler").unwrap();
         let mut p = [0.0f32; MAX_PARAMS];
         for (k, pd) in desc.params.iter().enumerate() {
@@ -869,7 +907,10 @@ mod tests {
         // Pitch: strong line at A3 (all zone/octave math baked in).
         let on = line_power(&out, f0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
         let off = tone_power(&out, 253.0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
-        assert!(on > 25.0 * off, "fundamental must sit at 220 Hz: {on} vs {off}");
+        assert!(
+            on > 25.0 * off,
+            "fundamental must sit at 220 Hz: {on} vs {off}"
+        );
         // Harmonic spectrum falling with frequency (no static, no buzz).
         let low = line_power(&out, f0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
         let high = line_power(&out, 7000.0, sr, (0.08 * sr) as usize, (0.8 * sr) as usize);
@@ -885,7 +926,10 @@ mod tests {
             soft.iter().fold(0f32, |m, s| m.max(s.abs())),
         );
         assert!(ml > 0.05 && ml < 1.2, "sane peak level, got {ml}");
-        assert!(ml > 4.0 * ms, "velocity must move the dynamic (loud {ml} soft {ms})");
+        assert!(
+            ml > 4.0 * ms,
+            "velocity must move the dynamic (loud {ml} soft {ms})"
+        );
         // Damper: sound gone a short while after note-off.
         inst.all_off();
         inst.note_on(0, 60, 110);
@@ -906,7 +950,10 @@ mod tests {
             unsafe { inst.process_into(&mut blk, &p) };
             quiet = quiet.max(blk.iter().fold(0f32, |m, s| m.max(s.abs())));
         }
-        assert!(quiet < 0.02 * ml, "damper must stop the note, tail peak {quiet}");
+        assert!(
+            quiet < 0.02 * ml,
+            "damper must stop the note, tail peak {quiet}"
+        );
         inst.all_off();
     }
 
@@ -927,8 +974,9 @@ mod tests {
     // ===================== v0.10 acceptance pins =====================
 
     fn v10_host_table(data: Vec<f32>, extra: usize) {
-        let mut v: Vec<crate::assets::AssetData> =
-            (0..extra + 1).map(|_| std::sync::Arc::from(Vec::<f32>::new())).collect();
+        let mut v: Vec<crate::assets::AssetData> = (0..extra + 1)
+            .map(|_| std::sync::Arc::from(Vec::<f32>::new()))
+            .collect();
         v[2] = std::sync::Arc::from(data);
         set_host_assets(std::sync::Arc::new(v), 48_000);
     }
@@ -980,7 +1028,9 @@ mod tests {
 
         // Nothing moved since: identical render (no re-copy churn).
         let peak3 = render(&inst);
-        assert!((peak3 - peak2).abs() < 1e-6, "stable table must not alter output");
+        assert!(
+            (peak3 - peak2).abs() < 1e-6,
+            "stable table must not alter output"
+        );
     }
-
 }

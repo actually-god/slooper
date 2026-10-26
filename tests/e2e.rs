@@ -916,9 +916,9 @@ fn e2e_midi_clip_plays_live() {
     let inst = reg
         .create_instance("piano", sr as f64, &[])
         .expect("bundled piano must compile and load");
-    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(slooper::audio::SynthHandle::Script(
-        inst,
-    )))));
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(
+        slooper::audio::SynthHandle::Script(inst),
+    ))));
 
     // A MIDI-only project: one bar of quarter notes at 120 BPM on track 0.
     // No audio asset exists at index 0 — the clip resolves through the MIDI
@@ -950,7 +950,11 @@ fn e2e_midi_clip_plays_live() {
     // Silent while the transport is stopped.
     std::thread::sleep(Duration::from_millis(150));
     wait_until(
-        || ring_peak(&ring, &widx, 960).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 960)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "silence before the transport starts",
     );
@@ -960,7 +964,11 @@ fn e2e_midi_clip_plays_live() {
     // allocated): the first staged note panicked inside `process`.
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "MIDI clip audible through the default synth",
     );
@@ -972,7 +980,9 @@ fn e2e_midi_clip_plays_live() {
     // between the last note-off and the wrap.
     std::thread::sleep(Duration::from_millis(1100));
     assert!(
-        ring_peak(&ring, &widx, 16000).map(|p| p > 0.002).unwrap_or(false),
+        ring_peak(&ring, &widx, 16000)
+            .map(|p| p > 0.002)
+            .unwrap_or(false),
         "MIDI render died mid-bar",
     );
     let after = widx.load(Ordering::Relaxed);
@@ -982,7 +992,9 @@ fn e2e_midi_clip_plays_live() {
         "audio graph stopped cycling (RT thread died?)"
     );
     assert!(
-        ring_peak(&ring, &widx, 16000).map(|p| p > 0.002).unwrap_or(false),
+        ring_peak(&ring, &widx, 16000)
+            .map(|p| p > 0.002)
+            .unwrap_or(false),
         "no sound after the transport wrapped through the loop point",
     );
 
@@ -994,7 +1006,11 @@ fn e2e_midi_clip_plays_live() {
     );
     std::thread::sleep(Duration::from_millis(700)); // let the tail ring out
     wait_until(
-        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 2400)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "silence after StopAll (transport gate closes the MIDI render)",
     );
@@ -1176,11 +1192,7 @@ fn e2e_export_writes_file() {
     let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 4_000]);
     let mut arr = Arrangement::new();
     arr.insert(0, 0, Clip::new(0, 0));
-    arr.insert(
-        0,
-        1,
-        Clip::new(1, 4_000),
-    );
+    arr.insert(0, 1, Clip::new(1, 4_000));
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0, a1]);
     b.cmd(Cmd::SetProject {
         assets: table,
@@ -1500,10 +1512,16 @@ fn e2e_vst_insert_export() {
     );
 
     // Removing the insert restores the dry export.
-    b.cmd(Cmd::SetTrackEffects { i: 0, chain: TrackFx::default() });
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx::default(),
+    });
     drop(load);
     let back = export("back");
-    assert!(energy(&back[8_000..]) < 1e-9, "tail gone after removing insert");
+    assert!(
+        energy(&back[8_000..]) < 1e-9,
+        "tail gone after removing insert"
+    );
 
     b.cmd(Cmd::SetProject {
         assets: Arc::new(vec![]),
@@ -1560,7 +1578,11 @@ fn e2e_midi_note_sustains_across_blocks() {
     let active = client
         .activate_async(
             (),
-            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
         )
         .unwrap();
     b.cmd(Cmd::Apply {
@@ -1583,7 +1605,9 @@ fn e2e_midi_note_sustains_across_blocks() {
     let inst = reg
         .create_instance("piano", sr as f64, &[])
         .expect("bundled piano must compile and load");
-    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(slooper::audio::SynthHandle::Script(inst)))));
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(
+        slooper::audio::SynthHandle::Script(inst),
+    ))));
     let pat = one_note_pattern(sr, 57, 2.0);
     b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
     let mut arr = Arrangement::new();
@@ -1598,7 +1622,11 @@ fn e2e_midi_note_sustains_across_blocks() {
     std::thread::sleep(Duration::from_millis(150));
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "note attack audible",
     );
@@ -1614,7 +1642,10 @@ fn e2e_midi_note_sustains_across_blocks() {
     let mid = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
         .expect("mid-note window");
     let mid_rms = rms(&mid);
-    assert!(mid_rms > 2e-3, "sustained note must keep sounding mid-body: {mid_rms}");
+    assert!(
+        mid_rms > 2e-3,
+        "sustained note must keep sounding mid-body: {mid_rms}"
+    );
     assert!(
         mid_rms > 0.2 * head_rms,
         "note body collapsed to a blip: mid {mid_rms} vs head {head_rms}"
@@ -1633,7 +1664,11 @@ fn e2e_midi_note_sustains_across_blocks() {
     b.cmd(Cmd::StopAll);
     std::thread::sleep(Duration::from_millis(500));
     wait_until(
-        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 2400)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "silence after StopAll (sustain state must reset on stop)",
     );
@@ -1669,7 +1704,11 @@ fn e2e_midi_vsti_sustains_live() {
     let active = client
         .activate_async(
             (),
-            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
         )
         .unwrap();
     b.cmd(Cmd::Apply {
@@ -1690,7 +1729,9 @@ fn e2e_midi_vsti_sustains_live() {
         .expect("vitalium must load");
     b.cmd(Cmd::SetTrackSynth {
         i: 0,
-        synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(load.entry.clone()))),
+        synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(
+            load.entry.clone(),
+        ))),
     });
     let pat = one_note_pattern(sr, 60, 2.0);
     b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
@@ -1706,7 +1747,11 @@ fn e2e_midi_vsti_sustains_live() {
     std::thread::sleep(Duration::from_millis(150));
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(6),
         "VSTi note audible",
     );
@@ -1719,7 +1764,10 @@ fn e2e_midi_vsti_sustains_live() {
     let mid = read_ring(&ring, &widx, (sr as usize) / 10, Duration::from_millis(500))
         .expect("mid-note window");
     let mid_rms = rms(&mid);
-    assert!(mid_rms > 2e-3, "VSTi must keep producing through event-free blocks: {mid_rms}");
+    assert!(
+        mid_rms > 2e-3,
+        "VSTi must keep producing through event-free blocks: {mid_rms}"
+    );
     assert!(
         mid_rms > 0.2 * head_rms,
         "VSTi note collapsed to a blip: mid {mid_rms} vs head {head_rms}"
@@ -1728,7 +1776,11 @@ fn e2e_midi_vsti_sustains_live() {
     b.cmd(Cmd::StopAll);
     std::thread::sleep(Duration::from_millis(600));
     wait_until(
-        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 2400)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "StopAll must silence the plugin (flush ring + all-notes-off)",
     );
@@ -1756,7 +1808,11 @@ fn e2e_preview_renders_and_plays() {
     let active = client
         .activate_async(
             (),
-            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
         )
         .unwrap();
     b.cmd(Cmd::Apply {
@@ -1814,13 +1870,21 @@ fn e2e_preview_renders_and_plays() {
         samples: Arc::from(buf),
     });
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "preview audible at the master out",
     );
     std::thread::sleep(Duration::from_millis(3100));
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "preview auto-stops at the end of its buffer",
     );
@@ -1837,7 +1901,9 @@ fn e2e_preview_renders_and_plays() {
             .expect("vitalium must load");
         b.cmd(Cmd::SetTrackSynth {
             i: 0,
-            synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(load.entry.clone()))),
+            synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(
+                load.entry.clone(),
+            ))),
         });
         std::thread::sleep(Duration::from_millis(200));
         let mut ev = vec![
@@ -1879,7 +1945,11 @@ fn e2e_midi_seek_silences_held_note() {
     let active = client
         .activate_async(
             (),
-            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
         )
         .unwrap();
     b.cmd(Cmd::Apply {
@@ -1898,7 +1968,9 @@ fn e2e_midi_seek_silences_held_note() {
 
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
     let inst = reg.create_instance("piano", sr as f64, &[]).expect("piano");
-    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(slooper::audio::SynthHandle::Script(inst)))));
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(
+        slooper::audio::SynthHandle::Script(inst),
+    ))));
     let pat = one_note_pattern(sr, 57, 4.0);
     b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
     let mut arr = Arrangement::new();
@@ -1913,21 +1985,33 @@ fn e2e_midi_seek_silences_held_note() {
     std::thread::sleep(Duration::from_millis(150));
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "note audible before the seek",
     );
     // Jump to 6 s — past the clip end, mid-note. Nothing may keep ringing.
-    b.cmd(Cmd::Seek { pos: (sr as u64) * 6 });
+    b.cmd(Cmd::Seek {
+        pos: (sr as u64) * 6,
+    });
     wait_until(
-        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 2400)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(4),
         "seek must silence the held note (sustain state resets with the position)",
     );
     // And stay silent while the transport keeps running over empty bars.
     std::thread::sleep(Duration::from_millis(500));
     assert!(
-        ring_peak(&ring, &widx, 4800).map(|p| p < 0.002).unwrap_or(false),
+        ring_peak(&ring, &widx, 4800)
+            .map(|p| p < 0.002)
+            .unwrap_or(false),
         "held note resurrected after the seek (sustain kept advancing)"
     );
     b.cmd(Cmd::StopAll);
@@ -1953,15 +2037,26 @@ fn e2e_preview_voices_are_additive() {
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
     let src_name = client.name().to_string();
     let _active = client
-        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
         .unwrap();
     b.cmd(Cmd::Apply {
         ins: vec![],
         outs: vec![(format!("{src_name}:sink"), 3)],
     });
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
-            .is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
         "sink layout not applied"
     );
 
@@ -1971,21 +2066,29 @@ fn e2e_preview_voices_are_additive() {
         let n = sr as usize;
         Arc::from(
             (0..n)
-                .map(|k| {
-                    (2.0 * std::f32::consts::PI * f * k as f32 / sr as f32).sin() * 0.4
-                })
+                .map(|k| (2.0 * std::f32::consts::PI * f * k as f32 / sr as f32).sin() * 0.4)
                 .collect::<Vec<f32>>(),
         )
     };
-    b.cmd(Cmd::PreviewPlay { id: 11, samples: mk(440.0) });
+    b.cmd(Cmd::PreviewPlay {
+        id: 11,
+        samples: mk(440.0),
+    });
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.2).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.2)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "first preview audible",
     );
     let solo = ring_peak(&ring, &widx, 4800).unwrap_or(0.0);
     // Second voice WHILE the first still runs (1 s buffers, ~0.9 s left).
-    b.cmd(Cmd::PreviewPlay { id: 12, samples: mk(880.0) });
+    b.cmd(Cmd::PreviewPlay {
+        id: 12,
+        samples: mk(880.0),
+    });
     let mut best = solo;
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(30));
@@ -2046,15 +2149,26 @@ fn e2e_vst2_effect_not_silent() {
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
     let src_name = client.name().to_string();
     let _active = client
-        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
         .unwrap();
     b.cmd(Cmd::Apply {
         ins: vec![],
         outs: vec![(format!("{src_name}:sink"), 3)],
     });
     assert!(
-        wait_for(&b, |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }), Duration::from_secs(5))
-            .is_some(),
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
         "sink layout not applied"
     );
 
@@ -2075,20 +2189,19 @@ fn e2e_vst2_effect_not_silent() {
     // DRY reference first (no chain): proves the clip itself is audible.
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.2).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.2)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "dry clip audible",
     );
     b.cmd(Cmd::StopAll);
 
     // Now the same clip behind the VST2 effect.
-    let load = slooper::vsthost::open(
-        &dll,
-        slooper::vsthost::VstKind::V2,
-        sr,
-        None,
-    )
-    .expect("open wolf-shaper");
+    let load = slooper::vsthost::open(&dll, slooper::vsthost::VstKind::V2, sr, None)
+        .expect("open wolf-shaper");
     b.cmd(Cmd::SetTrackEffects {
         i: 0,
         chain: slooper::audio::TrackFx {
@@ -2135,7 +2248,11 @@ fn e2e_v13_sampler_patch_swap_live() {
     let active = client
         .activate_async(
             (),
-            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
         )
         .unwrap();
     b.cmd(Cmd::Apply {
@@ -2191,7 +2308,11 @@ fn e2e_v13_sampler_patch_swap_live() {
     std::thread::sleep(Duration::from_millis(150));
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 2400).map(|p| p > 0.3).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 2400)
+                .map(|p| p > 0.3)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "asset A (loud) audible while notes fire",
     );
