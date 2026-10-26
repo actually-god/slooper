@@ -5982,56 +5982,6 @@ impl App {
                             // the same value; matching d1 later rejected every
                             // sweep message from controllers that re-use
                             // numbers mid-sweep.
-                            let mut mgr_muted = false;
-                            // v0.15 automation manager: a picked record
-                            // source is MUTED in the main window while the
-                            // manager is open; with REC armed its raw value
-                            // draws the curve (percent of the target range:
-                            // 0 = min = -inf, 127 = max = +6 dB on volume).
-                            let mgr_slot = self.auto_mgr_rec.iter().find(|(slot, b)| {
-                                if MidiAction::ALL[*slot].is_continuous() {
-                                    b.same_axis(&bind)
-                                } else {
-                                    *b == bind
-                                }
-                            });
-                            if mgr_slot.is_some() && self.auto_edit.is_some() {
-                                if let Some(ed) = self.auto_edit.as_mut() {
-                                    if ed.rec {
-                                        let raw = match &msg {
-                                            MidiMsg::ControlChange { value, .. } => Some(*value),
-                                            MidiMsg::NoteOn { velocity, .. } => Some(*velocity),
-                                            _ => None,
-                                        };
-                                        if let Some(raw) = raw {
-                                            let (rmin, rmax) =
-                                                crate::automation::target_range(&ed.target);
-                                            let v =
-                                                rmin + (raw as f32 / 127.0) * (rmax - rmin);
-                                            let trel = self
-                                                .backend
-                                                .engine
-                                                .pos()
-                                                .saturating_sub(ed.rec_start.max(0) as u64)
-                                                as i64;
-                                            let skip = ed.nodes.last().is_some_and(|last| {
-                                                (last.v - v).abs() < 1e-4
-                                                    && (trel - last.t)
-                                                        < (self.sample_rate.max(1) as i64 / 50)
-                                            });
-                                            if !skip {
-                                                ed.nodes.push(crate::automation::Node {
-                                                    t: trel,
-                                                    v,
-                                                    s: crate::automation::Shape::Linear,
-                                                });
-                                                ed.changed = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                mgr_muted = true;
-                            }
                             let cval = match &msg {
                                 MidiMsg::ControlChange { value, .. } => Some(*value),
                                 MidiMsg::NoteOn { velocity, .. } if *velocity > 0 => {
@@ -8771,6 +8721,16 @@ fn lane_row(
 /// Delete (operating on the selection — the clip is selected first if it
 /// is not part of it). On empty grid: Paste here. Both: Select all and an
 /// explicit (safe) "Clear this track".
+/// Bare dB number for the level readouts ("-inf", "+0.0", "-12.3").
+fn db_num(amp: f32) -> String {
+    if amp <= 0.0 {
+        "-inf".into()
+    } else {
+        format!("{:+.1}", 20.0 * amp.log10())
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // ui, app + the lane's whole geometry
 fn grid_context_menu(
     ui: &mut egui::Ui,
     app: &mut App,
@@ -9171,54 +9131,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
     });
 }
 
-/// What a level text box shows when it is not being edited (number only;
-/// the "dB" unit is plain text drawn right after the box).
-fn level_display(kind: u8, midi: u8) -> String {
-    match kind {
-        KIND_VOL => db_num(vol_amp(midi)),
-        KIND_GAIN => db_num(gain_amp(midi)),
-        _ => format!("{}", pan_text(midi)),
-    }
-}
-
-/// Bare dB number for the level text box ("-inf", "+0.0", "-12.3").
-fn db_num(amp: f32) -> String {
-    if amp <= 0.0 {
-        "-inf".into()
-    } else {
-        format!("{:+.1}", 20.0 * amp.log10())
-    }
-}
-
-/// Parse a level text box back to a MIDI value ("−12.3 dB", "-inf", "50").
-/// Volume / gain floor at MIDI 1 for finite values (0 stays reserved for
 /// the exact "-inf"); pan maps -100..=100 -> 0..=127.
-fn level_parse(kind: u8, s: &str) -> Option<u8> {
-    let t: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let t = t.strip_suffix("db").unwrap_or(&t);
-    match kind {
-        KIND_PAN => t.parse::<f32>().ok().map(pan_midi),
-        _ => {
-            if t == "-inf" {
-                return Some(0);
-            }
-            let db = t.parse::<f32>().ok()?;
-            if !db.is_finite() {
-                return None;
-            }
-            let v = match kind {
-                KIND_VOL => vol_midi(db) as f32,
-                _ => GAIN_UNITY_MIDI as f32 + db / 0.215,
-            };
-            Some(v.round().clamp(1.0, 127.0) as u8)
-        }
-    }
-}
-
 /// One small chip per mixer-chain slot on the track header; clicking opens
 /// that slot's controls (script editor window; plugins open their own).
 fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
@@ -10858,7 +10771,16 @@ mod tests {
 
         // v0.15: right-clicking the grid no longer destroys the track — it
         // opens the clip menu, and deletion moved behind an explicit item.
-        let p = egui::pos2(500.0, 240.0);
+        // Settle first: the drop may open a child lane and re-row the
+        // grid for a few frames, and a press during a re-row belongs to no
+        // widget. Park the pointer clear of everything, idle, then click.
+        frame(&mut app, &ctx, vec![moved(egui::pos2(900.0, 600.0))]);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let p = egui::pos2(700.0, 246.0);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p)]);
         frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
         frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
         assert_eq!(total(&app), 1, "right-click kept the clips (no more instant clear)");
@@ -10937,24 +10859,33 @@ mod tests {
 
     #[test]
     fn level_text_roundtrip() {
-        // Volume spans -inf..=+6 dB: 0 = -inf, VOL_UNITY_MIDI = 0 dB,
-        // 127 = +6 dB, and every dB text parses back to the same knob.
+        // v0.15: the text boxes moved into the Set value dialog; the SAME
+        // dB semantics live in value_user_parse / value_user_display.
+        use crate::automation::{TARGET_TRACK_PAN, TARGET_TRACK_VOL};
         assert_eq!(db_num(vol_amp(0)), "-inf");
-        assert_eq!(level_display(KIND_VOL, VOL_UNITY_MIDI), "+0.0");
-        assert_eq!(level_display(KIND_VOL, 127), "+6.0");
-        assert_eq!(level_parse(KIND_VOL, "+0.0"), Some(VOL_UNITY_MIDI));
-        assert_eq!(level_parse(KIND_VOL, "+6.0"), Some(127));
-        assert_eq!(level_parse(KIND_VOL, "-inf"), Some(0));
-        assert_eq!(level_parse(KIND_VOL, "-12.3"), Some(vol_midi(-12.3)));
+        assert_eq!(value_user_display(TARGET_TRACK_VOL, vol_amp(VOL_UNITY_MIDI)), "+0.0");
+        assert_eq!(value_user_display(TARGET_TRACK_VOL, vol_amp(127)), "+6.0");
+        // Typed values are 1:1 dB and round-trip through the fader.
+        let db = |t: &str| {
+            let v = value_user_parse(TARGET_TRACK_VOL, t)?;
+            Some(vol_midi(if v <= 0.0 {
+                f32::NEG_INFINITY
+            } else {
+                20.0 * v.log10()
+            }))
+        };
+        assert_eq!(db("+0.0"), Some(VOL_UNITY_MIDI));
+        assert_eq!(db("+6.0"), Some(127));
+        assert_eq!(db("-inf"), Some(0));
+        assert_eq!(db("-12.3"), Some(vol_midi(-12.3)));
         // Monotone over the whole range, and unity sits at 0 dB exactly.
         for v in 1..127u8 {
             assert!(vol_amp(v) < vol_amp(v + 1), "vol_amp not monotone at {v}");
         }
         assert!((20.0 * vol_amp(VOL_UNITY_MIDI).log10()).abs() < 0.02);
         // Pan: centre reads 0.
-        let s = level_display(KIND_PAN, 64);
-        assert_eq!(s, "0");
-        assert_eq!(level_parse(KIND_PAN, &s), Some(64));
+        assert_eq!(value_user_display(TARGET_TRACK_PAN, 0.5), "0");
+        assert_eq!(value_user_parse(TARGET_TRACK_PAN, "0"), Some(0.5));
     }
 
     #[test]
@@ -11521,7 +11452,7 @@ mod tests {
         app.arr.insert(1, 0, mk(0, 48_000));
         app.open_auto_editor(None);
         assert_eq!(
-            app.auto_edit.as_ref().unwrap().len_samples as i64,
+            app.auto_edit.as_ref().unwrap().len_samples,
             192_000,
             "fresh curve spans the LONGEST track"
         );
@@ -11529,7 +11460,7 @@ mod tests {
         app.select_one((1, 0, 0));
         app.open_auto_editor(None);
         assert_eq!(
-            app.auto_edit.as_ref().unwrap().len_samples as i64,
+            app.auto_edit.as_ref().unwrap().len_samples,
             48_000,
             "with a selection the curve spans the SELECTED clip"
         );
