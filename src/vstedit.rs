@@ -1440,7 +1440,7 @@ unsafe fn root_window(d: *mut Display) -> XWindow {
 mod tests {
     use super::*;
 
-    /// Real-plugin editor smoke: loads amsynth (or any VST2 present),
+    /// Real-plugin editor smoke: loads the first VST2 present,
     /// opens its editor in a live X11 window, pumps idle, and verifies the
     /// plugin actually parented a window into our container. Gated on
     /// `SLOOPER_VST_SMOKE=1` + an installed plugin + DISPLAY, so CI skips
@@ -1456,8 +1456,8 @@ mod tests {
             return;
         }
         let cand = [
-            dirs_home().join(".vst/amsynth_vst.so"),
             dirs_home().join(".vst/wolf-shaper-vst.so"),
+            dirs_home().join(".vst/DragonflyHallReverb-vst.so"),
         ];
         let Some(path) = cand.iter().find(|p| p.exists()).cloned() else {
             eprintln!("skip: no known VST2 plugin installed");
@@ -1514,19 +1514,28 @@ mod tests {
         p.exists().then_some(p)
     }
 
-    /// v10.1 pin (amsynth blank-panel report): a plugin whose editor dies
-    /// mid-build — it throws `unordered_map::at` and its child window
+    /// v10.1 pin (originally the amsynth blank-panel report; that plugin
+    /// has since been REMOVED from this host, so this pin now needs an
+    /// explicit path): a plugin whose editor dies mid-build — child window
     /// stays 1x1 — must be REFUSED: container destroyed, thread exited,
     /// `open_failed` set so the UI falls back to sliders. The historical
     /// bug: the paint probe compared against black, and the container's
     /// own background counted as "painted", leaving a permanent blank,
-    /// uncloseable window.
+    /// uncloseable window. Set `SLOOPER_BROKEN_EDITOR=/path/to/plugin.so`
+    /// to run it against a known-broken editor; skipped otherwise.
     #[test]
     fn v101_vstedit_refuses_unpainted_editor() {
-        let Some(path) = smoke_gate(".vst/amsynth_vst.so") else {
-            eprintln!("skip: SLOOPER_VST_SMOKE=1 + ~/.vst/amsynth_vst.so required");
-            return;
+        let path = match std::env::var_os("SLOOPER_BROKEN_EDITOR").map(std::path::PathBuf::from) {
+            Some(p) if p.is_file() => p,
+            _ => {
+                eprintln!("skip: SLOOPER_BROKEN_EDITOR=<broken .so> required");
+                return;
+            }
         };
+        if std::env::var("SLOOPER_VST_SMOKE").unwrap_or_default() != "1" || !x11_available() {
+            eprintln!("skip: SLOOPER_VST_SMOKE=1 + X11 display required");
+            return;
+        }
         let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None)
             .expect("plugin loads");
         let entry = &load.entry;

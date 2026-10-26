@@ -11,7 +11,7 @@ use slooper::vsthost::{open, VstKind};
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/home/admin/.vst/amsynth_vst.so".to_string());
+        .unwrap_or_else(|| "/home/admin/.vst/wolf-shaper-vst.so".to_string());
     let load = open(Path::new(&path), VstKind::V2, 48_000, None)
         .unwrap_or_else(|e| panic!("open {path}: {e}"));
     let entry = load.entry;

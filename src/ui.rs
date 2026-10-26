@@ -760,6 +760,8 @@ pub struct App {
     track_synth_inst: Vec<Option<Arc<crate::audio::SynthHandle>>>,
     /// Track whose synth sliders window is open.
     synth_win: Option<usize>,
+    /// v17: track whose SYNTHS picker window is open (the ♪ chip).
+    synth_pick: Option<usize>,
     /// Open VST2 custom editor windows, keyed by track. Closing (button,
     /// window manager, or a plugin swap) dispatches `effEditClose` on the
     /// editor thread before the plugin may be unloaded (`src/vstedit.rs`).
@@ -1068,6 +1070,7 @@ impl App {
             track_synth_params,
             track_synth_inst,
             synth_win: None,
+            synth_pick: None,
             vst_editors: std::collections::HashMap::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
@@ -6759,6 +6762,10 @@ impl App {
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
         }
+        let sp = self.synth_pick;
+        if let Some(t) = sp {
+            synth_pick_window(ui, self, t);
+        }
         self.value_popups(ui);
     }
 
@@ -8023,11 +8030,13 @@ fn strip_fx_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
 }
 
 /// Synth-pick row of a mixer strip (also rendered inside the "more" menu).
+/// v17: the old ComboBox is gone — the ♪ chip opens the SYNTHS window
+/// (folder(s), kind-tagged list, border on the active synth), matching how
+/// the FX chip opens the chain window.
 fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
     // Per-track synthesizer for MIDI clips (default: bundled piano;
     // scanned VST instruments can be bound as "vst:<path>").
     let cur = app.track_synth[t].clone().unwrap_or_default();
-    let stems = app.synth_registry.stems();
     let show = if cur.is_empty() {
         "piano".to_string()
     } else if let Some((_, p)) = vst_synth_decode(&cur) {
@@ -8046,40 +8055,12 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
     } else {
         cur.clone()
     };
-    let mut rescan = false;
-    egui::ComboBox::from_id_salt(("synthpick", t))
-        .selected_text(RichText::new(format!("\u{266a} {show}")))
-        .show_ui(ui, |ui| {
-            let mut tmp = cur.clone();
-            ui.selectable_value(&mut tmp, String::new(), "default (piano)");
-            for stem in &stems {
-                ui.selectable_value(&mut tmp, stem.clone(), stem.as_str());
-            }
-            if !app.vst_scanned {
-                app.vst_rescan();
-            }
-            for e in app.vst_scan.clone() {
-                if !e.instrument || e.error.is_some() {
-                    continue;
-                }
-                let val = vst_synth_encode(e.kind, &e.path.to_string_lossy());
-                ui.selectable_value(&mut tmp, val, format!("\u{266a} {} (VSTi)", e.name));
-            }
-            if ui
-                .small_button("\u{21bb}")
-                .on_hover_text("Re-scan the synths folder")
-                .clicked()
-            {
-                rescan = true;
-            }
-            if tmp != cur {
-                // (set_track_synth_stem auto-opens the plugin's GUI)
-                app.set_track_synth_stem(t, &tmp);
-            }
-        });
-    if rescan {
-        app.synth_registry.rescan();
-        app.status = "synths re-scanned".into();
+    if ui
+        .small_button(RichText::new(format!("\u{266a} {show}")))
+        .on_hover_text("This track's synthesizer \u{2014} opens the synth picker")
+        .clicked()
+    {
+        app.synth_pick = Some(t);
     }
     if app.track_synth_inst[t].is_some() {
         // v0.11 R3: hosted plugins are plug-and-play -- this button
@@ -8102,6 +8083,175 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
             }
         }
     }
+}
+
+/// v17: the SYNTHS window — a simpler sibling of the mixer-chain window
+/// that replaces the old per-track synth ComboBox. It shows WHERE
+/// synthesizers live (the compiled-Rust-script folder and the plugin scan
+/// folders), lists every choice with a kind tag (`[rust]` for native synth
+/// scripts, `[vst2]`/`[vst3]` for plugin instruments), draws a BORDER
+/// around the one bound to this track, and binds on click (a plugin
+/// selection keeps the v0.10 standard: its own window opens with it).
+fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
+    if !app.vst_scanned && app.vst_scan_rx.is_none() {
+        app.vst_rescan();
+    }
+    let cur = app.track_synth[t].clone().unwrap_or_default();
+    let mut open = true;
+    egui::Window::new(RichText::new(format!("SYNTHS \u{2014} track {}", t + 1)).strong())
+        .open(&mut open)
+        .min_width(540.0)
+        .default_height(460.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Synthesizers (click binds to this track):").strong());
+            // (tag, label, stem-to-bind) for every choice: the default,
+            // every script synth, every scanned plugin instrument.
+            let mut rows: Vec<(&'static str, String, String)> =
+                vec![("rust", "piano \u{2014} default".to_string(), String::new())];
+            for stem in app.synth_registry.stems() {
+                if stem != "piano" {
+                    rows.push(("rust", stem.clone(), stem));
+                }
+            }
+            for e in app.vst_scan.iter() {
+                if !e.instrument || e.error.is_some() {
+                    continue;
+                }
+                let tag = if e.kind == crate::vsthost::VstKind::V2 { "vst2" } else { "vst3" };
+                rows.push((
+                    tag,
+                    format!("{} \u{2014} plugin instrument", e.name),
+                    vst_synth_encode(e.kind, &e.path.to_string_lossy()),
+                ));
+            }
+            let scanning = !app.vst_scanned || app.vst_scan_rx.is_some();
+            egui::ScrollArea::vertical()
+                .id_salt(("synthpicklist", t))
+                .max_height(190.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let full_w = ui.available_width();
+                    let n_rows = rows.len();
+                    let mut pick: Option<String> = None;
+                    for (tag, label, stem) in rows {
+                        let active = stem == cur;
+                        let txt = if active {
+                            RichText::new(format!("[{tag}]  {label}")).strong()
+                        } else {
+                            RichText::new(format!("[{tag}]  {label}"))
+                        };
+                        let resp = ui.add_sized(
+                            [full_w, 24.0],
+                            egui::Button::new(txt).frame(false),
+                        );
+                        if resp.clicked() && !active {
+                            pick = Some(stem);
+                        }
+                        if active {
+                            // THE marker: a border around the selected synth.
+                            let rect = resp.rect.expand(2.0);
+                            ui.painter().rect(
+                                rect,
+                                4.0,
+                                Color32::TRANSPARENT,
+                                egui::Stroke::new(1.6, Color32::from_rgb(120, 190, 255)),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                    }
+                    if n_rows <= 2 {
+                        ui.label(
+                            RichText::new(if scanning {
+                                "scanning plugin folders\u{2026}"
+                            } else {
+                                "(only script synths found \u{2014} drop a VST instrument into \
+                                 one of the folders below and press Rescan Plugins)"
+                            })
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    if let Some(stem) = pick {
+                        // set_track_synth_stem auto-opens the plugin's GUI
+                        // (v0.10 standard) and persists the binding.
+                        app.set_track_synth_stem(t, &stem);
+                    }
+                });
+            ui.label(
+                RichText::new(
+                    "[rust] native synth script (compiled Rust, in the script folder) \u{2014} \
+                     [vst2] / [vst3] plugin instrument (a `.so` in a plugin folder). A border \
+                     marks the synth this track is playing.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.separator();
+
+            // --- where synthesizers live ----------------------------------
+            ui.label(RichText::new("Synth script folder (native Rust):").strong());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(app.synth_registry.dir().display().to_string())
+                        .monospace()
+                        .small(),
+                );
+                if ui
+                    .small_button("Rescan scripts")
+                    .on_hover_text("Re-scan and re-compile the synth script folder")
+                    .clicked()
+                {
+                    app.synth_registry.rescan();
+                    app.status = "synths re-scanned".into();
+                }
+            });
+            if !fx::rustc_available() {
+                ui.label(
+                    RichText::new(
+                        "rustc is not on PATH \u{2014} synth scripts cannot compile. Install \
+                         Rust (rustup).",
+                    )
+                    .color(Color32::YELLOW),
+                );
+            }
+            ui.label(RichText::new("Plugin folders:").strong());
+            for d in crate::vsthost::default_vst_dirs() {
+                ui.label(
+                    RichText::new(d.display().to_string())
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
+            }
+            for d in &app.vst_dirs {
+                ui.label(
+                    RichText::new(d.as_str())
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Rescan Plugins")
+                    .on_hover_text("Scan the folders above for new plugins")
+                    .clicked()
+                {
+                    app.vst_rescan();
+                }
+                ui.label(
+                    RichText::new(
+                        "add your own folders to the list in the MIXER CHAIN window",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+            if !app.vst_note.is_empty() {
+                ui.label(RichText::new(&app.vst_note).weak().small());
+            }
+        });
+    app.synth_pick = if open { Some(t) } else { None };
 }
 
 /// The toolbar row above the timeline: quantize / snap controls, asset
@@ -15287,10 +15437,10 @@ mod tests {
         assert_ne!(app.synth_win, Some(0), "slider window for a script synth");
         assert!(app.track_synth_inst[0].is_some(), "script instance bound");
 
-        let plugin =
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".vst/amsynth_vst.so");
+        let plugin = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".vst/wolf-shaper-vst.so");
         if std::env::var_os("SLOOPER_VST_SMOKE").is_none() || !plugin.exists() {
-            eprintln!("skip: SLOOPER_VST_SMOKE unset or no amsynth");
+            eprintln!("skip: SLOOPER_VST_SMOKE unset or no wolf-shaper");
             return;
         }
         if std::env::var_os("DISPLAY").is_none() {
@@ -15327,6 +15477,181 @@ mod tests {
         // Unbinding retires the editor cleanly.
         app.set_track_synth_stem(0, "");
         assert!(app.vst_editors.is_empty(), "editor left open after unbind");
+    }
+
+    // ================= v17: SYNTHS picker window ======================
+    // (requirement list: scratch slooper-v17/REQUIREMENTS.md — a window,
+    // not a ComboBox: shows the synth folders, lists every synth kind-
+    // tagged ([rust] script vs [vst2]/[vst3] plugin), BORDER on active.)
+
+    /// Paint one frame; return (galley, rect) for every synth-list row
+    /// and every ACTIVE-marker border rect.
+    fn synth_window_shapes(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut texts = Vec::new();
+        let mut borders = Vec::new();
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let s = t.galley.text().to_string();
+                    if s.contains("[rust]") || s.contains("[vst3]") || s.contains("[vst2]") {
+                        texts.push((s, egui::Rect::from_min_size(t.pos, t.galley.rect.size())));
+                    }
+                }
+                egui::epaint::Shape::Rect(r) => {
+                    // The ACTIVE border color, possibly dimmed by the
+                    // window's fade-in animation (shapes are painted at
+                    // the layer's animated alpha) — compare un-premultiplied.
+                    if (r.stroke.width - 1.6).abs() < 0.01 {
+                        let p = r.stroke.color.to_array();
+                        if p[3] > 10
+                            && (p[0] as u32 * 255 / p[3] as u32).abs_diff(120) <= 12
+                            && (p[1] as u32 * 255 / p[3] as u32).abs_diff(190) <= 14
+                            && (p[2] as u32 * 255 / p[3] as u32).abs_diff(255) <= 14
+                        {
+                            borders.push(r.rect);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        (texts, borders)
+    }
+
+    fn fake_vsti() -> crate::vsthost::VstEntry {
+        crate::vsthost::VstEntry {
+            path: std::path::PathBuf::from("/nonexistent/fake-synth.vst3"),
+            kind: crate::vsthost::VstKind::V3,
+            name: "FakeSynth".into(),
+            vendor: "nosoft".into(),
+            instrument: true,
+            error: None,
+        }
+    }
+
+    /// v17: the ♪ chip on a mixer strip opens the SYNTHS window (the old
+    /// ComboBox is gone).
+    #[test]
+    fn v17_synth_chip_opens_picker_window() {
+        let mut app = headless_app("synthpick");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
+        frame(&mut app, &ctx, vec![moved(m)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, false)],
+        );
+        let c = label_center(&mut app, &ctx, "\u{266a} piano").expect("synth chip in the popup");
+        frame(&mut app, &ctx, vec![moved(c)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(c, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.synth_pick,
+            Some(0),
+            "the chip opens the SYNTHS window"
+        );
+    }
+
+    /// v17: the window lists script synths as `[rust]` and scanned plugin
+    /// instruments as `[vst3]`, and draws exactly one border — around the
+    /// ACTIVE synth (default: piano).
+    #[test]
+    fn v17_synth_window_lists_kinds_and_borders_active() {
+        let mut app = headless_app("synthwin");
+        let ctx = egui::Context::default();
+        app.vst_scanned = true; // no live scan in this pin
+        app.vst_scan = vec![fake_vsti()];
+        app.synth_pick = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let (texts, borders) = synth_window_shapes(&mut app, &ctx);
+        let has = |needle: &str| texts.iter().any(|(s, _)| s.contains(needle));
+        assert!(has("[rust]  piano"), "default synth listed as rust script");
+        assert!(has("sampler"), "script synth listed");
+        assert!(has("[vst3]  FakeSynth"), "plugin synth listed kind-tagged");
+        assert_eq!(borders.len(), 1, "exactly one ACTIVE border");
+        let piano = texts
+            .iter()
+            .find(|(s, _)| s.contains("piano"))
+            .map(|(_, r)| *r)
+            .expect("piano row");
+        assert!(
+            borders[0].contains(piano.center()),
+            "border marks the ACTIVE (default piano) row"
+        );
+    }
+
+    /// v17: clicking a plugin row BINDS it to the track, and the border
+    /// moves with it (active marker follows selection). The fake path
+    /// fails to load — the binding itself must still persist (the picker
+    /// never hides a broken-but-chosen synth; the status line reports it).
+    #[test]
+    fn v17_synth_window_click_binds_and_moves_border() {
+        let mut app = headless_app("synthbind");
+        let ctx = egui::Context::default();
+        app.vst_scanned = true;
+        app.vst_scan = vec![fake_vsti()];
+        app.synth_pick = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let d = galley_at(&mut app, &ctx, "FakeSynth")
+            .map(|r| r.center())
+            .expect("FakeSynth row painted");
+        frame(&mut app, &ctx, vec![moved(d)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.track_synth[0].as_deref(),
+            Some("vst3:/nonexistent/fake-synth.vst3"),
+            "row click binds the plugin synth (status: {})",
+            app.status
+        );
+        let (texts, borders) = synth_window_shapes(&mut app, &ctx);
+        assert_eq!(borders.len(), 1, "still exactly one ACTIVE border");
+        let row = texts
+            .iter()
+            .find(|(s, _)| s.contains("FakeSynth"))
+            .map(|(_, r)| *r)
+            .expect("FakeSynth row");
+        assert!(
+            borders[0].contains(row.center()),
+            "border moved to the newly-active plugin row"
+        );
     }
 
     // ================= v0.13 acceptance-criteria pins =====================
