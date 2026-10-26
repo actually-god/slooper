@@ -245,6 +245,15 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<VstEntry> {
                     continue;
                 }
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // v17: an already-instantiated, unchanged file is NOT probed
+                // again — creating (and worse, dropping) a second instance of
+                // a live library tears down the toolkit singletons the live
+                // instance still uses (the Vitalium crash). Reuse its identity.
+                if let Some(cached) = cached_entry(&p) {
+                    seen.push(p.clone());
+                    out.push(cached);
+                    continue;
+                }
                 if name.ends_with(".vst3") {
                     seen.push(p.clone());
                     out.push(probe_vst3(&p));
@@ -388,15 +397,33 @@ fn base_label(path: &Path) -> String {
 }
 
 fn probe_vst3(path: &Path) -> VstEntry {
+    // Never re-instantiate a live/unchanged library (see `cached_entry`).
+    if let Some(cached) = cached_entry(path) {
+        return cached;
+    }
     match vst3_host::discovery::get_plugin_info(path) {
         Ok(info) => {
             // Instrument or effect? Instantiate once (UI thread, scan only)
             // and look at the audio buses: a synth has no audio inputs.
-            let instrument = vst3_host::simple::load_plugin(path)
-                .ok()
-                .and_then(|p| p.bus_arrangements().ok())
-                .map(|b| b.inputs.is_empty())
-                .unwrap_or(false);
+            // v17: the probe instance is LEAKED, exactly like the VST2
+            // probe's documented rule — dropping it fires `deleteInstance`
+            // /terminate into the binary, and the one-shot process globals
+            // it tears down (JUCE singletons, DPF connection points) belong
+            // to every other instance of this plugin in the process: the
+            // Vitalium crash (delete-while-active warnings, then SEGV).
+            let mut instrument = false;
+            if let Ok(p) = vst3_host::simple::load_plugin(path) {
+                instrument =
+                    p.bus_arrangements().ok().map(|b| b.inputs.is_empty()).unwrap_or(false);
+                note_instantiated(
+                    path,
+                    VstKind::V3,
+                    info.name.clone(),
+                    info.vendor.clone(),
+                    instrument,
+                );
+                std::mem::forget(p);
+            }
             VstEntry {
                 path: path.to_path_buf(),
                 kind: VstKind::V3,
@@ -419,6 +446,10 @@ fn probe_vst3(path: &Path) -> VstEntry {
 
 fn probe_vst2(path: &Path) -> VstEntry {
     use vst2::plugin::Plugin;
+    // Never re-instantiate a live/unchanged library (see `cached_entry`).
+    if let Some(cached) = cached_entry(path) {
+        return cached;
+    }
     let probed = vst2::host::PluginLoader::load(path, Arc::new(Mutex::new(StubHost)))
         .map(|mut l| l.instance());
     match probed {
@@ -430,6 +461,13 @@ fn probe_vst2(path: &Path) -> VstEntry {
             // down editor machinery every LATER instance still uses: the next
             // effEditOpen dereferences freed C++ statics and dies (SIGSEGV
             // mid-editor-open). Read the metadata, then leak the instance.
+            note_instantiated(
+                path,
+                VstKind::V2,
+                info.name.clone(),
+                info.vendor.clone(),
+                info.inputs == 0,
+            );
             std::mem::forget(inst);
             VstEntry {
                 path: path.to_path_buf(),
@@ -651,6 +689,111 @@ pub fn vst_loader_lock() -> std::sync::MutexGuard<'static, ()> {
     VST_LOADER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// ---------------------------------------------------------------- loaded libs
+//
+// v17 (the Vitalium crash): plugin binaries carry one-shot PROCESS-GLOBAL
+// state (JUCE singletons, DPF connection points). Two host habits made that
+// state fatal:
+//   * `probe_vst3` DROPPED its probe instance on every scan —
+//     `deleteInstance`/terminate while other instances of the same library
+//     were live ("asked to delete component while audio processor still
+//     active") and tore down singletons the live instance still used;
+//   * `scan()` re-instantiated libraries that were ALREADY live (the bound
+//     synth), hitting `juce_Singleton` on the second creation (one Rescan
+//     with Vitalium bound printed ~57 000 JUCE assertion failures before
+//     the first use-after-free).
+// Fix: every successful instantiation records the file's identity here, and
+// a scan that finds an unchanged, already-instantiated file REUSES the
+// cached metadata instead of touching the library again. Probes never drop
+// what they create (the VST2 rule, extended to VST3).
+
+/// One already-instantiated library file.
+struct CachedLib {
+    mtime: std::time::SystemTime,
+    len: u64,
+    entry: VstEntry,
+}
+
+fn lib_cache() -> &'static Mutex<std::collections::BTreeMap<PathBuf, CachedLib>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::BTreeMap<PathBuf, CachedLib>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Instantiations performed by this process (pin v17: a re-scan of a
+/// live/unchanged library must NOT add one).
+static INSTANTIATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Instantiations performed so far — observability + test hook.
+pub fn instantiation_count() -> u64 {
+    INSTANTIATIONS.load(Ordering::Relaxed)
+}
+
+/// The real library file behind a scan target: a `.so` for itself, and for
+/// a bundle directory (`.vst3` or `Foo.vst`) the plugin `.so` inside it —
+/// a replaced plugin build rewrites THAT file, and only its identity tells
+/// us the cached entry went stale.
+fn lib_file_of(path: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    let mut best: Option<(PathBuf, u64)> = None;
+    let c = path.join("Contents");
+    if c.is_dir() {
+        for arch in std::fs::read_dir(&c).into_iter().flatten().flatten() {
+            let p = arch.path();
+            let cands: Vec<PathBuf> = if p.is_dir() {
+                std::fs::read_dir(&p)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|f| f.extension().map(|x| x == "so").unwrap_or(false))
+                    .collect()
+            } else if p.extension().map(|x| x == "so").unwrap_or(false) {
+                vec![p]
+            } else {
+                vec![]
+            };
+            for f in cands {
+                let len = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+                if best.as_ref().map(|(_, l)| len > *l).unwrap_or(true) {
+                    best = Some((f, len));
+                }
+            }
+        }
+    }
+    best.map(|(f, _)| f).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// File identity: a replaced build must be probed again.
+fn file_sig(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let md = std::fs::metadata(lib_file_of(path)).ok()?;
+    Some((md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len()))
+}
+
+/// Record a SUCCESSFUL instantiation (both opens, both probes). Failed
+/// loads are NOT recorded: a broken file is probed again at the next Rescan.
+fn note_instantiated(path: &Path, kind: VstKind, name: String, vendor: String, instrument: bool) {
+    INSTANTIATIONS.fetch_add(1, Ordering::Relaxed);
+    let Some((mtime, len)) = file_sig(path) else { return };
+    let entry =
+        VstEntry { path: path.to_path_buf(), kind, name, vendor, instrument, error: None };
+    if let Ok(mut c) = lib_cache().lock() {
+        c.insert(path.to_path_buf(), CachedLib { mtime, len, entry });
+    }
+}
+
+/// The entry for a file already instantiated in this process, unchanged
+/// since. `scan()` reuses it instead of instantiating the library again.
+fn cached_entry(path: &Path) -> Option<VstEntry> {
+    let (mtime, len) = file_sig(path)?;
+    let c = lib_cache().lock().ok()?;
+    let hit = c.get(path).filter(|c| c.mtime == mtime && c.len == len)?;
+    Some(hit.entry.clone())
+}
+
+
 // ---------------------------------------------------------------- GUI thread
 //
 // ONE thread owns every plugin *control-plane* call: instantiation,
@@ -661,8 +804,8 @@ pub fn vst_loader_lock() -> std::sync::MutexGuard<'static, ()> {
 // JUCE deferred every editor operation onto the (idle) load thread
 // forever: the child window appeared created-and-sized but never mapped,
 // and no VST2 GUI ever showed (the v10.2 "plugin GUIs don't work"
-// report — verified on this machine for wolf-shaper, Dragonfly and
-// amsynth: the identical open becomes painted-at-first-idle when load
+// report — verified on this machine for wolf-shaper and Dragonfly:
+// the identical open becomes painted-at-first-idle when load
 // and editOpen share a thread). Serializing instantiation AND all editor
 // dispatch on this thread makes every toolkit's affinity assumption
 // true by construction.
@@ -945,6 +1088,17 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     let out_ch = plugin.output_channel_count().max(1);
     // Checked before the plugin moves into the realtime runner.
     let has_editor = plugin.has_editor();
+    // v17: record this instantiation for the scan cache (see `cached_entry`).
+    {
+        let instrument = plugin
+            .audio_bus_layout()
+            .map(|l| l.inputs.is_empty())
+            .unwrap_or(false);
+        let vendor = vst3_host::discovery::get_plugin_info(path)
+            .map(|i| i.vendor)
+            .unwrap_or_default();
+        note_instantiated(path, VstKind::V3, plugin_name(path), vendor, instrument);
+    }
     plugin
         .start_processing()
         .map_err(|e| format!("start: {e}"))?;
@@ -991,6 +1145,14 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     inst.set_sample_rate(sample_rate as f32);
     inst.set_block_size(VST_BLOCK as i64);
     inst.resume();
+    // v17: record this instantiation for the scan cache (see `cached_entry`).
+    note_instantiated(
+        path,
+        VstKind::V2,
+        info.name.to_string(),
+        info.vendor.to_string(),
+        info.inputs == 0,
+    );
     let params_obj: Arc<dyn PluginParameters> = inst.get_parameter_object();
     let n = (info.parameters.max(0) as usize).min(VST_MAX_PARAMS);
     let descs: Vec<VstParamDesc> = (0..n)
@@ -1488,6 +1650,96 @@ mod tests {
         for e in &entries {
             assert!(e.path.extension().is_some());
         }
+    }
+
+    /// v17 pin (Vitalium crash, host side): a `scan()` must NEVER create a
+    /// second instance of a library this process already instantiated —
+    /// the shared toolkit singletons (JUCE/DPF) do not survive it, and the
+    /// old probe additionally DROPPED its instance (delete-while-active →
+    /// use-after-free: 57 000 assertion failures per Rescan with Vitalium
+    /// bound, then SIGSEGV). A re-scan of an unchanged, already-instantiated
+    /// file must reuse the cached identity with ZERO new instantiations.
+    #[test]
+    fn v17_rescan_never_reinstantiate_live_library() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let src = std::path::PathBuf::from(format!("{home}/.vst/wolf-shaper-vst.so"));
+        if !src.is_file() {
+            eprintln!("skip: no wolf-shaper VST2 on this host");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sp-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let so = dir.join("wolf-shaper-vst.so");
+        std::fs::copy(&src, &so).unwrap();
+
+        let n0 = instantiation_count();
+        let first = scan(std::slice::from_ref(&dir));
+        assert_eq!(instantiation_count(), n0 + 1, "first scan probes once");
+        let second = scan(std::slice::from_ref(&dir));
+        assert_eq!(
+            instantiation_count(),
+            n0 + 1,
+            "RE-scan of an unchanged, already-probed library must not instantiate again"
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].name, second[0].name);
+        assert_eq!(first[0].instrument, second[0].instrument);
+        assert!(!second[0].instrument, "wolf-shaper is an effect");
+
+        // The user's crash sequence: BIND (a live instance now exists),
+        // then re-scan the folder. Before the fix the re-scan re-probed the
+        // live library and dropped the probe mid-flight.
+        let load = open(&so, VstKind::V2, 48_000, None).expect("open wolf-shaper");
+        assert_eq!(instantiation_count(), n0 + 2, "the open instantiates once");
+        let third = scan(std::slice::from_ref(&dir));
+        assert_eq!(
+            instantiation_count(),
+            n0 + 2,
+            "re-scan while the library is BOUND must not instantiate at all"
+        );
+        assert_eq!(third[0].name, first[0].name);
+        std::mem::forget(load.entry); // probe rule: never drop plugin instances
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v17 pin (the exact user symptom): a Vitalium instance bound to a
+    /// track keeps making sound ACROSS a folder re-scan. Pre-fix the scan
+    /// deleted shared plugin state under the live instance (delete-while-
+    /// active warnings, then death). Skips without the plugin.
+    #[test]
+    fn v17_bound_instrument_survives_rescan() {
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let bundle = std::path::PathBuf::from(format!("{home}/.vst3/vitalium.vst3"));
+        if !bundle.is_dir() {
+            eprintln!("skip: no vitalium on this host");
+            return;
+        }
+        let load = open(&bundle, VstKind::V3, 48_000, None).expect("open vitalium");
+        let entry = load.entry;
+        let parent = bundle.parent().unwrap();
+        // The crash window: scan the folder WHILE this instance is live.
+        let entries = scan(&[parent.to_path_buf()]);
+        let me = entries.iter().find(|e| e.path == bundle);
+        assert!(me.is_some(), "the live plugin must still be listed");
+        assert!(me.unwrap().instrument, "cached identity: instrument");
+        // And it must STILL make sound.
+        entry.note_on(0, 60, 110);
+        let mut peak = 0.0f32;
+        let mut out = vec![0f32; 512];
+        let silence = [0f32; 512];
+        for _ in 0..120 {
+            entry.process(&silence, &mut out);
+            for x in out.iter() {
+                peak = peak.max(x.abs());
+            }
+        }
+        assert!(peak > 1e-4, "bound vitalium alive after re-scan, peak {peak}");
+        std::mem::forget(entry);
     }
 
     /// End-to-end against the local plugin folders when present: every
