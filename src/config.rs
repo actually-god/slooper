@@ -517,12 +517,15 @@ mod tests {
             track_synth: vec![None, Some("piano".into())],
             track_synth_params: vec![vec![], vec![0.2]],
             vst_dirs: vec!["/tmp/vst".into()],
-            track_vst: vec![None, Some(VstSave {
-                path: "/tmp/vst/thing.vst3".into(),
-                kind: "VST3".into(),
-                name: "Thing".into(),
-                params: vec![0.4],
-            })],
+            track_vst: vec![
+                None,
+                Some(VstSave {
+                    path: "/tmp/vst/thing.vst3".into(),
+                    kind: "VST3".into(),
+                    name: "Thing".into(),
+                    params: vec![0.4],
+                }),
+            ],
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -546,7 +549,10 @@ mod tests {
         assert_eq!(back.vst_dirs, cfg.vst_dirs);
         assert_eq!(back.track_vst.len(), 2);
         let v = back.track_vst[1].clone().unwrap();
-        assert_eq!((v.path.as_str(), v.kind.as_str(), v.params.as_slice()), ("/tmp/vst/thing.vst3", "VST3", &[0.4f32][..]));
+        assert_eq!(
+            (v.path.as_str(), v.kind.as_str(), v.params.as_slice()),
+            ("/tmp/vst/thing.vst3", "VST3", &[0.4f32][..])
+        );
         assert_eq!(back.trk_gain, cfg.trk_gain);
         assert_eq!(back.trk_pan, cfg.trk_pan);
         assert!(!back.preview_on, "preview toggle round-trips");

@@ -120,7 +120,8 @@ impl<'a> Event<'a> {
                     // We can safely cast the event pointer to a `SysExEvent` pointer as
                     // event_type refers to a `SysEx` type.
                     #[allow(clippy::cast_ptr_alignment)]
-                    let event: &api::SysExEvent = &*(event as *const api::Event as *const api::SysExEvent);
+                    let event: &api::SysExEvent =
+                        &*(event as *const api::Event as *const api::SysExEvent);
                     slice::from_raw_parts(event.system_data, event.data_size as usize)
                 },
 

@@ -85,7 +85,11 @@ fn main() {
         let t0 = Instant::now();
         for i in 0..n {
             let mut out = [0f32; 512];
-            let input = if i % 2 == 0 { [0.01f32; 512] } else { [-0.01f32; 512] };
+            let input = if i % 2 == 0 {
+                [0.01f32; 512]
+            } else {
+                [-0.01f32; 512]
+            };
             l.entry.process(&input, &mut out);
         }
         let secs = t0.elapsed().as_secs_f64();
@@ -122,7 +126,10 @@ fn main() {
                 gui_latency("VST2 + burst", 60, Duration::from_millis(4));
                 let t0 = Instant::now();
                 w.close();
-                println!("editor VST2 close: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+                println!(
+                    "editor VST2 close: {:.1} ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
             Err(e) => println!("editor VST2 open failed: {e}"),
         }
@@ -148,7 +155,10 @@ fn main() {
                 gui_latency("VST3 editor open", 60, Duration::from_millis(16));
                 let t0 = Instant::now();
                 w.close();
-                println!("editor VST3 close: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+                println!(
+                    "editor VST3 close: {:.1} ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
             }
             Err(e) => println!("editor VST3 open failed: {e}"),
         }
@@ -159,7 +169,8 @@ fn main() {
     for l in loads.iter().filter(|l| l.entry.has_editor()).take(2) {
         let w = if l.entry.kind() == VstKind::V2 {
             l.entry.vst2_handle().and_then(|h| {
-                slooper::vstedit::open_editor(&h, &l.entry.path().to_string_lossy(), "probe-both").ok()
+                slooper::vstedit::open_editor(&h, &l.entry.path().to_string_lossy(), "probe-both")
+                    .ok()
             })
         } else {
             l.entry.open_vst3_editor(48_000).ok()
@@ -170,7 +181,11 @@ fn main() {
     }
     if !keep.is_empty() {
         std::thread::sleep(Duration::from_millis(1500));
-        gui_latency(&format!("{} editors open", keep.len()), 60, Duration::from_millis(16));
+        gui_latency(
+            &format!("{} editors open", keep.len()),
+            60,
+            Duration::from_millis(16),
+        );
         for mut w in keep {
             w.close();
         }

@@ -88,8 +88,15 @@ fn main() {
                 }
             }
         };
-        println!("{verdict:9} {role:6} {:10} {:50} {detail}", format!("{kind:?}"), e.name);
+        println!(
+            "{verdict:9} {role:6} {:10} {:50} {detail}",
+            format!("{kind:?}"),
+            e.name
+        );
     }
-    println!("--- {} plugins audited, {fails} failure(s)", found.iter().filter(|e| e.error.is_none()).count());
+    println!(
+        "--- {} plugins audited, {fails} failure(s)",
+        found.iter().filter(|e| e.error.is_none()).count()
+    );
     std::process::exit(if fails > 0 { 1 } else { 0 });
 }

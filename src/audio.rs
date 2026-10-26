@@ -123,10 +123,14 @@ pub struct FxSlot {
 
 impl FxSlot {
     pub fn scripted(inst: Arc<crate::fx::Instance>, desc: crate::fx::EffectDesc) -> Self {
-        Self { kind: FxKind::Scripted { inst, desc } }
+        Self {
+            kind: FxKind::Scripted { inst, desc },
+        }
     }
     pub fn vst(entry: Arc<crate::vsthost::RtStageEntry>) -> Self {
-        Self { kind: FxKind::Vst(entry) }
+        Self {
+            kind: FxKind::Vst(entry),
+        }
     }
     pub fn is_vst(&self) -> bool {
         matches!(self.kind, FxKind::Vst(_))
@@ -1194,15 +1198,19 @@ impl Engine {
             // the live RT path uses the same span rule. Scripted-only chains
             // keep the historical per-clip phase-0 treatment.
             let span = chain.has_vst();
-            let mut trk: Vec<f32> = if span { vec![0.0f32; len.max(1)] } else { Vec::new() };
+            let mut trk: Vec<f32> = if span {
+                vec![0.0f32; len.max(1)]
+            } else {
+                Vec::new()
+            };
             let midi = self.midi();
             // MIDI clips first: the whole track's patterns through one fresh
             // synth, then through the same track FX + gain as audio clips.
-            if arr.tracks[t]
-                .lanes
-                .iter()
-                .any(|l| l.clips.iter().any(|c| matches!(midi.get(c.asset as usize), Some(Some(_)))))
-            {
+            if arr.tracks[t].lanes.iter().any(|l| {
+                l.clips
+                    .iter()
+                    .any(|c| matches!(midi.get(c.asset as usize), Some(Some(_))))
+            }) {
                 if let Some(h) = self.synth_for(t) {
                     let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
                     for lane in &arr.tracks[t].lanes {
@@ -1424,16 +1432,11 @@ impl Engine {
             // Same clip-pinned-at-pos mapping as live playback and
             // render_tracks; the selection window slices the output.
             let dstart = cl.pos as usize;
-            let dend = cl
-                .data_end(alen_u)
-                .min(cl.end(alen_u))
-                .min(cl.pos + alen_u) as usize;
+            let dend = cl.data_end(alen_u).min(cl.end(alen_u)).min(cl.pos + alen_u) as usize;
             let mut chunk: Vec<f32> = (dstart..dend)
                 .map(|k| data[(cl.cut + (k as u64 - cl.pos)) as usize])
                 .enumerate()
-                .map(|(j, x)| {
-                    mix(x) * cl.gain * cl.fade_at((dstart + j) as u64, alen_u)
-                })
+                .map(|(j, x)| mix(x) * cl.gain * cl.fade_at((dstart + j) as u64, alen_u))
                 .collect();
             if span {
                 // Fresh full-chain pass over this chunk (selection bounces
@@ -1732,7 +1735,7 @@ fn run(
                 engine.set_project(assets, arr, len);
             }
             Ok(Cmd::SetMidiAssets(midi)) => engine.set_midi_assets(midi),
-        Ok(Cmd::SetAutoAssets(auto)) => engine.set_auto_assets(auto),
+            Ok(Cmd::SetAutoAssets(auto)) => engine.set_auto_assets(auto),
             Ok(Cmd::SetTrackSynth { i, synth }) => {
                 engine.set_track_synth(i.min(MAX_LOOPS - 1), synth)
             }
@@ -2489,8 +2492,7 @@ impl Proc {
             // Transport stopped (or the pattern table went away) while
             // something was sounding: silence every voice once so nothing
             // leaks into the next run, and drop all sustain bookkeeping.
-            if self.midi_sustain.iter().any(|s| *s) || self.midi_ring_to.iter().any(|r| *r != 0)
-            {
+            if self.midi_sustain.iter().any(|s| *s) || self.midi_ring_to.iter().any(|r| *r != 0) {
                 for h in self.synths_cache.iter().flatten() {
                     h.all_off();
                 }
@@ -2530,7 +2532,12 @@ impl Proc {
             if !engine.track_on(t) {
                 continue;
             }
-            let handle = match synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone()) {
+            let handle = match synths_cache
+                .get(t)
+                .cloned()
+                .flatten()
+                .or_else(|| dflt.clone())
+            {
                 Some(i) => i,
                 None => continue, // no synth loaded at all: silence
             };
@@ -2873,7 +2880,9 @@ impl Proc {
         }
         let mut s = x;
         for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
-            let FxKind::Scripted { inst, .. } = &slot.kind else { continue };
+            let FxKind::Scripted { inst, .. } = &slot.kind else {
+                continue;
+            };
             let g = inst.param_gen();
             if g != rt.gen {
                 inst.read_params(&mut rt.p);
@@ -2892,7 +2901,9 @@ impl Proc {
     /// The dry input is already trim-scaled; pan/master are folded later.
     fn run_chain_block(&mut self, t: usize, buf: &mut [f32], tmp: &mut [f32]) {
         let n = buf.len().min(tmp.len());
-        let Self { fx_cache, fx_rt, .. } = self;
+        let Self {
+            fx_cache, fx_rt, ..
+        } = self;
         for (k, slot) in fx_cache[t].slots().iter().enumerate() {
             match &slot.kind {
                 FxKind::Scripted { inst, .. } => {
@@ -2936,7 +2947,8 @@ impl Proc {
                     let Some(Some(a)) = self.auto_cache.get(cl.asset as usize).cloned() else {
                         continue;
                     };
-                    let rel = (pos - cl.pos as i64 + cl.cut as i64).rem_euclid(a.len_samples.max(1));
+                    let rel =
+                        (pos - cl.pos as i64 + cl.cut as i64).rem_euclid(a.len_samples.max(1));
                     let v = a.eval(rel);
                     match a.target.as_str() {
                         crate::automation::TARGET_TRACK_VOL => out.vol[t] = Some(v),
@@ -2960,8 +2972,12 @@ impl Proc {
     /// target on track `t`. False for unknown or malformed ids.
     fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> bool {
         if let Some(idx) = target.strip_prefix("synth:") {
-            let Ok(idx) = idx.parse::<usize>() else { return false };
-            let Some(Some(handle)) = self.synths_cache.get(t).cloned() else { return false };
+            let Ok(idx) = idx.parse::<usize>() else {
+                return false;
+            };
+            let Some(Some(handle)) = self.synths_cache.get(t).cloned() else {
+                return false;
+            };
             match handle.as_ref() {
                 SynthHandle::Script(i) => i.set_param(idx, v),
                 SynthHandle::Vst(e) => e.set_param_rt(idx, v),
@@ -2969,12 +2985,18 @@ impl Proc {
             return true;
         }
         if let Some(rest) = target.strip_prefix("fx:") {
-            let Some((row_s, idx_s)) = rest.split_once(':') else { return false };
+            let Some((row_s, idx_s)) = rest.split_once(':') else {
+                return false;
+            };
             let (Ok(row), Ok(idx)) = (row_s.parse::<usize>(), idx_s.parse::<usize>()) else {
                 return false;
             };
-            let Some(tf) = self.fx_cache.get(t) else { return false };
-            let Some(slot) = tf.slots().get(row) else { return false };
+            let Some(tf) = self.fx_cache.get(t) else {
+                return false;
+            };
+            let Some(slot) = tf.slots().get(row) else {
+                return false;
+            };
             match &slot.kind {
                 FxKind::Scripted { inst, .. } => inst.set_param(idx, v),
                 FxKind::Vst(e) => e.set_param_rt(idx, v),
@@ -3189,8 +3211,8 @@ impl ProcessHandler for Proc {
             self.preview = snap;
             self.preview_cache_gen = pvg;
         }
-        self.preview_live = self.engine.preview_on.load(Ordering::Relaxed) != 0
-            && !self.preview_curs.is_empty();
+        self.preview_live =
+            self.engine.preview_on.load(Ordering::Relaxed) != 0 && !self.preview_curs.is_empty();
 
         // Per-track output trim (volume x gain, linear) snapshotted once per
         // cycle; applied to each clip's PLAYBACK contribution only, so the
@@ -3337,11 +3359,14 @@ impl ProcessHandler for Proc {
         // the manual control it targets (a curve wins over the knob it
         // rides while it sounds — FL semantics). Plugin-parameter targets
         // land directly on the live instances' atomics.
-        let auto = if transport { self.eval_automation(p0) } else { AutoOut::default() };
+        let auto = if transport {
+            self.eval_automation(p0)
+        } else {
+            AutoOut::default()
+        };
         for t in 0..MAX_LOOPS {
             if let Some(v) = auto.vol[t] {
-                amp[t] =
-                    v * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
+                amp[t] = v * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
             }
             if let Some(pn) = auto.pan[t] {
                 let (l, r) = pan_gains(pn);
@@ -3403,8 +3428,7 @@ impl ProcessHandler for Proc {
         }
         let ins = &in_bufs[..nin];
 
-        let g = f32::from_bits(self.gain.load(Ordering::Relaxed))
-            * auto.master_vol.unwrap_or(1.0);
+        let g = f32::from_bits(self.gain.load(Ordering::Relaxed)) * auto.master_vol.unwrap_or(1.0);
 
         // Metronome grid on the timeline: click k at timeline sample
         // `k * sub_len` (sub = clicks per beat). Track the grid index last
@@ -3494,7 +3518,12 @@ impl ProcessHandler for Proc {
             &vst_mask,
             &chain_mask,
         );
-        let MixLists { mix: mix_list, n_mix: nmix, acc: acc_list, n_acc: nacc } = lists;
+        let MixLists {
+            mix: mix_list,
+            n_mix: nmix,
+            acc: acc_list,
+            n_acc: nacc,
+        } = lists;
 
         // Per-block mix buffers (taken out of self so the sample loop can
         // call `&mut self` effect code freely; `clip_buf` uses the same trick).
@@ -3796,7 +3825,10 @@ impl ProcessHandler for Proc {
         // coarser than the block rate).
         self.engine.pos.store(self.pos, Ordering::Relaxed);
         self.engine.preview_pos.store(
-            self.preview_curs.last().map(|(_, i)| *i as u64).unwrap_or(0),
+            self.preview_curs
+                .last()
+                .map(|(_, i)| *i as u64)
+                .unwrap_or(0),
             Ordering::Relaxed,
         );
         self.peak.store(peak_val, Ordering::Relaxed);
@@ -4097,11 +4129,7 @@ mod tests {
         let a1: Arc<[f32]> = Arc::from(vec![0.25f32; 2000]);
         let mut arr = Arrangement::new();
         arr.insert(0, 0, Clip::new(0, 0));
-        arr.insert(
-            1,
-            0,
-            Clip::new(1, 1000),
-        );
+        arr.insert(1, 0, Clip::new(1, 1000));
         let e = Engine::new();
         e.set_project(Arc::new(vec![a0.clone(), a1.clone()]), Arc::new(arr), 4000);
         (e, a0, a1)
@@ -4266,7 +4294,11 @@ mod tests {
         e.play_preview(7, a.clone());
         e.play_preview(7, a);
         let snap = e.preview_snapshot();
-        assert_eq!(snap.len(), 2, "a repeat of the SAME asset stacks, never cuts off");
+        assert_eq!(
+            snap.len(),
+            2,
+            "a repeat of the SAME asset stacks, never cuts off"
+        );
         assert_ne!(snap[0].0, snap[1].0);
     }
 
@@ -4339,7 +4371,11 @@ mod tests {
     /// its play flag mutes it like any other track.
     #[test]
     fn v10_track_64_plays_and_mutes() {
-        let a: Arc<[f32]> = Arc::from((0..1000).map(|k| ((k % 40) as f32) * 0.01 - 0.2).collect::<Vec<f32>>());
+        let a: Arc<[f32]> = Arc::from(
+            (0..1000)
+                .map(|k| ((k % 40) as f32) * 0.01 - 0.2)
+                .collect::<Vec<f32>>(),
+        );
         let mut arr = Arrangement::new();
         arr.insert(64, 0, Clip::new(0, 0));
         let e = Engine::new();
@@ -4359,7 +4395,11 @@ mod tests {
     /// holds a MIDI clip elsewhere.
     #[test]
     fn v10_audio_clip_is_sample_only_midi_is_synth_only() {
-        let a: Arc<[f32]> = Arc::from((0..600).map(|k| (k as f32) * 0.001 - 0.3).collect::<Vec<f32>>());
+        let a: Arc<[f32]> = Arc::from(
+            (0..600)
+                .map(|k| (k as f32) * 0.001 - 0.3)
+                .collect::<Vec<f32>>(),
+        );
         // Pattern asset (id 1) on track 2: the SAMPLE path must ignore it
         // entirely — pattern audio comes only through the track's synth,
         // which the head render never runs.
@@ -4368,7 +4408,11 @@ mod tests {
         arr.insert(1, 0, Clip::new(0, 0));
         arr.insert(2, 0, Clip::new(1, 0));
         let e = Engine::new();
-        e.set_project(Arc::new(vec![a.clone(), Arc::from(Vec::<f32>::new())]), Arc::new(arr), 600);
+        e.set_project(
+            Arc::new(vec![a.clone(), Arc::from(Vec::<f32>::new())]),
+            Arc::new(arr),
+            600,
+        );
         e.set_midi_assets(Arc::new(vec![None, Some(std::sync::Arc::new(pat))]));
         let out = e.render_project().expect("render");
         assert_eq!(out.len(), 600);
@@ -4384,12 +4428,17 @@ mod tests {
         arr2.insert(2, 0, Clip::new(1, 0));
         let e2 = Engine::new();
         e2.set_project(Arc::new(vec![a]), Arc::new(arr2), 600);
-        e2.set_midi_assets(Arc::new(vec![None, Some(std::sync::Arc::new(crate::midipat::Pattern::new(120)))]));
+        e2.set_midi_assets(Arc::new(vec![
+            None,
+            Some(std::sync::Arc::new(crate::midipat::Pattern::new(120))),
+        ]));
         let out = e2.render_project().unwrap_or_default();
         let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
-        assert!(peak < 1e-9, "a MIDI clip never renders raw samples (peak {peak})");
+        assert!(
+            peak < 1e-9,
+            "a MIDI clip never renders raw samples (peak {peak})"
+        );
     }
-
 
     /// AC1.3: the full user flow with NO re-selection ritual: bind a fresh
     /// sampler to asset id 2, play a note (must sound); then the user drags
@@ -4404,8 +4453,9 @@ mod tests {
         std::env::remove_var("SLOOPER_SYNTHS_DIR");
 
         let table = |v: f32| {
-            let mut t: Vec<crate::assets::AssetData> =
-                (0..3).map(|_| std::sync::Arc::from(Vec::<f32>::new())).collect();
+            let mut t: Vec<crate::assets::AssetData> = (0..3)
+                .map(|_| std::sync::Arc::from(Vec::<f32>::new()))
+                .collect();
             t[2] = std::sync::Arc::from(vec![v; 1200]);
             std::sync::Arc::new(t)
         };
@@ -4451,5 +4501,4 @@ mod tests {
         e.stop_preview_id(99); // unknown id: no-op, never panics
         assert_eq!(e.preview_snapshot().len(), 1);
     }
-
 }

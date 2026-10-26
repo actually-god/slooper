@@ -134,7 +134,9 @@ impl Pattern {
     pub fn save_mid(&self, path: &Path) -> Result<(), String> {
         let mut tr: Vec<u8> = Vec::new();
         // Tempo: microseconds per quarter note.
-        let us = (60_000_000u32 / self.bpm.max(1) as u32).max(1).to_be_bytes();
+        let us = (60_000_000u32 / self.bpm.max(1) as u32)
+            .max(1)
+            .to_be_bytes();
         tr.extend_from_slice(&vlq(0));
         // SMF tempo = 3 big-endian bytes (drop the top byte, keep [1..4]).
         tr.extend_from_slice(&[0xFF, 0x51, 0x03, us[1], us[2], us[3]]);
@@ -149,7 +151,10 @@ impl Pattern {
         // Flatten to (tick, event-bytes) and diff-sort.
         let mut ev: Vec<(u32, Vec<u8>)> = Vec::new();
         for n in &self.notes {
-            ev.push((n.start, vec![0x90 | n.ch & 0xF, n.note & 0x7F, n.vel.clamp(1, 127)]));
+            ev.push((
+                n.start,
+                vec![0x90 | n.ch & 0xF, n.note & 0x7F, n.vel.clamp(1, 127)],
+            ));
             ev.push((
                 (n.start + n.len.max(1)).min(u32::MAX - 1),
                 vec![0x80 | n.ch & 0xF, n.note & 0x7F, n.vel / 2],
@@ -296,7 +301,12 @@ impl Pattern {
                         if p + 2 > end {
                             break;
                         }
-                        pat.ccs.push(Cc { ch, num: b[p], val: b[p + 1], at: tick });
+                        pat.ccs.push(Cc {
+                            ch,
+                            num: b[p],
+                            val: b[p + 1],
+                            at: tick,
+                        });
                         p += 2;
                         running = st;
                     }
@@ -304,7 +314,11 @@ impl Pattern {
                         if p >= end {
                             break;
                         }
-                        pat.press.push(Press { ch, val: b[p], at: tick });
+                        pat.press.push(Press {
+                            ch,
+                            val: b[p],
+                            at: tick,
+                        });
                         p += 1;
                         running = st;
                     }
@@ -371,7 +385,9 @@ impl Pattern {
             }
         }
         pat.sort();
-        if pat.len_ticks == 0 || pat.len_ticks < pat.notes.iter().map(|n| n.start + n.len).max().unwrap_or(0) {
+        if pat.len_ticks == 0
+            || pat.len_ticks < pat.notes.iter().map(|n| n.start + n.len).max().unwrap_or(0)
+        {
             pat.quantize_grid(1, false);
         }
         Ok(pat)
@@ -408,10 +424,33 @@ mod tests {
     #[test]
     fn pattern_roundtrips_through_smf() {
         let mut p = Pattern::new(96);
-        p.notes.push(Note { ch: 0, note: 60, vel: 100, press: 40, start: 0, len: 240 });
-        p.notes.push(Note { ch: 1, note: 67, vel: 80, press: 0, start: 240, len: 240 });
-        p.ccs.push(Cc { ch: 0, num: 7, val: 90, at: 120 });
-        p.press.push(Press { ch: 1, val: 40, at: 200 });
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 40,
+            start: 0,
+            len: 240,
+        });
+        p.notes.push(Note {
+            ch: 1,
+            note: 67,
+            vel: 80,
+            press: 0,
+            start: 240,
+            len: 240,
+        });
+        p.ccs.push(Cc {
+            ch: 0,
+            num: 7,
+            val: 90,
+            at: 120,
+        });
+        p.press.push(Press {
+            ch: 1,
+            val: 40,
+            at: 200,
+        });
         p.len_ticks = 960;
         let dir = std::env::temp_dir().join("sp-midipat-rt");
         std::fs::create_dir_all(&dir).unwrap();
@@ -440,7 +479,14 @@ mod tests {
     #[test]
     fn quantize_snaps_and_extends_to_whole_bars() {
         let mut p = Pattern::new(120);
-        p.notes.push(Note { ch: 0, note: 60, vel: 90, press: 0, start: 100, len: 300 });
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 90,
+            press: 0,
+            start: 100,
+            len: 300,
+        });
         p.quantize_grid(PPQ as u32 / 4, true);
         let n = &p.notes[0];
         assert_eq!(n.start % (PPQ as u32 / 4), 0);
@@ -455,8 +501,8 @@ mod tests {
         let mut trk: Vec<u8> = Vec::new();
         trk.extend_from_slice(&[0x00, 0x90, 60, 100]); // C-3 on
         trk.extend_from_slice(&[0x00, 0xE0, 0x40, 0x20]); // pitch bend (2 bytes!)
-        // explicit note-on at 16 (a mis-sized pitch-bend skip would
-        // consume THIS status byte), then running-status note-off
+                                                          // explicit note-on at 16 (a mis-sized pitch-bend skip would
+                                                          // consume THIS status byte), then running-status note-off
         trk.extend_from_slice(&[0x10, 0x90, 61, 100]);
         trk.extend_from_slice(&[0x00, 61, 0x00]);
         trk.extend_from_slice(&[0x00, 0xA0, 60, 50]); // poly aftertouch (2 bytes)

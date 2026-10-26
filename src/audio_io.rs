@@ -24,8 +24,9 @@ use symphonia::core::probe::Hint;
 /// enabled symphonia decoders handle (see Cargo.toml features). The dialog
 /// filter and the probe hint both come from this list, so a format is never
 /// offered unless it can actually be decoded.
-pub const IMPORT_EXTENSIONS: &[&str] =
-    &["wav", "mp3", "ogg", "oga", "flac", "m4a", "aac", "aiff", "aif"];
+pub const IMPORT_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "ogg", "oga", "flac", "m4a", "aac", "aiff", "aif",
+];
 
 /// Export formats. WAV/FLAC are pure-Rust; MP3/OGG need a system ffmpeg.
 #[derive(Clone, Copy, PartialEq)]
@@ -74,7 +75,12 @@ pub fn decode_to_mono(path: &Path, target_rate: u32) -> Result<Vec<f32>, String>
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| format!("unsupported or corrupt audio file: {e}"))?;
     let mut format = probed.format;
 
@@ -216,8 +222,8 @@ fn write_wav(path: &Path, rate: u32, samples: &[f32]) -> Result<(), String> {
 fn write_flac(path: &Path, rate: u32, samples: &[f32]) -> Result<(), String> {
     let pcm = to_i16(samples);
     let plane: Vec<i32> = pcm.iter().map(|&s| s as i32).collect();
-    let mut enc = rusty_flac::Encoder::new(rate, 1, 16)
-        .map_err(|e| format!("flac encoder init: {e:?}"))?;
+    let mut enc =
+        rusty_flac::Encoder::new(rate, 1, 16).map_err(|e| format!("flac encoder init: {e:?}"))?;
     enc.push_planar(&[&plane])
         .map_err(|e| format!("flac encode: {e:?}"))?;
     let bytes = enc.finish();
@@ -279,23 +285,25 @@ mod tests {
         // decode back to roughly the same length — this is what the GUI's
         // Export button ultimately relies on.
         let sr = 48_000;
-        let samples: Vec<f32> =
-            (0..sr).map(|n| (n as f32 * 0.0914).sin() * 0.5).collect();
+        let samples: Vec<f32> = (0..sr).map(|n| (n as f32 * 0.0914).sin() * 0.5).collect();
         let path = tmp_stem("wav");
         export(&path, sr, &samples, ExportFormat::Wav).expect("wav export");
         let file = path.with_extension("wav");
         let bytes = std::fs::read(&file).expect("wav file must exist on disk");
         assert!(bytes.starts_with(b"RIFF"), "must be a RIFF container");
         let mono = decode_to_mono(&file, sr).expect("exported wav must decode back");
-        assert!((mono.len() as i64 - sr as i64).abs() <= 1, "decoded length {:?}", mono.len());
+        assert!(
+            (mono.len() as i64 - sr as i64).abs() <= 1,
+            "decoded length {:?}",
+            mono.len()
+        );
         let _ = std::fs::remove_file(&file);
     }
 
     #[test]
     fn export_flac_writes_file() {
         let sr = 48_000;
-        let samples: Vec<f32> =
-            (0..sr).map(|n| (n as f32 * 0.0914).sin() * 0.5).collect();
+        let samples: Vec<f32> = (0..sr).map(|n| (n as f32 * 0.0914).sin() * 0.5).collect();
         let path = tmp_stem("flac");
         export(&path, sr, &samples, ExportFormat::Flac).expect("flac export");
         let file = path.with_extension("flac");

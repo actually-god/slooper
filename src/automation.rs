@@ -89,8 +89,16 @@ impl Automation {
             target: target.into(),
             len_samples: len,
             nodes: vec![
-                Node { t: 0, v, s: Shape::Linear },
-                Node { t: len, v, s: Shape::Linear },
+                Node {
+                    t: 0,
+                    v,
+                    s: Shape::Linear,
+                },
+                Node {
+                    t: len,
+                    v,
+                    s: Shape::Linear,
+                },
             ],
         }
     }
@@ -107,15 +115,30 @@ impl Automation {
         self.nodes.sort_by_key(|n| n.t);
         self.nodes.dedup_by(|a, b| a.t == b.t);
         if self.nodes.is_empty() {
-            self.nodes.push(Node { t: 0, v: 0.0, s: Shape::Linear });
+            self.nodes.push(Node {
+                t: 0,
+                v: 0.0,
+                s: Shape::Linear,
+            });
         }
         if self.nodes.len() == 1 {
             let v = self.nodes[0].v;
-            self.nodes.push(Node { t: self.len_samples, v, s: Shape::Linear });
+            self.nodes.push(Node {
+                t: self.len_samples,
+                v,
+                s: Shape::Linear,
+            });
         }
         if self.nodes[0].t != 0 {
             let v = self.nodes[0].v;
-            self.nodes.insert(0, Node { t: 0, v, s: Shape::Linear });
+            self.nodes.insert(
+                0,
+                Node {
+                    t: 0,
+                    v,
+                    s: Shape::Linear,
+                },
+            );
         }
         let _ = (min_t, max_v);
     }
@@ -242,15 +265,27 @@ mod tests {
 
     fn auto(nodes: Vec<Node>) -> Automation {
         let len = nodes.last().map(|n| n.t.max(1)).unwrap_or(1);
-        Automation { target: "track.vol".into(), len_samples: len, nodes }
+        Automation {
+            target: "track.vol".into(),
+            len_samples: len,
+            nodes,
+        }
     }
 
     #[test]
     fn v11_eval_linear_interpolates_absolute_values() {
         // volume ramp 0.2 -> 1.7 over 1000 samples: absolute, not %.
         let a = auto(vec![
-            Node { t: 0, v: 0.2, s: Shape::Linear },
-            Node { t: 1000, v: 1.7, s: Shape::Linear },
+            Node {
+                t: 0,
+                v: 0.2,
+                s: Shape::Linear,
+            },
+            Node {
+                t: 1000,
+                v: 1.7,
+                s: Shape::Linear,
+            },
         ]);
         assert!((a.eval(0) - 0.2).abs() < 1e-6);
         assert!((a.eval(500) - 0.95).abs() < 1e-4, "mid {}", a.eval(500));
@@ -273,9 +308,21 @@ mod tests {
     #[test]
     fn v11_node_lookup_hits_exact_and_bisects() {
         let a = auto(vec![
-            Node { t: 0, v: 0.0, s: Shape::Linear },
-            Node { t: 100, v: 1.0, s: Shape::Linear },
-            Node { t: 200, v: 0.5, s: Shape::Linear },
+            Node {
+                t: 0,
+                v: 0.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: 100,
+                v: 1.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: 200,
+                v: 0.5,
+                s: Shape::Linear,
+            },
         ]);
         assert_eq!(a.eval(100), 1.0);
         assert!((a.eval(150) - 0.75).abs() < 1e-5);
@@ -286,18 +333,36 @@ mod tests {
         // R4 semantics: a clip window CLIPS the curve; half-length clips
         // still see the ORIGINAL ramp, and the curve repeats per asset len.
         let a = auto(vec![
-            Node { t: 0, v: 0.0, s: Shape::Linear },
-            Node { t: 1000, v: 1.0, s: Shape::Linear },
+            Node {
+                t: 0,
+                v: 0.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: 1000,
+                v: 1.0,
+                s: Shape::Linear,
+            },
         ]);
         assert!((a.eval_at(0, 500, 0, 500) - 0.5).abs() < 1e-5);
-        assert!((a.eval_at(0, 1000, 0, 1000) - 0.0).abs() < 1e-5, "wraps at the asset len");
-        assert!((a.eval_at(10, 610, 100, 400) - 0.7).abs() < 1e-5, "cut shifts the window");
+        assert!(
+            (a.eval_at(0, 1000, 0, 1000) - 0.0).abs() < 1e-5,
+            "wraps at the asset len"
+        );
+        assert!(
+            (a.eval_at(10, 610, 100, 400) - 0.7).abs() < 1e-5,
+            "cut shifts the window"
+        );
     }
 
     #[test]
     fn v11_json_roundtrip_and_flat() {
         let mut a = Automation::flat("track.pan", -0.25, 2400);
-        a.nodes.push(Node { t: 1200, v: 0.5, s: Shape::Smooth });
+        a.nodes.push(Node {
+            t: 1200,
+            v: 0.5,
+            s: Shape::Smooth,
+        });
         a.normalize(0, f32::INFINITY);
         let j = a.to_json().unwrap();
         let b = Automation::from_json(&j).unwrap();
@@ -311,7 +376,11 @@ mod tests {
         let mut a = Automation {
             target: "track.vol".into(),
             len_samples: 100,
-            nodes: vec![Node { t: 50, v: 0.5, s: Shape::Linear }],
+            nodes: vec![Node {
+                t: 50,
+                v: 0.5,
+                s: Shape::Linear,
+            }],
         };
         a.normalize(0, f32::INFINITY);
         // Endpoints pinned; the user node at 50 is kept (it is flat there,

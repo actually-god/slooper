@@ -141,7 +141,13 @@ pub fn sanitize_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()
-        .map(|c| if c.is_control() || c == '/' || c == '\\' { '-' } else { c })
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ').to_string();
     if cleaned.is_empty() {
@@ -181,12 +187,20 @@ pub fn load(path: &Path) -> Result<Project, String> {
 /// All project files in `dir` (newest first); empty when the dir is missing.
 pub fn list_projects(dir: &Path) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, std::time::SystemTime, PathBuf)> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) == Some(EXT) {
-            let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let name = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mtime = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
             out.push((name, mtime, p));
         }
     }
@@ -223,19 +237,45 @@ mod tests {
             format: FORMAT.into(),
             version: VERSION,
             name: "demo".into(),
-            metro: ProjMetro { bpm: 96, num: 6, sub: 3 },
-            quantize: ProjQuantize { q_sub: 4, snap_sub: 2, auto: true, loop_tl: false },
+            metro: ProjMetro {
+                bpm: 96,
+                num: 6,
+                sub: 3,
+            },
+            quantize: ProjQuantize {
+                q_sub: 4,
+                snap_sub: 2,
+                auto: true,
+                loop_tl: false,
+            },
             playhead: 12_345,
             tracks: vec![ProjTrack {
                 vol: 100,
                 gain: 80,
                 pan: 64,
                 on: true,
-                fx: vec![TrackFxSave { stem: "template".into(), params: vec![1.0] }],
+                fx: vec![TrackFxSave {
+                    stem: "template".into(),
+                    params: vec![1.0],
+                }],
                 chain: Vec::new(),
-                lanes: vec![vec![ProjClip { asset: 0, pos: 0, cut: 0, play_len: None, gain: 1.0, fade_in: 0, fade_out: 0 }], vec![]],
+                lanes: vec![
+                    vec![ProjClip {
+                        asset: 0,
+                        pos: 0,
+                        cut: 0,
+                        play_len: None,
+                        gain: 1.0,
+                        fade_in: 0,
+                        fade_out: 0,
+                    }],
+                    vec![],
+                ],
             }],
-            assets: vec![ProjAsset { name: "kick".into(), file: "/x/kick.wav".into() }],
+            assets: vec![ProjAsset {
+                name: "kick".into(),
+                file: "/x/kick.wav".into(),
+            }],
             track_synths: vec![Some("piano".into())],
             track_synth_params: vec![vec![0.5]],
         }
@@ -273,14 +313,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sp-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("old.slooper");
-        std::fs::write(&p, r#"{"format":"slooper-project","version":1,"name":"old",
+        std::fs::write(
+            &p,
+            r#"{"format":"slooper-project","version":1,"name":"old",
             "metro":{"bpm":120,"num":4,"sub":3},
             "quantize":{"q_sub":3,"snap_sub":3,"auto":false,"loop_tl":true},
             "playhead":0,
             "tracks":[{"vol":127,"gain":80,"pan":64,"on":true,"fx":[],"lanes":[[],[]]}],
-            "n_tracks":null,"assets":[]}"#).unwrap();
+            "n_tracks":null,"assets":[]}"#,
+        )
+        .unwrap();
         let loaded = load(&p).unwrap();
-        assert_eq!(loaded.tracks[0].vol, crate::ui::VOL_UNITY_MIDI, "127 -> 0 dB");
+        assert_eq!(
+            loaded.tracks[0].vol,
+            crate::ui::VOL_UNITY_MIDI,
+            "127 -> 0 dB"
+        );
         assert_eq!(loaded.tracks[0].gain, 80, "gain domain unchanged");
         assert_eq!(loaded.tracks[0].pan, 64);
         // Future versions are still refused.
@@ -323,7 +371,10 @@ mod tests {
         assert_eq!(sanitize_name("   "), "project");
         assert_eq!(sanitize_name("../../etc/passwd"), "-..-etc-passwd");
         let p = project_path(Path::new("/p"), "two words");
-        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "two words.slooper");
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            "two words.slooper"
+        );
 
         // list_projects: only .slooper files, and a missing dir is empty.
         let dir = std::env::temp_dir().join(format!("sp-list-{}", std::process::id()));

@@ -85,14 +85,20 @@ fn main() {
         }
     }
     if !connected {
-        eprintln!(
-            "could not connect {src_name}:midi_out -> {target}: {last_err:?}"
-        );
+        eprintln!("could not connect {src_name}:midi_out -> {target}: {last_err:?}");
         std::process::exit(1);
     }
 
     let sent = Arc::new(AtomicU64::new(0));
-    let active = client.activate_async((), Src { out, sent: sent.clone() }).unwrap();
+    let active = client
+        .activate_async(
+            (),
+            Src {
+                out,
+                sent: sent.clone(),
+            },
+        )
+        .unwrap();
     eprintln!(
         "sinco_emu: {src_name}:midi_out -> {} (PC 1/2 on ch 0-3, {} messages per cycle)",
         target,

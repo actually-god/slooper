@@ -87,7 +87,15 @@ fn main() {
     }
 
     let sent = Arc::new(AtomicU64::new(0));
-    let active = client.activate_async((), Src { out, sent: sent.clone() }).unwrap();
+    let active = client
+        .activate_async(
+            (),
+            Src {
+                out,
+                sent: sent.clone(),
+            },
+        )
+        .unwrap();
 
     eprintln!(
         "midi_tester: {src_name}:midi_out -> {} ({} messages per cycle)",

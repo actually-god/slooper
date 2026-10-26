@@ -106,11 +106,21 @@ where
     type Item = (&'b [T], &'b mut [T]);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.audio_buffer.inputs.len() && self.index < self.audio_buffer.outputs.len() {
-            let input =
-                unsafe { slice::from_raw_parts(self.audio_buffer.inputs[self.index], self.audio_buffer.samples) };
-            let output =
-                unsafe { slice::from_raw_parts_mut(self.audio_buffer.outputs[self.index], self.audio_buffer.samples) };
+        if self.index < self.audio_buffer.inputs.len()
+            && self.index < self.audio_buffer.outputs.len()
+        {
+            let input = unsafe {
+                slice::from_raw_parts(
+                    self.audio_buffer.inputs[self.index],
+                    self.audio_buffer.samples,
+                )
+            };
+            let output = unsafe {
+                slice::from_raw_parts_mut(
+                    self.audio_buffer.outputs[self.index],
+                    self.audio_buffer.samples,
+                )
+            };
             let val = (input, output);
             self.index += 1;
             Some(val)
@@ -430,7 +440,11 @@ impl SendEventBuffer {
     /// # }
     /// ```
     #[inline(always)]
-    pub fn send_events<T: IntoIterator<Item = U>, U: WriteIntoPlaceholder>(&mut self, events: T, host: &mut dyn Host) {
+    pub fn send_events<T: IntoIterator<Item = U>, U: WriteIntoPlaceholder>(
+        &mut self,
+        events: T,
+        host: &mut dyn Host,
+    ) {
         self.store_events(events);
         host.process_events(self.events());
     }
@@ -504,14 +518,18 @@ mod tests {
 
         let inputs = vec![in1.as_ptr(), in2.as_ptr()];
         let mut outputs = vec![out1.as_mut_ptr(), out2.as_mut_ptr()];
-        let mut buffer = unsafe { AudioBuffer::from_raw(2, 2, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
+        let mut buffer =
+            unsafe { AudioBuffer::from_raw(2, 2, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
 
         for (input, output) in buffer.zip() {
-            input.iter().zip(output.iter_mut()).fold(0, |acc, (input, output)| {
-                assert_eq!(*input, acc as f32);
-                assert_eq!(*output, 0.0);
-                acc + 1
-            });
+            input
+                .iter()
+                .zip(output.iter_mut())
+                .fold(0, |acc, (input, output)| {
+                    assert_eq!(*input, acc as f32);
+                    assert_eq!(*output, 0.0);
+                    acc + 1
+                });
         }
     }
 
@@ -528,7 +546,8 @@ mod tests {
 
         let inputs = vec![in1.as_ptr(), in2.as_ptr()];
         let mut outputs = vec![out1.as_mut_ptr(), out2.as_mut_ptr(), out3.as_mut_ptr()];
-        let mut buffer = unsafe { AudioBuffer::from_raw(2, 3, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
+        let mut buffer =
+            unsafe { AudioBuffer::from_raw(2, 3, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
 
         let mut iter = buffer.zip();
         if let Some((observed_in1, observed_out1)) = iter.next() {
@@ -561,7 +580,8 @@ mod tests {
 
         let inputs = vec![in1.as_ptr(), in2.as_ptr(), in3.as_ptr()];
         let mut outputs = vec![out1.as_mut_ptr(), out2.as_mut_ptr()];
-        let mut buffer = unsafe { AudioBuffer::from_raw(3, 2, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
+        let mut buffer =
+            unsafe { AudioBuffer::from_raw(3, 2, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
 
         let mut iter = buffer.zip();
 
@@ -593,14 +613,18 @@ mod tests {
 
         let inputs = vec![in1.as_ptr(), in2.as_ptr()];
         let mut outputs = vec![out1.as_mut_ptr(), out2.as_mut_ptr()];
-        let mut buffer = unsafe { AudioBuffer::from_raw(2, 2, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
+        let mut buffer =
+            unsafe { AudioBuffer::from_raw(2, 2, inputs.as_ptr(), outputs.as_mut_ptr(), SIZE) };
 
         for (input, output) in buffer.zip() {
-            input.iter().zip(output.iter_mut()).fold(0, |acc, (input, output)| {
-                assert_eq!(*input, acc as f32);
-                assert_eq!(*output, 0.0);
-                acc + 1
-            });
+            input
+                .iter()
+                .zip(output.iter_mut())
+                .fold(0, |acc, (input, output)| {
+                    assert_eq!(*input, acc as f32);
+                    assert_eq!(*output, 0.0);
+                    acc + 1
+                });
         }
     }
 }
