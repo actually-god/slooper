@@ -5382,11 +5382,28 @@ impl App {
         if roll_closed {
             self.piano_roll = None;
         }
+        // v0.15 bug hunt: the automation manager holds an asset id too.
+        // Without this, deleting ANY earlier asset made overwrite-save
+        // write into the wrong asset; deleting its own asset left the
+        // editor saving nowhere at all.
+        let mut mgr_closed = false;
+        if let Some(ed) = self.auto_edit.as_mut() {
+            match ed.asset {
+                Some(id) if id == k => mgr_closed = true,
+                Some(id) if id > k => ed.asset = Some(id - 1),
+                _ => {}
+            }
+        }
+        if mgr_closed {
+            self.auto_edit = None;
+        }
         // An in-flight audition may reference the dead id; the name-based
         // toggle would stop a DIFFERENT asset's preview on the next click.
         self.preview_playing = None;
         self.push_project();
-        self.status = if roll_closed {
+        self.status = if mgr_closed {
+            "asset removed (its clips too); automation manager closed with it".into()
+        } else if roll_closed {
             "asset removed (its clips too); piano roll closed with it".into()
         } else {
             "asset removed (its clips too)".into()
@@ -6791,24 +6808,26 @@ fn value_user_parse(target: &str, s: &str) -> Option<f32> {
     use crate::automation::*;
     let t: String = s.trim().to_ascii_lowercase().replace('\u{2212}', "-");
     let t = t.strip_suffix("db").unwrap_or(&t).trim().to_string();
+    // v0.15 bug hunt: f32::parse ACCEPTS "nan"/"inf" — an unguarded
+    // value slid NaN through clamp (NaN.clamp is NaN) straight into the
+    // engine. Every branch must demand a finite number.
+    let num = |t: &str| -> Option<f32> { t.parse::<f32>().ok().filter(|x| x.is_finite()) };
     match target {
         TARGET_TRACK_VOL | TARGET_MASTER_VOL | TARGET_PSEUDO_GAIN => {
             if t == "-inf" {
                 return Some(0.0);
             }
-            let db: f32 = t.parse().ok()?;
-            if !db.is_finite() {
-                return None;
-            }
+            let db = num(&t)?;
             Some(10f32.powf(db / 20.0).clamp(0.0, 2.0))
         }
         TARGET_TRACK_PAN => {
-            let p: f32 = t.parse().ok()?;
+            let p = num(&t)?;
             Some(((p.clamp(-100.0, 100.0) + 100.0) / 200.0).clamp(0.0, 1.0))
         }
-        TARGET_MASTER_TEMPO | TARGET_TRACK_MUTE => t.parse().ok(),
+        TARGET_MASTER_TEMPO => num(&t).map(|bpm| bpm.clamp(20.0, 300.0)),
+        TARGET_TRACK_MUTE => num(&t).map(|m| m.clamp(0.0, 1.0)),
         _ => {
-            let p: f32 = t.parse().ok()?;
+            let p = num(&t)?;
             Some((p / 100.0).clamp(0.0, 1.0))
         }
     }
@@ -12215,6 +12234,71 @@ mod tests {
         // Saving again bumps the name (roll-2.mid), never overwrites.
         app.save_piano_roll(&mut pat, 2);
         assert!(app.assets.last().unwrap().name.contains("roll-2"));
+    }
+
+    /// v0.15 bug-hunt pin: user value entry must reject the non-finite
+    /// literals f32::parse accepts ("nan"/"inf"), while "-inf" keeps its
+    /// dB meaning and tempo/mute clamp into their legal ranges.
+    #[test]
+    fn v15_parse_rejects_nonfinite_values() {
+        use crate::automation::{
+            TARGET_MASTER_TEMPO, TARGET_TRACK_MUTE, TARGET_TRACK_PAN, TARGET_TRACK_VOL,
+        };
+        for tgt in [TARGET_TRACK_PAN, TARGET_MASTER_TEMPO, TARGET_TRACK_MUTE, "fx.3.p0"] {
+            for bad in ["nan", "NaN", "inf", "-inf", "+inf"] {
+                assert!(
+                    value_user_parse(tgt, bad).is_none(),
+                    "{tgt} accepted non-finite {bad}"
+                );
+            }
+        }
+        // "-inf" is MEANINGFUL for dB targets: silence, not a bad parse.
+        assert_eq!(value_user_parse(TARGET_TRACK_VOL, "-inf"), Some(0.0));
+        assert!(value_user_parse(TARGET_TRACK_VOL, "nan").is_none());
+        // 1:1 entry semantics + range clamps survive.
+        assert!((value_user_parse(TARGET_TRACK_VOL, "-6").unwrap() - 0.501_187_2).abs() < 1e-3);
+        assert_eq!(value_user_parse(TARGET_MASTER_TEMPO, "500"), Some(300.0));
+        assert_eq!(value_user_parse(TARGET_TRACK_MUTE, "7"), Some(1.0));
+    }
+
+    /// v0.15 bug-hunt pin: deleting assets while the automation manager
+    /// is open must remap its asset id (earlier asset deleted) or close
+    /// it (its OWN asset deleted) — never leave it writing into a
+    /// neighbour's asset.
+    #[test]
+    fn v15_asset_removal_remaps_auto_editor() {
+        use crate::automation::{Node, Shape, TARGET_TRACK_VOL};
+        let mut app = headless_app("autorem");
+        app.sample_rate = 48_000;
+        // Two saved automation assets: k0 then k1.
+        for _ in 0..2 {
+            app.open_auto_editor(None);
+            let mut ed = app.auto_edit.take().unwrap();
+            ed.target = TARGET_TRACK_VOL.to_string();
+            ed.nodes = vec![
+                Node { t: 0, v: 0.3, s: Shape::Linear },
+                Node { t: 48_000, v: 0.6, s: Shape::Linear },
+            ];
+            app.auto_commit(&mut ed, 0, false);
+        }
+        let k1 = app.assets.len() - 1;
+        let k0 = k1 - 1;
+
+        // Editor open on the LATER asset; delete an EARLIER one -> remap.
+        app.open_auto_editor(Some(k1));
+        app.remove_asset_at(k0);
+        assert_eq!(
+            app.auto_edit.as_ref().and_then(|e| e.asset),
+            Some(k1 - 1),
+            "id must slide with the table"
+        );
+        assert_eq!(app.auto_edit.as_ref().and_then(|e| e.asset), Some(app.assets.len() - 1));
+
+        // Editor open on the deleted asset itself -> manager closes.
+        let k = app.assets.len() - 1;
+        app.open_auto_editor(Some(k));
+        app.remove_asset_at(k);
+        assert!(app.auto_edit.is_none(), "manager must close with its asset");
     }
 
     /// v0.11 R5 pin: the automation manager buffer -> asset -> clip ->
