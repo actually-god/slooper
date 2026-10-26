@@ -2153,6 +2153,8 @@ impl App {
         let pos = self.backend.engine.pos();
         let mut sel: Vec<(usize, usize, usize)> = Vec::new();
         let mut base_lanes: HashMap<usize, usize> = HashMap::new();
+        // v0.15 bug hunt: asset ids inside the clipboard are kept in sync
+        // with the table by remove_asset_at's remap; paste trusts it.
         for it in &cb.items {
             let t = (t_target + it.t_off).min(self.n_tracks - 1);
             let alen = self.assets.get(it.asset as usize).map(|a| a.samples()).unwrap_or(0);
@@ -2175,14 +2177,19 @@ impl App {
             let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
             sel.push((t, lane, li));
         }
+        if sel.is_empty() {
+            self.status = "paste: nothing to paste (assets were deleted)".into();
+            return;
+        }
         sel.sort();
+        let npaste = sel.len();
         self.sel_clips = sel;
         self.sel_anchor = self.sel_clips.first().copied();
         self.push_project();
         self.scroll_view_to(pos);
         self.status = format!(
             "pasted {} clip(s) at the playhead \u{b7} track {}",
-            cb.items.len(),
+            npaste,
             t_target + 1
         );
     }
@@ -5396,6 +5403,20 @@ impl App {
         }
         if mgr_closed {
             self.auto_edit = None;
+        }
+        // v0.15 bug hunt: the clipboard holds asset ids too. Without the
+        // same remap, copy -> delete -> paste placed clips pointing at a
+        // NEIGHBOUR asset (or a dangling id).
+        if let Some(cb) = self.clipboard.as_mut() {
+            cb.items.retain(|it| it.asset as usize != k);
+            for it in cb.items.iter_mut() {
+                if it.asset as usize > k {
+                    it.asset -= 1;
+                }
+            }
+            if cb.items.is_empty() {
+                self.clipboard = None;
+            }
         }
         // An in-flight audition may reference the dead id; the name-based
         // toggle would stop a DIFFERENT asset's preview on the next click.
@@ -12302,6 +12323,64 @@ mod tests {
             n1,
             "no nodes may grow past len_samples"
         );
+    }
+
+    /// v0.15 bug-hunt pin: deleting an asset must remap the clip
+    /// clipboard — copy -> delete (earlier asset) -> paste must place the
+    /// SAME asset, and deleting the copied asset must empty the clipboard.
+    #[test]
+    fn v15_asset_removal_remaps_clipboard() {
+        use crate::automation::{Node, Shape, TARGET_TRACK_VOL};
+        let mut app = headless_app("cbremap");
+        app.sample_rate = 48_000;
+        for _ in 0..2 {
+            app.open_auto_editor(None);
+            let mut ed = app.auto_edit.take().unwrap();
+            ed.target = TARGET_TRACK_VOL.to_string();
+            ed.nodes = vec![
+                Node { t: 0, v: 0.3, s: Shape::Linear },
+                Node { t: 48_000, v: 0.6, s: Shape::Linear },
+            ];
+            app.auto_commit(&mut ed, 0, false);
+        }
+        let n = app.assets.len();
+        let (k0, k1) = (n - 2, n - 1);
+        // place a clip of the LATER asset, select it, copy.
+        let lane = app.arr.place_auto(
+            0,
+            crate::arrange::Clip {
+                asset: k1 as u32,
+                pos: 0,
+                cut: 0,
+                play_len: None,
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+            app.assets[k1].samples(),
+        );
+        app.sel_clips = vec![(0, lane, app.arr.tracks[0].lanes[lane].clips.len() - 1)];
+        app.clipboard_copy();
+        assert_eq!(app.clipboard.as_ref().unwrap().items[0].asset as usize, k1);
+
+        // Delete the EARLIER asset: clipboard id slides with the table.
+        app.remove_asset_at(k0);
+        assert_eq!(
+            app.clipboard.as_ref().unwrap().items[0].asset as usize,
+            k1 - 1,
+            "clipboard asset id must follow the table"
+        );
+        app.clipboard_paste();
+        let placed = app.arr.tracks[0]
+            .lanes
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .any(|c| c.asset as usize == k1 - 1 && c.pos == app.backend.engine.pos());
+        assert!(placed, "paste must land on the (remapped) same asset");
+
+        // Deleting the clipboard's own asset leaves nothing to paste.
+        app.remove_asset_at(k1 - 1);
+        assert!(app.clipboard.is_none(), "clipboard must empty with its asset");
     }
 
     /// v0.15 bug-hunt pin: deleting assets while the automation manager
