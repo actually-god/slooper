@@ -27,7 +27,6 @@
 //!   why moving the *owner* between threads is sound.
 
 use std::cell::UnsafeCell;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,7 +38,80 @@ pub const VST_MAX_PARAMS: usize = 64;
 /// Ring capacity: covers the largest plausible JACK callback plus slop.
 /// The rings never grow past this (oldest samples are dropped on overflow),
 /// which keeps the audio thread allocation-free after load.
-const RING_CAP: usize = 64 * 1024 + 2 * VST_BLOCK;
+const RING_CAP: usize = 1 << 16;
+
+/// Realtime f32 ring (v16 pipeline pass): fixed capacity, memcpy in/out.
+/// The previous per-sample `VecDeque` churn (push/pop/Option-unwrap per
+/// sample, 3 rings per plugin) showed up as pointless audio-thread work;
+/// this version moves whole blocks and never allocates or unwraps.
+/// Overflow keeps the NEWEST samples and reports how many oldest were
+/// dropped, so the echo ring can stay history-consistent (v0.6 behavior).
+struct FxRing {
+    buf: Vec<f32>,
+    head: usize,
+    count: usize,
+}
+
+impl FxRing {
+    fn with_capacity(cap: usize) -> Self {
+        Self { buf: vec![0.0f32; cap], head: 0, count: 0 }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.count
+    }
+    #[inline]
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+    /// Append a block; returns how many oldest samples overflowed away.
+    fn push_slice(&mut self, s: &[f32]) -> usize {
+        let cap = self.buf.len();
+        if s.len() >= cap {
+            // Bigger than the whole ring: keep its newest window.
+            let start = s.len() - cap;
+            self.buf.copy_from_slice(&s[start..]);
+            let dropped = self.count + start;
+            self.head = 0;
+            self.count = cap;
+            return dropped;
+        }
+        let over = self.count + s.len();
+        let dropped = over.saturating_sub(cap);
+        if dropped > 0 {
+            self.head = (self.head + dropped) % cap;
+            self.count -= dropped;
+        }
+        let start = (self.head + self.count) % cap;
+        let first = (cap - start).min(s.len());
+        self.buf[start..start + first].copy_from_slice(&s[..first]);
+        if s.len() > first {
+            self.buf[..s.len() - first].copy_from_slice(&s[first..]);
+        }
+        self.count += s.len();
+        dropped
+    }
+    /// Drop `n` oldest samples (max `count`).
+    fn drop_front(&mut self, n: usize) {
+        let n = n.min(self.count);
+        self.head = (self.head + n) % self.buf.len();
+        self.count -= n;
+    }
+    /// Copy out up to `dst.len()` samples; returns how many were taken.
+    fn drain_into(&mut self, dst: &mut [f32]) -> usize {
+        let cap = self.buf.len();
+        let n = self.count.min(dst.len());
+        let first = (cap - self.head).min(n);
+        dst[..first].copy_from_slice(&self.buf[self.head..self.head + first]);
+        if n > first {
+            dst[first..n].copy_from_slice(&self.buf[..n - first]);
+        }
+        self.head = (self.head + n) % cap;
+        self.count -= n;
+        n
+    }
+}
 
 // ---------------------------------------------------------------- kinds ---
 
@@ -481,11 +553,11 @@ struct RtState {
     stage_r: Vec<f32>,
     stage_ol: Vec<f32>,
     stage_or: Vec<f32>,
-    in_ring: VecDeque<f32>,
-    out_ring: VecDeque<f32>,
+    in_ring: FxRing,
+    out_ring: FxRing,
     /// Dry echo filling the startup window until the plugin (plus any
     /// latency it adds) produces its first samples.
-    echo: VecDeque<f32>,
+    echo: FxRing,
     /// Channel voice messages fed for instrument use, delivered at the next
     /// internal 512-block boundary (audio-thread contract, like `process`).
     pending_midi: Vec<[u8; 3]>,
@@ -590,7 +662,31 @@ pub fn vst_loader_lock() -> std::sync::MutexGuard<'static, ()> {
 // and editOpen share a thread). Serializing instantiation AND all editor
 // dispatch on this thread makes every toolkit's affinity assumption
 // true by construction.
+//
+// CADENCE (v16 responsiveness pass): the loop's tick is ADAPTIVE. With
+// editors open every tick dispatches one idle step, so the tick IS the
+// plugin UI's input/framerate — the fixed 30 ms tick was measured at
+// 27-33 Hz and reads as delayed mouse input and low editor framerate
+// (JUCE and VST3 message queues want 4-10 ms service; Steinberg's own
+// VST3 host runs its message loop continuously). With no editors open,
+// the old 30 ms idle tick costs nothing.
 type GuiJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Pump tick while at least one plugin editor is open (ms): every tick is
+/// one `effEditIdle` / `service_run_loop` step, so plugin UIs run at
+/// ~1/this-rate input latency and repaint.
+const EDITOR_TICK_MS: u64 = 6;
+/// Pump tick with no editors open (ms): keeps the historical idle cost.
+const IDLE_TICK_MS: u64 = 30;
+
+/// Loop iterations completed by the GUI pump thread (observability pin:
+/// sample the rate to verify the adaptive tick).
+static GUI_HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+
+/// GUI-thread iterations so far; increases once per pump tick.
+pub fn gui_heartbeat() -> u64 {
+    GUI_HEARTBEAT.load(Ordering::Relaxed)
+}
 
 fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
     static TX: std::sync::OnceLock<std::sync::mpsc::Sender<GuiJob>> =
@@ -599,20 +695,49 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
         let (tx, rx) = std::sync::mpsc::channel::<GuiJob>();
         std::thread::Builder::new()
             .name("vst2-gui".into())
-            .spawn(move || loop {
-                match rx.recv_timeout(std::time::Duration::from_millis(30)) {
-                    Ok(job) => {
-                        job();
-                        while let Ok(job) = rx.try_recv() {
+            .spawn(move || {
+                let stats = std::env::var_os("SLOOPER_VST_STATS").is_some();
+                let mut window = 0u32;
+                let mut pump_ms = 0.0f64;
+                let mut t_window = std::time::Instant::now();
+                loop {
+                    let tick = if crate::vstedit::editors_active() > 0 {
+                        EDITOR_TICK_MS
+                    } else {
+                        IDLE_TICK_MS
+                    };
+                    match rx.recv_timeout(std::time::Duration::from_millis(tick)) {
+                        Ok(job) => {
                             job();
+                            while let Ok(job) = rx.try_recv() {
+                                job();
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    // Editor idle pump for every open editor. Toolkits
+                    // expect a steady effEditIdle; the fast tick only
+                    // exists while editors are actually open.
+                    let t0 = std::time::Instant::now();
+                    crate::vstedit::pump_editors();
+                    GUI_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+                    if stats {
+                        window += 1;
+                        pump_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                        if window % 100 == 0 {
+                            let dt = t_window.elapsed().as_secs_f64().max(0.001);
+                            eprintln!(
+                                "[vst-stats] tick={tick}ms avg={:.2}ms rate={:.1}Hz editors={}",
+                                pump_ms / 100.0,
+                                100.0 / dt,
+                                crate::vstedit::editors_active()
+                            );
+                            pump_ms = 0.0;
+                            t_window = std::time::Instant::now();
                         }
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                // Editor idle pump for every open editor (30 ms cadence,
-                // what FLTK/JUCE/VSTGUI expect from effEditIdle).
-                crate::vstedit::pump_editors();
             })
             .expect("spawn vst2-gui thread");
         tx
@@ -629,6 +754,41 @@ pub fn on_gui_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) 
         }))
         .map_err(|_| "vst gui thread gone".to_string())?;
     rrx.recv().map_err(|_| "vst gui thread gone".to_string())
+}
+
+/// Queue `f` on the VST GUI thread WITHOUT waiting (v16: wakes the loop
+/// immediately even mid-sleep; used for close hand-offs and async loads).
+pub fn post(f: impl FnOnce() + Send + 'static) {
+    let _ = gui_tx().send(Box::new(f));
+}
+
+/// v16: start a plugin load on the GUI thread and return immediately.
+/// The caller polls the receiver (the UI thread must never block on an
+/// instantiation: a Vitalium-class load measured 180 ms of frozen app).
+pub fn open_async(
+    path: &Path,
+    kind: VstKind,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+) -> std::sync::mpsc::Receiver<Result<Arc<RtStageEntry>, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    let saved = saved.map(|s| s.to_vec());
+    post(move || {
+        let _ = tx.send(open(&path, kind, sample_rate, saved.as_deref()).map(|l| l.entry));
+    });
+    rx
+}
+
+/// v16: run [`scan`] on the GUI thread, returning immediately. Loading
+/// every plugin for metadata can take seconds; doing it on the UI thread
+/// froze the app on the first chain-window open.
+pub fn scan_async(dirs: Vec<PathBuf>) -> std::sync::mpsc::Receiver<Vec<VstEntry>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    post(move || {
+        let _ = tx.send(scan(&dirs));
+    });
+    rx
 }
 
 /// Load a plugin (UI/manager/render thread entry point) — the actual
@@ -702,9 +862,9 @@ fn assemble(
         stage_r: stage_buf(),
         stage_ol: stage_buf(),
         stage_or: stage_buf(),
-        in_ring: VecDeque::with_capacity(RING_CAP),
-        out_ring: VecDeque::with_capacity(RING_CAP),
-        echo: VecDeque::with_capacity(RING_CAP),
+        in_ring: FxRing::with_capacity(RING_CAP),
+        out_ring: FxRing::with_capacity(RING_CAP),
+        echo: FxRing::with_capacity(RING_CAP),
         pending_midi: Vec::new(),
         ev_pool: Vec::new(),
         errors: 0,
@@ -1018,39 +1178,44 @@ impl RtStageEntry {
 
         self.poll_params(s);
 
-        for &x in &input[..n] {
-            if s.in_ring.len() == RING_CAP {
-                s.in_ring.pop_front();
-                s.echo.pop_front();
-            }
-            s.in_ring.push_back(x);
-            s.echo.push_back(x);
+        // Whole-block ring moves (v16 pipeline pass): no per-sample
+        // push/pop/unwrap on the audio thread anymore.
+        let dropped = s.in_ring.push_slice(&input[..n]);
+        s.echo.push_slice(&input[..n]);
+        if dropped > 0 {
+            // History-consistent echo trim: the old code popped the echo in
+            // lockstep with in-ring overflow.
+            s.echo.drop_front(dropped);
         }
 
         while s.in_ring.len() >= VST_BLOCK {
-            for (i, sl) in s.stage_l.iter_mut().enumerate() {
-                let x = s.in_ring.pop_front().unwrap_or(0.0);
-                *sl = x;
-                s.stage_r[i] = x;
-            }
+            s.in_ring.drain_into(&mut s.stage_l);
+            s.stage_r.copy_from_slice(&s.stage_l);
             s.stage_ol.fill(0.0);
             s.stage_or.fill(0.0);
             self.process_block(s);
-            for i in 0..VST_BLOCK {
-                if s.out_ring.len() == RING_CAP {
-                    s.out_ring.pop_front();
-                }
-                s.out_ring.push_back(s.stage_ol[i]);
-            }
+            let got = s.stage_ol.len().min(VST_BLOCK);
+            s.out_ring.push_slice(&s.stage_ol[..got]);
         }
 
-        for o in output.iter_mut().take(n) {
-            *o = match s.out_ring.pop_front() {
-                Some(x) => x,
-                // Startup/seek fill: keep the dry signal until the plugin
-                // (plus any latency) has produced its first samples.
-                None => s.echo.pop_front().unwrap_or(0.0),
-            };
+        // Drain output; while the plugin has produced nothing (startup,
+        // seek, latency window) the echo carries the dry signal through —
+        // exactly the old per-sample rule, now per chunk.
+        let mut off = 0usize;
+        while off < n {
+            let got = s.out_ring.drain_into(&mut output[off..n]);
+            if got > 0 {
+                off += got;
+                continue;
+            }
+            let got = s.echo.drain_into(&mut output[off..n]);
+            if got == 0 {
+                break;
+            }
+            off += got;
+        }
+        if off < n {
+            output[off..n].fill(0.0);
         }
     }
 
