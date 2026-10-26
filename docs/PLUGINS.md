@@ -44,6 +44,51 @@ bridge its **GUI** over X11, so Windows synths/effects appear and behave
 exactly like native ones: sound, sliders, and their custom editor window.
 (Install: AUR `yabridge`, or the release tarball + `./yabridgectl sync`.)
 
+## The open-source instrument set on this host
+
+Everything here is a **prebuilt Linux x86-64 plugin with a free license** —
+drop-in installs from upstream releases, no patches, no config. Each one is
+verified by `cargo run --release --example plugin_audit` (held-note render
+through the real slooper open path) plus a real-editor probe; instruments
+are additionally covered by the `every_local_instrument_makes_sound` test.
+
+| Instrument | Type | License / upstream |
+|---|---|---|
+| Vitalium | wavetable | GPL-3.0, `matthartung/vitalium` (distrho-ports build) |
+| Geonkick | analog drums | GPL-3.0, `raedv/geonkick` |
+| Dexed | FM (DX7) | GPL-3.0, `asb2m10/dexed` (v1.0.1 `Dexed-1.0.1-lnx.zip`) |
+| JS80P | 8-voice FM/phase | GPL-3.0, `attilammagyar/js80p` (v4.1.1 VST3 bundle) |
+| Overtonium | additive | AGPL-3.0, `benjamindehli/overtonium` |
+| Virtual FM-1 | FM / organ | GPL-3.0, `jbschooley/Virtual-FM-1` |
+| Dragonfly reverbs, Swanky Amp, Wolf Shaper | effects | GPL/MIT, upstreams as packaged by Linux Audio |
+
+amSynth 2.0 is **not** part of the set: its VST2 editor dies mid-build on
+this build (`unordered_map::at` + blank panel), and its GUI-less VST3
+variant duplicates Vitalium coverage less reliably; the file was removed
+from `~/.vst` (v17).
+
+## v17 host fixes: why plugins could crash or load silent
+
+1. **Scan could kill a live instrument (the Vitalium crash).** The scan
+   probe instantiated and *dropped* plugin binaries; dropping the last
+   instance fires `terminate()`/`deactivate()` into library-global state
+   that every other instance of the same binary is still using — a
+   delete-while-active abort, then SEGV on the next audio block. Instantiated
+   libraries are now remembered process-wide: probes reuse the live
+   instance's identity and never drop what they create, and scanning while
+   a synth is bound no longer touches that plugin's library at all.
+2. **Fresh opens wrote reported defaults into every parameter.** Many
+   synths (Dexed's `Output`, JS80P) carry their init state in patch data
+   and advertise bogus `default_value` metadata (0.0); writing defaults at
+   load silenced them the instant they opened — invisible "plugin is
+   broken" reports. A fresh open now writes **nothing** (the plugin keeps
+   its own init state); parameter values are pushed only when restoring
+   saved/preset state.
+3. **Instruments with an audio input bus were shelved as effects.** The
+   instrument test was "has no audio inputs", which misfiled JS80P (a
+   synth with a feedback bus). The declared VST3 category
+   (`Instrument|Synth`) now decides; the bus shape is only a fallback.
+
 ## VST custom GUIs (VST2) — open automatically
 
 Binding a plugin instrument (track synth popup) or adding a plugin effect

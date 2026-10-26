@@ -413,8 +413,22 @@ fn probe_vst3(path: &Path) -> VstEntry {
             // Vitalium crash (delete-while-active warnings, then SEGV).
             let mut instrument = false;
             if let Ok(p) = vst3_host::simple::load_plugin(path) {
-                instrument =
-                    p.bus_arrangements().ok().map(|b| b.inputs.is_empty()).unwrap_or(false);
+                // Trust the plugin's declared category first: synths with a
+                // feedback/sidechain bus (JS80P) declare `Instrument|Synth`
+                // yet HAVE an audio input bus, and the old "no inputs" bus
+                // heuristic shelved them into the FX list. Only fall back to
+                // the bus shape when the category says nothing either way.
+                let cat = p.info().category.to_ascii_lowercase();
+                instrument = if cat.contains("instrument") || cat.contains("synth") {
+                    true
+                } else if cat.contains("fx") || cat.contains("effect") {
+                    false
+                } else {
+                    p.bus_arrangements()
+                        .ok()
+                        .map(|b| b.inputs.is_empty())
+                        .unwrap_or(false)
+                };
                 note_instantiated(
                     path,
                     VstKind::V3,
@@ -518,6 +532,23 @@ impl VstParams {
             slots: descs
                 .iter()
                 .map(|d| AtomicU32::new(d.default.to_bits()))
+                .collect(),
+            generation: AtomicU64::new(1),
+        })
+    }
+
+    /// Mirror seeded with explicit live values (clamped to the slots we have
+    /// descriptors for). Used when the plugin's *current* state — not its
+    /// reported defaults — is the correct baseline; see `open_v3`.
+    pub fn with_values(descs: &[VstParamDesc], values: &[f32]) -> Arc<Self> {
+        Arc::new(Self {
+            slots: descs
+                .iter()
+                .enumerate()
+                .map(|(k, d)| {
+                    let v = values.get(k).copied().unwrap_or(d.default).clamp(0.0, 1.0);
+                    AtomicU32::new(v.to_bits())
+                })
                 .collect(),
             generation: AtomicU64::new(1),
         })
@@ -1078,11 +1109,25 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
             writable: !p.is_read_only,
         })
         .collect();
-    let params = VstParams::new(&descs);
+    // Seed the mirror from the plugin's CURRENT values, not its reported
+    // defaults. Several synths (Dexed, JS80P) initialize from patch/program
+    // data and advertise bogus `default_value` metadata (Output = 0.0): a
+    // host that seeds from defaults and writes every param back silences
+    // them the instant they load. Fresh open => write nothing; the plugin
+    // already holds its own init state. Only a RESTORE (saved Some) pushes
+    // values into the plugin, and only the saved ones.
+    let current: Vec<f32> = ps
+        .iter()
+        .take(VST_MAX_PARAMS)
+        .map(|p| p.value as f32)
+        .collect();
+    let params = VstParams::with_values(&descs, &current);
     apply_saved(&params, &descs, saved);
-    for (k, d) in descs.iter().enumerate() {
-        if d.writable {
-            let _ = plugin.set_parameter(d.id, params.get(k) as f64);
+    if let Some(vals) = saved {
+        for (k, d) in descs.iter().enumerate().take(vals.len()) {
+            if d.writable {
+                let _ = plugin.set_parameter(d.id, params.get(k) as f64);
+            }
         }
     }
     let out_ch = plugin.output_channel_count().max(1);
@@ -1090,13 +1135,26 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     let has_editor = plugin.has_editor();
     // v17: record this instantiation for the scan cache (see `cached_entry`).
     {
-        let instrument = plugin
-            .audio_bus_layout()
-            .map(|l| l.inputs.is_empty())
+        let pinfo = vst3_host::discovery::get_plugin_info(path).ok();
+        // Same rule as `probe_vst3`: declared category beats the bus-shape
+        // heuristic (JS80P is a synth WITH an audio input bus).
+        let instrument = pinfo
+            .as_ref()
+            .map(|i| {
+                let cat = i.category.to_ascii_lowercase();
+                if cat.contains("instrument") || cat.contains("synth") {
+                    true
+                } else if cat.contains("fx") || cat.contains("effect") {
+                    false
+                } else {
+                    plugin
+                        .audio_bus_layout()
+                        .map(|l| l.inputs.is_empty())
+                        .unwrap_or(false)
+                }
+            })
             .unwrap_or(false);
-        let vendor = vst3_host::discovery::get_plugin_info(path)
-            .map(|i| i.vendor)
-            .unwrap_or_default();
+        let vendor = pinfo.map(|i| i.vendor).unwrap_or_default();
         note_instantiated(path, VstKind::V3, plugin_name(path), vendor, instrument);
     }
     plugin
@@ -1604,6 +1662,40 @@ impl vst2::host::Host for StubHost {
 mod tests {
     use super::*;
 
+    /// v17 regression: `open_v3` must NOT seed from reported `default_value`
+    /// metadata or write params back on a fresh (unsaved) open. Dexed and
+    /// JS80P advertise `Output`/level defaults of 0.0 while carrying their
+    /// real init state in patch data — writing defaults into them silences
+    /// the plugin at load. The mirror seeds from CURRENT values instead;
+    /// this pins the constructor that makes that possible. (The audible
+    /// half of the regression is guarded by `every_local_instrument_makes_sound`.)
+    #[test]
+    fn v17_with_values_seeds_live_state_not_defaults() {
+        let descs = vec![
+            VstParamDesc {
+                id: 0,
+                name: "Output".into(),
+                default: 0.0, // the bogus metadata Dexed reports
+                writable: true,
+            },
+            VstParamDesc {
+                id: 1,
+                name: "Cutoff".into(),
+                default: 0.0,
+                writable: true,
+            },
+        ];
+        // Plugin's actual state on fresh load: full output, filter open.
+        let p = VstParams::with_values(&descs, &[1.0, 0.8, 0.5]);
+        assert_eq!(p.get(0), 1.0, "live value beats reported default");
+        assert_eq!(p.get(1), 0.8);
+        // Missing trailing values fall back to the descriptor default,
+        // and out-of-range values clamp like `set` does.
+        let q = VstParams::with_values(&descs, &[2.0]);
+        assert_eq!(q.get(0), 1.0, "clamped");
+        assert_eq!(q.get(1), 0.0, "falls back to default");
+    }
+
     #[test]
     fn params_store_and_signal() {
         let descs = vec![
@@ -1738,7 +1830,10 @@ mod tests {
                 peak = peak.max(x.abs());
             }
         }
-        assert!(peak > 1e-4, "bound vitalium alive after re-scan, peak {peak}");
+        assert!(
+            peak > 1e-4,
+            "bound vitalium alive after re-scan, peak {peak}"
+        );
         std::mem::forget(entry);
     }
 
@@ -1945,12 +2040,16 @@ mod tests {
     fn v16_test_plugin() -> Option<(PathBuf, VstKind)> {
         let found = scan(&default_vst_dirs());
         let pick = |needle: &str, kind: VstKind| -> Option<(PathBuf, VstKind)> {
+            // Filter on kind too: `~/.vst` sorts before `~/.vst3`, and the
+            // VST2 wolf-shaper .so opened as a VST3 dies with "no ModuleEntry".
             found
                 .iter()
-                .find(|e| e.error.is_none() && e.path.to_string_lossy().contains(needle))
+                .find(|e| {
+                    e.error.is_none() && e.kind == kind && e.path.to_string_lossy().contains(needle)
+                })
                 .map(|e| (e.path.clone(), kind))
         };
-        pick("wolf-shaper", VstKind::V3).or_else(|| pick("Dragonfly", VstKind::V2))
+        pick("wolf-shaper", VstKind::V3).or_else(|| pick("wolf-shaper", VstKind::V2))
     }
 
     /// v16 helper: GUI-pump iterations per second over a sampling window

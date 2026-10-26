@@ -15508,19 +15508,19 @@ mod tests {
                         texts.push((s, egui::Rect::from_min_size(t.pos, t.galley.rect.size())));
                     }
                 }
-                egui::epaint::Shape::Rect(r) => {
+                egui::epaint::Shape::Rect(r)
+                    if (r.stroke.width - 1.6).abs() < 0.01 =>
+                {
                     // The ACTIVE border color, possibly dimmed by the
                     // window's fade-in animation (shapes are painted at
                     // the layer's animated alpha) — compare un-premultiplied.
-                    if (r.stroke.width - 1.6).abs() < 0.01 {
-                        let p = r.stroke.color.to_array();
-                        if p[3] > 10
-                            && (p[0] as u32 * 255 / p[3] as u32).abs_diff(120) <= 12
-                            && (p[1] as u32 * 255 / p[3] as u32).abs_diff(190) <= 14
-                            && (p[2] as u32 * 255 / p[3] as u32).abs_diff(255) <= 14
-                        {
-                            borders.push(r.rect);
-                        }
+                    let p = r.stroke.color.to_array();
+                    if p[3] > 10
+                        && (p[0] as u32 * 255 / p[3] as u32).abs_diff(120) <= 12
+                        && (p[1] as u32 * 255 / p[3] as u32).abs_diff(190) <= 14
+                        && (p[2] as u32 * 255 / p[3] as u32).abs_diff(255) <= 14
+                    {
+                        borders.push(r.rect);
                     }
                 }
                 _ => {}
