@@ -203,19 +203,6 @@ pub fn gain_amp(v: u8) -> f32 {
     }
 }
 
-/// dB display string ("  +0.0 dB", "-12.3 dB", "-inf dB").
-pub fn db_str(amp: f32) -> String {
-    if amp <= 0.0 {
-        "-inf dB".into()
-    } else {
-        format!("{:+.1} dB", 20.0 * amp.log10())
-    }
-}
-
-/// MIDI value that centres the per-loop pan slider (the -100..=100 text
-/// shows 0 there; pan is an equal-power split between the L / R buses).
-pub const PAN_CENTRE_MIDI: u8 = 64;
-
 /// Pan MIDI value (0..=127) -> the -100..=100 position shown in the text
 /// box: -100 = hard left, 0 = centre, +100 = hard right. (The old scale was
 /// 0..=100 with 50 centre; this is that position doubled and shifted, so
@@ -228,11 +215,6 @@ pub fn pan_text(m: u8) -> i32 {
 /// centre lands exactly on 0 for the MIDI centre value.
 fn pan_text_old(m: u8) -> u32 {
     (m as f32 * 100.0 / 127.0).round() as u32
-}
-
-/// -100..=100 text position -> pan MIDI value (0..=127).
-pub fn pan_midi(t: f32) -> u8 {
-    (((t.clamp(-100.0, 100.0) + 100.0) * 0.5) * 127.0 / 100.0).round() as u8
 }
 
 /// Engine pan position [0, 1] for a MIDI value (hard right at 127).

@@ -1303,28 +1303,6 @@ pub fn x11_available() -> bool {
     std::env::var_os("DISPLAY").is_some()
 }
 
-/// Read the child-window count of an XID from a fresh connection
-/// (integration tests; `0` on any failure).
-pub fn count_children(xid: u64) -> usize {
-    unsafe {
-        let d = XOpenDisplay(ptr::null());
-        if d.is_null() {
-            return 0;
-        }
-        let mut root: XWindow = 0;
-        let mut parent: XWindow = 0;
-        let mut kids: *mut XWindow = ptr::null_mut();
-        let mut n: c_int = 0;
-        let ok = XQueryTree(d, xid, &mut root, &mut parent, &mut kids, &mut n);
-        let count = if ok != 0 { n.max(0) as usize } else { 0 };
-        if !kids.is_null() {
-            XFree(kids as *mut c_void);
-        }
-        XCloseDisplay(d);
-        count
-    }
-}
-
 /// Child count on the thread's own connection (XQueryTree needs no round
 /// trip through a new connection here).
 unsafe fn count_children_local(d: *mut Display, win: XWindow) -> usize {
