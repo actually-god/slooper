@@ -6065,6 +6065,12 @@ impl App {
                                                     && (trel - last.t)
                                                         < (self.sample_rate.max(1) as i64 / 50)
                                             });
+                                            // v0.15 bug hunt: never grow the
+                                            // curve past its declared span —
+                                            // nodes beyond len_samples would
+                                            // pile up invisible and collapse
+                                            // onto the endpoint on reload.
+                                            let skip = skip || trel >= ed.len_samples.max(1);
                                             if !skip {
                                                 ed.nodes.push(crate::automation::Node {
                                                     t: trel,
@@ -12259,6 +12265,43 @@ mod tests {
         assert!((value_user_parse(TARGET_TRACK_VOL, "-6").unwrap() - 0.501_187_2).abs() < 1e-3);
         assert_eq!(value_user_parse(TARGET_MASTER_TEMPO, "500"), Some(300.0));
         assert_eq!(value_user_parse(TARGET_TRACK_MUTE, "7"), Some(1.0));
+    }
+
+    /// v0.15 bug-hunt pin: MIDI recording in the automation manager
+    /// draws the curve INSIDE its declared span only — moves after the
+    /// span end must not pile up invisible nodes.
+    #[test]
+    fn v15_mgr_record_never_grows_past_span() {
+        use crate::audio::{Evt, RawMidiMsg};
+        use crate::automation::{Node, Shape};
+        use crate::midi::{MidiAction, MidiBind};
+        let mut app = headless_app("reclim");
+        app.sample_rate = 48_000;
+        let slot = (0..MidiAction::ALL.len())
+            .find(|i| MidiAction::ALL[*i].is_continuous())
+            .expect("a continuous binding slot");
+        app.auto_mgr_rec = vec![(slot, MidiBind { ty: 1, ch: 0, d1: 42 })];
+        app.open_auto_editor(None);
+        {
+            let ed = app.auto_edit.as_mut().unwrap();
+            ed.len_samples = 48_000; // one second
+            ed.rec = true;
+            ed.rec_start = 0;
+            ed.nodes = vec![Node { t: 0, v: 0.5, s: Shape::Linear }];
+        }
+        let cc = |v| Evt::Midi(RawMidiMsg { bytes: vec![0xB0, 42, v] });
+        app.backend.engine.seek_to(24_000);
+        app.handle_evt(cc(80));
+        let n1 = app.auto_edit.as_ref().unwrap().nodes.len();
+        assert_eq!(n1, 2, "an in-span move must record");
+        app.backend.engine.seek_to(120_000);
+        app.handle_evt(cc(100));
+        app.handle_evt(cc(110));
+        assert_eq!(
+            app.auto_edit.as_ref().unwrap().nodes.len(),
+            n1,
+            "no nodes may grow past len_samples"
+        );
     }
 
     /// v0.15 bug-hunt pin: deleting assets while the automation manager
