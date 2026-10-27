@@ -473,7 +473,16 @@ impl<T: Host> PluginLoader<T> {
         let instance = PluginInstance::new(effect, Arc::clone(&self.lib));
 
         let api_ver = instance.dispatch(plugin::OpCode::GetApiVersion, 0, 0, ptr::null_mut(), 0.0);
-        if api_ver >= 2400 {
+        // Vendored patch #4 (see VENDOR-NOTES.md): upstream rejected anything
+        // below VST 2.4, which bricks a huge era of legacy freeware (VST 1.0
+        // plugins report 0/100-2300 and simply ignore unknown opcodes, which
+        // is harmless for the paths slooper drives: getParams/process/
+        // setProgram all exist in every VST generation). Accept everything
+        // that looks like a version number; keep rejecting garbage.
+        if api_ver >= 2400 || api_ver == 0 || (100..2400).contains(&api_ver) {
+            if api_ver < 2400 {
+                trace!("loading legacy plugin reporting api version {}", api_ver);
+            }
             Ok(instance)
         } else {
             trace!("Could not load plugin with api version {}", api_ver);

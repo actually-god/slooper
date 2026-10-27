@@ -205,6 +205,11 @@ Each track plays its MIDI clips through its own **synth binding** (the
   instrument (loop-aware zones across the full keyboard, real hammer and
   damper behaviour) built from the open TimGM6mb soundfont — not a synthetic
   model; any track without an explicit binding falls back to it.
+- **drums** — a bundled analog drum kit driven straight from MIDI keys:
+  kick (C1), snare (D1), closed/open hats (F#1/G#1, the open hat chokes on
+  note-off), tom, crash, clap, ride, and a pitched tom on any other key.
+- **pad** — a bundled warm subtractive pad (three detuned partials, slow
+  filter + LFO shimmer), plays polyphonically from any chord.
 - **sampler** — a bundled script that plays any rack asset pitched around a
   **root note** (the slider shows `C3`-style note names). Pick a patch from
   its dropdown, or **drag any audio file onto its drop zone** — from the
@@ -467,7 +472,10 @@ the list = first in the signal path). Open it with the strip's **FX** chip:
 - **+ effect** adds a scripted effect; **+ VST plugin** adds a scanned
   binary plugin. **Effects folder** / **Rescan effects** manage script
   location (default `~/.local/share/slooper/effects`, seeded with
-  `template.rs` + the ABI contract on first run); **Plugin folders**
+  `template.rs` + the ABI contract + the stock effects — parametric EQ,
+  space echo (delay+reverb), **compressor**, **chorus** — on first run;
+  stock files are updated/added automatically on app updates, user files
+  are never touched); **Plugin folders**
   (Add / ×) + **Rescan Plugins** manage VST scanning (`~/.vst`, `~/.vst3`,
   system dirs, plus your own).
 - **Editors**: effect scripts show their **scripted custom GUI** or
