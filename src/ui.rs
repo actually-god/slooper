@@ -760,6 +760,14 @@ pub struct App {
     track_synth_inst: Vec<Option<Arc<crate::audio::SynthHandle>>>,
     /// Track whose synth sliders window is open.
     synth_win: Option<usize>,
+    /// v18: files dropped from the OS file manager into the window,
+    /// drained from raw input at the top of every frame (routing lives in
+    /// `ui_root`): sampler window (while open it owns drops, as ever) →
+    /// lane strips (place clips at the pointer) → rack panel (import).
+    /// Directories become rack folders immediately. Previously only the
+    /// sampler drop zone listened, so dropping samples from the file
+    /// manager did nothing anywhere else in the app.
+    os_drops: Vec<std::path::PathBuf>,
     /// v17: track whose SYNTHS picker window is open (the ♪ chip).
     synth_pick: Option<usize>,
     /// Open VST2 custom editor windows, keyed by track. Closing (button,
@@ -1070,6 +1078,7 @@ impl App {
             track_synth_params,
             track_synth_inst,
             synth_win: None,
+            os_drops: Vec::new(),
             synth_pick: None,
             vst_editors: std::collections::HashMap::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
@@ -2188,10 +2197,22 @@ impl App {
     }
 
     /// Remove every selected clip (assets stay in the rack).
+    /// v18: every grid gesture (clip drag, edge resize, marquee) is
+    /// index-based, so anything that REMOVES clips must disarm them — a
+    /// resize/move holding a dead index panicked on the next pointer move
+    /// (cut or Delete pressed while an edge drag was still armed).
+    fn cancel_grid_gestures(&mut self) {
+        self.drag_clip = None;
+        self.clip_resize = None;
+        self.marquee = None;
+        self.marquee_pending = None;
+    }
+
     fn delete_selection(&mut self) {
         if self.sel_clips.is_empty() {
             return;
         }
+        self.cancel_grid_gestures();
         let n = self.sel_clips.len();
         let mut ids = self.sel_clips.clone();
         ids.sort();
@@ -5108,6 +5129,59 @@ impl App {
         );
     }
 
+    /// The synth slider window doubles as a SAMPLER editor when the
+    /// bound script's first parameter is the asset picker.
+    fn sampler_editor_open(&self) -> Option<usize> {
+        let t = self.synth_win?;
+        let stem = self.track_synth.get(t)?.clone()?;
+        if !matches!(
+            self.track_synth_inst.get(t)?.as_ref()?.as_ref(),
+            SynthHandle::Script(_)
+        ) {
+            return None;
+        }
+        let desc = self.synth_registry.desc(&stem)?;
+        desc.params.first().is_some_and(|p| p.label == "asset").then_some(t)
+    }
+
+    /// v18: apply an OS-drop batch to the live sampler on `t`: import
+    /// each audio file (rack dedup via `ensure_asset`) and swap the
+    /// patch — no restart, no re-pick. Kept status string identical to
+    /// the old in-window handler so existing pins hold.
+    fn sampler_files_dropped(&mut self, t: usize, paths: &[std::path::PathBuf]) {
+        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
+            return;
+        };
+        let inst = match handle.as_ref() {
+            SynthHandle::Script(i) => i.clone(),
+            SynthHandle::Vst(_) => return,
+        };
+        let mut swapped: Option<usize> = None;
+        let mut rejected = 0usize;
+        for path in paths {
+            if !crate::assets::is_audio_file(path) {
+                rejected += 1;
+                continue; // midi/auto/unknown: not a sample
+            }
+            if let Some(k) = self.ensure_asset(path) {
+                inst.set_param(0, k as f32);
+                if let Some(vals) = self.track_synth_params.get_mut(t) {
+                    vals.clear();
+                    vals.extend_from_slice(&inst.values());
+                }
+                self.save_config();
+                swapped = Some(k);
+            }
+        }
+        match swapped.and_then(|k| self.assets.get(k).map(|a| a.name.clone())) {
+            Some(n) => self.status = format!("track {} sampler: {n} (dropped file)", t + 1),
+            None if rejected > 0 => {
+                self.status = format!("sampler: dropped file{} not audio", if rejected == 1 { "" } else { "s" });
+            }
+            None => {}
+        }
+    }
+
     /// Auto sliders for a track's live synth instance (values ride the
     /// instance atomics, exactly like effect params).
     fn synth_sliders_window(&mut self, ui: &mut egui::Ui, t: usize) {
@@ -5264,38 +5338,11 @@ impl App {
                             );
                         }
                     }
-                    // v0.13: OS-level file drop (file manager \u{2192} this
-                    // window). egui's payload DnD above carries only
-                    // in-app assets; the reported "a new sample needs an
-                    // app restart" was exactly this hole — a WAV dragged
-                    // from disk did nothing, and the rack-folder + restart
-                    // dance was the only way in. winit delivers dropped
-                    // files through raw input; this open sampler editor
-                    // consumes them, decodes via ensure_asset (which now
-                    // pushes the rack table to the engine) and switches
-                    // the live patch — no restart, no re-selection.
-                    let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
-                        i.raw
-                            .dropped_files
-                            .iter()
-                            .map(|f| f.path().to_path_buf())
-                            .collect()
-                    });
-                    for path in dropped {
-                        if !crate::assets::is_audio_file(&path) {
-                            continue; // midi/auto/unknown: not a sample
-                        }
-                        if let Some(k) = self.ensure_asset(&path) {
-                            inst.set_param(0, k as f32);
-                            dirty = true;
-                            let name = self
-                                .assets
-                                .get(k)
-                                .map(|a| a.name.clone())
-                                .unwrap_or_default();
-                            self.status = format!("track {} sampler: {name} (dropped file)", t + 1);
-                        }
-                    }
+                    // v18: OS-level file drops (file manager → app while
+                    // this window is open) are claimed CENTRALLY at the
+                    // top of `ui_root` (one drain per frame, then the
+                    // sampler swap via `sampler_files_dropped`); by the
+                    // time this window paints the queue is already empty.
                     ui.separator();
                 }
                 for (k, pd) in desc.params.iter().enumerate() {
@@ -5482,6 +5529,7 @@ impl App {
 
     fn clear_track(&mut self, i: usize) {
         self.arr.clear_track(i);
+        self.cancel_grid_gestures();
         self.sel_clips.clear();
         self.sel_anchor = None;
         self.push_project();
@@ -5668,6 +5716,7 @@ impl App {
         if k >= self.assets.len() {
             return;
         }
+        self.cancel_grid_gestures(); // its arr.remove_asset drops clips
         self.arr.remove_asset(k as u32);
         for tr in self.arr.tracks.iter_mut() {
             for lane in tr.lanes.iter_mut() {
@@ -5958,6 +6007,9 @@ impl App {
     /// Replace the whole working state with a saved project. Assets resolve
     /// through the project's audio folder first, then the rack folders.
     fn do_load(&mut self, path: &Path) {
+        // v18: a loaded project replaces the whole arrange — any armed
+        // grid gesture points into the OLD indices.
+        self.cancel_grid_gestures();
         let pr = match project::load(path) {
             Ok(p) => p,
             Err(e) => {
@@ -6594,6 +6646,47 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // ---- v18: OS file drops (drain exactly once per frame) ----
+        // winit delivers file-manager drops through raw input. Folders
+        // become rack folders on the spot; audio/midi files queue for
+        // whoever owns the target: an open SAMPLER editor owns drops
+        // (the v0.13 contract: swap the live patch), then lane strips
+        // place clips at the pointer while painting, and anything the
+        // pointer never visited is imported into the rack at frame end.
+        // Previously ONLY the sampler window listened, so dropping a
+        // sample anywhere else did nothing — "dragging audio clips in
+        // is nonfunctional".
+        let fresh: Vec<std::path::PathBuf> = ui.ctx().input_mut(|i| {
+            i.raw
+                .dropped_files
+                .drain(..)
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        for path in fresh {
+            if path.is_dir() {
+                let mut f = RackFolder::new(path.to_string_lossy().into_owned());
+                f.rescan();
+                let n = f.files.len();
+                self.rack.push(f);
+                self.save_config();
+                self.status = format!(
+                    "rack: added folder {} ({n} file(s))",
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                );
+            } else {
+                self.os_drops.push(path);
+            }
+        }
+        if !self.os_drops.is_empty() {
+            if let Some(t) = self.sampler_editor_open() {
+                let paths = std::mem::take(&mut self.os_drops);
+                self.sampler_files_dropped(t, &paths);
+            }
+        }
         // ---- global wheel routing (must run first thing in the frame) ----
         // Ctrl/Cmd+wheel zooms the timeline (same state as the zoom slider);
         // Shift+wheel pans it horizontally. egui turns MouseWheel into
@@ -6767,6 +6860,49 @@ impl App {
             synth_pick_window(ui, self, t);
         }
         self.value_popups(ui);
+        // v18: OS drops that never landed on a lane strip (dropped over
+        // the rack panel, mixer, or anywhere else without a specific
+        // target) import into the rack: `ensure_asset` dedups and selects,
+        // so the new asset is immediately pickable.
+        if !self.os_drops.is_empty() {
+            let paths = std::mem::take(&mut self.os_drops);
+            let mut names: Vec<String> = Vec::new();
+            let mut bad: Vec<String> = Vec::new();
+            for path in &paths {
+                let shown = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let importable = crate::assets::is_audio_file(path)
+                    || crate::assets::is_midi_file(path)
+                    || crate::assets::is_auto_file(path);
+                match importable.then(|| self.ensure_asset(path)).flatten() {
+                    Some(ai) => names.push(
+                        self.assets
+                            .get(ai)
+                            .map(|a| a.name.clone())
+                            .unwrap_or(shown),
+                    ),
+                    None => bad.push(shown),
+                }
+            }
+            let mut status = if names.is_empty() {
+                String::new()
+            } else {
+                format!("rack: imported {}", names.join(", "))
+            };
+            if !bad.is_empty() {
+                let part = format!("unsupported: {}", bad.join(", "));
+                status = if status.is_empty() {
+                    part
+                } else {
+                    format!("{status} \u{b7} skipped {part}")
+                };
+            }
+            if !status.is_empty() {
+                self.status = status;
+            }
+        }
     }
 
     /// v0.15: the two right-click popups every automatable value answers
@@ -6792,6 +6928,10 @@ impl App {
                 });
             if let Some(r) = resp {
                 let rect = r.response.rect;
+                // v18: same click-away rule, stated once: a fresh press of
+                // either button (or Escape) OUTSIDE the menu dismisses it.
+                // (The right-click that OPENED the menu releases on top of
+                // it, which is inside — it never dismisses itself.)
                 let click_elsewhere = armed
                     && ui.ctx().input(|i| {
                         (i.pointer.button_clicked(egui::PointerButton::Primary)
@@ -6912,7 +7052,18 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 Some(_) => format!("{} Hz \u{b7} {}", app.sample_rate, app.status),
                 None => app.status.clone(),
             };
-            ui.label(RichText::new(status).weak());
+            // v18: the status lives in a FIXED-WIDTH, truncating field. It
+            // used to be a bare label in the middle of the bar, so every
+            // longer message (e.g. after creating an automation asset)
+            // shoved the transport, tempo box and everything else rightward
+            // by hundreds of pixels — mid-session the widgets you had just
+            // right-clicked literally moved out from under the cursor, and
+            // on a narrow window they vanished off-screen entirely.
+            ui.add_sized(
+                egui::vec2(300.0, 18.0),
+                egui::Label::new(RichText::new(status).weak()).truncate(),
+            )
+            .on_hover_text(app.status.clone());
             if let Some((i, o)) = app.applied {
                 ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
             }
@@ -7100,7 +7251,13 @@ fn value_menu_items(
             value_user_display(target, current),
         ));
         app.value_dialog_focus = true;
-        ui.close();
+        // v18: deliberately NO ui.close() in here. One host of these items
+        // is the manual mini-menu WINDOW — and ui.close() there marks that
+        // window's id as closed in egui's memory FOREVER (the window has no
+        // open-flag), so every future attempt to open the value menu paints
+        // nothing: "right-click automation stopped working". The context
+        // menu host closes itself in `auto_menu`; the window host simply
+        // stops drawing once `value_menu` clears.
         return true;
     }
     if ui
@@ -7112,10 +7269,20 @@ fn value_menu_items(
         .clicked()
     {
         app.create_flat_auto_asset(track, target, current);
-        ui.close();
         return true;
     }
     false
+}
+
+/// Context-menu host for the shared value items (volume/pan/synth/fx
+/// sliders right-click through here).
+fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) {
+    // v18: this host is an egui CONTEXT menu: dismiss it once an item was
+    // chosen (the shared items cannot call ui.close() themselves — see the
+    // note there about the mini-menu window's closed-state memory).
+    if value_menu_items(ui, app, track, target, current) {
+        ui.close();
+    }
 }
 
 /// Rough current position of a target, 0..1, for the bind popup's faux
@@ -7165,11 +7332,6 @@ fn target_preview_frac(app: &App, track: usize, id: &str) -> f32 {
             0.5
         }
     }
-}
-
-/// Legacy name kept for existing call sites.
-fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) {
-    let _ = value_menu_items(ui, app, track, target, current);
 }
 
 /// Unit label a "Set value" dialog shows for a target.
@@ -8899,6 +9061,8 @@ fn lane_row(
         }
         best.map(|(_, ci, edge)| (ci, edge))
     };
+    // v18: one shared hover point for all hover reactions below.
+    let hover_pt = resp.hover_pos();
 
     // ---- paint (clipped to this strip) ----
     let old_clip = ui.clip_rect();
@@ -8941,6 +9105,12 @@ fn lane_row(
             Color32::from_rgb(170, 70, 74)
         } else {
             COL_CLIP
+        };
+        // v18: hover brighten — the clip under the pointer lifts a touch.
+        let fill = if hover_pt.is_some_and(|p| cres.contains(p)) {
+            fill.linear_multiply(1.4)
+        } else {
+            fill
         };
         draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres, fill, sel);
         // Extended-past-data tail: silence, hatched dark so it reads as
@@ -9102,6 +9272,48 @@ fn lane_row(
             );
         }
     }
+    // ---- v18: hover reactions (cursor + trim glow) ----
+    // Display-only: pointer events already repaint, so there is no
+    // animation timer forcing frames. The cursor and a lit edge tell the
+    // user what a click or drag WOULD do, before they do it — the fix
+    // for "I didn't know clips could be trimmed / lanes dragged".
+    if let Some(pt) = hover_pt {
+        if rect.contains(pt) {
+            if let Some((ci, edge)) = edge_at(app, pt) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                let (c, _) = &clips[ci];
+                let alen = app.asset_len(c.asset);
+                let ex = if edge == 0 {
+                    x_of(x0, c.pos, sr, px)
+                } else {
+                    x_of(x0, c.end(alen), sr, px)
+                };
+                ui.painter().vline(
+                    ex,
+                    rect.min.y + 1.0..=rect.max.y - 1.0,
+                    egui::Stroke::new(2.0, Color32::from_rgb(255, 214, 120)),
+                );
+            } else if clips.iter().any(|(c, _)| {
+                let alen = app.asset_len(c.asset);
+                pt.x >= x_of(x0, c.pos, sr, px) && pt.x <= x_of(x0, c.end(alen), sr, px)
+            }) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+    }
+    // Drop-target outline: while an asset rides an in-app drag or an OS
+    // file drop is in flight, the strip under the pointer lights up so
+    // the release target is unmistakable.
+    let drop_in_flight = !app.os_drops.is_empty()
+        || egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
+    if drop_in_flight && hover_pt.is_some_and(|p| rect.contains(p)) {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            2.0,
+            egui::Stroke::new(1.5, Color32::from_rgb(150, 200, 255)),
+            egui::StrokeKind::Inside,
+        );
+    }
     // ---- interactions ----
     // Release of a rack drag over this strip places the clip (the strip
     // receives it directly; the old manual cross-panel handoff never did).
@@ -9121,6 +9333,80 @@ fn lane_row(
             }
         }
         return; // the drop consumed this frame's pointer
+    }
+    // v18: OS file-drop release over this strip. While the queue from
+    // this frame's drain is non-empty and the pointer sits here, the
+    // files land on THIS lane: imported via `ensure_asset`, snapped to
+    // the grid, collision-split into child lanes exactly like paste.
+    // Undroppable types are named in the status line instead of
+    // silently vanishing into the rack.
+    if !app.os_drops.is_empty() {
+        if let Some(pt) = ui.input(|i| i.pointer.hover_pos()) {
+            if rect.contains(pt) {
+                let pos = snap_start(s_at(x0, pt.x, sr, px), snapu);
+                let mut placed: Vec<(usize, usize, usize)> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                let mut bad: Vec<String> = Vec::new();
+                for path in std::mem::take(&mut app.os_drops) {
+                    let shown = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let importable = crate::assets::is_audio_file(&path)
+                        || crate::assets::is_midi_file(&path)
+                        || crate::assets::is_auto_file(&path);
+                    let Some(ai) = importable.then(|| app.ensure_asset(&path)).flatten() else {
+                        bad.push(shown);
+                        continue;
+                    };
+                    let id = ai as u32;
+                    let nl0 = app.arr.tracks[t].lanes.len();
+                    let lane = app.arr.place_auto(t, Clip::new(id, pos), app.asset_len(id));
+                    app.grow_for_lanes(t, nl0);
+                    let li = app
+                        .arr
+                        .tracks
+                        .get(t)
+                        .and_then(|tr| tr.lanes.get(lane))
+                        .map(|l| l.clips.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    placed.push((t, lane, li));
+                    names.push(
+                        app.assets
+                            .get(ai)
+                            .map(|a| a.name.clone())
+                            .unwrap_or(shown),
+                    );
+                }
+                if !placed.is_empty() {
+                    app.sel_clips = placed;
+                    app.sel_anchor = app.sel_clips.first().copied();
+                    app.push_project();
+                }
+                let mut status = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "dropped {} on track {} \u{b7} drag \
+                         its{} edges to trim",
+                        names.join(", "),
+                        t + 1,
+                        if names.len() == 1 { "" } else { "s" }
+                    )
+                };
+                if !bad.is_empty() {
+                    let part = format!("unsupported: {}", bad.join(", "));
+                    status = if status.is_empty() {
+                        part
+                    } else {
+                        format!("{status} \u{b7} skipped {part}")
+                    };
+                }
+                if !status.is_empty() {
+                    app.status = status;
+                }
+            }
+        }
     }
     // Any primary press in the grid remembers this track as the paste
     // target ("paste into the nearest track to the last click").
@@ -9268,7 +9554,21 @@ fn lane_row(
                     app.backend.cmd(Cmd::Seek { pos });
                 }
             } else if let Some(r) = app.clip_resize {
-                if rect.contains(pt) {
+                // v18: the clip under the gesture can be removed mid-drag
+                // (Ctrl+X / right-click Delete while the button is still
+                // down) — if its slot is gone, DISARM; never index dead
+                // slots here. (delete_selection now also cancels gestures;
+                // this is the belt to that belt, per the crash pin.)
+                let alive = app
+                    .arr
+                    .tracks
+                    .get(r.t)
+                    .and_then(|tr| tr.lanes.get(r.lane))
+                    .and_then(|l| l.clips.get(r.c))
+                    .is_some();
+                if !alive {
+                    app.clip_resize = None;
+                } else if rect.contains(pt) {
                     let asset = app.arr.tracks[r.t].lanes[r.lane].clips[r.c].asset;
                     let alen = app.asset_len(asset);
                     let unit = (snapu as u64).max(1);
@@ -14265,11 +14565,15 @@ mod tests {
 
     /// ALL painted rects of an exact fill color (clip bodies).
     fn painted_rects(app: &mut App, ctx: &egui::Context, rgb: (u8, u8, u8)) -> Vec<egui::Rect> {
+        // v18: park the pointer away from the grid before probing — the
+        // hover feedback brightens the clip under the pointer, and this
+        // probe always matches the BASE fill rgb.
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            events: vec![moved(egui::pos2(20.0, 18.0))],
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -14766,6 +15070,10 @@ mod tests {
         );
 
         // AC5.2 trim from the head (left edge inward): pos AND cut move.
+        // v18: park the pointer OFF the clip before probing painted
+        // rects — a hovering pointer brightens the clip (hover feedback)
+        // and this probe matches the BASE rgb.
+        frame(&mut app, &ctx, vec![moved(egui::pos2(20.0, 18.0))]);
         frame(&mut app, &ctx, vec![]);
         let r1 = painted_rects(&mut app, &ctx, sel_rgb)
             .into_iter()
@@ -15926,5 +16234,576 @@ mod tests {
                 "dragging snare.wav onto the drop zone must set the sampler's asset param (status {:?})",
                 app.status
             );
+    }
+
+    // ================= v18 acceptance pins: core-workflow sweep ============
+    // (requirements list: scratch slooper-v18/REQUIREMENTS.md)
+
+    fn n_clips(a: &App) -> usize {
+        a.arr
+            .tracks
+            .iter()
+            .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+            .sum()
+    }
+
+    /// Every placement in the arrangement as (track, lane, index, clip).
+    fn clip_ids(a: &App) -> Vec<(usize, usize, usize, crate::arrange::Clip)> {
+        let mut v = Vec::new();
+        for (t, tr) in a.arr.tracks.iter().enumerate() {
+            for (k, ln) in tr.lanes.iter().enumerate() {
+                for (c, cl) in ln.clips.iter().enumerate() {
+                    v.push((t, k, c, *cl));
+                }
+            }
+        }
+        v
+    }
+
+    fn write_test_wav(dir: &std::path::Path, name: &str, n: usize, f: f32) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 * f).sin() * 0.4).collect();
+        crate::audio_io::export(&p, 48000, &data, crate::audio_io::ExportFormat::Wav).unwrap();
+        p
+    }
+
+    /// Right-click press + release at p (separate frames, pointer armed).
+    fn rmb(app: &mut App, ctx: &egui::Context, p: egui::Pos2) {
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Secondary, false)],
+        );
+    }
+
+    /// Left-click the painted galley whose text equals `needle`.
+    fn click_label(app: &mut App, ctx: &egui::Context, needle: &str) {
+        let r = galley_at(app, ctx, needle).unwrap_or_else(|| {
+            panic!("galley {needle:?} not painted (status {:?})", app.status)
+        });
+        let p = r.center();
+        frame(app, ctx, vec![moved(p)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+    }
+
+    /// All galley centers equal to `needle`, in paint order.
+    fn galleys_all(app: &mut App, ctx: &egui::Context, needle: &str) -> Vec<egui::Pos2> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut hits = Vec::new();
+        for cs in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text() == needle {
+                    hits.push(t.pos + t.galley.rect.center().to_vec2());
+                }
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hits
+    }
+
+    // ---- R1: OS file drag & drop into the MAIN window ---------------------
+
+    /// R1a: a WAV dropped from the FILE MANAGER onto a track lane decodes,
+    /// registers, and lands as a selected clip at the drop position. Before
+    /// v18 OS drops were consumed ONLY by the sampler drop zone, so dropping
+    /// a sample anywhere else in the app silently did nothing.
+    #[test]
+    fn v18_osdrop_wav_on_grid_places_clip() {
+        let mut app = headless_app("v18dropg");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let wav = write_test_wav(
+            &std::env::temp_dir().join("sp-uity-v18dropg").join("in"),
+            "zap.wav",
+            24_000,
+            0.2,
+        );
+        let n0 = app.assets.len();
+        let p = egui::pos2(500.0, 240.0); // lane strip of track 2 (DnD-pin geometry)
+        frame_files(&mut app, &ctx, vec![moved(p)], vec![wav]);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        assert_eq!(app.assets.len(), n0 + 1, "dropped wav imported: {}", app.status);
+        assert_eq!(n_clips(&app), 1, "drop placed a clip: {}", app.status);
+        assert!(app.status.contains("track 2"), "status names the track: {}", app.status);
+        assert!(!app.sel_clips.is_empty(), "placed clip is selected");
+        assert_eq!(app.sel_asset, Some(app.assets.len() - 1), "and rack-selected");
+    }
+
+    /// R1b: a drop anywhere else (here: the rack panel) imports the asset —
+    /// the sample is in the project, no restart, no folder dance.
+    #[test]
+    fn v18_osdrop_on_rack_imports_asset() {
+        let mut app = headless_app("v18droprack");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let wav = write_test_wav(
+            &std::env::temp_dir().join("sp-uity-v18droprack").join("in"),
+            "blip.wav",
+            12_000,
+            0.1,
+        );
+        let n0 = app.assets.len();
+        frame_files(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))], vec![wav]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "rack drop imported: {}", app.status);
+        assert_eq!(n_clips(&app), 0, "rack drop places no clip");
+        assert_eq!(app.sel_asset, Some(app.assets.len() - 1), "imported asset selected");
+    }
+
+    /// R1c: a .mid dropped on a lane places a MIDI clip.
+    #[test]
+    fn v18_osdrop_midi_file_places_clip() {
+        let mut app = headless_app("v18dropmid");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let dir = std::env::temp_dir().join("sp-uity-v18dropmid").join("in");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mid = dir.join("line.mid");
+        let mut pat = crate::midipat::Pattern::new(120);
+        pat.len_ticks = 4 * 480;
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
+        pat.save_mid(&mid).unwrap();
+        frame_files(&mut app, &ctx, vec![moved(egui::pos2(500.0, 240.0))], vec![mid]);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(ids.len(), 1, "midi drop placed one clip: {}", app.status);
+        assert!(
+            app.assets[ids[0].3.asset as usize].pattern.is_some(),
+            "placed clip carries a pattern"
+        );
+    }
+
+    /// R1d: an unsupported file is refused with a clear status, no panic.
+    #[test]
+    fn v18_osdrop_unsupported_file_reports() {
+        let mut app = headless_app("v18dropbad");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let dir = std::env::temp_dir().join("sp-uity-v18dropbad").join("in");
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "not audio").unwrap();
+        let n0 = app.assets.len();
+        frame_files(&mut app, &ctx, vec![moved(egui::pos2(500.0, 240.0))], vec![txt]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0, "nothing imported");
+        assert_eq!(n_clips(&app), 0, "no clip");
+        assert!(
+            app.status.contains("unsupported"),
+            "clear refusal message: {:?}",
+            app.status
+        );
+    }
+
+    /// R1e: a DIRECTORY dropped on the rack becomes a new rack folder
+    /// (its files visible immediately) — the "+ folder" dialog without
+    /// the dialog.
+    #[test]
+    fn v18_osdrop_folder_adds_rack_folder() {
+        let mut app = headless_app("v18dropdir");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let dir = std::env::temp_dir().join("sp-uity-v18dropdir").join("newpack");
+        write_test_wav(&dir, "hat.wav", 6_000, 0.4);
+        let n0 = app.rack.len();
+        frame_files(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))], vec![dir]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rack.len(), n0 + 1, "folder added to the rack: {}", app.status);
+        let last = app.rack.last().unwrap();
+        assert_eq!(last.files.len(), 1, "its files scanned");
+    }
+
+    // ---- R2: deleting clips -----------------------------------------------
+
+    /// R2: Delete/Backspace keys remove exactly the selected clips; an
+    /// automation clip deletes too (asset survives); repeat presses and a
+    /// stale selection after remove_asset_at must not panic.
+    #[test]
+    fn v18_delete_key_removes_clips_and_survives_abuse() {
+        let mut app = headless_app("v18delkey");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.arr.insert(0, 0, Clip::new(a, 96_000));
+        app.create_flat_auto_asset(1, crate::automation::TARGET_TRACK_VOL, 0.5);
+        let before = n_clips(&app);
+        assert_eq!(before, 3, "2 audio clips + 1 automation clip");
+        app.select_one((0, 0, 1));
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        assert_eq!(n_clips(&app), before - 1, "Delete key removed the clip: {}", app.status);
+        assert_eq!(
+            clip_ids(&app).iter().filter(|(t, _, _, _)| *t == 0).count(),
+            1,
+            "the RIGHT clip went (index 1, not the first)"
+        );
+        let (at, ak, ac, _c) = clip_ids(&app)
+            .into_iter()
+            .find(|(_, _, _, c)| {
+                app.assets.get(c.asset as usize).is_some_and(|x| x.is_auto())
+            })
+            .expect("automation clip placed");
+        let n_assets = app.assets.len();
+        app.select_one((at, ak, ac));
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Backspace, Default::default())]);
+        assert_eq!(n_clips(&app), before - 2, "Backspace deleted the automation clip");
+        assert_eq!(app.assets.len(), n_assets, "automation ASSET stays in the rack");
+        // A stray key with no selection must no-op, not delete "whatever".
+        assert!(app.sel_clips.is_empty());
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        assert_eq!(n_clips(&app), before - 2);
+        // remove_asset_at cleared the selection — later Delete is a no-op.
+        app.select_one((0, 0, 0));
+        app.remove_asset_at(a as usize);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        assert!(app.sel_clips.is_empty());
+    }
+
+    // ---- R3: automation creation by right-click ----------------------------
+
+    /// R3a: right-clicking the BPM box opens the mini menu; "Create
+    /// automation asset" produces an AUTO asset + clip at the playhead on
+    /// the owning track, and a second creation gets its own asset (auto-2,
+    /// never overwritten).
+    #[test]
+    fn v18_rmb_tempo_creates_automation_asset_twice() {
+        let mut app = headless_app("v18rmbtempo");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let n0 = app.assets.len();
+        let p = app.bpm_rect.expect("bpm rect painted").center();
+        rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation asset");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "AUTO asset created: {}", app.status);
+        assert!(app.assets[n0].is_auto(), "kind = automation");
+        let ids = clip_ids(&app);
+        assert_eq!(ids.len(), 1, "automation clip placed: {}", app.status);
+        assert_eq!(ids[0].0, 0, "placed on the selected track");
+        assert_eq!(app.assets[n0].name, "auto-1");
+        // Second creation: its own asset, never overwrite the first. The
+        // rect is re-read because the top bar's layout belongs to the app
+        // (a v18 pin — it used to JITTER with status text; a real user
+        // aims at the CURRENTLY painted box).
+        let p = app.bpm_rect.expect("bpm rect still painted").center();
+        rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation asset");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 2, "second asset: {}", app.status);
+        assert_eq!(app.assets[n0 + 1].name, "auto-2", "auto-2 next to auto-1");
+    }
+
+    /// R3a-2: the same menu from a TRACK volume readout in the mixer binds
+    /// the clip to that track's volume target.
+    #[test]
+    fn v18_rmb_track_vol_creates_auto_for_that_target() {
+        let mut app = headless_app("v18rmbvol");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Paint order in the mixer: master strip first, then track 1.
+        let readout = format!("{:>5}", db_num(1.0));
+        let hits = galleys_all(&mut app, &ctx, &readout);
+        let p = *hits
+            .get(1)
+            .unwrap_or_else(|| panic!("expected master + track-1 dB readouts, got {hits:?}"));
+        let n0 = app.assets.len();
+        rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation asset");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "track-vol menu creates: {}", app.status);
+        let auto = app.assets[n0].automation.as_ref().expect("automation attached");
+        assert_eq!(auto.target, crate::automation::TARGET_TRACK_VOL);
+    }
+
+    /// R3b: in the automation canvas, clicking empty space ADDS a node and
+    /// right-clicking a node deletes it (the tooltip promises exactly this).
+    #[test]
+    fn v18_auto_canvas_click_adds_rmb_deletes_node() {
+        let mut app = headless_app("v18autocanvas");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.open_auto_editor(None);
+        frame(&mut app, &ctx, vec![]);
+        let n0 = app.auto_edit.as_ref().unwrap().nodes.len();
+        // Find the curve canvas the proven v15 way: a click inside adds
+        // exactly one node (same scan, same coordinates).
+        let mut cp = None;
+        'outer: for y in (380i32..=560).step_by(6) {
+            for x in (260i32..=700).step_by(40) {
+                let p = egui::pos2(x as f32, y as f32);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![btn(p, egui::PointerButton::Primary, false)],
+                );
+                let n = app.auto_edit.as_ref().unwrap().nodes.len();
+                if n == n0 + 1 {
+                    cp = Some(p);
+                    break 'outer;
+                }
+                assert!(n == n0, "click never deletes nodes");
+            }
+        }
+        let p = cp.expect("click empty canvas adds a node");
+        // Right-click the NEW node (it sits exactly under p): it vanishes.
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.auto_edit
+                .as_ref()
+                .expect("editor stays open")
+                .nodes
+                .len(),
+            n0,
+            "right-click deleted the node"
+        );
+    }
+
+    // ---- R4: clipboard ------------------------------------------------------
+
+    /// R4a: Ctrl+X is a real cut (copy + delete), Ctrl+V brings the clip
+    /// back — driven with REAL key events through the shortcut pipeline.
+    #[test]
+    fn v18_ctrlx_cut_key_then_paste() {
+        let mut app = headless_app("v18cutkey");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::X, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(n_clips(&app), 0, "Ctrl+X deleted the clip");
+        assert_eq!(app.clipboard.as_ref().map(|c| c.items.len()), Some(1), "and copied it");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(n_clips(&app), 1, "Ctrl+V pasted it back: {}", app.status);
+    }
+
+    /// R4b: copy -> remove_asset_at -> paste must not panic and must not
+    /// place a clip pointing at the dead id (the clipboard entries drop).
+    #[test]
+    fn v18_copy_delete_asset_paste_is_safe() {
+        let mut app = headless_app("v18cdead");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(app.clipboard.as_ref().map(|c| c.items.len()), Some(1));
+        app.remove_asset_at(a as usize);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(n_clips(&app), 0, "no ghost clip from the dead asset");
+    }
+
+    /// R4c: after a REAL click on track 3's grid, Ctrl+V lands on track 3.
+    #[test]
+    fn v18_paste_lands_on_last_clicked_track() {
+        let mut app = headless_app("v18pastetgt");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        app.select_one((0, 0, 0));
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        // Real left-click on track 3's EMPTY grid area (x far right of the
+        // 3 s clip at 160 px/s). Settle a frame first so the props-strip
+        // shift is baked into grid_anchor before geometry is sampled.
+        frame(&mut app, &ctx, vec![]);
+        let top3 = app.grid_anchor - app.vscroll + 2.0 * (app.track_h(2) + TRACK_SEP_HIT);
+        let p = egui::pos2(1100.0, top3 + app.track_h(2) * 0.5);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.last_click_track, Some(2), "grid click remembered track 3");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        let ids = clip_ids(&app);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().any(|(t, _, _, _)| *t == 2), "paste landed on track 3: {ids:?}");
+    }
+
+    // ---- R5/R6: drag gestures vs. destructive edits -------------------------
+
+    /// R5a: dragging a selected clip DOWN moves it to the track's child
+    /// lane, the selection follows, and a following plain click still works
+    /// (no stuck gesture).
+    #[test]
+    fn v18_vertical_clip_drag_moves_lane_and_reclick_works() {
+        let mut app = headless_app("v18vertdrag");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        // Two overlapping clips on track 2: the second opens a child lane.
+        app.arr.insert(1, 0, Clip::new(a, 0));
+        let lane = app.arr.place_auto(1, Clip::new(a, 0), app.asset_len(a));
+        assert_eq!(lane, 1, "overlap opened the child lane");
+        app.select_one((1, 0, 0));
+        // Settle one frame so the clip-props strip exists BEFORE geometry
+        // is sampled — the strip shifts the whole grid down.
+        frame(&mut app, &ctx, vec![]);
+        let top1 = app.grid_anchor - app.vscroll + app.track_h(0) + TRACK_SEP_HIT;
+        let lane_h = app.track_h(1) / 2.0;
+        let grab = egui::pos2(500.0, top1 + lane_h * 0.5);
+        let drop = egui::pos2(500.0, top1 + lane_h * 1.5);
+        frame(&mut app, &ctx, vec![moved(grab)]);
+        frame(&mut app, &ctx, vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)]);
+        let mid = egui::pos2(500.0, (grab.y + drop.y) * 0.5);
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        frame(&mut app, &ctx, vec![moved(drop)]);
+        frame(&mut app, &ctx, vec![moved(drop), btn(drop, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(ids.iter().filter(|(t, k, _, _)| *t == 1 && *k == 1).count(), 2, "both clips now share the child lane: {ids:?}");
+        assert!(app.sel_clips.iter().all(|(t, k, _)| *t == 1 && *k == 1), "selection followed the lane");
+        // Plain click afterwards still selects (the reaper must be
+        // clean) — click the CHILD LANE the clips now live in; lane 0 is
+        // empty after the drag, and clicking empty grid correctly clears.
+        let click = egui::pos2(500.0, top1 + lane_h * 1.5);
+        frame(&mut app, &ctx, vec![moved(click)]);
+        frame(&mut app, &ctx, vec![moved(click), btn(click, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(click, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.sel_clips.len(), 1, "click after drag selects again: {:?}", app.sel_clips);
+    }
+
+    /// R5b: cutting the selected clip WHILE an edge-resize drag is armed
+    /// (button still down) must not panic on the next pointer move.
+    #[test]
+    fn v18_cut_during_armed_edge_resize_does_not_panic() {
+        let mut app = headless_app("v18cutresize");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        let top0 = app.grid_anchor - app.vscroll;
+        // Right edge of the 3 s clip at the default zoom.
+        let edge_x = 270.0 + 3.0 * app.px_per_sec;
+        let grab = egui::pos2(edge_x - 2.0, top0 + app.track_h(0) * 0.5);
+        frame(&mut app, &ctx, vec![moved(grab)]);
+        frame(&mut app, &ctx, vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)]);
+        let moved_to = egui::pos2(edge_x + 14.0, top0 + app.track_h(0) * 0.5);
+        frame(&mut app, &ctx, vec![moved(moved_to)]);
+        assert!(app.clip_resize.is_some(), "edge resize armed");
+        // Ctrl+X while the button is still down: the clip dies under us.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                moved(moved_to),
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::X, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(n_clips(&app), 0, "cut happened");
+        // Keep moving, then release: the dead gesture must not be touched.
+        frame_keys(&mut app, &ctx, vec![moved(egui::pos2(edge_x + 40.0, moved_to.y))]);
+        frame(&mut app, &ctx, vec![btn(egui::pos2(edge_x + 40.0, moved_to.y), egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+    }
+
+    /// R6: right-clicking the grid MID-marquee (primary still down) opens a
+    /// menu without panic, and the arrangement survives the whole sequence.
+    #[test]
+    fn v18_rmb_mid_marquee_is_safe() {
+        let mut app = headless_app("v18rmbmarquee");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        let top0 = app.grid_anchor - app.vscroll;
+        let p0 = egui::pos2(900.0, top0 + app.track_h(0) * 0.5);
+        frame(&mut app, &ctx, vec![moved(p0)]);
+        frame(&mut app, &ctx, vec![moved(p0), btn(p0, egui::PointerButton::Primary, true)]);
+        let p1 = egui::pos2(980.0, top0 + app.track_h(0) * 0.5);
+        frame(&mut app, &ctx, vec![moved(p1)]);
+        // Secondary press + release while the primary is still held.
+        frame(&mut app, &ctx, vec![btn(p1, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(p1, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![moved(p1)]);
+        // Release primary somewhere else; idle frames settle everything.
+        frame(&mut app, &ctx, vec![btn(p0, egui::PointerButton::Primary, false)]);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(n_clips(&app), 1, "nothing was destroyed en route");
     }
 }
