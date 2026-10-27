@@ -269,6 +269,21 @@ pub fn scan_with(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                 if skip_bridged && (name.contains(".dll.") || dir.to_string_lossy().contains("/yabridge/")) {
                     continue;
                 }
+                // v19.1: a real chainloader wrapper is guarded even in
+                // production — if the probe says Wine cannot host, the entry
+                // gets an error note instead of aborting the process.
+                // Only for formats scan would actually dlopen: raw `.dll`s
+                // inside yabridge folders stay invisible, as always.
+                let probeable = name.ends_with(".vst3")
+                    || (name.ends_with(".vst") && p.is_dir())
+                    || (name.ends_with(".so") && !p.is_dir());
+                if probeable && is_wine_bridged(&p) {
+                    if let Err(why) = bridge_ok(bridge_needs32(&p)) {
+                        seen.push(p.clone());
+                        out.push(bridge_error_entry(&p, why));
+                        continue;
+                    }
+                }
                 if name.ends_with(".vst3") {
                     seen.push(p.clone());
                     out.push(probe_vst3(&p));
@@ -400,6 +415,338 @@ pub fn yabridge_sync(roots: &[PathBuf]) -> Option<String> {
     Some(format!(
         "yabridge: {added} Windows plugin folder(s) processed — {line}"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// v19.1 Wine-bridge guard. A yabridge chainloader calls abort() INSIDE this
+// process when its Wine host cannot start (reproduced on the release install:
+// desktop session without WINELOADER → WoW64-only Wine 11 → the 32-bit host
+// dies `c000007b` → chainloader prints "The Wine host process has exited
+// unexpectedly" and aborts the app). dlopen of the wrapper IS the abort —
+// there is no error path after it. The only defense that works is asking
+// Wine, BEFORE any dlopen, whether it can run its own host binary at all.
+// ---------------------------------------------------------------------------
+
+/// Fingerprint yabridge embeds in every chainloader wrapper it copies into
+/// the plugin folders (its own debug/source path, survives stripping).
+const CHAINLOADER_MAGIC: &[u8] = b"libyabridge-chainloader";
+
+/// True when `p` contains yabridge chainloader magic bytes. Only the first
+/// 512 KiB of small files is read — wrappers are ~89 KiB, real plugin
+/// binaries are usually larger and never touched.
+fn is_chainloader_file(p: &Path) -> bool {
+    if p.metadata().map(|m| m.len() > 512 * 1024).unwrap_or(true) {
+        return false;
+    }
+    std::fs::File::open(p)
+        .and_then(|mut f| {
+            use std::io::Read;
+            let mut buf = vec![0u8; 512 * 1024];
+            let n = f.read(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf
+                .windows(CHAINLOADER_MAGIC.len())
+                .any(|w| w == CHAINLOADER_MAGIC))
+        })
+        .unwrap_or(false)
+}
+
+/// Every `.so` inside a bundle's `Contents/` (directly or one arch subdir
+/// down) — covers both the VST3 `Contents/x86_64-linux/` and VST2
+/// `Contents/x86-64.so` layouts. Used for the chainloader magic check only.
+fn bundle_inner_libs(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir.join("Contents")) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Ok(rd2) = std::fs::read_dir(&p) {
+                out.extend(rd2.flatten().map(|e2| e2.path()).filter(|q| {
+                    q.extension().map(|x| x == "so").unwrap_or(false)
+                }));
+            }
+        } else if p.extension().map(|x| x == "so").unwrap_or(false) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The Windows `.dll` a wrapper sits next to: yabridge keeps `X.so`/
+/// `X.dll.so`/`X.vst3` and `X.dll` side by side.
+fn bridge_companion_dll(p: &Path) -> Option<PathBuf> {
+    let name = p.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".so")
+        .or_else(|| name.strip_suffix(".vst3"))
+        .unwrap_or(name);
+    let dll = if stem.ends_with(".dll") {
+        stem.to_string()
+    } else {
+        format!("{stem}.dll")
+    };
+    let p = p.parent()?.join(dll);
+    p.is_file().then_some(p)
+}
+
+/// PE `Machine` field of a Windows DLL (`None` when not a parseable PE):
+/// 0x014c = i386, 0x8664 = x86-64.
+fn pe_machine(dll: &Path) -> Option<u16> {
+    let b = std::fs::read(dll).ok()?;
+    if b.len() < 0x40 || &b[0..2] != b"MZ" {
+        return None;
+    }
+    let off = u32::from_le_bytes([b[0x3c], b[0x3d], b[0x3e], b[0x3f]]) as usize;
+    if off + 6 > b.len() || &b[off..off + 4] != b"PE\0\0" {
+        return None;
+    }
+    Some(u16::from_le_bytes([b[off + 4], b[off + 5]]))
+}
+
+/// Whether this wrapper needs a 32-bit-capable Wine host. Unknown PE → true:
+/// guessing 64 wrongly means an in-process abort, guessing 32 wrongly means
+/// a false "unavailable" note. The asymmetry decides.
+fn bridge_needs32(p: &Path) -> bool {
+    !matches!(
+        bridge_companion_dll(p).as_deref().and_then(pe_machine),
+        Some(0x8664)
+    )
+}
+
+/// True when probing/loading `p` would dlopen a yabridge chainloader —
+/// i.e. drag Wine into THIS process.
+pub fn is_wine_bridged(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if p.to_string_lossy().contains("/yabridge/") {
+        return true;
+    }
+    if name.ends_with(".vst3") || name.ends_with(".vst") {
+        let libs = bundle_inner_libs(p);
+        return libs.iter().any(|so| is_chainloader_file(so))
+            || (name.contains(".dll.") && bridge_companion_dll(p).is_some());
+    }
+    if is_chainloader_file(p) {
+        return true;
+    }
+    // Sidecar naming ALONE is not proof (the v10 fixture renames a real
+    // Linux plugin that way): it only guards when the companion `.dll`
+    // actually parses as a Windows binary.
+    name.contains(".dll.")
+        && bridge_companion_dll(p)
+            .map(|d| pe_machine(&d).is_some())
+            .unwrap_or(false)
+}
+
+/// The Wine loader the chainloader child would pick (yabridge honours
+/// `WINELOADER`, else `wine` on PATH): probe THAT one, not some other wine.
+/// `SLOOPER_WINE` overrides everything (test seam).
+fn bridge_wine_loader() -> Option<PathBuf> {
+    for var in ["SLOOPER_WINE", "WINELOADER"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(PathBuf::from(v));
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let c = Path::new(dir).join("wine");
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    ["/usr/bin/wine", "/usr/local/bin/wine"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|c| c.is_file())
+}
+
+/// Where yabridge installed its host binaries (the wrappers exec these
+/// under Wine). `SLOOPER_YABRIDGE_DIR` overrides (test seam).
+fn bridge_host_exe(need32: bool) -> Option<PathBuf> {
+    let names: [&str; 2] = if need32 {
+        ["yabridge-host-32.exe.so", "yabridge-host-32.exe"]
+    } else {
+        ["yabridge-host.exe.so", "yabridge-host.exe"]
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(v) = std::env::var("SLOOPER_YABRIDGE_DIR") {
+        dirs.push(PathBuf::from(v));
+    }
+    if let Ok(x) = std::env::var("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(x).join("yabridge"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/share/yabridge"));
+    }
+    dirs.extend(["/usr/share/yabridge", "/usr/lib/yabridge"].map(PathBuf::from));
+    dirs.iter().find_map(|d| {
+        names
+            .iter()
+            .find_map(|n| {
+                let p = d.join(n);
+                p.is_file().then_some(p)
+            })
+    })
+}
+
+/// Run the Wine host once, argument-free, and judge the loader from its
+/// output. Success markers: the host banner/usage (Wine RAN the PE — the
+/// host then exits with a usage error or keeps running on its socket, and
+/// a still-alive host at the deadline counts too). A silent, quick death is
+/// treated as broken: a loader that cannot even produce the host's banner
+/// has no business hosting plugins.
+fn bridge_probe(loader: &Path, exe: &Path, need32: bool) -> Result<(), String> {
+    let out_path = std::env::temp_dir().join(format!(
+        "slooper-wine-probe-{}-{}.log",
+        std::process::id(),
+        if need32 { "32" } else { "64" }
+    ));
+    let f = std::fs::File::create(&out_path).map_err(|e| format!("probe temp file: {e}"))?;
+    let f2 = f.try_clone().ok();
+    let mut child = std::process::Command::new(loader)
+        .arg(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(f))
+        .stderr(f2.map(std::process::Stdio::from).unwrap_or(std::process::Stdio::null()))
+        .spawn()
+        .map_err(|e| {
+            format!("Wine loader '{}' could not be started: {e}", loader.display())
+        })?;
+    let start = std::time::Instant::now();
+    let mut alive_at_deadline = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed().as_millis() >= 20_000 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    alive_at_deadline = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+    let txt = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    if txt.contains("host version") || txt.contains("Usage: yabridge-host") {
+        return Ok(()); // Wine ran the host — the banner is the host itself talking
+    }
+    if alive_at_deadline {
+        return Ok(()); // host process alive = Wine works, host waits on its socket
+    }
+    let why = if txt.contains("c000007b") {
+        if need32 {
+            "this Wine cannot run 32-bit Windows code (c000007b)"
+        } else {
+            "Wine cannot load its host binary (c000007b)"
+        }
+    } else if txt.contains("wineserver") {
+        // Mixed Wine versions sharing one prefix: another build's wineserver
+        // owns it right now. The REAL host load would hit the same wall —
+        // surface it with the cure instead of a generic "cannot start".
+        "a wineserver from a different Wine build holds the prefix — close all Windows-audio programs and retry"
+    } else if txt.contains("failed to start") {
+        "Wine failed to start its plugin host"
+    } else {
+        "Wine could not start its plugin host"
+    };
+    let tail: String = txt
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" / ")
+        .chars()
+        .take(160)
+        .collect();
+    Err(if tail.is_empty() {
+        why.to_string()
+    } else {
+        format!("{why} — last output: {tail}")
+    })
+}
+
+/// Cached outcome of the two bitness probes; the env fingerprint invalidates
+/// it, so tests (and fixed environments) re-probe instead of inheriting.
+struct BridgeProbeResult {
+    key: String,
+    ok32: Result<(), String>,
+    ok64: Result<(), String>,
+}
+
+fn bridge_probes() -> std::sync::MutexGuard<'static, Option<BridgeProbeResult>> {
+    static CACHE: std::sync::OnceLock<Mutex<Option<BridgeProbeResult>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ask Wine — once per process, once per bitness — whether it can host
+/// Windows plugins. `SLOOPER_BRIDGE_PROBE=0` trusts wrappers blindly
+/// (power-user escape hatch), `SLOOPER_SKIP_BRIDGED=1` never touches them.
+fn bridge_ok(need32: bool) -> Result<(), String> {
+    if std::env::var("SLOOPER_BRIDGE_PROBE").map(|v| v == "0").unwrap_or(false) {
+        return Ok(());
+    }
+    let key = [
+        std::env::var("SLOOPER_WINE").unwrap_or_default(),
+        std::env::var("WINELOADER").unwrap_or_default(),
+        std::env::var("SLOOPER_YABRIDGE_DIR").unwrap_or_default(),
+        std::env::var("PATH").unwrap_or_default(),
+    ]
+    .join("\u{1}");
+    let mut slot = bridge_probes();
+    if slot.as_ref().map(|c| c.key != key).unwrap_or(true) {
+        let probe = |n32: bool| match (bridge_wine_loader(), bridge_host_exe(n32)) {
+            (None, _) => Err("Wine not found (install Wine or set WINELOADER)".to_string()),
+            (_, None) => Err("yabridge host binaries not found (run `yabridgectl sync`)".to_string()),
+            (Some(w), Some(h)) => bridge_probe(&w, &h, n32),
+        };
+        *slot = Some(BridgeProbeResult {
+            key,
+            ok32: probe(true),
+            ok64: probe(false),
+        });
+    }
+    let c = slot.as_ref().expect("bridge probe cache just filled");
+    if need32 {
+        c.ok32.clone()
+    } else {
+        c.ok64.clone()
+    }
+}
+
+/// Scan result for a bridged plugin the probe refused: a greyed "not
+/// loaded" row naming what to do, never a crashed app.
+fn bridge_error_entry(p: &Path, why: String) -> VstEntry {
+    let name = base_label(p).trim_end_matches(".dll").to_string();
+    let kind = if p.to_string_lossy().contains(".vst3") {
+        VstKind::V3
+    } else {
+        VstKind::V2
+    };
+    VstEntry {
+        path: p.to_path_buf(),
+        kind,
+        name: format!("{name} (Windows)"),
+        vendor: "Wine".to_string(),
+        instrument: false,
+        error: Some(format!(
+            "Wine bridge unavailable: {why}. Set WINELOADER to a Wine build that runs {}-bit plugins, then rescan",
+            if bridge_needs32(p) { "32" } else { "64" }
+        )),
+    }
 }
 
 fn base_label(path: &Path) -> String {
@@ -1013,6 +1360,13 @@ fn open_inner(
     sample_rate: u32,
     saved: Option<&[f32]>,
 ) -> Result<VstLoad, String> {
+    // v19.1: never dlopen a chainloader wrapper whose Wine probe failed —
+    // the dlopen itself is the abort(). Covers lazily (re)opened chain rows
+    // saved in a project/config on a machine whose Wine since broke.
+    if is_wine_bridged(path) {
+        bridge_ok(bridge_needs32(path))
+            .map_err(|w| format!("Windows plugin '{}' unavailable: {w}", path.display()))?;
+    }
     let _loader = vst_loader_lock();
     let entry = match kind {
         VstKind::V3 => open_v3(path, sample_rate, saved)?,
@@ -2055,6 +2409,135 @@ mod tests {
             "raw .dll must never be dlopen'd by scan"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================== v0.19.1 Wine-bridge guard pins =====================
+
+    /// Synthetic Windows DLL: MZ + PE header with the given `Machine` field.
+    fn v191_fake_dll(path: &Path, machine: u16) {
+        let mut b = vec![0u8; 512];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        b[64..68].copy_from_slice(b"PE\0\0");
+        b[68..70].copy_from_slice(&machine.to_le_bytes());
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// Fixture: a plugins folder holding a yabridge-magic wrapper with an
+    /// i386 companion `.dll`, plus fake yabridge host binaries and a fake
+    /// Wine loader whose BEHAVIOUR is `wine_body` (executed as a /bin/sh
+    /// script by the probe). Sets the probe env seams; caller must tear down.
+    fn v191_bridge_fixture(tag: &str, wine_body: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("sp-bridge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("plugins")).unwrap();
+        std::fs::create_dir_all(root.join("yabridge")).unwrap();
+        for h in ["yabridge-host-32.exe.so", "yabridge-host.exe.so"] {
+            std::fs::write(root.join("yabridge").join(h), "#!/bin/sh\n").unwrap();
+        }
+        let wine = root.join("wine");
+        std::fs::write(&wine, format!("#!/bin/sh\n{wine_body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            root.join("plugins/Monk.dll.so"),
+            b"MZ\x90\x00 libyabridge-chainloader-vst2.so (synthetic fixture)",
+        )
+        .unwrap();
+        v191_fake_dll(&root.join("plugins/Monk.dll"), 0x014c);
+        std::env::set_var("SLOOPER_WINE", &wine);
+        std::env::set_var("SLOOPER_YABRIDGE_DIR", root.join("yabridge"));
+        root
+    }
+
+    fn v191_bridge_teardown(root: &Path) {
+        std::env::remove_var("SLOOPER_WINE");
+        std::env::remove_var("SLOOPER_YABRIDGE_DIR");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v191_pe_machine_reads_both_bitnesses() {
+        let dir = std::env::temp_dir().join(format!("sp-pe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        v191_fake_dll(&dir.join("m32.dll"), 0x014c);
+        v191_fake_dll(&dir.join("m64.dll"), 0x8664);
+        std::fs::write(dir.join("junk.dll"), b"MZ junk").unwrap();
+        assert_eq!(pe_machine(&dir.join("m32.dll")), Some(0x014c));
+        assert_eq!(pe_machine(&dir.join("m64.dll")), Some(0x8664));
+        assert_eq!(pe_machine(&dir.join("junk.dll")), None);
+        // The bitness decision for a wrapper follows its companion dll.
+        std::fs::copy(dir.join("junk.dll"), dir.join("mystery.dll")).unwrap();
+        std::fs::write(dir.join("mystery.dll.so"), b"#!/bin/sh\n").unwrap();
+        assert!(bridge_needs32(&dir.join("mystery.dll.so")), "unparseable PE must assume 32-bit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v191_scan_marks_dead_wine_bridge_without_crash() {
+        let root = v191_bridge_fixture(
+            "dead",
+            "echo 'wine: failed to start L\"yabridge-host-32.exe.so\": c000007b' >&2\nexit 1",
+        );
+        let found = scan_with(std::slice::from_ref(&root.join("plugins")), false);
+        let e = found
+            .iter()
+            .find(|e| e.path.to_string_lossy().contains("Monk.dll.so"))
+            .expect("bridged wrapper must still be listed (greyed), never hidden");
+        let err = e.error.as_deref().unwrap_or_default();
+        assert!(err.contains("32-bit"), "error must name the bitness gap: {err}");
+        assert!(err.contains("WINELOADER"), "error must name the remedy: {err}");
+        // The raw `.dll` companion stays invisible — scan never probes PE.
+        assert!(
+            !found
+                .iter()
+                .any(|e| e.path.extension().and_then(|x| x.to_str()) == Some("dll")),
+            "raw .dll must never become an entry"
+        );
+        v191_bridge_teardown(&root);
+    }
+
+    #[test]
+    fn v191_scan_passes_bridge_when_wine_probe_passes() {
+        // Probe success (the host's own banner) must take the NORMAL load
+        // path: the synthetic wrapper then fails as a plain dlopen error —
+        // proof the guard did not refuse it.
+        let root = v191_bridge_fixture(
+            "live",
+            "echo 'yabridge host version 5.1.1 (32-bit compatibility mode)'\necho 'Usage: yabridge-host-32.exe a b c d'\nexit 1",
+        );
+        let found = scan_with(std::slice::from_ref(&root.join("plugins")), false);
+        let e = found
+            .iter()
+            .find(|e| e.path.to_string_lossy().contains("Monk.dll.so"))
+            .expect("wrapper entry present");
+        let err = e.error.clone().unwrap_or_default();
+        assert!(
+            !err.contains("bridge unavailable"),
+            "guard must not refuse when the probe passes: {err}"
+        );
+        assert!(!err.is_empty(), "junk wrapper must still fail the real load: {e:?}");
+        v191_bridge_teardown(&root);
+    }
+
+    #[test]
+    fn v191_open_inner_refuses_bridge_with_dead_wine() {
+        let root = v191_bridge_fixture(
+            "open",
+            "echo 'wine: failed to start L\"x\": c000007b' >&2\nexit 1",
+        );
+        let p = root.join("plugins/Monk.dll.so");
+        assert!(is_wine_bridged(&p));
+        let err = open_inner(&p, VstKind::V2, 48_000, None)
+            .err()
+            .expect("dead Wine must be refused BEFORE any dlopen");
+        assert!(err.contains("unavailable"), "{err}");
+        v191_bridge_teardown(&root);
     }
 
     /// AC3.1: opening a local VST2 EFFECT goes through the full handshake

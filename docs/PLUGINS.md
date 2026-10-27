@@ -130,10 +130,37 @@ Two infrastructure facts this uncovered (both fixed):
    `wine64` + 32-bit libs, no root needed), exported via
    `~/.config/environment.d/yabridge-wine.conf` →
    `WINELOADER=$HOME/Tools/winege/bin/wine64` (takes effect at next login;
-   for one-off shells export it before launching slooper).
+   for one-off shells export it before launching slooper). NOTE: a session
+   started BEFORE that file existed never sees it — `systemctl --user
+   show-environment` then lacks WINELOADER and desktop launches still get
+   the system wine. Fix live with `systemctl --user set-environment
+   WINELOADER=$HOME/Tools/winege/bin/wine64` (or re-login).
 2. **vendored vst2 patch #4**: the crate rejected every plugin reporting
    `GetApiVersion < 2400`, which bricks legacy VST 1.0/2.0 plugins. The gate
    now accepts any plausible version (see `vendor/vst2/VENDOR-NOTES.md`).
+
+## v19.1 Wine bridge guard: a dead Wine can no longer kill the app
+
+Before this, one unloadable yabridge wrapper was an app-killer: the
+chainloader spawns Wine inside the dlopen'd probe, and when Wine cannot run
+the host binary (WoW64-only wine + 32-bit plugin → `c000007b`) it prints
+"The Wine host process has exited unexpectedly" and calls `abort()` **in
+slooper's own process** — a core dump mid-scan, every other plugin lost with
+it. Reproduced exactly on a desktop session missing `WINELOADER` (see the
+fact 1 note above).
+
+Scan and open now run a **functional probe before any dlopen**: the chosen
+Wine loader (same discovery yabridge itself uses — `WINELOADER`, else
+`wine` on PATH; `SLOOPER_WINE` overrides) is asked to start the real yabridge
+host binary once per bitness. The host's banner/usage output (or a host that
+stays alive) proves the loader works; `c000007b`, a foreign-version
+`wineserver`, or a silent death mark that bitness dead, and every bridged
+plugin becomes a greyed, named reason — "this Wine cannot run 32-bit Windows
+code (c000007b) … Set WINELOADER to a Wine build that runs 32-bit plugins,
+then rescan" — instead of a crash. Mixed Wine versions sharing one prefix
+also now explain themselves (the wineserver case). Escape hatches:
+`SLOOPER_SKIP_BRIDGED=1` never touches bridged plugins; `SLOOPER_BRIDGE_PROBE=0`
+trusts wrappers blindly (power users). Pinned by `v191_*` unit tests.
 
 ## v17 host fixes: why plugins could crash or load silent
 
