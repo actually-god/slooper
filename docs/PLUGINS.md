@@ -67,6 +67,74 @@ this build (`unordered_map::at` + blank panel), and its GUI-less VST3
 variant duplicates Vitalium coverage less reliably; the file was removed
 from `~/.vst` (v17).
 
+## v19 expansion set (installed under `~/AudioFOSS`, linked into `~/.vst3`/`~/.vst`)
+
+Varied FOSS synths **and** effects, all verified through the real host path
+by `examples/plugin_one` per-plugin children (a vendor crash can only take
+down its own row). Arch/CachyOS binary packages were extracted into
+`~/AudioFOSS/{vst3,vst,share}` (no root needed) and symlinked into the scan
+folders; plugin data (Surge, Cardinal) is symlinked under
+`~/.local/share/`.
+
+| Plugin | Kind | License / source |
+|---|---|---|
+| Surge XT + Surge XT Effects | synth / FX | Gpl-3.0, `surge-synthesizer` |
+| Odin2 | poly synth | GPL-2.0, `micdhall/Odin2` |
+| OB-Xf | synth | MIT, `Tytelus/OB-Xf` |
+| JC303 | acid bass | GPL-3.0, `squarewaveaudio/jc303` |
+| SG-323 | guitar sim | GPL-3.0, `pusevox/SG-323` |
+| SoulForce | organ | MIT, `AzioSoulforce/SoulForce` |
+| OneTrick CHONK | bass | GPL-3.0, `OneTrickBass/CHONK` |
+| Ultramaster KR-106 | bass/saturn | GPL-3.0, `OlofLindahl/Ultramaster` |
+| ADLplug (OPL2/OPL3) / OPNplug (OPNM) | FM synths | MIT + GPL-2.0, `adamgq/*` |
+| Kars / Nekobi / MVerb / Ma* / 3Band* / CycleShifter / glBars / PingPongPan / ProM / Amplitude* | DPF demo set + MDA-DM | BSD/GPL, DISTRHO |
+| lsp-plugins (198 FX classes) | FX suite | GPL-3.0, `sadko4u/lsp-plugins` |
+| RoomReverb | convolution verb | GPL-3.0, `ElephantDashDSP` |
+| Cardinal / CardinalSynth / CardinalFX | VCV modular | GPL-3.0, `KXStudio/Cardinal` |
+| Stochas | pattern sequencer | GPL-3.0, `SWSoundStudios/Stochas` |
+
+Verified-working notes (audit verdicts):
+
+* **lsp-plugins**: upstream 1.2.35 ships a `moduleinfo.json` whose legacy
+  `Classes`/`Compatibility` sections carry duplicate class ids for dev-only
+  "A/B Tester" entries; the spec-compliant loader then rejects the WHOLE
+  bundle. Fixed locally by dropping those two legacy sections (original kept
+  as `moduleinfo.json.orig`); all 198 effect classes load afterwards.
+* **ADLplug/OPNplug**: the CachyOS znver4 rebuilds link `libfmt.so.11` but
+  the distro moved to fmt 12. Fixed without root: `libfmt.so.11` extracted
+  from the Arch archive into `~/AudioFOSS/lib` + `rpath` patched onto the
+  plugin `.so`s (patchelf from an extracted package).
+* **AmplitudeImposer** (DPF leftovers): crashes on open (no moduleinfo,
+  segfault) — quarantined in `~/AudioFOSS/quarantine`, NOT linked in.
+* **Cardinal / CardinalSynth / CardinalFX / Stochas**: load and run but are
+  intentionally SILENT until a patch/sequence is loaded — the unit tests
+  skip them (`local_audio_test_drivable`), as silence is their correct
+  default state.
+
+### Legacy 32-bit Windows VSTs: AudioNerdz **Delay Lama** (the singing monk)
+
+The 2001 freeware VST (32-bit Win32, VST ~1.0) has no Linux build. Install
+path verified end-to-end on this host — the DLL (from the Internet Archive
+mirror of the original distribution, sha256
+`469ce87e…`) lives at `~/AudioFOSS/delaylama/win32/Delay Lama.dll`,
+registered with `yabridgectl`, and plays through slooper's normal instrument
+list. (It deliberately does NOT live under `~/wine*/drive_c/Program Files/…`
+— `default_vst_dirs` scans those VSTPlugins paths, and a raw `.dll` found
+there would get instantiated by every scan through the bridge.)
+
+Two infrastructure facts this uncovered (both fixed):
+
+1. **Arch wine ≥10 is WoW64-only (no `wine64`), and yabridge's 32-bit
+   bitbridge does not work on it** (upstream-documented). A legacy-WoW wine
+   must be supplied: `~/Tools/winege` (wine-lutris GE-Proton8-26, contains
+   `wine64` + 32-bit libs, no root needed), exported via
+   `~/.config/environment.d/yabridge-wine.conf` →
+   `WINELOADER=$HOME/Tools/winege/bin/wine64` (takes effect at next login;
+   for one-off shells export it before launching slooper).
+2. **vendored vst2 patch #4**: the crate rejected every plugin reporting
+   `GetApiVersion < 2400`, which bricks legacy VST 1.0/2.0 plugins. The gate
+   now accepts any plausible version (see `vendor/vst2/VENDOR-NOTES.md`).
+
 ## v17 host fixes: why plugins could crash or load silent
 
 1. **Scan could kill a live instrument (the Vitalium crash).** The scan

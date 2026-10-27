@@ -13,6 +13,10 @@ it directly from slooper, so we vendor and patch:
 3. **State chunks.** Added `PluginInstance::get_chunk` / `set_chunk`
    (VST2.4 `effGetChunk`/`effSetChunk`, program chunk) so plugin state can
    be persisted in slooper projects.
+4. **Legacy API versions.** Upstream refused plugins whose `GetApiVersion`
+   is below 2400. Legacy VST 1.0/2.0 plugins (e.g. AudioNerdz Delay Lama,
+   2001) report 0/1000 and work fine through the opcodes slooper drives, so
+   the gate now accepts any plausible version and only rejects garbage.
 
 Renamed the crate to `vst2` to avoid any ambiguity with the unrelated
 published `vst` crate. Plugin-authoring machinery (`plugin_main!` etc.) is

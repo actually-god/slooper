@@ -222,6 +222,15 @@ pub fn default_vst_dirs() -> Vec<PathBuf> {
 /// instantiate once (required for metadata) and drop again — both safe on
 /// a UI thread but slow, so this runs only on explicit user rescans.
 pub fn scan(dirs: &[PathBuf]) -> Vec<VstEntry> {
+    // Production default: honour the wine-free-scan switch if set.
+    scan_with(dirs, std::env::var("SLOOPER_SKIP_BRIDGED").is_ok())
+}
+
+/// `scan` with the yabridge-skip decision made explicit (unit tests pass
+/// `skip_bridged = true` for local scans — instantiating a Wine wrapper
+/// from a unit test risks aborting the process, see below — and `false`
+/// for fixtures that must prove sidecar discovery works).
+pub fn scan_with(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
     let mut out = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
     for root in dirs {
@@ -252,6 +261,12 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<VstEntry> {
                 if let Some(cached) = cached_entry(&p) {
                     seen.push(p.clone());
                     out.push(cached);
+                    continue;
+                }
+                // yabridge wrappers dlopen straight into a Wine-host probe;
+                // when the Wine side cannot come up, yabridge's chainloader
+                // calls abort() INSIDE this process — unrecoverable.
+                if skip_bridged && (name.contains(".dll.") || dir.to_string_lossy().contains("/yabridge/")) {
                     continue;
                 }
                 if name.ends_with(".vst3") {
@@ -1841,11 +1856,37 @@ mod tests {
     /// backend contract — open, ring processing across block sizes,
     /// parameter push — runs for real. Silently skips when no plugins are
     /// installed (CI).
+    /// Local-audio-test filter. Two classes of installed plugin must not be
+    /// driven by the unit suite:
+    ///  * yabridge wrappers (`…/yabridge/…`): instantiating one spawns a
+    ///    Wine host — slow, and it ABORTS the whole test process when no
+    ///    usable wine loader is configured. Windows plugins are covered by
+    ///    `examples/plugin_audit`, not by unit tests.
+    ///  * Modular/patchless bundles (Cardinal family, Stochas): they are
+    ///    silent until the user loads a patch/sequence — silence is their
+    ///    correct default state, not a dead output bus.
+    fn local_audio_test_drivable(e: &super::VstEntry) -> bool {
+        if e.path.to_string_lossy().contains("/yabridge/") {
+            return false;
+        }
+        const PATCHLESS: &[&str] = &[
+            "Cardinal.vst3",
+            "CardinalSynth.vst3",
+            "CardinalFX.vst3",
+            "Stochas.vst3",
+        ];
+        !PATCHLESS.contains(&e.path.file_name().and_then(|s| s.to_str()).unwrap_or(""))
+    }
+
     #[test]
     fn smoke_local_plugins_if_present() {
-        let found = scan(&default_vst_dirs());
+        let found = scan_with(&default_vst_dirs(), true);
         let mut ran = 0;
-        for e in found.iter().filter(|e| e.error.is_none()).take(3) {
+        for e in found
+            .iter()
+            .filter(|e| e.error.is_none() && local_audio_test_drivable(e))
+            .take(3)
+        {
             for kind in [VstKind::V2, VstKind::V3] {
                 let Ok(load) = open(&e.path, kind, 48_000, None) else {
                     continue;
@@ -1881,9 +1922,12 @@ mod tests {
     /// every loadable instrument on an activated output bus.
     #[test]
     fn every_local_instrument_makes_sound() {
-        let found = scan(&default_vst_dirs());
+        let found = scan_with(&default_vst_dirs(), true);
         let mut checked = 0;
-        for e in found.iter().filter(|e| e.error.is_none() && e.instrument) {
+        for e in found
+            .iter()
+            .filter(|e| e.error.is_none() && e.instrument && local_audio_test_drivable(e))
+        {
             if !e.path.extension().is_some_and(|x| x == "vst3") {
                 continue; // VST2 instruments are covered by the smoke test
             }
@@ -1919,9 +1963,12 @@ mod tests {
     /// fails here with the path named.
     #[test]
     fn v12_local_vst3_effects_pass_audio() {
-        let found = scan(&default_vst_dirs());
+        let found = scan_with(&default_vst_dirs(), true);
         let mut checked = 0;
-        for e in found.iter().filter(|e| e.error.is_none() && !e.instrument) {
+        for e in found
+            .iter()
+            .filter(|e| e.error.is_none() && !e.instrument && local_audio_test_drivable(e))
+        {
             if !e.path.extension().is_some_and(|x| x == "vst3") {
                 continue; // VST2 effects are pinned by v10_local_vst2_effect_passes_audio
             }
