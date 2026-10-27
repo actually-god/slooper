@@ -52,16 +52,20 @@ pub const API_SRC: &str = include_str!("effect_api.rs");
 pub const TEMPLATE_SRC: &str = include_str!("../effects/template.rs");
 /// File name the template is written under.
 pub const TEMPLATE_FILE: &str = "template.rs";
-/// Bundled example effects with custom child GUIs (parametric EQ with a
-/// response/spectrum graph, and the delay+reverb with an animated canvas).
-/// Written into brand-new effects folders so the child-GUI features are
-/// discoverable; never written over an existing (user-owned) copy.
+/// Bundled stock + example effects (parametric EQ with a response graph,
+/// delay+reverb with an animated canvas, the v19 compressor and chorus).
+/// Files already present are content-compared and updated in place (with a
+/// `.bak`) on every release; files missing from an existing folder are added
+/// — these names are ours by construction, so shipping a new stock effect
+/// means every install gets it, not just fresh ones.
 pub const EXAMPLES: &[(&str, &str)] = &[
     (
         "parametric_eq.rs",
         include_str!("../effects/parametric_eq.rs"),
     ),
     ("space_echo.rs", include_str!("../effects/space_echo.rs")),
+    ("compressor.rs", include_str!("../effects/compressor.rs")),
+    ("chorus.rs", include_str!("../effects/chorus.rs")),
 ];
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
@@ -616,20 +620,18 @@ fn seed_api(dir: &Path) {
     if fresh && !t.exists() {
         let _ = std::fs::write(&t, TEMPLATE_SRC);
     }
-    // Bundled examples that are ALREADY PRESENT are updated with every app
-    // release, not just seeded once: the previous write-only-if-absent rule
-    // meant plugin fixes shipped in later releases never reached an existing
-    // install — users ran the day-one scripts forever ("EQ still has all
-    // bugs" while the repo copy was fixed). A file about to change is copied
-    // to `<name>.rs.bak` (single generation) first, so nothing is lost; a
-    // user customization that must survive updates belongs under its own
-    // file name. Files that are NOT present are never added to an existing
-    // folder — only a fresh folder gets the full starter set.
+    // Bundled examples are CONTENT-COMPARED on every app release, not just
+    // seeded once: the previous write-only-if-absent rule meant plugin fixes
+    // shipped in later releases never reached an existing install — users ran
+    // the day-one scripts forever ("EQ still has all bugs" while the repo
+    // copy was fixed). A file about to change is copied to `<name>.rs.bak`
+    // (single generation) first, so nothing is lost; a user customization
+    // that must survive updates belongs under its own file name. Files that
+    // are missing are ADDED even to an existing folder: these names are the
+    // stock set, owned by the app by construction, so a new stock effect
+    // reaches every install the same way bundled synths always did.
     for (name, src) in EXAMPLES {
         let p = dir.join(name);
-        if !p.exists() && !fresh {
-            continue;
-        }
         match std::fs::read_to_string(&p) {
             Ok(cur) if cur == *src => {}
             Ok(cur) => {
@@ -2306,7 +2308,13 @@ mod tests {
         reg.rescan();
         assert_eq!(
             reg.stems(),
-            vec!["template".to_string()],
+            vec![
+                "chorus".to_string(),
+                "compressor".to_string(),
+                "parametric_eq".to_string(),
+                "space_echo".to_string(),
+                "template".to_string(),
+            ],
             "errors: {:?}",
             reg.items().iter().map(|i| &i.error).collect::<Vec<_>>()
         );
@@ -2425,6 +2433,25 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     }
 
     #[test]
+    fn v19_seed_adds_missing_stock_effects_to_existing_folder() {
+        // A user folder that predates the compressor/chorus drop must gain
+        // them on next launch: stock names are app-owned, so seeding no
+        // longer stops at "folder already has stuff".
+        let dir = temp_dir("v19_seed");
+        std::fs::write(dir.join("my_thing.rs"), "// user file\nfn main(){}\n").unwrap();
+        seed_api(&dir);
+        for name in ["compressor.rs", "chorus.rs", API_FILE] {
+            assert!(dir.join(name).exists(), "{name} must be seeded into a pre-existing folder");
+        }
+        assert!(dir.join("my_thing.rs").is_file(), "user files are untouched");
+        assert!(!dir.join("template.rs").exists(), "template stays fresh-folder-only");
+        // Second seed is a no-op: no .bak churn when content already matches.
+        seed_api(&dir);
+        assert!(!dir.join("compressor.rs.bak").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn broken_scripts_are_reported_not_fatal() {
         let dir = temp_dir("broken");
         std::fs::write(dir.join("ok.rs"), TEMPLATE_SRC).unwrap();
@@ -2441,7 +2468,16 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             std::fs::remove_dir_all(&dir).ok();
             return;
         }
-        assert_eq!(reg.stems(), vec!["ok".to_string()]);
+        assert_eq!(
+            reg.stems(),
+            vec![
+                "chorus".to_string(),
+                "compressor".to_string(),
+                "ok".to_string(),
+                "parametric_eq".to_string(),
+                "space_echo".to_string(),
+            ]
+        );
         let errs: HashMap<_, _> = reg
             .items()
             .iter()

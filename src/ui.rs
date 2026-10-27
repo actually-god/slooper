@@ -14191,7 +14191,7 @@ mod tests {
         copy_tree(&ins_src, &dir.join("Geonkick.vst3"));
 
         // Ground truth straight from the scanner: one instrument, one effect.
-        let entries = crate::vsthost::scan(&[dir.clone()]);
+        let entries = crate::vsthost::scan(std::slice::from_ref(&dir));
         let ok: Vec<_> = entries.iter().filter(|e| e.error.is_none()).collect();
         assert_eq!(ok.len(), 2, "both plugins must scan: {entries:?}");
         let ins = ok.iter().find(|e| e.instrument).expect("scan sees the instrument");

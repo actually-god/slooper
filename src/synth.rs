@@ -30,6 +30,8 @@ pub const MAX_PARAMS: usize = SLOOPER_MAX_SYNTH_PARAMS;
 pub const API_SRC: &str = include_str!("synth_api.rs");
 pub const BUNDLED: &[(&str, &str)] = &[
     ("piano.rs", include_str!("../synths/piano.rs")),
+    ("drums.rs", include_str!("../synths/drums.rs")),
+    ("pad.rs", include_str!("../synths/pad.rs")),
     ("sampler.rs", include_str!("../synths/sampler.rs")),
     // Attribution for the piano samples (TimGM6mb, GPL-2); the registry
     // only compiles *.rs, so this rides along as documentation.
