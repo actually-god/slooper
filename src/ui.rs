@@ -1676,6 +1676,12 @@ impl App {
     /// lands the entry (then the v0.10 rule kicks in: the plugin's own
     /// GUI opens when the load finishes).
     fn add_fx_plugin(&mut self, i: usize, e: &crate::vsthost::VstEntry) {
+        // v0.19 belt-and-braces: instruments never enter a mixer chain
+        // (their entry point is the ♪ synth picker on the track header).
+        if e.instrument {
+            self.vst_note = format!("{} is an instrument — bind it with ♪", e.name);
+            return;
+        }
         let sr = self.sample_rate.max(48_000);
         let rx = crate::vsthost::open_async(&e.path, e.kind, sr, None);
         self.vst_note = format!("{}: loading…", e.name);
@@ -10709,20 +10715,19 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                                     if e.error.is_some() {
                                         continue;
                                     }
-                                    let label = format!(
-                                        "[{}] {}{} — {}",
-                                        e.kind.tag(),
-                                        e.name,
-                                        if e.instrument { " ♪" } else { "" },
-                                        e.vendor
-                                    );
-                                    let hover = if e.instrument {
-                                        "Instrument: also selectable as this track's synth \
-                                         (♪ button on the track header)"
-                                    } else {
-                                        "Effect plugin for this track's chain"
-                                    };
-                                    if ui.selectable_label(false, &label).on_hover_text(hover).clicked()
+                                    // v0.19: an instrument is NOT an effect.
+                                    // Synths never belong in the mixer
+                                    // chain — they are bound through the
+                                    // track header's synth (♪) picker.
+                                    if e.instrument {
+                                        continue;
+                                    }
+                                    let label =
+                                        format!("[{}] {} \u{2014} {}", e.kind.tag(), e.name, e.vendor);
+                                    if ui
+                                        .selectable_label(false, &label)
+                                        .on_hover_text("Effect plugin for this track's chain")
+                                        .clicked()
                                     {
                                         app.add_fx_plugin(loop_i, &e);
                                     }
@@ -14150,6 +14155,123 @@ mod tests {
         let editors: Vec<_> = app.fx_vst_editors.drain().collect();
         drop(editors);
         drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.19 AC1: the FX chain window's "+ VST plugin" picker is for
+    /// EFFECTS only. With one effect and one instrument in the scan
+    /// folder, the popup must list the effect and never the instrument
+    /// (instruments are bound through the ♪ synth picker). Headless,
+    /// real folder scan, real popup galleys.
+    #[test]
+    fn v19_fx_menu_hides_instruments() {
+        fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for en in std::fs::read_dir(src).unwrap() {
+                let en = en.unwrap();
+                let to = dst.join(en.file_name());
+                if en.file_type().unwrap().is_dir() {
+                    copy_tree(&en.path(), &to);
+                } else {
+                    std::fs::copy(en.path(), &to).unwrap();
+                }
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let fx_src = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
+        let ins_src = std::path::PathBuf::from(format!("{home}/.vst3/Geonkick.vst3"));
+        if !fx_src.is_file() || !ins_src.is_dir() {
+            eprintln!("skipping v19 fx-menu pin: need Dragonfly VST2 + Geonkick VST3 local");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sp-fxmenu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&fx_src, dir.join("dfhall.so")).unwrap();
+        copy_tree(&ins_src, &dir.join("Geonkick.vst3"));
+
+        // Ground truth straight from the scanner: one instrument, one effect.
+        let entries = crate::vsthost::scan(&[dir.clone()]);
+        let ok: Vec<_> = entries.iter().filter(|e| e.error.is_none()).collect();
+        assert_eq!(ok.len(), 2, "both plugins must scan: {entries:?}");
+        let ins = ok.iter().find(|e| e.instrument).expect("scan sees the instrument");
+        let fx = ok.iter().find(|e| !e.instrument).expect("scan sees the effect");
+
+        let mut app = headless_app("fxmenupin");
+        std::env::set_var("HOME", &dir);
+        app.vst_dirs = vec![dir.to_string_lossy().into_owned()];
+        let ctx = egui::Context::default();
+
+        frame(&mut app, &ctx, vec![]);
+        let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
+        frame(&mut app, &ctx, vec![moved(m)]);
+        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        let p = label_center(&mut app, &ctx, "FX").expect("FX chip in the more popup");
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.fx_window, Some(0), "chip opens the chain window");
+
+        let mut scanned = false;
+        for _ in 0..800 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.vst_scanned {
+                scanned = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        assert!(scanned, "folder scan must land ({:?})", app.vst_note);
+
+        // Open the picker and read the popup's painted text. (This runs
+        // BEFORE the direct-add guard test below: that test's refusal note
+        // quotes the instrument's name, and the popup scan joins every
+        // painted text — including status notes.)
+        let q = label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker");
+        frame(&mut app, &ctx, vec![moved(q)]);
+        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]); // the popup paints on the next frame
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let all: String = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+
+        assert!(
+            all.contains(&fx.name) && all.contains("Dragonfly"),
+            "the effect plugin must be listed in the chain picker"
+        );
+        assert!(
+            !all.contains(&ins.name),
+            "instrument {:?} must NOT be listed in the chain picker",
+            ins.name
+        );
+
+        // Belt-and-braces guard: even a direct add refuses an instrument.
+        let n_before = app.fx_rows[0].len();
+        app.add_fx_plugin(0, ins);
+        assert_eq!(app.fx_rows[0].len(), n_before, "instrument never enters a chain");
+        assert!(app.vst_note.contains("instrument"), "refusal is explained: {}", app.vst_note);
+
+        std::env::set_var("HOME", &home);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
