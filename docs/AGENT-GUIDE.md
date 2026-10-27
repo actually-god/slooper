@@ -209,6 +209,21 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 8. **Releases**: source commit on `main` → tag `vX.Y.Z` → push tag → update
    the AUR repo (`pkgver`/`pkgrel` + fresh `makepkg --printsrcinfo`). Do not
    force-move public tags after the AUR package references them.
+9. **Grid/UI interaction rules (v18)**:
+   - OS file drops drain EXACTLY ONCE per frame from `raw.dropped_files`
+     at the top of `ui_root` into `App::os_drops`; the router there hands
+     them to sampler window → lane strips → rack. Never read raw drops
+     inside a widget: two consumers meant one silently ate the drop.
+   - Grid gestures (`drag_clip`, `clip_resize`, marquee) carry raw
+     `(track, lane, clip)` indices. Any code path that REMOVES clips must
+     call `App::cancel_grid_gestures()` — the cut-while-dragging crash.
+   - NEVER call `ui.close()` inside an `egui::Window` body unless the
+     window owns `.open(&mut flag)`: closing leaves a PERMANENT closed
+     state on that window id and it paints `None` forever after (this is
+     how the right-click value menu died; egui context-menu hosts close
+     themselves — see `auto_menu`).
+   - Hover feedback brightens painted fills; the test probe
+     `painted_rects()` parks the pointer away before reading rgb.
 
 ## Where things are wired (quick grep targets)
 
