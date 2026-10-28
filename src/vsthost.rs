@@ -1028,6 +1028,11 @@ pub struct RtStageEntry {
     /// `src/vstedit.rs`). VST3 editors host a shadow instance instead —
     /// [`RtStageEntry::open_vst3_editor`].
     vst2: Option<Vst2Handle>,
+    /// v20: the VST3 state chunk this instance was (re)opened from, if any.
+    /// A reopened shadow editor loads it, so the plugin GUI shows the
+    /// preset the live instance is actually playing (session-only: like
+    /// VSTi params, chunks never enter config/project saves in v0.20).
+    editor_state: Mutex<Option<Vec<u8>>>,
 }
 
 /// Raw editor-dispatch handle for a loaded VST2 plugin: just the
@@ -1312,15 +1317,29 @@ pub fn open_async(
     sample_rate: u32,
     saved: Option<&[f32]>,
 ) -> std::sync::mpsc::Receiver<Result<Arc<RtStageEntry>, String>> {
+    open_async_with_state(path, kind, sample_rate, saved, None)
+}
+
+/// [`open_async`] carrying a VST3 state chunk (see [`open_with_state`]).
+pub fn open_async_with_state(
+    path: &Path,
+    kind: VstKind,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    state: Option<&[u8]>,
+) -> std::sync::mpsc::Receiver<Result<Arc<RtStageEntry>, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
+    let state = state.map(|s| s.to_vec());
     post(move || {
         // `open_inner` DIRECTLY: this closure already runs on the GUI
         // thread, and `open` would proxy its result back to this very
         // thread — waiting on ourselves = the v16 pump freeze this pin
         // caught ("picked plugin never loaded").
-        let _ = tx.send(open_inner(&path, kind, sample_rate, saved.as_deref()).map(|l| l.entry));
+        let _ = tx.send(
+            open_inner(&path, kind, sample_rate, saved.as_deref(), state.as_deref()).map(|l| l.entry),
+        );
     });
     rx
 }
@@ -1346,9 +1365,27 @@ pub fn open(
     sample_rate: u32,
     saved: Option<&[f32]>,
 ) -> Result<VstLoad, String> {
+    open_with_state(path, kind, sample_rate, saved, None)
+}
+
+/// v20 (`open` + a VST3 state chunk): the chunk is applied to the fresh
+/// instance BEFORE parameter cells are seeded, so descriptors, cells, and
+/// the plugin's own patch all come up in the saved state. This is how a
+/// preset chosen inside a VST3 editor (whose editor is a shadow instance,
+/// never the one making sound) reaches the live instance on rebuild.
+/// Chunks for VST2 are a no-op: its editor edits the live instance
+/// in place, so there is no second state to carry.
+pub fn open_with_state(
+    path: &Path,
+    kind: VstKind,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    state: Option<&[u8]>,
+) -> Result<VstLoad, String> {
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
-    on_gui_thread(move || open_inner(&path, kind, sample_rate, saved.as_deref()))?
+    let state = state.map(|s| s.to_vec());
+    on_gui_thread(move || open_inner(&path, kind, sample_rate, saved.as_deref(), state.as_deref()))?
 }
 
 /// [`open`]'s body. Runs ON the VST GUI thread (the proxy above, or a
@@ -1359,6 +1396,7 @@ fn open_inner(
     kind: VstKind,
     sample_rate: u32,
     saved: Option<&[f32]>,
+    state: Option<&[u8]>,
 ) -> Result<VstLoad, String> {
     // v19.1: never dlopen a chainloader wrapper whose Wine probe failed —
     // the dlopen itself is the abort(). Covers lazily (re)opened chain rows
@@ -1369,7 +1407,8 @@ fn open_inner(
     }
     let _loader = vst_loader_lock();
     let entry = match kind {
-        VstKind::V3 => open_v3(path, sample_rate, saved)?,
+        VstKind::V3 => open_v3(path, sample_rate, saved, state)?,
+        // VST2 editors edit the live instance: no chunk round-trip exists.
         VstKind::V2 => open_v2(path, sample_rate, saved)?,
     };
     Ok(VstLoad {
@@ -1409,6 +1448,7 @@ fn assemble(
     descs: Vec<VstParamDesc>,
     has_editor: bool,
     vst2: Option<Vst2Handle>,
+    editor_state: Option<Vec<u8>>,
 ) -> RtStageEntry {
     let last: Vec<f32> = (0..descs.len()).map(|k| params.get(k)).collect();
     let seen_gen = params.generation();
@@ -1440,10 +1480,16 @@ fn assemble(
         spec: parts.spec,
         has_editor,
         vst2,
+        editor_state: Mutex::new(editor_state),
     }
 }
 
-fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtStageEntry, String> {
+fn open_v3(
+    path: &Path,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    state: Option<&[u8]>,
+) -> Result<RtStageEntry, String> {
     use vst3_host::{
         audio::{AudioBuffers, BusDirection, MediaType},
         realtime::RealtimePluginRunner,
@@ -1451,6 +1497,17 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     };
     let mut plugin = simple::load_plugin_with_settings(path, sample_rate as f64, VST_BLOCK)
         .map_err(|e| format!("load: {e}"))?;
+    // v20: apply a carried state chunk FIRST (the preset a VST3 shadow
+    // editor's user picked): everything measured below — buses, cells,
+    // descriptors — then reflects the plugin's real saved state. A failed
+    // restore must not kill the row: fall back to the plugin's defaults.
+    if let Some(bytes) = state {
+        if let Err(e) = plugin.load_state(bytes) {
+            if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
+                eprintln!("[vsthost] {path:?}: load_state refused ({e}) — defaults");
+            }
+        }
+    }
     // JUCE-wrapper plugins (Vitalium, SwankyAmp — distrho-ports builds) advertise
     // their buses with `active = 0` in `getBusInfo`, and the loader honours that.
     // An unactivated output bus renders NOTHING: `output_channel_count` collapses
@@ -1547,6 +1604,7 @@ fn open_v3(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         descs,
         has_editor,
         None,
+        state.map(|s| s.to_vec()),
     ))
 }
 
@@ -1624,6 +1682,7 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         descs,
         has_editor,
         vst2,
+        None,
     ))
 }
 
@@ -1698,11 +1757,15 @@ impl RtStageEntry {
             .map(|(i, d)| (d.id, self.params.get(i) as f64))
             .collect();
         let ids: Vec<u32> = self.descs.iter().map(|d| d.id).collect();
+        // v20: seed the shadow with THIS instance's state chunk when it was
+        // (re)opened from one, so the reopened GUI shows the live patch.
+        let state = self.editor_state.lock().unwrap().clone();
         crate::vstedit::open_vst3_editor(
             &path,
             &self.name,
             sample_rate,
             initial,
+            state,
             ids,
             self.params.clone(),
         )
@@ -2315,6 +2378,93 @@ mod tests {
         );
     }
 
+    /// v20 (user report: presets picked in a plugin window never reached
+    /// the sound): `open_with_state` must restore a saved state chunk into
+    /// the fresh instance AND seed the parameter cells from the restored
+    /// patch — the harvest/rebuild path runs through exactly this call.
+    #[test]
+    fn v20_vst3_open_with_state_restores() {
+        let wolf = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join(".vst3/wolf-shaper.vst3");
+        if !wolf.is_dir() {
+            eprintln!("skip: no wolf-shaper.vst3 on this host");
+            return;
+        }
+        // Capture a chunk from a raw crate instance: one distinctive edit,
+        // then serialize (what a shadow editor's teardown hands over).
+        let mut p = match vst3_host::simple::load_plugin_with_settings(
+            &wolf,
+            48000.0,
+            crate::vsthost::VST_BLOCK,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip: wolf-shaper raw load failed ({e})");
+                return;
+            }
+        };
+        // Capture a chunk the way the shadow editor's teardown does: set
+        // the component parameter, RUN the plugin (host-set values only
+        // enter the serializable state after processing — probe fact, see
+        // `examples/v20_chunkdiff.rs`), then serialize.
+        let pre_id = match p
+            .get_parameters()
+            .ok()
+            .and_then(|ps| ps.into_iter().find(|x| x.name == "Pre Gain").map(|x| x.id))
+        {
+            Some(id) => id,
+            None => {
+                eprintln!("skip: wolf-shaper has no \"Pre Gain\"");
+                return;
+            }
+        };
+        if p.set_parameter(pre_id, 0.25).is_err() {
+            eprintln!("skip: set_parameter(Pre Gain) failed");
+            return;
+        }
+        if p.start_processing().is_ok() {
+            let ch = p.output_channel_count().max(1) as usize;
+            let mut bufs = vst3_host::audio::AudioBuffers::new(ch, ch, super::VST_BLOCK, 48000.0);
+            for _ in 0..4 {
+                if p.process_audio(&mut bufs).is_err() {
+                    break;
+                }
+            }
+            let _ = p.stop_processing();
+        }
+        let bytes = match p.save_state() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: save_state failed ({e})");
+                return;
+            }
+        };
+        assert!(bytes.len() > 64, "wolf-shaper chunk suspiciously small");
+        drop(p);
+
+        let load = match open_with_state(&wolf, VstKind::V3, 48_000, None, Some(&bytes)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skip: open_with_state failed ({e})");
+                return;
+            }
+        };
+        let entry = &load.entry;
+        let pre = match entry.descs().iter().position(|d| d.name == "Pre Gain") {
+            Some(k) => k,
+            None => {
+                eprintln!("skip: no \"Pre Gain\" cell");
+                return;
+            }
+        };
+        let got = entry.params.get(pre);
+        assert!(
+            (got - 0.25).abs() < 0.02,
+            "open_with_state restored the chunk but the cells disagree: \
+             Pre Gain cell {got:.3}, chunk asked 0.250"
+        );
+    }
+
     /// End-to-end against the local plugin folders when present: every
     /// backend contract — open, ring processing across block sizes,
     /// parameter push — runs for real. Silently skips when no plugins are
@@ -2642,7 +2792,7 @@ mod tests {
         );
         let p = root.join("plugins/Monk.dll.so");
         assert!(is_wine_bridged(&p));
-        let err = open_inner(&p, VstKind::V2, 48_000, None)
+        let err = open_inner(&p, VstKind::V2, 48_000, None, None)
             .err()
             .expect("dead Wine must be refused BEFORE any dlopen");
         assert!(err.contains("unavailable"), "{err}");
