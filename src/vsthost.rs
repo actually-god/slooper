@@ -1992,16 +1992,22 @@ impl RtStageEntry {
         }
     }
 
-    /// VST2 pulls parameter changes on the audio thread; VST3 values were
-    /// pushed through the ring at change time, so for it this only keeps
-    /// `seen_gen` honest.
+    /// VST2 pulls parameter changes on the audio thread through its
+    /// parameter object; VST3 cell writes (the shadow-editor drain lands
+    /// here, `vstedit::route_param_edits3` → `VstParams::set`) are RELAYED
+    /// into the runner's command ring on this same thread — pre-v20 this
+    /// function silently ignored VST3, so every editor gesture died at the
+    /// mirror and the plugin GUI changed nothing audible. The ring mutex is
+    /// `try_lock`ed (RT rule): the UI holds it for µs-long pushes, and on
+    /// contention `seen_gen` stays stale so the NEXT block retries the diff
+    /// (drops are impossible in steady state, and a full ring retries too).
     fn poll_params(&self, s: &mut RtState) {
         let gen = self.params.generation();
         if gen == s.seen_gen {
             return;
         }
-        s.seen_gen = gen;
         if let Some(po) = &s.params_obj {
+            s.seen_gen = gen;
             for (k, desc) in self.descs.iter().enumerate() {
                 let v = self.params.get(k);
                 if k < s.last.len() && (s.last[k] - v).abs() > f32::EPSILON {
@@ -2009,6 +2015,31 @@ impl RtStageEntry {
                     po.set_parameter(desc.id as i32, v);
                 }
             }
+            return;
+        }
+        if matches!(s.backend, Backend::V3(_)) {
+            if let Ok(mut g) = self.control.try_lock() {
+                if let Some(c) = g.as_mut() {
+                    let mut retry = false;
+                    for (k, desc) in self.descs.iter().enumerate() {
+                        let v = self.params.get(k);
+                        if k < s.last.len() && (s.last[k] - v).abs() > f32::EPSILON {
+                            if c.set_parameter(desc.id, v as f64) {
+                                s.last[k] = v;
+                            } else {
+                                retry = true; // ring full: resend next block
+                            }
+                        }
+                    }
+                    if !retry {
+                        s.seen_gen = gen;
+                    }
+                } else {
+                    s.seen_gen = gen; // control retired: nothing to relay to
+                }
+            }
+        } else {
+            s.seen_gen = gen;
         }
     }
 }
@@ -2204,6 +2235,84 @@ mod tests {
             "bound vitalium alive after re-scan, peak {peak}"
         );
         std::mem::forget(entry);
+    }
+
+    /// v20 (user report "VST plugins don't apply changes — synths AND EQs,
+    /// e.g. Surge XT Effects"): the VST3 editor hosts a SHADOW instance,
+    /// and its drain (`vstedit::route_param_edits3`) deposits every
+    /// performEdit into the shared cell mirror with a generation bump —
+    /// it NEVER touches the runner's command ring. Pre-v20 `poll_params`
+    /// applied the cells only for VST2 (`params_obj`), so every shadow-
+    /// editor gesture died at the mirror: knobs and preset broadcasts
+    /// changed nothing audible, while VST2 editors (editing the LIVE
+    /// instance) worked — exactly the reported split. Pin: replay the
+    /// drain call with Post Gain → 0 and require the processed output to
+    /// go silent. (RED on HEAD.)
+    #[test]
+    fn v20_vst3_cell_write_reaches_sound() {
+        let wolf = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join(".vst3/wolf-shaper.vst3");
+        if !wolf.is_dir() {
+            eprintln!("skip: no wolf-shaper.vst3 on this host");
+            return;
+        }
+        let load = match open(&wolf, VstKind::V3, 48_000, None) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skip: wolf-shaper VST3 would not open ({e})");
+                return;
+            }
+        };
+        let entry = &load.entry;
+        // Pre Gain has the strongest clean response on this build (probe:
+        // norm 0→1 swings the noise peak ~2.2×); Post Gain 0 was disproven
+        // as a mute control (bottoms out near −1 dB on this build).
+        let pre = match entry
+            .descs()
+            .iter()
+            .position(|d| d.writable && d.name == "Pre Gain")
+        {
+            Some(k) => k,
+            None => {
+                eprintln!("skip: no writable \"Pre Gain\" param");
+                return;
+            }
+        };
+        // Deterministic noise (LCG — no rand dependency, reproducible).
+        let mut st = 0x2545_F491_u32;
+        let mut noise = vec![0f32; 512];
+        for x in noise.iter_mut() {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *x = ((st >> 8) as f32 / (1 << 24) as f32) * 2.0 - 1.0;
+        }
+        let measure = |e: &super::RtStageEntry, blocks: usize| -> f32 {
+            let mut peak = 0f32;
+            let mut out = [0f32; 512];
+            for _ in 0..blocks {
+                e.process(&noise, &mut out);
+                peak = peak.max(out.iter().fold(0f32, |m, x| m.max(x.abs())));
+            }
+            peak
+        };
+        // Let the plugin (and its latency) settle before measuring.
+        let before = measure(entry, 24);
+        assert!(before > 1e-3, "baseline noise through wolf-shaper is silent");
+        // THE exact editor-drain call shape: (id, normalized) → cell — and
+        // NOTHING else. Both directions must move the audio: on HEAD both
+        // peaks sat equal (measured 1.0341 vs 1.0453 on the old assertion).
+        let ids: Vec<u32> = entry.descs().iter().map(|d| d.id).collect();
+        let pid = entry.descs()[pre].id;
+        crate::vstedit::route_param_edits3(vec![(pid, 0.0)], &ids, &entry.params);
+        assert_eq!(entry.params.get(pre), 0.0, "drain wrote the cell");
+        let p_lo = measure(entry, 24);
+        crate::vstedit::route_param_edits3(vec![(pid, 1.0)], &ids, &entry.params);
+        let p_hi = measure(entry, 24);
+        assert!(
+            p_hi > p_lo * 1.5,
+            "cell-only writes (the shadow-editor drain path) never reached \
+             the live VST3 runner: peak(lo) {p_lo:.4} vs peak(hi) {p_hi:.4} \
+             (baseline {before:.4})"
+        );
     }
 
     /// End-to-end against the local plugin folders when present: every
