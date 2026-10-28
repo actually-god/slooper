@@ -53,7 +53,7 @@ use std::ffi::{c_void, CString};
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::vsthost::Vst2Handle;
@@ -439,6 +439,11 @@ struct Shared {
     width: Arc<AtomicI32>,
     height: Arc<AtomicI32>,
     xid: Arc<AtomicUsize>,
+    /// v20 (VST3 editors): the shadow's serialized component state, captured
+    /// at teardown when the user changed something. The host harvests it via
+    /// `EditorWindow::take_state` and rebuilds the sounding instance, so a
+    /// preset picked inside the plugin's own GUI reaches the audio.
+    state: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Shared {
@@ -447,6 +452,7 @@ impl Shared {
             stop: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             open_failed: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(None)),
             painted: Arc::new(AtomicBool::new(false)),
             children: Arc::new(AtomicUsize::new(0)),
             width: Arc::new(AtomicI32::new(0)),
@@ -472,9 +478,19 @@ pub struct EditorWindow {
     height: Arc<AtomicI32>,
     /// The host container's XID (0 until the GUI thread creates it).
     xid: Arc<AtomicUsize>,
+    /// v20: VST3 shadow-editor state hand-off (see `Shared::state`).
+    state: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl EditorWindow {
+    /// v20: take the VST3 shadow's state chunk if the user changed the
+    /// plugin through its own GUI (presets, patch data beyond automatable
+    /// params). Non-empty ONLY after a VST3 editor retired with changes;
+    /// VST2 editors edit the live instance and never produce one.
+    pub fn take_state(&mut self) -> Option<Vec<u8>> {
+        self.state.lock().ok().and_then(|mut c| c.take())
+    }
+
     /// Plugin path this editor was opened for (stale-editor detection).
     pub fn path(&self) -> &str {
         &self.path
@@ -575,6 +591,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         width: shared.width.clone(),
         height: shared.height.clone(),
         xid: shared.xid.clone(),
+        state: shared.state.clone(),
     })
 }
 
@@ -970,6 +987,10 @@ struct Editor3 {
     /// position, value = id (`performEdit` reports ids).
     ids: Vec<u32>,
     params: Arc<crate::vsthost::VstParams>,
+    /// Load-time sample rate for the teardown state flush (see
+    /// `teardown`): host-applied values only enter a plugin's
+    /// serializable state once it has run audio with them.
+    sr: u32,
     d: *mut Display,
     win: XWindow,
     title: String,
@@ -981,6 +1002,10 @@ struct Editor3 {
     created: Instant,
     house: Instant,
     dead_ticks: u32,
+    /// v20: set when the user has demonstrably edited through this shadow
+    /// (a performEdit reached us, or the plugin raised a restartComponent
+    /// request) — only then is its state chunk worth harvesting at close.
+    changed: bool,
 }
 
 /// Open a VST3 plugin's own editor window. Mirrors [`open_editor`] exactly
@@ -995,6 +1020,7 @@ pub fn open_vst3_editor(
     title: &str,
     sample_rate: u32,
     initial: Vec<(u32, f64)>,
+    state: Option<Vec<u8>>,
     ids: Vec<u32>,
     params: Arc<crate::vsthost::VstParams>,
 ) -> Result<EditorWindow, String> {
@@ -1011,7 +1037,7 @@ pub fn open_vst3_editor(
             // SAFETY: runs on the GUI thread, the sole owner of all
             // editor state (see module docs).
             if let Some(e) =
-                unsafe { make_editor3(path_j, title, sample_rate, initial, ids, params, s2) }
+                unsafe { make_editor3(path_j, title, sample_rate, initial, state, ids, params, s2) }
             {
                 reg.borrow_mut().push(e);
             }
@@ -1027,6 +1053,7 @@ pub fn open_vst3_editor(
         width: shared.width.clone(),
         height: shared.height.clone(),
         xid: shared.xid.clone(),
+        state: shared.state.clone(),
     })
 }
 
@@ -1038,8 +1065,15 @@ thread_local! {
 /// cells (slider path: atomic write + generation bump). Free function: it
 /// borrows the plugin and the cells separately (the state machine holds
 /// the plugin mutably while pumping).
-fn drain_param_edits3(plugin: &vst3_host::Plugin, ids: &[u32], params: &crate::vsthost::VstParams) {
-    route_param_edits3(plugin.get_parameter_changes(), ids, params);
+fn drain_param_edits3(
+    plugin: &vst3_host::Plugin,
+    ids: &[u32],
+    params: &crate::vsthost::VstParams,
+) -> bool {
+    let changes = plugin.get_parameter_changes();
+    let touched = !changes.is_empty();
+    route_param_edits3(changes, ids, params);
+    touched
 }
 
 /// The host half of VST3 editor→sound sync: an edit reported as
@@ -1087,6 +1121,7 @@ unsafe fn make_editor3(
     title: String,
     sample_rate: u32,
     initial: Vec<(u32, f64)>,
+    state: Option<Vec<u8>>,
     ids: Vec<u32>,
     params: Arc<crate::vsthost::VstParams>,
     shared: Shared,
@@ -1127,6 +1162,18 @@ unsafe fn make_editor3(
             }
         }
     };
+    // v20: restore the live instance's state chunk FIRST when it has one
+    // (the instance was (re)opened from a harvested preset), then layer the
+    // cell mirror on top: cells hold everything the user moved since, and
+    // both come from the SAME instance the previous editor kept in sync.
+    // A refused chunk (vendor quirks) degrades to cell-only priming.
+    if let Some(bytes) = &state {
+        if let Err(e) = plugin.load_state(bytes) {
+            if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
+                eprintln!("[vstedit3] {title}: shadow load_state refused ({e}) — cell priming only");
+            }
+        }
+    }
     // Prime from the sounding instance BEFORE the view exists, so the
     // editor paints its real current state, and adopt the preferred size.
     for (id, v) in &initial {
@@ -1163,6 +1210,7 @@ unsafe fn make_editor3(
         plugin: Some(plugin),
         ids,
         params,
+        sr: sample_rate,
         d,
         win,
         title,
@@ -1174,6 +1222,7 @@ unsafe fn make_editor3(
         created: Instant::now(),
         house: Instant::now(),
         dead_ticks: 0,
+        changed: false,
     })
 }
 
@@ -1201,7 +1250,9 @@ impl Editor3 {
                         return;
                     }
                     plugin.service_run_loop();
-                    drain_param_edits3(plugin, &self.ids, &self.params);
+                    if drain_param_edits3(plugin, &self.ids, &self.params) {
+                        self.changed = true;
+                    }
                     // Steinberg's X11 view creates a real child window;
                     // the same live-child / painted-pixel verdict as VST2.
                     let child_live = first_sized_child(self.d, self.win)
@@ -1265,7 +1316,9 @@ impl Editor3 {
                     // service (timers + registered X fds), and the edit
                     // drain is the slider path back into the sound.
                     plugin.service_run_loop();
-                    drain_param_edits3(plugin, &self.ids, &self.params);
+                    if drain_param_edits3(plugin, &self.ids, &self.params) {
+                        self.changed = true;
+                    }
                     // The plugin may request a size change (e.g. the
                     // view only commits its real rect once mapped).
                     if let Some((w, h)) = plugin.take_editor_resize_request() {
@@ -1286,6 +1339,12 @@ impl Editor3 {
                     // operations.
                     if self.house.elapsed() >= HOUSEKEEPING {
                         self.house = Instant::now();
+                        // v20: a plugin that changes patch data WITHOUT
+                        // broadcasting performEdits (preset reload) still
+                        // announces itself through restartComponent.
+                        if !plugin.take_restart_flags().is_empty() {
+                            self.changed = true;
+                        }
                         let kids = count_children_local(self.d, self.win);
                         self.shared.children.store(kids, Ordering::SeqCst);
                         let alive = first_sized_child(self.d, self.win)
@@ -1333,6 +1392,56 @@ impl Editor3 {
     /// destroy the container, mark the handle retired.
     fn teardown(&mut self, refused: bool) {
         unsafe {
+            // v20: harvest BEFORE anything is torn down. If the user edited
+            // through this shadow, its component state holds patch changes
+            // the sounding instance never saw (preset browsers, non-param
+            // state). Hand the chunk to the host via `EditorWindow::
+            // take_state`; the host rebuilds the live instance from it.
+            if self.changed {
+                if let Some(p) = self.plugin.as_mut() {
+                    // v20 PROBE FACT (v20_chunkdiff example): host-set
+                    // parameter values are NOT part of a plugin's
+                    // serializable state until the plugin has actually
+                    // RUN audio with them — wolf-shaper and 3BandEQ wrote
+                    // byte-identical chunks until one silent block ran
+                    // (DPF's isLive deferral; the same pattern the VST3
+                    // SDK teaches). The shadow never processes during
+                    // its life, so push a few silent blocks through NOW,
+                    // otherwise the chunk would lag every knob the user
+                    // moved and rebuilding from it could UNDO edits.
+                    if let Err(e) = p.start_processing() {
+                        if self.dbg {
+                            eprintln!("[vstedit3] {}: state-flush start failed: {e}", self.title);
+                        }
+                    } else {
+                        let ch = p.output_channel_count().max(1).max(0) as usize;
+                        let mut bufs = vst3_host::audio::AudioBuffers::new(
+                            ch,
+                            ch,
+                            crate::vsthost::VST_BLOCK,
+                            self.sr.max(1) as f64,
+                        );
+                        for _ in 0..4 {
+                            if p.process_audio(&mut bufs).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = p.stop_processing();
+                    }
+                    match p.save_state() {
+                        Ok(bytes) => {
+                            if let Ok(mut cell) = self.shared.state.lock() {
+                                *cell = Some(bytes);
+                            }
+                        }
+                        Err(e) => {
+                            if self.dbg {
+                                eprintln!("[vstedit3] {}: save_state failed: {e}", self.title);
+                            }
+                        }
+                    }
+                }
+            }
             // View first, plugin second — close_editor must run before
             // the instance tears down.
             let plugin = self.plugin.take();

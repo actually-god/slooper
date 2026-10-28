@@ -551,6 +551,10 @@ pub enum ChainRow {
         entry: Option<Arc<crate::vsthost::RtStageEntry>>,
         open_rx:
             Option<std::sync::mpsc::Receiver<Result<Arc<crate::vsthost::RtStageEntry>, String>>>,
+        /// v20: latest state chunk harvested from this plugin's VST3
+        /// shadow editor (see `vstedit::Shared::state`). Session-only —
+        /// like VSTi params it never enters config or project saves.
+        state: Option<Vec<u8>>,
     },
 }
 
@@ -571,6 +575,7 @@ impl Clone for ChainRow {
                 name,
                 params,
                 entry,
+                state,
                 ..
             } => ChainRow::Vst {
                 path: path.clone(),
@@ -578,6 +583,7 @@ impl Clone for ChainRow {
                 name: name.clone(),
                 params: params.clone(),
                 entry: entry.clone(),
+                state: state.clone(),
                 open_rx: None,
             },
         }
@@ -814,6 +820,10 @@ pub struct App {
     /// editors. v0.11 R3: hosted plugins have NO slider-window fallback --
     /// their own window is the only parameter surface.
     fx_vst_editors: std::collections::HashMap<(usize, usize), crate::vstedit::EditorWindow>,
+    /// v20: last state chunk harvested from each track's VST3 synth
+    /// editor; re-applied when the binding rebuilds (session-only, like
+    /// `track_synth_params`).
+    track_synth_state: Vec<Option<Vec<u8>>>,
     /// Scan of all VST folders (lazy on first window open, manual Rescan).
     vst_scan: Vec<crate::vsthost::VstEntry>,
     vst_scanned: bool,
@@ -898,6 +908,7 @@ impl App {
                                         params: params.clone(),
                                         entry: None,
                                         open_rx: None,
+                                        state: None,
                                     })
                                 }
                             })
@@ -1097,6 +1108,7 @@ impl App {
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
             fx_vst_editors: std::collections::HashMap::new(),
+            track_synth_state: vec![None; MAX_LOOPS],
             vst_scan: Vec::new(),
             vst_scan_rx: None,
             vst_pending_gui: Vec::new(),
@@ -1606,6 +1618,7 @@ impl App {
                     params,
                     entry,
                     open_rx,
+                    state,
                 } => {
                     // Open lazily (first rebuild after load, or after the
                     // folder rescan dropped a failed load). v16: rows with
@@ -1614,7 +1627,13 @@ impl App {
                     if entry.is_none() && open_rx.is_none() {
                         let p = std::path::Path::new(path);
                         if p.is_file() || p.is_dir() {
-                            match crate::vsthost::open(p, *kind, sr, Some(params)) {
+                            match crate::vsthost::open_with_state(
+                                p,
+                                *kind,
+                                sr,
+                                Some(params),
+                                state.as_deref(),
+                            ) {
                                 Ok(load) => *entry = Some(load.entry),
                                 Err(err) => {
                                     self.vst_note = format!("{name}: {err}");
@@ -1686,6 +1705,7 @@ impl App {
         let rx = crate::vsthost::open_async(&e.path, e.kind, sr, None);
         self.vst_note = format!("{}: loading…", e.name);
         self.fx_rows[i].push(ChainRow::Vst {
+            state: None,
             path: e.path.to_string_lossy().into_owned(),
             kind: e.kind,
             name: e.name.clone(),
@@ -2560,6 +2580,7 @@ impl App {
                                 params,
                                 entry: _,
                                 open_rx: _,
+                                state: _,
                             } => ChainSave::Vst {
                                 path: path.clone(),
                                 kind: kind.tag().to_string(),
@@ -2599,11 +2620,14 @@ impl App {
         let inst = match self.track_synth[t].as_deref().filter(|s| !s.is_empty()) {
             Some(stem) if vst_synth_decode(stem).is_some() => {
                 let (kind, path) = vst_synth_decode(stem).unwrap();
-                match crate::vsthost::open(
+                // v20: re-apply a preset the user picked in this synth's
+                // own GUI (harvested when that editor last closed).
+                match crate::vsthost::open_with_state(
                     std::path::Path::new(path),
                     kind,
                     self.sample_rate.max(1),
                     None,
+                    self.track_synth_state[t].as_deref(),
                 ) {
                     Ok(load) => Some(std::sync::Arc::new(SynthHandle::Vst(load.entry))),
                     Err(err) => {
@@ -2672,6 +2696,7 @@ impl App {
             Some(stem.to_string())
         };
         self.track_synth_params[t].clear();
+        self.track_synth_state[t] = None;
         self.rebuild_track_synth(t);
         // v0.10 STANDARD: a plugin instrument opens its own GUI the moment
         // it is bound. v0.11 R3: hosted plugins never fall back to a slider
@@ -5397,8 +5422,10 @@ impl App {
         // v0.11 double-open guard: a second effEditOpen against the same
         // live instance while an editor is open races two toolkit editor
         // states (and silently leaked the first container when the map
-        // entry was replaced). Retire any old window FIRST.
-        if let Some(mut w) = self.vst_editors.remove(&t) {
+        // entry was replaced). Retire any old window FIRST — v20: close it
+        // IN PLACE (the slot gets overwritten below) so `reap_vst_editors`
+        // still sees the dying window and harvests its state chunk.
+        if let Some(w) = self.vst_editors.get_mut(&t) {
             w.close();
         }
         let Some(arc) = self.track_synth_inst[t].clone() else {
@@ -5430,7 +5457,9 @@ impl App {
     /// impossible); clicking with no live window opens it.
     fn toggle_synth_gui(&mut self, t: usize) {
         if self.vst_editors.get(&t).is_some_and(|w| !w.is_closed()) {
-            if let Some(mut w) = self.vst_editors.remove(&t) {
+            // v20: close in place; the reaper harvests the patch (if the
+            // user changed any) once the editor thread retires the window.
+            if let Some(w) = self.vst_editors.get_mut(&t) {
                 w.close();
             }
             self.status = format!("track {}: plugin window closed", t + 1);
@@ -5444,8 +5473,16 @@ impl App {
     /// Chain-slot counterpart: click a plugin row and the plugin's own GUI
     /// opens (a second click closes it).
     fn vst_row_gui(&mut self, t: usize, row: usize) {
-        if self.fx_vst_editors.remove(&(t, row)).is_some() {
-            return; // toggle closed
+        // v20: toggle-close stays IN the map (vst_editors' rule) so the
+        // reaper can harvest the shadow's state chunk after teardown.
+        if self.fx_vst_editors.contains_key(&(t, row)) {
+            if let Some(w) = self.fx_vst_editors.get_mut(&(t, row)) {
+                if !w.is_closed() {
+                    w.close();
+                    return;
+                }
+            }
+            self.fx_vst_editors.remove(&(t, row)); // dead handle
         }
         let Some(entry) = self
             .fx_rows
@@ -5494,7 +5531,15 @@ impl App {
             }
         }
         for k in fx_closed {
-            self.fx_vst_editors.remove(&k);
+            if let Some(mut w) = self.fx_vst_editors.remove(&k) {
+                let same = matches!(
+                    self.fx_rows.get(k.0).and_then(|rows| rows.get(k.1)),
+                    Some(ChainRow::Vst { path, .. }) if path == w.path()
+                );
+                if same {
+                    self.harvest_chain_state(k.0, k.1, &mut w);
+                }
+            }
         }
         for (t, w) in self.vst_editors.iter() {
             let cur = match self.track_synth_inst.get(*t).and_then(|slot| slot.as_ref()) {
@@ -5514,12 +5559,79 @@ impl App {
             }
         }
         for t in closed {
-            self.vst_editors.remove(&t);
+            if let Some(mut w) = self.vst_editors.remove(&t) {
+                let same = match self.track_synth_inst.get(t).and_then(|s| s.as_ref()) {
+                    Some(arc) => matches!(arc.as_ref(),
+                        crate::audio::SynthHandle::Vst(e)
+                        if e.path().to_string_lossy() == w.path()),
+                    None => false,
+                };
+                if same {
+                    self.harvest_synth_state(t, &mut w);
+                }
+            }
         }
         if refused {
             self.status = "plugin editor could not draw \u{2014} its own window is the only \
                  parameter surface, so close and re-open it to retry"
                 .into();
+        }
+    }
+
+    /// v20 (user report: presets picked inside a plugin's own window did
+    /// nothing): a VST3 editor drives a SHADOW instance. Sliders reach the
+    /// sound through the cell mirror, but preset/patch changes never
+    /// broadcast performEdits — they live only in the shadow's component
+    /// state, which its teardown hands over (`EditorWindow::take_state`).
+    /// Apply it: stash on the row and re-open the instance from the chunk,
+    /// async like every other plugin load (the UI thread never waits on
+    /// instantiation). VST2 editors edit the live instance in place and
+    /// never hand over a chunk, so this never fires for them.
+    fn harvest_chain_state(&mut self, t: usize, r: usize, w: &mut crate::vstedit::EditorWindow) {
+        let Some(bytes) = w.take_state() else { return };
+        let sr = self.sample_rate.max(1);
+        {
+            let Some(row) = self.fx_rows.get_mut(t).and_then(|rows| rows.get_mut(r)) else {
+                return;
+            };
+            let ChainRow::Vst {
+                path,
+                kind,
+                name,
+                entry,
+                open_rx,
+                state,
+                ..
+            } = row
+            else {
+                return;
+            };
+            *state = Some(bytes.clone());
+            if entry.is_some() || open_rx.is_some() {
+                // Cells re-seed from the chunk (saved=None), so the patch's
+                // own parameter values win over the stale config snapshot.
+                *entry = None;
+                *open_rx = Some(crate::vsthost::open_async_with_state(
+                    std::path::Path::new(path),
+                    *kind,
+                    sr,
+                    None,
+                    Some(&bytes),
+                ));
+                self.vst_note = format!("{name}: applying preset\u{2026}");
+            }
+        }
+        self.rebuild_fx(t);
+    }
+
+    /// Synth-binding twin of [`App::harvest_chain_state`]: rebuild the
+    /// binding synchronously from the harvested chunk (opening a synth
+    /// binding always paid this cost; the next note already sounds new).
+    fn harvest_synth_state(&mut self, t: usize, w: &mut crate::vstedit::EditorWindow) {
+        let Some(bytes) = w.take_state() else { return };
+        self.track_synth_state[t] = Some(bytes);
+        if self.rebuild_track_synth(t) {
+            self.status = format!("track {}: preset applied", t + 1);
         }
     }
 
@@ -5849,6 +5961,7 @@ impl App {
                             params,
                             entry: _,
                             open_rx: _,
+                            state: _,
                         } => ChainSave::Vst {
                             path: path.clone(),
                             kind: kind.tag().to_string(),
@@ -6165,6 +6278,7 @@ impl App {
                             params,
                             entry: None,
                             open_rx: None,
+                            state: None,
                         })
                     }
                 })
@@ -6179,6 +6293,9 @@ impl App {
         for t in 0..MAX_LOOPS {
             self.track_synth[t] = pr.track_synths.get(t).cloned().flatten();
             self.track_synth_params[t] = pr.track_synth_params.get(t).cloned().unwrap_or_default();
+            // v20: harvested editor patches are session-only — they do not
+            // cross a project boundary.
+            self.track_synth_state[t] = None;
         }
         self.rebuild_all_synths();
         // Heights are a per-session view; the new arrangement starts fresh.
