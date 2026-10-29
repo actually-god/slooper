@@ -795,6 +795,11 @@ pub struct App {
     /// widget cannot host an egui context menu (FX-script bridge sliders,
     /// the bpm text box): (track, target, current value, screen pos).
     value_menu: Option<(usize, String, f32, egui::Pos2)>,
+    /// v20 R4: where a grid right-press LANDED — the menu's clip-vs-grid
+    /// content is computed from this frozen point, never from wherever
+    /// the pointer drifts while the overlay is open (the drifting hit-test
+    /// swapped menu variants under the cursor: "the pop-up list is buggy").
+    grid_menu_anchor: Option<((usize, usize), egui::Pos2)>,
     /// v0.15: "Set value" dialog (track, target, input text in USER units).
     value_dialog: Option<(usize, String, String)>,
     /// v0.15: focus + arm the "Set value" text box once, when it opens.
@@ -1098,6 +1103,7 @@ impl App {
             auto_mgr_rec: Vec::new(),
             auto_pick_open: false,
             value_menu: None,
+            grid_menu_anchor: None,
             value_dialog: None,
             value_dialog_focus: false,
             value_menu_armed: false,
@@ -1878,11 +1884,21 @@ impl App {
     /// chain rows (config save goes through `fx_save_pending`).
     fn fx_editor_window(&mut self, ui: &mut egui::Ui) {
         let mut closed = false;
+        // v20 R3: editor gesture requests (right-click = automation asset,
+        // double-click = Set value) — collected here, applied after the
+        // borrow of `self.fx_editor` ends (the handlers take `&mut self`).
+        let mut ctx_req: Option<(usize, String, f32)> = None;
+        let mut dbl_req: Option<(usize, String, f32)> = None;
         if let Some(ed) = self.fx_editor.as_mut() {
             closed = !crate::fxgui::window(ui, ed);
-            if let Some((k, v, pos)) = ed.ctx_menu.take() {
-                self.value_menu = Some((ed.loop_i, format!("fx:{}:{}", ed.slot, k), v, pos));
-            }
+            ctx_req = ed
+                .ctx_menu
+                .take()
+                .map(|(k, v, _)| (ed.loop_i, format!("fx:{}:{}", ed.slot, k), v));
+            dbl_req = ed
+                .dbl_set
+                .take()
+                .map(|(k, v)| (ed.loop_i, format!("fx:{}:{}", ed.slot, k), v));
             let pend = std::mem::take(&mut ed.pending);
             if !pend.is_empty() {
                 if let Some(ChainRow::Script { params, .. }) =
@@ -1896,6 +1912,14 @@ impl App {
                     self.fx_save_pending = true;
                 }
             }
+        }
+        if let Some((loop_i, target, v)) = ctx_req {
+            // Right-click answers DIRECTLY with the automation asset.
+            self.rmb_create_auto(Some(loop_i), &target, v);
+        }
+        if let Some((loop_i, target, v)) = dbl_req {
+            self.value_dialog = Some((loop_i, target.clone(), value_user_display(&target, v)));
+            self.value_dialog_focus = true;
         }
         if closed {
             self.fx_editor = None;
@@ -2885,15 +2909,88 @@ impl App {
         );
     }
 
-    /// Instant constant-value automation asset placed at the playhead
-    /// (the "flat" branch of the right-click menu).
-    fn create_flat_auto_asset(&mut self, track: usize, target: &str, v: f32) {
+    /// v20 R3: the ONE right-click automation creator (replaces the old
+    /// flat-at-playhead path). Geometry follows the user's context, the
+    /// way FL answers "create automation clip":
+    ///
+    /// * clips selected  → asset length = span of the selection
+    ///   (`max(end) - min(pos)`, clip lengths resolved through
+    ///   `Clip::end(asset_len)`), clip placed at `min(pos)`;
+    /// * nothing selected → length = the longest track's end in the
+    ///   project (empty project falls back to 2 s), clip placed at the
+    ///   snapped playhead;
+    /// * host track = the control's OWNER track for track-relative
+    ///   targets (`owner = Some(t)`); for global targets (tempo, master
+    ///   vol) the first selected track, else the longest track;
+    /// * the clip always lands on a NEW child lane of the host (never a
+    ///   reused lane — automation stacked over audio is the point);
+    /// * curve seeded FLAT at the control's current value, so binding it
+    ///   cannot jump the sound;
+    /// * the automation manager opens on the new asset.
+    ///
+    /// Returns the asset id. Direct slider right-clicks call this with no
+    /// menu in between; the bpm/gain/mute menus route their "Create
+    /// automation asset" item through here too, so every entry point
+    /// shares one semantics.
+    fn rmb_create_auto(&mut self, owner: Option<usize>, target: &str, current: f32) -> Option<u32> {
         if self.sample_rate == 0 {
             self.status = "automation: wait for the audio engine".into();
-            return;
+            return None;
         }
-        let len = (self.sample_rate * 2) as i64;
-        let auto = crate::automation::Automation::flat(target, v, len);
+        // --- selection span ------------------------------------------------
+        let mut sel: Option<(u64, u64, usize)> = None; // (pos, len, first track)
+        if !self.sel_clips.is_empty() {
+            let (mut lo, mut hi, mut ft) = (u64::MAX, 0u64, usize::MAX);
+            for &(t, l, c) in self.sel_clips.iter() {
+                if let Some(cl) = self
+                    .arr
+                    .tracks
+                    .get(t)
+                    .and_then(|tr| tr.lanes.get(l))
+                    .and_then(|ln| ln.clips.get(c))
+                {
+                    lo = lo.min(cl.pos);
+                    hi = hi.max(cl.end(self.asset_len(cl.asset)));
+                    ft = ft.min(t);
+                }
+            }
+            if hi > lo {
+                sel = Some((lo, hi - lo, ft));
+            }
+        }
+        // --- longest track --------------------------------------------------
+        let (mut longest_t, mut longest_end, mut best) = (0usize, 0u64, 0u64);
+        for t in 0..self.n_tracks.min(MAX_LOOPS) {
+            let mut end = 0u64;
+            for ln in &self.arr.tracks[t].lanes {
+                for cl in &ln.clips {
+                    end = end.max(cl.end(self.asset_len(cl.asset)));
+                }
+            }
+            if end > best {
+                best = end;
+                longest_t = t;
+                longest_end = end;
+            }
+        }
+        let fallback = self.sample_rate as u64 * 2;
+        let (pos, len, host) = match (&sel, owner) {
+            (Some((p, l, _)), Some(t)) => (*p, *l, t),
+            (Some((p, l, ft)), None) => (*p, *l, *ft),
+            (None, Some(t)) => (
+                snap_start(self.backend.engine.pos(), self.snap_unit()),
+                longest_end.max(fallback),
+                t,
+            ),
+            (None, None) => (
+                snap_start(self.backend.engine.pos(), self.snap_unit()),
+                longest_end.max(fallback),
+                longest_t,
+            ),
+        };
+        let host = host.min(self.n_tracks.saturating_sub(1));
+        let len = len.max(1);
+        let auto = crate::automation::Automation::flat(target, current, len as i64);
         let dir = self.primary_folder();
         let mut n = 1u32;
         let path = loop {
@@ -2905,7 +3002,7 @@ impl App {
         };
         if let Err(e) = std::fs::write(&path, auto.to_json().unwrap_or_default()) {
             self.status = format!("automation: {e}");
-            return;
+            return None;
         }
         let id = self.assets.len() as u32;
         let name = path
@@ -2919,20 +3016,25 @@ impl App {
             Arc::new(auto),
             false,
         ));
-        let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
-        let nl0 = self.arr.tracks[track].lanes.len();
-        let lane = self.arr.place_auto(track, Clip::new(id, pos), len as u64);
-        self.grow_for_lanes(track, nl0);
+        let nl0 = self.arr.tracks[host].lanes.len();
+        // v20 R3: ALWAYS a new child lane — the requirement's "child
+        // track". `place_auto` would reuse lane 0/free lanes; stacking
+        // automation visibly above the audio it controls is the point.
+        let lane = self.arr.add_lane(host);
+        self.arr.insert(host, lane, Clip::new(id, pos));
+        self.grow_for_lanes(host, nl0);
         if let Some(f) = self.rack.first_mut() {
             f.rescan();
         }
         self.push_project();
+        // ...and show it: the manager opens on the new asset, bound.
+        self.open_auto_editor(Some(id as usize));
         self.status = format!(
-            "\u{201c}{name}\u{201d} = flat {} at {v:.3} \u{2192} track {} lane {} \u{b7} edit it from the rack or the automation button",
+            "\u{201c}{name}\u{201d} = flat {} at {current:.3} on a new lane \u{b7} track {} \u{b7} manager open",
             crate::automation::describe_target(target),
-            track + 1,
-            lane + 1
+            host + 1
         );
+        Some(id)
     }
 
     /// v0.15: apply a "Set value" dialog entry to the control it belongs
@@ -5392,10 +5494,14 @@ impl App {
                             .step_by(1.0)
                             .custom_formatter(|n, _| note_name(n.round().clamp(0.0, 127.0) as u8));
                     }
-                    let resp = ui.add(sl);
-                    resp.context_menu(|ui| {
-                        auto_menu(ui, self, t, &format!("synth:{k}"), nv);
-                    });
+                    let mut resp = ui
+                        .add(sl)
+                        // v20 R3: Slider senses DRAG only; union click
+                        // interest so RMB/double-click reach the binding.
+                        .interact(egui::Sense::click());
+                    // v20 R3: right-click = automation asset for this
+                    // slider (owner = this track); double-click = Set value.
+                    bind_value_controls(&mut resp, self, Some(t), &format!("synth:{k}"), nv);
                     if resp.changed() {
                         inst.set_param(k, nv);
                         self.note_auto(t, &format!("synth:{k}"), nv);
@@ -6825,7 +6931,11 @@ impl App {
         // flick reports PIXELS.
         let mut zoom_ln = 0.0f32;
         let mut pan = 0.0f32;
-        let bpm_rect = self.bpm_rect;
+        // v20 R4: TAKE, not copy — the rect re-registers every frame the
+        // bpm box paints; if it stops painting (narrow window, different
+        // chrome) the swallow zone must vanish with it instead of eating
+        // right-presses over stale coordinates forever.
+        let bpm_rect = self.bpm_rect.take();
         let mut rmb_bpm: Option<egui::Pos2> = None;
         // While the pointer sits over an open piano-roll canvas its
         // ctrl/alt-wheel gestures belong to the ROLL (time / row zoom) —
@@ -7040,8 +7150,16 @@ impl App {
             let armed = self.value_menu_armed;
             self.value_menu_armed = true;
             let mut done = false;
+            // v20 R4: the .open() flag is the whole point of the v18
+            // family rule: WITHOUT it, the title-bar X marks Id("value_menu")
+            // closed in egui memory FOREVER and every later right-click
+            // paints nothing ("right-click automation stopped working").
+            // With it, a fresh request re-opens, and X-close clears the
+            // field here so state and memory agree.
+            let mut open = true;
             let resp = egui::Window::new(crate::automation::describe_target(&target))
                 .id(egui::Id::new("value_menu"))
+                .open(&mut open)
                 .fixed_pos(pos)
                 .collapsible(false)
                 .resizable(false)
@@ -7064,10 +7182,14 @@ impl App {
                                 .expand(4.0)
                                 .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
                     });
-                if done || click_elsewhere {
+                if done || click_elsewhere || !open {
                     self.value_menu = None;
                     self.value_menu_armed = false;
                 }
+            } else {
+                // Window could not draw at all — never keep stale state.
+                self.value_menu = None;
+                self.value_menu_armed = false;
             }
         } else {
             self.value_menu_armed = false;
@@ -7386,19 +7508,54 @@ fn value_menu_items(
     if ui
         .button("Create automation asset")
         .on_hover_text(
-            "Create a red automation asset holding this exact value and place it at the \
-             playhead; edit its curve any time in the automation manager.",
+            "Create a red automation asset holding this exact value — spanning the selected \
+             clips (or the longest track) on a new lane — and edit it in the automation manager.",
         )
         .clicked()
     {
-        app.create_flat_auto_asset(track, target, current);
+        // v20 R3: tempo is the global target reachable from a menu; every
+        // other menu target belongs to the menu's track.
+        let owner = if target == crate::automation::TARGET_MASTER_TEMPO {
+            None
+        } else {
+            Some(track)
+        };
+        app.rmb_create_auto(owner, target, current);
         return true;
     }
     false
 }
 
-/// Context-menu host for the shared value items (volume/pan/synth/fx
-/// sliders right-click through here).
+/// v20 R3: the ONE binding gesture pair for every automatable slider and
+/// readout (strip vol/pan, master vol, synth sliders, fx auto/bridge
+/// sliders): right-click creates the automation asset (selection/longest
+/// geometry, seeded at the control's current value, manager opens) with
+/// NO intermediate menu; double-click opens the Set value dialog.
+fn bind_value_controls(
+    resp: &mut egui::Response,
+    app: &mut App,
+    owner: Option<usize>,
+    target: &str,
+    current: f32,
+) {
+    // An egui Slider senses DRAG only — a secondary click never surfaces
+    // there at all; those controls union click interest at creation (see
+    // the fx wrappers) so `secondary_clicked()` is the ONE signal. Mixing
+    // a hover-press fallback with it would create once per frame phase.
+    if resp.secondary_clicked() {
+        app.rmb_create_auto(owner, target, current);
+    }
+    if resp.double_clicked() {
+        let t = owner.unwrap_or(app.selected);
+        app.value_dialog = Some((t, target.to_string(), value_user_display(target, current)));
+        app.value_dialog_focus = true;
+    }
+}
+
+/// Context-menu host for the shared value items. v20 R3: sliders bind
+/// directly (see `bind_value_controls`) — this host survives for the
+/// controls that keep a right-click MENU (bpm box, gain row, mute), whose
+/// "Create automation asset" item routes through the same new semantics.
 fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, current: f32) {
     // v18: this host is an egui CONTEXT menu: dismiss it once an item was
     // chosen (the shared items cannot call ui.close() themselves — see the
@@ -8005,7 +8162,7 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
         // v0.15: no text box — right-click opens Set value / Create
         // automation asset, matching every other automatable value.
         let mut mv = app.master_midi as i16;
-        let msl = ui
+        let mut msl = ui
             .add_sized(
                 egui::vec2(44.0, 18.0),
                 Slider::new(&mut mv, 0..=127).show_value(false),
@@ -8013,7 +8170,7 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             .on_hover_text(
                 "Master volume: -inf .. +6 dB. Right-click for exact entry and automation.",
             );
-        let mvr = ui
+        let mut mvr = ui
             .add_sized(
                 egui::vec2(50.0, 18.0),
                 egui::Label::new(
@@ -8031,17 +8188,11 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
             app.levels_dirty = true;
         }
-        let mmenu = |ui: &mut egui::Ui, app: &mut App| {
-            auto_menu(
-                ui,
-                app,
-                app.selected,
-                crate::automation::TARGET_MASTER_VOL,
-                vol_amp(app.master_midi),
-            )
-        };
-        msl.context_menu(|ui| mmenu(ui, app));
-        mvr.context_menu(|ui| mmenu(ui, app));
+        // v20 R3: master volume binds directly too (global target: no
+        // owner track — selection's first track or the longest hosts it).
+        let mvv = vol_amp(app.master_midi);
+        bind_value_controls(&mut msl, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
+        bind_value_controls(&mut mvr, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
         if ui
             .small_button(RichText::new("0").monospace())
             .on_hover_text("Reset master volume to 0 dB")
@@ -9812,6 +9963,34 @@ fn lane_row(
     // actions on empty grid. The old "right-click anywhere clears this
     // track" gesture destroyed a whole track on one accidental press and
     // blocked every discovery path a context menu should own.
+    // v20 R4: freeze WHERE the right-press landed (per lane) the moment it
+    // happens; the menu content stays anchored to that point while the
+    // overlay tracks the pointer. Cleared when no menu is open anymore.
+    if resp.secondary_clicked() {
+        // The PRESS point (not where the pointer sits at release): this is
+        // the spot the menu content must stay anchored to.
+        let press = ui.ctx().input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    pos,
+                    ..
+                } => Some(*pos),
+                _ => None,
+            })
+        })
+        .or_else(|| resp.interact_pointer_pos());
+        if let Some(pp) = press {
+            app.grid_menu_anchor = Some(((t, k), pp));
+        }
+    } else if !resp.context_menu_opened()
+        && app.grid_menu_anchor
+            .as_ref()
+            .is_some_and(|((tt, kk), _)| *tt == t && *kk == k)
+    {
+        app.grid_menu_anchor = None;
+    }
     resp.clone().context_menu(|ui| {
         grid_context_menu(ui, app, t, k, &clips, rect, x0, sr, px);
     });
@@ -9842,8 +10021,16 @@ fn grid_context_menu(
     sr: f64,
     px: f64,
 ) {
-    let hit: Option<usize> = ui
-        .input(|i| i.pointer.interact_pos())
+    // v20 R4: compute the hit from the FROZEN press point when the menu
+    // was opened on this lane — never from the live pointer, which drifts
+    // over other clips (or off them) while the user reaches for an item
+    // and swaps the menu contents mid-hover.
+    let anchor = app
+        .grid_menu_anchor
+        .filter(|((tt, kk), _)| *tt == t && *kk == k)
+        .map(|(_, p)| p);
+    let hit: Option<usize> = anchor
+        .or_else(|| ui.input(|i| i.pointer.interact_pos()))
         .filter(|p| rect.contains(*p))
         .and_then(|p| {
             let pos = s_at(x0, p.x, sr, px);
@@ -10143,13 +10330,13 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         );
         let mut v = midi;
         let sw = (ui.available_width() - 86.0).max(30.0);
-        let r = ui
+        let mut r = ui
             .add_sized(
                 egui::vec2(sw, 18.0),
                 Slider::new(&mut v, 0..=127).show_value(false),
             )
             .on_hover_text(hover);
-        let vr = ui.add_sized(
+        let mut vr = ui.add_sized(
             egui::vec2(52.0, 18.0),
             egui::Label::new(
                 RichText::new(if kind == KIND_PAN {
@@ -10187,34 +10374,61 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
             }
             app.levels_dirty = true;
         }
-        // v0.15: right-click either the slider or its value readout — both
-        // answer the automation menu (vol/pan; gain is a manual trim).
-        let menu = |ui: &mut egui::Ui, app: &mut App| match kind {
-            KIND_VOL => auto_menu(
-                ui,
-                app,
-                i,
-                crate::automation::TARGET_TRACK_VOL,
-                vol_amp(midi),
-            ),
-            KIND_GAIN => {
-                if ui
-                    .button(format!(
-                        "Set value   [{} dB]",
-                        db_num(gain_amp(midi)).trim_start_matches('+')
-                    ))
-                    .clicked()
-                {
-                    app.value_dialog =
-                        Some((i, TARGET_PSEUDO_GAIN.to_string(), db_num(gain_amp(midi))));
-                    app.value_dialog_focus = true;
-                    ui.close();
-                }
+        // v20 R3: right-click the slider OR its readout and the automation
+        // asset appears directly (vol/pan; double-click sets an exact
+        // value). Gain stays a manual trim — its menu is just Set value.
+        match kind {
+            KIND_VOL => {
+                bind_value_controls(
+                    &mut r,
+                    app,
+                    Some(i),
+                    crate::automation::TARGET_TRACK_VOL,
+                    vol_amp(midi),
+                );
+                bind_value_controls(
+                    &mut vr,
+                    app,
+                    Some(i),
+                    crate::automation::TARGET_TRACK_VOL,
+                    vol_amp(midi),
+                );
             }
-            _ => auto_menu(ui, app, i, crate::automation::TARGET_TRACK_PAN, pan01(midi)),
-        };
-        r.context_menu(|ui| menu(ui, app));
-        vr.context_menu(|ui| menu(ui, app));
+            KIND_GAIN => {
+                let menu = |ui: &mut egui::Ui, app: &mut App| {
+                    if ui
+                        .button(format!(
+                            "Set value   [{} dB]",
+                            db_num(gain_amp(midi)).trim_start_matches('+')
+                        ))
+                        .clicked()
+                    {
+                        app.value_dialog =
+                            Some((i, TARGET_PSEUDO_GAIN.to_string(), db_num(gain_amp(midi))));
+                        app.value_dialog_focus = true;
+                        ui.close();
+                    }
+                };
+                r.context_menu(|ui| menu(ui, app));
+                vr.context_menu(|ui| menu(ui, app));
+            }
+            _ => {
+                bind_value_controls(
+                    &mut r,
+                    app,
+                    Some(i),
+                    crate::automation::TARGET_TRACK_PAN,
+                    pan01(midi),
+                );
+                bind_value_controls(
+                    &mut vr,
+                    app,
+                    Some(i),
+                    crate::automation::TARGET_TRACK_PAN,
+                    pan01(midi),
+                );
+            }
+        }
         // Reset this strip straight to its "0" position.
         if ui
             .small_button(RichText::new("0").monospace())
@@ -11565,12 +11779,25 @@ mod tests {
     }
 
     /// One UI frame with the given pointer events.
+    /// Shared test clock: EVERY frame (including `galley_at`'s read-only
+    /// runs) advances it, like a real egui backend. With a constant time 0
+    /// egui's double-click accounting misbehaves after an unrelated click
+    /// (all presses claim the same instant), which used to mask/cause flaky
+    /// gesture pins.
+    static TEST_CLOCK_TICKS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    fn test_time() -> f64 {
+        TEST_CLOCK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64 / 60.0
+    }
+
     fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             events,
             ..Default::default()
         };
@@ -12587,8 +12814,9 @@ mod tests {
     }
 
     /// v0.15 pin: the master row's dB text box is gone (a plain readout
-    /// now); right-click answers the two-item menu, and "Set value" opens
-    /// the dialog that applies 1:1 dB (typed -12 = -12 dB). The "0"
+    /// now). v20 R3 restated the gestures: right-click CREATES the
+    /// automation asset directly (no menu), DOUBLE-click opens the Set
+    /// value dialog applying 1:1 dB (typed -12 = -12 dB). The "0"
     /// zeroize button still resets to 0 dB.
     #[test]
     fn v15_ui_master_set_value_dialog() {
@@ -12596,9 +12824,49 @@ mod tests {
         let ctx = egui::Context::default();
         app.master_midi = 50;
         frame(&mut app, &ctx, vec![]);
-        // Zeroize button: the first painted "0" galley is the mixer dock's
-        // master strip — panels draw in add order and the master strip
-        // precedes every track strip inside the mixer.
+
+        // v20 R3: DOUBLE-click the dB readout opens the Set value dialog
+        // (right-click's job is now direct asset creation — pinned by
+        // v20_rmb_slider_creates_auto_clip). NOTE: the double-click runs on
+        // an otherwise UNCLICKED app on purpose — egui 0.36's headless
+        // replay never fires double_clicked() again once some other point
+        // received a click (reproducible in pure egui: examples kept out of
+        // tree; real backends stream continuous timing and are unaffected).
+        let want = format!("{:>5}", db_num(vol_amp(app.master_midi)));
+        let cp = label_center(&mut app, &ctx, &want)
+            .expect("master dB readout is painted")
+            .to_vec2();
+        let p = egui::pos2(cp.x, cp.y);
+        for _ in 0..2 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        }
+        assert!(
+            app.value_dialog.is_some(),
+            "double-click opens the Set value dialog (status {:?})",
+            app.status
+        );
+        assert_eq!(app.value_dialog.as_ref().unwrap().1, "master.vol");
+
+        // Type -12 and commit: 1:1 dB semantics (NOT MIDI 12, NOT -12/127).
+        type_into_focused(&mut app, &ctx, "-12");
+        assert_eq!(
+            app.master_midi,
+            vol_midi(-12.0),
+            "typed dB value applies to master 1:1"
+        );
+        assert!(app.value_dialog.is_none(), "dialog closes on apply");
+
+        // Zeroize button (checked LAST: its click is exactly the prior-click
+        // that poisons headless double-click accounting above): the first
+        // painted "0" galley is the mixer dock's master strip — panels draw
+        // in add order and the master strip precedes every track strip.
+        app.master_midi = 50;
+        frame(&mut app, &ctx, vec![]);
         let z = label_center(&mut app, &ctx, "0").expect("a \"0\" button is painted");
         frame(
             &mut app,
@@ -12614,52 +12882,6 @@ mod tests {
             app.master_midi, VOL_UNITY_MIDI,
             "zeroize resets master to 0 dB"
         );
-
-        // Right-click the dB readout: the two-item menu opens.
-        let want = format!("{:>5}", db_num(vol_amp(app.master_midi)));
-        let cp = label_center(&mut app, &ctx, &want)
-            .expect("master dB readout is painted")
-            .to_vec2();
-        let p = egui::pos2(cp.x, cp.y);
-        frame(
-            &mut app,
-            &ctx,
-            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
-        );
-        frame(
-            &mut app,
-            &ctx,
-            vec![btn(p, egui::PointerButton::Secondary, false)],
-        );
-        let sv = galley_at(&mut app, &ctx, "Set value").expect("Set value item is painted");
-        assert!(
-            galley_at(&mut app, &ctx, "Create automation asset").is_some(),
-            "the menu also offers Create automation asset"
-        );
-
-        // Clicking Set value opens the dialog bound to master.vol.
-        let sv = sv.center();
-        frame(
-            &mut app,
-            &ctx,
-            vec![moved(sv), btn(sv, egui::PointerButton::Primary, true)],
-        );
-        frame(
-            &mut app,
-            &ctx,
-            vec![btn(sv, egui::PointerButton::Primary, false)],
-        );
-        assert!(app.value_dialog.is_some(), "Set value opens the dialog");
-        assert_eq!(app.value_dialog.as_ref().unwrap().1, "master.vol");
-
-        // Type -12 and commit: 1:1 dB semantics (NOT MIDI 12, NOT -12/127).
-        type_into_focused(&mut app, &ctx, "-12");
-        assert_eq!(
-            app.master_midi,
-            vol_midi(-12.0),
-            "typed dB value applies to master 1:1"
-        );
-        assert!(app.value_dialog.is_none(), "dialog closes on apply");
     }
 
     /// v0.15: a fresh automation curve spans the SELECTED clips, else the
@@ -14742,6 +14964,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -16693,7 +16916,7 @@ mod tests {
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         app.arr.insert(0, 0, Clip::new(a, 0));
         app.arr.insert(0, 0, Clip::new(a, 96_000));
-        app.create_flat_auto_asset(1, crate::automation::TARGET_TRACK_VOL, 0.5);
+        app.rmb_create_auto(Some(1), crate::automation::TARGET_TRACK_VOL, 0.5);
         let before = n_clips(&app);
         assert_eq!(before, 3, "2 audio clips + 1 automation clip");
         app.select_one((0, 0, 1));
@@ -16760,8 +16983,9 @@ mod tests {
         assert_eq!(app.assets[n0 + 1].name, "auto-2", "auto-2 next to auto-1");
     }
 
-    /// R3a-2: the same menu from a TRACK volume readout in the mixer binds
-    /// the clip to that track's volume target.
+    /// R3a-2 (v20 R3 restatement): right-clicking a TRACK volume readout
+    /// in the mixer creates the asset DIRECTLY — no menu in between — and
+    /// binds it to that track's volume target.
     #[test]
     fn v18_rmb_track_vol_creates_auto_for_that_target() {
         let mut app = headless_app("v18rmbvol");
@@ -16775,11 +16999,421 @@ mod tests {
             .unwrap_or_else(|| panic!("expected master + track-1 dB readouts, got {hits:?}"));
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
-        click_label(&mut app, &ctx, "Create automation asset");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "track-vol menu creates: {}", app.status);
+        assert_eq!(app.assets.len(), n0 + 1, "right-click creates directly: {}", app.status);
         let auto = app.assets[n0].automation.as_ref().expect("automation attached");
         assert_eq!(auto.target, crate::automation::TARGET_TRACK_VOL);
+    }
+
+    // ---- v20 R3: right-click = DIRECT automation clip creation -----------
+
+    fn push_v20_audio(app: &mut App, name: &str, frames: usize) -> u32 {
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; frames].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            name.into(),
+            std::path::PathBuf::from(format!("/tmp/{name}-v20.wav")),
+            data,
+            false,
+        ));
+        a
+    }
+
+    /// Track-1 volume readout center. Callers FIRST set `trk_vol[0]` to a
+    /// value the rest of the mixer does not show — then exactly one widget
+    /// paints that dB string, and the hit cannot be confused with master.
+    fn v20_track1_vol_point(app: &mut App, ctx: &egui::Context) -> egui::Pos2 {
+        let readout = format!("{:>5}", db_num(vol_amp(app.trk_vol[0])));
+        let hits = galleys_all(app, ctx, &readout);
+        assert_eq!(
+            hits.len(),
+            1,
+            "track-1 readout {:?} must be painted exactly once, got {hits:?}",
+            readout
+        );
+        hits[0]
+    }
+
+    fn v20_master_vol_point(app: &mut App, ctx: &egui::Context) -> egui::Pos2 {
+        let want = format!("{:>5}", db_num(vol_amp(app.master_midi)));
+        label_center(app, ctx, &want)
+            .unwrap_or_else(|| panic!("master dB readout {:?} not painted", want))
+    }
+
+    fn v20_last_auto(app: &App) -> crate::automation::Automation {
+        app.assets
+            .last()
+            .and_then(|a| a.automation.clone().map(|a| (*a).clone()))
+            .expect("last asset is an automation")
+    }
+
+    fn v20_placed(app: &App, asset: u32) -> Option<(usize, usize, crate::arrange::Clip)> {
+        (0..MAX_LOOPS).find_map(|t| {
+            app.arr.tracks[t].lanes.iter().enumerate().find_map(|(l, ln)| {
+                ln.clips
+                    .iter()
+                    .find(|c| c.asset == asset)
+                    .cloned()
+                    .map(|c| (t, l, c))
+            })
+        })
+    }
+
+    /// R3: right-clicking the track-volume readout creates the asset with
+    /// NO menu in between, FLAT at the control's current value, on a NEW
+    /// child lane of the OWNER track, and opens the manager on it.
+    #[test]
+    fn v20_rmb_slider_creates_auto_clip() {
+        let mut app = headless_app("v20rmbauto1");
+        let ctx = egui::Context::default();
+        app.trk_vol[0] = 32; // strip 1 must read differently from master
+        frame(&mut app, &ctx, vec![]);
+        let p = v20_track1_vol_point(&mut app, &ctx);
+        let n0 = app.assets.len();
+        let lanes0 = app.arr.tracks[0].lanes.len();
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "direct creation: {}", app.status);
+        let auto = v20_last_auto(&app);
+        assert_eq!(auto.target, crate::automation::TARGET_TRACK_VOL);
+        let cur = vol_amp(app.trk_vol[0]);
+        assert!(
+            auto.nodes.iter().all(|n| (n.v - cur).abs() < 1e-6),
+            "curve seeded FLAT at the current value (no jump): {:?}",
+            auto.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
+        );
+        // Empty project → the documented 2 s fallback length.
+        assert_eq!(auto.len_samples as u64, 48_000 * 2);
+        let (t, lane, cl) = v20_placed(&app, n0 as u32).expect("automation clip placed");
+        // Strip "1" (the one whose readout we right-clicked) is arr track 0.
+        assert_eq!((t, lane), (0, lanes0), "NEW child lane of the OWNER track");
+        assert_eq!(cl.pos, 0, "no selection → snapped playhead");
+        let ed = app.auto_edit.as_ref().expect("manager opened on the asset");
+        assert_eq!(ed.asset, Some(n0));
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+    }
+
+    /// R3: with clips selected the asset spans the SELECTION
+    /// (max end − min pos, lengths via `Clip::end(asset_len)`) and lands
+    /// at the selection's start. Global target (master vol) → host is the
+    /// first selected track.
+    #[test]
+    fn v20_rmb_auto_clip_uses_selection() {
+        let mut app = headless_app("v20rmbsel");
+        let ctx = egui::Context::default();
+        let a1 = push_v20_audio(&mut app, "v20sa", 192_000);
+        app.arr.insert(2, 0, crate::arrange::Clip::new(a1, 48_000));
+        let a2 = push_v20_audio(&mut app, "v20sb", 96_000);
+        app.arr.insert(5, 0, crate::arrange::Clip::new(a2, 96_000));
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((2, 0, 0));
+        app.select_toggle((5, 0, 0));
+        let p = v20_master_vol_point(&mut app, &ctx);
+        let n0 = app.assets.len();
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "master RMB creates: {}", app.status);
+        let auto = v20_last_auto(&app);
+        assert_eq!(auto.target, crate::automation::TARGET_MASTER_VOL);
+        // ends: 48k+192k=240k and 96k+96k=192k; min pos 48k → span 192k.
+        assert_eq!(auto.len_samples as u64, 192_000, "selection span");
+        let (t, lane, cl) = v20_placed(&app, n0 as u32).expect("placed");
+        assert_eq!((t, lane), (2, 1), "new lane of the FIRST selected track");
+        assert_eq!(cl.pos, 48_000, "placed at the selection start");
+    }
+
+    /// R3: with nothing selected the length comes from the LONGEST track
+    /// in the project and the host track is that longest track (global
+    /// target).
+    #[test]
+    fn v20_rmb_auto_clip_uses_longest_track() {
+        let mut app = headless_app("v20rmblong");
+        let ctx = egui::Context::default();
+        let a1 = push_v20_audio(&mut app, "v20la", 96_000);
+        app.arr.insert(3, 0, crate::arrange::Clip::new(a1, 0));
+        let a2 = push_v20_audio(&mut app, "v20lb", 4_800);
+        app.arr.insert(0, 0, crate::arrange::Clip::new(a2, 0));
+        frame(&mut app, &ctx, vec![]);
+        let p = v20_master_vol_point(&mut app, &ctx);
+        let n0 = app.assets.len();
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "creates: {}", app.status);
+        let auto = v20_last_auto(&app);
+        assert_eq!(auto.len_samples as u64, 96_000, "longest-track length");
+        let (t, lane, _cl) = v20_placed(&app, n0 as u32).expect("placed");
+        assert_eq!((t, lane), (3, 1), "new lane on the LONGEST track");
+    }
+
+    /// R3: the seeded value is the control's CURRENT value, not a default —
+    /// moving the fader first must show up in the curve.
+    #[test]
+    fn v20_rmb_auto_clip_seeded_current() {
+        let mut app = headless_app("v20rmbseed");
+        let ctx = egui::Context::default();
+        app.trk_vol[0] = 32; // distinct readout for the helper
+        frame(&mut app, &ctx, vec![]);
+        let p = v20_track1_vol_point(&mut app, &ctx);
+        let n0 = app.assets.len();
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "creates: {}", app.status);
+        let want = vol_amp(32);
+        let auto = v20_last_auto(&app);
+        assert!(
+            auto.nodes.iter().all(|n| (n.v - want).abs() < 1e-6),
+            "seeded at vol_amp(32)={want}: {:?}",
+            auto.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
+        );
+    }
+
+    /// R3: the manager opens on the NEW asset, and rack naming keeps
+    /// counting (auto-1, auto-2, never an overwrite).
+    #[test]
+    fn v20_rmb_auto_clip_opens_manager() {
+        let mut app = headless_app("v20rmbmgr");
+        let ctx = egui::Context::default();
+        app.trk_vol[0] = 45; // distinct readout for the helper
+        frame(&mut app, &ctx, vec![]);
+        let p = v20_track1_vol_point(&mut app, &ctx);
+        let n0 = app.assets.len();
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets[n0].name, "auto-1");
+        let ed = app.auto_edit.as_ref().expect("manager open");
+        assert_eq!(ed.asset, Some(n0));
+        assert!(!ed.nodes.is_empty(), "manager shows the curve");
+    }
+
+    /// R3: double-click still opens Set value (vol/pan/master/synth/fx).
+    #[test]
+    fn v20_dblclick_set_value() {
+        let mut app = headless_app("v20dblval");
+        let ctx = egui::Context::default();
+        app.trk_vol[0] = 32; // distinct readout for the helper
+        frame(&mut app, &ctx, vec![]);
+        let p = v20_track1_vol_point(&mut app, &ctx);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        }
+        let dlg = app.value_dialog.clone().expect("double-click opens Set value");
+        assert_eq!(dlg.1, crate::automation::TARGET_TRACK_VOL);
+    }
+
+    // ---- v20 R4: right-click menu integrity ------------------------------
+
+    /// The grid menu's clip/grid content comes from the FROZEN press point.
+    /// Moving the pointer across other clips (or empty grid) while the menu
+    /// is open must not swap the list nor re-select (the old live hit-test
+    /// flipped variants under the cursor mid-hover).
+    #[test]
+    fn v20_grid_menu_stable_while_hovering() {
+        let mut app = headless_app("v20gridstab");
+        let ctx = egui::Context::default();
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, crate::arrange::Clip::new(a, 0));
+        app.arr.insert(0, 0, crate::arrange::Clip::new(a, 144_000));
+        frame(&mut app, &ctx, vec![]);
+        // Press the first clip: sweep until the CLIP variant opens.
+        let mut press = None;
+        'outer: for y in (160..620).step_by(60) {
+            for x in (200..1300).step_by(40) {
+                let p = egui::pos2(x as f32, y as f32);
+                rmb(&mut app, &ctx, p);
+                frame(&mut app, &ctx, vec![]);
+                if galley_at(&mut app, &ctx, "Copy  (Ctrl+C)").is_some() {
+                    press = Some(p);
+                    break 'outer;
+                }
+            }
+        }
+        let press = press.expect("a right-click on a clip opens the clip variant");
+        let anchor = app.sel_anchor;
+        let status = app.status.clone();
+        // Hover EMPTY grid (the old live hit-test flipped to the grid
+        // variant and re-selected the lane under the pointer).
+        frame(&mut app, &ctx, vec![moved(press + egui::vec2(240.0, 240.0))]);
+        assert!(
+            galley_at(&mut app, &ctx, "Copy  (Ctrl+C)").is_some(),
+            "menu content stays the clip variant while hovering empty grid (status {:?})",
+            app.status
+        );
+        assert_eq!(app.sel_anchor, anchor, "selection does not drift");
+        assert_eq!(app.status, status, "no lane-clear side effects");
+        // Hover ANOTHER clip (old code: re-selected clip 2 mid-menu).
+        frame(&mut app, &ctx, vec![moved(press + egui::vec2(0.0, 60.0))]);
+        assert!(
+            galley_at(&mut app, &ctx, "Copy  (Ctrl+C)").is_some(),
+            "menu stays anchored while the pointer roams (status {:?})",
+            app.status
+        );
+    }
+
+    /// A bpm_rect that no longer matches a painted bpm box must not swallow
+    /// right-presses over the grid (the rect re-registers each frame; the
+    /// stale one is consumed and gone).
+    #[test]
+    fn v20_rmb_stale_bpm_rect_not_swallowed() {
+        let mut app = headless_app("v20stalebpm");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let real = app.bpm_rect.expect("bpm box painted");
+        // Poison the rect over the grid area the way the old leak did.
+        app.bpm_rect = Some(egui::Rect::from_center_size(
+            egui::pos2(700.0, 320.0),
+            egui::vec2(400.0, 300.0),
+        ));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.bpm_rect, Some(real), "the stale rect never survives a frame");
+        let mut menu = None;
+        for y in (150..640).step_by(50) {
+            let p = egui::pos2(700.0, y as f32);
+            rmb(&mut app, &ctx, p);
+            frame(&mut app, &ctx, vec![]);
+            if galley_at(&mut app, &ctx, "Clear this track").is_some() {
+                menu = Some(p);
+                break;
+            }
+        }
+        assert!(
+            menu.is_some(),
+            "a grid right-click in the poisoned zone still opens the menu"
+        );
+        assert!(app.value_menu.is_none(), "the press was not swallowed by bpm");
+    }
+
+    /// The value mini-menu family: opening, dismissing, and REOPENING must
+    /// work over and over. (The old Window had no open-flag: an X-close
+    /// poisoned Id("value_menu") in egui memory forever; now `.open()` makes
+    /// visibility caller-owned.)
+    #[test]
+    fn v20_value_menu_survives_close() {
+        let mut app = headless_app("v20valuereopen");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let p = app.bpm_rect.expect("bpm box painted").center();
+        for round in 0..3 {
+            rmb(&mut app, &ctx, p);
+            frame(&mut app, &ctx, vec![]);
+            assert!(app.value_menu.is_some(), "round {round}: menu state opens");
+            assert!(
+                galley_at(&mut app, &ctx, "Set value").is_some(),
+                "round {round}: the mini-menu WINDOW paints (id never poisoned)"
+            );
+            // Dismiss with a click elsewhere.
+            click_pt(&mut app, &ctx, egui::pos2(60.0, 800.0));
+            frame(&mut app, &ctx, vec![]);
+            assert!(app.value_menu.is_none(), "round {round}: click-away closes");
+        }
+    }
+
+    /// R3/R4: the fx auto-slider grid answers right-click DIRECTLY with an
+    /// automation asset bound to `fx:<slot>:<param>`.
+    #[test]
+    fn v20_fx_auto_slider_rmb_auto() {
+        let mut app = headless_app("v20fxauto");
+        let ctx = egui::Context::default();
+        if app.fx_registry.desc("chorus").is_none() {
+            // The stock seed put chorus.rs in the effects folder at App::new;
+            // a headless run without it: seed manually and rescan.
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(
+                dir.join("chorus.rs"),
+                include_str!("../effects/chorus.rs"),
+            )
+            .unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, "chorus");
+        frame(&mut app, &ctx, vec![]);
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        let lab = galley_at(&mut app, &ctx, "rate").expect("auto grid painted 'rate'");
+        // The row is [150 px slider][8 gap][label]: aim mid-slider.
+        let p = egui::pos2(lab.center().x - 85.0, lab.center().y);
+        let n0 = app.assets.len();
+        rmb(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "fx slider RMB creates: {}", app.status);
+        let auto = v20_last_auto(&app);
+        assert_eq!(auto.target, "fx:0:0", "bound to chorus 'rate'");
+        assert_eq!(app.auto_edit.as_ref().expect("manager open").asset, Some(n0));
+    }
+
+    /// R4: bridge widgets (a custom-GUI script's own knobs) answer the SAME
+    /// gestures — right-click creates the bound asset through the label→
+    /// param map, no GUI-ABI change. space_echo's canvas knob caption is
+    /// "tone 3.6kHz"; the knob circle sits ~30 px above that caption.
+    #[test]
+    fn v20_fx_bridge_slider_rmb_auto() {
+        let mut app = headless_app("v20fxbridge");
+        let ctx = egui::Context::default();
+        if app.fx_registry.desc("space_echo").is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(
+                dir.join("space_echo.rs"),
+                include_str!("../effects/space_echo.rs"),
+            )
+            .unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, "space_echo");
+        frame(&mut app, &ctx, vec![]);
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        // NOTE: a freshly opened floating window keeps easing toward its
+        // rest position for a few frames, and every `galley_at` probe is an
+        // extra zero-input frame — a caption sampled too early points beside
+        // the 44 px knob by click time. Settle (probe twice, click off the
+        // SECOND reading) and retry once from a fresh sample.
+        let n0 = app.assets.len();
+        let mut made = false;
+        for _ in 0..2 {
+            let _ = galley_at(&mut app, &ctx, "tone ");
+            let cap = galley_at(&mut app, &ctx, "tone ")
+                .expect("custom canvas painted the 'tone …' knob caption");
+            let p = egui::pos2(cap.center().x, cap.center().y - 30.0);
+            rmb(&mut app, &ctx, p);
+            frame(&mut app, &ctx, vec![]);
+            if app.assets.len() == n0 + 1 {
+                made = true;
+                break;
+            }
+        }
+        assert!(made, "bridge knob RMB creates: {}", app.status);
+        let auto = v20_last_auto(&app);
+        assert_eq!(auto.target, "fx:0:2", "bound to space_echo 'tone' (param 2)");
+    }
+
+    /// R5: the manager's target combo (a `ComboBox::show_ui` site — the
+    /// metro_sub silent-drop family) must actually LAND the pick: clicking
+    /// a popup row switches the target and runs the rescale path.
+    #[test]
+    fn v20_combo_picks_land() {
+        let mut app = headless_app("v20combo");
+        let ctx = egui::Context::default();
+        app.trk_vol[0] = 32;
+        frame(&mut app, &ctx, vec![]);
+        // Manager on a fresh track-volume asset.
+        app.rmb_create_auto(Some(0), crate::automation::TARGET_TRACK_VOL, vol_amp(32));
+        frame(&mut app, &ctx, vec![]);
+        let btn = label_center(&mut app, &ctx, "track volume (linear)")
+            .expect("combo shows the current target");
+        click_pt(&mut app, &ctx, btn);
+        frame(&mut app, &ctx, vec![]); // popup opens
+        let row = label_center(&mut app, &ctx, "track pan (0=L, 0.5=C, 1=R)")
+            .expect("popup lists the pan target");
+        click_pt(&mut app, &ctx, row);
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().expect("manager still open");
+        assert_eq!(
+            ed.target,
+            crate::automation::TARGET_TRACK_PAN,
+            "combo pick LANDS (metro_sub trap: response dropped, value reverts)"
+        );
     }
 
     /// R3b: in the automation canvas, clicking empty space ADDS a node and
