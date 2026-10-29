@@ -2007,10 +2007,15 @@ fn apply_layout(
                     applied_out += 1;
                 }
                 Err(e) => {
-                    let _ = tx.try_send(Evt::Error(format!(
+                    let msg = format!(
                         "could not connect output {pool_name} -> {dst}: {}",
                         describe_err(e)
-                    )));
+                    );
+                    // v21: input failures already printed; output failures
+                    // only reached the status line, which made "no audio"
+                    // debugging blind in headless/launch-log runs.
+                    eprintln!("[slooper] {msg}");
+                    let _ = tx.try_send(Evt::Error(msg));
                 }
             }
         }
