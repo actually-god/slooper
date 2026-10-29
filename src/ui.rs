@@ -717,6 +717,11 @@ pub struct App {
     /// track / left edge); paste re-places it at the playhead on the
     /// last-clicked track, opening a child lane when busy.
     clipboard: Option<Clipboard>,
+    /// v22: text staged for the OS clipboard after the next copy action.
+    /// egui-winit DROPS Ctrl+V entirely (no event at all) when the OS
+    /// clipboard is empty, so a copy must leave something there or the
+    /// paste intent never reaches the app. Drained every logic frame.
+    os_clip_seed: Option<String>,
     /// Active clip-edge drag (trim / extend, non-destructive).
     clip_resize: Option<ClipResize>,
     /// Rubber-band selection box in flight: (track, lane, x at press,
@@ -1071,6 +1076,7 @@ impl App {
             sel_anchor: None,
             last_click_track: None,
             clipboard: None,
+            os_clip_seed: None,
             clip_resize: None,
             marquee: None,
             marquee_pending: None,
@@ -1329,20 +1335,39 @@ impl App {
         // Clip clipboard: Ctrl/Cmd+C copies the whole selection (a group of
         // clips spanning any number of tracks/lanes), Ctrl/Cmd+V places it
         // at the playhead on the last grid-clicked track (busy lanes open a
-        // child lane automatically). Handled before action firing so a bare
-        // C/V binding never double-fires — AND before the text-focus guard:
-        // egui keeps a TextEdit focused until another FOCUSABLE widget is
-        // clicked, and grid clips are plain painted rects, so the old
-        // "return early while any box has focus" meant Ctrl+C/V silently
-        // died the moment the user had ever touched the bpm/quantize/name
-        // boxes (the reported "copy/paste does nothing").
+        // child lane automatically).
+        //
+        // v22 THE REAL EVENT PATH: egui-winit NEVER delivers a key event
+        // for Ctrl+C/X/V in the shipped app — it converts those combos
+        // straight into `Event::Copy` / `Event::Cut` / `Event::Paste` and
+        // swallows the key (egui-winit-0.36.2 `on_event`: `is_copy_command`
+        // → push → return, no `Event::Key`). Checking only
+        // `key_pressed(C/V/X)` passed every headless pin (they inject raw
+        // `Event::Key`) while the real app received nothing — the reported
+        // "Ctrl+C/V don't register". Accept BOTH signals.
+        // Precedence (probe-pinned by `v22_ui_textedit_keeps_its_copy`):
+        // Ctrl+S always saves; while a TextEdit has focus the combo belongs
+        // to the TEXT (egui handles Copy/Cut/Paste itself — and clicking
+        // the grid drops focus, so this holds only while actually typing);
+        // then a focused piano roll owns the keys; else the clip clipboard.
         let (ccopy, ccut, cpaste) = ctx.input(|i| {
             (
-                i.modifiers.command && i.key_pressed(egui::Key::C),
-                i.modifiers.command && i.key_pressed(egui::Key::X),
-                i.modifiers.command && i.key_pressed(egui::Key::V),
+                (i.modifiers.command && i.key_pressed(egui::Key::C))
+                    || i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                (i.modifiers.command && i.key_pressed(egui::Key::X))
+                    || i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                (i.modifiers.command && i.key_pressed(egui::Key::V))
+                    || i
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Paste(_))),
             )
         });
+        if ctx.text_edit_focused() {
+            // The focused text edit consumes Copy/Cut/Paste itself; the
+            // clip clipboard must not clobber while the user is typing.
+            return;
+        }
         if ccopy || ccut || cpaste {
             // While the piano roll owns the keyboard these keys belong to
             // the ROLL (handled in `piano_roll_window`) — never clips.
@@ -1368,10 +1393,6 @@ impl App {
                 }
                 return; // swallow the key
             }
-        }
-
-        if ctx.text_edit_focused() {
-            return;
         }
 
         // The piano roll owns the keyboard while it has focus: no
@@ -1574,6 +1595,8 @@ impl App {
     fn set_trk_gain(&mut self, i: usize, v: u8) {
         self.trk_gain[i] = v;
         self.backend.engine.set_loop_gain(i, gain_amp(v));
+        // v22: gain joined the automation domain — AREC captures its moves.
+        self.note_auto(i, crate::automation::TARGET_TRACK_GAIN, gain_amp(v));
     }
 
     /// Set loop `i`'s stereo pan from a MIDI-range value (0 = hard left,
@@ -2342,6 +2365,7 @@ impl App {
                     let nm = a.name.clone();
                     self.status =
                         format!("copied \u{201c}{nm}\u{201d} \u{b7} Ctrl+V pastes at the playhead");
+                    self.os_clip_seed = Some(format!("slooper: copied asset \u{201c}{nm}\u{201d}"));
                 }
             } else {
                 self.status = "nothing to copy \u{b7} select a clip first".into();
@@ -2376,6 +2400,7 @@ impl App {
         let n = items.len();
         self.clipboard = Some(Clipboard { items });
         self.status = format!("copied {n} clip(s) \u{b7} Ctrl+V pastes the group at the playhead");
+        self.os_clip_seed = Some(format!("slooper: copied {n} clip(s)"));
     }
 
     /// Ctrl+V: paste the clipboard group at the playhead on the target
@@ -4263,10 +4288,15 @@ impl App {
         // `handle_shortcuts` returns early for a focused roll, so these
         // keys cannot double-fire on clips) ----
         if roll.focused && !ui.ctx().text_edit_focused() {
+            // v22: same real-event path as `handle_shortcuts` — egui-winit
+            // delivers Ctrl+C/V as Event::Copy / Event::Paste and swallows
+            // the key; accept both signals here too.
             let (c, v, a, d) = ui.ctx().input(|i| {
                 (
-                    i.modifiers.command && i.key_pressed(egui::Key::C),
-                    i.modifiers.command && i.key_pressed(egui::Key::V),
+                    (i.modifiers.command && i.key_pressed(egui::Key::C))
+                        || i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    (i.modifiers.command && i.key_pressed(egui::Key::V))
+                        || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
                     i.modifiers.command && i.key_pressed(egui::Key::A),
                     i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
                 )
@@ -4286,6 +4316,7 @@ impl App {
                     self.roll_clip = Some(ns);
                     self.status =
                         format!("copied {k} note(s) \u{b7} Ctrl+V pastes at the playhead");
+                    self.os_clip_seed = Some(format!("slooper: copied {k} note(s)"));
                 } else {
                     // v21: the roll owning the keys used to be INVISIBLE —
                     // Ctrl+C with no selected notes silently did nothing and
@@ -6848,6 +6879,12 @@ impl eframe::App for App {
 
         self.handle_shortcuts(ctx);
 
+        // v22: land the OS-clipboard seed staged by the last copy (see
+        // `App::os_clip_seed`) — one frame later at worst.
+        if let Some(t) = self.os_clip_seed.take() {
+            ctx.copy_text(t);
+        }
+
         let mut changed = false;
         while let Ok(evt) = self.backend.evt_rx.try_recv() {
             self.handle_evt(evt);
@@ -7643,8 +7680,10 @@ fn value_unit_label(target: &str) -> &'static str {
     }
 }
 
-/// Pseudo-target id for the manual-only gain trim (no automation domain).
-const TARGET_PSEUDO_GAIN: &str = "track.gain";
+/// Gain-trim target id — a REAL automation target since v22 (the engine
+/// evaluates it: AutoOut.gain); the old name said "pseudo" because the
+/// manager listed it while the engine silently dropped it.
+const TARGET_PSEUDO_GAIN: &str = crate::automation::TARGET_TRACK_GAIN;
 
 /// Internal target value -> user-unit display string (volume/gain in dB so
 /// typing 0 means +0 dB; plugin/synth params in 0..100 %).
@@ -8185,7 +8224,10 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             )
             .on_hover_text(
                 "Master volume: -inf .. +6 dB. Right-click for exact entry and automation.",
-            );
+            )
+            // v22: union click sense (Slider is DRAG-only by default —
+            // without this the direct RMB-automation gesture is dead).
+            .interact(egui::Sense::click());
         let mut mvr = ui
             .add_sized(
                 egui::vec2(50.0, 18.0),
@@ -10330,7 +10372,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
     };
     let hover = match kind {
         KIND_VOL => "Track playback volume: -inf…+6 dB (0 dB = three-quarters). Right-click for exact entry and automation.",
-        KIND_GAIN => "Track gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Right-click for exact entry.",
+        KIND_GAIN => "Track gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Right-click creates an automation asset; double-click sets an exact value.",
         _ => "Track pan: -100 = hard left, 0 = centre, +100 = hard right. Right-click for exact entry and automation.",
     };
     ui.horizontal(|ui| {
@@ -10346,12 +10388,18 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         );
         let mut v = midi;
         let sw = (ui.available_width() - 86.0).max(30.0);
+        // v22: `.interact(Sense::click())` is NOT cosmetic — an egui Slider
+        // senses DRAG only, so without the click union the right-click
+        // automation and double-click Set-value gestures NEVER surface
+        // (the reported "right click on mixer sliders does nothing";
+        // v20 added the union only to fxgui/synth sliders).
         let mut r = ui
             .add_sized(
                 egui::vec2(sw, 18.0),
                 Slider::new(&mut v, 0..=127).show_value(false),
             )
-            .on_hover_text(hover);
+            .on_hover_text(hover)
+            .interact(egui::Sense::click());
         let mut vr = ui.add_sized(
             egui::vec2(52.0, 18.0),
             egui::Label::new(
@@ -10411,22 +10459,24 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                 );
             }
             KIND_GAIN => {
-                let menu = |ui: &mut egui::Ui, app: &mut App| {
-                    if ui
-                        .button(format!(
-                            "Set value   [{} dB]",
-                            db_num(gain_amp(midi)).trim_start_matches('+')
-                        ))
-                        .clicked()
-                    {
-                        app.value_dialog =
-                            Some((i, TARGET_PSEUDO_GAIN.to_string(), db_num(gain_amp(midi))));
-                        app.value_dialog_focus = true;
-                        ui.close();
-                    }
-                };
-                r.context_menu(|ui| menu(ui, app));
-                vr.context_menu(|ui| menu(ui, app));
+                // v22: gain is a real automation target now — right-click
+                // creates the asset directly, exactly like vol/pan (the
+                // Set-value-only menu stayed because the engine could not
+                // evaluate the target; double-click still opens Set value).
+                bind_value_controls(
+                    &mut r,
+                    app,
+                    Some(i),
+                    TARGET_PSEUDO_GAIN,
+                    gain_amp(midi),
+                );
+                bind_value_controls(
+                    &mut vr,
+                    app,
+                    Some(i),
+                    TARGET_PSEUDO_GAIN,
+                    gain_amp(midi),
+                );
             }
             _ => {
                 bind_value_controls(

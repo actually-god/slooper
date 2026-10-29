@@ -215,6 +215,7 @@ pub type AssetTable = Vec<Arc<[f32]>>;
 /// they are written straight onto the live instances.
 struct AutoOut {
     vol: [Option<f32>; MAX_LOOPS],
+    gain: [Option<f32>; MAX_LOOPS],
     pan: [Option<f32>; MAX_LOOPS],
     muted: [bool; MAX_LOOPS],
     master_vol: Option<f32>,
@@ -225,6 +226,7 @@ impl AutoOut {
     fn new() -> AutoOut {
         AutoOut {
             vol: core::array::from_fn(|_| None),
+            gain: core::array::from_fn(|_| None),
             pan: core::array::from_fn(|_| None),
             muted: [false; MAX_LOOPS],
             master_vol: None,
@@ -2957,6 +2959,7 @@ impl Proc {
                     let v = a.eval(rel);
                     match a.target.as_str() {
                         crate::automation::TARGET_TRACK_VOL => out.vol[t] = Some(v),
+                        crate::automation::TARGET_TRACK_GAIN => out.gain[t] = Some(v),
                         crate::automation::TARGET_TRACK_PAN => out.pan[t] = Some(v),
                         crate::automation::TARGET_TRACK_MUTE => out.muted[t] = v >= 0.5,
                         crate::automation::TARGET_MASTER_VOL => out.master_vol = Some(v),
@@ -3370,8 +3373,16 @@ impl ProcessHandler for Proc {
             AutoOut::default()
         };
         for t in 0..MAX_LOOPS {
-            if let Some(v) = auto.vol[t] {
-                amp[t] = v * f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
+            // v22: vol and gain automation COMPOSE — each curve overrides
+            // only its own manual control (a gain curve keeps the fader,
+            // a vol curve keeps the trim, both together ride together).
+            if auto.vol[t].is_some() || auto.gain[t].is_some() {
+                let v = auto.vol[t]
+                    .unwrap_or_else(|| f32::from_bits(self.engine.vol[t].load(Ordering::Relaxed)));
+                let g = auto.gain[t].unwrap_or_else(|| {
+                    f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed))
+                });
+                amp[t] = v * g;
             }
             if let Some(pn) = auto.pan[t] {
                 let (l, r) = pan_gains(pn);

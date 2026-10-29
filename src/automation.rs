@@ -211,6 +211,10 @@ pub fn warp(s: Shape, u: f32) -> f32 {
 /// Known target ids that address a per-TRACK control (value semantics for
 /// the UI; everything else carries its own index).
 pub const TARGET_TRACK_VOL: &str = "track.vol";
+/// v22: the per-track GAIN TRIM joins the automation domain (the mixer
+/// strip enumerates it as a bindable source — evaluating it makes that
+/// promise real). Values are LINEAR gain (1.0 = 0 dB; the strip shows dB).
+pub const TARGET_TRACK_GAIN: &str = "track.gain";
 pub const TARGET_TRACK_PAN: &str = "track.pan";
 pub const TARGET_TRACK_MUTE: &str = "track.mute";
 pub const TARGET_MASTER_VOL: &str = "master.vol";
@@ -227,6 +231,7 @@ pub fn is_plugin_target(t: &str) -> bool {
 pub fn describe_target(t: &str) -> String {
     match t {
         TARGET_TRACK_VOL => "track volume".into(),
+        TARGET_TRACK_GAIN => "track gain".into(),
         TARGET_TRACK_PAN => "track pan".into(),
         TARGET_TRACK_MUTE => "track mute".into(),
         TARGET_MASTER_VOL => "master volume".into(),
@@ -251,6 +256,8 @@ pub fn describe_target(t: &str) -> String {
 pub fn target_range(t: &str) -> (f32, f32) {
     match t {
         TARGET_TRACK_VOL => (0.0, 2.0),
+        // 127 on the gain strip = +10 dB = 3.162 linear; canvas clamp.
+        TARGET_TRACK_GAIN => (0.0, 3.162),
         TARGET_TRACK_PAN => (-1.0, 1.0),
         TARGET_TRACK_MUTE => (0.0, 1.0),
         TARGET_MASTER_VOL => (0.0, 2.0),
