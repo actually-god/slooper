@@ -1,6 +1,6 @@
 [package]
 name = "slooper"
-version = "0.19.1"
+version = "0.20.0"
 edition = "2021"
 description = "Minimalist live audio looper for JACK/PipeWire (Rust, eframe)"
 license = "MIT"
