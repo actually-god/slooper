@@ -278,6 +278,13 @@ pub fn scan_with(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                     || (name.ends_with(".vst") && p.is_dir())
                     || (name.ends_with(".so") && !p.is_dir());
                 if probeable && is_wine_bridged(&p) {
+                    // v22: heal a self-referencing companion symlink BEFORE
+                    // probing — yabridge itself only answers with an ELOOP
+                    // toast and a dead instance (the user's Delay Lama
+                    // report), and it does that on EVERY scan/open.
+                    if bridge_companion_dll(&p).is_none() {
+                        repair_looped_companion(&p, dirs);
+                    }
                     if let Err(why) = bridge_ok(bridge_needs32(&p)) {
                         seen.push(p.clone());
                         out.push(bridge_error_entry(&p, why));
@@ -354,33 +361,7 @@ fn yabridgectl_path() -> Option<PathBuf> {
 /// yabridge is not installed. Never fails the caller's native scan.
 pub fn yabridge_sync(roots: &[PathBuf]) -> Option<String> {
     let exe = yabridgectl_path()?;
-    // Collect the folders that directly contain Windows plugin files.
-    let mut dll_dirs: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        let subdirs = std::fs::read_dir(root)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir());
-        for dir in std::iter::once(root.clone()).chain(subdirs) {
-            let has = std::fs::read_dir(&dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .any(|e| {
-                    e.path()
-                        .extension()
-                        .map(|x| x.eq_ignore_ascii_case("dll"))
-                        .unwrap_or(false)
-                });
-            if has && !dll_dirs.contains(&dir) {
-                dll_dirs.push(dir);
-            }
-        }
-    }
+    let dll_dirs = dll_source_dirs(roots);
     if dll_dirs.is_empty() {
         return None;
     }
@@ -472,6 +453,136 @@ fn bundle_inner_libs(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The folders `yabridge_sync` registers: scan roots + one sub-level that
+/// directly contain Windows plugin files.
+///
+/// v22 NEVER a yabridge output folder. yabridge's centralized layout writes
+/// wrapper + companion `.dll` symlink into `<vstdir>/yabridge/`; the
+/// companion is a SYMLINK, so registering that folder as a plugin source
+/// teaches yabridgectl to record its own symlink as the DLL's source — the
+/// next sync then regenerates the companion pointing AT ITSELF and every
+/// load dies ELOOP ("Too many levels of symbolic links", the Delay Lama
+/// toast). The scan guard uses the same `/yabridge/` marker for 5 years of
+/// releases; this closes the sync side.
+fn dll_source_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dll_dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let subdirs = std::fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir());
+        for dir in std::iter::once(root.clone()).chain(subdirs) {
+            if is_yabridge_output(&dir) {
+                continue;
+            }
+            let has = std::fs::read_dir(&dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x.eq_ignore_ascii_case("dll"))
+                        .unwrap_or(false)
+                });
+            if has && !dll_dirs.contains(&dir) {
+                dll_dirs.push(dir);
+            }
+        }
+    }
+    dll_dirs
+}
+
+/// True for yabridge's own generated-output folders (`<scan dir>/yabridge`):
+/// they contain wrappers and companion symlinks, never the source DLLs.
+fn is_yabridge_output(dir: &Path) -> bool {
+    let s = dir.to_string_lossy();
+    s.contains("/yabridge/") || s.ends_with("/yabridge")
+}
+
+/// v22 self-repair for the self-referencing companion symlink left behind by
+/// the historical mistake above: `X.dll -> …/yabridge/X.dll` (ELOOP). When a
+/// wrapper's companion exists as a symlink that does not resolve, hunt the
+/// real same-named DLL (scan roots + yabridgectl's registered plugin dirs,
+/// one sub-level deep) and re-point the link. `None` when nothing is broken
+/// or nothing real was found — the bridge guard then reports honestly.
+fn repair_looped_companion(wrapper: &Path, scan_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let name = wrapper.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".so")
+        .or_else(|| name.strip_suffix(".vst3"))
+        .unwrap_or(name);
+    let dll_name = if stem.ends_with(".dll") {
+        stem.to_string()
+    } else {
+        format!("{stem}.dll")
+    };
+    let link = wrapper.parent()?.join(&dll_name);
+    // Only a link that EXISTS (as a symlink) but does not resolve is broken;
+    // a missing companion is yabridgectl's business (sync recreates it).
+    let raw = std::fs::symlink_metadata(&link).ok()?;
+    if !raw.file_type().is_symlink() {
+        return None;
+    }
+    if std::fs::File::open(&link).is_ok() {
+        return None; // resolves fine
+    }
+    // Candidate homes for the real file: the scan dirs, plus every folder
+    // yabridgectl itself knows about (its config records where it found
+    // the DLL originally — the same information the loop corrupted).
+    let mut cand_dirs: Vec<PathBuf> = scan_dirs.to_vec();
+    if let Ok(home) = std::env::var("HOME") {
+        let cfgp = std::path::Path::new(&home)
+            .join(".config/yabridgectl/config.toml");
+        if let Ok(txt) = std::fs::read_to_string(&cfgp) {
+            // `plugin_dirs = [ 'a', 'b', ... ]` — single-quoted TOML strings.
+            for seg in txt.split('\'') {
+                let p = PathBuf::from(seg);
+                if p.is_absolute() && p.is_dir() {
+                    cand_dirs.push(p);
+                }
+            }
+        }
+    }
+    for base in cand_dirs {
+        let subs = std::fs::read_dir(&base)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir());
+        for dir in std::iter::once(base).chain(subs) {
+            let cand = dir.join(&dll_name);
+            // Real Windows binary = proof; a symlink that resolves to one
+            // proves nothing about the ORIGINAL (it may be the loop).
+            if dir.join(&dll_name) == link {
+                continue;
+            }
+            if matches!(std::fs::symlink_metadata(&cand), Ok(m) if !m.file_type().is_symlink())
+                && pe_machine(&cand).is_some()
+            {
+                std::fs::remove_file(&link).ok()?;
+                std::os::unix::fs::symlink(&cand, &link).ok()?;
+                if std::fs::File::open(&link).is_ok() {
+                    eprintln!(
+                        "[vsthost] repaired looped companion link {} -> {}",
+                        link.display(),
+                        cand.display()
+                    );
+                    return Some(cand);
+                }
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// The Windows `.dll` a wrapper sits next to: yabridge keeps `X.so`/
