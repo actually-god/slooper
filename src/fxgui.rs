@@ -61,9 +61,13 @@ pub struct FxEditor {
     /// mirrors them into the persisted chain rows).
     pub pending: Vec<(usize, f32)>,
     /// v0.15: an auto-slider row was right-clicked: (param, current value,
-    /// screen pos). The UI layer turns this into the Set value / Create
-    /// automation asset mini menu (this crate cannot see `App`).
+    /// screen pos). v20 R3: the UI layer answers a right-click DIRECTLY
+    /// with an automation asset (the intermediate mini-menu is gone), and
+    /// `dbl_set` carries the double-click twin (same param/value) into the
+    /// Set value dialog.
     pub ctx_menu: Option<(usize, f32, egui::Pos2)>,
+    /// v20 R3: double-click on a bound slider/knob — (param, current).
+    pub dbl_set: Option<(usize, f32)>,
     // --- user presets (files in `<fx_dir>/user presets/`, see fx.rs) ---
     fx_dir: PathBuf,
     /// Preset names owned by this stem, refreshed on open/save/delete.
@@ -110,6 +114,7 @@ impl FxEditor {
             frame_no: 0,
             pending: Vec::new(),
             ctx_menu: None,
+            dbl_set: None,
             fx_dir,
             preset_list,
             preset_sel: None,
@@ -155,6 +160,14 @@ struct Bridge<'a> {
     inst: &'a fx::Instance,
     params: &'a [ParamDesc],
     pending: &'a mut Vec<(usize, f32)>,
+    /// v20 R3: right-click / double-click requests from bridge widgets.
+    /// The GUI ABI stays untouched — custom scripts draw exactly as
+    /// before; the bridge simply notices the gestures egui already
+    /// delivers. The param is found by LABEL in `params` (the label a
+    /// script paints its slider with is the row's `ParamDesc.label`;
+    /// unlabeled or unknown labels request nothing).
+    ctx_out: &'a mut Option<(usize, f32, Pos2)>,
+    dbl_out: &'a mut Option<(usize, f32)>,
 }
 
 impl Bridge<'_> {
@@ -168,6 +181,38 @@ impl Bridge<'_> {
     }
     fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> Rect {
         Rect::from_min_size(self.pos(x, y), Vec2::new(w.max(4.0), h.max(4.0)))
+    }
+    /// Route a widget gesture to the owning param index by label. Exact
+    /// label first (auto grid rows); then a value-decorated display string
+    /// that BEGINS with the label plus a space ("time 240ms" → `time`),
+    /// which is how stock scripts render live values into knob captions.
+    /// Unknown or abbreviated captions request nothing.
+    fn param_by_label(&self, label: &str) -> Option<usize> {
+        if label.is_empty() {
+            return None;
+        }
+        self.params
+            .iter()
+            .position(|p| p.label == label)
+            .or_else(|| {
+                self.params.iter().position(|p| {
+                    !p.label.is_empty() && label.starts_with(&format!("{} ", p.label))
+                })
+            })
+    }
+    fn note_ctx(&mut self, label: &str, v: f32, at: Pos2) {
+        if let Some(k) = self.param_by_label(label) {
+            if self.ctx_out.is_none() {
+                *self.ctx_out = Some((k, v, at));
+            }
+        }
+    }
+    fn note_dbl(&mut self, label: &str, v: f32) {
+        if let Some(k) = self.param_by_label(label) {
+            if self.dbl_out.is_none() {
+                *self.dbl_out = Some((k, v));
+            }
+        }
     }
 }
 
@@ -383,9 +428,22 @@ extern "C" fn tr_slider(
     }
     let label = cstr(label);
     if !label.is_empty() {
-        sl = sl.text(label);
+        sl = sl.text(label.clone());
     }
-    let r = br.ui.put(rect, sl);
+    // v20 R3: Slider senses DRAG only; union click interest so the RMB and
+    // double-click gestures below actually fire on it.
+    let r = br.ui.put(rect, sl).interact(egui::Sense::click());
+    // v20 R3: right-click = create automation asset for this param,
+    // double-click = Set value (both land via the editor's request
+    // channels; the gestures add no state and cost nothing idle).
+    if r.secondary_clicked() {
+        if let Some(pp) = br.ui.input(|i| i.pointer.interact_pos()) {
+            br.note_ctx(&label, v, pp);
+        }
+    }
+    if r.double_clicked() {
+        br.note_dbl(&label, v);
+    }
     if r.changed() {
         unsafe { *value = v.clamp(min, max) };
         1
@@ -418,10 +476,27 @@ extern "C" fn tr_knob(
         br.base.x as i32,
         br.base.y as i32,
     ));
-    let resp = br
-        .ui
-        .interact(rect, id, Sense::drag().union(Sense::hover()));
+    let resp = br.ui.interact(
+        rect,
+        id,
+        Sense::drag()
+            .union(Sense::hover())
+            // v20 R3: click sense so right/double clicks reach the knob
+            // (a plain drag response never sees them).
+            .union(Sense::click()),
+    );
     let mut v = unsafe { *value };
+    {
+        let label = cstr(label);
+        if resp.secondary_clicked() {
+            if let Some(pp) = br.ui.input(|i| i.pointer.interact_pos()) {
+                br.note_ctx(&label, v, pp);
+            }
+        }
+        if resp.double_clicked() {
+            br.note_dbl(&label, v);
+        }
+    }
     if resp.dragged() {
         // Vertical drag; full range in ~180 px, log/curve-aware so a nudge
         // moves the same visual distance on log params (freq, Q).
@@ -875,6 +950,8 @@ fn custom_ui(ui: &mut Ui, ed: &mut FxEditor, height: f32) {
         inst: &ed.inst,
         params: &ed.desc.params,
         pending: &mut ed.pending,
+        ctx_out: &mut ed.ctx_menu,
+        dbl_out: &mut ed.dbl_set,
     };
     let mut api = API_FNS;
     api.n_params = ed.inst.n_params() as u32;
@@ -908,13 +985,19 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 }
                 let r = ui
                     .add_sized(Vec2::new(150.0, 0.0), sl)
-                    .on_hover_text(format!("{:.2} … {:.2}", p.min, p.max));
+                    .on_hover_text(format!("{:.2} … {:.2}", p.min, p.max))
+                    // v20 R3: click interest on a drag-only Slider, else the
+                    // RMB/double-click requests never surface.
+                    .interact(egui::Sense::click());
                 // v0.15: right-click hands the request to the UI layer, which
                 // shows Set value / Create automation asset for `fx:<row>:<k>`.
                 if r.secondary_clicked() {
                     if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
                         ed.ctx_menu = Some((k, v, pp));
                     }
+                }
+                if r.double_clicked() {
+                    ed.dbl_set = Some((k, v));
                 }
                 ui.label(&p.label);
                 ui.label(RichText::new(format!("{v:.2}")).monospace().small());

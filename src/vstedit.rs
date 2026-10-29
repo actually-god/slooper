@@ -1116,6 +1116,7 @@ fn pump_vst3_editors() {
 /// before the attach break child-window mapping), attach the editor view,
 /// and hand back the state machine. `None` retires with the failure flags
 /// already set on `shared`.
+#[allow(clippy::too_many_arguments)] // one bundle per editor: paths, state, param rings
 unsafe fn make_editor3(
     path: String,
     title: String,
@@ -1414,7 +1415,7 @@ impl Editor3 {
                             eprintln!("[vstedit3] {}: state-flush start failed: {e}", self.title);
                         }
                     } else {
-                        let ch = p.output_channel_count().max(1).max(0) as usize;
+                        let ch = p.output_channel_count().max(1);
                         let mut bufs = vst3_host::audio::AudioBuffers::new(
                             ch,
                             ch,
