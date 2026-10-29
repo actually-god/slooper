@@ -677,10 +677,26 @@ fn bridge_probe(loader: &Path, exe: &Path, need32: bool) -> Result<(), String> {
 
 /// Cached outcome of the two bitness probes; the env fingerprint invalidates
 /// it, so tests (and fixed environments) re-probe instead of inheriting.
+/// v21: a FAILURE is only sticky for [`bridge_retry_gap`] — one transient
+/// wineserver race (mixed Wine builds draining) must never grey out every
+/// bridged plugin for the whole process ("VST2 plugins never initialize").
 struct BridgeProbeResult {
     key: String,
     ok32: Result<(), String>,
     ok64: Result<(), String>,
+    /// When at least one side failed: the moment the pair was probed.
+    failed_at: Option<std::time::Instant>,
+}
+
+/// How long a failed probe pair stays cached before the next open re-probes.
+/// `SLOOPER_BRIDGE_RETRY_SECS` overrides (tests use 0; opens are rare and a
+/// failed probe exits fast, so a short cooldown cannot be spammed).
+fn bridge_retry_gap() -> std::time::Duration {
+    std::env::var("SLOOPER_BRIDGE_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(8))
 }
 
 fn bridge_probes() -> std::sync::MutexGuard<'static, Option<BridgeProbeResult>> {
@@ -707,16 +723,34 @@ fn bridge_ok(need32: bool) -> Result<(), String> {
     ]
     .join("\u{1}");
     let mut slot = bridge_probes();
-    if slot.as_ref().map(|c| c.key != key).unwrap_or(true) {
+    let needs_probe = slot
+        .as_ref()
+        .map(|c| {
+            if c.key != key {
+                return true; // environment changed — always re-probe
+            }
+            // v21: a dead-Wine verdict is a snapshot, not a life sentence.
+            match (c.ok32.is_err() || c.ok64.is_err(), c.failed_at) {
+                (true, Some(t)) => t.elapsed() >= bridge_retry_gap(),
+                (true, None) => true,
+                _ => false,
+            }
+        })
+        .unwrap_or(true);
+    if needs_probe {
         let probe = |n32: bool| match (bridge_wine_loader(), bridge_host_exe(n32)) {
             (None, _) => Err("Wine not found (install Wine or set WINELOADER)".to_string()),
             (_, None) => Err("yabridge host binaries not found (run `yabridgectl sync`)".to_string()),
             (Some(w), Some(h)) => bridge_probe(&w, &h, n32),
         };
+        let ok32 = probe(true);
+        let ok64 = probe(false);
+        let failed = ok32.is_err() || ok64.is_err();
         *slot = Some(BridgeProbeResult {
             key,
-            ok32: probe(true),
-            ok64: probe(false),
+            ok32,
+            ok64,
+            failed_at: failed.then(std::time::Instant::now),
         });
     }
     let c = slot.as_ref().expect("bridge probe cache just filled");
@@ -2796,6 +2830,41 @@ mod tests {
             .err()
             .expect("dead Wine must be refused BEFORE any dlopen");
         assert!(err.contains("unavailable"), "{err}");
+        v191_bridge_teardown(&root);
+    }
+
+    /// v21: one transient Wine failure (the documented "wineserver draining"
+    /// race) must not poison the whole process — the next open re-probes, and
+    /// once Wine answers again the bridge path proceeds. A permanently cached
+    /// failure was the mechanism behind "VST2 plugins fail to initialize
+    /// entirely" for the rest of a session.
+    #[test]
+    fn v21_bridge_probe_recovers_after_transient_failure() {
+        // Fake Wine: first probe dies like a cold/draining wineserver; every
+        // later probe answers with the host banner (= works).
+        let root = v191_bridge_fixture(
+            "recov",
+            "d=$(dirname \"$0\")\n\
+             if [ ! -f \"$d/probed-ok\" ]; then touch \"$d/probed-ok\"; \
+             echo 'wine: failed to start L\"x\": c000007b' >&2; exit 1; fi\n\
+             echo 'yabridge host version 5.1.1 (32-bit compatibility mode)'\n\
+             echo 'Usage: yabridge-host-32.exe a b c d'\nexit 1",
+        );
+        std::env::set_var("SLOOPER_BRIDGE_RETRY_SECS", "0");
+        let p = root.join("plugins/Monk.dll.so");
+        let err = open_inner(&p, VstKind::V2, 48_000, None, None)
+            .err()
+            .expect("first attempt refused while the probe sees a dead Wine");
+        assert!(err.contains("unavailable"), "first refusal: {err}");
+        let err2 = open_inner(&p, VstKind::V2, 48_000, None, None)
+            .err()
+            .expect("the synthetic wrapper still fails the REAL load");
+        assert!(
+            !err2.contains("unavailable"),
+            "recovered Wine must reach the real load path, not a cached \
+             bridge refusal: {err2}"
+        );
+        std::env::remove_var("SLOOPER_BRIDGE_RETRY_SECS");
         v191_bridge_teardown(&root);
     }
 
