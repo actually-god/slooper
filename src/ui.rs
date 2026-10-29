@@ -830,10 +830,13 @@ pub struct App {
     /// editors. v0.11 R3: hosted plugins have NO slider-window fallback --
     /// their own window is the only parameter surface.
     fx_vst_editors: std::collections::HashMap<(usize, usize), crate::vstedit::EditorWindow>,
-    /// v20: last state chunk harvested from each track's VST3 synth
-    /// editor; re-applied when the binding rebuilds (session-only, like
-    /// `track_synth_params`).
+    /// v20/v22: last state chunk harvested from each track's VST synth
+    /// editor; re-applied when the binding rebuilds. v22: this is REAL
+    /// persisted state now (base64 into config + project, live-saved while
+    /// the editor is open) — the v20 session-only rule lost user edits.
     track_synth_state: Vec<Option<Vec<u8>>>,
+    /// v22: throttle for `tick_plugin_persist`.
+    vst_persist_next: Option<std::time::Instant>,
     /// Scan of all VST folders (lazy on first window open, manual Rescan).
     vst_scan: Vec<crate::vsthost::VstEntry>,
     vst_scanned: bool,
@@ -909,6 +912,7 @@ impl App {
                                     kind,
                                     name,
                                     params,
+                                    state,
                                 } => {
                                     let kind = crate::vsthost::VstKind::parse(kind)?;
                                     Some(ChainRow::Vst {
@@ -918,7 +922,10 @@ impl App {
                                         params: params.clone(),
                                         entry: None,
                                         open_rx: None,
-                                        state: None,
+                                        // v22: decode the persisted chunk so the
+                                        // first rebuild boots the plugin in the
+                                        // exact state the user saved.
+                                        state: state.as_deref().and_then(crate::config::b64_decode),
                                     })
                                 }
                             })
@@ -1120,7 +1127,15 @@ impl App {
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
             fx_vst_editors: std::collections::HashMap::new(),
-            track_synth_state: vec![None; MAX_LOOPS],
+            track_synth_state: (0..MAX_LOOPS)
+                .map(|t| {
+                    cfg.track_synth_states
+                        .get(t)
+                        .and_then(|s| s.as_deref())
+                        .and_then(crate::config::b64_decode)
+                })
+                .collect(),
+            vst_persist_next: None,
             vst_scan: Vec::new(),
             vst_scan_rx: None,
             vst_pending_gui: Vec::new(),
@@ -1712,7 +1727,13 @@ impl App {
     ) -> Result<crate::vstedit::EditorWindow, String> {
         if let Some(h) = entry.vst2_handle() {
             let pth = entry.path().to_string_lossy().into_owned();
-            crate::vstedit::open_editor(&h, &pth, entry.name())
+            // v22: hand the editor the cell mirror + parameter count so
+            // its pump can read plugin-GUI edits back into the host
+            // (otherwise closing the window reverts everything — the
+            // reported persistence bug).
+            let cells = entry.params().clone();
+            let n = entry.descs().len();
+            crate::vstedit::open_editor(&h, &pth, entry.name(), cells, n)
         } else {
             entry.open_vst3_editor(self.sample_rate.max(48_000))
         }
@@ -2633,12 +2654,13 @@ impl App {
                                 params,
                                 entry: _,
                                 open_rx: _,
-                                state: _,
+                                state,
                             } => ChainSave::Vst {
                                 path: path.clone(),
                                 kind: kind.tag().to_string(),
                                 name: name.clone(),
                                 params: params.clone(),
+                                state: state.as_deref().map(crate::config::b64_encode),
                             },
                         })
                         .collect()
@@ -2647,6 +2669,11 @@ impl App {
             track_fx: Vec::new(),
             track_synth: self.track_synth.clone(),
             track_synth_params: self.track_synth_params.clone(),
+            track_synth_states: self
+                .track_synth_state
+                .iter()
+                .map(|s| s.as_deref().map(crate::config::b64_encode))
+                .collect(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
@@ -2675,11 +2702,22 @@ impl App {
                 let (kind, path) = vst_synth_decode(stem).unwrap();
                 // v20: re-apply a preset the user picked in this synth's
                 // own GUI (harvested when that editor last closed).
+                // v22: with NO chunk (always true for VST2 — it has no
+                // state ABI on this host) the saved cell snapshot is the
+                // only patch information that exists, so it must be
+                // applied: that is what makes plugin-GUI edits survive.
+                let saved = if self.track_synth_state[t].is_none()
+                    && !self.track_synth_params[t].is_empty()
+                {
+                    Some(self.track_synth_params[t].clone())
+                } else {
+                    None
+                };
                 match crate::vsthost::open_with_state(
                     std::path::Path::new(path),
                     kind,
                     self.sample_rate.max(1),
-                    None,
+                    saved.as_deref(),
                     self.track_synth_state[t].as_deref(),
                 ) {
                     Ok(load) => Some(std::sync::Arc::new(SynthHandle::Vst(load.entry))),
@@ -5740,7 +5778,106 @@ impl App {
     /// async like every other plugin load (the UI thread never waits on
     /// instantiation). VST2 editors edit the live instance in place and
     /// never hand over a chunk, so this never fires for them.
+    /// v22: persist plugin edits WHILE the editor is open. The teardown
+    /// harvest alone lost settings to the window-close rebuild path,
+    /// crashes, and WM kills — and nothing reached config or project
+    /// saves. This sweep (≤5 Hz) mirrors each open editor's cell values
+    /// and (VST3) state chunk into its chain row / synth binding and
+    /// writes config the moment anything changed: "saved" means "what the
+    /// plugin shows right now". Cheap — two Vec comparisons per editor.
+    fn tick_plugin_persist(&mut self) {
+        let now = std::time::Instant::now();
+        if self.vst_persist_next.is_some_and(|t| now < t) {
+            return;
+        }
+        self.vst_persist_next = Some(now + std::time::Duration::from_millis(200));
+        let mut dirty = false;
+        // Mixer chain slots.
+        let keys: Vec<(usize, usize)> = self.fx_vst_editors.keys().copied().collect();
+        for (t, r) in keys {
+            let closed = self
+                .fx_vst_editors
+                .get(&(t, r))
+                .map(|w| w.is_closed())
+                .unwrap_or(true);
+            if closed {
+                continue;
+            }
+            let chunk = self
+                .fx_vst_editors
+                .get(&(t, r))
+                .and_then(|w| w.state_snapshot());
+            let Some(rows) = self.fx_rows.get_mut(t) else { continue };
+            let Some(ChainRow::Vst {
+                params,
+                entry,
+                state,
+                ..
+            }) = rows.get_mut(r)
+            else {
+                continue;
+            };
+            if let Some(chunk) = chunk {
+                if state.as_deref() != Some(chunk.as_slice()) {
+                    *state = Some(chunk);
+                    dirty = true;
+                }
+            }
+            if let Some(e) = entry {
+                let snap: Vec<f32> = (0..e.descs().len()).map(|k| e.params().get(k)).collect();
+                if snap.as_slice() != params.as_slice() {
+                    *params = snap;
+                    dirty = true;
+                }
+            }
+        }
+        // Instrument bindings.
+        let tkeys: Vec<usize> = self.vst_editors.keys().copied().collect();
+        for t in tkeys {
+            let closed = self
+                .vst_editors
+                .get(&t)
+                .map(|w| w.is_closed())
+                .unwrap_or(true);
+            if closed {
+                continue;
+            }
+            if let Some(chunk) = self.vst_editors.get(&t).and_then(|w| w.state_snapshot()) {
+                if self.track_synth_state.get(t).map(Option::as_deref) != Some(Some(chunk.as_slice()))
+                {
+                    if let Some(slot) = self.track_synth_state.get_mut(t) {
+                        *slot = Some(chunk);
+                    }
+                    dirty = true;
+                }
+            }
+            let snap = match self.track_synth_inst.get(t).and_then(|h| h.as_ref()) {
+                Some(arc) => match arc.as_ref() {
+                    SynthHandle::Vst(e) => Some(
+                        (0..e.descs().len())
+                            .map(|k| e.params().get(k))
+                            .collect::<Vec<f32>>(),
+                    ),
+                    _ => None,
+                },
+                None => None,
+            };
+            if let (Some(vals), Some(slot)) = (snap, self.track_synth_params.get_mut(t)) {
+                if vals.as_slice() != slot.as_slice() {
+                    *slot = vals;
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            self.save_config();
+        }
+    }
+
     fn harvest_chain_state(&mut self, t: usize, r: usize, w: &mut crate::vstedit::EditorWindow) {
+        // v22: while the editor was open the persistence tick already
+        // mirrored this chunk into `row.state` continuously; what remains
+        // here is the very last harvest plus triggering the rebuild.
         let Some(bytes) = w.take_state() else { return };
         let sr = self.sample_rate.max(1);
         {
@@ -5786,6 +5923,9 @@ impl App {
         if self.rebuild_track_synth(t) {
             self.status = format!("track {}: preset applied", t + 1);
         }
+        // v22: persist the freshly harvested patch immediately (the tick
+        // also saves while open; this closes the final-instant gap).
+        self.save_config();
     }
 
     fn toggle_record(&mut self, i: usize) {
@@ -6114,12 +6254,13 @@ impl App {
                             params,
                             entry: _,
                             open_rx: _,
-                            state: _,
+                            state,
                         } => ChainSave::Vst {
                             path: path.clone(),
                             kind: kind.tag().to_string(),
                             name: name.clone(),
                             params: params.clone(),
+                            state: state.as_deref().map(crate::config::b64_encode),
                         },
                     })
                     .collect(),
@@ -6171,6 +6312,11 @@ impl App {
                 .collect(),
             track_synths: self.track_synth.clone(),
             track_synth_params: self.track_synth_params.clone(),
+            track_synth_states: self
+                .track_synth_state
+                .iter()
+                .map(|s| s.as_deref().map(crate::config::b64_encode))
+                .collect(),
         }
     }
 
@@ -6422,6 +6568,7 @@ impl App {
                         kind,
                         name,
                         params,
+                        state,
                     } => {
                         let kind = crate::vsthost::VstKind::parse(&kind)?;
                         Some(ChainRow::Vst {
@@ -6431,7 +6578,7 @@ impl App {
                             params,
                             entry: None,
                             open_rx: None,
-                            state: None,
+                            state: state.as_deref().and_then(crate::config::b64_decode),
                         })
                     }
                 })
@@ -6446,9 +6593,14 @@ impl App {
         for t in 0..MAX_LOOPS {
             self.track_synth[t] = pr.track_synths.get(t).cloned().flatten();
             self.track_synth_params[t] = pr.track_synth_params.get(t).cloned().unwrap_or_default();
-            // v20: harvested editor patches are session-only — they do not
-            // cross a project boundary.
-            self.track_synth_state[t] = None;
+            // v22: patches are REAL project state — decode the chunk the
+            // project carried (the v20 "session-only" rule here is what
+            // made plugin edits evaporate).
+            self.track_synth_state[t] = pr
+                .track_synth_states
+                .get(t)
+                .and_then(|s| s.as_deref())
+                .and_then(crate::config::b64_decode);
         }
         self.rebuild_all_synths();
         // Heights are a per-session view; the new arrangement starts fresh.
@@ -6896,6 +7048,8 @@ impl eframe::App for App {
         // before the held-drop below, so `effEditClose` always precedes
         // plugin teardown.
         self.reap_vst_editors();
+        // v22: persist plugin edits while their editors are still open.
+        self.tick_plugin_persist();
 
         // v16: land async plugin work (chain loads, folder scan) without
         // ever blocking this thread on plugin instantiation.
@@ -11414,7 +11568,12 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
             }
 
             egui::ScrollArea::vertical()
-                .min_scrolled_height(f32::INFINITY)
+                // v22: `.min_scrolled_height(f32::INFINITY)` (its original
+                // 0.1 idiom) makes egui 0.36.2's scrollbar math debug-assert
+                // ("from.start()/end() should not be equal" — an infinite
+                // remap range), which killed 15 UI harness tests. It was
+                // always redundant: `auto_shrink([false; 2])` below already
+                // pins the area to the full available height.
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     // Newest first (log is push_front).
@@ -11799,6 +11958,19 @@ mod tests {
     /// Fresh App with null audio, a scratch config dir, and one rack folder
     /// holding a generated kick.wav. Returns the app and the file's y-row
     /// finder left to the caller (layout is deterministic at px 1.0).
+    /// The account's real home directory. Tests sandbox HOME (headless_app
+    /// points it at a private temp folder so lazy VST folder scans never
+    /// touch — and never headlessly instantiate — the machine's real
+    /// plugin set), so tests that need a REAL plugin binary read it here.
+    fn real_home() -> String {
+        use std::sync::OnceLock;
+        static HOME: OnceLock<String> = OnceLock::new();
+        // Captured at the first call — before any test has swapped HOME
+        // (see headless_app); every swap site captures first.
+        HOME.get_or_init(|| std::env::var("HOME").unwrap_or_default())
+            .clone()
+    }
+
     fn headless_app(tag: &str) -> App {
         std::env::set_var("SLOOPER_NULL_AUDIO", "1");
         let dir = std::env::temp_dir().join(format!("sp-uity-{tag}"));
@@ -11826,6 +11998,15 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        // v22: the config isolation alone was not enough — HOME still
+        // pointed at the real account, so ANY test that happens to render
+        // the plugin/synth window trips the lazy folder scan, and that
+        // scan instantiates every real ~/.vst3 plugin on the shared GUI
+        // thread. (OB-Xf's editor view segfaults headlessly — a leaked
+        // background scan was SIGSEGV-ing later, unrelated tests.) A test
+        // that actually wants plugins (v16_plugin_env) swaps HOME itself
+        // and restores it, exactly as before.
+        std::env::set_var("HOME", &dir);
         let mut app = App::new(Backend::start());
         app.drain_events(); // discard the null-audio notice
         app.sample_rate = 48_000; // null audio never sends Evt::Ready
@@ -11854,7 +12035,12 @@ mod tests {
         std::sync::atomic::AtomicU64::new(1);
 
     fn test_time() -> f64 {
-        TEST_CLOCK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64 / 60.0
+        // v22: egui 0.36.2 coarsens fed times to f32 precision internally;
+        // a /60.0 tick is not exactly representable, so the rounded store
+        // can sit ABOVE the next raw f64 and emath::History debug-asserts
+        // "Time shouldn't move backwards". 1/64 ticks are exact in both
+        // precisions — monotone by construction.
+        TEST_CLOCK_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64 * 0.015625
     }
 
     fn frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
@@ -11938,6 +12124,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -12046,6 +12233,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -12108,6 +12296,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -12495,6 +12684,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -12532,6 +12722,7 @@ mod tests {
                 egui::vec2(1440.0, 853.0),
             )),
             events,
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| {
@@ -13417,6 +13608,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -13665,6 +13857,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -13702,6 +13895,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -13783,6 +13977,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -14171,6 +14366,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -14369,7 +14565,7 @@ mod tests {
     /// skips without a local plugin.
     #[test]
     fn chain_window_adds_scanned_plugin_slot() {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = real_home();
         let plugin = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
         if !plugin.is_file() {
             eprintln!("skipping chain plugin pin: no VST2 test plugin installed");
@@ -14429,6 +14625,7 @@ mod tests {
                         egui::Pos2::ZERO,
                         egui::vec2(1440.0, 853.0),
                     )),
+            time: Some(test_time()),
                     ..Default::default()
                 };
                 let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -14582,7 +14779,7 @@ mod tests {
                 }
             }
         }
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = real_home();
         let fx_src = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
         let ins_src = std::path::PathBuf::from(format!("{home}/.vst3/Geonkick.vst3"));
         if !fx_src.is_file() || !ins_src.is_dir() {
@@ -14644,6 +14841,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -14692,7 +14890,7 @@ mod tests {
             eprintln!("skip: SLOOPER_VST_SMOKE=1 + X11 required");
             return;
         }
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = real_home();
         let vst3dir = format!("{home}/.vst3");
         if !std::path::Path::new(&format!("{vst3dir}/wolf-shaper.vst3")).exists() {
             eprintln!("skip: wolf-shaper.vst3 not installed");
@@ -14839,7 +15037,7 @@ mod tests {
     /// exactly ONE scannable VST2. `None` = skip without the plugin.
     /// Returns (app, temp dir, REAL home) — the caller restores HOME.
     fn v16_plugin_env(tag: &str) -> Option<(App, std::path::PathBuf, String)> {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = real_home();
         let plugin = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
         if !plugin.is_file() {
             eprintln!("skip v16 ui pin: no VST2 test plugin installed");
@@ -15061,6 +15259,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -15102,6 +15301,7 @@ mod tests {
                 egui::vec2(1440.0, 853.0),
             )),
             events: vec![moved(egui::pos2(20.0, 18.0))],
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -15562,6 +15762,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -15798,6 +15999,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -15838,6 +16040,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -16020,7 +16223,7 @@ mod tests {
             eprintln!("skip: set SLOOPER_VST_SMOKE=1 to run");
             return;
         }
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = real_home();
         // Wolf Shaper: native Linux VST2 whose editor returns the "true"
         // (1) convention on effEditOpen — exactly what used to be refused.
         let p = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
@@ -16190,6 +16393,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
+            time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -16331,6 +16535,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -16522,6 +16727,7 @@ mod tests {
                 .into_iter()
                 .map(|p| std::sync::Arc::new(DroppedWav(p)) as egui::DroppedFileHandle)
                 .collect(),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -16832,6 +17038,7 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
             )),
+            time: Some(test_time()),
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -17810,5 +18017,119 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
         }
         assert_eq!(n_clips(&app), 1, "nothing was destroyed en route");
+    }
+    // ------------------------------------------------------------- v22 ----
+
+    /// v22 pin (the reported "Ctrl+C/V do not register"): the shipped app
+    /// NEVER sees key events for those combos — egui-winit turns them into
+    /// `Event::Copy` / `Event::Paste` and swallows the key. Injecting
+    /// exactly those events (not synthesized keys) must drive the clip
+    /// clipboard end to end.
+    #[test]
+    fn v22_egui_copy_paste_events_drive_the_clipboard() {
+        let mut app = headless_app("v22cp");
+        let ctx = egui::Context::default();
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sel_clips.push((0, 0, 0));
+        frame_keys(&mut app, &ctx, vec![egui::Event::Copy]);
+        assert!(
+            app.clipboard.is_some(),
+            "Event::Copy must fill the clip clipboard (no key event exists)"
+        );
+        frame_keys(&mut app, &ctx, vec![egui::Event::Paste(String::new())]);
+        let total = |a: &App| -> usize {
+            a.arr
+                .tracks
+                .iter()
+                .map(|t| t.lanes.iter().map(|l| l.clips.len()).sum::<usize>())
+                .sum()
+        };
+        assert_eq!(total(&app), 2, "Event::Paste places the clip again");
+    }
+
+    /// v22 pin (precedence): while the user is typing in a TextEdit (the
+    /// set-value dialog auto-focuses one), Copy belongs to the TEXT — the
+    /// clip clipboard must not be clobbered behind the edit.
+    #[test]
+    fn v22_ui_textedit_keeps_its_copy() {
+        let mut app = headless_app("v22tex");
+        let ctx = egui::Context::default();
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 48_000));
+        frame_keys(&mut app, &ctx, vec![]);
+        app.sel_clips.push((0, 0, 0));
+        app.value_dialog = Some((
+            0,
+            crate::automation::TARGET_TRACK_VOL.to_string(),
+            "0".to_string(),
+        ));
+        app.value_dialog_focus = true;
+        frame_keys(&mut app, &ctx, vec![]); // the dialog paints, its field takes focus
+        assert!(ctx.text_edit_focused());
+        frame_keys(&mut app, &ctx, vec![egui::Event::Copy]);
+        assert!(
+            app.clipboard.is_none(),
+            "Copy while typing belongs to the TextEdit, not the clips"
+        );
+        // Clicking the empty grid drops text focus — then Copy works again.
+        click_pt(&mut app, &ctx, egui::pos2(700.0, 620.0));
+        app.value_dialog = None;
+        frame_keys(&mut app, &ctx, vec![egui::Event::Copy]);
+        assert!(app.clipboard.is_some(), "no focused text -> clips own Copy");
+    }
+
+    /// v22 pin (the reported "right-click on mixer sliders does nothing"):
+    /// an egui Slider senses DRAG only, so the strip sliders union in
+    /// CLICK sense; right-click then creates the automation asset in
+    /// place. The mixer draws the vol row at every strip height, so pin
+    /// vol; the gain row (popup at short heights) is the same code path,
+    /// and its engine target is pinned below.
+    #[test]
+    fn v22_mixer_slider_right_click_creates_automation() {
+        let mut app = headless_app("v22rmb");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let before = app.assets.len();
+        let lanes = app.arr.tracks[0].lanes.len();
+        let lab = galley_at(&mut app, &ctx, "vol ").expect("mixer strip draws a vol row");
+        let p = egui::pos2(lab.max.x + 12.0, lab.center().y);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Secondary, false)],
+        );
+        assert_eq!(
+            app.assets.len(),
+            before + 1,
+            "right-clicking the slider creates an automation asset"
+        );
+        let au = app.assets
+            .last()
+            .unwrap()
+            .automation
+            .clone()
+            .expect("the new asset is automation");
+        assert_eq!(au.target, crate::automation::TARGET_TRACK_VOL);
+        assert_eq!(
+            app.arr.tracks[0].lanes.len(),
+            lanes + 1,
+            "the automation rides a new lane"
+        );
+        // Gain is a real target too (the reported "right click on ANY
+        // mixer slider"): label, UI range, and — decisively — the engine
+        // mapping all exist for track.gain.
+        use crate::automation::{describe_target, target_range, TARGET_TRACK_GAIN};
+        assert_eq!(describe_target(TARGET_TRACK_GAIN), "track gain");
+        let (lo, hi) = target_range(TARGET_TRACK_GAIN);
+        assert!(lo < hi && hi > 1.0);
     }
 }

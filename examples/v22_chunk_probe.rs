@@ -85,13 +85,13 @@ fn set_chunk_buffer(handle: &slooper::vsthost::Vst2Handle, data: &[u8]) -> bool 
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1);
     let kind = if std::env::var("PROBE_KIND").is_ok_and(|k| k == "V3") {
         slooper::vsthost::VstKind::V3
     } else {
         slooper::vsthost::VstKind::V2
     };
-    while let Some(p) = args.next() {
+    for p in args {
         let path = Path::new(&p);
         // order controlled by env so we can isolate the dangerous call
         let order = std::env::var("PROBE_ORDER").unwrap_or_else(|_| "file,buffer".into());

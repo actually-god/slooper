@@ -17,7 +17,13 @@ fn main() {
     let entry = load.entry;
     assert!(entry.has_editor(), "{} exposes no editor", entry.name());
     let handle = entry.vst2_handle().expect("vst2 handle");
-    let mut win = slooper::vstedit::open_editor(&handle, &path, entry.name())
+    let mut win = slooper::vstedit::open_editor(
+        &handle,
+        &path,
+        entry.name(),
+        entry.params().clone(),
+        entry.descs().len(),
+    )
         .unwrap_or_else(|e| panic!("open_editor: {e}"));
     let mut outcome = String::from("painted");
     for _ in 0..80 {

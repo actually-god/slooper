@@ -1206,6 +1206,13 @@ impl Vst2Handle {
             ((*ae).dispatcher)(ae, opcode, index, value, ptr, opt)
         }
     }
+    /// v22: current parameter value straight through `AEffect::getParameter`
+    /// (the vendor crate's own read path; `dispatch` would launder the
+    /// float return through `isize`). Used by the editor's live readback so
+    /// plugin-GUI edits reach the host's cell mirror.
+    pub fn get_param(&self, index: i32) -> f32 {
+        unsafe { ((*self.0).getParameter)(self.0, index) }
+    }
 }
 
 unsafe impl Send for RtStageEntry {}
@@ -3058,7 +3065,7 @@ mod tests {
         let load = open(&path, VstKind::V2, 48_000, None).expect("open dragonfly");
         let h = load.entry.vst2_handle().expect("vst2 handle");
         let mut editor =
-            crate::vstedit::open_editor(&h, &path.to_string_lossy(), "v16-ac1").expect("editor");
+            crate::vstedit::open_editor(&h, &path.to_string_lossy(), "v16-ac1", crate::vsthost::VstParams::new(&[]), 0).expect("editor");
         let t0 = std::time::Instant::now();
         while !editor.painted() && !editor.open_failed() && !editor.is_closed() {
             assert!(
@@ -3200,5 +3207,84 @@ mod tests {
             "after flush the pipeline is empty: the echo carry must return the input at once"
         );
         drop(load);
+    }
+    /// v22 pin (VST2 load failure): yabridge's own generated output must
+    /// never be handed back as DLL SOURCE — a self-referencing scan made
+    /// `X.dll -> .../yabridge/X.dll` loops and every bridge load died with
+    /// ELOOP. `dll_source_dirs` skips any `.../yabridge` directory.
+    #[test]
+    fn v22_dll_source_dirs_skip_yabridge_output() {
+        let root = std::env::temp_dir().join(format!("sp-v22yab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("commercial")).unwrap();
+        std::fs::create_dir_all(root.join("yabridge")).unwrap();
+        std::fs::write(root.join("commercial/one.dll"), b"MZ").unwrap();
+        std::fs::write(root.join("yabridge/two.dll"), b"MZ").unwrap();
+        std::fs::write(root.join("top.dll"), b"MZ").unwrap();
+        let got = dll_source_dirs(std::slice::from_ref(&root));
+        assert!(got.contains(&root), "top-level dll dir scans: {got:?}");
+        assert!(got.contains(&root.join("commercial")), "subdir scans: {got:?}");
+        assert!(
+            !got.contains(&root.join("yabridge")),
+            "yabridge output dir must NEVER scan as source: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// v22 pin: the ELOOP companion symlink is re-pointed at the real DLL
+    /// (self-heal at scan time — the reported "invalid DLL file format"
+    /// for every yabridged plugin); a link that resolves is left alone.
+    #[test]
+    fn v22_repair_looped_companion_repoints_to_real_dll() {
+        let root = std::env::temp_dir().join(format!("sp-v22rep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Sandbox HOME so yabridgectl's config cannot pull the machine's
+        // real plugin dirs into candidate ranking (suite is single-
+        // threaded; every HOME swap restores below).
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        std::env::set_var("HOME", &root);
+        let src = root.join("win32");
+        let wrp = root.join("out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(wrp.join("yabridge")).unwrap();
+        // A real Windows binary is proof for the repair hunt.
+        let mut pe = vec![0u8; 0x90];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes());
+        std::fs::write(src.join("Delay Lama.dll"), &pe).unwrap();
+        let wrapper = wrp.join("Delay Lama.so");
+        std::fs::write(&wrapper, b"bridge").unwrap();
+        // The historical corruption: companion points into the yabridge
+        // dir, whose entry points back at the companion. ELOOP.
+        std::os::unix::fs::symlink(
+            wrp.join("yabridge/Delay Lama.dll"),
+            wrp.join("Delay Lama.dll"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            wrp.join("Delay Lama.dll"),
+            wrp.join("yabridge/Delay Lama.dll"),
+        )
+        .unwrap();
+        assert!(
+            std::fs::File::open(wrp.join("Delay Lama.dll")).is_err(),
+            "fixture: the loop must fail to open"
+        );
+        let fixed = repair_looped_companion(&wrapper, std::slice::from_ref(&src)).expect("loop repaired");
+        assert_eq!(fixed, src.join("Delay Lama.dll"));
+        assert_eq!(
+            std::fs::canonicalize(wrp.join("Delay Lama.dll")).unwrap(),
+            std::fs::canonicalize(src.join("Delay Lama.dll")).unwrap(),
+            "companion now resolves to the real file"
+        );
+        assert!(
+            repair_looped_companion(&wrapper, &[src]).is_none(),
+            "a healthy companion is not touched"
+        );
+        std::env::set_var("HOME", real_home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

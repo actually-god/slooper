@@ -107,7 +107,13 @@ fn main() {
         .find(|l| l.entry.kind() == VstKind::V2 && l.entry.has_editor());
     if let Some(l) = v2 {
         let h = l.entry.vst2_handle().unwrap();
-        match slooper::vstedit::open_editor(&h, &l.entry.path().to_string_lossy(), "probe-v2") {
+        match slooper::vstedit::open_editor(
+            &h,
+            &l.entry.path().to_string_lossy(),
+            "probe-v2",
+            l.entry.params().clone(),
+            l.entry.descs().len(),
+        ) {
             Ok(mut w) => {
                 let mut waited = Duration::ZERO;
                 while !w.painted() && waited.as_secs() < 6 {
@@ -169,8 +175,14 @@ fn main() {
     for l in loads.iter().filter(|l| l.entry.has_editor()).take(2) {
         let w = if l.entry.kind() == VstKind::V2 {
             l.entry.vst2_handle().and_then(|h| {
-                slooper::vstedit::open_editor(&h, &l.entry.path().to_string_lossy(), "probe-both")
-                    .ok()
+                slooper::vstedit::open_editor(
+                    &h,
+                    &l.entry.path().to_string_lossy(),
+                    "probe-both",
+                    l.entry.params().clone(),
+                    l.entry.descs().len(),
+                )
+                .ok()
             })
         } else {
             l.entry.open_vst3_editor(48_000).ok()
