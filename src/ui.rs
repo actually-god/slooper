@@ -2384,6 +2384,10 @@ impl App {
     /// off-screen.
     fn clipboard_paste(&mut self) {
         let Some(cb) = self.clipboard.clone() else {
+            // v21: an empty clipboard used to return in SILENCE — with a
+            // fresh session that read as "Ctrl+V does nothing".
+            self.status = "paste: clipboard is empty \u{b7} select clips, then Ctrl+C copies them"
+                .into();
             return;
         };
         let t_target = self
@@ -4282,6 +4286,13 @@ impl App {
                     self.roll_clip = Some(ns);
                     self.status =
                         format!("copied {k} note(s) \u{b7} Ctrl+V pastes at the playhead");
+                } else {
+                    // v21: the roll owning the keys used to be INVISIBLE —
+                    // Ctrl+C with no selected notes silently did nothing and
+                    // read as "clip copy/paste is broken".
+                    self.status = "piano roll has the keyboard \u{b7} select notes to copy \
+                                   (click outside the roll for clip copy)"
+                        .into();
                 }
             }
             if v {
@@ -4303,6 +4314,11 @@ impl App {
                     roll.sel_notes = idxs;
                     roll.changed = true;
                     self.status = format!("pasted {} note(s) at the playhead", clip.len());
+                } else {
+                    // v21: same silent-swallow fix as the roll copy above.
+                    self.status = "piano roll clipboard is empty \u{b7} select notes and Ctrl+C \
+                                   (click outside the roll to paste clips)"
+                        .into();
                 }
             }
             if a {
@@ -17570,6 +17586,72 @@ mod tests {
         let ids = clip_ids(&app);
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().any(|(t, _, _, _)| *t == 2), "paste landed on track 3: {ids:?}");
+    }
+
+    /// v21 AC2: Ctrl+V in a fresh session (empty clipboard) must SAY so —
+    /// the silent return read as "the paste binding is broken".
+    #[test]
+    fn v21_ui_paste_empty_clipboard_is_loud() {
+        let mut app = headless_app("v21emptypaste");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(
+            app.status.contains("clipboard is empty"),
+            "an empty Ctrl+V must explain itself, got: {}",
+            app.status
+        );
+    }
+
+    /// v21 AC3: while the piano roll owns the keyboard, Ctrl+C/V with no
+    /// roll content to act on must name the roll — the silent swallow looked
+    /// exactly like a dead clipboard binding.
+    #[test]
+    fn v21_ui_roll_keyboard_swallow_is_loud() {
+        let mut app = headless_app("v21rollloud");
+        let ctx = egui::Context::default();
+        let canvas = open_roll_headless(&mut app, &ctx);
+        // Click inside the window's title bar: the roll takes the keyboard
+        // WITHOUT drawing a note in the canvas.
+        let title = egui::pos2(canvas.center().x, canvas.min.y - 14.0);
+        click_pt(&mut app, &ctx, title);
+        assert!(
+            app.piano_roll.as_ref().unwrap().focused,
+            "a title-bar click must hand the keyboard to the roll"
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(
+            app.status.contains("piano roll"),
+            "roll copy with no notes selected must name the roll: {}",
+            app.status
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(
+            app.status.contains("piano roll"),
+            "roll paste with an empty roll clipboard must name the roll: {}",
+            app.status
+        );
     }
 
     // ---- R5/R6: drag gestures vs. destructive edits -------------------------
