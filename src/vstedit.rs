@@ -491,6 +491,14 @@ impl EditorWindow {
         self.state.lock().ok().and_then(|mut c| c.take())
     }
 
+    /// v22: non-destructive peek at the harvested chunk (see `take_state`).
+    /// With real-time harvesting the chunk is ALREADY current while the
+    /// window is open; the host polls this to persist it, and `take_state`
+    /// at reap only needs to trigger the instance rebuild.
+    pub fn state_snapshot(&self) -> Option<Vec<u8>> {
+        self.state.lock().ok().and_then(|c| c.clone())
+    }
+
     /// Plugin path this editor was opened for (stale-editor detection).
     pub fn path(&self) -> &str {
         &self.path
@@ -561,7 +569,13 @@ impl Drop for EditorWindow {
 /// `AEffect` dispatcher handle from `vsthost`; the GUI thread keeps
 /// using it, so the plugin instance must outlive the returned handle
 /// (slooper closes editors before unloading, see `ui.rs`).
-pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<EditorWindow, String> {
+pub fn open_editor(
+    handle: &Vst2Handle,
+    path: &str,
+    title: &str,
+    cells: Arc<crate::vsthost::VstParams>,
+    ncell: usize,
+) -> Result<EditorWindow, String> {
     if !x11_available() {
         return Err("no X11 display (VST2 editors need X11/XWayland)".into());
     }
@@ -576,7 +590,7 @@ pub fn open_editor(handle: &Vst2Handle, path: &str, title: &str) -> Result<Edito
         REG.with(|reg| {
             // SAFETY: runs on the GUI thread, the sole owner of all
             // editor state (see module docs).
-            if let Some(e) = unsafe { make_editor(ae, &title, s2) } {
+            if let Some(e) = unsafe { make_editor(ae, &title, s2, cells, ncell) } {
                 reg.borrow_mut().push(e);
             }
         });
@@ -654,6 +668,11 @@ const VERIFY_PATIENCE: Duration = Duration::from_secs(3);
 
 struct Editor {
     handle: Vst2Handle,
+    /// v22: live readback plumbing — the plugin's own GUI writes
+    /// `AEffect::params` directly; the host cell mirror never hears about
+    /// it unless the pump reads the instance back (see `sync_cells`).
+    cells: Arc<crate::vsthost::VstParams>,
+    ncell: usize,
     d: *mut Display,
     win: XWindow,
     title: String,
@@ -670,7 +689,13 @@ struct Editor {
 /// Create the container, map it, and dispatch `effEditOpen` — all on the
 /// GUI thread. `None` (with the failure flags already set) when X or the
 /// plugin refuses outright.
-unsafe fn make_editor(handle: Vst2Handle, title: &str, shared: Shared) -> Option<Editor> {
+unsafe fn make_editor(
+    handle: Vst2Handle,
+    title: &str,
+    shared: Shared,
+    cells: Arc<crate::vsthost::VstParams>,
+    ncell: usize,
+) -> Option<Editor> {
     // NO XInitThreads: hosts that host plugin UIs on a dedicated thread
     // (Carla, Y/Plugins) deliberately leave libX11 unthreaded — JUCE's
     // X initialization inside plugins breaks with it (verified here:
@@ -715,6 +740,8 @@ unsafe fn make_editor(handle: Vst2Handle, title: &str, shared: Shared) -> Option
     EDITORS_ACTIVE.fetch_add(1, Ordering::Relaxed);
     Some(Editor {
         handle,
+        cells,
+        ncell,
         d,
         win,
         title: title.to_string(),
@@ -876,6 +903,15 @@ impl Editor {
                     // need four X round-trips per pump step.
                     if self.house.elapsed() >= HOUSEKEEPING {
                         self.house = Instant::now();
+                        // v22: pull the plugin's live parameter values into
+                        // the cell mirror (inlined: a method call would
+                        // fight the arm's `ref mut last_size` borrow).
+                        for k in 0..self.ncell {
+                            let v = self.handle.get_param(k as i32);
+                            if v.is_finite() {
+                                self.cells.set(k, v);
+                            }
+                        }
                         let kids = count_children_local(self.d, self.win);
                         self.shared.children.store(kids, Ordering::SeqCst);
                         // Dead-editor watchdog: nothing viewable for
@@ -901,6 +937,23 @@ impl Editor {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// v22: read every parameter back out of the live `AEffect` into the
+    /// host's cell mirror. A VST2 plugin's own GUI writes `AEffect::params`
+    /// directly — the mirror only ever saw host-side writes, so sliders
+    /// moved inside the plugin never reached the config/project snapshot
+    /// (the "close the plugin window and settings revert to defaults"
+    /// report). `VstParams::set` bumps the generation only on change, and
+    /// the audio-side relay then re-sends the identical value (last-value
+    /// filter), so the loop is stable and cheap.
+    fn sync_cells(&self) {
+        for k in 0..self.ncell {
+            let v = self.handle.get_param(k as i32);
+            if v.is_finite() {
+                self.cells.set(k, v);
             }
         }
     }
@@ -932,6 +985,13 @@ impl Editor {
     /// drops to (or keeps) the slider panel.
     fn teardown(&mut self, refused: bool) {
         unsafe {
+            // v22: final readback so the last gesture inside the plugin's
+            // own GUI (within the last housekeeping tick) is persisted.
+            // Skipped on refused teardowns — a watchdog-killed instance may
+            // not survive parameter calls.
+            if !refused {
+                self.sync_cells();
+            }
             if !self.d.is_null() {
                 // v16: one pump tick faster for the whole app if this was
                 // the last open editor (lets the idle tick take over).
@@ -1340,6 +1400,26 @@ impl Editor3 {
                     // operations.
                     if self.house.elapsed() >= HOUSEKEEPING {
                         self.house = Instant::now();
+                        // v22: real-time persistence — a plugin that has
+                        // been touched hands its chunk to the host every
+                        // housekeeping beat, not only at teardown, so
+                        // closing/killing/crashing can no longer lose the
+                        // settings the user just made.
+                        //
+                        // CHUNK-ONLY here (no silent-block flush): the
+                        // shadow has NO processing layout — a JUCE synth
+                        // (v17 pin) asserts inside processBlock when the
+                        // flush runs mid-life, and the flush only matters
+                        // for host-set params, which (a) the teardown
+                        // flush still covers in full and (b) the cell
+                        // mirror persists separately anyway.
+                        if self.changed {
+                            if let Ok(bytes) = plugin.save_state() {
+                                if let Ok(mut cell) = self.shared.state.lock() {
+                                    *cell = Some(bytes);
+                                }
+                            }
+                        }
                         // v20: a plugin that changes patch data WITHOUT
                         // broadcasting performEdits (preset reload) still
                         // announces itself through restartComponent.
@@ -1389,60 +1469,72 @@ impl Editor3 {
         XFlush(self.d);
     }
 
+/// v20/v22: serialize a shadow's component state into `shared.state` —
+/// silent-block flush first (v20 PROBE FACT, kept verbatim in the body),
+/// then `save_state`. Free function on loose fields so both callers can
+/// run it while `self.plugin` is already re-borrowed inside the pump.
+/// Safe to call any number of times: teardown calls it once at close,
+/// and the Live phase calls it on a timer while the window is open (v22
+/// real-time persistence), so a crash or WM kill can never lose the
+/// visible patch more than a couple of seconds.
+fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: &Shared) {
+    // v20 PROBE FACT (v20_chunkdiff example): host-set parameter values
+    // are NOT part of a plugin's serializable state until the plugin
+    // has actually RUN audio with them — wolf-shaper and 3BandEQ wrote
+    // byte-identical chunks until one silent block ran (DPF's isLive
+    // deferral; the same pattern the VST3 SDK teaches). The shadow
+    // never processes during its life, so push a few silent blocks
+    // through NOW, otherwise the chunk would lag every knob the user
+    // moved and rebuilding from it could UNDO edits.
+    if let Err(e) = p.start_processing() {
+        if dbg {
+            eprintln!("[vstedit3] {title}: state-flush start failed: {e}");
+        }
+    } else {
+        let ch = p.output_channel_count().max(1);
+        let mut bufs = vst3_host::audio::AudioBuffers::new(
+            ch,
+            ch,
+            crate::vsthost::VST_BLOCK,
+            sr.max(1) as f64,
+        );
+        for _ in 0..4 {
+            if p.process_audio(&mut bufs).is_err() {
+                break;
+            }
+        }
+        let _ = p.stop_processing();
+    }
+    match p.save_state() {
+        Ok(bytes) => {
+            if let Ok(mut cell) = shared.state.lock() {
+                *cell = Some(bytes);
+            }
+        }
+        Err(e) => {
+            if dbg {
+                eprintln!("[vstedit3] {title}: save_state failed: {e}");
+            }
+        }
+    }
+}
+
+    /// v20/v22: harvest the shadow's chunk (see [`harvest3`]).
+    fn harvest(&mut self) {
+        if !self.changed {
+            return;
+        }
+        if let Some(p) = self.plugin.as_mut() {
+            Self::harvest3(p, self.sr, self.dbg, &self.title, &self.shared);
+        }
+    }
+
     /// Detach the view, retire the shadow instance under the loader lock,
     /// destroy the container, mark the handle retired.
     fn teardown(&mut self, refused: bool) {
         unsafe {
-            // v20: harvest BEFORE anything is torn down. If the user edited
-            // through this shadow, its component state holds patch changes
-            // the sounding instance never saw (preset browsers, non-param
-            // state). Hand the chunk to the host via `EditorWindow::
-            // take_state`; the host rebuilds the live instance from it.
-            if self.changed {
-                if let Some(p) = self.plugin.as_mut() {
-                    // v20 PROBE FACT (v20_chunkdiff example): host-set
-                    // parameter values are NOT part of a plugin's
-                    // serializable state until the plugin has actually
-                    // RUN audio with them — wolf-shaper and 3BandEQ wrote
-                    // byte-identical chunks until one silent block ran
-                    // (DPF's isLive deferral; the same pattern the VST3
-                    // SDK teaches). The shadow never processes during
-                    // its life, so push a few silent blocks through NOW,
-                    // otherwise the chunk would lag every knob the user
-                    // moved and rebuilding from it could UNDO edits.
-                    if let Err(e) = p.start_processing() {
-                        if self.dbg {
-                            eprintln!("[vstedit3] {}: state-flush start failed: {e}", self.title);
-                        }
-                    } else {
-                        let ch = p.output_channel_count().max(1);
-                        let mut bufs = vst3_host::audio::AudioBuffers::new(
-                            ch,
-                            ch,
-                            crate::vsthost::VST_BLOCK,
-                            self.sr.max(1) as f64,
-                        );
-                        for _ in 0..4 {
-                            if p.process_audio(&mut bufs).is_err() {
-                                break;
-                            }
-                        }
-                        let _ = p.stop_processing();
-                    }
-                    match p.save_state() {
-                        Ok(bytes) => {
-                            if let Ok(mut cell) = self.shared.state.lock() {
-                                *cell = Some(bytes);
-                            }
-                        }
-                        Err(e) => {
-                            if self.dbg {
-                                eprintln!("[vstedit3] {}: save_state failed: {e}", self.title);
-                            }
-                        }
-                    }
-                }
-            }
+            // v20: harvest BEFORE anything is torn down (see `harvest`).
+            self.harvest();
             // View first, plugin second — close_editor must run before
             // the instance tears down.
             let plugin = self.plugin.take();
@@ -1582,7 +1674,7 @@ mod tests {
             path.display()
         );
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win = match open_editor(&h, &path.to_string_lossy(), "smoke") {
+        let mut win = match open_editor(&h, &path.to_string_lossy(), "smoke", crate::vsthost::VstParams::new(&[]), 0) {
             Ok(w) => w,
             Err(e) => panic!("open_editor failed: {e}"),
         };
@@ -1650,7 +1742,7 @@ mod tests {
             .expect("plugin loads");
         let entry = &load.entry;
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-refuse").expect("open_editor");
+        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-refuse", crate::vsthost::VstParams::new(&[]), 0).expect("open_editor");
         // Verification is 100 x 30 ms (shared pump); slack ok.
         let mut waited = 0u32;
         while !win.open_failed() && !win.painted() && waited < 8000 {
@@ -1692,7 +1784,7 @@ mod tests {
             .expect("plugin loads");
         let entry = &load.entry;
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-close").expect("open_editor");
+        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-close", crate::vsthost::VstParams::new(&[]), 0).expect("open_editor");
         let mut waited = 0u32;
         while !win.painted() && !win.is_closed() && waited < 8000 {
             std::thread::sleep(Duration::from_millis(100));
@@ -1801,7 +1893,7 @@ mod tests {
             }
             let h = entry.vst2_handle().expect("vst2 handle");
             let mut win =
-                open_editor(&h, &path.to_string_lossy(), "pin-paint").expect("open_editor");
+                open_editor(&h, &path.to_string_lossy(), "pin-paint", crate::vsthost::VstParams::new(&[]), 0).expect("open_editor");
             let mut waited = 0u32;
             while !win.painted() && !win.is_closed() && waited < 10_000 {
                 std::thread::sleep(Duration::from_millis(100));
@@ -1987,7 +2079,8 @@ mod tests {
         }
         let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None).ok()?;
         let h = load.entry.vst2_handle()?;
-        let mut w = open_editor(&h, &path.to_string_lossy(), tag).ok()?;
+        let mut w = open_editor(&h, &path.to_string_lossy(), tag, crate::vsthost::VstParams::new(&[]), 0)
+            .ok()?;
         let t0 = std::time::Instant::now();
         while !w.painted()
             && !w.open_failed()

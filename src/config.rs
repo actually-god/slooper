@@ -76,7 +76,55 @@ pub enum ChainSave {
         name: String,
         #[serde(default)]
         params: Vec<f32>,
+        /// v22: plugin state chunk, base64 (VST3 + chunk-capable hosts).
+        /// Older files simply lack the key and load with `None`.
+        #[serde(default)]
+        state: Option<String>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// base64 (standard alphabet, padded) — hand-rolled so plugin state can ride
+// in JSON/config without pulling a dependency (offline AUR builds).
+// ---------------------------------------------------------------------------
+
+const B64_T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn b64_encode(v: &[u8]) -> String {
+    let mut s = String::with_capacity(v.len().div_ceil(3) * 4);
+    for c in v.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        s.push(B64_T[(n >> 18 & 63) as usize] as char);
+        s.push(B64_T[(n >> 12 & 63) as usize] as char);
+        s.push(if c.len() > 1 { B64_T[(n >> 6 & 63) as usize] as char } else { '=' });
+        s.push(if c.len() > 2 { B64_T[(n & 63) as usize] as char } else { '=' });
+    }
+    s
+}
+
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for ch in s.bytes() {
+        let v = match ch {
+            b'A'..=b'Z' => ch - b'A',
+            b'a'..=b'z' => ch - b'a' + 26,
+            b'0'..=b'9' => ch - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' | b' ' => continue,
+            _ => return None,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -226,6 +274,11 @@ pub struct Config {
     pub track_synth: Vec<Option<String>>,
     #[serde(default)]
     pub track_synth_params: Vec<Vec<f32>>,
+    /// Per-track synth state chunk (base64; index = track). v22: plugin
+    /// patches are REAL state now — the v20 "session-only" rule threw away
+    /// every change a user made inside a plugin GUI.
+    #[serde(default)]
+    pub track_synth_states: Vec<Option<String>>,
     /// Number of tracks the program exposes (clamped 1..=16). Per-track
     /// levels and bindings are kept for ALL 16 slots regardless, so raising
     /// the count again restores everything that was configured while a
@@ -276,6 +329,7 @@ impl Default for Config {
             track_vst: Vec::new(),
             track_synth: Vec::new(),
             track_synth_params: Vec::new(),
+            track_synth_states: Vec::new(),
         }
     }
 }
@@ -374,6 +428,7 @@ impl Config {
                         kind: vs.kind.clone(),
                         name: vs.name.clone(),
                         params: vs.params.clone(),
+                        state: None,
                     });
                 }
                 v
@@ -516,6 +571,7 @@ mod tests {
             trk_pan: vec![64, 20],
             track_synth: vec![None, Some("piano".into())],
             track_synth_params: vec![vec![], vec![0.2]],
+            track_synth_states: vec![],
             vst_dirs: vec!["/tmp/vst".into()],
             track_vst: vec![
                 None,
@@ -615,5 +671,52 @@ mod tests {
         assert!(cfg.projects_dir().ends_with("slooper-projects"));
         cfg.project_dir = "/srv/music".into();
         assert_eq!(cfg.projects_dir(), PathBuf::from("/srv/music"));
+    }
+
+    /// v22 pin: plugin state chunks ride base64 through the JSON saves —
+    /// xattr storage vanished silently on vfat/external drives, which is
+    /// how plugin edits "went back to default" after closing the GUI.
+    #[test]
+    fn v22_b64_state_roundtrip() {
+        let raw: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let enc = b64_encode(&raw);
+        assert!(
+            !enc.contains('\n') && !enc.contains(' '),
+            "state must survive as one JSON string"
+        );
+        assert_eq!(b64_decode(&enc).unwrap(), raw);
+        assert_eq!(b64_encode(&[]), "");
+        assert_eq!(b64_decode("").unwrap(), Vec::<u8>::new());
+        assert!(b64_decode("!!!").is_none(), "garbage is rejected, not trusted");
+    }
+
+    /// v22 pin: `ChainSave::Vst` persists the state chunk (project saves),
+    /// and pre-v22 files without the key load as `None`.
+    #[test]
+    fn v22_chainsave_vst_state_roundtrip() {
+        let c = ChainSave::Vst {
+            path: "/host/thing.vst3".into(),
+            kind: "VST3".into(),
+            name: "Thing".into(),
+            params: vec![0.25, 0.75],
+            state: Some(b64_encode(b"plugin-chunk")),
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        let back: ChainSave = serde_json::from_str(&j).unwrap();
+        match back {
+            ChainSave::Vst { state, params, .. } => {
+                assert_eq!(
+                    state.as_deref().and_then(b64_decode),
+                    Some(b"plugin-chunk".to_vec())
+                );
+                assert_eq!(params, vec![0.25, 0.75]);
+            }
+            _ => panic!("variant lost"),
+        }
+        let old = r#"{"type":"vst","path":"/p","kind":"VST2","name":"","params":[0.5]}"#;
+        match serde_json::from_str::<ChainSave>(old).unwrap() {
+            ChainSave::Vst { state, .. } => assert!(state.is_none(), "old files load state=None"),
+            _ => unreachable!(),
+        }
     }
 }

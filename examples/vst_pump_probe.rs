@@ -26,7 +26,13 @@ fn main() {
         if let Some(e) = pick(VstKind::V2) {
             let l = open(&e.path, e.kind, 48_000, None).expect("open v2");
             let h = l.entry.vst2_handle().unwrap();
-            if let Ok(w) = slooper::vstedit::open_editor(&h, &e.path.to_string_lossy(), "p2") {
+            if let Ok(w) = slooper::vstedit::open_editor(
+                &h,
+                &e.path.to_string_lossy(),
+                "p2",
+                l.entry.params().clone(),
+                l.entry.descs().len(),
+            ) {
                 let t = Instant::now();
                 while !w.painted() && t.elapsed().as_secs() < 6 {
                     std::thread::sleep(Duration::from_millis(20));

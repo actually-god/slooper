@@ -121,6 +121,9 @@ pub struct Project {
     pub track_synths: Vec<Option<String>>,
     #[serde(default)]
     pub track_synth_params: Vec<Vec<f32>>,
+    /// Per-track synth state chunk (base64; index = track).
+    #[serde(default)]
+    pub track_synth_states: Vec<Option<String>>,
 }
 
 impl Project {
@@ -278,6 +281,7 @@ mod tests {
             }],
             track_synths: vec![Some("piano".into())],
             track_synth_params: vec![vec![0.5]],
+            track_synth_states: vec![],
         }
     }
 
