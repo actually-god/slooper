@@ -1,0 +1,1312 @@
+[34m[0.000 info CardinalCommon.cpp:666 Initializer] [0mCardinal VST3 26.02, compatible with Rack version 2.4.1
+[34m[0.000 info CardinalCommon.cpp:667 Initializer] [0mLinux 7.3.0-4-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 22 Oct 2026 17:30:02 +0000 x86_64
+[34m[0.000 info CardinalCommon.cpp:668 Initializer] [0mBinary filename: /home/admin/AudioFOSS/vst3/CardinalFX.vst3/Contents/x86_64-linux/CardinalFX.so
+[34m[0.000 info CardinalCommon.cpp:670 Initializer] [0mBundle path: /home/admin/AudioFOSS/vst3/CardinalFX.vst3
+[34m[0.000 info CardinalCommon.cpp:676 Initializer] [0mSystem directory: /usr/share/cardinal
+[34m[0.000 info CardinalCommon.cpp:677 Initializer] [0mUser directory: /home/admin/Documents/Cardinal
+[34m[0.000 info CardinalCommon.cpp:678 Initializer] [0mTemplate patch: /home/admin/Documents/Cardinal/templates/fx.vcv
+[34m[0.000 info CardinalCommon.cpp:679 Initializer] [0mSystem template patch: /usr/share/cardinal/patches/templates/fx.vcv
+[dpf] System directory "/usr/share/cardinal" does not exist.
+Make sure Cardinal was downloaded and installed correctly.
+[34m[0.000 info CardinalCommon.cpp:693 Initializer] [0mInitializing plugins
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Cardinal
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Cardinal.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Fundamental
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Fundamental.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 21kHz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/21kHz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 8Mode
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/8Mode.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AaronStatic
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AaronStatic.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module admiral
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/admiral.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module alefsbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/alefsbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Algoritmarte
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Algoritmarte.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AmalgamatedHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AmalgamatedHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AnimatedCircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AnimatedCircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ArableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ArableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AriaModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AriaModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AS
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AS.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AudibleInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AudibleInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Autinn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Autinn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Axioma
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Axioma.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BaconPlugs
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BaconPlugs.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Befaco
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Befaco.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Bidoo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Bidoo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Biset
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Biset.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BogaudioModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BogaudioModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CatroModulo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CatroModulo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module cf
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/cf.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ChowDSP
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ChowDSP.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Computerscare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Computerscare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CVfunk
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CVfunk.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module dBiz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/dBiz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module DHE-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/DHE-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module eightfold
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/eightfold.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module EnigmaCurry
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/EnigmaCurry.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ESeries
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ESeries.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ExpertSleepers-Encoders
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ExpertSleepers-Encoders.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Extratone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Extratone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module FehlerFabrik
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/FehlerFabrik.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module forsitan-modulare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/forsitan-modulare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GlueTheGiant
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GlueTheGiant.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GoodSheperd
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GoodSheperd.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GrandeModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GrandeModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module h4n4-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/h4n4-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HamptonHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HamptonHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HetrickCV
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HetrickCV.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ImpromptuModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ImpromptuModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ihtsyn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ihtsyn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module JW-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/JW-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module kocmoc
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/kocmoc.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LifeFormModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LifeFormModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LilacLoop
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LilacLoop.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LittleUtils
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LittleUtils.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LomasModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LomasModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LyraeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LyraeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Meander
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Meander.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MindMeldModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MindMeldModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ML_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ML_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MockbaModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MockbaModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Mog
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Mog.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module mscHack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/mscHack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MSM
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MSM.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MUS-X
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MUS-X.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module myth-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/myth-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module nonlinearcircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/nonlinearcircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Orbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Orbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ParableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ParableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PathSet
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PathSet.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PdArray
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PdArray.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PinkTrombone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PinkTrombone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Prism
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Prism.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rackwindows
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rackwindows.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rcm-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rcm-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module RebelTech
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/RebelTech.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module repelzen
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/repelzen.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Sapphire
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Sapphire.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module sonusmodular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/sonusmodular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module StarlingVia
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/StarlingVia.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stocaudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stocaudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stoermelder-packone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stoermelder-packone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module surgext
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/surgext.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module unless_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/unless_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ValleyAudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ValleyAudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Venom
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Venom.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module voxglitch
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/voxglitch.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WhatTheRack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WhatTheRack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WSTD-Drums
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WSTD-Drums.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZetaCarinaeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZetaCarinaeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZZC
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZZC.json does not exist
+[34m[0.000 info plugins.cpp:3803 initStaticPlugins] [0mHave 0 modules from 0 plugin collections
+[34m[0.000 info CardinalCommon.cpp:696 Initializer] [0mInitializing plugin browser DB
+[34m[0.001 info CardinalCommon.cpp:713 Initializer] [0mOSC Remote control is not available on plugin variants
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/fx.vcv
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/fx.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/fx.vcv: Failed to open '/usr/share/cardinal/patches/templates/fx.vcv'
+[34m[0.001 info CardinalCommon.cpp:758 loadSettings] [0mLoading settings
+[34m[0.001 info Rack/src/settings.cpp:519 load] [0mLoading settings /home/admin/.config/Cardinal/fx.json
+[34m[0.031 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/fx.vcv
+[34m[0.031 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/fx.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/fx.vcv: Failed to open '/usr/share/cardinal/patches/templates/fx.vcv'
+[34m[0.032 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[0.032 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[0.032 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[0.032 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[0.032 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[0.032 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[0.032 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[0.032 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[0.032 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[0.032 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[0.032 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[0.032 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[0.033 info CardinalCommon.cpp:730 ~Initializer] [0mSave settings
+[34m[0.033 info Rack/src/settings.cpp:498 save] [0mSaving settings /home/admin/.config/Cardinal/fx.json
+[34m[0.033 info CardinalCommon.cpp:734 ~Initializer] [0mClearing asset paths
+[34m[0.033 info CardinalCommon.cpp:739 ~Initializer] [0mDestroying plugins
+[34m[0.033 info CardinalCommon.cpp:742 ~Initializer] [0mDestroying colourized assets
+[34m[0.033 info CardinalCommon.cpp:745 ~Initializer] [0mDestroying settings
+[34m[0.033 info CardinalCommon.cpp:748 ~Initializer] [0mDestroying logger
+[34m[0.000 info CardinalCommon.cpp:666 Initializer] [0mCardinal VST3 26.02, compatible with Rack version 2.4.1
+[34m[0.000 info CardinalCommon.cpp:667 Initializer] [0mLinux 7.3.0-4-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 22 Oct 2026 17:30:02 +0000 x86_64
+[34m[0.000 info CardinalCommon.cpp:668 Initializer] [0mBinary filename: /home/admin/AudioFOSS/vst3/CardinalFX.vst3/Contents/x86_64-linux/CardinalFX.so
+[34m[0.000 info CardinalCommon.cpp:670 Initializer] [0mBundle path: /home/admin/AudioFOSS/vst3/CardinalFX.vst3
+[34m[0.000 info CardinalCommon.cpp:676 Initializer] [0mSystem directory: /usr/share/cardinal
+[34m[0.000 info CardinalCommon.cpp:677 Initializer] [0mUser directory: /home/admin/Documents/Cardinal
+[34m[0.000 info CardinalCommon.cpp:678 Initializer] [0mTemplate patch: /home/admin/Documents/Cardinal/templates/fx.vcv
+[34m[0.000 info CardinalCommon.cpp:679 Initializer] [0mSystem template patch: /usr/share/cardinal/patches/templates/fx.vcv
+[dpf] System directory "/usr/share/cardinal" does not exist.
+Make sure Cardinal was downloaded and installed correctly.
+[34m[0.000 info CardinalCommon.cpp:693 Initializer] [0mInitializing plugins
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Cardinal
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Cardinal.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Fundamental
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Fundamental.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 21kHz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/21kHz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 8Mode
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/8Mode.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AaronStatic
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AaronStatic.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module admiral
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/admiral.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module alefsbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/alefsbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Algoritmarte
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Algoritmarte.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AmalgamatedHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AmalgamatedHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AnimatedCircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AnimatedCircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ArableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ArableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AriaModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AriaModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AS
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AS.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AudibleInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AudibleInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Autinn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Autinn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Axioma
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Axioma.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BaconPlugs
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BaconPlugs.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Befaco
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Befaco.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Bidoo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Bidoo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Biset
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Biset.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BogaudioModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BogaudioModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CatroModulo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CatroModulo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module cf
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/cf.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ChowDSP
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ChowDSP.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Computerscare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Computerscare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CVfunk
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CVfunk.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module dBiz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/dBiz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module DHE-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/DHE-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module eightfold
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/eightfold.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module EnigmaCurry
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/EnigmaCurry.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ESeries
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ESeries.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ExpertSleepers-Encoders
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ExpertSleepers-Encoders.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Extratone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Extratone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module FehlerFabrik
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/FehlerFabrik.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module forsitan-modulare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/forsitan-modulare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GlueTheGiant
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GlueTheGiant.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GoodSheperd
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GoodSheperd.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GrandeModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GrandeModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module h4n4-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/h4n4-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HamptonHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HamptonHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HetrickCV
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HetrickCV.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ImpromptuModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ImpromptuModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ihtsyn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ihtsyn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module JW-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/JW-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module kocmoc
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/kocmoc.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LifeFormModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LifeFormModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LilacLoop
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LilacLoop.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LittleUtils
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LittleUtils.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LomasModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LomasModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LyraeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LyraeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Meander
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Meander.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MindMeldModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MindMeldModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ML_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ML_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MockbaModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MockbaModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Mog
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Mog.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module mscHack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/mscHack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MSM
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MSM.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MUS-X
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MUS-X.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module myth-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/myth-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module nonlinearcircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/nonlinearcircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Orbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Orbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ParableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ParableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PathSet
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PathSet.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PdArray
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PdArray.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PinkTrombone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PinkTrombone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Prism
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Prism.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rackwindows
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rackwindows.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rcm-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rcm-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module RebelTech
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/RebelTech.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module repelzen
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/repelzen.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Sapphire
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Sapphire.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module sonusmodular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/sonusmodular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module StarlingVia
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/StarlingVia.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stocaudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stocaudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stoermelder-packone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stoermelder-packone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module surgext
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/surgext.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module unless_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/unless_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ValleyAudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ValleyAudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Venom
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Venom.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module voxglitch
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/voxglitch.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WhatTheRack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WhatTheRack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WSTD-Drums
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WSTD-Drums.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZetaCarinaeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZetaCarinaeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZZC
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZZC.json does not exist
+[34m[0.000 info plugins.cpp:3803 initStaticPlugins] [0mHave 0 modules from 0 plugin collections
+[34m[0.000 info CardinalCommon.cpp:696 Initializer] [0mInitializing plugin browser DB
+[34m[0.000 info CardinalCommon.cpp:713 Initializer] [0mOSC Remote control is not available on plugin variants
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/fx.vcv
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/fx.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/fx.vcv: Failed to open '/usr/share/cardinal/patches/templates/fx.vcv'
+[34m[0.001 info CardinalCommon.cpp:758 loadSettings] [0mLoading settings
+[34m[0.001 info Rack/src/settings.cpp:519 load] [0mLoading settings /home/admin/.config/Cardinal/fx.json
+[34m[0.018 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/fx.vcv
+[34m[0.018 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/fx.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/fx.vcv: Failed to open '/usr/share/cardinal/patches/templates/fx.vcv'
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[34m[0.000 info CardinalCommon.cpp:666 Initializer] [0mCardinal VST3 26.02, compatible with Rack version 2.4.1
+[34m[0.000 info CardinalCommon.cpp:667 Initializer] [0mLinux 7.3.0-4-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 22 Oct 2026 17:30:02 +0000 x86_64
+[34m[0.000 info CardinalCommon.cpp:668 Initializer] [0mBinary filename: /home/admin/AudioFOSS/vst3/CardinalSynth.vst3/Contents/x86_64-linux/CardinalSynth.so
+[34m[0.000 info CardinalCommon.cpp:670 Initializer] [0mBundle path: /home/admin/AudioFOSS/vst3/CardinalSynth.vst3
+[34m[0.000 info CardinalCommon.cpp:676 Initializer] [0mSystem directory: /usr/share/cardinal
+[34m[0.000 info CardinalCommon.cpp:677 Initializer] [0mUser directory: /home/admin/Documents/Cardinal
+[34m[0.000 info CardinalCommon.cpp:678 Initializer] [0mTemplate patch: /home/admin/Documents/Cardinal/templates/synth.vcv
+[34m[0.000 info CardinalCommon.cpp:679 Initializer] [0mSystem template patch: /usr/share/cardinal/patches/templates/synth.vcv
+[dpf] System directory "/usr/share/cardinal" does not exist.
+Make sure Cardinal was downloaded and installed correctly.
+[34m[0.000 info CardinalCommon.cpp:693 Initializer] [0mInitializing plugins
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Cardinal
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Cardinal.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Fundamental
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Fundamental.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 21kHz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/21kHz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 8Mode
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/8Mode.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AaronStatic
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AaronStatic.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module admiral
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/admiral.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module alefsbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/alefsbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Algoritmarte
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Algoritmarte.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AmalgamatedHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AmalgamatedHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AnimatedCircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AnimatedCircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ArableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ArableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AriaModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AriaModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AS
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AS.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AudibleInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AudibleInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Autinn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Autinn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Axioma
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Axioma.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BaconPlugs
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BaconPlugs.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Befaco
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Befaco.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Bidoo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Bidoo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Biset
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Biset.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BogaudioModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BogaudioModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CatroModulo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CatroModulo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module cf
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/cf.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ChowDSP
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ChowDSP.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Computerscare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Computerscare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CVfunk
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CVfunk.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module dBiz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/dBiz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module DHE-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/DHE-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module eightfold
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/eightfold.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module EnigmaCurry
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/EnigmaCurry.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ESeries
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ESeries.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ExpertSleepers-Encoders
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ExpertSleepers-Encoders.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Extratone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Extratone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module FehlerFabrik
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/FehlerFabrik.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module forsitan-modulare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/forsitan-modulare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GlueTheGiant
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GlueTheGiant.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GoodSheperd
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GoodSheperd.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GrandeModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GrandeModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module h4n4-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/h4n4-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HamptonHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HamptonHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HetrickCV
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HetrickCV.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ImpromptuModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ImpromptuModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ihtsyn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ihtsyn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module JW-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/JW-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module kocmoc
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/kocmoc.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LifeFormModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LifeFormModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LilacLoop
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LilacLoop.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LittleUtils
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LittleUtils.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LomasModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LomasModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LyraeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LyraeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Meander
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Meander.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MindMeldModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MindMeldModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ML_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ML_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MockbaModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MockbaModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Mog
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Mog.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module mscHack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/mscHack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MSM
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MSM.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MUS-X
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MUS-X.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module myth-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/myth-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module nonlinearcircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/nonlinearcircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Orbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Orbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ParableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ParableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PathSet
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PathSet.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PdArray
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PdArray.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PinkTrombone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PinkTrombone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Prism
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Prism.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rackwindows
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rackwindows.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rcm-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rcm-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module RebelTech
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/RebelTech.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module repelzen
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/repelzen.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Sapphire
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Sapphire.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module sonusmodular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/sonusmodular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module StarlingVia
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/StarlingVia.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stocaudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stocaudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stoermelder-packone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stoermelder-packone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module surgext
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/surgext.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module unless_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/unless_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ValleyAudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ValleyAudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Venom
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Venom.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module voxglitch
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/voxglitch.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WhatTheRack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WhatTheRack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WSTD-Drums
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WSTD-Drums.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZetaCarinaeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZetaCarinaeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZZC
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZZC.json does not exist
+[34m[0.000 info plugins.cpp:3803 initStaticPlugins] [0mHave 0 modules from 0 plugin collections
+[34m[0.000 info CardinalCommon.cpp:696 Initializer] [0mInitializing plugin browser DB
+[34m[0.000 info CardinalCommon.cpp:713 Initializer] [0mOSC Remote control is not available on plugin variants
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/synth.vcv
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/synth.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/synth.vcv: Failed to open '/usr/share/cardinal/patches/templates/synth.vcv'
+[34m[0.001 info CardinalCommon.cpp:758 loadSettings] [0mLoading settings
+[34m[0.001 info Rack/src/settings.cpp:519 load] [0mLoading settings /home/admin/.config/Cardinal/synth.json
+[34m[0.015 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/synth.vcv
+[34m[0.015 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/synth.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/synth.vcv: Failed to open '/usr/share/cardinal/patches/templates/synth.vcv'
+[34m[0.015 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[0.016 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[0.016 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[0.016 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[0.016 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[0.016 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[0.016 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[0.016 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[0.016 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[0.016 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[0.016 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[0.016 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[0.016 info CardinalCommon.cpp:730 ~Initializer] [0mSave settings
+[34m[0.016 info Rack/src/settings.cpp:498 save] [0mSaving settings /home/admin/.config/Cardinal/synth.json
+[34m[0.016 info CardinalCommon.cpp:734 ~Initializer] [0mClearing asset paths
+[34m[0.016 info CardinalCommon.cpp:739 ~Initializer] [0mDestroying plugins
+[34m[0.016 info CardinalCommon.cpp:742 ~Initializer] [0mDestroying colourized assets
+[34m[0.016 info CardinalCommon.cpp:745 ~Initializer] [0mDestroying settings
+[34m[0.016 info CardinalCommon.cpp:748 ~Initializer] [0mDestroying logger
+[34m[0.000 info CardinalCommon.cpp:666 Initializer] [0mCardinal VST3 26.02, compatible with Rack version 2.4.1
+[34m[0.000 info CardinalCommon.cpp:667 Initializer] [0mLinux 7.3.0-4-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 22 Oct 2026 17:30:02 +0000 x86_64
+[34m[0.000 info CardinalCommon.cpp:668 Initializer] [0mBinary filename: /home/admin/AudioFOSS/vst3/CardinalSynth.vst3/Contents/x86_64-linux/CardinalSynth.so
+[34m[0.000 info CardinalCommon.cpp:670 Initializer] [0mBundle path: /home/admin/AudioFOSS/vst3/CardinalSynth.vst3
+[34m[0.000 info CardinalCommon.cpp:676 Initializer] [0mSystem directory: /usr/share/cardinal
+[34m[0.000 info CardinalCommon.cpp:677 Initializer] [0mUser directory: /home/admin/Documents/Cardinal
+[34m[0.000 info CardinalCommon.cpp:678 Initializer] [0mTemplate patch: /home/admin/Documents/Cardinal/templates/synth.vcv
+[34m[0.000 info CardinalCommon.cpp:679 Initializer] [0mSystem template patch: /usr/share/cardinal/patches/templates/synth.vcv
+[dpf] System directory "/usr/share/cardinal" does not exist.
+Make sure Cardinal was downloaded and installed correctly.
+[34m[0.000 info CardinalCommon.cpp:693 Initializer] [0mInitializing plugins
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Cardinal
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Cardinal.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Fundamental
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Fundamental.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 21kHz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/21kHz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 8Mode
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/8Mode.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AaronStatic
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AaronStatic.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module admiral
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/admiral.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module alefsbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/alefsbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Algoritmarte
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Algoritmarte.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AmalgamatedHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AmalgamatedHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AnimatedCircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AnimatedCircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ArableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ArableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AriaModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AriaModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AS
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AS.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AudibleInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AudibleInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Autinn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Autinn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Axioma
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Axioma.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BaconPlugs
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BaconPlugs.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Befaco
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Befaco.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Bidoo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Bidoo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Biset
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Biset.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BogaudioModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BogaudioModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CatroModulo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CatroModulo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module cf
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/cf.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ChowDSP
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ChowDSP.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Computerscare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Computerscare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CVfunk
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CVfunk.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module dBiz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/dBiz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module DHE-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/DHE-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module eightfold
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/eightfold.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module EnigmaCurry
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/EnigmaCurry.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ESeries
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ESeries.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ExpertSleepers-Encoders
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ExpertSleepers-Encoders.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Extratone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Extratone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module FehlerFabrik
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/FehlerFabrik.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module forsitan-modulare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/forsitan-modulare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GlueTheGiant
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GlueTheGiant.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GoodSheperd
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GoodSheperd.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GrandeModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GrandeModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module h4n4-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/h4n4-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HamptonHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HamptonHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HetrickCV
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HetrickCV.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ImpromptuModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ImpromptuModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ihtsyn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ihtsyn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module JW-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/JW-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module kocmoc
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/kocmoc.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LifeFormModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LifeFormModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LilacLoop
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LilacLoop.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LittleUtils
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LittleUtils.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LomasModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LomasModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LyraeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LyraeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Meander
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Meander.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MindMeldModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MindMeldModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ML_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ML_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MockbaModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MockbaModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Mog
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Mog.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module mscHack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/mscHack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MSM
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MSM.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MUS-X
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MUS-X.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module myth-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/myth-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module nonlinearcircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/nonlinearcircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Orbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Orbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ParableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ParableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PathSet
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PathSet.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PdArray
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PdArray.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PinkTrombone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PinkTrombone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Prism
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Prism.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rackwindows
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rackwindows.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rcm-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rcm-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module RebelTech
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/RebelTech.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module repelzen
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/repelzen.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Sapphire
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Sapphire.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module sonusmodular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/sonusmodular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module StarlingVia
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/StarlingVia.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stocaudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stocaudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stoermelder-packone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stoermelder-packone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module surgext
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/surgext.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module unless_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/unless_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ValleyAudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ValleyAudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Venom
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Venom.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module voxglitch
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/voxglitch.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WhatTheRack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WhatTheRack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WSTD-Drums
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WSTD-Drums.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZetaCarinaeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZetaCarinaeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZZC
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZZC.json does not exist
+[34m[0.000 info plugins.cpp:3803 initStaticPlugins] [0mHave 0 modules from 0 plugin collections
+[34m[0.000 info CardinalCommon.cpp:696 Initializer] [0mInitializing plugin browser DB
+[34m[0.000 info CardinalCommon.cpp:713 Initializer] [0mOSC Remote control is not available on plugin variants
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/synth.vcv
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/synth.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/synth.vcv: Failed to open '/usr/share/cardinal/patches/templates/synth.vcv'
+[34m[0.001 info CardinalCommon.cpp:758 loadSettings] [0mLoading settings
+[34m[0.001 info Rack/src/settings.cpp:519 load] [0mLoading settings /home/admin/.config/Cardinal/synth.json
+[34m[0.012 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/synth.vcv
+[34m[0.012 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/synth.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/synth.vcv: Failed to open '/usr/share/cardinal/patches/templates/synth.vcv'
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[34m[0.000 info CardinalCommon.cpp:666 Initializer] [0mCardinal VST3 26.02, compatible with Rack version 2.4.1
+[34m[0.000 info CardinalCommon.cpp:667 Initializer] [0mLinux 7.3.0-4-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 22 Oct 2026 17:30:02 +0000 x86_64
+[34m[0.000 info CardinalCommon.cpp:668 Initializer] [0mBinary filename: /home/admin/AudioFOSS/vst3/Cardinal.vst3/Contents/x86_64-linux/Cardinal.so
+[34m[0.000 info CardinalCommon.cpp:670 Initializer] [0mBundle path: /home/admin/AudioFOSS/vst3/Cardinal.vst3
+[34m[0.000 info CardinalCommon.cpp:676 Initializer] [0mSystem directory: /usr/share/cardinal
+[34m[0.000 info CardinalCommon.cpp:677 Initializer] [0mUser directory: /home/admin/Documents/Cardinal
+[34m[0.000 info CardinalCommon.cpp:678 Initializer] [0mTemplate patch: /home/admin/Documents/Cardinal/templates/main.vcv
+[34m[0.000 info CardinalCommon.cpp:679 Initializer] [0mSystem template patch: /usr/share/cardinal/patches/templates/main.vcv
+[dpf] System directory "/usr/share/cardinal" does not exist.
+Make sure Cardinal was downloaded and installed correctly.
+[34m[0.000 info CardinalCommon.cpp:693 Initializer] [0mInitializing plugins
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Cardinal
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Cardinal.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Fundamental
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Fundamental.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 21kHz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/21kHz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 8Mode
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/8Mode.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AaronStatic
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AaronStatic.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module admiral
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/admiral.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module alefsbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/alefsbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Algoritmarte
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Algoritmarte.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AmalgamatedHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AmalgamatedHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AnimatedCircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AnimatedCircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ArableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ArableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AriaModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AriaModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AS
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AS.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AudibleInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AudibleInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Autinn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Autinn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Axioma
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Axioma.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BaconPlugs
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BaconPlugs.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Befaco
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Befaco.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Bidoo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Bidoo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Biset
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Biset.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BogaudioModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BogaudioModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CatroModulo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CatroModulo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module cf
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/cf.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ChowDSP
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ChowDSP.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Computerscare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Computerscare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CVfunk
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CVfunk.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module dBiz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/dBiz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module DHE-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/DHE-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module eightfold
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/eightfold.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module EnigmaCurry
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/EnigmaCurry.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ESeries
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ESeries.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ExpertSleepers-Encoders
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ExpertSleepers-Encoders.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Extratone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Extratone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module FehlerFabrik
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/FehlerFabrik.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module forsitan-modulare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/forsitan-modulare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GlueTheGiant
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GlueTheGiant.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GoodSheperd
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GoodSheperd.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GrandeModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GrandeModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module h4n4-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/h4n4-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HamptonHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HamptonHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HetrickCV
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HetrickCV.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ImpromptuModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ImpromptuModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ihtsyn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ihtsyn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module JW-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/JW-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module kocmoc
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/kocmoc.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LifeFormModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LifeFormModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LilacLoop
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LilacLoop.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LittleUtils
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LittleUtils.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LomasModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LomasModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LyraeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LyraeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Meander
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Meander.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MindMeldModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MindMeldModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ML_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ML_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MockbaModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MockbaModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Mog
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Mog.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module mscHack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/mscHack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MSM
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MSM.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MUS-X
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MUS-X.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module myth-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/myth-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module nonlinearcircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/nonlinearcircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Orbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Orbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ParableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ParableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PathSet
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PathSet.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PdArray
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PdArray.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PinkTrombone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PinkTrombone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Prism
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Prism.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rackwindows
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rackwindows.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rcm-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rcm-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module RebelTech
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/RebelTech.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module repelzen
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/repelzen.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Sapphire
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Sapphire.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module sonusmodular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/sonusmodular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module StarlingVia
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/StarlingVia.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stocaudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stocaudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stoermelder-packone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stoermelder-packone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module surgext
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/surgext.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module unless_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/unless_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ValleyAudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ValleyAudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Venom
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Venom.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module voxglitch
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/voxglitch.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WhatTheRack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WhatTheRack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WSTD-Drums
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WSTD-Drums.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZetaCarinaeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZetaCarinaeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZZC
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZZC.json does not exist
+[34m[0.000 info plugins.cpp:3803 initStaticPlugins] [0mHave 0 modules from 0 plugin collections
+[34m[0.000 info CardinalCommon.cpp:696 Initializer] [0mInitializing plugin browser DB
+[34m[0.000 info CardinalCommon.cpp:713 Initializer] [0mOSC Remote control is not available on plugin variants
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/main.vcv
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/main.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/main.vcv: Failed to open '/usr/share/cardinal/patches/templates/main.vcv'
+[34m[0.001 info CardinalCommon.cpp:758 loadSettings] [0mLoading settings
+[34m[0.001 info Rack/src/settings.cpp:519 load] [0mLoading settings /home/admin/.config/Cardinal/main.json
+[34m[0.012 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/main.vcv
+[34m[0.012 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/main.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/main.vcv: Failed to open '/usr/share/cardinal/patches/templates/main.vcv'
+[34m[0.012 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[0.013 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[0.013 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[0.013 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[0.013 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[0.013 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[0.013 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[0.013 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[0.013 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[0.013 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[0.013 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[0.013 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[0.013 info CardinalCommon.cpp:730 ~Initializer] [0mSave settings
+[34m[0.013 info Rack/src/settings.cpp:498 save] [0mSaving settings /home/admin/.config/Cardinal/main.json
+[34m[0.013 info CardinalCommon.cpp:734 ~Initializer] [0mClearing asset paths
+[34m[0.013 info CardinalCommon.cpp:739 ~Initializer] [0mDestroying plugins
+[34m[0.013 info CardinalCommon.cpp:742 ~Initializer] [0mDestroying colourized assets
+[34m[0.013 info CardinalCommon.cpp:745 ~Initializer] [0mDestroying settings
+[34m[0.013 info CardinalCommon.cpp:748 ~Initializer] [0mDestroying logger
+[34m[0.000 info CardinalCommon.cpp:666 Initializer] [0mCardinal VST3 26.02, compatible with Rack version 2.4.1
+[34m[0.000 info CardinalCommon.cpp:667 Initializer] [0mLinux 7.3.0-4-cachyos #1 SMP PREEMPT_DYNAMIC Thu, 22 Oct 2026 17:30:02 +0000 x86_64
+[34m[0.000 info CardinalCommon.cpp:668 Initializer] [0mBinary filename: /home/admin/AudioFOSS/vst3/Cardinal.vst3/Contents/x86_64-linux/Cardinal.so
+[34m[0.000 info CardinalCommon.cpp:670 Initializer] [0mBundle path: /home/admin/AudioFOSS/vst3/Cardinal.vst3
+[34m[0.000 info CardinalCommon.cpp:676 Initializer] [0mSystem directory: /usr/share/cardinal
+[34m[0.000 info CardinalCommon.cpp:677 Initializer] [0mUser directory: /home/admin/Documents/Cardinal
+[34m[0.000 info CardinalCommon.cpp:678 Initializer] [0mTemplate patch: /home/admin/Documents/Cardinal/templates/main.vcv
+[34m[0.000 info CardinalCommon.cpp:679 Initializer] [0mSystem template patch: /usr/share/cardinal/patches/templates/main.vcv
+[dpf] System directory "/usr/share/cardinal" does not exist.
+Make sure Cardinal was downloaded and installed correctly.
+[34m[0.000 info CardinalCommon.cpp:693 Initializer] [0mInitializing plugins
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Cardinal
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Cardinal.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Fundamental
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Fundamental.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 21kHz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/21kHz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module 8Mode
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/8Mode.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AaronStatic
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AaronStatic.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module admiral
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/admiral.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module alefsbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/alefsbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Algoritmarte
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Algoritmarte.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AmalgamatedHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AmalgamatedHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AnimatedCircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AnimatedCircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ArableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ArableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AriaModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AriaModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AS
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AS.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module AudibleInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/AudibleInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Autinn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Autinn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Axioma
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Axioma.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BaconPlugs
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BaconPlugs.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Befaco
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Befaco.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Bidoo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Bidoo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Biset
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Biset.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module BogaudioModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/BogaudioModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CatroModulo
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CatroModulo.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module cf
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/cf.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ChowDSP
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ChowDSP.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Computerscare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Computerscare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module CVfunk
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/CVfunk.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module dBiz
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/dBiz.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module DHE-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/DHE-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module eightfold
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/eightfold.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module EnigmaCurry
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/EnigmaCurry.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ESeries
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ESeries.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ExpertSleepers-Encoders
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ExpertSleepers-Encoders.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Extratone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Extratone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module FehlerFabrik
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/FehlerFabrik.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module forsitan-modulare
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/forsitan-modulare.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GlueTheGiant
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GlueTheGiant.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GoodSheperd
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GoodSheperd.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module GrandeModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/GrandeModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module h4n4-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/h4n4-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HamptonHarmonics
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HamptonHarmonics.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module HetrickCV
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/HetrickCV.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ImpromptuModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ImpromptuModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ihtsyn
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ihtsyn.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module JW-Modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/JW-Modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module kocmoc
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/kocmoc.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LifeFormModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LifeFormModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LilacLoop
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LilacLoop.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LittleUtils
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LittleUtils.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LomasModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LomasModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module LyraeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/LyraeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Meander
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Meander.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MindMeldModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MindMeldModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ML_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ML_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MockbaModular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MockbaModular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Mog
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Mog.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module mscHack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/mscHack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MSM
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MSM.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module MUS-X
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/MUS-X.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module myth-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/myth-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module nonlinearcircuits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/nonlinearcircuits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Orbits
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Orbits.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ParableInstruments
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ParableInstruments.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PathSet
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PathSet.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PdArray
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PdArray.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module PinkTrombone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/PinkTrombone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Prism
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Prism.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rackwindows
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rackwindows.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module rcm-modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/rcm-modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module RebelTech
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/RebelTech.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module repelzen
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/repelzen.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Sapphire
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Sapphire.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module sonusmodular
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/sonusmodular.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module StarlingVia
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/StarlingVia.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stocaudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stocaudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module stoermelder-packone
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/stoermelder-packone.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module surgext
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/surgext.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module unless_modules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/unless_modules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ValleyAudio
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ValleyAudio.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module Venom
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/Venom.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module voxglitch
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/voxglitch.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WhatTheRack
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WhatTheRack.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module WSTD-Drums
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/WSTD-Drums.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZetaCarinaeModules
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZetaCarinaeModules.json does not exist
+[35m[0.000 debug plugins.cpp:1065 StaticPluginLoader] [0mLoading plugin module ZZC
+[dpf] Manifest file /usr/share/cardinal/PluginManifests/ZZC.json does not exist
+[34m[0.000 info plugins.cpp:3803 initStaticPlugins] [0mHave 0 modules from 0 plugin collections
+[34m[0.000 info CardinalCommon.cpp:696 Initializer] [0mInitializing plugin browser DB
+[34m[0.000 info CardinalCommon.cpp:713 Initializer] [0mOSC Remote control is not available on plugin variants
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/main.vcv
+[34m[0.001 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/main.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/main.vcv: Failed to open '/usr/share/cardinal/patches/templates/main.vcv'
+[34m[0.001 info CardinalCommon.cpp:758 loadSettings] [0mLoading settings
+[34m[0.001 info Rack/src/settings.cpp:519 load] [0mLoading settings /home/admin/.config/Cardinal/main.json
+[34m[0.011 info Rack/src/patch.cpp:273 load] [0mLoading patch /home/admin/Documents/Cardinal/templates/main.vcv
+[34m[0.011 info Rack/src/patch.cpp:273 load] [0mLoading patch /usr/share/cardinal/patches/templates/main.vcv
+[dpf] [Cardinal] osdialog_message called 0 0 Could not load system template patch, clearing rack: Unarchiver could not open archive /usr/share/cardinal/patches/templates/main.vcv: Failed to open '/usr/share/cardinal/patches/templates/main.vcv'
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+[dpf] assertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3427, value 130
+Using RNN model with AVX SIMD instructions!
+Using RNN model with AVX SIMD instructions!
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[WRN] Failed to obtain plugin configuration: error=6
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[31massertion failure: "cc >= 0 && cc < 130" in file ../../dpf/distrho/src/DistrhoPluginVST3.cpp, line 3406, value 130[0m
+[34m[1.320 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[1.320 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[1.320 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[1.320 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[1.320 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[1.320 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[1.375 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[1.375 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[1.375 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[1.375 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[1.375 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[1.375 info override/context.cpp:68 ~Context] [0mDeleting engine
+[34m[1.439 info override/context.cpp:48 ~Context] [0mDeleting window
+[34m[1.439 info override/context.cpp:52 ~Context] [0mDeleting patch manager
+[34m[1.439 info override/context.cpp:56 ~Context] [0mDeleting scene
+[34m[1.439 info override/context.cpp:60 ~Context] [0mDeleting event state
+[34m[1.439 info override/context.cpp:64 ~Context] [0mDeleting history state
+[34m[1.439 info override/context.cpp:68 ~Context] [0mDeleting engine
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
+JUCE Assertion failure in juce_Singleton.h:50
