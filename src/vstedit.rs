@@ -50,7 +50,7 @@
 //! verified-paint X11 container.
 
 use std::ffi::{c_void, CString};
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_long, c_ulong};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -114,6 +114,12 @@ extern "C" {
         depth: *mut u32,
     ) -> c_int;
     fn XGetWindowAttributes(d: *mut Display, w: XWindow, attrs: *mut XWindowAttributes) -> c_int;
+    fn XChangeWindowAttributes(
+        d: *mut Display,
+        w: XWindow,
+        valuemask: c_ulong,
+        attrs: *mut XSetWinAttrs,
+    ) -> c_int;
     fn XSetErrorHandler(
         handler: Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
     ) -> Option<extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
@@ -238,6 +244,94 @@ extern "C" {
 #[repr(C, align(8))]
 struct XWindowAttributes {
     raw: [u8; 136],
+}
+
+/// Prefix of Xutil.h `XSetWindowAttributes` — only the members we ever
+/// request via the value mask are read by Xlib, and the layout through
+/// `override_redirect` is exactly the C one (5 × unsigned long, then
+/// two Bools). v24: the crash-guard probe sets `override_redirect` so
+/// the WM never touches the throwaway window: no frame, no taskbar
+/// entry, no focus steal, and — the user-visible half of the v23
+/// regression — no flash of a window that exists only to crash.
+#[repr(C)]
+struct XSetWinAttrs {
+    background_pixmap: c_ulong,
+    background_pixel: c_ulong,
+    border_pixmap: c_ulong,
+    border_pixel: c_ulong,
+    event_mask: c_long,
+    do_not_use: c_int,
+    override_redirect: c_int,
+}
+
+/// X.h `CWOverrideRedirect`.
+const CW_OVERRIDE_REDIRECT: c_ulong = 1 << 8;
+
+/// v24: set once in the crash-guard probe child: editor containers are
+/// created INITIALLY UNMAPPED, so a safety check can never paint a
+/// window the user sees (the "opens, closes, opens again" flash). The
+/// plugin still creates, attaches, and maps its OWN view child — which
+/// is what actually runs the display-enumeration and toolkit bootstrap
+/// the guard exists to catch (ADLplug's findDisplays SIGSEGV) — the
+/// plugin simply draws into an unmapped parent nobody can see.
+/// (An off-screen position is NOT an option here: this Xwayland recenters
+/// every window on the screen regardless of override_redirect —
+/// measured, v24.) Regular host windows are untouched: slooper never
+/// maps the container itself, so normal opens behave exactly as before.
+static PROBE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn probe_mode() -> bool {
+    PROBE_MODE.load(Ordering::SeqCst)
+}
+
+/// Mark this process as a throwaway editor probe (call before any
+/// window exists; `probe_child` does).
+pub fn enter_probe_mode() {
+    PROBE_MODE.store(true, Ordering::SeqCst);
+}
+
+/// Test seam: set probe mode, return the previous value.
+pub fn set_probe_mode(v: bool) -> bool {
+    PROBE_MODE.swap(v, Ordering::SeqCst)
+}
+
+/// Test hook (v24): is container `xid` currently mapped/visible? The
+/// crash-guard contract is that a probe container NEVER reports `true`
+/// (it is created unmapped); a normal host container reports `true`
+/// once it paints. `None` if the window is gone.
+pub fn container_is_viewable(xid: u64) -> Option<bool> {
+    if !x11_available() {
+        return None;
+    }
+    unsafe {
+        let d = XOpenDisplay(ptr::null());
+        if d.is_null() {
+            return None;
+        }
+        let mut attrs = XWindowAttributes::new();
+        let got = XGetWindowAttributes(d, xid as XWindow, &mut attrs) != 0;
+        let viewable = got && attrs.map_state() == IS_VIEWABLE;
+        XCloseDisplay(d);
+        if got {
+            Some(viewable)
+        } else {
+            None
+        }
+    }
+}
+
+/// Make `win` WM-invisible (override-redirect). Call BEFORE `XMapWindow`.
+unsafe fn hide_from_wm(d: *mut Display, win: XWindow) {
+    let attrs = XSetWinAttrs {
+        background_pixmap: 0,
+        background_pixel: 0,
+        border_pixmap: 0,
+        border_pixel: 0,
+        event_mask: 0,
+        do_not_use: 0,
+        override_redirect: 1,
+    };
+    XChangeWindowAttributes(d, win, CW_OVERRIDE_REDIRECT, &attrs as *const _ as *mut _);
 }
 
 /// X.h map-state enum.
@@ -693,6 +787,10 @@ enum Phase {
 /// per editor every step — with the 6 ms responsiveness tick it would
 /// dominate, and healthy editors do not need 160 Hz existence checks.
 const HOUSEKEEPING: Duration = Duration::from_millis(500);
+/// v24: model-sync beat (VST3 shadow editors) — knob-freshness cadence,
+/// see `Editor3::step`. 150 ms is imperceptible and cheap next to the
+/// 60 fps editor pump it rides.
+const MODEL_SYNC: Duration = Duration::from_millis(150);
 /// ~4 s of housekeeping ticks without proof of life means the editor
 /// died (same patience as the old 120 × 30 ms step counting).
 const DEAD_TICKS_PATIENCE: u32 = 8;
@@ -748,7 +846,16 @@ unsafe fn make_editor(
     // Border width 0 and a SENTINEL background/border (see
     // CONTAINER_BG): the pixel probe must be able to tell "plugin
     // drew here" apart from "empty window furniture".
+    // v24: the crash-guard probe creates its container UNMAPPED and
+    // override-redirect — `effEditOpen` still runs the toolkit bootstrap
+    // (JUCE's findDisplays: the ADLplug SIGSEGV) and its view child
+    // maps, but a child of an unmapped parent can never reach the
+    // screen. Off-screen positions are not an option: this Xwayland
+    // recenters every window regardless (measured, v24).
     let win = XCreateSimpleWindow(d, root, 0, 0, w0, h0, 0, CONTAINER_BG, CONTAINER_BG);
+    if probe_mode() {
+        hide_from_wm(d, win);
+    }
     // The container is mapped BARE — no window name, no WM protocols,
     // no event selection — and that is load-bearing: any of those
     // requests issued before `effEditOpen` change how the window manager
@@ -760,7 +867,9 @@ unsafe fn make_editor(
     shared.xid.store(win as usize, Ordering::SeqCst);
     let wm_delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
     let wm_protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
-    XMapWindow(d, win);
+    if !probe_mode() {
+        XMapWindow(d, win);
+    }
     XSync(d, 0);
     let dbg = std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some();
     let opened = handle.dispatch(EFF_EDIT_OPEN, 0, 0, win as usize as *mut c_void, 0.0);
@@ -1099,6 +1208,23 @@ struct Editor3 {
     /// (a performEdit reached us, or the plugin raised a restartComponent
     /// request) — only then is its state chunk worth harvesting at close.
     changed: bool,
+    /// Cell-order writability mirror of `ids` (from `descs`): only
+    /// writable parameters take part in the v24 model-sync and its
+    /// edited set — read-only readouts (meters, GR) must never be
+    /// pushed back into the sound.
+    writable: Vec<bool>,
+    /// v24: last observed shadow-model value per cell (see `step`'s
+    /// model-sync). Diffs against this are edits INSIDE the plugin.
+    shadow_last: Vec<f32>,
+    /// v24: the parameter ids this shadow has actually seen move
+    /// (reported by the UI, injected, or model-diffed). The harvested
+    /// patch carries ONLY these: whole-model patches replanted resting
+    /// MIDI-CC/bender values on reopen and silenced the synth (the v23
+    /// "no sound until swapped out and back" regression).
+    edited: std::collections::HashSet<u32>,
+    /// Model-sync beat (finer than [`HOUSEKEEPING`]: half a second of
+    /// lag on every knob would read as "only updates when closed").
+    sync: Instant,
 }
 
 /// Open a VST3 plugin's own editor window. Mirrors [`open_editor`] exactly
@@ -1108,6 +1234,7 @@ struct Editor3 {
 /// same GUI-thread ownership. `initial` carries (id, normalized value)
 /// pairs copied from the sounding instance's parameter cells; `ids` is the
 /// cell-order id list used to route the plugin's edits back.
+#[allow(clippy::too_many_arguments)] // (path, title, sr, seed, state) + (ids, writable, cells) — the editor's full identity, one per slot
 pub fn open_vst3_editor(
     path: &str,
     title: &str,
@@ -1115,6 +1242,7 @@ pub fn open_vst3_editor(
     initial: Vec<(u32, f64)>,
     state: Option<Vec<u8>>,
     ids: Vec<u32>,
+    writable: Vec<bool>,
     params: Arc<crate::vsthost::VstParams>,
 ) -> Result<EditorWindow, String> {
     if !x11_available() {
@@ -1129,9 +1257,19 @@ pub fn open_vst3_editor(
         REG3.with(|reg| {
             // SAFETY: runs on the GUI thread, the sole owner of all
             // editor state (see module docs).
-            if let Some(e) =
-                unsafe { make_editor3(path_j, title, sample_rate, initial, state, ids, params, s2) }
-            {
+            if let Some(e) = unsafe {
+                make_editor3(
+                    path_j,
+                    title,
+                    sample_rate,
+                    initial,
+                    state,
+                    ids,
+                    writable,
+                    params,
+                    s2,
+                )
+            } {
                 reg.borrow_mut().push(e);
             }
         });
@@ -1175,19 +1313,23 @@ pub fn inject_shadow_edit(xid: u64, cell: usize, v: f32) {
     })
 }
 
-/// Route every edit the plugin UI reported into the shared parameter
-/// cells (slider path: atomic write + generation bump). Free function: it
-/// borrows the plugin and the cells separately (the state machine holds
-/// the plugin mutably while pumping).
-fn drain_param_edits3(
-    plugin: &vst3_host::Plugin,
-    ids: &[u32],
-    params: &crate::vsthost::VstParams,
-) -> bool {
-    let changes = plugin.get_parameter_changes();
-    let touched = !changes.is_empty();
-    route_param_edits3(changes, ids, params);
-    touched
+/// Test hook (v24): change the shadow MODEL for cell `cell` and write
+/// NOTHING else — exactly what a vendor UI that never reports (Surge XT,
+/// Overtonium) does to its own instance. The model-sync must notice and
+/// carry the edit into the cells on its own; if a test passes with this
+/// but not `inject_shadow_edit`, the sync is working.
+pub fn mutate_shadow_model(xid: u64, cell: usize, v: f32) {
+    crate::vsthost::post(move || {
+        REG3.with(|reg| {
+            for e in reg.borrow_mut().iter_mut() {
+                if e.shared.xid.load(Ordering::SeqCst) as u64 == xid {
+                    if let (Some(p), Some(&id)) = (e.plugin.as_mut(), e.ids.get(cell)) {
+                        let _ = p.set_parameter(id, v as f64);
+                    }
+                }
+            }
+        });
+    })
 }
 
 /// The host half of VST3 editor→sound sync: an edit reported as
@@ -1238,6 +1380,7 @@ unsafe fn make_editor3(
     initial: Vec<(u32, f64)>,
     state: Option<Vec<u8>>,
     ids: Vec<u32>,
+    writable: Vec<bool>,
     params: Arc<crate::vsthost::VstParams>,
     shared: Shared,
 ) -> Option<Editor3> {
@@ -1301,11 +1444,24 @@ unsafe fn make_editor3(
     shared.width.store(w0, Ordering::SeqCst);
     shared.height.store(h0, Ordering::SeqCst);
     let root = root_window(d);
+    // v24: the crash-guard probe NEVER shows a window. The container is
+    // created unmapped and override-redirect: the plugin still creates
+    // and attaches its view child (that is what runs findDisplays / the
+    // toolkit bootstrap the guard exists to catch — ADLplug's SIGSEGV),
+    // but a child of an unmapped parent can never reach the screen.
+    // Position tricks are useless here: this Xwayland recenters every
+    // window on-screen regardless of coordinates or redirect flag
+    // (measured, v24). Normal opens map the container right after.
     let win = XCreateSimpleWindow(d, root, 0, 0, w0, h0, 0, CONTAINER_BG, CONTAINER_BG);
+    if probe_mode() {
+        hide_from_wm(d, win);
+    }
     shared.xid.store(win as usize, Ordering::SeqCst);
     let wm_delete = XInternAtom(d, c"WM_DELETE_WINDOW".as_ptr(), 0);
     let wm_protocols = XInternAtom(d, c"WM_PROTOCOLS".as_ptr(), 0);
-    XMapWindow(d, win);
+    if !probe_mode() {
+        XMapWindow(d, win);
+    }
     XSync(d, 0);
     {
         let _loader = crate::vsthost::vst_loader_lock();
@@ -1338,6 +1494,10 @@ unsafe fn make_editor3(
         house: Instant::now(),
         dead_ticks: 0,
         changed: false,
+        writable,
+        shadow_last: Vec::new(),
+        edited: std::collections::HashSet::new(),
+        sync: Instant::now(),
     })
 }
 
@@ -1365,8 +1525,13 @@ impl Editor3 {
                         return;
                     }
                     plugin.service_run_loop();
-                    if drain_param_edits3(plugin, &self.ids, &self.params) {
-                        self.changed = true;
+                    {
+                        let edits = plugin.get_parameter_changes();
+                        if !edits.is_empty() {
+                            self.edited.extend(edits.iter().map(|(id, _)| *id));
+                            route_param_edits3(edits, &self.ids, &self.params);
+                            self.changed = true;
+                        }
                     }
                     // Steinberg's X11 view creates a real child window;
                     // the same live-child / painted-pixel verdict as VST2.
@@ -1431,8 +1596,53 @@ impl Editor3 {
                     // service (timers + registered X fds), and the edit
                     // drain is the slider path back into the sound.
                     plugin.service_run_loop();
-                    if drain_param_edits3(plugin, &self.ids, &self.params) {
-                        self.changed = true;
+                    {
+                        let edits = plugin.get_parameter_changes();
+                        if !edits.is_empty() {
+                            self.edited.extend(edits.iter().map(|(id, _)| *id));
+                            route_param_edits3(edits, &self.ids, &self.params);
+                            self.changed = true;
+                        }
+                    }
+                    // v24 model-sync: vendor UIs that mutate their own
+                    // instance instead of reporting (Surge XT, Overtonium:
+                    // their toolkits drive the controller/processor pair
+                    // directly and never call performEdit) still change
+                    // the SOUND live — diff the shadow's own model against
+                    // its last beat and push what moved into the cells.
+                    // The same diff feeds `edited`, so the harvested patch
+                    // covers exactly what changed and nothing resting.
+                    if self.sync.elapsed() >= MODEL_SYNC {
+                        self.sync = Instant::now();
+                        if let Ok(model) = plugin.get_parameters() {
+                            let mut touched = false;
+                            if self.shadow_last.len() != model.len() {
+                                // first beat (or the plugin renumbered):
+                                // baseline without pushing — the baseline
+                                // IS the seeded state, pushing it would
+                                // stomp cells with the plugin's defaults.
+                                self.shadow_last =
+                                    model.iter().map(|x| x.value as f32).collect();
+                            } else {
+                                for (k, pm) in model.iter().enumerate() {
+                                    let v = pm.value as f32;
+                                    if (self.shadow_last[k] - v).abs() <= 1.0 / 8192.0 {
+                                        continue;
+                                    }
+                                    self.shadow_last[k] = v;
+                                    if self.writable.get(k).copied().unwrap_or(false) {
+                                        if let Some(&id) = self.ids.get(k) {
+                                            self.edited.insert(id);
+                                            self.params.set(k, v);
+                                            touched = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if touched {
+                                self.changed = true;
+                            }
+                        }
                     }
                     // The plugin may request a size change (e.g. the
                     // view only commits its real rect once mapped).
@@ -1531,7 +1741,14 @@ impl Editor3 {
 /// and the Live phase calls it on a timer while the window is open (v22
 /// real-time persistence), so a crash or WM kill can never lose the
 /// visible patch more than a couple of seconds.
-fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: &Shared) {
+fn harvest3(
+    p: &mut vst3_host::Plugin,
+    sr: u32,
+    dbg: bool,
+    title: &str,
+    shared: &Shared,
+    edited: &std::collections::HashSet<u32>,
+) {
     // v20 PROBE FACT (v20_chunkdiff example): host-set parameter values
     // are NOT part of a plugin's serializable state until the plugin
     // has actually RUN audio with them — wolf-shaper and 3BandEQ wrote
@@ -1561,21 +1778,32 @@ fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: 
     }
     match p.save_state() {
         Ok(bytes) => {
-            // v23: ride-along parameter snapshot — the shadow's model
-            // values (id, normalized) at the exact moment of the harvest.
-            // This is what makes chunk-omitting vendors survive the
-            // rebuild (see `EditorWindow::take_patch`).
-            let psnap = p
-                .get_parameters()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|x| (x.id, x.value as f32))
-                .collect();
-            if let (Ok(mut cell), Ok(mut pcell)) =
-                (shared.state.lock(), shared.params.lock())
-            {
-                *cell = Some(bytes);
-                *pcell = Some(psnap);
+            match p.get_parameters() {
+                Ok(all) => {
+                    // v24: ride-along parameter snapshot — but ONLY the
+                    // params this shadow actually saw move (the v23
+                    // whole-model snapshot replanted resting MIDI-CC /
+                    // bender values on reopen and silenced the synth).
+                    // With a chunk that carries no values, this edited
+                    // set is exactly the user's edits; with one that
+                    // does, it overrides just what was touched.
+                    let psnap: Vec<(u32, f32)> = all
+                        .into_iter()
+                        .filter(|x| edited.contains(&x.id))
+                        .map(|x| (x.id, x.value as f32))
+                        .collect();
+                    if let (Ok(mut cell), Ok(mut pcell)) =
+                        (shared.state.lock(), shared.params.lock())
+                    {
+                        *cell = Some(bytes);
+                        *pcell = Some(psnap);
+                    }
+                }
+                Err(_) => {
+                    if let Ok(mut cell) = shared.state.lock() {
+                        *cell = Some(bytes);
+                    }
+                }
             }
         }
         Err(e) => {
@@ -1592,13 +1820,14 @@ fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: 
             return;
         }
         if let Some(p) = self.plugin.as_mut() {
-            Self::harvest3(p, self.sr, self.dbg, &self.title, &self.shared);
+            Self::harvest3(p, self.sr, self.dbg, &self.title, &self.shared, &self.edited);
         }
     }
 
     /// Backing for [`inject_shadow_edit`]: set the shadow model parameter
     /// for cell `cell` and mirror it into the shared cells (the identical
-    /// route a plugin-UI `performEdit` takes through `drain_param_edits3`).
+    /// route a plugin-UI `performEdit` takes through the edit drain), and
+    /// record the id as edited so it lands in the harvested patch.
     fn inject_edit(&mut self, cell: usize, v: f32) -> bool {
         let Some(id) = self.ids.get(cell).copied() else {
             return false;
@@ -1609,6 +1838,10 @@ fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: 
         };
         if ok {
             self.changed = true;
+            self.edited.insert(id);
+            if let Some(slot) = self.shadow_last.get_mut(cell) {
+                *slot = v;
+            }
             self.params.set(cell, v);
         }
         ok
@@ -1677,6 +1910,10 @@ pub fn x11_available() -> bool {
 /// Exit-code protocol: 0 = survived (or nothing to test), 2 = plugin did
 /// not load in the child (not an editor verdict). Crashes exit by signal.
 pub fn probe_child(spec: &str) -> i32 {
+    // v24: every window this process creates is throwaway — park it
+    // off-screen and WM-invisible so the safety check is never seen
+    // (the v23 "opens, closes, opens again" flash).
+    enter_probe_mode();
     // Two env vars on purpose: env strings are NUL-terminated, and paths
     // may legally contain tabs — `SLOOPER_EDITOR_PROBE` carries only the
     // kind token, `SLOOPER_EDITOR_PROBE_PATH` the plugin path.
@@ -1973,6 +2210,184 @@ mod tests {
             "editor must exit on WM_DELETE_WINDOW (close button)"
         );
         win.close();
+    }
+
+    /// v24 pin (issue 1's mechanism — the Surge XT / Overtonium class):
+    /// vendor UIs that mutate their own shadow instance and report NOTHING
+    /// (no `performEdit`, no report sink). `mutate_shadow_model` is exactly
+    /// such a mutation — model-only, no cell write, no report — so the
+    /// only way the cell can move is the v24 model-sync. The old
+    /// `inject_shadow_edit` wrote the cell itself and could never catch
+    /// this class of dead-live-path bug.
+    #[test]
+    fn v24_model_only_edit_reaches_cells_live() {
+        if !x11_available() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        let kr = dirs_home().join(".vst3/Ultramaster KR-106.vst3");
+        if !kr.is_dir() {
+            eprintln!("skip: no KR-106");
+            return;
+        }
+        let load = crate::vsthost::open(&kr, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("KR-106 loads");
+        let entry = load.entry;
+        let k = entry
+            .descs()
+            .iter()
+            .position(|d| d.writable)
+            .expect("writable param");
+        let mut win = match entry.open_vst3_editor(48_000) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("skip: shadow editor refused ({e})");
+                return;
+            }
+        };
+        let mut painted = false;
+        for _ in 0..100 {
+            if win.open_failed() {
+                break;
+            }
+            if win.painted() && win.xid() != 0 {
+                painted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !painted {
+            eprintln!("skip: KR-106 editor never painted here");
+            win.close();
+            return;
+        }
+        let xid = win.xid();
+        // Let the model-sync capture its baseline (first Live beat)
+        // BEFORE the mutation, so the diff sees a real change.
+        std::thread::sleep(Duration::from_millis(300));
+        mutate_shadow_model(xid, k, 0.83);
+        let mut live = false;
+        for _ in 0..80 {
+            if (entry.params().get(k) - 0.83).abs() < 1e-3 {
+                live = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            live,
+            "issue 1: an edit that exists ONLY in the shadow model must \
+             reach the live cells (model-sync) — this is the whole fix for \
+             vendors that never report"
+        );
+        // Close like a user, then inspect the harvested patch: it must
+        // carry EXACTLY the edited param — every resting CC / bender is
+        // what silenced reopened synths in v23.
+        assert!(request_wm_delete(xid), "WM_DELETE sent");
+        for _ in 0..80 {
+            if win.is_closed() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let patch = win
+            .take_patch()
+            .expect("an edited plugin must hand back a patch");
+        assert_eq!(
+            patch.params,
+            vec![(entry.descs()[k].id, 0.83)],
+            "issue 2: patch must carry exactly the edited param, nothing resting"
+        );
+    }
+
+    /// v24 pin (issue 3): the crash guard must never SHOW a window. In
+    /// probe mode the container is created but never mapped, so it is
+    /// never viewable — while the very same plugin opens fully viewable
+    /// (painted) in normal mode. The off-screen alternative was measured
+    /// dead on this Xwayland (every window is recentered on screen), so
+    /// "unmapped" is the contract; the probe-child e2e test pins that
+    /// unmapped still reproduces vendor crashes (ADLplug SIGSEGV).
+    #[test]
+    fn v24_probe_windows_are_never_viewable() {
+        if !x11_available() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        let wolf = dirs_home().join(".vst3/wolf-shaper.vst3");
+        if !wolf.is_dir() {
+            eprintln!("skip: no wolf-shaper");
+            return;
+        }
+        // Normal mode first: the plugin DOES open viewable (so the probe
+        // assertion below cannot pass by mere brokenness).
+        {
+            let load = crate::vsthost::open(&wolf, crate::vsthost::VstKind::V3, 48_000, None)
+                .expect("wolf loads");
+            let entry = load.entry;
+            let mut win = match entry.open_vst3_editor(48_000) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("skip: shadow editor refused ({e})");
+                    return;
+                }
+            };
+            let mut painted = false;
+            for _ in 0..80 {
+                if win.open_failed() {
+                    break;
+                }
+                if win.painted() && win.xid() != 0 {
+                    painted = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !painted {
+                eprintln!("skip: editor never painted here");
+                win.close();
+                return;
+            }
+            assert_eq!(
+                container_is_viewable(win.xid()),
+                Some(true),
+                "normal container must be viewable once painted"
+            );
+            win.close();
+        }
+        // Probe mode: same plugin, same API — the container must NEVER
+        // be viewable, yet must exist (a live, refused-to-map window is
+        // the crash surface the probe exists to run).
+        let prev = set_probe_mode(true);
+        {
+            let load = crate::vsthost::open(&wolf, crate::vsthost::VstKind::V3, 48_000, None)
+                .expect("wolf loads in probe mode");
+            let entry = load.entry;
+            let mut win = match entry.open_vst3_editor(48_000) {
+                Ok(w) => w,
+                Err(e) => {
+                    set_probe_mode(prev);
+                    panic!("probe-mode open failed: {e}");
+                }
+            };
+            // Give the editor time to build its view (the same window
+            // the real open would show), then judge visibility.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let xid = win.xid();
+            assert_ne!(xid, 0, "probe container must still be created");
+            assert!(
+                !win.painted(),
+                "issue 3: a probe window must never reach painted/viewable"
+            );
+            assert_ne!(
+                container_is_viewable(xid),
+                Some(true),
+                "issue 3: probe container {xid:x} must never be viewable"
+            );
+            win.close();
+        }
+        set_probe_mode(prev);
     }
 
     /// v10.2 pin: `is_viewable` must distinguish a MAPPED window from a

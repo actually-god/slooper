@@ -287,6 +287,12 @@ this project (v10.2):
 
 ## v23: three window bugs users reported, and what the sweep found
 
+> **v24 correction.** The v23 pass fixed the crashes (#3) and part of the
+> rest, but two of its three diagnoses were incomplete and its #2 fix
+> introduced a new bug. Read the **v24** section below as authoritative;
+> the numbered items here are kept for the history of what the sweep
+> actually found.
+
 A 47-plugin sweep (`cargo run --release --example v23_sweep -- jsonl`)
 graded every locally installed plugin on open, parameter count, chunk
 round-trip, and audio. Three user reports mapped to three distinct root
@@ -330,3 +336,54 @@ A 2.9 k-param plugin is unautomatable in a raw list: every automation
 target picker carries a shared search box and renders at most 400 rows;
 the parameter window has its own filter. (`filtered_targets` in
 `src/ui.rs`.)
+
+## v24: the three reports, actually fixed (and the regressions v23 caused)
+
+After updating to v23 the user found #1 unchanged, #2 now produced **silence**
+on reopen, and #3's guard made **every** plugin flash a window. All three
+traced to root causes under the editor path and pinned by new tests.
+
+### 1. Live edits still didn't reach the sound (Overtonium / Surge XT)
+
+The 64→8192 param-cap fix was real but not the whole story. These vendors'
+GUIs drive their **own** controller/processor pair and never call
+`performEdit`, so nothing arrived on the report sink the host drained — the
+sound only changed at close, when the teardown harvest read the model. Fix:
+the shadow editor now runs a **model-sync** every 150 ms — it diffs the
+plugin's own parameter model against its previous beat and pushes what moved
+into the live cells (writable params only, so meters / gain-reduction are
+never pushed back). The `mutate_shadow_model` test changes the model and
+writes nothing else — exactly such a silent vendor — and requires the cell to
+move; the old `inject_shadow_edit` wrote the cell itself and could never catch
+this. Pinned: `v24_model_only_edit_reaches_cells_live`.
+
+### 2. Reopened synth was silent until swapped out and back (KR-106)
+
+v23's patch rode the shadow's **whole** model — every resting MIDI-CC, bender
+and gate param included. Reapplying those normalized resting values on reopen
+(over a chunk that already restored them) zeroed volume/expression → silence;
+binding another synth and back cleared the stale chunk. Fix: the harvested
+patch carries **only the parameters that actually moved** (the model-sync's
+edited set). Untouched params are left exactly as the chunk restores them.
+Pinned by the same test: after one model edit the patch must equal
+`[(edited_id, value)]` — nothing resting.
+
+### 3. Every plugin flashed a window on load (the guard painting itself)
+
+The crash guard opened the plugin in a throwaway child **mapped on-screen**,
+then the safe verdict reopened it — the "opens, closes, opens again" flash,
+for every plugin. Off-screen placement is not an option here: this Xwayland
+recenters every window on the screen regardless of coordinates or
+override-redirect (measured). Fix: the probe creates its container but
+**never maps it** — a child of an unmapped parent cannot reach the screen, yet
+the plugin still builds its view and runs the display-enumeration / idle
+bootstrap the guard exists to catch. Verified: unmapped still reproduces
+ADLplug's SIGSEGV (child dies) and wolf-shaper survives. Pinned by
+`v24_probe_windows_are_never_viewable` (probe never viewable; the same plugin
+does open viewable in normal mode) and the real-binary `v23_probe_child…` e2e.
+
+### Deprecated code removed
+
+`drain_param_edits3` (superseded by the inline drain + model-sync); the v23
+whole-model param snapshot. `open_vst3_editor` gained a `writable` cell map;
+`harvest3` takes the edited set and filters the patch to it.
