@@ -19697,6 +19697,150 @@ mod tests {
         }
     }
 
+    /// Manual visual smoke: renders the automation manager (bars mode, a
+    /// concave curve) headlessly and dumps every painted shape as an SVG to
+    /// $SLOOPER_V26_DUMP (rasterize with ImageMagick -> real pixels, no
+    /// live-window input needed). `cargo test --lib -- --ignored` to run.
+    #[test]
+    #[ignore = "manual visual smoke: set SLOOPER_V26_DUMP=/path/out.svg"]
+    fn v26_dump_manager_svg() {
+        use crate::automation::{Node, Shape};
+        let out_path = std::env::var("SLOOPER_V26_DUMP").expect("set SLOOPER_V26_DUMP=/path.svg");
+        let mut app = headless_app("v26dump");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        let len = app.auto_edit.as_ref().unwrap().len_samples;
+        app.auto_edit.as_mut().unwrap().nodes = vec![
+            Node { t: 0, v: 1.0, s: Shape::Linear },
+            Node { t: len / 4, v: 1.9, s: Shape::Linear },
+            Node { t: len / 2, v: 0.2, s: Shape::Smooth },
+            Node { t: (len * 3) / 4, v: 1.5, s: Shape::Linear },
+            Node { t: len, v: 1.0, s: Shape::Linear },
+        ];
+        app.auto_edit.as_mut().unwrap().len_bars = true;
+        app.auto_edit.as_mut().unwrap().sel = 1;
+        v26_settle(&mut app, &ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut svg = String::from(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1440\" height=\"853\"><rect width=\"1440\" height=\"853\" fill=\"black\"/>",
+        );
+        let col = |c: Color32| -> String {
+            let p = c.to_array();
+            let f = |v: u8| (if p[3] == 255 { v as u32 } else { v as u32 * 255 / p[3].max(1) as u32 }).min(255) as u8;
+            format!(
+                "rgba({},{},{},{:.2})",
+                f(p[0]),
+                f(p[1]),
+                f(p[2]),
+                p[3] as f64 / 255.0
+            )
+        };
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Rect(r) => {
+                    if r.fill == Color32::from_rgb(16, 18, 24) && r.rect.width() > 400.0 {
+                        eprintln!(
+                            "CANVAS {:.1} {:.1} {:.1} {:.1}",
+                            r.rect.min.x,
+                            r.rect.min.y,
+                            r.rect.max.x,
+                            r.rect.max.y
+                        );
+                    }
+                    if r.fill != Color32::TRANSPARENT {
+                        svg.push_str(&format!(
+                            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{}\"/>",
+                            r.rect.min.x,
+                            r.rect.min.y,
+                            r.rect.width(),
+                            r.rect.height(),
+                            col(r.fill)
+                        ));
+                    }
+                    if r.stroke.width > 0.1 {
+                        svg.push_str(&format!(
+                            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\"/>",
+                            r.rect.min.x,
+                            r.rect.min.y,
+                            r.rect.width(),
+                            r.rect.height(),
+                            col(r.stroke.color),
+                            r.stroke.width
+                        ));
+                    }
+                }
+                egui::epaint::Shape::LineSegment { points, stroke } => {
+                    svg.push_str(&format!(
+                        "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"{:.1}\"/>",
+                        points[0].x,
+                        points[0].y,
+                        points[1].x,
+                        points[1].y,
+                        col(stroke.color),
+                        stroke.width.max(1.0)
+                    ));
+                }
+                egui::epaint::Shape::Circle(c) => {
+                    if c.fill != Color32::TRANSPARENT {
+                        svg.push_str(&format!(
+                            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\"/>",
+                            c.center.x,
+                            c.center.y,
+                            c.radius,
+                            col(c.fill)
+                        ));
+                    }
+                }
+                egui::epaint::Shape::Mesh(m) => {
+                    for tri in m.triangles() {
+                        let v = |i: u32| &m.vertices[i as usize];
+                        let c = v(tri[0]).color;
+                        svg.push_str(&format!(
+                            "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" fill=\"{}\"/>",
+                            v(tri[0]).pos.x,
+                            v(tri[0]).pos.y,
+                            v(tri[1]).pos.x,
+                            v(tri[1]).pos.y,
+                            v(tri[2]).pos.x,
+                            v(tri[2]).pos.y,
+                            col(c)
+                        ));
+                    }
+                }
+                egui::epaint::Shape::Text(t) => {
+                    let size = 11.0_f32;
+                    let esc: String = t
+                        .galley
+                        .text()
+                        .chars()
+                        .filter(|c| !matches!(c, '<' | '&'))
+                        .collect();
+                    svg.push_str(&format!(
+                        "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"monospace\" font-size=\"{:.1}\" fill=\"#d8d8dc\">{}</text>",
+                        t.pos.x,
+                        t.pos.y + size,
+                        size,
+                        esc
+                    ));
+                }
+                _ => {}
+            }
+        }
+        svg.push_str("</svg>");
+        std::fs::write(&out_path, svg).unwrap();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+    }
+
     /// R1: length switches from seconds to BARS derived from the
     /// metronome (bpm + beats-per-measure), and entering bars mode rounds
     /// the length to whole bars.
