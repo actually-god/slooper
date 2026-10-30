@@ -208,6 +208,132 @@ pub fn warp(s: Shape, u: f32) -> f32 {
     }
 }
 
+/// v26: one-click curve presets for the automation manager, so building a
+/// useful curve takes ONE click instead of a node at a time. Times are
+/// fractions of the asset length; values are fractions of the TARGET's own
+/// range (0 = min, 1 = max), so "fade in" means mute -> +6 dB on volume
+/// and left -> right on pan without any unit maths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    FadeIn,
+    FadeOut,
+    Peak,
+    Valley,
+    EaseUp,
+    EaseDown,
+    Saw,
+    Square,
+    Sine,
+}
+
+impl Preset {
+    pub const ALL: [Preset; 9] = [
+        Preset::FadeIn,
+        Preset::FadeOut,
+        Preset::Peak,
+        Preset::Valley,
+        Preset::EaseUp,
+        Preset::EaseDown,
+        Preset::Saw,
+        Preset::Square,
+        Preset::Sine,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Preset::FadeIn => "fade in",
+            Preset::FadeOut => "fade out",
+            Preset::Peak => "peak",
+            Preset::Valley => "valley",
+            Preset::EaseUp => "ease up",
+            Preset::EaseDown => "ease down",
+            Preset::Saw => "saw",
+            Preset::Square => "square",
+            Preset::Sine => "sine",
+        }
+    }
+}
+
+/// Nodes for one preset (first t = 0, last t = len, values inside [lo, hi]).
+/// `Saw`/`Square` use 1-sample ramps — they read as jumps on any realistic
+/// zoom, and true vertical segments would break the sorted-t invariant.
+pub fn preset_nodes(p: Preset, len: i64, lo: f32, hi: f32) -> Vec<Node> {
+    use Shape::*;
+    let len = len.max(8);
+    let v = |f: f32| lo + f * (hi - lo);
+    let n = |u: f32, f: f32, s: Shape| Node {
+        t: (u * len as f32).round() as i64,
+        v: v(f),
+        s,
+    };
+    match p {
+        Preset::FadeIn => vec![n(0.0, 0.0, Linear), n(1.0, 1.0, Linear)],
+        Preset::FadeOut => vec![n(0.0, 1.0, Linear), n(1.0, 0.0, Linear)],
+        Preset::Peak => vec![
+            n(0.0, 0.0, Linear),
+            n(0.5, 1.0, Smooth),
+            n(1.0, 0.0, Smooth),
+        ],
+        Preset::Valley => vec![
+            n(0.0, 1.0, Linear),
+            n(0.5, 0.0, Smooth),
+            n(1.0, 1.0, Smooth),
+        ],
+        // Slow = fast away from the first node, soft arrival at the second.
+        Preset::EaseUp => vec![n(0.0, 0.0, Linear), n(1.0, 1.0, Slow)],
+        Preset::EaseDown => vec![n(0.0, 1.0, Linear), n(1.0, 0.0, Slow)],
+        Preset::Saw => vec![
+            Node {
+                t: 0,
+                v: v(0.0),
+                s: Linear,
+            },
+            Node {
+                t: len - 1,
+                v: v(1.0),
+                s: Linear,
+            },
+            Node {
+                t: len,
+                v: v(0.0),
+                s: Linear,
+            },
+        ],
+        Preset::Square => vec![
+            Node {
+                t: 0,
+                v: v(0.0),
+                s: Linear,
+            },
+            Node {
+                t: 1,
+                v: v(1.0),
+                s: Linear,
+            },
+            Node {
+                t: len / 2,
+                v: v(1.0),
+                s: Linear,
+            },
+            Node {
+                t: len / 2 + 1,
+                v: v(0.0),
+                s: Linear,
+            },
+            Node {
+                t: len,
+                v: v(0.0),
+                s: Linear,
+            },
+        ],
+        Preset::Sine => (0..=16)
+            .map(|i| {
+                let u = i as f32 / 16.0;
+                n(u, 0.5 + 0.5 * (std::f32::consts::TAU * u).sin(), Smooth)
+            })
+            .collect(),
+    }
+}
+
 /// Known target ids that address a per-TRACK control (value semantics for
 /// the UI; everything else carries its own index).
 pub const TARGET_TRACK_VOL: &str = "track.vol";
@@ -408,5 +534,49 @@ mod tests {
         assert!(!is_plugin_target("track.vol"));
         assert_eq!(target_range(TARGET_MASTER_TEMPO), (20.0, 300.0));
         assert_eq!(target_range("synth:5"), (0.0, 1.0));
+    }
+
+    /// v26: every preset is a VALID automation curve: ends pinned at
+    /// 0/len, strictly increasing times, values inside the target range —
+    /// and the representative shapes actually shape.
+    #[test]
+    fn v26_preset_nodes_shapes() {
+        for p in Preset::ALL {
+            let nodes = preset_nodes(p, 96_000, 0.0, 2.0);
+            assert!(nodes.len() >= 2, "{}: node count", p.label());
+            assert_eq!(nodes.first().unwrap().t, 0, "{}: start", p.label());
+            assert_eq!(nodes.last().unwrap().t, 96_000, "{}: end", p.label());
+            for w in nodes.windows(2) {
+                assert!(w[1].t > w[0].t, "{}: times strictly sorted", p.label());
+            }
+            for n in &nodes {
+                assert!(
+                    n.v >= -1e-6 && n.v <= 2.0 + 1e-6,
+                    "{}: value {} out of range",
+                    p.label(),
+                    n.v
+                );
+            }
+            let a = Automation {
+                target: "track.vol".into(),
+                len_samples: 96_000,
+                nodes,
+            };
+            match p {
+                Preset::FadeIn => assert!(a.eval(24_000) < a.eval(72_000)),
+                Preset::Peak => assert!(a.eval(48_000) > 1.9 && a.eval(0) < 0.1),
+                Preset::Valley => assert!(a.eval(48_000) < 0.1 && a.eval(0) > 1.9),
+                Preset::Sine => {
+                    assert_eq!(a.nodes.len(), 17);
+                    assert!((a.eval(24_000) - 2.0).abs() < 0.02, "sine peak");
+                    assert!((a.eval(72_000) - 0.0).abs() < 0.02, "sine trough");
+                    assert!((a.eval(0) - 1.0).abs() < 1e-3, "sine starts mid-range");
+                }
+                Preset::Square => {
+                    assert!(a.eval(24_000) > 1.9 && a.eval(72_000) < 0.1);
+                }
+                _ => {}
+            }
+        }
     }
 }
