@@ -12,6 +12,14 @@
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result {
+    // v23: editor crash-guard child (see `vstedit::probe_child`). This
+    // process only ever tests ONE plugin window and exits — no JACK, no
+    // eframe, no config, nothing that could be confused for a second DAW.
+    if let Some(spec) = std::env::var_os("SLOOPER_EDITOR_PROBE") {
+        std::process::exit(slooper::vstedit::probe_child(
+            spec.to_string_lossy().as_ref(),
+        ));
+    }
     // Plugin editors decide the app's windowing world: the VST2 spec has
     // exactly one Linux UI ABI — native X11 embedding — so every hosted
     // plugin opens plain X11 windows. Under a Wayland session winit would

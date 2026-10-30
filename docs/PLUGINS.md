@@ -274,12 +274,59 @@ this project (v10.2):
   --release --example editor_smoke [so]` opens a real editor, verifies it,
   injects the same `WM_DELETE_WINDOW` client message a close button sends,
   and asserts the editor exits.
-- Plugins with a known-broken GUI are removed from the plugin folders
-  rather than shipped broken (amsynth 2.0's VST2 threw `unordered_map::at`
-  during editor build and was deleted from `~/.vst`). Any plugin whose
-  editor still fails is refused within ~3 s and its parameter sliders
-  drive the plugin instead — a bad GUI can never blank-panel or hang.
+- Plugins with a known-broken GUI no longer need removing by hand: since
+  v23 the crash guard (below) detects crashing editors automatically, on
+  this machine only, and routes those plugins to the parameter window.
+  Any editor that merely *fails* (refuses to paint) is still refused
+  within ~3 s and its parameter sliders drive the plugin instead — a bad
+  GUI can never blank-panel, hang, or crash the app.
 - Probe and live instances of the same plugin binary intentionally share
   one process-lifetime load (see `vst_loader_lock` / probe-leak comments):
   plugin toolkits carry process-global state that does not survive
   terminate/dlclose cycles inside a running host.
+
+## v23: three window bugs users reported, and what the sweep found
+
+A 47-plugin sweep (`cargo run --release --example v23_sweep -- jsonl`)
+graded every locally installed plugin on open, parameter count, chunk
+round-trip, and audio. Three user reports mapped to three distinct root
+causes — all fixed, each pinned by a test:
+
+1. **"Changing values in Overtonium / Surge XT only updates after the
+   GUI closes."** The host parameter table was capped at 64 entries;
+   these plugins publish ~2.9 k (Surge XT 2855, Overtonium 2931, KR-106
+   2138). Every `performEdit` past the cap mapped to no cell and died —
+   only the teardown harvest made the move appear. The cap is now
+   `VST_MAX_PARAMS = 8192` and compile-checked to stay ahead of reality.
+2. **"KR-106 changes live, but closing the GUI loses them."** A rebuild
+   replanted only the plugin's state chunk — and many vendors' chunks
+   simply do not carry parameter values (KR-106: 336 bytes for 2138
+   params; the sweep flagged 15+ local plugins). A close now harvests a
+   **patch**: chunk first, the shadow's own model values second, applied
+   in that order on reopen. Both ride the v22 real-time tick, so even a
+   killed window cannot lose more than ~2 s of editing.
+3. **"ADLplug shows a solid blue window, then the whole program dies."**
+   ADLplug/OPNplug (JUCE 6) SIGSEGV in XRandR display enumeration on
+   this host's Xwayland — inside the plugin's process, which until now
+   WAS slooper's process.
+
+### The editor crash guard
+
+`open_plugin_gui` is the single path to any vendor window. A plugin whose
+verdict is unknown is opened in a **throwaway child first** (the same
+`slooper` binary, `SLOOPER_EDITOR_PROBE=V2|V3` +
+`SLOOPER_EDITOR_PROBE_PATH=<file>`; a vendor crash kills only the child).
+The verdict is cached in `config.json` under `editor_probe` per file
+mtime: safe plugins open their window directly from then on, banned ones
+open slooper's **parameter window** instead — sliders, a search box, and
+full persistence through the same cells and tick as a real editor.
+Nothing is ever banned on a skip (no X11 → no verdict), and Wine-bridged
+transients are never cached. Status-line text announces every decision;
+`SLOOPER_UNSAFE_EDITOR=1` bypasses the guard for development.
+
+### Huge parameter lists are searchable
+
+A 2.9 k-param plugin is unautomatable in a raw list: every automation
+target picker carries a shared search box and renders at most 400 rows;
+the parameter window has its own filter. (`filtered_targets` in
+`src/ui.rs`.)

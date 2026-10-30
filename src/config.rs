@@ -263,6 +263,13 @@ pub struct Config {
     /// always scanned on top of these).
     #[serde(default)]
     pub vst_dirs: Vec<String>,
+    /// v23: editor crash-guard cache — plugin path → (file mtime seconds,
+    /// editor safe to open). Written by the editor probe (see
+    /// `vsthost::probe_editor`); an entry whose mtime no longer matches the
+    /// plugin file is stale and re-probes, so a plugin update re-arms its
+    /// window automatically. Absent = never probed.
+    #[serde(default)]
+    pub editor_probe: std::collections::BTreeMap<String, (u64, bool)>,
     /// Per-track VST insert (legacy single-insert format; folded into
     /// `track_chain` on load, never written again).
     #[serde(default)]
@@ -326,6 +333,7 @@ impl Default for Config {
             track_fx: Vec::new(),
             track_chain: Vec::new(),
             vst_dirs: Vec::new(),
+            editor_probe: Default::default(),
             track_vst: Vec::new(),
             track_synth: Vec::new(),
             track_synth_params: Vec::new(),
@@ -535,6 +543,7 @@ mod tests {
                 }),
             }],
             midi_axis: Vec::new(),
+            editor_probe: Default::default(),
             ports_in: vec!["remote:out_1".into()],
             ports_out: vec!["remote:in_1".into(), "remote:in_2".into()],
             ports_out_lr: vec![1, 2],
@@ -688,6 +697,28 @@ mod tests {
         assert_eq!(b64_encode(&[]), "");
         assert_eq!(b64_decode("").unwrap(), Vec::<u8>::new());
         assert!(b64_decode("!!!").is_none(), "garbage is rejected, not trusted");
+    }
+
+    /// v23 pin: the editor crash-guard cache (path → (mtime, safe))
+    /// rides the config file, so a plugin that crashes THIS display
+    /// server stays on the parameter window across restarts — and an
+    /// older config without the key still loads (empty cache = probe
+    /// again, never ban from memory alone).
+    #[test]
+    fn v23_editor_probe_cache_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.editor_probe
+            .insert("/host/ADLplug.so".into(), (1_700_000_000, false));
+        cfg.editor_probe
+            .insert("/host/wolf-shaper.vst3".into(), (1_700_000_001, true));
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.editor_probe.get("/host/ADLplug.so"),
+            Some(&(1_700_000_000, false))
+        );
+        let old: Config = serde_json::from_str(r#"{"n_tracks":8}"#).unwrap();
+        assert!(old.editor_probe.is_empty(), "pre-v23 config loads clean");
     }
 
     /// v22 pin: `ChainSave::Vst` persists the state chunk (project saves),

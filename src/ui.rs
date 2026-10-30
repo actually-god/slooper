@@ -530,6 +530,55 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// What a plugin editor window (or its stand-in) belongs to. The GUI
+/// hosts plugin instances at exactly two kinds of places, and the v23
+/// editor crash-guard must route its verdict back to the right one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuiTarget {
+    /// A track's bound VST instrument.
+    Synth(usize),
+    /// A mixer-chain slot (track, row).
+    Chain(usize, usize),
+}
+
+/// Filter used by every list that enumerates automation targets. Plugins
+/// can publish THOUSANDS of parameters (Surge XT: ~2.9 k), so a raw list
+/// is both slow to lay out and impossible to read; a shared search string
+/// (and a 400-row cap) keeps any target reachable in a keystroke or two.
+pub fn filtered_targets(targets: &[(String, String)], q: &str) -> Vec<(String, String)> {
+    let ql = q.trim().to_lowercase();
+    targets
+        .iter()
+        .filter(|(_, label)| ql.is_empty() || label.to_lowercase().contains(&ql))
+        .take(400)
+        .cloned()
+        .collect()
+}
+
+/// Search box shared by all automation target pickers. State lives in
+/// egui temp data under a fixed id, so both pickers (the checkbox list
+/// and the inline row menu) stay in sync.
+pub fn target_search_box(ui: &mut egui::Ui, placeholder: &str) -> String {
+    let id = egui::Id::new("slooper_target_search");
+    let q: String = ui.ctx().data(|d| d.get_temp::<String>(id)).unwrap_or_default();
+    let mut q2 = q.clone();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("search").weak().small());
+        ui.add(
+            egui::TextEdit::singleline(&mut q2)
+                .desired_width(170.0)
+                .hint_text(placeholder),
+        );
+        if !q2.is_empty() && ui.small_button("✕").clicked() {
+            q2.clear();
+        }
+    });
+    if q2 != q {
+        ui.ctx().data_mut(|d| d.insert_temp(id, q2.clone()));
+    }
+    q2
+}
+
 /// One row of a track's mixer chain (ordered audio path). Scripted effects
 /// and hosted plugins are the same kind of slot — FL Studio's mixer model —
 /// so a plugin can sit anywhere in the chain and a track can host as many
@@ -843,6 +892,28 @@ pub struct App {
     /// User-set extra VST folders (config); the system defaults are always
     /// scanned on top of these.
     vst_dirs: Vec<String>,
+    /// v23: mirror of `Config::editor_probe` — plugin path → (file mtime,
+    /// editor safe). Populated by the editor crash-guard (see
+    /// `open_plugin_gui`); a banned plugin keeps sounding but opens the
+    /// parameter-sliders window instead of its crashing vendor window.
+    editor_probe: std::collections::BTreeMap<String, (u64, bool)>,
+    /// v23: in-flight editor-probe children: (target, plugin path,
+    /// verdict receiver, entry to open on success).
+    editor_probes: Vec<(
+        GuiTarget,
+        std::path::PathBuf,
+        std::sync::mpsc::Receiver<crate::vsthost::EditorProbe>,
+        std::sync::Arc<crate::vsthost::RtStageEntry>,
+    )>,
+    /// v23: plugin whose stand-in parameter window is open.
+    params_win: Option<GuiTarget>,
+    /// v23: filter text of the parameter window (huge plugins expose
+    /// thousands of params — without a filter they are unusable).
+    params_filter: String,
+    /// v23: (id, normalized) lists harvested from synth-binding editor
+    /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
+    /// parameter half — chunks alone may omit exactly the moved knobs).
+    synth_patch_params: Vec<Vec<(u32, f32)>>,
     /// One-line feedback under the folder row.
     vst_note: String,
     /// v16: completion channel of a folder scan running on the plugin GUI
@@ -1141,6 +1212,11 @@ impl App {
             vst_pending_gui: Vec::new(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
+            editor_probe: cfg.editor_probe.clone(),
+            editor_probes: Vec::new(),
+            params_win: None,
+            params_filter: String::new(),
+            synth_patch_params: vec![Vec::new(); MAX_LOOPS],
             vst_note: String::new(),
             fx_editor: None,
             fx_dir_edit: fx_dir.display().to_string(),
@@ -1671,12 +1747,22 @@ impl App {
                     if entry.is_none() && open_rx.is_none() {
                         let p = std::path::Path::new(path);
                         if p.is_file() || p.is_dir() {
+                            // v23: the row's persisted chunk travels as a
+                            // patch header (params empty: the row's cell
+                            // snapshot rides `saved` and was kept fresh by
+                            // the persistence tick).
+                            let patch = state
+                                .as_deref()
+                                .map(|c| crate::vsthost::VstPatch {
+                                    chunk: c.to_vec(),
+                                    params: Vec::new(),
+                                });
                             match crate::vsthost::open_with_state(
                                 p,
                                 *kind,
                                 sr,
                                 Some(params),
-                                state.as_deref(),
+                                patch.as_ref(),
                             ) {
                                 Ok(load) => *entry = Some(load.entry),
                                 Err(err) => {
@@ -1736,6 +1822,259 @@ impl App {
             crate::vstedit::open_editor(&h, &pth, entry.name(), cells, n)
         } else {
             entry.open_vst3_editor(self.sample_rate.max(48_000))
+        }
+    }
+
+    // ------------------------------------------------ v23 editor crash guard
+    //
+    // Vendor editor windows run in-process and some of them die on
+    // particular X servers (ADLplug/OPNplug: JUCE 6 display enumeration
+    // SIGSEGVs on Xwayland's RandR table, exactly the "solid blue window,
+    // then the whole program crashes" report). NEVER open an untested
+    // editor directly: `open_plugin_gui` gates every open through a
+    // one-shot child-process probe whose verdict is cached per file mtime.
+
+    /// File mtime (seconds) used as the probe cache's version tag.
+    fn plugin_mtime(path: &str) -> Option<u64> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    }
+
+    /// Is `target` still hosting the plugin probed for `path`?
+    fn target_alive(&self, target: GuiTarget, path: &str) -> bool {
+        let p = std::path::Path::new(path);
+        match target {
+            GuiTarget::Synth(t) => matches!(
+                self.track_synth_inst
+                    .get(t)
+                    .and_then(|h| h.as_ref())
+                    .map(|a| &**a),
+                Some(SynthHandle::Vst(e)) if e.path() == p
+            ),
+            GuiTarget::Chain(t, r) => matches!(
+                self.fx_rows.get(t).and_then(|rows| rows.get(r)),
+                Some(ChainRow::Vst { path: row_path, .. }) if row_path.as_str() == path
+            ),
+        }
+    }
+
+    /// Resolve a GUI target to its live plugin entry (None when gone).
+    fn target_entry(&self, target: GuiTarget) -> Option<std::sync::Arc<crate::vsthost::RtStageEntry>> {
+        match target {
+            GuiTarget::Synth(t) => match self.track_synth_inst.get(t)?.as_ref()?.as_ref() {
+                SynthHandle::Vst(e) => Some(e.clone()),
+                _ => None,
+            },
+            GuiTarget::Chain(t, r) => match self.fx_rows.get(t)?.get(r)? {
+                ChainRow::Vst { entry, .. } => entry.clone(),
+                _ => None,
+            },
+        }
+    }
+
+    /// The ONE path to a plugin's own window. Cached-safe opens directly;
+    /// cached-banned opens the parameter window instead; unknown plugins
+    /// are probed in a disposable child first (status line announces it —
+    /// v21 rule: keyboard/UI actions that defer answer loudly).
+    fn open_plugin_gui(
+        &mut self,
+        target: GuiTarget,
+        entry: std::sync::Arc<crate::vsthost::RtStageEntry>,
+    ) {
+        let path = entry.path().to_string_lossy().into_owned();
+        // Escape hatch for development: open without the guard.
+        if std::env::var_os("SLOOPER_UNSAFE_EDITOR").is_some() || !entry.has_editor() {
+            self.open_plugin_gui_now(target, &entry);
+            return;
+        }
+        let known = Self::plugin_mtime(&path).and_then(|m| {
+            self.editor_probe
+                .get(&path)
+                .filter(|(cm, _)| *cm == m)
+                .map(|(_, ok)| *ok)
+        });
+        match known {
+            Some(true) => self.open_plugin_gui_now(target, &entry),
+            Some(false) => {
+                self.status = format!(
+                    "{}: plugin window disabled (crashes this X server) \u{2014} parameter window instead",
+                    entry.name()
+                );
+                self.params_win = Some(target);
+                self.params_filter.clear();
+            }
+            None => {
+                if self.editor_probes.iter().any(|(_, p, _, _)| p.display().to_string() == path) {
+                    self.status = "plugin window still being checked \u{2014} one moment".into();
+                    return;
+                }
+                let pth = std::path::PathBuf::from(&path);
+                let kind = entry.kind();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::vsthost::probe_editor(&pth, kind));
+                });
+                self.editor_probes.push((target, std::path::PathBuf::from(&path), rx, entry));
+                self.status =
+                    "first window for this plugin is safety-checked in a child process \u{2014} one moment"
+                        .into();
+            }
+        }
+    }
+
+    /// Open the window synchronously and register it with its target.
+    fn open_plugin_gui_now(
+        &mut self,
+        target: GuiTarget,
+        entry: &std::sync::Arc<crate::vsthost::RtStageEntry>,
+    ) {
+        match self.plugin_window_open(entry) {
+            Ok(w) => {
+                match target {
+                    GuiTarget::Synth(t) => {
+                        self.vst_editors.insert(t, w);
+                    }
+                    GuiTarget::Chain(t, r) => {
+                        self.fx_vst_editors.insert((t, r), w);
+                    }
+                }
+                self.status = format!("{}: plugin window opened", entry.name());
+            }
+            Err(err) => self.status = format!("plugin GUI: {err} \u{2014} closed"),
+        }
+    }
+
+    /// Land finished editor probes: cache the verdict, then open the real
+    /// window (safe), or the parameter stand-in (banned).
+    fn poll_editor_probes(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let mut i = 0;
+        while i < self.editor_probes.len() {
+            match self.editor_probes[i].2.try_recv() {
+                Ok(crate::vsthost::EditorProbe::Safe) => {
+                    let (target, path, _, entry) = self.editor_probes.remove(i);
+                    let ps = path.to_string_lossy().into_owned();
+                    if let Some(m) = Self::plugin_mtime(&ps) {
+                        self.editor_probe.insert(ps.clone(), (m, true));
+                        self.save_config();
+                    }
+                    if self.target_alive(target, &ps) {
+                        self.open_plugin_gui_now(target, &entry);
+                    } else {
+                        self.status = format!(
+                            "{}: window checked OK \u{2014} open it any time",
+                            entry.name()
+                        );
+                    }
+                }
+                Ok(crate::vsthost::EditorProbe::Banned { why, persist }) => {
+                    let (target, path, _, entry) = self.editor_probes.remove(i);
+                    let ps = path.to_string_lossy().into_owned();
+                    if persist {
+                        if let Some(m) = Self::plugin_mtime(&ps) {
+                            self.editor_probe.insert(ps.clone(), (m, false));
+                            self.save_config();
+                        }
+                    }
+                    self.status =
+                        format!("{why} \u{2014} window disabled by the crash guard, {}", entry.name());
+                    if self.target_alive(target, &ps) {
+                        self.params_win = Some(target);
+                        self.params_filter.clear();
+                    }
+                }
+                Ok(crate::vsthost::EditorProbe::Skip) => {
+                    let (target, path, _, entry) = self.editor_probes.remove(i);
+                    // No X11 / no child possible: the honest open path
+                    // reports its own error; never ban on a skip.
+                    if self.target_alive(target, &path.to_string_lossy()) {
+                        self.open_plugin_gui_now(target, &entry);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.editor_probes.remove(i);
+                }
+                Err(TryRecvError::Empty) => i += 1,
+            }
+        }
+    }
+
+    /// v23: the stand-in parameter window for a plugin whose own window is
+    /// banned. Sliders ride the same cell mirror the plugin GUI drives
+    /// (VST3 command ring / VST2 audio-thread poll), and the persistence
+    /// tick mirrors cells into the row/binding exactly like it does for
+    /// open editors — so what you dial sticks, and survives restarts.
+    /// Huge plugins publish thousands of params, hence the filter box:
+    /// at most 400 rows are laid out per frame.
+    fn params_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.params_win else { return };
+        let Some(entry) = self.target_entry(target) else {
+            self.params_win = None;
+            return;
+        };
+        let mut open = true;
+        let mut new_filter = self.params_filter.clone();
+        egui::Window::new(format!("{} \u{2014} parameters", entry.name()))
+            .id(egui::Id::new("slooper_params_win"))
+            .default_pos([420.0, 140.0])
+            .default_width(460.0)
+            .default_height(460.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let total = entry.descs().iter().filter(|d| d.writable).count();
+                ui.horizontal(|ui| {
+                    ui.label("filter");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut new_filter)
+                            .hint_text("parameter name")
+                            .desired_width(200.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{total} params"))
+                            .weak()
+                            .small(),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "this plugin's own window is disabled (crash guard) \u{b7} changes \
+                         apply live and persist",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.separator();
+                let ql = new_filter.trim().to_lowercase();
+                let rows: Vec<(usize, String)> = entry
+                    .descs()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.writable)
+                    .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
+                    .take(400)
+                    .map(|(k, d)| (k, d.name.clone()))
+                    .collect();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (k, name) in rows {
+                            let mut v = entry.params().get(k);
+                            let s = ui.add(
+                                egui::Slider::new(&mut v, 0.0..=1.0)
+                                    .text(name.chars().take(24).collect::<String>()),
+                            );
+                            if s.changed() {
+                                entry.set_param(k, v);
+                            }
+                        }
+                    });
+            });
+        self.params_filter = new_filter;
+        if !open {
+            self.params_win = None;
         }
     }
 
@@ -1855,13 +2194,8 @@ impl App {
                     _ => None,
                 };
                 if let Some((entry, _)) = plan {
-                    match self.plugin_window_open(&entry) {
-                        Ok(w) => {
-                            self.fx_vst_editors.insert((t, row), w);
-                            self.status = format!("{}: plugin window opened", entry.name());
-                        }
-                        Err(err) => self.status = format!("plugin GUI: {err} \u{2014} closed"),
-                    }
+                    // v23: gated — the window may be probe-checked or banned.
+                    self.open_plugin_gui(GuiTarget::Chain(t, row), entry);
                 }
             }
             self.vst_pending_gui = keep;
@@ -2636,6 +2970,7 @@ impl App {
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
+            editor_probe: self.editor_probe.clone(),
             track_vst: Vec::new(),
             track_chain: self
                 .fx_rows
@@ -2713,12 +3048,22 @@ impl App {
                 } else {
                     None
                 };
+                // v23: chunk + the parameter list harvested with it (from
+                // the editor closure that triggered this rebuild, if any).
+                // Chunks may omit normalized values — the list is what
+                // keeps knob moves through the plugin GUI after close.
+                let patch = self.track_synth_state[t].clone().map(|chunk| {
+                    crate::vsthost::VstPatch {
+                        chunk,
+                        params: std::mem::take(&mut self.synth_patch_params[t]),
+                    }
+                });
                 match crate::vsthost::open_with_state(
                     std::path::Path::new(path),
                     kind,
                     self.sample_rate.max(1),
                     saved.as_deref(),
-                    self.track_synth_state[t].as_deref(),
+                    patch.as_ref(),
                 ) {
                     Ok(load) => Some(std::sync::Arc::new(SynthHandle::Vst(load.entry))),
                     Err(err) => {
@@ -3339,7 +3684,14 @@ impl App {
                     .small(),
                 );
                 ui.separator();
-                for (id, label) in &targets {
+                // v23: plugins can expose ~2.9k params (Surge XT) — a raw
+                // list is unusable; filter first.
+                let q = target_search_box(ui, "filter parameter names");
+                let shown = filtered_targets(&targets, &q);
+                if shown.is_empty() && !targets.is_empty() {
+                    ui.label(RichText::new("no match").weak().small());
+                }
+                for (id, label) in &shown {
                     let frac = target_preview_frac(self, track, id);
                     let full = ui.available_width();
                     let (bar, _) =
@@ -3415,6 +3767,10 @@ impl App {
             .show(ui.ctx(), |ui| {
                 let (rmin, rmax) = crate::automation::target_range(&ed.target);
                 let len = ed.len_samples.max(1);
+                // v23: target list can be thousands deep (plugin params)
+                // — search box drives the combo's contents.
+                let q = target_search_box(ui, "filter automation target");
+                let shown = filtered_targets(&targets, &q);
                 ui.horizontal(|ui| {
                     ui.label("target");
                     let cur = targets
@@ -3426,7 +3782,7 @@ impl App {
                         .selected_text(cur)
                         .width(240.0)
                         .show_ui(ui, |ui| {
-                            for (id, label) in &targets {
+                            for (id, label) in shown.iter() {
                                 // v0.15: switching outputs RESCALES the
                                 // curve — the asset's min/max follow the
                                 // selected output's limits automatically.
@@ -5629,17 +5985,10 @@ impl App {
         if !entry.has_editor() {
             return false;
         }
-        match self.plugin_window_open(&entry) {
-            Ok(w) => {
-                self.status = format!("{}: plugin window opened", entry.name());
-                self.vst_editors.insert(t, w);
-                true
-            }
-            Err(e) => {
-                self.status = format!("plugin GUI: {e} \u{2014} closed");
-                false
-            }
-        }
+        // v23: gated open (crash guard); the status line announces what
+        // happens either way.
+        self.open_plugin_gui(GuiTarget::Synth(t), entry);
+        true
     }
 
     /// v0.11 R3: the track-row GUI button for a hosted plugin. Clicking
@@ -5687,14 +6036,11 @@ impl App {
             return;
         };
         if entry.has_editor() {
-            match self.plugin_window_open(&entry) {
-                Ok(w) => {
-                    self.status = format!("{}: plugin window opened", entry.name());
-                    self.fx_vst_editors.insert((t, row), w);
-                    return;
-                }
-                Err(e) => self.status = format!("plugin GUI: {e} \u{2014} closed"),
-            }
+            // v23: gated — safe plugins open now, unknown ones get probed,
+            // banned ones land on the parameter window. All announced in
+            // the status line.
+            self.open_plugin_gui(GuiTarget::Chain(t, row), entry);
+            return;
         }
         // v0.11 R3: hosted plugins get NO slider window. A plugin with no
         // drawable editor keeps its current parameter values.
@@ -5872,13 +6218,70 @@ impl App {
         if dirty {
             self.save_config();
         }
+        // v23: the stand-in parameter window (banned editors) has no
+        // EditorWindow handle, so mirror its target the same way: cells →
+        // row / binding snapshot → config. Without this the sliders would
+        // sound live but evaporate on restart.
+        if let Some(target) = self.params_win {
+            let (snap, dirty2) = match target {
+                GuiTarget::Chain(t, r) => {
+                    let cur = self
+                        .target_entry(target)
+                        .map(|e| (0..e.descs().len()).map(|k| e.params().get(k)).collect::<Vec<f32>>());
+                    if let (Some(snap), Some(rows)) = (cur, self.fx_rows.get_mut(t)) {
+                        if let Some(ChainRow::Vst { params, .. }) = rows.get_mut(r) {
+                            let d = snap.as_slice() != params.as_slice();
+                            if d {
+                                *params = snap.clone();
+                            }
+                            (snap, d)
+                        } else {
+                            (snap, false)
+                        }
+                    } else {
+                        (Vec::new(), false)
+                    }
+                }
+                GuiTarget::Synth(t) => {
+                    let snap = match self
+                        .track_synth_inst
+                        .get(t)
+                        .and_then(|h| h.as_ref())
+                        .map(|a| &**a)
+                    {
+                        Some(SynthHandle::Vst(e)) => Some(
+                            (0..e.descs().len())
+                                .map(|k| e.params().get(k))
+                                .collect::<Vec<f32>>(),
+                        ),
+                        _ => None,
+                    };
+                    if let (Some(vals), Some(slot)) = (snap, self.track_synth_params.get_mut(t)) {
+                        let d = vals.as_slice() != slot.as_slice();
+                        if d {
+                            *slot = vals.clone();
+                        }
+                        (vals, d)
+                    } else {
+                        (Vec::new(), false)
+                    }
+                }
+            };
+            let _ = snap;
+            if dirty2 {
+                self.save_config();
+            }
+        }
     }
 
     fn harvest_chain_state(&mut self, t: usize, r: usize, w: &mut crate::vstedit::EditorWindow) {
         // v22: while the editor was open the persistence tick already
         // mirrored this chunk into `row.state` continuously; what remains
         // here is the very last harvest plus triggering the rebuild.
-        let Some(bytes) = w.take_state() else { return };
+        // v23: the harvest is a full PATCH (chunk + shadow parameter
+        // values) — chunk-only rebuilds reverted every knob move on the
+        // vendors whose chunk omits normalized values (KR-106 et al.).
+        let Some(patch) = w.take_patch() else { return };
         let sr = self.sample_rate.max(1);
         {
             let Some(row) = self.fx_rows.get_mut(t).and_then(|rows| rows.get_mut(r)) else {
@@ -5896,7 +6299,7 @@ impl App {
             else {
                 return;
             };
-            *state = Some(bytes.clone());
+            *state = Some(patch.chunk.clone());
             if entry.is_some() || open_rx.is_some() {
                 // Cells re-seed from the chunk (saved=None), so the patch's
                 // own parameter values win over the stale config snapshot.
@@ -5906,7 +6309,7 @@ impl App {
                     *kind,
                     sr,
                     None,
-                    Some(&bytes),
+                    Some(&patch),
                 ));
                 self.vst_note = format!("{name}: applying preset\u{2026}");
             }
@@ -5918,8 +6321,12 @@ impl App {
     /// binding synchronously from the harvested chunk (opening a synth
     /// binding always paid this cost; the next note already sounds new).
     fn harvest_synth_state(&mut self, t: usize, w: &mut crate::vstedit::EditorWindow) {
-        let Some(bytes) = w.take_state() else { return };
-        self.track_synth_state[t] = Some(bytes);
+        // v23: full patch (chunk + parameter values). `rebuild_track_synth`
+        // applies the chunk first and the values second, so plugins whose
+        // chunk omits normalized params keep the knobs the window moved.
+        let Some(patch) = w.take_patch() else { return };
+        self.synth_patch_params[t] = patch.params;
+        self.track_synth_state[t] = Some(patch.chunk);
         if self.rebuild_track_synth(t) {
             self.status = format!("track {}: preset applied", t + 1);
         }
@@ -7050,6 +7457,9 @@ impl eframe::App for App {
         self.reap_vst_editors();
         // v22: persist plugin edits while their editors are still open.
         self.tick_plugin_persist();
+        // v23: land editor crash-guard probes (open the real window when
+        // the verdict is safe, the parameter stand-in when it is not).
+        self.poll_editor_probes();
 
         // v16: land async plugin work (chain loads, folder scan) without
         // ever blocking this thread on plugin instantiation.
@@ -7082,6 +7492,10 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // v23: the stand-in parameter window (plugins whose own window is
+        // banned by the crash guard). Painted here, with every other
+        // window, so it exists on the same frame the guard decides.
+        self.params_window(ui.ctx());
         // ---- v18: OS file drops (drain exactly once per frame) ----
         // winit delivers file-manager drops through raw input. Folders
         // become rack folders on the spot; audio/midi files queue for
@@ -12741,6 +13155,10 @@ mod tests {
     /// `frame()` alone only paints.
     fn logic_tick(app: &mut App) {
         app.reap_vst_editors();
+        // v23: the crash-guard verdicts and the editor persistence tick
+        // live in `App::logic`; headless tests drive them here too.
+        app.tick_plugin_persist();
+        app.poll_editor_probes();
         app.poll_vst_opens();
     }
 
@@ -18131,5 +18549,274 @@ mod tests {
         assert_eq!(describe_target(TARGET_TRACK_GAIN), "track gain");
         let (lo, hi) = target_range(TARGET_TRACK_GAIN);
         assert!(lo < hi && hi > 1.0);
+    }
+
+    // ------------------------------------------------ v23 plugin-window pins
+    //
+    // Three user reports drive this block: (1) big-plugin knob moves only
+    // applied after the GUI closed, (2) KR-106 knob moves were LOST when
+    // the GUI closed, (3) ADLplug's editor crashed the whole app. Host-
+    // level pins for all three live in `vsthost.rs`; these pins cover the
+    // UI plumbing: the crash-guard gate, its stand-in parameter window,
+    // and the real close→harvest→rebuild cycle through an editor window.
+
+    /// Render two cold frames and collect every painted galley string from
+    /// the second (egui 0.36 paints `egui::Window` contents only once the
+    /// context has one frame of memory — panels paint immediately, windows
+    /// land on the next frame).
+    fn v23_texts(app: &mut App) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw.clone(), |ui| app.ui_root(ui));
+        out.textures_delta.clear(); // font atlas delta: drop-safe render only
+        drop(out);
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        out.textures_delta.clear();
+        texts
+    }
+
+    /// v23 gate pin (issue 3, UI half): a plugin with a CACHED-BAN verdict
+    /// never opens its vendor window; it opens the stand-in parameter
+    /// window, announces itself in the status line, and its sliders feed
+    /// the same cells + persistence tick as a real editor would.
+    #[test]
+    fn v23_ui_banned_editor_opens_params_window() {
+        let home = real_home();
+        let wolf = format!("{home}/.vst3/wolf-shaper.vst3");
+        let p = std::path::Path::new(&wolf);
+        if !p.is_dir() {
+            eprintln!("skip: no wolf-shaper");
+            return;
+        }
+        let mut app = headless_app("v23ban");
+        let load = crate::vsthost::open(p, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("wolf-shaper opens");
+        let entry = load.entry;
+        let m = App::plugin_mtime(&wolf).expect("mtime");
+        app.editor_probe.insert(wolf.clone(), (m, false));
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: wolf.clone(),
+            kind: crate::vsthost::VstKind::V3,
+            name: "wolf".into(),
+            params: vec![0.0; entry.descs().len()],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+        });
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone());
+        assert!(
+            app.status.contains("parameter window"),
+            "ban must announce itself: {}",
+            app.status
+        );
+        assert_eq!(app.params_win, Some(GuiTarget::Chain(0, 0)));
+        // A second click on a banned plugin stays on the stand-in (no
+        // vendor window is ever attempted — that is the crash never eaten).
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone());
+        assert!(app.fx_vst_editors.is_empty() && app.vst_editors.is_empty());
+        let texts = v23_texts(&mut app);
+        assert!(
+            texts.iter().any(|t| t == "filter"),
+            "params window must paint its filter box; galleys: {texts:?}"
+        );
+        // Sliders ride the cells; the persistence tick mirrors cells →
+        // row snapshot (what config save writes). This is the plumbing
+        // that makes issue 2 survive restarts for banned-window plugins.
+        entry.set_param(0, 0.5);
+        app.tick_plugin_persist();
+        if let ChainRow::Vst { params, .. } = &app.fx_rows[0][0] {
+            assert!((params[0] - 0.5).abs() < 1e-6, "row snapshot stale");
+        } else {
+            panic!("row gone");
+        }
+        std::mem::forget(entry);
+    }
+
+    /// v23 gate pin: a CACHED-SAFE verdict opens the vendor window
+    /// synchronously — no re-probe, no extra latency (the guard must not
+    /// tax healthy plugins after the first check).
+    #[test]
+    fn v23_ui_cached_safe_opens_window_directly() {
+        if !crate::vstedit::x11_available() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        let home = real_home();
+        let wolf = format!("{home}/.vst3/wolf-shaper.vst3");
+        let p = std::path::Path::new(&wolf);
+        if !p.is_dir() {
+            return;
+        }
+        let mut app = headless_app("v23safe");
+        let load = crate::vsthost::open(p, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("wolf-shaper opens");
+        let entry = load.entry;
+        let m = App::plugin_mtime(&wolf).expect("mtime");
+        app.editor_probe.insert(wolf.clone(), (m, true));
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: wolf.clone(),
+            kind: crate::vsthost::VstKind::V3,
+            name: "wolf".into(),
+            params: vec![0.0; entry.descs().len()],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+        });
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone());
+        assert!(
+            app.status.contains("plugin window opened"),
+            "cached-safe must open directly: {}",
+            app.status
+        );
+        let mut w = app.fx_vst_editors.remove(&(0, 0)).expect("window handle");
+        w.close();
+        std::mem::forget(entry);
+    }
+
+    /// v23 end-to-end pin (issue 2, the flagship): bind KR-106, open its
+    /// real editor window, drag a knob (injected `performEdit` — the same
+    /// route its UI takes), close the window with a WM_DELETE exactly
+    /// like a user, and require the value to survive the harvest →
+    /// rebuild. On chunk-only rebuild this reverted to the factory
+    /// preset (336-byte chunk for 2138 params — sweep fact).
+    #[test]
+    fn v23_ui_synth_gui_close_persists_patch() {
+        if !crate::vstedit::x11_available() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        let home = real_home();
+        let kr = format!("{home}/.vst3/Ultramaster KR-106.vst3");
+        if !std::path::Path::new(&kr).is_dir() {
+            eprintln!("skip: no KR-106");
+            return;
+        }
+        let mut app = headless_app("v23kr");
+        app.track_synth[0] = Some(vst_synth_encode(crate::vsthost::VstKind::V3, &kr));
+        assert!(app.rebuild_track_synth(0), "KR-106 binds as synth");
+        let entry = match app.track_synth_inst[0].as_ref() {
+            Some(arc) => match arc.as_ref() {
+                crate::audio::SynthHandle::Vst(e) => e.clone(),
+                _ => panic!("VST binding lost"),
+            },
+            None => panic!("no synth instance"),
+        };
+        let k = entry
+            .descs()
+            .iter()
+            .position(|d| d.writable)
+            .expect("KR-106 writable param");
+        app.open_plugin_gui_now(GuiTarget::Synth(0), &entry);
+        let ctx = egui::Context::default();
+        // Wait for the vendor window to map (its own thread does the X
+        // work; patience for a big JUCE-class editor).
+        let mut painted = false;
+        for _ in 0..140 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            match app.vst_editors.get(&0) {
+                Some(w) => {
+                    if w.open_failed() {
+                        break;
+                    }
+                    if w.painted() && w.xid() != 0 {
+                        painted = true;
+                        break;
+                    }
+                }
+                None => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !painted {
+            eprintln!("skip: KR-106 editor never painted on this display");
+            if let Some(mut w) = app.vst_editors.remove(&0) {
+                w.close();
+            }
+            return;
+        }
+        let xid = app.vst_editors.get(&0).unwrap().xid();
+        // "Changing values … work fine" — live write reaches the cells.
+        crate::vstedit::inject_shadow_edit(xid, k, 0.91);
+        let mut live = false;
+        for _ in 0..40 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if (entry.params().get(k) - 0.91).abs() < 1e-3 {
+                live = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(live, "issue 1: editor edit never reached the live cells");
+        // The user closes the window.
+        assert!(crate::vstedit::request_wm_delete(xid), "WM_DELETE sent");
+        for _ in 0..160 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            let gone = match app.vst_editors.get(&0) {
+                Some(w) => w.is_closed(),
+                None => true,
+            };
+            if gone {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        frame(&mut app, &ctx, vec![]); // reap + harvest + rebuild
+        assert!(!app.vst_editors.contains_key(&0), "closed editor reaped");
+        assert!(
+            app.track_synth_state[0].is_some(),
+            "issue 2: no chunk harvested from the closed editor"
+        );
+        let e2 = match app.track_synth_inst[0].as_ref() {
+            Some(arc) => match arc.as_ref() {
+                crate::audio::SynthHandle::Vst(e) => e.clone(),
+                _ => panic!("rebuild lost the VST"),
+            },
+            None => panic!("rebuild dropped the synth"),
+        };
+        assert!(
+            (e2.params().get(k) - 0.91).abs() < 1e-3,
+            "issue 2: knob reverted to factory after the window closed"
+        );
+        std::mem::forget(e2);
+    }
+
+    /// v23: automation target pickers stay usable when a plugin publishes
+    /// thousands of params (Surge XT: 2855) — search narrows, the list is
+    /// capped, and empty search still fills the list to the cap.
+    #[test]
+    fn v23_target_lists_filter_huge_plugins() {
+        let targets: Vec<(String, String)> = (0..3000)
+            .map(|i| {
+                let label = if i % 97 == 0 {
+                    format!("Filter Resonance {i}")
+                } else {
+                    format!("Param {i}")
+                };
+                (format!("vst:{i}"), label)
+            })
+            .collect();
+        let all = filtered_targets(&targets, "");
+        assert!(!all.is_empty() && all.len() <= 400, "cap must bound the list");
+        let hit = filtered_targets(&targets, "resonance");
+        assert!(hit.len() >= 30 && hit.iter().all(|(_, l)| l.contains("Resonance")));
+        assert!(filtered_targets(&targets, "zzz-nothing").is_empty());
     }
 }
