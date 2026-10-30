@@ -33,8 +33,15 @@ use std::sync::{Arc, Mutex};
 
 /// Fixed processing granularity handed to plugins (samples).
 pub const VST_BLOCK: usize = 512;
-/// Number of sliders the VST panel exposes per plugin.
-pub const VST_MAX_PARAMS: usize = 64;
+/// Upper bound on tracked parameters per plugin. Surge XT alone
+/// enumerates ~2.9 k VST3 parameters; the old cap of 64 truncated the
+/// table so that nearly every knob a big synth reported via
+/// `performEdit` mapped to no cell and died at the editor drain —
+/// windows "did nothing until closed" (v23 user report). 8192 covers the
+/// VST2 spec maximum (1024) and every real-world VST3 with room; the
+/// per-block param diff scans this many atomics only when a generation
+/// bump happened, which stays microseconds on the RT thread.
+pub const VST_MAX_PARAMS: usize = 8192;
 /// Ring capacity: covers the largest plausible JACK callback plus slop.
 /// The rings never grow past this (oldest samples are dropped on overflow),
 /// which keeps the audio thread allocation-free after load.
@@ -1224,6 +1231,22 @@ pub struct VstLoad {
     pub entry: Arc<RtStageEntry>,
 }
 
+/// v23: a full patch harvested from a closed VST3 shadow editor — the
+/// component state chunk PLUS the shadow's own (parameter id, normalized
+/// value) list. The chunk alone is NOT enough to restore sound: the VST3
+/// spec keeps normalized parameter values out of the state streams, so
+/// vendors differ — the v23 full-host sweep found 15+ plugins whose chunk
+/// silently omits them, and a chunk-only rebuild therefore REVERTED every
+/// knob the user had just moved (the reported Ultramaster KR-106
+/// "closing the window loses all changes"). Rebuilding applies the chunk
+/// first, then this list, so both chunk carriers and chunk omitters land
+/// on exactly what the plugin window showed.
+#[derive(Clone, Debug, Default)]
+pub struct VstPatch {
+    pub chunk: Vec<u8>,
+    pub params: Vec<(u32, f32)>,
+}
+
 /// Process-wide plugin instantiation lock. dlopen-ing plugin code and
 /// running a plugin's factory/editor bootstrap touch PROCESS-GLOBAL state
 /// inside the plugin binary (toolkit singletons, lazy statics). A per-frame
@@ -1472,25 +1495,25 @@ pub fn open_async(
     open_async_with_state(path, kind, sample_rate, saved, None)
 }
 
-/// [`open_async`] carrying a VST3 state chunk (see [`open_with_state`]).
+/// [`open_async`] carrying a VST3 patch (see [`open_with_state`]).
 pub fn open_async_with_state(
     path: &Path,
     kind: VstKind,
     sample_rate: u32,
     saved: Option<&[f32]>,
-    state: Option<&[u8]>,
+    patch: Option<&VstPatch>,
 ) -> std::sync::mpsc::Receiver<Result<Arc<RtStageEntry>, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
-    let state = state.map(|s| s.to_vec());
+    let patch = patch.cloned();
     post(move || {
         // `open_inner` DIRECTLY: this closure already runs on the GUI
         // thread, and `open` would proxy its result back to this very
         // thread — waiting on ourselves = the v16 pump freeze this pin
         // caught ("picked plugin never loaded").
         let _ = tx.send(
-            open_inner(&path, kind, sample_rate, saved.as_deref(), state.as_deref()).map(|l| l.entry),
+            open_inner(&path, kind, sample_rate, saved.as_deref(), patch.as_ref()).map(|l| l.entry),
         );
     });
     rx
@@ -1520,11 +1543,12 @@ pub fn open(
     open_with_state(path, kind, sample_rate, saved, None)
 }
 
-/// v20 (`open` + a VST3 state chunk): the chunk is applied to the fresh
-/// instance BEFORE parameter cells are seeded, so descriptors, cells, and
-/// the plugin's own patch all come up in the saved state. This is how a
-/// preset chosen inside a VST3 editor (whose editor is a shadow instance,
-/// never the one making sound) reaches the live instance on rebuild.
+/// v20 (`open` + a VST3 patch): the chunk is applied to the fresh
+/// instance FIRST, then the patch's (id, value) parameter list (v23) —
+/// descriptors, cells, and the plugin's own patch all come up in the
+/// state the editor window showed. This is how a preset or knob move
+/// made inside a VST3 editor (whose editor is a shadow instance, never
+/// the one making sound) reaches the live instance on rebuild.
 /// Chunks for VST2 are a no-op: its editor edits the live instance
 /// in place, so there is no second state to carry.
 pub fn open_with_state(
@@ -1532,12 +1556,12 @@ pub fn open_with_state(
     kind: VstKind,
     sample_rate: u32,
     saved: Option<&[f32]>,
-    state: Option<&[u8]>,
+    patch: Option<&VstPatch>,
 ) -> Result<VstLoad, String> {
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
-    let state = state.map(|s| s.to_vec());
-    on_gui_thread(move || open_inner(&path, kind, sample_rate, saved.as_deref(), state.as_deref()))?
+    let patch = patch.cloned();
+    on_gui_thread(move || open_inner(&path, kind, sample_rate, saved.as_deref(), patch.as_ref()))?
 }
 
 /// [`open`]'s body. Runs ON the VST GUI thread (the proxy above, or a
@@ -1548,7 +1572,7 @@ fn open_inner(
     kind: VstKind,
     sample_rate: u32,
     saved: Option<&[f32]>,
-    state: Option<&[u8]>,
+    patch: Option<&VstPatch>,
 ) -> Result<VstLoad, String> {
     // v19.1: never dlopen a chainloader wrapper whose Wine probe failed —
     // the dlopen itself is the abort(). Covers lazily (re)opened chain rows
@@ -1559,7 +1583,7 @@ fn open_inner(
     }
     let _loader = vst_loader_lock();
     let entry = match kind {
-        VstKind::V3 => open_v3(path, sample_rate, saved, state)?,
+        VstKind::V3 => open_v3(path, sample_rate, saved, patch)?,
         // VST2 editors edit the live instance: no chunk round-trip exists.
         VstKind::V2 => open_v2(path, sample_rate, saved)?,
     };
@@ -1570,6 +1594,135 @@ fn open_inner(
 
 fn stage_buf() -> Vec<f32> {
     vec![0.0f32; VST_BLOCK]
+}
+
+// ---------------------------------------------------------------- editor probe
+//
+// v23 (user report: "opening ADLplug shows a blue window, then the whole
+// program crashes"): plugin editor windows run IN-PROCESS, inside the
+// plugin's own GUI toolkit, and some vendors' UI code dies on particular
+// X servers. Proven on this host: ADLplug/OPNplug (JUCE 6) SIGSEGV inside
+// `juce::Displays::findDisplays` on Xwayland's zero-CRTC RandR table —
+// under a vanilla X server the very same editor paints and closes fine.
+// Vendor code we cannot patch must never take the app down, so the FIRST
+// time a plugin's window is requested it is opened in a disposable child
+// slooper process first (see `vstedit::probe_child`). Clean child exit =
+// safe; crash, abort or hang = the editor is BANNED: the plugin still
+// loads and sounds, and the parameter-sliders window stands in for the
+// dead window. Results are cached in config keyed by the file's mtime, so
+// a plugin binary change re-arms the probe automatically.
+//
+// Exit-code protocol of the probe child (`vstedit::probe_child`):
+// 0 = editor opened, painted (or refused cleanly) and closed — safe;
+// 2 = the plugin itself failed to load in the child (not an editor
+// verdict — the real open will surface the honest load error).
+// Anything else (signal, abort, timeout) = banned.
+
+/// Verdict of [`probe_editor`].
+#[derive(Debug)]
+pub enum EditorProbe {
+    /// Opening this editor in a child survived; open it for real.
+    Safe,
+    /// The editor crashed / hung the child. `persist` false means the
+    /// failure smells transient (Wine bridge) and must not be cached.
+    Banned { why: String, persist: bool },
+    /// The probe cannot run here (no current exe, no X11, spawn error):
+    /// proceed without a verdict — NEVER ban on a skip.
+    Skip,
+}
+
+fn probe_banned(path: &Path, why: String, persist: bool) -> EditorProbe {
+    EditorProbe::Banned {
+        why: format!("{}: {why}", path.display()),
+        persist,
+    }
+}
+
+/// Run the child-process editor probe. BLOCKS (up to ~45 s: Surge XT's
+/// factory alone takes seconds) — call from a worker thread, never the UI
+/// or GUI thread.
+pub fn probe_editor(path: &Path, kind: VstKind) -> EditorProbe {
+    if !crate::vstedit::x11_available() {
+        // No X display: editors cannot open at all here; the regular open
+        // path reports that honestly. Not an editor verdict.
+        return EditorProbe::Skip;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return EditorProbe::Skip,
+    };
+    // The probe child re-enters OUR main(); only the real application
+    // binary has that dispatch. Under `cargo test` current_exe is the
+    // libtest harness — spawning it would recursively run the suite.
+    let real_app = exe
+        .file_name()
+        .is_some_and(|n| matches!(n.to_str(), Some("slooper") | Some("slooper-bin")));
+    if !real_app {
+        return EditorProbe::Skip;
+    }
+    let child = std::process::Command::new(exe)
+        .env(
+            "SLOOPER_EDITOR_PROBE",
+            if matches!(kind, VstKind::V3) { "V3" } else { "V2" },
+        )
+        .env("SLOOPER_EDITOR_PROBE_PATH", path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(_) => return EditorProbe::Skip,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                if st.success() {
+                    return EditorProbe::Safe;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = st.signal() {
+                        // A Wine-bridged plugin aborting in a child can be
+                        // the documented transient "wrong wineserver" race
+                        // — v21 rule: never a life sentence without retry.
+                        let transient = is_wine_bridged(path);
+                        return probe_banned(
+                            path,
+                            format!("its plugin window crashed the test process (signal {sig})"),
+                            !transient,
+                        );
+                    }
+                }
+                if st.code() == Some(2) {
+                    return EditorProbe::Safe; // load failure, not an editor verdict
+                }
+                return probe_banned(
+                    path,
+                    format!(
+                        "its plugin window failed the test (exit {:?})",
+                        st.code()
+                    ),
+                    true,
+                );
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return probe_banned(
+                        path,
+                        "its plugin window never finished opening (hung)".into(),
+                        true,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(_) => return EditorProbe::Skip,
+        }
+    }
 }
 
 fn apply_saved(params: &VstParams, descs: &[VstParamDesc], saved: Option<&[f32]>) {
@@ -1640,7 +1793,7 @@ fn open_v3(
     path: &Path,
     sample_rate: u32,
     saved: Option<&[f32]>,
-    state: Option<&[u8]>,
+    patch: Option<&VstPatch>,
 ) -> Result<RtStageEntry, String> {
     use vst3_host::{
         audio::{AudioBuffers, BusDirection, MediaType},
@@ -1653,11 +1806,22 @@ fn open_v3(
     // editor's user picked): everything measured below — buses, cells,
     // descriptors — then reflects the plugin's real saved state. A failed
     // restore must not kill the row: fall back to the plugin's defaults.
-    if let Some(bytes) = state {
-        if let Err(e) = plugin.load_state(bytes) {
-            if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
-                eprintln!("[vsthost] {path:?}: load_state refused ({e}) — defaults");
+    // v23: then re-apply the shadow's (id, value) parameter list. VST3
+    // state chunks legitimately omit normalized parameter values (the
+    // sweep proved 15+ plugins here omit them), so a chunk-only rebuild
+    // reverted exactly the knob moves the user had just made. Applying the
+    // shadow's values on top makes the rebuild equal the closed window for
+    // BOTH vendor families (carriers re-receive their own values).
+    if let Some(p) = patch {
+        if !p.chunk.is_empty() {
+            if let Err(e) = plugin.load_state(&p.chunk) {
+                if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
+                    eprintln!("[vsthost] {path:?}: load_state refused ({e}) — defaults");
+                }
             }
+        }
+        for (id, v) in &p.params {
+            let _ = plugin.set_parameter(*id, *v as f64);
         }
     }
     // JUCE-wrapper plugins (Vitalium, SwankyAmp — distrho-ports builds) advertise
@@ -1756,7 +1920,7 @@ fn open_v3(
         descs,
         has_editor,
         None,
-        state.map(|s| s.to_vec()),
+        patch.map(|p| p.chunk.clone()).filter(|v| !v.is_empty()),
     ))
 }
 
@@ -2368,7 +2532,7 @@ mod tests {
     /// file must reuse the cached identity with ZERO new instantiations.
     #[test]
     fn v17_rescan_never_reinstantiate_live_library() {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::test_real_home();
         let src = std::path::PathBuf::from(format!("{home}/.vst/wolf-shaper-vst.so"));
         if !src.is_file() {
             eprintln!("skip: no wolf-shaper VST2 on this host");
@@ -2594,7 +2758,13 @@ mod tests {
         assert!(bytes.len() > 64, "wolf-shaper chunk suspiciously small");
         drop(p);
 
-        let load = match open_with_state(&wolf, VstKind::V3, 48_000, None, Some(&bytes)) {
+        let load = match open_with_state(
+            &wolf,
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch { chunk: bytes.clone(), params: Vec::new() }),
+        ) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("skip: open_with_state failed ({e})");
@@ -2776,7 +2946,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sp-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::test_real_home();
         let src = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
         if !src.is_file() {
             eprintln!("skip: no wolf-shaper on this host");
@@ -2992,7 +3162,7 @@ mod tests {
     /// e2e test `e2e_vst2_effect_not_silent` under real JACK.
     #[test]
     fn v10_local_vst2_effect_passes_audio() {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::test_real_home();
         let p = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
         if !p.is_file() {
             eprintln!("skip: no wolf-shaper on this host");
@@ -3056,7 +3226,7 @@ mod tests {
             idle <= 40.0,
             "idle pump must stay on the cheap 30 ms tick (≤40 Hz), got {idle:.1} Hz"
         );
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::test_real_home();
         let path = std::path::Path::new(&home).join(".vst/DragonflyHallReverb-vst.so");
         if !path.is_file() {
             eprintln!("skip AC1: Dragonfly VST2 not installed");
@@ -3286,5 +3456,172 @@ mod tests {
         );
         std::env::set_var("HOME", real_home);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// v23 (user report: "changing values in Overtonium and Surge XT
+    /// only actually updates after the user closes the GUI"): the host
+    /// parameter table was capped at 64, but these plugins publish ~2.9 k
+    /// parameters (sweep, `examples/v23_sweep.rs`: Surge XT 2855,
+    /// Overtonium 2931, KR-106 2138). Every `performEdit` id past the cap
+    /// mapped to no cell and died silently; only the editor teardown's
+    /// harvest made the move appear. The cap must exceed reality, and a
+    /// high-index cell write must round-trip.
+    #[test]
+    fn v23_param_table_covers_huge_plugins() {
+        // Compile-time: the whole point of the constant is to stay ahead
+        // of reality; a shrink does not compile, which is the pin.
+        const _: () = assert!(VST_MAX_PARAMS >= 8192, "param cap regressed");
+        let home = crate::test_real_home();
+        let mut checked = 0;
+        for name in ["Surge XT.vst3", "Overtonium.vst3", "Ultramaster KR-106.vst3"] {
+            let p = std::path::Path::new(&home).join(".vst3").join(name);
+            if !p.is_dir() {
+                continue;
+            }
+            let load = match open(&p, VstKind::V3, 48_000, None) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("skip {name}: {e}");
+                    continue;
+                }
+            };
+            let n = load.entry.descs().len();
+            eprintln!("v23 cap pin: {name} publishes {n} params");
+            assert!(
+                n > 100,
+                "{name}: only {n} params enumerated — table still truncated?"
+            );
+            let k = n / 2;
+            load.entry.set_param(k, 0.25);
+            assert_eq!(
+                load.entry.params().get(k),
+                0.25,
+                "{name}: high-index cell {k} lost the write"
+            );
+            std::mem::forget(load.entry); // plugin teardown off this thread
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("skip: no huge-plugin test subject installed");
+        }
+    }
+
+    /// v23 (user report: "changing values in Ultramaster KR-106 work
+    /// fine, but once the GUI closes, all changes are lost"): the plugin
+    /// DOES answer `setState` — with its factory preset. The sweep: its
+    /// chunk is 336 bytes for 2138 parameters; the values a rebuild needs
+    /// are simply not in there. A `VstPatch` carries both chunk and the
+    /// shadow's parameter values, applied chunk-first, values second.
+    /// RED on chunk-only rebuild, GREEN with the patch path.
+    #[test]
+    fn v23_patch_reopen_keeps_params_a_chunk_omits() {
+        let home = crate::test_real_home();
+        let kr = std::path::Path::new(&home)
+            .join(".vst3")
+            .join("Ultramaster KR-106.vst3");
+        if !kr.is_dir() {
+            eprintln!("skip: no KR-106 on this host");
+            return;
+        }
+        // The REAL vendor chunk: raw-load, save_state immediately (the
+        // sweep proved a fresh save_state already reverts live values —
+        // this is exactly what a chunk-only rebuild replays).
+        let raw = match vst3_host::simple::load_plugin_with_settings(
+            &kr,
+            48000.0,
+            crate::vsthost::VST_BLOCK,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip: KR-106 raw load failed ({e})");
+                return;
+            }
+        };
+        let params_ids: Vec<(u32, f32)> = match raw.get_parameters() {
+            Ok(ps) => ps
+                .into_iter()
+                .filter(|x| x.flags & 0x2 == 0) // skip readonly (canEdit)
+                .take(8)
+                .map(|x| (x.id, 0.613f32))
+                .collect(),
+            Err(_) => return,
+        };
+        if params_ids.len() < 4 {
+            eprintln!("skip: KR-106 exposed too few writable params");
+            return;
+        }
+        let chunk = match raw.save_state() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        drop(raw);
+
+        // Chunk alone must NOT reproduce the values (that is the bug);
+        // if a future vendor build carries them, the pin is vacuous — skip.
+        let bare = match open_with_state(&kr, VstKind::V3, 48_000, None, Some(&VstPatch { chunk: chunk.clone(), params: Vec::new() })) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let descs = bare.entry.descs();
+        let id2idx: std::collections::HashMap<u32, usize> =
+            descs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
+        let got: Vec<f32> = params_ids
+            .iter()
+            .filter_map(|(id, _)| id2idx.get(id).map(|i| bare.entry.params().get(*i)))
+            .collect();
+        std::mem::forget(bare.entry);
+        if got.iter().all(|v| (*v - 0.613).abs() < 1e-3) {
+            eprintln!("skip: this KR-106 build already carries params in its chunk");
+            return;
+        }
+
+        // With the patch, every value survives the reopen.
+        let fixed = open_with_state(
+            &kr,
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch { chunk, params: params_ids.clone() }),
+        )
+        .expect("KR-106 reopen with patch");
+        for (id, want) in &params_ids {
+            let i = match id2idx.get(id) {
+                Some(i) => *i,
+                None => continue,
+            };
+            assert_eq!(
+                fixed.entry.params().get(i),
+                *want,
+                "KR-106: patched param id {id} reverted after reopen"
+            );
+        }
+        std::mem::forget(fixed.entry);
+    }
+
+    /// v23 (user report: "opening ADLplug briefly shows a solid blue
+    /// window, then crash the entire program"): JUCE display
+    /// enumeration SIGSEGVs on this Xwayland. The crash guard probes the
+    /// editor in a throwaway child FIRST. This is the parent-side pin
+    /// for the VERDICT TYPE; the full child round-trip (a real vendor
+    /// SIGSEGV the host survives) lives in `tests/e2e.rs`, because the
+    /// probe child must be the real binary (`probe_editor` refuses to
+    /// spawn a test harness).
+    #[test]
+    fn v23_probe_refuses_to_spawn_a_test_harness() {
+        if !crate::vstedit::x11_available() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        // current_exe here is the libtest binary → the guard must Skip
+        // (never ban, never spawn ourselves).
+        let home = crate::test_real_home();
+        let adl = std::path::Path::new(&home).join(".vst/ADLplug.so");
+        if !adl.is_file() {
+            return;
+        }
+        match probe_editor(&adl, VstKind::V2) {
+            EditorProbe::Skip => {}
+            other => panic!("probe must refuse inside a test harness, got {other:?}"),
+        }
     }
 }

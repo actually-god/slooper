@@ -2341,3 +2341,62 @@ fn e2e_v13_sampler_patch_swap_live() {
     );
     let _ = active;
 }
+
+// ---------------------------------------------------------------------------
+// v23 editor crash guard — child protocol (issue 3: "ADLplug briefly shows a
+// solid blue window, then crash the entire program").
+//
+// The guard's whole promise is that a vendor editor SIGSEGV lands on a
+// THROWAWAY child, never the app. That promise lives in the real binary's
+// main() dispatch (`vstedit::probe_child`), which a test harness cannot
+// emulate — so this spawns the actual `slooper` binary as the probe child.
+// The strongest signal is implicit: this test process must still be alive
+// to make the assertion.
+// ---------------------------------------------------------------------------
+
+fn v23_probe_child(path: &std::path::Path, kind: &str) -> std::process::ExitStatus {
+    use std::process::{Command, Stdio};
+    let exe = std::env::var("CARGO_BIN_EXE_slooper").expect("cargo bin env");
+    Command::new(exe)
+        .env("SLOOPER_EDITOR_PROBE", kind)
+        .env("SLOOPER_EDITOR_PROBE_PATH", path)
+        .env("SLOOPER_NULL_AUDIO", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn probe child")
+}
+
+#[test]
+fn v23_probe_child_dies_instead_of_the_host() {
+    if !slooper::vstedit::x11_available() {
+        eprintln!("skip: no X display for editor probes");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let adl = std::path::Path::new(&home).join(".vst/ADLplug.so");
+    if adl.is_file() {
+        let st = v23_probe_child(&adl, "V2");
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        let crashed = st.signal().is_some() || st.code() == Some(4);
+        assert!(
+            crashed,
+            "ADLplug's editor must take down ONLY the child (status {st:?})"
+        );
+    }
+    let wolf = std::path::Path::new(&home).join(".vst3/wolf-shaper.vst3");
+    if wolf.is_dir() {
+        let st = v23_probe_child(&wolf, "V3");
+        // Exit 2 = did not load in the child = NOT an editor verdict; that
+        // is a skip, a crash-or-hang verdict against a healthy editor is a
+        // test failure.
+        if st.code() != Some(2) {
+            assert!(
+                st.success(),
+                "wolf-shaper's editor is healthy; the probe said {st:?}"
+            );
+        }
+    }
+}

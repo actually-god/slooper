@@ -444,7 +444,18 @@ struct Shared {
     /// `EditorWindow::take_state` and rebuilds the sounding instance, so a
     /// preset picked inside the plugin's own GUI reaches the audio.
     state: Arc<Mutex<Option<Vec<u8>>>>,
+    /// v23: alongside the chunk, the shadow's own (parameter id,
+    /// normalized value) list at harvest time. VST3 chunks legally omit
+    /// normalized values, and the v23 sweep showed 15+ local plugins whose
+    /// chunk does — rebuilds must re-apply the model values or every knob
+    /// move silently reverts when the window closes.
+    params: SharedPatch,
 }
+
+/// Teardown hand-off of the shadow's model parameter values:
+/// `(param id, normalized)`, harvested alongside the state chunk (see
+/// [`EditorWindow::take_patch`]).
+type SharedPatch = Arc<Mutex<Option<Vec<(u32, f32)>>>>;
 
 impl Shared {
     fn new() -> Self {
@@ -453,6 +464,7 @@ impl Shared {
             closed: Arc::new(AtomicBool::new(false)),
             open_failed: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(None)),
+            params: Arc::new(Mutex::new(None)),
             painted: Arc::new(AtomicBool::new(false)),
             children: Arc::new(AtomicUsize::new(0)),
             width: Arc::new(AtomicI32::new(0)),
@@ -480,6 +492,8 @@ pub struct EditorWindow {
     xid: Arc<AtomicUsize>,
     /// v20: VST3 shadow-editor state hand-off (see `Shared::state`).
     state: Arc<Mutex<Option<Vec<u8>>>>,
+    /// v23: shadow parameter hand-off (see `Shared::params`).
+    params: SharedPatch,
 }
 
 impl EditorWindow {
@@ -489,6 +503,24 @@ impl EditorWindow {
     /// VST2 editors edit the live instance and never produce one.
     pub fn take_state(&mut self) -> Option<Vec<u8>> {
         self.state.lock().ok().and_then(|mut c| c.take())
+    }
+
+    /// v23: take the FULL harvest — state chunk plus the shadow's own
+    /// parameter values at teardown. VST3 chunks legitimately omit
+    /// normalized parameter values (the sweep: 15+ local plugins do), so a
+    /// chunk-only rebuild reverted every knob move the window had just
+    /// applied. The host rebuilds with the chunk FIRST and these values
+    /// SECOND, which reproduces the closed window exactly for both vendor
+    /// families. `None` when nothing was harvested (VST2, unchanged).
+    pub fn take_patch(&mut self) -> Option<crate::vsthost::VstPatch> {
+        let chunk = self.take_state()?;
+        let params = self
+            .params
+            .lock()
+            .ok()
+            .and_then(|mut p| p.take())
+            .unwrap_or_default();
+        Some(crate::vsthost::VstPatch { chunk, params })
     }
 
     /// v22: non-destructive peek at the harvested chunk (see `take_state`).
@@ -606,6 +638,7 @@ pub fn open_editor(
         height: shared.height.clone(),
         xid: shared.xid.clone(),
         state: shared.state.clone(),
+        params: shared.params.clone(),
     })
 }
 
@@ -1114,11 +1147,32 @@ pub fn open_vst3_editor(
         height: shared.height.clone(),
         xid: shared.xid.clone(),
         state: shared.state.clone(),
+        params: shared.params.clone(),
     })
 }
 
 thread_local! {
     static REG3: std::cell::RefCell<Vec<Editor3>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test/automation hook: inject a parameter edit into the live VST3
+/// shadow editor owning container `xid`, exactly what the plugin's own
+/// UI produces when the user drags a knob: the shadow model updates
+/// (harvest at teardown rides it) and the shared cell mirror moves with
+/// a generation bump (the live sound follows, like a slider). The edit
+/// is applied on the shared VST GUI thread (that is where the editor
+/// registry lives), so observe the effect through the cells with a
+/// short retry loop (the caller watches the cells).
+pub fn inject_shadow_edit(xid: u64, cell: usize, v: f32) {
+    crate::vsthost::post(move || {
+        REG3.with(|reg| {
+            for e in reg.borrow_mut().iter_mut() {
+                if e.shared.xid.load(Ordering::SeqCst) as u64 == xid {
+                    let _ = e.inject_edit(cell, v);
+                }
+            }
+        });
+    })
 }
 
 /// Route every edit the plugin UI reported into the shared parameter
@@ -1507,8 +1561,21 @@ fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: 
     }
     match p.save_state() {
         Ok(bytes) => {
-            if let Ok(mut cell) = shared.state.lock() {
+            // v23: ride-along parameter snapshot — the shadow's model
+            // values (id, normalized) at the exact moment of the harvest.
+            // This is what makes chunk-omitting vendors survive the
+            // rebuild (see `EditorWindow::take_patch`).
+            let psnap = p
+                .get_parameters()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|x| (x.id, x.value as f32))
+                .collect();
+            if let (Ok(mut cell), Ok(mut pcell)) =
+                (shared.state.lock(), shared.params.lock())
+            {
                 *cell = Some(bytes);
+                *pcell = Some(psnap);
             }
         }
         Err(e) => {
@@ -1527,6 +1594,24 @@ fn harvest3(p: &mut vst3_host::Plugin, sr: u32, dbg: bool, title: &str, shared: 
         if let Some(p) = self.plugin.as_mut() {
             Self::harvest3(p, self.sr, self.dbg, &self.title, &self.shared);
         }
+    }
+
+    /// Backing for [`inject_shadow_edit`]: set the shadow model parameter
+    /// for cell `cell` and mirror it into the shared cells (the identical
+    /// route a plugin-UI `performEdit` takes through `drain_param_edits3`).
+    fn inject_edit(&mut self, cell: usize, v: f32) -> bool {
+        let Some(id) = self.ids.get(cell).copied() else {
+            return false;
+        };
+        let ok = match self.plugin.as_mut() {
+            Some(p) => p.set_parameter(id, v as f64).is_ok(),
+            None => false,
+        };
+        if ok {
+            self.changed = true;
+            self.params.set(cell, v);
+        }
+        ok
     }
 
     /// Detach the view, retire the shadow instance under the loader lock,
@@ -1575,6 +1660,86 @@ impl Drop for Editor3 {
 /// libX11 alongside the GUI thread's live connections.
 pub fn x11_available() -> bool {
     std::env::var_os("DISPLAY").is_some()
+}
+
+// ---------------------------------------------------------------- v23 probe
+//
+// The child half of the editor crash guard (parent half and rationale:
+// `vsthost::probe_editor`). This runs at the very start of `main` when
+// `SLOOPER_EDITOR_PROBE` is set — before the backend, before JACK, before
+// any window of ours: load the plugin, open its window exactly like the
+// app would (for VST3 that means the SAME topology: one sounding instance
+// plus the shadow editor instance), give it time to show the crash that
+// paints after the first idles, close, exit. A vendor crash kills only
+// this throwaway process, and the parent converts that into a ban instead
+// of a lost session.
+
+/// Exit-code protocol: 0 = survived (or nothing to test), 2 = plugin did
+/// not load in the child (not an editor verdict). Crashes exit by signal.
+pub fn probe_child(spec: &str) -> i32 {
+    // Two env vars on purpose: env strings are NUL-terminated, and paths
+    // may legally contain tabs — `SLOOPER_EDITOR_PROBE` carries only the
+    // kind token, `SLOOPER_EDITOR_PROBE_PATH` the plugin path.
+    let Ok(path) = std::env::var("SLOOPER_EDITOR_PROBE_PATH") else {
+        return 0;
+    };
+    let kind = if spec == "V3" {
+        crate::vsthost::VstKind::V3
+    } else {
+        crate::vsthost::VstKind::V2
+    };
+    if !x11_available() {
+        return 0; // nothing testable; parent only probes with DISPLAY set
+    }
+    let path = std::path::Path::new(&path);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let load = match crate::vsthost::open(path, kind, 48_000, None) {
+        Ok(l) => l,
+        Err(_) => return 2,
+    };
+    let entry = load.entry;
+    if !entry.has_editor() {
+        return 0;
+    }
+    let mut win = if let Some(h) = entry.vst2_handle() {
+        match open_editor(
+            &h,
+            &path.to_string_lossy(),
+            &name,
+            entry.params().clone(),
+            entry.descs().len(),
+        ) {
+            Ok(w) => w,
+            Err(_) => return 0, // honest refusal: the app path reports it
+        }
+    } else {
+        match entry.open_vst3_editor(48_000) {
+            Ok(w) => w,
+            Err(_) => return 0,
+        }
+    };
+    // Verify window is 3 s; allow slack for the toolkit's own bootstrap.
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if win.painted() || win.open_failed() || win.is_closed() {
+            break;
+        }
+    }
+    // Stay alive briefly PAINTED: the ADLplug class of crash fires from the
+    // idle pump right after the first frame (the user sees a solid-color
+    // window for a heartbeat before the app dies).
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    win.close();
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if win.is_closed() {
+            break;
+        }
+    }
+    0
 }
 
 /// Child count on the thread's own connection (XQueryTree needs no round
