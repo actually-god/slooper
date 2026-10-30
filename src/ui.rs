@@ -3281,7 +3281,7 @@ impl App {
         r.nodes.push(crate::automation::Node {
             t: trel,
             v,
-            s: crate::automation::Shape::Linear,
+            c: 0.0,
         });
     }
 
@@ -3685,12 +3685,12 @@ impl App {
                         crate::automation::Node {
                             t: 0,
                             v: 1.0,
-                            s: crate::automation::Shape::Linear,
+                            c: 0.0,
                         },
                         crate::automation::Node {
                             t: len,
                             v: 1.0,
-                            s: crate::automation::Shape::Linear,
+                            c: 0.0,
                         },
                     ],
                 )
@@ -3716,82 +3716,321 @@ impl App {
     /// are created by clicking, moved by dragging, deleted by right-click;
     /// the node editor shows ABSOLUTE values (seconds + the target's own
     /// units), never percentages, and every axis has numeric entry.
-    /// v0.15: the "select value" popup — a rendering of the selected
-    /// track, its mixer values and the header values, where EVERY
-    /// automatable value carries a translucent overlay button. Clicking
-    /// one binds the open automation curve to that value; the curve's
-    /// min/max rescale to the new output's limits automatically.
+    /// v27: the "select value" window reworked per user request: instead of
+    /// one long filtered list it RENDERS the gear — a mini mixer with a
+    /// clickable strip per track (vol / trim / pan / mute) plus the master
+    /// section, and one panel per plugin (instrument + FX inserts) that
+    /// mirrors each parameter as its own little control at its current
+    /// value (a static mirror: values track the app, the panels never move
+    /// the controls). Every control carries the translucent bind overlay;
+    /// clicking binds this curve to that value (and rescales the curve to
+    /// the new target's range). The filter box narrows the PARAMETER cells
+    /// — the answer to 2.9k-param synths making the old list endless.
     fn auto_pick_window(&mut self, ui: &mut egui::Ui) {
         if !self.auto_pick_open || self.auto_edit.is_none() {
             return;
         }
         let track = self.selected.min(self.n_tracks.saturating_sub(1));
-        let targets = auto_targets(self, track);
         let mut pick: Option<(String, String)> = None;
         let mut open = true;
         egui::Window::new("Select value to automate")
             .id(egui::Id::new("auto_pick"))
-            .default_pos([520.0, 160.0])
-            .default_width(360.0)
+            .default_pos([240.0, 110.0])
+            .default_width(760.0)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(
                     RichText::new(format!(
-                        "track {} \u{b7} bpm {} \u{b7} master {} \u{b7} metro {} \u{b7} click the \
-                         overlay on the value this curve should drive",
+                        "track {} \u{b7} bpm {} \u{b7} click the control this curve should drive",
                         track + 1,
-                        self.metro_bpm,
-                        db_num(vol_amp(self.master_midi)),
-                        if self.metro_on { "on" } else { "off" },
+                        self.metro_bpm
                     ))
                     .weak()
                     .small(),
                 );
-                ui.separator();
-                // v23: plugins can expose ~2.9k params (Surge XT) — a raw
-                // list is unusable; filter first.
                 let q = target_search_box(ui, "filter parameter names");
-                let shown = filtered_targets(&targets, &q);
-                if shown.is_empty() && !targets.is_empty() {
-                    ui.label(RichText::new("no match").weak().small());
-                }
-                for (id, label) in &shown {
-                    let frac = target_preview_frac(self, track, id);
-                    let full = ui.available_width();
-                    let (bar, _) =
-                        ui.allocate_at_least(egui::vec2(full, 20.0), egui::Sense::hover());
-                    let p = ui.painter();
-                    p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
-                    p.rect_filled(
-                        egui::Rect::from_min_size(
-                            bar.min,
-                            egui::vec2(bar.width() * frac.clamp(0.0, 1.0), bar.height()),
-                        ),
-                        2.0,
-                        Color32::from_rgb(96, 104, 132),
-                    );
-                    p.text(
-                        bar.min + egui::vec2(5.0, bar.height() / 2.0),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        egui::FontId::proportional(11.0),
-                        Color32::from_rgb(226, 226, 232),
-                    );
-                    // Translucent overlay ADDED LAST: it sits on top and
-                    // takes the click — the "semi-transparent button".
-                    let btn = ui.put(
-                        bar,
-                        egui::Button::new(RichText::new("").small())
-                            .fill(Color32::from_rgba_premultiplied(255, 120, 120, 24))
-                            .min_size(egui::vec2(full, 20.0)),
-                    );
-                    if btn
-                        .on_hover_text(format!("bind this curve to {label}"))
-                        .clicked()
-                    {
-                        pick = Some((id.clone(), label.clone()));
-                    }
-                }
+                let ql = q.to_lowercase();
+                egui::ScrollArea::vertical()
+                    .max_height(440.0)
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        // ---- the mixer: one strip per track + master ----
+                        ui.label(RichText::new("MIXER").strong().small());
+                        ui.horizontal(|ui| {
+                            for t in 0..self.n_tracks {
+                                let sel = t == track;
+                                egui::Frame::new()
+                                    .fill(if sel {
+                                        Color32::from_rgb(40, 42, 54)
+                                    } else {
+                                        Color32::from_rgb(28, 30, 38)
+                                    })
+                                    .corner_radius(4.0)
+                                    .inner_margin(4.0)
+                                    .show(ui, |ui| {
+                                        ui.vertical(|ui| {
+                                        ui.set_width(56.0);
+                                        let nr = ui
+                                            .horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("T{}", t + 1))
+                                                        .strong()
+                                                        .small(),
+                                                );
+                                                if sel {
+                                                    ui.label(RichText::new("\u{25c0}").small().color(
+                                                        Color32::from_rgb(255, 210, 120),
+                                                    ));
+                                                }
+                                            })
+                                            .response
+                                            .rect;
+                                        // Clicking the strip NAME binds its
+                                        // volume (lane strip only) \u{b7} keeps
+                                        // the strips narrow like the mixer.
+                                        if sel {
+                                            bind_overlay(
+                                                ui,
+                                                nr,
+                                                "track volume \u{b7} strip title",
+                                                crate::automation::TARGET_TRACK_VOL,
+                                                &mut pick,
+                                            );
+                                        }
+                                        // volume fader
+                                        let fv = target_preview_frac(self, t, crate::automation::TARGET_TRACK_VOL);
+                                        bind_fader_cell(
+                                            ui,
+                                            &mut pick,
+                                            "vol",
+                                            crate::automation::TARGET_TRACK_VOL,
+                                            fv,
+                                            true,
+                                            db_num(fv * 2.0),
+                                            sel,
+                                        );
+                                        // gain trim (small horizontal)
+                                        let fg = target_preview_frac(self, t, TARGET_PSEUDO_GAIN);
+                                        bind_fader_cell(
+                                            ui,
+                                            &mut pick,
+                                            "trim",
+                                            TARGET_PSEUDO_GAIN,
+                                            fg,
+                                            false,
+                                            format!("{:+.1}", 20.0 * (fg * 3.162f32).max(1e-6).log10()),
+                                            sel,
+                                        );
+                                        // pan (center-detented bar)
+                                        let fp = target_preview_frac(self, t, crate::automation::TARGET_TRACK_PAN);
+                                        bind_fader_cell(
+                                            ui,
+                                            &mut pick,
+                                            "pan",
+                                            crate::automation::TARGET_TRACK_PAN,
+                                            fp,
+                                            false,
+                                            pan_hint(fp),
+                                            sel,
+                                        );
+                                        // mute lamp
+                                        let fm = target_preview_frac(self, t, crate::automation::TARGET_TRACK_MUTE);
+                                        bind_lamp_cell(
+                                            ui,
+                                            &mut pick,
+                                            "mute",
+                                            crate::automation::TARGET_TRACK_MUTE,
+                                            fm >= 0.5,
+                                            sel,
+                                        );
+                                        });
+                                    });
+                            }
+                            // master strip
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(44, 38, 30))
+                                .corner_radius(4.0)
+                                .inner_margin(4.0)
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                    ui.set_width(64.0);
+                                    ui.label(
+                                        RichText::new("MASTER").strong().small().size(10.0),
+                                    );
+                                    let fv = target_preview_frac(self, track, crate::automation::TARGET_MASTER_VOL);
+                                    bind_fader_cell(
+                                        ui,
+                                        &mut pick,
+                                        "vol",
+                                        crate::automation::TARGET_MASTER_VOL,
+                                        fv,
+                                        true,
+                                        db_num(fv * 2.0),
+                                        true,
+                                    );
+                                    let ft = target_preview_frac(self, track, crate::automation::TARGET_MASTER_TEMPO);
+                                    let bpm: f32 = self.metro_bpm.trim().parse().unwrap_or(120.0);
+                                    bind_lamp_cell2(
+                                        ui,
+                                        &mut pick,
+                                        "tempo",
+                                        crate::automation::TARGET_MASTER_TEMPO,
+                                        format!("{bpm:.0}"),
+                                        ft,
+                                    );
+                                    });
+                                });
+                        });
+                        ui.separator();
+                        // ---- plugin panels: the 1:1 parameter mirrors ----
+                        let mut panels: Vec<(String, Vec<(String, String)>)> = Vec::new();
+                        let stem = self
+                            .track_synth
+                            .get(track)
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_default();
+                        if !stem.is_empty() {
+                            let mut es: Vec<(String, String)> = Vec::new();
+                            let title =
+                                if let Some(d) = self.synth_registry.desc(&stem) {
+                                    let nm = d.name.clone();
+                                    for (k, pd) in d.params.iter().enumerate() {
+                                        es.push((format!("synth:{k}"), pd.label.clone()));
+                                    }
+                                    format!("synth \u{b7} {nm}")
+                                } else if let Some(Some(h)) = self.track_synth_inst.get(track) {
+                                    if let SynthHandle::Vst(e) = h.as_ref() {
+                                        let nm = e.name().to_string();
+                                        for (k, d) in e.descs().iter().enumerate() {
+                                            if d.writable {
+                                                es.push((format!("synth:{k}"), d.name.clone()));
+                                            }
+                                        }
+                                        format!("synth \u{b7} {nm}")
+                                    } else {
+                                        format!("synth \u{b7} {stem}")
+                                    }
+                                } else {
+                                    format!("synth \u{b7} {stem}")
+                                };
+                            panels.push((title, es));
+                        }
+                        if let Some(rows) = self.fx_rows.get(track) {
+                            for (r, row) in rows.iter().enumerate() {
+                                let (title, es): (String, Vec<(String, String)>) = match row {
+                                    ChainRow::Vst {
+                                        entry: Some(e),
+                                        name,
+                                        ..
+                                    } => (
+                                        name.clone(),
+                                        e.descs()
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, d)| d.writable)
+                                            .map(|(k, d)| (format!("fx:{r}:{k}"), d.name.clone()))
+                                            .collect(),
+                                    ),
+                                    ChainRow::Vst { name, params, .. } => (
+                                        name.clone(),
+                                        (0..params.len())
+                                            .map(|k| (format!("fx:{r}:{k}"), format!("param {k}")))
+                                            .collect(),
+                                    ),
+                                    ChainRow::Script { stem, params } => {
+                                        match self.fx_registry.desc(stem) {
+                                            Some(d) => {
+                                                let nm = d.name.clone();
+                                                (
+                                                    nm,
+                                                    d.params
+                                                        .iter()
+                                                        .enumerate()
+                                                        .map(|(k, pd)| {
+                                                            (format!("fx:{r}:{k}"), pd.label.clone())
+                                                        })
+                                                        .collect(),
+                                                )
+                                            }
+                                            None => (
+                                                stem.clone(),
+                                                (0..params.len())
+                                                    .map(|k| {
+                                                        (format!("fx:{r}:{k}"), format!("param {k}"))
+                                                    })
+                                                    .collect(),
+                                            ),
+                                        }
+                                    }
+                                };
+                                if !es.is_empty() {
+                                    panels.push((title, es));
+                                }
+                            }
+                        }
+                        let mut any_panel = false;
+                        for (title, es) in panels {
+                            let shown: Vec<(String, String)> = if ql.is_empty() {
+                                es
+                            } else {
+                                es.into_iter()
+                                    .filter(|(id, lb)| {
+                                        lb.to_lowercase().contains(&ql) || id.contains(&ql)
+                                    })
+                                    .collect()
+                            };
+                            if shown.is_empty() {
+                                continue;
+                            }
+                            any_panel = true;
+                            ui.label(
+                                RichText::new(format!("{title} \u{b7} static panel"))
+                                    .strong()
+                                    .small()
+                                    .color(Color32::from_rgb(210, 175, 120)),
+                            );
+                            // Cap the visible grid (Surge: ~2.9k params) —
+                            // the filter box above reaches the rest.
+                            let cap = if ql.is_empty() { 48 } else { shown.len() };
+                            let hidden = shown.len().saturating_sub(cap);
+                            ui.horizontal_wrapped(|ui| {
+                                for (id, label) in shown.iter().take(cap) {
+                                    let frac = target_preview_frac(self, track, id);
+                                    bind_param_cell(
+                                        ui,
+                                        &mut pick,
+                                        format!("{title} \u{b7} {label}"),
+                                        id.clone(),
+                                        label.clone(),
+                                        frac,
+                                    );
+                                }
+                            });
+                            if hidden > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "+{hidden} more parameters \u{b7} type in the filter box to find them"
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+                        if !any_panel {
+                            ui.label(
+                                RichText::new(if ql.is_empty() {
+                                    "no instrument or effect loaded on this track \u{2014} the mixer controls above are still bindable"
+                                } else {
+                                    "no parameter matches the filter"
+                                })
+                                .weak()
+                                .italics()
+                                .small(),
+                            );
+                        }
+                    });
             });
         if let Some((id, label)) = pick {
             if let Some(ed) = self.auto_edit.as_mut() {
@@ -3814,7 +4053,7 @@ impl App {
     }
 
     fn auto_window(&mut self, ui: &mut egui::Ui) {
-        use crate::automation::{Automation, Node, Shape};
+        use crate::automation::{Automation, Node};
         let Some(mut ed) = self.auto_edit.take() else {
             return;
         };
@@ -3947,7 +4186,7 @@ impl App {
                     }
                     ui.label(
                         RichText::new(
-                            "click = add \u{b7} drag = move \u{b7} dbl-click = shape \u{b7} r-click = delete",
+                            "click = add \u{b7} drag = move \u{b7} dbl-click = curvature \u{b7} r-click = delete",
                         )
                             .weak()
                             .italics(),
@@ -4033,9 +4272,9 @@ impl App {
                     if ui
                         .button("Select value\u{2026}")
                         .on_hover_text(
-                            "choose which value this curve drives: a rendering of the \
-                             track, its mixer, and the header values, each with a bind \
-                             overlay",
+                            "choose which value this curve drives: the mixer strips, the \
+                             master, and a static 1:1 panel per plugin showing every \
+                             parameter at its current value \u{b7} click one to bind",
                         )
                         .clicked()
                     {
@@ -4241,7 +4480,7 @@ impl App {
                                 .unwrap_or(ed.nodes.len());
                             ed.nodes.insert(
                                 at,
-                                Node { t, v, s: Shape::Linear },
+                                Node { t, v, c: 0.0 },
                             );
                             ed.sel = at;
                             ed.drag = Some(at);
@@ -4304,16 +4543,23 @@ impl App {
                         }
                     }
                 }
-                // v26: double-click a node to cycle the shape of the
-                // segment leading into it (linear \u{b7} smooth \u{b7} slow \u{b7}
-                // fast) \u{b7} the FL gesture. A double-click on empty space
-                // first ADDS a node (first click), and the cycle then
-                // applies to that new node, which is never a misfire.
+                // v27: double-click a node cycles the curvature of the
+                // segment leading into it (straight \u{b7} settle \u{b7} rush),
+                // the quick gesture for the continuous slider. A
+                // double-click on empty space first ADDS a node (first
+                // click), and the cycle applies to that new node, which is
+                // never a misfire.
                 if resp.double_clicked() {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                         if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
                             if let Some(n) = ed.nodes.get_mut(idx) {
-                                n.s = n.s.next();
+                                n.c = if n.c.abs() < 1e-6 {
+                                    0.75
+                                } else if n.c > 0.0 {
+                                    -0.75
+                                } else {
+                                    0.0
+                                };
                             }
                             ed.sel = idx;
                             ed.changed = true;
@@ -4323,7 +4569,7 @@ impl App {
                 if !ui.input(|i| i.pointer.any_down()) {
                     ed.drag = None;
                 }
-                resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, double-click a node to change the curve shape, right-click a node to delete it");
+                resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, double-click a node to cycle its segment curvature, right-click a node to delete it");
 
                 // ---- node editor ------------------------------------------
                 let mut resort: Option<i64> = None;
@@ -4371,15 +4617,28 @@ impl App {
                             n.v = vv;
                             ed.changed = true;
                         }
-                        egui::ComboBox::from_id_salt("auto_shape")
-                            .selected_text(n.s.label())
-                            .show_ui(ui, |ui| {
-                                for sh in Shape::ALL {
-                                    if ui.selectable_value(&mut n.s, sh, sh.label()).changed() {
-                                        ed.changed = true;
-                                    }
-                                }
-                            });
+                        // v27: one CONTINUOUS curvature for the segment
+                        // arriving at this node (FL Studio's dial) replaces
+                        // the old four-mode dropdown.
+                        let mut cc = n.c;
+                        if ui
+                            .add_sized(
+                                [140.0, 18.0],
+                                egui::Slider::new(&mut cc, -1.0..=1.0)
+                                    .text("curve")
+                                    .custom_formatter(|v, _| format!("{v:+.2}")),
+                            )
+                            .on_hover_text(
+                                "curvature of the segment arriving at this node: 0 straight \u{b7} \
+                                 + rushes away from the previous node and settles in softly \u{b7} \
+                                 \u{2212} eases away and rushes in (\u{b1}1 = the old slow/fast \
+                                 curves, sine/ease presets build on this)",
+                            )
+                            .changed()
+                        {
+                            n.c = cc;
+                            ed.changed = true;
+                        }
                         if ui.button("delete").clicked() && ed.nodes.len() > 1 {
                             ed.nodes.remove(ed.sel);
                             ed.sel = ed.sel.saturating_sub(1);
@@ -7588,7 +7847,7 @@ impl App {
                                                 ed.nodes.push(crate::automation::Node {
                                                     t: trel,
                                                     v,
-                                                    s: crate::automation::Shape::Linear,
+                                                    c: 0.0,
                                                 });
                                                 ed.changed = true;
                                             }
@@ -8512,6 +8771,240 @@ fn auto_menu(ui: &mut egui::Ui, app: &mut App, track: usize, target: &str, curre
     }
 }
 
+/// v27: pan position as the mixer writes it ("C", "L37", "R12").
+fn pan_hint(frac: f32) -> String {
+    let p = (frac * 200.0 - 100.0).round() as i32;
+    if p == 0 {
+        "C".into()
+    } else if p < 0 {
+        format!("L{}", -p)
+    } else {
+        format!("R{p}")
+    }
+}
+
+/// v27: THE bind idiom for the value-picker — the translucent overlay is
+/// added LAST over the painted control look so it takes the click and
+/// tints red on hover (the v0.15 semi-transparent button).
+fn bind_overlay(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    full: &str,
+    id: &str,
+    pick: &mut Option<(String, String)>,
+) {
+    let btn = ui.put(
+        rect,
+        egui::Button::new(RichText::new(""))
+            .fill(Color32::from_rgba_premultiplied(255, 120, 120, 24))
+            .min_size(rect.size()),
+    );
+    if btn
+        .on_hover_text(format!("bind this curve to {full}"))
+        .clicked()
+    {
+        *pick = Some((id.to_string(), full.to_string()));
+    }
+}
+
+/// v27: one mixer control mirrored for binding. `vertical` draws a fader
+/// (volume/master), otherwise a compact labeled bar (trim/pan); the value
+/// text shows the control's CURRENT reading — the "static image" of the
+/// real control, clickable to automate.
+#[allow(clippy::too_many_arguments)] // one closure-shaped widget per control kind
+fn bind_fader_cell(
+    ui: &mut egui::Ui,
+    pick: &mut Option<(String, String)>,
+    name: &str,
+    id: &str,
+    frac: f32,
+    vertical: bool,
+    value: String,
+    on: bool,
+) {
+    let size = if vertical {
+        egui::vec2(54.0, 72.0)
+    } else {
+        egui::vec2(54.0, 28.0)
+    };
+    let (r, _) = ui.allocate_at_least(size, egui::Sense::hover());
+    let f = frac.clamp(0.0, 1.0);
+    let p = ui.painter();
+    if vertical {
+        let gx = r.min.x + 10.0;
+        p.line_segment(
+            [egui::pos2(gx, r.min.y + 2.0), egui::pos2(gx, r.max.y - 2.0)],
+            egui::Stroke::new(3.0, Color32::from_gray(48)),
+        );
+        let y = r.max.y - 4.0 - f * (r.height() - 8.0);
+        p.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(gx, y), egui::vec2(16.0, 7.0)),
+            2.0,
+            Color32::from_gray(175),
+        );
+        p.text(
+            egui::pos2(r.min.x + 24.0, r.min.y + 6.0),
+            egui::Align2::LEFT_TOP,
+            name.to_string(),
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(195),
+        );
+        p.text(
+            egui::pos2(r.min.x + 24.0, r.min.y + 19.0),
+            egui::Align2::LEFT_TOP,
+            value,
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(140),
+        );
+    } else {
+        p.text(
+            r.min + egui::vec2(1.0, 0.0),
+            egui::Align2::LEFT_TOP,
+            name.to_string(),
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(195),
+        );
+        p.text(
+            r.max - egui::vec2(1.0, 0.0),
+            egui::Align2::RIGHT_TOP,
+            value,
+            egui::FontId::proportional(10.0),
+            Color32::from_gray(140),
+        );
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(r.min.x, r.min.y + 14.0),
+            egui::vec2(r.width() - 2.0, 8.0),
+        );
+        p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
+        p.rect_filled(
+            egui::Rect::from_min_size(
+                bar.min,
+                egui::vec2(bar.width() * f, bar.height()),
+            ),
+            2.0,
+            Color32::from_rgb(96, 104, 132),
+        );
+        p.line_segment(
+            [
+                egui::pos2(bar.min.x + bar.width() * f, bar.min.y - 1.0),
+                egui::pos2(bar.min.x + bar.width() * f, bar.max.y + 1.0),
+            ],
+            egui::Stroke::new(1.0, Color32::from_gray(215)),
+        );
+    }
+    if on {
+        bind_overlay(ui, r, &format!("{name} \u{b7} track strip"), id, pick);
+    } else {
+        ui.interact(
+            r,
+            ui.id().with(("stripoff", id)),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(
+            "an automation clip drives the track it sits on \u{b7} open this curve on \
+             that lane to automate its controls",
+        );
+    }
+}
+
+/// v27: mute / tempo style cell — state square plus label, bindable.
+fn bind_lamp_cell(
+    ui: &mut egui::Ui,
+    pick: &mut Option<(String, String)>,
+    name: &str,
+    id: &str,
+    lit: bool,
+    on: bool,
+) {
+    let (r, _) = ui.allocate_at_least(egui::vec2(54.0, 18.0), egui::Sense::hover());
+    let p = ui.painter();
+    let sq = egui::Rect::from_min_size(egui::pos2(r.min.x + 1.0, r.center().y - 6.0), egui::vec2(12.0, 12.0));
+    if lit {
+        p.rect_filled(sq, 2.0, Color32::from_rgb(230, 70, 70));
+    } else {
+        p.rect_stroke(
+            sq,
+            2.0,
+            egui::Stroke::new(1.0, Color32::from_gray(90)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    p.text(
+        egui::pos2(r.min.x + 18.0, r.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{name} {}", if lit { "on" } else { "off" }),
+        egui::FontId::proportional(10.0),
+        Color32::from_gray(160),
+    );
+    if on {
+        bind_overlay(ui, r, &format!("{name} \u{b7} track strip"), id, pick);
+    }
+}
+
+/// v27: tempo-style cell — current reading over a detent bar, bindable.
+fn bind_lamp_cell2(
+    ui: &mut egui::Ui,
+    pick: &mut Option<(String, String)>,
+    name: &str,
+    id: &str,
+    value: String,
+    frac: f32,
+) {
+    bind_fader_cell(ui, pick, name, id, frac, false, value, true);
+}
+
+/// v27: one plugin parameter mirrored 1:1 as a mini control: label, bar at
+/// its current value, percentage reading — and the bind overlay. This is
+/// what makes choosing among thousands of plugin params visual: the panel
+/// looks like the plugin's controls and reads them live.
+fn bind_param_cell(
+    ui: &mut egui::Ui,
+    pick: &mut Option<(String, String)>,
+    full: String,
+    id: String,
+    label: String,
+    frac: f32,
+) {
+    let (r, _) = ui.allocate_at_least(egui::vec2(122.0, 30.0), egui::Sense::hover());
+    let p = ui.painter();
+    let short: String = label.chars().take(15).collect();
+    p.text(
+        r.min + egui::vec2(1.0, 0.0),
+        egui::Align2::LEFT_TOP,
+        short,
+        egui::FontId::proportional(10.0),
+        Color32::from_rgb(226, 226, 232),
+    );
+    p.text(
+        r.max - egui::vec2(1.0, 0.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{:.0}%", frac.clamp(0.0, 1.0) * 100.0),
+        egui::FontId::proportional(9.0),
+        Color32::from_gray(140),
+    );
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(r.min.x + 1.0, r.min.y + 16.0),
+        egui::vec2(r.width() - 4.0, 8.0),
+    );
+    p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            bar.min,
+            egui::vec2(bar.width() * frac.clamp(0.0, 1.0), bar.height()),
+        ),
+        2.0,
+        Color32::from_rgb(96, 104, 132),
+    );
+    p.line_segment(
+        [
+            egui::pos2(bar.min.x + bar.width() * frac.clamp(0.0, 1.0), bar.min.y - 1.0),
+            egui::pos2(bar.min.x + bar.width() * frac.clamp(0.0, 1.0), bar.max.y + 1.0),
+        ],
+        egui::Stroke::new(1.0, Color32::from_gray(215)),
+    );
+    bind_overlay(ui, r, &full, &id, pick);
+}
+
 /// Rough current position of a target, 0..1, for the bind popup's faux
 /// strips (display only — the popup binds by TARGET ID, not by this).
 fn target_preview_frac(app: &App, track: usize, id: &str) -> f32 {
@@ -8549,10 +9042,12 @@ fn target_preview_frac(app: &App, track: usize, id: &str) -> f32 {
                     it.next().and_then(|v| v.parse::<usize>().ok()),
                     it.next().and_then(|v| v.parse::<usize>().ok()),
                 ) {
-                    if let Some(ChainRow::Script { params, .. }) =
-                        app.fx_rows.get(track).and_then(|rows| rows.get(r))
-                    {
-                        return params.get(i).copied().unwrap_or(0.5);
+                    match app.fx_rows.get(track).and_then(|rows| rows.get(r)) {
+                        Some(ChainRow::Script { params, .. })
+                        | Some(ChainRow::Vst { params, .. }) => {
+                            return params.get(i).copied().unwrap_or(0.5)
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -14198,7 +14693,7 @@ mod tests {
     /// curve's min/max to the new output's limits.
     #[test]
     fn v15_auto_pick_binds_and_rescales() {
-        use crate::automation::{Node, Shape};
+        use crate::automation::{Node};
         let mut app = headless_app("v15autopick");
         let ctx = egui::Context::default();
         app.open_auto_editor(None);
@@ -14209,12 +14704,12 @@ mod tests {
                 Node {
                     t: 0,
                     v: 0.0,
-                    s: Shape::Linear,
+                    c: 0.0,
                 },
                 Node {
                     t: 96_000,
                     v: 2.0,
-                    s: Shape::Linear,
+                    c: 0.0,
                 },
             ];
         }
@@ -14757,7 +15252,7 @@ mod tests {
         assert!(app.piano_roll.is_some(), "button opens the roll");
         // Let the window's open animation finish (each frame ticks ~25 ms)
         // so shapes reach full alpha before being matched.
-        for _ in 0..24 {
+        for _ in 0..48 {
             frame(&mut app, &ctx, vec![]);
         }
 
@@ -14977,7 +15472,7 @@ mod tests {
     #[test]
     fn v15_mgr_record_never_grows_past_span() {
         use crate::audio::{Evt, RawMidiMsg};
-        use crate::automation::{Node, Shape};
+        use crate::automation::{Node};
         use crate::midi::{MidiAction, MidiBind};
         let mut app = headless_app("reclim");
         app.sample_rate = 48_000;
@@ -15001,7 +15496,7 @@ mod tests {
             ed.nodes = vec![Node {
                 t: 0,
                 v: 0.5,
-                s: Shape::Linear,
+                c: 0.0,
             }];
         }
         let cc = |v| {
@@ -15028,7 +15523,7 @@ mod tests {
     /// SAME asset, and deleting the copied asset must empty the clipboard.
     #[test]
     fn v15_asset_removal_remaps_clipboard() {
-        use crate::automation::{Node, Shape, TARGET_TRACK_VOL};
+        use crate::automation::{Node, TARGET_TRACK_VOL};
         let mut app = headless_app("cbremap");
         app.sample_rate = 48_000;
         for _ in 0..2 {
@@ -15039,12 +15534,12 @@ mod tests {
                 Node {
                     t: 0,
                     v: 0.3,
-                    s: Shape::Linear,
+                    c: 0.0,
                 },
                 Node {
                     t: 48_000,
                     v: 0.6,
-                    s: Shape::Linear,
+                    c: 0.0,
                 },
             ];
             app.auto_commit(&mut ed, 0, false);
@@ -15098,7 +15593,7 @@ mod tests {
     /// neighbour's asset.
     #[test]
     fn v15_asset_removal_remaps_auto_editor() {
-        use crate::automation::{Node, Shape, TARGET_TRACK_VOL};
+        use crate::automation::{Node, TARGET_TRACK_VOL};
         let mut app = headless_app("autorem");
         app.sample_rate = 48_000;
         // Two saved automation assets: k0 then k1.
@@ -15110,12 +15605,12 @@ mod tests {
                 Node {
                     t: 0,
                     v: 0.3,
-                    s: Shape::Linear,
+                    c: 0.0,
                 },
                 Node {
                     t: 48_000,
                     v: 0.6,
-                    s: Shape::Linear,
+                    c: 0.0,
                 },
             ];
             app.auto_commit(&mut ed, 0, false);
@@ -15148,7 +15643,7 @@ mod tests {
     /// (arm -> move track volume -> stop -> asset + red clip).
     #[test]
     fn v11_automation_manager_roundtrip_and_write_rec() {
-        use crate::automation::{Node, Shape, TARGET_TRACK_PAN, TARGET_TRACK_VOL};
+        use crate::automation::{Node, TARGET_TRACK_PAN, TARGET_TRACK_VOL};
         let mut app = headless_app("autoedit");
         let ctx = egui::Context::default();
         frame_keys(&mut app, &ctx, vec![]);
@@ -15162,12 +15657,12 @@ mod tests {
             Node {
                 t: 0,
                 v: 0.0,
-                s: Shape::Linear,
+                c: 0.0,
             },
             Node {
                 t: 48_000,
                 v: 1.0,
-                s: Shape::Smooth,
+                c: 0.5,
             },
         ];
         let before = app.assets.len();
@@ -15186,7 +15681,9 @@ mod tests {
         let txt = std::fs::read_to_string(&a.path).unwrap();
         let back = crate::automation::Automation::from_json(&txt).unwrap();
         assert_eq!(back.target, TARGET_TRACK_PAN);
-        assert!((back.eval(24_000) - 0.5).abs() < 0.02);
+        // v27: the node carries c = 0.5 (the old "smooth" migrated); the
+        // curvature family puts the midpoint at 1 - 0.5^2 = 0.75.
+        assert!((back.eval(24_000) - 0.75).abs() < 0.02);
 
         // --- overwrite in place -----------------------------------------
         app.open_auto_editor(Some(k));
@@ -19683,6 +20180,140 @@ mod tests {
         frame(app, ctx, vec![]);
     }
 
+    // ---- v27: continuous curvature + visual value-picker pins ---------
+
+    /// The node row's curvature slider (the dropdown is gone) edits the
+    /// segment of the selected node continuously.
+    #[test]
+    fn v27_curvature_slider_sets_node() {
+        let mut app = headless_app("v27curv");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        v26_settle(&mut app, &ctx);
+        let curve = galley_at(&mut app, &ctx, "curve").expect("curvature slider label");        // Grab the handle: it is the gray capsule at the CENTER of the
+        // slider track (the value text and label live OUTSIDE the track).
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let y = curve.center().y;
+        let track = out
+            .shapes
+            .iter()
+            .find_map(|cs| {
+                if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                    let rr = r.rect;
+                    if (rr.center().y - y).abs() < 6.0
+                        && r.fill == Color32::from_gray(60)
+                        && (60.0..130.0).contains(&rr.width())
+                        && rr.height() < 12.0
+                    {
+                        return Some(rr);
+                    }
+                }
+                None
+            })
+            .expect("curvature slider track");
+        let cc = track.center();
+        drag_pt(&mut app, &ctx, cc, cc + egui::vec2(30.0, 0.0));
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        let sel = ed.sel;
+        assert!(
+            ed.nodes[sel].c > 0.3,
+            "slider drag set curvature, got {}",
+            ed.nodes[sel].c
+        );
+        assert!(ed.changed);
+    }
+
+    /// The picker shows one mixer strip per track and the master, but only
+    /// THE LANE'S OWN strip binds (an automation clip drives the track it
+    /// sits on) \u{b7} and clicking the strip's volume fader binds volume
+    /// while the old flat list is gone for good.
+    #[test]
+    fn v27_pick_strips_are_strips() {
+        let mut app = headless_app("v27strip");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        app.auto_pick_open = true;
+        v26_settle(&mut app, &ctx);
+        for t in 0..app.n_tracks {
+            galley_at(&mut app, &ctx, &format!("T{}", t + 1)).expect("one strip per track");
+        }
+        galley_at(&mut app, &ctx, "MASTER").expect("master strip");
+        // (the manager's own target COMBO legitimately reads
+        // "track volume (linear)"; the old popup LIST additionally painted
+        // a master row \u{b7} that pattern must be gone)
+        let old = galley_at(&mut app, &ctx, "master volume (linear)");
+        assert!(old.is_none(), "the endless flat list is gone");
+        // The lane's own strip binds volume (name row and fader do; other
+        // tracks' strips are context only).
+        // EXACT "T1": the arranger's lane heads ("T1 track") would
+        // false-hit a `contains` scan; the picker's strip titles don't.
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let vol = out
+            .shapes
+            .iter()
+            .find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == "T1" {
+                        let r = t.galley.rect;
+                        return Some(egui::Rect::from_center_size(
+                            t.pos + (r.center() - r.min),
+                            r.size(),
+                        ));
+                    }
+                }
+                None
+            })
+            .expect("lane strip name");
+        click_pt(&mut app, &ctx, vol.center());
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+        assert!(!app.auto_pick_open, "picker closes after binding");
+    }
+
+    /// A plugin on the lane gets a panel mirroring its parameters 1:1;
+    /// clicking one binds that parameter as the curve's target.
+    #[test]
+    fn v27_pick_plugin_panel_binds() {
+        let mut app = headless_app("v27panel");
+        let ctx = egui::Context::default();
+        if app.fx_registry.desc("space_echo").is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(
+                dir.join("space_echo.rs"),
+                include_str!("../effects/space_echo.rs"),
+            )
+            .unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, "space_echo");
+        frame(&mut app, &ctx, vec![]);
+        v26_manager_open(&mut app, &ctx);
+        app.auto_pick_open = true;
+        v26_settle(&mut app, &ctx);
+        let cell = galley_at(&mut app, &ctx, "tone").expect("param cell mirrors 'tone'");
+        click_pt(&mut app, &ctx, cell.center());
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.target, "fx:0:2", "panel click bound the plugin parameter");
+    }
+
     /// egui 0.36 paints a freshly opened window through a fade-IN animation
     /// (every shape at the layer's animated alpha — the synth-window pins
     /// know it). Color probes need the alpha settled at 255.
@@ -19704,21 +20335,23 @@ mod tests {
     #[test]
     #[ignore = "manual visual smoke: set SLOOPER_V26_DUMP=/path/out.svg"]
     fn v26_dump_manager_svg() {
-        use crate::automation::{Node, Shape};
+        use crate::automation::{Node};
         let out_path = std::env::var("SLOOPER_V26_DUMP").expect("set SLOOPER_V26_DUMP=/path.svg");
         let mut app = headless_app("v26dump");
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
         let len = app.auto_edit.as_ref().unwrap().len_samples;
         app.auto_edit.as_mut().unwrap().nodes = vec![
-            Node { t: 0, v: 1.0, s: Shape::Linear },
-            Node { t: len / 4, v: 1.9, s: Shape::Linear },
-            Node { t: len / 2, v: 0.2, s: Shape::Smooth },
-            Node { t: (len * 3) / 4, v: 1.5, s: Shape::Linear },
-            Node { t: len, v: 1.0, s: Shape::Linear },
+            Node { t: 0, v: 1.0, c: 0.0 },
+            Node { t: len / 4, v: 1.9, c: 0.0 },
+            Node { t: len / 2, v: 0.2, c: 0.5 },
+            Node { t: (len * 3) / 4, v: 1.5, c: 0.0 },
+            Node { t: len, v: 1.0, c: 0.0 },
         ];
         app.auto_edit.as_mut().unwrap().len_bars = true;
         app.auto_edit.as_mut().unwrap().sel = 1;
+        // v27: also dump the reworked visual picker.
+        app.auto_pick_open = true;
         v26_settle(&mut app, &ctx);
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -19907,7 +20540,7 @@ mod tests {
     /// triangles from one corner and left white lenses at the dips.
     #[test]
     fn v26_auto_fill_covers_concave_dip() {
-        use crate::automation::{Automation, Node, Shape};
+        use crate::automation::{Automation, Node};
         let mut app = headless_app("v26fill");
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
@@ -19916,22 +20549,22 @@ mod tests {
             Node {
                 t: 0,
                 v: 1.0,
-                s: Shape::Linear,
+                c: 0.0,
             },
             Node {
                 t: len / 4,
                 v: 1.9,
-                s: Shape::Linear,
+                c: 0.0,
             },
             Node {
                 t: len / 2,
                 v: 0.2,
-                s: Shape::Linear,
+                c: 0.0,
             },
             Node {
                 t: len,
                 v: 1.0,
-                s: Shape::Linear,
+                c: 0.0,
             },
         ];
         v26_settle(&mut app, &ctx);
@@ -20047,7 +20680,7 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         {
             let ed = app.auto_edit.as_ref().unwrap();
-            assert_eq!(ed.nodes.len(), 17, "sine is a fine LFO curve");
+            assert_eq!(ed.nodes.len(), 9, "v27 curvature sine: fewer nodes");
             assert_eq!(ed.nodes.last().unwrap().t, 96_000);
         }
         let p = label_center(&mut app, &ctx, "fade in").expect("fade-in preset button");
@@ -20062,7 +20695,7 @@ mod tests {
     /// leading into it (the hint text promises it; the node combo shows it).
     #[test]
     fn v26_auto_dbl_click_cycles_shape() {
-        use crate::automation::{Node, Shape};
+        use crate::automation::{Node};
         let mut app = headless_app("v26dbl");
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
@@ -20071,17 +20704,17 @@ mod tests {
             Node {
                 t: 0,
                 v: 1.0,
-                s: Shape::Linear,
+                c: 0.0,
             },
             Node {
                 t: len / 2,
                 v: 1.0,
-                s: Shape::Linear,
+                c: 0.0,
             },
             Node {
                 t: len,
                 v: 1.0,
-                s: Shape::Linear,
+                c: 0.0,
             },
         ];
         v26_settle(&mut app, &ctx);
@@ -20097,11 +20730,20 @@ mod tests {
         let ed = app.auto_edit.as_ref().unwrap();
         assert_eq!(ed.nodes.len(), 3, "a double-click cycles, never adds");
         assert_eq!(ed.sel, 1);
-        assert_eq!(
-            ed.nodes[1].s,
-            Shape::Smooth,
-            "dbl-click cycles linear \u{b7} smooth"
-        );
+        // v27: the cycle walks the CONTINUOUS curvature 0 \u{b7} +0.75 \u{b7} -0.75.
+        assert!((ed.nodes[1].c - 0.75).abs() < 1e-6, "dbl-click sets curvature");
+        // Let egui's double-click window expire, else the click counter
+        // climbs to 3 and double_clicked() never fires again.
+        for _ in 0..48 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert!((ed.nodes[1].c + 0.75).abs() < 1e-6, "cycle reaches negative");
+        assert_eq!(ed.nodes.len(), 3);
     }
 
     /// R1: in bars mode every canvas click/drag lands on the beat grid
