@@ -266,6 +266,11 @@ struct AutoEdit {
     rec: bool,
     /// Engine position when REC was armed (nodes stamp relative to it).
     rec_start: i64,
+    /// v26: canvas length unit — false = seconds, true = BARS of the
+    /// metronome grid (bpm + beats-per-measure). Purely a view unit: the
+    /// asset always stores samples; bars decide the grid, the labels and
+    /// the snap the canvas edits with.
+    len_bars: bool,
 }
 
 /// Floating piano-roll editor (the top-bar "Piano roll" window). Notes are
@@ -3702,6 +3707,7 @@ impl App {
             changed: false,
             rec: false,
             rec_start: 0,
+            len_bars: false,
         }));
     }
 
@@ -3813,6 +3819,11 @@ impl App {
             return;
         };
         let sr = self.sample_rate.max(1) as f64;
+        // v26: metronome maths for the bars view (beat/bar in samples).
+        let bpm = self.bpm();
+        let beats = self.beats() as f64;
+        let beat_s = quantize::beat_samples(self.sample_rate.max(1), bpm).max(1.0);
+        let bar_s = (beat_s * beats).max(1.0);
         let track = self.selected;
         let targets = auto_targets(self, track);
         let mut action: u8 = 0; // 1=save new, 2=overwrite, 3=cancel
@@ -3858,18 +3869,72 @@ impl App {
                                 }
                             }
                         });
-                    ui.label("length (s)");
-                    let mut secs = ed.len_samples as f64 / sr;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut secs)
-                                .speed(0.05)
-                                .range(0.05..=600.0),
-                        )
-                        .changed()
-                    {
-                        ed.len_samples = ((secs * sr) as i64).max((sr / 10.0) as i64);
-                        ed.changed = true;
+                    // ---- v26: length in SECONDS or in BARS -------------
+                    // Bars are the metronome's: length comes from bpm and
+                    // beats-per-measure, entering the mode rounds to whole
+                    // bars, and the length DragValue can never leave the
+                    // beat grid.
+                    ui.label("length");
+                    egui::ComboBox::from_id_salt("auto_len_unit")
+                        .selected_text(if ed.len_bars { "bars" } else { "sec" })
+                        .show_ui(ui, |ui| {
+                            let was = ed.len_bars;
+                            ui.selectable_value(&mut ed.len_bars, false, "sec");
+                            if ui
+                                .selectable_value(&mut ed.len_bars, true, "bars")
+                                .changed()
+                                && !was
+                            {
+                                ed.len_samples = (((ed.len_samples as f64 / bar_s).round()
+                                    .max(1.0))
+                                    * bar_s)
+                                    .round() as i64;
+                                ed.changed = true;
+                            }
+                        });
+                    if ed.len_bars {
+                        let mut bars = ed.len_samples as f64 / bar_s;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut bars)
+                                    .speed(0.25)
+                                    .range(0.25..=512.0)
+                                    .custom_formatter(|v, _| format!("{v:.2} bars")),
+                            )
+                            .on_hover_text(format!(
+                                "1 bar = {:.2} s at {} bpm \u{b7} {} beats/bar \u{b7} lengths quantize to beats",
+                                bar_s / sr,
+                                bpm,
+                                beats as i64
+                            ))
+                            .changed()
+                        {
+                            ed.len_samples =
+                                ((bars * beats).round().max(1.0) * beat_s).round() as i64;
+                            ed.changed = true;
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "= {:.2} s @ {} bpm",
+                                ed.len_samples as f64 / sr,
+                                bpm
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    } else {
+                        let mut secs = ed.len_samples as f64 / sr;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut secs)
+                                    .speed(0.05)
+                                    .range(0.05..=600.0),
+                            )
+                            .changed()
+                        {
+                            ed.len_samples = ((secs * sr) as i64).max((sr / 10.0) as i64);
+                            ed.changed = true;
+                        }
                     }
                 });
                 ui.horizontal(|ui| {
@@ -3881,7 +3946,9 @@ impl App {
                         ed.changed = true;
                     }
                     ui.label(
-                        RichText::new("click = add node \u{b7} drag = move \u{b7} right-click = delete")
+                        RichText::new(
+                            "click = add \u{b7} drag = move \u{b7} dbl-click = shape \u{b7} r-click = delete",
+                        )
                             .weak()
                             .italics(),
                     );
@@ -3979,15 +4046,33 @@ impl App {
                 // ---- the curve canvas ------------------------------------
                 let (rect, resp) =
                     ui.allocate_at_least(egui::vec2(596.0, 240.0), egui::Sense::click_and_drag());
+                // v26: in bars mode every canvas edit lands on the metronome
+                // beat grid (Alt = freehand) and times label as bar.beat.
+                let bars_mode = ed.len_bars;
+                let snap_beat = bars_mode && !ui.input(|i| i.modifiers.alt);
                 let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
                 let y_of = |v: f32| {
                     rect.max.y
                         - ((v - rmin) / (rmax - rmin).max(1e-9)).clamp(0.0, 1.0) * rect.height()
                 };
                 let t_of = |x: f32| {
-                    (((x - rect.min.x) / rect.width()) as f64 * len as f64)
-                        .round()
-                        .clamp(0.0, len as f64) as i64
+                    let raw = ((x - rect.min.x) / rect.width()) as f64 * len as f64;
+                    let q = if snap_beat {
+                        (raw / beat_s).round() * beat_s
+                    } else {
+                        raw.round()
+                    };
+                    q.clamp(0.0, len as f64) as i64
+                };
+                let pos_label = |t: i64| {
+                    if bars_mode {
+                        let bar = (t as f64 / bar_s) as i64 + 1;
+                        let beat = (((t as f64 % bar_s) / beat_s).floor() as i64 + 1)
+                            .min(beats as i64);
+                        format!("{bar}.{beat}")
+                    } else {
+                        format!("{:.2}s", t as f64 / sr)
+                    }
                 };
                 let v_of = |y: f32| {
                     let f = ((rect.max.y - y) / rect.height()) as f64;
@@ -4001,20 +4086,58 @@ impl App {
                     egui::StrokeKind::Inside,
                 );
                 // grid with ABSOLUTE value labels (the FL difference)
-                for gi in 1..8 {
-                    let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
-                    ui.painter().line_segment(
-                        [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
-                        egui::Stroke::new(1.0, Color32::from_gray(35)),
-                    );
-                    let gt = len as f64 * gi as f64 / 8.0;
-                    ui.painter().text(
-                        egui::pos2(gx + 2.0, rect.max.y - 8.0),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{:.2}s", gt / sr),
-                        egui::FontId::proportional(9.0),
-                        Color32::from_gray(110),
-                    );
+                if bars_mode {
+                    // v26: metronome grid \u{b7} minor line per beat, major
+                    // line + 1-based bar number per bar. Sub-beat spacing
+                    // below 3 px would mud the canvas, so beats fade out.
+                    let beats_i = beats as i64;
+                    let beat_px = (beat_s / len as f64) as f32 * rect.width();
+                    let bar_px = beat_px * beats as f32;
+                    let lbl_every = if bar_px < 26.0 {
+                        (26.0 / bar_px).ceil() as i64
+                    } else {
+                        1
+                    };
+                    let mut bi = 1i64;
+                    while (bi as f64) * beat_s < len as f64 {
+                        let is_bar = bi % beats_i == 0;
+                        if is_bar || beat_px >= 3.0 {
+                            let gx = x_of((bi as f64 * beat_s).round() as i64);
+                            ui.painter().line_segment(
+                                [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                                egui::Stroke::new(
+                                    1.0,
+                                    Color32::from_gray(if is_bar { 52 } else { 32 }),
+                                ),
+                            );
+                            if is_bar && bi / beats_i % lbl_every.max(1) == 0 {
+                                ui.painter().text(
+                                    egui::pos2(gx + 2.0, rect.max.y - 8.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("{}", bi / beats_i),
+                                    egui::FontId::proportional(9.0),
+                                    Color32::from_gray(130),
+                                );
+                            }
+                        }
+                        bi += 1;
+                    }
+                } else {
+                    for gi in 1..8 {
+                        let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
+                        ui.painter().line_segment(
+                            [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                            egui::Stroke::new(1.0, Color32::from_gray(35)),
+                        );
+                        let gt = len as f64 * gi as f64 / 8.0;
+                        ui.painter().text(
+                            egui::pos2(gx + 2.0, rect.max.y - 8.0),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{:.2}s", gt / sr),
+                            egui::FontId::proportional(9.0),
+                            Color32::from_gray(110),
+                        );
+                    }
                 }
                 for gi in 1..4 {
                     let gv = rmin + (rmax - rmin) * gi as f32 / 4.0;
@@ -4045,15 +4168,35 @@ impl App {
                 }
                 if pts.len() > 1 {
                     // translucent fill under the curve (area = "how much
-                    // of the range the curve holds")
-                    let mut area = pts.clone();
-                    area.push(egui::pos2(pts.last().unwrap().x, rect.max.y));
-                    area.push(egui::pos2(pts[0].x, rect.max.y));
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        area,
-                        Color32::from_rgba_premultiplied(255, 120, 120, 36),
-                        egui::Stroke::NONE,
-                    ));
+                    // of the range the curve holds").
+                    // v26: ONE convex_polygon over the whole area cannot
+                    // represent a concave curve \u{b7} its fan triangulation
+                    // left white lenses wherever the curve dipped under a
+                    // chord (user screenshot). The area is now a Mesh of
+                    // per-sample trapezoids: exact for any curvature, and
+                    // unfeathered triangles keep the alpha perfectly even
+                    // (no seams between the strips).
+                    let base = rect.max.y;
+                    let mut mesh = egui::epaint::Mesh::default();
+                    let fill = Color32::from_rgba_premultiplied(255, 120, 120, 36);
+                    for w in pts.windows(2) {
+                        if (w[1].x - w[0].x).abs() < 0.01 {
+                            continue;
+                        }
+                        let i = mesh.vertices.len() as u32;
+                        for q in [
+                            w[0],
+                            w[1],
+                            egui::pos2(w[1].x, base),
+                            egui::pos2(w[0].x, base),
+                        ] {
+                            mesh.colored_vertex(q, fill);
+                        }
+                        mesh.add_triangle(i, i + 1, i + 2);
+                        mesh.add_triangle(i, i + 2, i + 3);
+                    }
+                    ui.painter()
+                        .add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
                     for w in pts.windows(2) {
                         ui.painter().line_segment(
                             [w[0], w[1]],
@@ -4075,7 +4218,7 @@ impl App {
                         ui.painter().text(
                             egui::pos2(c.x + 10.0, c.y - 10.0),
                             egui::Align2::LEFT_BOTTOM,
-                            format!("{:.3} @ {:.2}s", n.v, n.t as f64 / sr),
+                            format!("{:.3} @ {}", n.v, pos_label(n.t)),
                             egui::FontId::proportional(10.0),
                             Color32::from_rgb(255, 220, 150),
                         );
@@ -4161,29 +4304,64 @@ impl App {
                         }
                     }
                 }
+                // v26: double-click a node to cycle the shape of the
+                // segment leading into it (linear \u{b7} smooth \u{b7} slow \u{b7}
+                // fast) \u{b7} the FL gesture. A double-click on empty space
+                // first ADDS a node (first click), and the cycle then
+                // applies to that new node, which is never a misfire.
+                if resp.double_clicked() {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                            if let Some(n) = ed.nodes.get_mut(idx) {
+                                n.s = n.s.next();
+                            }
+                            ed.sel = idx;
+                            ed.changed = true;
+                        }
+                    }
+                }
                 if !ui.input(|i| i.pointer.any_down()) {
                     ed.drag = None;
                 }
-                resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, right-click a node to delete it");
+                resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, double-click a node to change the curve shape, right-click a node to delete it");
 
                 // ---- node editor ------------------------------------------
                 let mut resort: Option<i64> = None;
                 ui.horizontal(|ui| {
                     if let Some(n) = ed.nodes.get_mut(ed.sel) {
-                        let mut ts = n.t as f64 / sr;
                         ui.label(format!("node {}", ed.sel + 1));
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut ts)
-                                    .speed(0.01)
-                                    .suffix(" s")
-                                    .range(0.0..=len as f64 / sr),
-                            )
-                            .changed()
-                        {
-                            n.t = (ts * sr).round().clamp(0.0, len as f64) as i64;
-                            resort = Some(n.t);
-                            ed.changed = true;
+                        if bars_mode {
+                            // v26: bars mode edits BEATS (1 beat = the
+                            // metronome's finest whole unit here).
+                            let mut bt = n.t as f64 / beat_s;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut bt)
+                                        .speed(0.25)
+                                        .suffix(" beats")
+                                        .range(0.0..=len as f64 / beat_s),
+                                )
+                                .changed()
+                            {
+                                n.t = (bt * beat_s).round().clamp(0.0, len as f64) as i64;
+                                resort = Some(n.t);
+                                ed.changed = true;
+                            }
+                        } else {
+                            let mut ts = n.t as f64 / sr;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut ts)
+                                        .speed(0.01)
+                                        .suffix(" s")
+                                        .range(0.0..=len as f64 / sr),
+                                )
+                                .changed()
+                            {
+                                n.t = (ts * sr).round().clamp(0.0, len as f64) as i64;
+                                resort = Some(n.t);
+                                ed.changed = true;
+                            }
                         }
                         let mut vv = n.v;
                         if ui
@@ -4215,6 +4393,28 @@ impl App {
                     ed.nodes.sort_by_key(|n| n.t);
                     ed.sel = ed.nodes.iter().position(|n| n.t == tt).unwrap_or(ed.sel);
                 }
+
+                // ---- v26: one-click shape presets -----------------------
+                // The whole point: a usable curve in ONE click. Each preset
+                // REPLACES the node set, mapped over the full length and the
+                // target's own min..max — every endpoint stays editable.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("presets:").weak());
+                    for p in crate::automation::Preset::ALL {
+                        if ui
+                            .button(p.label())
+                            .on_hover_text(
+                                "replace the whole curve with this shape, spanning the target's full range; edit the endpoints afterwards",
+                            )
+                            .clicked()
+                        {
+                            ed.nodes = crate::automation::preset_nodes(p, len, rmin, rmax);
+                            ed.sel = 0;
+                            ed.drag = None;
+                            ed.changed = true;
+                        }
+                    }
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Save as new asset + clip").clicked() {
                         action = 1;
@@ -19470,6 +19670,328 @@ mod tests {
             v25_hits(&mut app, &ctx, "\u{2014} none saved \u{2014}").len(),
             1,
             "empty preset strip must say so"
+        );
+    }
+
+    // ---- v26: automation-manager refinement pins ----------------------
+
+    fn v26_manager_open(app: &mut App, ctx: &egui::Context) {
+        app.metro_bpm = "120".into();
+        app.metro_num = "4".into();
+        frame(app, ctx, vec![]);
+        app.open_auto_editor(None);
+        frame(app, ctx, vec![]);
+    }
+
+    /// egui 0.36 paints a freshly opened window through a fade-IN animation
+    /// (every shape at the layer's animated alpha — the synth-window pins
+    /// know it). Color probes need the alpha settled at 255.
+    fn v26_settle(app: &mut App, ctx: &egui::Context) {
+        // Wait for the canvas background to paint at FULL alpha: while
+        // the window still fades, every color probe sees dimmed values.
+        for _ in 0..400 {
+            if painted_rect(app, ctx, (16, 18, 24)).is_some() {
+                return;
+            }
+            frame(app, ctx, vec![]);
+        }
+    }
+
+    /// R1: length switches from seconds to BARS derived from the
+    /// metronome (bpm + beats-per-measure), and entering bars mode rounds
+    /// the length to whole bars.
+    #[test]
+    fn v26_auto_len_bars_switch_snaps_rounds() {
+        let mut app = headless_app("v26bars1");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        app.auto_edit.as_mut().unwrap().len_samples = 100_000; // NOT bar-aligned
+        frame(&mut app, &ctx, vec![]);
+        let btn = label_center(&mut app, &ctx, "sec").expect("length unit combo reads sec");
+        click_pt(&mut app, &ctx, btn);
+        frame(&mut app, &ctx, vec![]); // popup opens
+        let row = label_center(&mut app, &ctx, "bars").expect("popup lists bars");
+        click_pt(&mut app, &ctx, row);
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert!(ed.len_bars, "the combo pick LANDS in bars mode");
+        assert_eq!(
+            ed.len_samples, 96_000,
+            "entering bars mode rounds to whole bars (120 bpm, 4/4 \u{b7} 1 bar = 96000)"
+        );
+    }
+
+    /// R1: dragging the BARS length value can never leave the beat grid.
+    #[test]
+    fn v26_auto_len_bars_drag_keeps_beat_grid() {
+        let mut app = headless_app("v26bars2");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        let ub = label_center(&mut app, &ctx, "sec").expect("unit combo");
+        click_pt(&mut app, &ctx, ub);
+        frame(&mut app, &ctx, vec![]);
+        let row = label_center(&mut app, &ctx, "bars").expect("bars row");
+        click_pt(&mut app, &ctx, row);
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "1.00 bars").expect("bars DragValue paints its value");
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        for dx in [8, 20, 44, 80] {
+            frame(&mut app, &ctx, vec![moved(egui::pos2(p.x + dx as f32, p.y))]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(egui::pos2(p.x + 80.0, p.y), egui::PointerButton::Primary, false)],
+        );
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert!(ed.len_bars, "the drag never leaves bars mode");
+        assert!(
+            ed.len_samples > 96_000,
+            "dragging right lengthened the curve: {}",
+            ed.len_samples
+        );
+        assert_eq!(
+            ed.len_samples % 24_000,
+            0,
+            "a bars-mode length is always whole beats: {}",
+            ed.len_samples
+        );
+    }
+
+    /// R2: the area fill under a CONCAVE curve must really cover every
+    /// point below the curve. The old single convex_polygon prim fanned
+    /// triangles from one corner and left white lenses at the dips.
+    #[test]
+    fn v26_auto_fill_covers_concave_dip() {
+        use crate::automation::{Automation, Node, Shape};
+        let mut app = headless_app("v26fill");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        let len = app.auto_edit.as_ref().unwrap().len_samples;
+        app.auto_edit.as_mut().unwrap().nodes = vec![
+            Node {
+                t: 0,
+                v: 1.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: len / 4,
+                v: 1.9,
+                s: Shape::Linear,
+            },
+            Node {
+                t: len / 2,
+                v: 0.2,
+                s: Shape::Linear,
+            },
+            Node {
+                t: len,
+                v: 1.0,
+                s: Shape::Linear,
+            },
+        ];
+        v26_settle(&mut app, &ctx);
+        // One probe frame: harvest the canvas rect AND the fill triangles.
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let fill_col = Color32::from_rgba_premultiplied(255, 120, 120, 36);
+        let mut tris: Vec<(egui::Pos2, egui::Pos2, egui::Pos2)> = Vec::new();
+        let mut canvas: Option<egui::Rect> = None;
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Mesh(m) => {
+                    if m.vertices.first().map(|v| v.color == fill_col).unwrap_or(false) {
+                        for tri in m.triangles() {
+                            tris.push((
+                                m.vertices[tri[0] as usize].pos,
+                                m.vertices[tri[1] as usize].pos,
+                                m.vertices[tri[2] as usize].pos,
+                            ));
+                        }
+                    }
+                }
+                egui::epaint::Shape::Rect(r)
+                    if r.fill == Color32::from_rgb(16, 18, 24)
+                        && r.rect.width() > 400.0
+                        && r.rect.height() > 150.0 =>
+                {
+                    canvas = Some(r.rect);
+                }
+                _ => {}
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        let rect = canvas.expect("automation canvas painted");
+        assert!(
+            tris.len() > 100,
+            "area fill present as a triangle mesh: {} tris",
+            tris.len()
+        );
+        let (rmin, rmax) = crate::automation::target_range("track.vol");
+        let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
+        let y_of = |v: f32| {
+            rect.max.y
+                - ((v - rmin) / (rmax - rmin)).clamp(0.0, 1.0) * rect.height()
+        };
+        let side = |a: egui::Pos2, b: egui::Pos2, p: egui::Pos2| {
+            (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y)
+        };
+        let covered = |p: egui::Pos2| {
+            tris.iter().any(|(a, b, c)| {
+                let (d1, d2, d3) = (side(*a, *b, p), side(*b, *c, p), side(*c, *a, p));
+                !(d1 < 0.0 || d2 < 0.0 || d3 < 0.0) || !(d1 > 0.0 || d2 > 0.0 || d3 > 0.0)
+            })
+        };
+        let auto = Automation {
+            target: "track.vol".into(),
+            len_samples: len,
+            nodes: app.auto_edit.as_ref().unwrap().nodes.clone(),
+        };
+        let mut missing = 0;
+        for i in 1..40i64 {
+            let t = len * i / 40;
+            let v = auto.eval(t);
+            let ytop = y_of(v);
+            if ytop >= rect.max.y - 2.0 {
+                continue;
+            }
+            for frac in [0.05f32, 0.5, 0.97] {
+                let p = egui::pos2(x_of(t) + 0.5, ytop + (rect.max.y - ytop) * frac);
+                if !covered(p) {
+                    missing += 1;
+                }
+            }
+        }
+        assert_eq!(
+            missing, 0,
+            "the fill leaves points under the curve unpainted (concave-dip lens bug)"
+        );
+    }
+
+    /// R3: ONE click on a preset button replaces the whole curve, scaled
+    /// to the target's own range.
+    #[test]
+    fn v26_auto_preset_buttons_replace_nodes() {
+        let mut app = headless_app("v26preset");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        let p = label_center(&mut app, &ctx, "peak").expect("peak preset button");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let ed = app.auto_edit.as_ref().unwrap();
+            let ts: Vec<i64> = ed.nodes.iter().map(|n| n.t).collect();
+            let vs: Vec<f32> = ed.nodes.iter().map(|n| n.v).collect();
+            assert_eq!(ts, vec![0, 48_000, 96_000], "peak spans the full length");
+            assert!(
+                vs[0].abs() < 1e-3 && (vs[1] - 2.0).abs() < 1e-3 && vs[2].abs() < 1e-3,
+                "peak rides the target's full range: {vs:?}"
+            );
+            assert!(ed.changed, "preset counts as an edit");
+        }
+        let p = label_center(&mut app, &ctx, "sine").expect("sine preset button");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let ed = app.auto_edit.as_ref().unwrap();
+            assert_eq!(ed.nodes.len(), 17, "sine is a fine LFO curve");
+            assert_eq!(ed.nodes.last().unwrap().t, 96_000);
+        }
+        let p = label_center(&mut app, &ctx, "fade in").expect("fade-in preset button");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.nodes.len(), 2, "fade in replaces (never appends)");
+        assert!(ed.nodes[0].v.abs() < 1e-3 && (ed.nodes[1].v - 2.0).abs() < 1e-3);
+    }
+
+    /// R3: double-clicking a node cycles the curvature of the segment
+    /// leading into it (the hint text promises it; the node combo shows it).
+    #[test]
+    fn v26_auto_dbl_click_cycles_shape() {
+        use crate::automation::{Node, Shape};
+        let mut app = headless_app("v26dbl");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        let len = app.auto_edit.as_ref().unwrap().len_samples;
+        app.auto_edit.as_mut().unwrap().nodes = vec![
+            Node {
+                t: 0,
+                v: 1.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: len / 2,
+                v: 1.0,
+                s: Shape::Linear,
+            },
+            Node {
+                t: len,
+                v: 1.0,
+                s: Shape::Linear,
+            },
+        ];
+        v26_settle(&mut app, &ctx);
+        // Node 1 rides value 1.0 of range 0..2, dead center of the canvas.
+        let rect = painted_rect(&mut app, &ctx, (16, 18, 24)).expect("automation canvas");
+        let c = rect.center();
+        // Double click = press+release, press+release, at ONE point (the
+        // v20 trap: split across points, headless double_clicked is dead).
+        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.nodes.len(), 3, "a double-click cycles, never adds");
+        assert_eq!(ed.sel, 1);
+        assert_eq!(
+            ed.nodes[1].s,
+            Shape::Smooth,
+            "dbl-click cycles linear \u{b7} smooth"
+        );
+    }
+
+    /// R1: in bars mode every canvas click/drag lands on the beat grid
+    /// (the same click in seconds mode stays freehand).
+    #[test]
+    fn v26_auto_bars_click_snaps_beat_grid() {
+        let mut app = headless_app("v26snap");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        app.auto_edit.as_mut().unwrap().len_bars = true;
+        v26_settle(&mut app, &ctx);
+        let rect = painted_rect(&mut app, &ctx, (16, 18, 24)).expect("automation canvas");
+        let p = egui::pos2(rect.min.x + 0.47 * rect.width(), rect.center().y);
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let ed = app.auto_edit.as_ref().unwrap();
+            assert_eq!(ed.nodes.len(), 3, "the click added one node");
+            let t = ed.nodes[ed.sel].t;
+            assert_eq!(t, 48_000, "bars mode snapped the click to beat 2, got {t}");
+        }
+        // Control: seconds mode never snaps.
+        app.auto_edit = None;
+        v26_manager_open(&mut app, &ctx);
+        v26_settle(&mut app, &ctx);
+        let rect = painted_rect(&mut app, &ctx, (16, 18, 24)).expect("automation canvas");
+        let p = egui::pos2(rect.min.x + 0.47 * rect.width(), rect.center().y);
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().unwrap();
+        let t = ed.nodes[ed.sel].t;
+        assert!(
+            (t - 45_120).abs() < 1_500 && t % 24_000 != 0,
+            "seconds mode stays freehand, got {t}"
         );
     }
 }
