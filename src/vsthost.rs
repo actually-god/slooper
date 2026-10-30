@@ -2073,6 +2073,9 @@ impl RtStageEntry {
             .map(|(i, d)| (d.id, self.params.get(i) as f64))
             .collect();
         let ids: Vec<u32> = self.descs.iter().map(|d| d.id).collect();
+        // v24: cell-order writability, so the model-sync never pushes a
+        // read-only readout (meter / gain-reduction) back into the sound.
+        let writable: Vec<bool> = self.descs.iter().map(|d| d.writable).collect();
         // v20: seed the shadow with THIS instance's state chunk when it was
         // (re)opened from one, so the reopened GUI shows the live patch.
         let state = self.editor_state.lock().unwrap().clone();
@@ -2083,6 +2086,7 @@ impl RtStageEntry {
             initial,
             state,
             ids,
+            writable,
             self.params.clone(),
         )
     }
