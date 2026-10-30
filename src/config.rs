@@ -292,6 +292,19 @@ pub struct Config {
     /// lower count hid the track.
     #[serde(default = "default_n_tracks")]
     pub n_tracks: usize,
+    /// v25: panel visibility (Settings ▸ GUI). Each dock can be hidden for
+    /// a cleaner window; all three default to visible.
+    #[serde(default = "default_true")]
+    pub show_rack: bool,
+    #[serde(default = "default_true")]
+    pub show_mixer: bool,
+    #[serde(default = "default_true")]
+    pub show_midi: bool,
+    /// v25: panel/window theme — "dark" (default) or "light". The
+    /// arrangement canvas and piano roll keep their fixed studio palette
+    /// either way (contrast for editing is intentional).
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -338,12 +351,20 @@ impl Default for Config {
             track_synth: Vec::new(),
             track_synth_params: Vec::new(),
             track_synth_states: Vec::new(),
+            show_rack: true,
+            show_mixer: true,
+            show_midi: true,
+            theme: default_theme(),
         }
     }
 }
 
 fn default_gui_scale() -> f32 {
     1.0
+}
+
+fn default_theme() -> String {
+    "dark".into()
 }
 
 /// "Current longest" is the default loop region mode (index 1 of
@@ -591,6 +612,10 @@ mod tests {
                     params: vec![0.4],
                 }),
             ],
+            show_rack: false,
+            show_mixer: true,
+            show_midi: false,
+            theme: "light".into(),
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -625,6 +650,9 @@ mod tests {
         assert_eq!(back.preview_track, Some(3), "preview track round-trips");
         assert!(!back.snap_on, "snap toggle round-trips");
         assert_eq!(back.fx_dir, "/tmp/effects");
+        // v25: panel visibility + theme ride the config file.
+        assert!(!back.show_rack && back.show_mixer && !back.show_midi);
+        assert_eq!(back.theme, "light");
         assert_eq!(back.track_fx[0][0].stem, "template");
         assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);
     }
@@ -651,6 +679,9 @@ mod tests {
         assert!(back.loop_tl, "the timeline loops by default");
         assert!(back.preview_on, "asset preview is on by default");
         assert_eq!(back.preview_secs, 5.0, "default preview length is 5 s");
+        // v25: an older config (no keys) = every panel visible, dark theme.
+        assert!(back.show_rack && back.show_mixer && back.show_midi);
+        assert_eq!(back.theme, "dark");
         assert!(back.midi.is_empty());
         // Per-track levels are #[serde(default)] — old configs load as empty
         // and App::new falls them back to 127 (vol) / 80 (gain) / 64 (pan).
