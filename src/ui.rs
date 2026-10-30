@@ -682,6 +682,23 @@ pub struct App {
     /// GUI zoom factor (Settings → GUI); 1.0 = default UI size.
     gui_scale: f32,
     show_settings: bool,
+    /// v25: Settings ▸ GUI panel-visibility toggles (persisted). Hidden
+    /// docks occupy no space and paint no heading.
+    show_rack: bool,
+    show_mixer: bool,
+    show_midi: bool,
+    /// v25: light egui Visuals for the panel/window chrome. The arrangement
+    /// canvas keeps its fixed studio palette either way.
+    light_theme: bool,
+    /// v25: last theme actually pushed into the context (apply on change
+    /// only, in `logic`).
+    theme_was_light: Option<bool>,
+    /// v25: staleness detection for the top-bar status field: the text is
+    /// watched at frame top, so every write site (40+) stays untouched, and
+    /// an old message is marked with an age suffix instead of posing as the
+    /// current state — past 10 min it is replaced by a live idle summary.
+    status_at: std::time::Instant,
+    status_seen: String,
 
     // --- mixer (per track) ---
     trk_vol: [u8; MAX_LOOPS],
@@ -1110,6 +1127,13 @@ impl App {
             master_midi: cfg.master_vol.min(127),
             gui_scale: cfg.gui_scale.clamp(0.7, 1.6),
             show_settings: false,
+            show_rack: cfg.show_rack,
+            show_mixer: cfg.show_mixer,
+            show_midi: cfg.show_midi,
+            light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
+            theme_was_light: None,
+            status_at: std::time::Instant::now(),
+            status_seen: "starting…".into(),
             trk_vol,
             trk_gain,
             trk_pan,
@@ -1648,6 +1672,36 @@ impl App {
                 })
                 .collect()
         });
+
+        // v25: GUI zoom on the keyboard — Ctrl/Cmd +/− steps 10 %,
+        // Ctrl/Cmd+0 snaps back to 100 %. The Settings ▸ GUI slider's keys;
+        // same range, applied live, persisted.
+        let zoom = ctx.input(|i| {
+            if !i.modifiers.command {
+                return None;
+            }
+            if i.key_pressed(egui::Key::Equals) {
+                Some(1.0f32)
+            } else if i.key_pressed(egui::Key::Minus) {
+                Some(-1.0)
+            } else if i.key_pressed(egui::Key::Num0) {
+                Some(0.0)
+            } else {
+                None
+            }
+        });
+        if let Some(z) = zoom {
+            self.gui_scale = if z == 0.0 {
+                1.0
+            } else {
+                (self.gui_scale + z * 0.1).clamp(0.7, 1.6)
+            };
+            self.gui_scale = (self.gui_scale * 100.0).round() / 100.0;
+            ctx.set_zoom_factor(self.gui_scale);
+            self.save_config();
+            self.status = format!("interface zoom {:.0}%", self.gui_scale * 100.0);
+            return; // swallow the key
+        }
 
         // Selected clips delete with Delete/Backspace — same vocabulary as
         // clearing bindings (learn modes above already swallowed the key if
@@ -2899,6 +2953,10 @@ impl App {
     fn save_config(&self) {
         let cfg = Config {
             n_tracks: self.n_tracks,
+            show_rack: self.show_rack,
+            show_mixer: self.show_mixer,
+            show_midi: self.show_midi,
+            theme: if self.light_theme { "light" } else { "dark" }.into(),
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -7139,7 +7197,13 @@ impl App {
                 // Synth instances need the rate: create the default piano
                 // and every bound track synth now.
                 self.rebuild_all_synths();
-                self.status = "JACK ready — select ports, then Apply".into();
+                // v25: honest readiness — if saved ports are being restored,
+                // don't tell the user to go pick ports.
+                self.status = if self.applied_ports.is_some() {
+                    "JACK ready — reconnecting your saved ports".into()
+                } else {
+                    "JACK ready — open SETTINGS to choose audio ports".into()
+                };
                 self.backend.cmd(Cmd::SetLatency {
                     ms: self.latency_ms.trim().parse().unwrap_or(0.0),
                 });
@@ -7173,8 +7237,10 @@ impl App {
                 self.avail_out = outs;
             }
             Evt::Applied { ins, outs } => {
+                // v25: the fixed top-bar readout below already shows this
+                // live — writing it into `status` too painted "applied: 1
+                // in / 2 out" TWICE on the same bar (user report).
                 self.applied = Some((ins, outs));
-                self.status = format!("applied: {} in / {} out", ins, outs);
             }
             Evt::Transport { on } => {
                 // The engine stops audition voices with the transport
@@ -7492,6 +7558,17 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // v25: theme toggle (Settings ▸ GUI). Panels and windows switch;
+        // the fixed-palette custom painters (grid, piano roll, meters) stay
+        // as they are — deliberate, and stated in the settings help text.
+        if self.theme_was_light != Some(self.light_theme) {
+            ui.ctx().set_visuals(if self.light_theme {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            });
+            self.theme_was_light = Some(self.light_theme);
+        }
         // v23: the stand-in parameter window (plugins whose own window is
         // banned by the crash guard). Painted here, with every other
         // window, so it exists on the same frame the guard decides.
@@ -7658,6 +7735,14 @@ impl App {
             self.save_config();
         }
 
+        // v25: status staleness watch — the text is compared at frame top,
+        // so every write site stays untouched while the top bar can tell a
+        // FRESH message from history (see `top_bar` for the display rules).
+        if self.status != self.status_seen {
+            self.status_seen = self.status.clone();
+            self.status_at = std::time::Instant::now();
+        }
+
         top_bar(ui, self);
         // Left panels stack outward in add order, so rendering SETTINGS
         // before the rack pops it up to the rack's LEFT; the rack and the
@@ -7665,9 +7750,15 @@ impl App {
         if self.show_settings {
             settings_panel(ui, self);
         }
-        rack_panel(ui, self);
-        mixer_panel(ui, self);
-        midi_monitor(ui, self);
+        if self.show_rack {
+            rack_panel(ui, self);
+        }
+        if self.show_mixer {
+            mixer_panel(ui, self);
+        }
+        if self.show_midi {
+            midi_monitor(ui, self);
+        }
         central_panels(ui, self);
 
         // Watchdog: a scrub/clip/marquee drag that somehow loses its
@@ -7914,9 +8005,38 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 n => format!("slooper · {n}"),
             };
             ui.heading(RichText::new(title).strong());
+            // v25: status display rules —
+            //  * fresh message: exactly as written;
+            //  * older than 60 s: gains a dim "· Nm ago" age suffix, so
+            //    history never reads like current state;
+            //  * older than 10 min: dropped in favor of a LIVE idle summary
+            //    (the engine state right now) — a stale "waiting …"-style
+            //    line must never sit in the bar posing as a current fact.
+            let age_s = app.status_at.elapsed().as_secs_f64();
+            let (body, tip) = if age_s > 600.0 {
+                let idle = match &app.client_name {
+                    Some(_) => format!("{} Hz · ready", app.sample_rate),
+                    None => "audio engine: offline".to_string(),
+                };
+                (
+                    idle,
+                    format!(
+                        "last message {} min ago: {}",
+                        (age_s / 60.0) as u64,
+                        app.status
+                    ),
+                )
+            } else if age_s >= 60.0 {
+                (
+                    format!("{} · {}m ago", app.status, (age_s / 60.0) as u64),
+                    app.status.clone(),
+                )
+            } else {
+                (app.status.clone(), app.status.clone())
+            };
             let status = match &app.client_name {
-                Some(_) => format!("{} Hz \u{b7} {}", app.sample_rate, app.status),
-                None => app.status.clone(),
+                Some(_) => format!("{} Hz · {}", app.sample_rate, body),
+                None => body,
             };
             // v18: the status lives in a FIXED-WIDTH, truncating field. It
             // used to be a bare label in the middle of the bar, so every
@@ -7929,9 +8049,15 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 egui::vec2(300.0, 18.0),
                 egui::Label::new(RichText::new(status).weak()).truncate(),
             )
-            .on_hover_text(app.status.clone());
-            if let Some((i, o)) = app.applied {
-                ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
+            .on_hover_text(tip);
+            if age_s <= 600.0 {
+                if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
+                    // v25: zero is shown by the idle summary instead — after
+                    // "Stop" the bar reads honestly, not "applied: 0 in / 0
+                    // out"; and once the notice behind it has aged out, the
+                    // suffix goes with it.
+                    ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
+                }
             }
             let xruns = app.backend.xruns.load(Ordering::Relaxed);
             if xruns > 0 {
@@ -11110,14 +11236,25 @@ fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
                 }
             }
         }
-        hover.push_str("Click to open this slot's controls window.");
+        // v25: say what the chip actually does; a dead row says that too
+        // instead of inviting a click that cannot land.
+        hover.push_str(if ok {
+            "Click to open this slot's controls window."
+        } else {
+            "not loaded — open the FX chain window (FX button) to rescan or remove"
+        });
         let color = if ok {
             Color32::from_rgb(150, 200, 255)
         } else {
             Color32::from_gray(140)
         };
+        // v25: dead rows are visibly disabled (their click used to paint
+        // nothing — the classic "button that does nothing").
         if ui
-            .button(RichText::new(label).small().color(color))
+            .add_enabled(
+                ok,
+                egui::Button::new(RichText::new(label).small().color(color)),
+            )
             .on_hover_text(hover)
             .clicked()
         {
@@ -11570,7 +11707,19 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                             } else {
                                 RichText::new(&label).weak()
                             };
-                            let resp = ui.add(egui::Button::new(txt).frame(false));
+                            // v25: a row whose script/plugin never loaded is
+                            // NOT clickable — its click used to do nothing
+                            // while the button still looked live. It now
+                            // paints dimmed and explains itself on hover.
+                            let resp = ui.add_enabled(
+                                ok,
+                                egui::Button::new(txt).frame(false),
+                            );
+                            let resp = resp.on_hover_text(if ok {
+                                "click to open controls"
+                            } else {
+                                "not loaded — fix the folder or rescan below"
+                            });
                             if resp.clicked() {
                                 act = Some((0, k));
                             }
@@ -11929,12 +12078,64 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
         .min_size(140.0)
         .default_size(220.0)
         .show(ui, |ui| {
-            ui.label(RichText::new("MIDI MONITOR").strong());
-            ui.label(
-                RichText::new("last detected MIDI input (also printed to stdout)")
-                    .weak()
-                    .small(),
-            );
+            // v25: ONE honest state line instead of a static paragraph.
+            // It says what the monitor sees RIGHT NOW; the pw-link
+            // instructions moved to its tooltip so the dock stops reading
+            // like a wall of documentation.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MIDI MONITOR").strong());
+                let (state, warn) = match (&app.last_midi, app.midi_sources.is_empty()) {
+                    (Some(_), false) => (
+                        format!(
+                            "live — {} message(s) logged from {} source(s)",
+                            app.midi_log.len(),
+                            app.midi_sources.len()
+                        ),
+                        false,
+                    ),
+                    // A genuine wait: something IS linked, nothing has
+                    // arrived yet. Only now may the panel say "waiting".
+                    (None, false) => (
+                        format!(
+                            "waiting — {} source(s) linked, no message yet",
+                            app.midi_sources.len()
+                        ),
+                        false,
+                    ),
+                    // Nothing to wait for: say so plainly instead of
+                    // promising a listen.
+                    (_, true) => (
+                        "no MIDI source linked — nothing is being received".to_string(),
+                        true,
+                    ),
+                };
+                let r = ui.label(
+                    RichText::new(state)
+                        .weak()
+                        .small()
+                        .color(if warn {
+                            Color32::from_rgb(220, 180, 120)
+                        } else {
+                            Color32::from_gray(160)
+                        }),
+                );
+                r.on_hover_text(
+                    "the audio thread reads the JACK port slooper:midi_in and listens on \
+                     every channel; every remote MIDI port that appears is linked to it \
+                     automatically (manually: pw-link 'your-midi-port' 'slooper:midi_in'). \
+                     Detected input is also printed to stdout.",
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Clear")
+                        .on_hover_text("empty the monitor log")
+                        .clicked()
+                    {
+                        app.midi_log.clear();
+                        app.last_midi = None;
+                    }
+                });
+            });
 
             if let Some(last) = &app.last_midi {
                 ui.add_space(4.0);
@@ -11943,7 +12144,7 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                     .inner_margin(6.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("[{}]", last.ts)).weak().monospace());
+                            ui.label(RichText::new(format!("[{}]  last:", last.ts)).weak().monospace());
                             ui.label(RichText::new(last.type_name).strong().monospace());
                             ui.label(RichText::new(&last.describe).monospace());
                             ui.separator();
@@ -11954,25 +12155,12 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                             );
                         });
                     });
-            } else {
-                ui.add_space(4.0);
-                ui.label(RichText::new("waiting for MIDI input…").weak());
-                ui.label(
-                    RichText::new(
-                        "the audio thread reads the JACK port slooper:midi_in and \
-                         listens on every channel — link your device to it (e.g. \
-                         pw-link 'your-midi-port' 'slooper:midi_in') and send a \
-                         message; new source ports appear below automatically",
-                    )
-                    .weak()
-                    .small(),
-                );
             }
 
             if !app.midi_sources.is_empty() {
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("sources linked to slooper:midi_in")
+                    RichText::new("sources auto-linked to slooper:midi_in")
                         .weak()
                         .small(),
                 );
@@ -12043,6 +12231,56 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     "How many tracks the program shows (up to 128 — the engine \
                      capacity). Per-track bindings for hidden tracks are kept — \
                      raise the number again and they return exactly as bound.",
+                )
+                .weak()
+                .small(),
+            );
+
+            // ---- v25: panel visibility + theme ---------------------------
+            ui.label(RichText::new("visible panels:").weak().small());
+            ui.horizontal_wrapped(|ui| {
+                if ui.checkbox(&mut app.show_rack, "asset rack").changed() {
+                    app.save_config();
+                }
+                if ui.checkbox(&mut app.show_mixer, "mixer dock").changed() {
+                    app.save_config();
+                }
+                if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
+                    app.save_config();
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Untick to hide a panel for a cleaner window — hidden panels \
+                     take no space and can be brought back the same way.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("theme:");
+                egui::ComboBox::from_id_salt("theme_cb")
+                    .selected_text(if app.light_theme { "light" } else { "dark" })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut app.light_theme, false, "dark")
+                            .changed()
+                        {
+                            app.save_config();
+                        }
+                        if ui
+                            .selectable_value(&mut app.light_theme, true, "light")
+                            .changed()
+                        {
+                            app.save_config();
+                        }
+                    });
+            });
+            ui.label(
+                RichText::new(
+                    "Panels and windows switch immediately. The arrangement canvas \
+                     and piano roll keep their fixed studio palette for contrast \
+                     either way.",
                 )
                 .weak()
                 .small(),
@@ -12160,6 +12398,13 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     for m in app.midi_binds.iter_mut() {
                         *m = None;
                     }
+                    // v25: the reset also drops axis calibration (the
+                    // knob min/max sweeps) — it belongs to the bindings
+                    // being cleared, and silently keeping it made the
+                    // button a partial lie.
+                    for c in app.knob_cal.iter_mut() {
+                        *c = None;
+                    }
                     app.save_config();
                     app.status = "bindings reset to defaults".into();
                 }
@@ -12250,6 +12495,16 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
                 if ui.button("Stop").clicked() {
                     app.backend.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
+                    // v25: make the Stop VISIBLE: before this nothing on
+                    // screen changed, the top bar kept claiming "applied:
+                    // N in / M out", and the config re-applied the old
+                    // ports on the next launch — an invisible button.
+                    app.applied_ports = None;
+                    app.applied = None;
+                    app.save_config();
+                    app.status =
+                        "audio: all ports disconnected — tick ports, then Apply Selection"
+                            .into();
                 }
                 if ui.button("Refresh").clicked() {
                     app.backend.cmd(Cmd::Refresh);
@@ -18818,5 +19073,403 @@ mod tests {
         let hit = filtered_targets(&targets, "resonance");
         assert!(hit.len() >= 30 && hit.iter().all(|(_, l)| l.contains("Resonance")));
         assert!(filtered_targets(&targets, "zzz-nothing").is_empty());
+    }
+
+    // =====================================================================
+    // v25 — UI overhaul: honest messaging, user-configurable chrome, and
+    // no controls that merely look alive.
+    // =====================================================================
+
+    /// ALL painted galley texts containing `needle` (galley_at returns the
+    /// first hit; these pins need the COUNT — duplication is the bug).
+    fn v25_hits(app: &mut App, ctx: &egui::Context, needle: &str) -> Vec<String> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            events: vec![moved(egui::pos2(20.0, 848.0))],
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hits: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let txt = t.galley.text();
+                    if txt.contains(needle) {
+                        return Some(txt.to_string());
+                    }
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hits
+    }
+
+    /// The status line must exist in exactly ONE place: the top bar. (The
+    /// asset rack used to mirror it — two copies of every message.)
+    #[test]
+    fn v25_status_line_paints_once() {
+        let mut app = headless_app("v25statusonce");
+        let ctx = egui::Context::default();
+        app.status = "one status line to say hello".into();
+        app.status_at = std::time::Instant::now();
+        frame(&mut app, &ctx, vec![]);
+        let hits = v25_hits(&mut app, &ctx, "status line to say hello");
+        assert_eq!(hits.len(), 1, "top bar only, got {hits:?}");
+    }
+
+    /// A notice ages out into an honest engine state instead of a vague
+    /// "ready" that survives forever, and the port-count suffix is painted
+    /// once (it used to be echoed by both status surfaces).
+    #[test]
+    fn v25_status_ages_and_shows_applied_once() {
+        let mut app = headless_app("v25statusage");
+        let ctx = egui::Context::default();
+        app.status = "JACK ready - engine stopped until PLAY".into();
+        app.status_at = std::time::Instant::now();
+        app.applied = Some((1, 2));
+        frame(&mut app, &ctx, vec![]);
+        let fresh = v25_hits(&mut app, &ctx, "applied: 1 in / 2 out");
+        assert_eq!(
+            fresh.len(),
+            1,
+            "port suffix shows exactly once (used to be mirrored): {fresh:?}"
+        );
+        // Age the notice by twenty minutes.
+        app.status_at -= std::time::Duration::from_secs(1200);
+        let aged = v25_hits(&mut app, &ctx, "audio engine: offline");
+        assert_eq!(
+            aged.len(),
+            1,
+            "an aged notice is replaced by the actual engine state: {aged:?}"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "engine stopped until PLAY").is_empty(),
+            "the stale notice must be gone"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "applied: 1 in / 2 out").is_empty(),
+            "the suffix ages out with the notice it belongs to"
+        );
+    }
+
+    /// The MIDI monitor may only CLAIM listening when a source is linked;
+    /// with nothing linked it says so. The old static "listening" and the
+    /// never-filled "waiting for MIDI input" are gone for good.
+    #[test]
+    fn v25_midi_monitor_status_is_honest() {
+        let mut app = headless_app("v25midimon");
+        let ctx = egui::Context::default();
+        app.show_midi = true;
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "no MIDI source linked").len(),
+            1,
+            "nothing linked: the panel says exactly that"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "listening").is_empty()
+                && v25_hits(&mut app, &ctx, "waiting for MIDI input").is_empty(),
+            "no fabricated listening/waiting text"
+        );
+        // A source appears: the wait becomes real and counts the sources.
+        app.midi_sources = vec!["dev:out".into()];
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "waiting — 1 source(s) linked").len(),
+            1,
+            "with a source the wait is honest and specific"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "last:").is_empty(),
+            "no last-event line until a message actually arrived"
+        );
+        // Traffic: the live line and the last-event row appear only now.
+        app.last_midi = Some(MidiLine {
+            ts: "12:34:56".into(),
+            type_name: "Note On",
+            describe: "C4 vel 100 ch 0".into(),
+            raw_hex: "90 3C 64".into(),
+        });
+        app.midi_log.push_front(MidiLine {
+            ts: "12:34:56".into(),
+            type_name: "Note On",
+            describe: "C4 vel 100 ch 0".into(),
+            raw_hex: "90 3C 64".into(),
+        });
+        assert!(!v25_hits(&mut app, &ctx, "live — 1 message(s) logged").is_empty());
+        assert!(!v25_hits(&mut app, &ctx, "Note On").is_empty());
+        // The log must be clearable — it used to fill forever with no way
+        // back; the status line reverts to the honest wait.
+        let p = label_center(&mut app, &ctx, "Clear").expect("Clear button painted");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.midi_log.is_empty(), "Clear empties the log");
+        assert!(app.last_midi.is_none(), "Clear drops the stale last event");
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "waiting — 1 source(s) linked").len(),
+            1,
+            "after Clear the panel is waiting again, truthfully"
+        );
+    }
+
+    /// Settings ▸ GUI: the theme checkbox switches egui visuals AND
+    /// persists — the chrome is finally user-configurable.
+    #[test]
+    fn v25_settings_theme_toggle_applies_and_persists() {
+        let mut app = headless_app("v25theme");
+        let ctx = egui::Context::default();
+        let dark_now = |app: &mut App, ctx: &egui::Context| -> bool {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            // Pass 1: let ui_root apply any pending visuals change; pass 2:
+            // probe the frame's own style (a Ui snapshots its style when
+            // constructed, so reading in the same pass sees the OLD theme).
+            let mut out = ctx.run_ui(raw.clone(), |ui| app.ui_root(ui));
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            let mut dark = true;
+            let mut out2 = ctx.run_ui(raw.clone(), |ui| dark = ui.visuals().dark_mode);
+            out2.textures_delta.clear();
+            dark
+        };
+        assert!(dark_now(&mut app, &ctx), "dark by default");
+        app.show_settings = true;
+        // The theme control is a combo showing the current value; open it
+        // and pick "light".
+        let p = galley_at(&mut app, &ctx, "dark")
+            .map(|r| r.center())
+            .expect("theme combo shows 'dark'");
+        click_pt(&mut app, &ctx, p);
+        let p = label_center(&mut app, &ctx, "light").expect("popup offers 'light'");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.light_theme, "combo picks light");
+        assert!(
+            !dark_now(&mut app, &ctx),
+            "visuals switch the same frame — no restart dance"
+        );
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(
+            cfg_txt.contains("\"theme\": \"light\""),
+            "theme persists: {cfg_txt}"
+        );
+    }
+
+    /// Settings ▸ GUI ▸ panels: hiding a panel really unpaints it, and the
+    /// choice persists.
+    #[test]
+    fn v25_settings_panel_toggles_hide_panels() {
+        let mut app = headless_app("v25panels");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(!v25_hits(&mut app, &ctx, "ASSET RACK").is_empty(), "rack default on");
+        assert!(!v25_hits(&mut app, &ctx, "MIXER").is_empty(), "mixer default on");
+        app.show_settings = true;
+        let p = label_center(&mut app, &ctx, "asset rack").expect("rack checkbox");
+        click_pt(&mut app, &ctx, p);
+        let p = label_center(&mut app, &ctx, "mixer dock").expect("mixer checkbox");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.show_rack && !app.show_mixer, "flags flip");
+        assert!(
+            v25_hits(&mut app, &ctx, "ASSET RACK").is_empty(),
+            "hidden rack must not paint its header"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "MIXER").is_empty(),
+            "hidden mixer must not paint its heading: {:?}",
+            v25_hits(&mut app, &ctx, "MIXER")
+        );
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(
+            cfg_txt.contains("\"show_rack\": false") && cfg_txt.contains("\"show_mixer\": false"),
+            "panel visibility persists: {cfg_txt}"
+        );
+    }
+
+    /// Ctrl +/−/0 GUI zoom: works from the keyboard and persists. (The
+    /// slider that does the same lives in Settings ▸ GUI.)
+    #[test]
+    fn v25_zoom_shortcuts() {
+        let mut app = headless_app("v25zoom");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let zoom_key = |app: &mut App, ctx: &egui::Context, key: egui::Key| {
+            frame_keys(
+                app,
+                ctx,
+                vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                    key_ev(key, egui::Modifiers::COMMAND),
+                ],
+            );
+            frame_keys(
+                app,
+                ctx,
+                vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            );
+        };
+        let base = app.gui_scale;
+        zoom_key(&mut app, &ctx, egui::Key::Equals);
+        assert!(app.gui_scale > base, "Ctrl+= zooms in");
+        let up = app.gui_scale;
+        zoom_key(&mut app, &ctx, egui::Key::Minus);
+        assert!(app.gui_scale < up, "Ctrl+- zooms out");
+        zoom_key(&mut app, &ctx, egui::Key::Num0);
+        assert!((app.gui_scale - 1.0).abs() < 1e-6, "Ctrl+0 resets to 100%");
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"gui_scale\": 1.0"), "zoom persists: {cfg_txt}");
+    }
+
+    /// The bindings reset must actually reset everything it claims — the
+    /// axis (knob) calibration used to survive it silently, making the
+    /// button a partial lie.
+    #[test]
+    fn v25_reset_clears_axis_calibration() {
+        let mut app = headless_app("v25resetaxis");
+        let ctx = egui::Context::default();
+        app.knob_cal[3] = Some(crate::config::MidiAxisCal { slot: 3, lo: 9, hi: 118 });
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        let p = label_center(&mut app, &ctx, "Reset to Defaults").expect("reset button");
+        click_pt(&mut app, &ctx, p);
+        assert!(
+            app.knob_cal.iter().all(|c| c.is_none()),
+            "axis calibration must not outlive the reset"
+        );
+    }
+
+    /// Audio ports ▸ Stop used to be invisible: it disconnected the engine
+    /// but changed nothing on screen and the config re-applied the old
+    /// ports next launch. Now one click visibly rewinds everything.
+    #[test]
+    fn v25_stop_ports_button_is_visible() {
+        let mut app = headless_app("v25stopports");
+        let ctx = egui::Context::default();
+        app.applied = Some((1, 2));
+        app.applied_ports = Some((
+            vec!["system:playback_1".to_string()],
+            vec![("system:capture_1".to_string(), 0u8)],
+        ));
+        app.status_at = std::time::Instant::now();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(v25_hits(&mut app, &ctx, "applied: 1 in / 2 out").len(), 1);
+        app.show_settings = true;
+        // AUDIO PORTS is the last settings section — below the fold at the
+        // harness' 1440x853 screen, where egui 0.36 culls the clipped
+        // galleys. Probe AND click through a tall viewport, so the press
+        // coordinates are inside it too.
+        let big = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 2600.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let big_frame = |app: &mut App, events: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
+            let mut raw = big.clone();
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let shapes = std::mem::take(&mut out.shapes);
+            let prims = ctx.tessellate(shapes.clone(), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            shapes
+        };
+        big_frame(&mut app, vec![]);
+        let out = big_frame(&mut app, vec![]);
+        let find_stop = |out: &[egui::epaint::ClippedShape]| -> Option<egui::Pos2> {
+            out.iter().find_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text() == "Stop" => {
+                    Some(t.pos + t.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+        };
+        let p = find_stop(&out).unwrap_or_else(|| {
+            let mut by_y: Vec<(f32, String)> = out
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Text(t) => Some((
+                        t.pos.y,
+                        t.galley.text().chars().take(40).collect::<String>(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            by_y.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let tail: Vec<String> = by_y
+                .iter()
+                .rev()
+                .take(20)
+                .map(|(y, s)| format!("{y:.0}:{s}"))
+                .collect();
+            panic!("no Stop; last galleys by y: {tail:?}");
+        });
+        big_frame(&mut app, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        big_frame(&mut app, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert!(app.applied.is_none(), "readout state clears");
+        assert!(
+            app.applied_ports.is_none(),
+            "Stop forgets the ports — no silent reconnect next launch"
+        );
+        assert!(
+            app.status.contains("ports disconnected"),
+            "status explains the click: {}",
+            app.status
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "applied: 1 in / 2 out").is_empty(),
+            "the top-bar readout disappears with the click"
+        );
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(
+            !cfg_txt.contains("system:playback_1"),
+            "config must not resurrect the stopped ports"
+        );
+    }
+
+    /// The native-plugin editor title names the effect and the TRACK
+    /// (never the pre-v0.2 "loop N" wording), and with zero saved presets
+    /// the preset strip says so instead of offering a dead Load/picker.
+    #[test]
+    fn v25_fx_editor_title_and_preset_guard() {
+        let mut app = headless_app("v25fxtitle");
+        let ctx = egui::Context::default();
+        if app.fx_registry.desc("chorus").is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(dir.join("chorus.rs"), include_str!("../effects/chorus.rs")).unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, "chorus");
+        frame(&mut app, &ctx, vec![]);
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        let title = v25_hits(&mut app, &ctx, "Chorus Doubler \u{2014} track 1");
+        assert_eq!(
+            title.len(),
+            1,
+            "editor title names the effect + track (no pre-v0.2 'loop N'): {title:?}"
+        );
+        // Zero presets: the strip states reality; the old code showed an
+        // empty picker plus a Load button whose only reply was a scold.
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "\u{2014} none saved \u{2014}").len(),
+            1,
+            "empty preset strip must say so"
+        );
     }
 }

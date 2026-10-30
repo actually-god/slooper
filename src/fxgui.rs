@@ -667,7 +667,9 @@ pub fn window(ui: &mut Ui, ed: &mut FxEditor) -> bool {
     ui.ctx().request_repaint();
     let mut open = true;
     let (hw, hh) = ed.size_hint();
-    let title = format!("{} — loop {}", ed.name.clone(), ed.loop_i + 1);
+    // v25: "loop N" was v0.1 vocabulary (the loop-pedal model) — the thing
+    // an effect sits on is a TRACK; every other window already says so.
+    let title = format!("{} \u{2014} track {}", ed.name.clone(), ed.loop_i + 1);
     egui::Window::new(RichText::new(title).strong())
         .open(&mut open)
         .resizable(!ed.is_custom())
@@ -705,40 +707,47 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
                 .and_then(|i| ed.preset_list.get(i).cloned())
                 .unwrap_or_else(|| String::from("select…"))
         };
-        let mut cb = ComboBox::from_id_salt("fx_user_preset")
+        // v25: with zero presets the combo opened an EMPTY popup and Load
+        // only answered "pick a preset first" — both read as dead buttons.
+        // Disabled until something exists; the text says exactly that.
+        let has_presets = !ed.preset_list.is_empty();
+        let cb = ComboBox::from_id_salt("fx_user_preset")
             .selected_text(status)
             .width(150.0);
-        // An empty list simply offers an empty popup; the Load button is
-        // the guarded path, so the combo itself stays enabled.
-        let _ = &mut cb;
-        cb.show_ui(ui, |ui| {
-            // Snapshot the names: the closure must not hold a borrow of
-            // `ed` while `load_user_preset` mutably borrows it.
-            let names: Vec<String> = ed.preset_list.to_vec();
-            for (i, name) in names.iter().enumerate() {
-                if ui
-                    .selectable_value(&mut ed.preset_sel, Some(i), name)
-                    .clicked()
-                {
-                    // Picking from the list loads it — one fewer click.
-                    ed.load_user_preset(name);
-                    ui.close();
+        ui.add_enabled_ui(has_presets, |ui| {
+            cb.show_ui(ui, |ui| {
+                // Snapshot the names: the closure must not hold a borrow of
+                // `ed` while `load_user_preset` mutably borrows it.
+                let names: Vec<String> = ed.preset_list.to_vec();
+                for (i, name) in names.iter().enumerate() {
+                    if ui
+                        .selectable_value(&mut ed.preset_sel, Some(i), name)
+                        .clicked()
+                    {
+                        // Picking from the list loads it — one fewer click.
+                        ed.load_user_preset(name);
+                        ui.close();
+                    }
+                }
+            });
+            if ui
+                .button(RichText::new("Load").small())
+                .on_hover_text(if has_presets {
+                    "apply the selected preset"
+                } else {
+                    "save one first: type a name and press Save"
+                })
+                .clicked()
+            {
+                match ed.preset_sel {
+                    Some(i) => {
+                        let n = ed.preset_list[i].clone();
+                        ed.load_user_preset(&n);
+                    }
+                    None => ed.preset_msg = "pick a preset first".into(),
                 }
             }
         });
-        if ui
-            .button(RichText::new("Load").small())
-            .on_hover_text("apply the selected preset")
-            .clicked()
-        {
-            match ed.preset_sel {
-                Some(i) => {
-                    let n = ed.preset_list[i].clone();
-                    ed.load_user_preset(&n);
-                }
-                None => ed.preset_msg = "pick a preset first".into(),
-            }
-        }
         ui.add_sized(
             [110.0, 0.0],
             TextEdit::singleline(&mut ed.preset_name)
