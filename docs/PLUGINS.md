@@ -387,3 +387,33 @@ does open viewable in normal mode) and the real-binary `v23_probe_child…` e2e.
 `drain_param_edits3` (superseded by the inline drain + model-sync); the v23
 whole-model param snapshot. `open_vst3_editor` gained a `writable` cell map;
 `harvest3` takes the edited set and filters the patch to it.
+
+## Arturia Analog Lab V (Windows-only) — bridged on this host
+
+Analog Lab Pro has no Linux build. On this machine it runs through
+**yabridge + wine-ge** and appears in the synth picker as
+`Analog Lab V` (`~/.vst/yabridge/Analog Lab V.so`, 64-bit VST2 bridge).
+
+Recipe (the GUI installer's PureBasic stub deadlocks under wine — skip it):
+
+1. Download the Windows installer from Arturia's downloads page and run it
+   under winege just long enough that it unpacks `Analog Lab V Setup.exe`
+   + `Setup-1/2.bin` into `Temp/pbt*` — then run
+   `innoextract --extract --collisions=overwrite` on that trio.
+2. Layout into the prefix: `commonappdata/Arturia/*` →
+   `~/.wine/drive_c/ProgramData/Arturia/` (samples, presets, shared data —
+   the plugin resolves them via `C:\ProgramData\Arturia`).
+3. `winetricks --unattended vcrun2022` (the DLL imports
+   `MSVCP140_CODECVT_IDS.dll`).
+4. `yabridgectl add ~/AudioFOSS/arturia/win64 && yabridgectl sync`
+   (flat directory so slooper's VST2 scan finds the wrapper).
+5. `WINELOADER=~ Tools/winege/bin/wine64` must be in the host's environment
+   (set via `~/.config/environment.d/yabridge-wine.conf`).
+
+AL V is a synth **with an audio input** — the VST2 probe must read
+`effFlagsSynth`, not "no inputs" (v31 fix). Sound stays silent until the
+one-time Arturia login (ASC agent + `Analog Lab V.exe` standalone, laid
+from the ASC installer the same extract way).
+
+MiniLab 37 hardware needs nothing: class-compliant MIDI, auto-linked to
+`slooper:midi_in`. Firmware updates need MCC → Windows or a friend.
