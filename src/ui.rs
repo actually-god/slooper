@@ -10291,6 +10291,20 @@ fn value_user_parse(target: &str, s: &str) -> Option<f32> {
 /// is persisted per `idx` (0 = asset rack, 1 = MIDI bindings,
 /// 2 = MIDI monitor) in config; `fallback` is the classic dock footprint
 /// used until the user moves the window the first time.
+/// True while `pt` sits inside one of the OPEN free side windows. Lane
+/// strips use this so an OS file drop onto (say) the asset rack imports
+/// into the rack instead of placing a clip on the grid beneath.
+fn over_side_window(app: &App, pt: egui::Pos2) -> bool {
+    let hits = |a: [f32; 4]| {
+        a[2] > 80.0
+            && egui::Rect::from_min_size(egui::pos2(a[0], a[1]), egui::vec2(a[2], a[3]))
+                .contains(pt)
+    };
+    (app.show_rack && hits(app.side_wins.rack))
+        || (app.show_binds && hits(app.side_wins.binds))
+        || (app.show_midi && hits(app.side_wins.monitor))
+}
+
 fn side_window(
     ui: &mut egui::Ui,
     app: &mut App,
@@ -10315,6 +10329,8 @@ fn side_window(
         .default_size(egui::vec2(size[0], size[1]))
         .resizable(true)
         .collapsible(true)
+        // Fully FREE: never snap back when dragged (partly) off-screen.
+        .constrain(false)
         // First frame must be fully painted: headless probes (and users
         // with animations off) would otherwise see the content fade in.
         .fade_in(false)
@@ -13058,7 +13074,7 @@ fn lane_row(
     // silently vanishing into the rack.
     if !app.os_drops.is_empty() {
         if let Some(pt) = ui.input(|i| i.pointer.hover_pos()) {
-            if rect.contains(pt) {
+            if rect.contains(pt) && !over_side_window(app, pt) {
                 let pos = snap_start(s_at(x0, pt.x, sr, px), snapu);
                 let mut placed: Vec<(usize, usize, usize)> = Vec::new();
                 let mut names: Vec<String> = Vec::new();
@@ -15429,6 +15445,16 @@ mod tests {
     /// float OVER the canvas (unlike the old docks, which reserved their
     /// edge). Pins that click the grid, the mixer or the settings panel
     /// hide them first so coordinates land on the panel under test.
+    /// v30 R6: keep the three free windows OPEN but push them off-screen
+    /// (their geometry is "known" once set) so clicks land on whatever
+    /// panel sits beneath — for pins that need the windows' galleys to
+    /// exist yet must click the main GUI underneath.
+    fn park_side_wins(app: &mut App) {
+        app.side_wins.rack = [-3000.0, -3000.0, 340.0, 640.0];
+        app.side_wins.binds = [-3000.0, -2300.0, 300.0, 620.0];
+        app.side_wins.monitor = [-3000.0, -1600.0, 520.0, 240.0];
+    }
+
     fn clear_canvas(app: &mut App) {
         app.show_rack = false;
         app.show_midi = false;
@@ -15756,43 +15782,27 @@ mod tests {
     /// so its heading text renders further left).
     #[test]
     fn settings_panel_pops_up_left_of_the_rack() {
+        // v25 pinned "settings docks left of the rack". v30 R6: the rack is
+        // a free window that floats wherever the user parked it — opening
+        // SETTINGS must not move or hide it any more.
         let mut app = headless_app("settings");
         let ctx = egui::Context::default();
+        app.show_binds = false;
+        app.show_midi = false;
+        app.show_settings = false;
+        frame(&mut app, &ctx, vec![]); // windows paint their content from frame 2
+        let rack0 = galley_centers(&mut app, &ctx, "ASSET RACK", true);
+        assert!(!rack0.is_empty(), "rack heading painted");
         app.show_settings = true;
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1440.0, 853.0),
-            )),
-            time: Some(test_time()),
-            ..Default::default()
-        };
-        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
-        // Read headings from the pre-tessellate shapes (0.36 tessellates
-        // text away into callbacks, but the Shape list still carries galleys).
-        let mut x_settings = f32::MAX;
-        let mut x_rack = f32::MAX;
-        for cs in &out.shapes {
-            if let egui::epaint::Shape::Text(t) = &cs.shape {
-                let txt = t.galley.text();
-                if txt.contains("SETTINGS") {
-                    x_settings = x_settings.min(t.pos.x);
-                }
-                if txt.contains("ASSET RACK") {
-                    x_rack = x_rack.min(t.pos.x);
-                }
-            }
-        }
-        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
-        drop(prims);
-        out.textures_delta.clear();
+        let rack = galley_centers(&mut app, &ctx, "ASSET RACK", true);
+        let settings = galley_centers(&mut app, &ctx, "SETTINGS", true);
+        assert!(!settings.is_empty(), "settings heading painted");
+        assert!(!rack.is_empty(), "rack still painted with settings open");
         assert!(
-            x_settings < f32::MAX && x_rack < f32::MAX,
-            "both headings painted"
-        );
-        assert!(
-            x_settings < x_rack,
-            "SETTINGS x={x_settings} must be left of ASSET RACK x={x_rack}"
+            (rack[0].x - rack0[0].x).abs() < 0.5,
+            "opening settings shifted the free rack window: {} -> {}",
+            rack0[0].x,
+            rack[0].x
         );
     }
 
@@ -15807,31 +15817,19 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]); // layout pass
 
-        // Click-probe the rack rows to locate kick.wav deterministically.
-        let mut y_row = None;
-        for y in (96..220).step_by(3) {
-            let p = egui::pos2(40.0, y as f32);
-            frame(
-                &mut app,
-                &ctx,
-                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
-            );
-            frame(
-                &mut app,
-                &ctx,
-                vec![btn(p, egui::PointerButton::Primary, false)],
-            );
-            if app.sel_asset.is_some() {
-                y_row = Some(y as f32);
-                break;
-            }
-        }
-        let y_row = y_row.expect("a rack row was clickable (kick.wav)");
+        // Locate kick.wav deterministically. v30 R6: the rack is a free
+        // window now — anchor on the painted row galley; a fixed x=40
+        // probe strip runs into the window's header buttons.
+        let kick = galley_centers(&mut app, &ctx, "kick", true);
+        assert!(!kick.is_empty(), "rack row visible (kick.wav)");
+        let start = kick[0];
+        click_pt(&mut app, &ctx, start);
+        assert!(app.sel_asset.is_some(), "row click selects kick");
+        let y_row = start.y;
 
         // Drag: press, move past the drag threshold, hover the lane strip of
         // track 1, release there (well inside the lane: the separation bar
         // under track 0 owns a few pixels above it now).
-        let start = egui::pos2(40.0, y_row);
         let lane = egui::pos2(500.0, 240.0);
         frame(
             &mut app,
@@ -16271,26 +16269,14 @@ mod tests {
         let ctx = egui::Context::default();
         frame_keys(&mut app, &ctx, vec![]); // layout pass
                                             // 1. Rack DnD drop onto a lane (same recipe as the DnD pin test).
-        let mut y_row = None;
-        for y in (96..220).step_by(3) {
-            let p = egui::pos2(40.0, y as f32);
-            frame(
-                &mut app,
-                &ctx,
-                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
-            );
-            frame(
-                &mut app,
-                &ctx,
-                vec![btn(p, egui::PointerButton::Primary, false)],
-            );
-            if app.sel_asset.is_some() {
-                y_row = Some(y as f32);
-                break;
-            }
-        }
-        let y_row = y_row.expect("rack row");
-        let start = egui::pos2(40.0, y_row);
+        // v30 R6: the rack floats, so anchor on the painted row galley —
+        // a fixed x=40 probe strip walks into the window's header buttons.
+        let kick = galley_centers(&mut app, &ctx, "kick", true);
+        assert!(!kick.is_empty(), "rack row visible");
+        let start = kick[0];
+        click_pt(&mut app, &ctx, start);
+        assert!(app.sel_asset.is_some(), "row click selects the asset");
+        let y_row = start.y;
         let lane = egui::pos2(500.0, 240.0);
         frame(
             &mut app,
@@ -16497,16 +16483,14 @@ mod tests {
             );
             frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
         };
-        // Find kick.wav's row: the click that starts a preview.
-        let mut y_row = None;
-        for y in (96..220).step_by(3) {
-            click(&mut app, &ctx, y as f32);
-            if app.preview_playing.is_some() {
-                y_row = Some(y as f32);
-                break;
-            }
-        }
-        let y_row = y_row.expect("clicking a rack row previews it");
+        // Find kick.wav's row: the click that starts a preview. v30 R6:
+        // the rack floats, so anchor to the painted row galley (a fixed
+        // coordinate strip walks into the window's own header buttons).
+        let kick = galley_centers(&mut app, &ctx, "kick", true);
+        assert!(!kick.is_empty(), "rack row visible");
+        let y_row = kick[0].y;
+        click(&mut app, &ctx, y_row);
+        assert!(app.preview_playing.is_some(), "clicking the row previews it");
         assert!(app
             .preview_playing
             .as_deref()
@@ -16551,6 +16535,7 @@ mod tests {
     fn v15_ui_master_set_value_dialog() {
         let mut app = headless_app("v15mastervol");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.master_midi = 50;
         frame(&mut app, &ctx, vec![]);
 
@@ -17321,6 +17306,7 @@ mod tests {
         std::env::remove_var("SLOOPER_SYNTH"); // not relevant, hygiene
         let mut app = headless_app("rollio");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
 
         // Scan painted galleys for a text; return its screen rect.
         fn find_galley(app: &mut App, ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
@@ -17865,6 +17851,7 @@ mod tests {
 
         let mut app = headless_app("rolldit");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame_keys(&mut app, &ctx, vec![]);
         app.sample_rate = 48_000;
 
@@ -18870,6 +18857,7 @@ mod tests {
     fn v07_roll_fills_scrolls_gates_and_closes() {
         let mut app = headless_app("v07rollnav");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         let canvas = open_roll_headless(&mut app, &ctx);
 
         // AC1.3 the window fills most of the screen.
@@ -18960,6 +18948,7 @@ mod tests {
     fn v07_roll_edge_resize_group_move_and_clipboard() {
         let mut app = headless_app("v07rolle");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         let _canvas = open_roll_headless(&mut app, &ctx);
         app.snap_on = false; // sample-granular gestures for exact deltas
         let ppb = 400.0f32; // px/beat at 120 bpm
@@ -19193,6 +19182,7 @@ mod tests {
     fn v07_clip_edge_drag_and_snap_toggle() {
         let mut app = headless_app("v07trim");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame_keys(&mut app, &ctx, vec![]);
         // A synthetic 12 s asset so edge drags have room to move.
         let data: std::sync::Arc<[f32]> = vec![0.25f32; 44_100 * 12].into();
@@ -19353,6 +19343,7 @@ mod tests {
     fn v07_main_grid_multi_select() {
         let mut app = headless_app("v07msel");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame_keys(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
@@ -20063,6 +20054,7 @@ mod tests {
     fn v17_synth_chip_opens_picker_window() {
         let mut app = headless_app("synthpick");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
         frame(&mut app, &ctx, vec![moved(m)]);
@@ -20563,6 +20555,11 @@ mod tests {
     fn v18_osdrop_on_rack_imports_asset() {
         let mut app = headless_app("v18droprack");
         let ctx = egui::Context::default();
+        // The rack floats where the old dock was — drop point (120,400)
+        // lands on the WINDOW, which must own the drop.
+        app.show_binds = false;
+        app.show_midi = false;
+        frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
         let wav = write_test_wav(
             &std::env::temp_dir().join("sp-uity-v18droprack").join("in"),
@@ -20813,6 +20810,7 @@ mod tests {
     fn v20_rmb_slider_creates_auto_clip() {
         let mut app = headless_app("v20rmbauto1");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.trk_vol[0] = 32; // strip 1 must read differently from master
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
@@ -20848,6 +20846,7 @@ mod tests {
     fn v20_rmb_auto_clip_uses_selection() {
         let mut app = headless_app("v20rmbsel");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         let a1 = push_v20_audio(&mut app, "v20sa", 192_000);
         app.arr.insert(2, 0, crate::arrange::Clip::new(a1, 48_000));
         let a2 = push_v20_audio(&mut app, "v20sb", 96_000);
@@ -20876,6 +20875,7 @@ mod tests {
     fn v20_rmb_auto_clip_uses_longest_track() {
         let mut app = headless_app("v20rmblong");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         let a1 = push_v20_audio(&mut app, "v20la", 96_000);
         app.arr.insert(3, 0, crate::arrange::Clip::new(a1, 0));
         let a2 = push_v20_audio(&mut app, "v20lb", 4_800);
@@ -20898,6 +20898,7 @@ mod tests {
     fn v20_rmb_auto_clip_seeded_current() {
         let mut app = headless_app("v20rmbseed");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.trk_vol[0] = 32; // distinct readout for the helper
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
@@ -20920,6 +20921,7 @@ mod tests {
     fn v20_rmb_auto_clip_opens_manager() {
         let mut app = headless_app("v20rmbmgr");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.trk_vol[0] = 45; // distinct readout for the helper
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
@@ -20937,6 +20939,7 @@ mod tests {
     fn v20_dblclick_set_value() {
         let mut app = headless_app("v20dblval");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.trk_vol[0] = 32; // distinct readout for the helper
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
@@ -21062,6 +21065,7 @@ mod tests {
     fn v20_fx_auto_slider_rmb_auto() {
         let mut app = headless_app("v20fxauto");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         if app.fx_registry.desc("chorus").is_none() {
             // The stock seed put chorus.rs in the effects folder at App::new;
             // a headless run without it: seed manually and rescan.
@@ -21347,6 +21351,7 @@ mod tests {
     fn v21_ui_roll_keyboard_swallow_is_loud() {
         let mut app = headless_app("v21rollloud");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         let canvas = open_roll_headless(&mut app, &ctx);
         // Click inside the window's title bar: the roll takes the keyboard
         // WITHOUT drawing a note in the canvas.
@@ -21393,6 +21398,7 @@ mod tests {
     fn v18_vertical_clip_drag_moves_lane_and_reclick_works() {
         let mut app = headless_app("v18vertdrag");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
@@ -21406,11 +21412,13 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let top1 = app.grid_anchor - app.vscroll + app.track_h(0) + TRACK_SEP_HIT;
         let lane_h = app.track_h(1) / 2.0;
-        let grab = egui::pos2(500.0, top1 + lane_h * 0.5);
-        let drop = egui::pos2(500.0, top1 + lane_h * 1.5);
+        // v30 R6: the grid now spans the full window (no left dock) — a
+        // 12k-sample clip spans x8..488, so the grab sits INSIDE it.
+        let grab = egui::pos2(250.0, top1 + lane_h * 0.5);
+        let drop = egui::pos2(250.0, top1 + lane_h * 1.5);
         frame(&mut app, &ctx, vec![moved(grab)]);
         frame(&mut app, &ctx, vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)]);
-        let mid = egui::pos2(500.0, (grab.y + drop.y) * 0.5);
+        let mid = egui::pos2(250.0, (grab.y + drop.y) * 0.5);
         frame(&mut app, &ctx, vec![moved(mid)]);
         frame(&mut app, &ctx, vec![moved(drop)]);
         frame(&mut app, &ctx, vec![moved(drop), btn(drop, egui::PointerButton::Primary, false)]);
@@ -21421,7 +21429,7 @@ mod tests {
         // Plain click afterwards still selects (the reaper must be
         // clean) — click the CHILD LANE the clips now live in; lane 0 is
         // empty after the drag, and clicking empty grid correctly clears.
-        let click = egui::pos2(500.0, top1 + lane_h * 1.5);
+        let click = egui::pos2(250.0, top1 + lane_h * 1.5);
         frame(&mut app, &ctx, vec![moved(click)]);
         frame(&mut app, &ctx, vec![moved(click), btn(click, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![btn(click, egui::PointerButton::Primary, false)]);
@@ -21434,13 +21442,15 @@ mod tests {
     fn v18_cut_during_armed_edge_resize_does_not_panic() {
         let mut app = headless_app("v18cutresize");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame_keys(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         app.arr.insert(0, 0, Clip::new(a, 0));
         let top0 = app.grid_anchor - app.vscroll;
-        // Right edge of the 3 s clip at the default zoom.
-        let edge_x = 270.0 + 3.0 * app.px_per_sec;
+        // Right edge of the 3 s clip at the default zoom. v30 R6: the
+        // grid lane starts at screen x≈8 (the rack dock is gone).
+        let edge_x = 8.0 + 3.0 * app.px_per_sec;
         let grab = egui::pos2(edge_x - 2.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(grab)]);
         frame(&mut app, &ctx, vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)]);
@@ -21565,6 +21575,7 @@ mod tests {
     fn v22_mixer_slider_right_click_creates_automation() {
         let mut app = headless_app("v22rmb");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let before = app.assets.len();
         let lanes = app.arr.tracks[0].lanes.len();
@@ -21892,6 +21903,20 @@ mod tests {
             time: Some(test_time()),
             ..Default::default()
         };
+        // v30 R6: warm the clock a few frames so every capture sees the
+        // side windows fully painted (fresh contexts animate windows in).
+        for _ in 0..16 {
+            let mut w = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: raw.screen_rect,
+                    time: Some(test_time()),
+                    ..Default::default()
+                },
+                |ui| app.ui_root(ui),
+            );
+            w.textures_delta.clear();
+        }
+        let raw = egui::RawInput { time: Some(test_time()), ..raw };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
         let hits: Vec<String> = out
             .shapes
@@ -22024,6 +22049,7 @@ mod tests {
     fn v25_settings_theme_toggle_applies_and_persists() {
         let mut app = headless_app("v25theme");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         let dark_now = |app: &mut App, ctx: &egui::Context| -> bool {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -22073,6 +22099,7 @@ mod tests {
     fn v25_settings_panel_toggles_hide_panels() {
         let mut app = headless_app("v25panels");
         let ctx = egui::Context::default();
+        park_side_wins(&mut app);
         frame(&mut app, &ctx, vec![]);
         assert!(!v25_hits(&mut app, &ctx, "ASSET RACK").is_empty(), "rack default on");
         assert!(!v25_hits(&mut app, &ctx, "MIXER").is_empty(), "mixer default on");
@@ -22140,6 +22167,7 @@ mod tests {
     fn v25_reset_clears_axis_calibration() {
         let mut app = headless_app("v25resetaxis");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.knob_cal[3] = Some(crate::config::MidiAxisCal { slot: 3, lo: 9, hi: 118 });
         frame(&mut app, &ctx, vec![]);
         app.show_settings = true;
@@ -23270,6 +23298,7 @@ mod tests {
     fn v29_record_button_arms_ticked_sources() {
         let mut app = headless_app("v29recall");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         app.rec_src[0] = RecSrc {
             audio: true,
@@ -23511,6 +23540,7 @@ mod tests {
     fn v29_drum_window_paints_and_persists() {
         let mut app = headless_app("v29drumw");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let d = galley_centers(&mut app, &ctx, "Drums", true);
         assert!(!d.is_empty(), "toolbar has the Drums button");
@@ -23604,6 +23634,7 @@ mod tests {
     fn v30_drum_kit_up_to_16_pads() {
         let mut app = headless_app("v30pads");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         assert_eq!(app.kit(0).len(), 8, "stock kit = 8 pads");
         app.synth_pick = Some(0);
         frame(&mut app, &ctx, vec![]);
@@ -23780,6 +23811,119 @@ mod tests {
         assert_eq!(galley_centers(&mut app, &ctx, "- kringel (5)", false).len(), 0);
     }
 
+    /// v30 R3: automation presets are FILES (effect-preset system, same
+    /// folder discipline): the nine factory shapes seed once, the user can
+    /// save the live curve under a name, load any file back, and delete
+    /// what they do not want. The old in-window recorder button is gone.
+    #[test]
+    fn v30_auto_presets_are_files_with_save_and_load() {
+        let mut app = headless_app("v30apreset");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let dir = crate::automation::presets_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        app.open_auto_editor(None);
+        frame(&mut app, &ctx, vec![]);
+        // Factory seed: opening the manager once materialises all nine.
+        assert!(dir.exists(), "presets folder seeded");
+        assert_eq!(crate::automation::list_presets().len(), 9, "nine factory files");
+        let lin = crate::automation::Preset::ALL[0].label().to_string();
+        assert!(!galley_centers(&mut app, &ctx, &lin, false).is_empty(), "factory preset painted");
+        // The old recorder button is gone (v30 R3).
+        assert!(
+            galley_centers(&mut app, &ctx, "\u{25cf} record", false).is_empty()
+                && galley_centers(&mut app, &ctx, "record:", false).is_empty(),
+            "manager no longer carries the record UI"
+        );
+        // SAVE: name the live curve and store it.
+        {
+            let ed = app.auto_edit.as_mut().expect("editor open");
+            ed.nodes = crate::automation::preset_nodes(
+                crate::automation::Preset::ALL[2],
+                ed.len_samples.max(1),
+                0.25,
+                0.75,
+            );
+        }
+        app.auto_preset_name = "my curve".into();
+        frame(&mut app, &ctx, vec![]);
+        let sv = galley_centers(&mut app, &ctx, "save curve", false);
+        assert!(!sv.is_empty(), "save button painted");
+        click_pt(&mut app, &ctx, sv[0]);
+        assert!(crate::automation::list_presets().contains(&"my curve".to_string()), "file saved");
+        // LOAD: wreck the nodes, click the file, the shape comes back.
+        // Round-trip identity: save and load run through the SAME editor
+        // range, so the loaded nodes equal the ones that were saved.
+        let want: Vec<(i64, f32)> = app
+            .auto_edit
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| (n.t, n.v))
+            .collect();
+        crate::automation::load_preset("my curve").expect("file parses");
+        {
+            let ed = app.auto_edit.as_mut().unwrap();
+            ed.nodes.clear();
+        }
+        // exact: the status line also quotes the name.
+        let my = galley_centers(&mut app, &ctx, "my curve", true);
+        assert!(!my.is_empty(), "saved preset listed as a button");
+        click_pt(&mut app, &ctx, my[0]);
+        let got: Vec<(i64, f32)> = app
+            .auto_edit
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| (n.t, n.v))
+            .collect();
+        assert_eq!(got, want, "loading the file restored the saved shape");
+        // DELETE via the right-click menu.
+        let my = galley_centers(&mut app, &ctx, "my curve", true);
+        rmb(&mut app, &ctx, my[0]);
+        let del = galley_centers(&mut app, &ctx, "delete preset", false);
+        assert!(!del.is_empty(), "context menu offers delete");
+        click_pt(&mut app, &ctx, del[0]);
+        assert!(!crate::automation::list_presets().contains(&"my curve".to_string()), "file deleted");
+    }
+
+    /// v30 R6: the three side windows are free — drag any title bar and
+    /// that window's geometry moves; the settled geometry lands in the
+    /// config so the layout the user built survives a restart.
+    #[test]
+    fn v30_side_windows_are_free_and_persist() {
+        let mut app = headless_app("v30sw");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.side_wins.rack[2] > 80.0, "rack geometry captured on first frame");
+        let before = app.side_wins;
+        // Rack drag: the window follows the pointer.
+        // Park the rack far RIGHT — a downward move would land it on the
+        // monitor's title bar and steal that window's later drag.
+        let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack title bar");
+        drag_pt(&mut app, &ctx, t.center(), t.center() + egui::vec2(700.0, 0.0));
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!((app.side_wins.rack[0] - before.rack[0]).abs() > 50.0, "rack moved");
+        // Monitor drag too (any window moves, not one hardcoded spot).
+        let m0 = app.side_wins.monitor;
+        let mt = galley_at(&mut app, &ctx, "MIDI MONITOR").expect("monitor title bar");
+        drag_pt(&mut app, &ctx, mt.center(), mt.center() + egui::vec2(-150.0, -300.0));
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!((app.side_wins.monitor[1] - m0[1]).abs() > 100.0, "monitor moved");
+        // Geometry persists to config once the drag settles.
+        app.save_config();
+        let cfg_txt = std::fs::read_to_string(crate::config::Config::path()).unwrap_or_default();
+        assert!(cfg_txt.contains("\"side_wins\""), "geometry persists");
+        let app2 = App::new(Backend::start());
+        assert_eq!(app2.side_wins.monitor, app.side_wins.monitor, "window lands back where the user parked it");
+    }
+
     #[test]
     fn v30_legacy_drum_pads_migrate_to_kit() {
         let dir = std::env::temp_dir().join(format!("sp-v30legacy-{}", std::process::id()));
@@ -23864,6 +24008,7 @@ mod tests {
     fn v29_clip_drag_across_tracks_moves_track() {
         let mut app = headless_app("v29xtk");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
@@ -23871,11 +24016,11 @@ mod tests {
         app.select_one((0, 0, 0));
         frame(&mut app, &ctx, vec![]); // settle grid geometry
         let top0 = app.grid_anchor - app.vscroll;
-        let mid0 = egui::pos2(500.0, top0 + app.track_h(0) * 0.5);
+        let mid0 = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(mid0)]);
         frame(&mut app, &ctx, vec![moved(mid0), btn(mid0, egui::PointerButton::Primary, true)]);
         // Drag down past track 0 into track 1's rows.
-        let in_t1 = egui::pos2(500.0, top0 + app.track_h(0) + TRACK_SEP_HIT + app.track_h(1) * 0.5);
+        let in_t1 = egui::pos2(250.0, top0 + app.track_h(0) + TRACK_SEP_HIT + app.track_h(1) * 0.5);
         frame(&mut app, &ctx, vec![moved(in_t1)]);
         frame(&mut app, &ctx, vec![moved(in_t1), btn(in_t1, egui::PointerButton::Primary, false)]);
         frame(&mut app, &ctx, vec![]);
@@ -23891,13 +24036,14 @@ mod tests {
     fn v29_clip_context_move_to_track() {
         let mut app = headless_app("v29ctxmv");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         app.arr.insert(0, 0, Clip::new(a, 0));
         frame(&mut app, &ctx, vec![]);
         let top0 = app.grid_anchor - app.vscroll;
-        let p = egui::pos2(500.0, top0 + app.track_h(0) * 0.5);
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
         // Open the clip context menu exactly like the v15 pin: select,
         // then press+release Secondary with a moved() in the press frame.
         click_pt(&mut app, &ctx, p);
@@ -23936,6 +24082,7 @@ mod tests {
     fn v29_mixer_volume_slider_drags() {
         let mut app = headless_app("v29volfix");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
         app.trk_vol[0] = 32;
         frame(&mut app, &ctx, vec![]);
         // Track-1 vol row: anchored on the UNIQUE readout string (the
