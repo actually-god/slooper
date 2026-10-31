@@ -972,6 +972,17 @@ fn probe_vst3(path: &Path) -> VstEntry {
     }
 }
 
+/// VST2 instrument classification. `PluginFlags::IS_SYNTH` (bit 8 of
+/// AEffect.flags — NOT bit 0, that is HAS_EDITOR) is the spec answer,
+/// but several bridges/vendors leave it clear, so a plugin with NO audio
+/// inputs still counts (a synth takes notes, not audio). A synth that
+/// ALSO declares an audio input (Analog Lab V: external audio through
+/// its engine) is only caught by the flag — the old `inputs == 0` rule
+/// shelved it as an effect and hid it from the synth picker.
+pub fn vst2_is_instrument(flags: i32, inputs: i32) -> bool {
+    (flags & (1 << 8)) != 0 || inputs == 0
+}
+
 fn probe_vst2(path: &Path) -> VstEntry {
     use vst2::plugin::Plugin;
     // Never re-instantiate a live/unchanged library (see `cached_entry`).
@@ -994,15 +1005,18 @@ fn probe_vst2(path: &Path) -> VstEntry {
                 VstKind::V2,
                 info.name.clone(),
                 info.vendor.clone(),
-                info.inputs == 0,
+                // `flags` (bit 0 = effFlagsSynth) lives on the AEffect;
+                // the loader's plugin::Info drops it.
+                vst2_is_instrument(inst.raw_flags(), info.inputs),
             );
+            let instrument = vst2_is_instrument(inst.raw_flags(), info.inputs);
             std::mem::forget(inst);
             VstEntry {
                 path: path.to_path_buf(),
                 kind: VstKind::V2,
                 name: info.name,
                 vendor: info.vendor,
-                instrument: info.inputs == 0,
+                instrument,
                 error: None,
             }
         }
@@ -3627,5 +3641,18 @@ mod tests {
             EditorProbe::Skip => {}
             other => panic!("probe must refuse inside a test harness, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn v31_vst2_instrument_flag_rule() {
+        // Synth flag (bit 8 = effFlagsSynth) wins even when the plugin
+        // also takes audio (Analog Lab V). HAS_EDITOR (bit 0) must NOT
+        // classify — wolf-shaper has an editor and is an effect.
+        assert!(vst2_is_instrument(1 << 8, 1));
+        assert!(!vst2_is_instrument(1, 1), "HAS_EDITOR is not IS_SYNTH");
+        // Legacy: no audio inputs = instrument regardless of flags.
+        assert!(vst2_is_instrument(0, 0));
+        // Plain effect: flag clear, inputs present.
+        assert!(!vst2_is_instrument(0, 1));
     }
 }
