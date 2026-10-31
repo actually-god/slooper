@@ -53,9 +53,9 @@ pub struct Node {
     /// curvature dial instead of a mode menu:
     /// * `0`  — straight line,
     /// * `+`  — fast away from the previous node, SOFT ARRIVAL here
-    ///          (c = +1 is the old `Slow` cubic exactly),
+    ///   (c = +1 is the old `Slow` cubic exactly),
     /// * `−`  — soft away from the previous node, RUSHING ARRIVAL here
-    ///          (c = −1 is the old `Fast` cubic exactly).
+    ///   (c = −1 is the old `Fast` cubic exactly).
     #[serde(default, skip_serializing_if = "is_zero_c")]
     pub c: f32,
 }

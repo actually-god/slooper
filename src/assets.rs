@@ -102,6 +102,9 @@ pub type AssetData = Arc<[f32]>;
 pub struct RackFile {
     pub name: String,
     pub path: PathBuf,
+    /// v28: sub-folder relative to the rack folder root, "/"-separated
+    /// (e.g. `"pearl-rock/kick"`). `""` = directly in the rack folder.
+    pub dir: String,
     /// True for .mid/.midi entries (the rack's MIDI section).
     pub is_midi: bool,
     /// True for `.slauto` automation assets (v0.11).
@@ -129,14 +132,44 @@ pub fn is_midi_file(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"))
 }
 
-/// List the audio files directly inside `dir` (sorted by name, case-insensitive).
-/// Missing/unreadable directories are an error the rack shows inline instead
-/// of silently disappearing — the folder may simply not exist right now.
+/// Max sub-folder nesting `scan_folder` descends into. Deep trees are
+/// almost always app internals (`foo.vst3/Contents/...`-style layouts) or
+/// archiving junk; four levels already covers pack/kit/voice/variant.
+const MAX_DEPTH: usize = 4;
+
+/// List the audio/MIDI/automation files in `dir` INCLUDING sub-folders
+/// (v28 recursive scan), sorted by sub-folder then name, case-insensitive;
+/// root-level files come first. Hidden entries (dot-prefix) are skipped.
+/// A missing/unreadable `dir` is an error the rack shows inline instead of
+/// silently disappearing — the folder may simply not exist right now.
+/// Unreadable SUB-folders are skipped quietly (one broken branch must not
+/// blank the whole folder's list).
 pub fn scan_folder(dir: &Path) -> Result<Vec<RackFile>, String> {
-    let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut files: Vec<RackFile> = Vec::new();
+    scan_into(dir, "", 0, &mut files)?;
+    files.sort_by_key(|f| (f.dir.to_lowercase(), f.name.to_lowercase()));
+    Ok(files)
+}
+
+fn scan_into(dir: &Path, rel: &str, depth: usize, out: &mut Vec<RackFile>) -> Result<(), String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for entry in rd.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if fname.starts_with('.') {
+            continue; // hidden files and folders never clutter a rack
+        }
         let p = entry.path();
+        if p.is_dir() {
+            if depth < MAX_DEPTH {
+                let sub = if rel.is_empty() {
+                    fname.clone()
+                } else {
+                    format!("{rel}/{fname}")
+                };
+                let _ = scan_into(&p, &sub, depth + 1, out);
+            }
+            continue;
+        }
         let is_midi = p.is_file() && is_midi_file(&p);
         let is_auto = p.is_file() && is_auto_file(&p);
         if p.is_file() && (is_audio_file(&p) || is_midi || is_auto) {
@@ -144,16 +177,16 @@ pub fn scan_folder(dir: &Path) -> Result<Vec<RackFile>, String> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            files.push(RackFile {
+            out.push(RackFile {
                 name,
                 path: p,
+                dir: rel.to_string(),
                 is_midi,
                 is_auto,
             });
         }
     }
-    files.sort_by_key(|f| f.name.to_lowercase());
-    Ok(files)
+    Ok(())
 }
 
 /// A rack folder entry: the path plus its last scan result.
@@ -203,6 +236,7 @@ mod tests {
         let rf = RackFile {
             name: "a".into(),
             path: PathBuf::from("/x/a.mid"),
+            dir: String::new(),
             is_midi: true,
             is_auto: false,
         };
@@ -248,6 +282,53 @@ mod tests {
         rf.path = dir.display().to_string();
         rf.rescan();
         assert!(rf.err.is_none() && rf.files.len() == 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v28 R1/A1: the rack scan descends into sub-folders — a pack tree
+    /// like `kit/kick/hit.wav` must surface, carry its relative dir for
+    /// group rendering, sort dir-then-name with root files first, skip
+    /// hidden folders and files, and stop at the depth limit.
+    #[test]
+    fn v28_scan_recurses_subfolders() {
+        let dir = std::env::temp_dir().join(format!("sp-assets-v28-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = |rel: &str| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        };
+        mk("top.wav");
+        mk("kit/alpha.wav");
+        mk("kit/snare/beta.wav");
+        mk("kit/notes.mid");
+        mk("kit/readme.txt"); // not an importable type
+        mk(".hidden/sneaky.wav");
+        mk("top/.dotfile.wav");
+        mk("a/b/c/d/maxok.wav"); // 4 path segments == MAX_DEPTH, scanned
+        mk("a/b/c/d/e/deep.wav"); // 5 segments > MAX_DEPTH, not scanned
+        mk("a/b/c/ok.wav");
+
+        let files = scan_folder(&dir).unwrap();
+        let got: Vec<(String, String)> = files
+            .iter()
+            .map(|f| (f.dir.clone(), f.name.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("".into(), "top".into()),
+                ("a/b/c".into(), "ok".into()),
+                ("a/b/c/d".into(), "maxok".into()),
+                ("kit".into(), "alpha".into()),
+                ("kit".into(), "notes".into()),
+                ("kit/snare".into(), "beta".into()),
+            ],
+            "recursive, dir-then-name sorted, root first, hidden + junk skipped, depth-bounded"
+        );
+        // Kind flags survive the recursion (the MIDI section needs them).
+        let mid = files.iter().find(|f| f.name == "notes").unwrap();
+        assert!(mid.is_midi && !mid.is_auto && mid.dir == "kit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

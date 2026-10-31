@@ -98,6 +98,14 @@ pub fn pack_dir() -> PathBuf {
     data_dir().join("samples").join(PACK_DIRNAME)
 }
 
+/// The samples root — parent of the 808 pack and of every pack the user
+/// drops in later. v28: this (not the pack folder) is the default rack
+/// folder, so the recursive scan shows the whole library with each pack as
+/// its own sub-folder group.
+pub fn samples_root() -> PathBuf {
+    data_dir().join("samples")
+}
+
 /// True when `path` is the seeded pack folder (compared trimmed/absolute).
 pub fn is_pack_dir(path: &str) -> bool {
     let p = Path::new(path.trim());
