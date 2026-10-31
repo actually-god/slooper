@@ -10625,6 +10625,7 @@ fn rack_dir_tree(dirs: &[String]) -> Vec<(String, Vec<String>)> {
     out
 }
 
+#[allow(clippy::too_many_arguments)] // the row already threads folder/file/geo/kind
 fn rack_file_row(
     ui: &mut egui::Ui,
     app: &mut App,
@@ -10810,8 +10811,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                             .find(|o| o.folder == f.path)
                             .map(|o| o.dirs.clone())
                             .unwrap_or_default();
-                        let ds: Vec<String> =
-                            f.dirs_in_order(&pref).into_iter().map(String::from).collect();
+                        let ds: Vec<String> = f.dirs_in_order(&pref);
                         for d in &ds {
                             app.rack_collapsed.insert(format!("{}\u{1}{d}", f.path));
                         }
@@ -24163,17 +24163,14 @@ mod tests {
             time: Some(test_time()),
             ..Default::default()
         };
-        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
         let mut lanes: Vec<egui::Rect> = Vec::new();
         let mut hair: Vec<f32> = Vec::new();
         let mut collect = |s: &egui::Shape| {
-            match s {
-                egui::Shape::Rect(r) => {
-                    if r.fill == Color32::from_rgb(24, 24, 29) {
-                        lanes.push(r.rect);
-                    }
+            if let egui::Shape::Rect(r) = s {
+                if r.fill == Color32::from_rgb(24, 24, 29) {
+                    lanes.push(r.rect);
                 }
-                _ => {}
             }
         };
         for c in &out.shapes {
@@ -24200,5 +24197,6 @@ mod tests {
             y += app.track_h(t) + TRACK_SEP_HIT;
         }
         eprintln!("predicted track spans: {:?}", pred);
+        drop(out.textures_delta);
     }
 }
