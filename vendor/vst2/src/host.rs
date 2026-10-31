@@ -292,6 +292,7 @@ pub struct PluginInstance {
     params: Arc<PluginParametersInstance>,
     lib: Arc<Library>,
     info: Info,
+    raw_flags: i32,
     is_editor_active: bool,
 }
 
@@ -492,16 +493,24 @@ impl<T: Host> PluginLoader<T> {
 }
 
 impl PluginInstance {
+    /// Raw AEffect flags from effGetInfo (host-side probe accessor).
+    /// Bit 0 = effFlagsSynth. The public `plugin::Info` drops flags.
+    pub fn raw_flags(&self) -> i32 {
+        self.raw_flags
+    }
+
     fn new(effect: *mut AEffect, lib: Arc<Library>) -> PluginInstance {
         use plugin::OpCode as op;
 
         let params = Arc::new(PluginParametersInstance {
             effect: UnsafeCell::new(effect),
         });
+        let raw_flags = unsafe { (*effect).flags };
         let mut plug = PluginInstance {
             params,
             lib,
             info: Default::default(),
+            raw_flags,
             is_editor_active: false,
         };
 
