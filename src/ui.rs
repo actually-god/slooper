@@ -10531,6 +10531,37 @@ type RackRow = (String, Vec<RackFile>, Option<String>);
 /// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
 /// `indent` > 0 marks a row inside a v28 sub-folder group.
 #[allow(clippy::too_many_arguments)] // row + folder/group/mode context
+/// v30 R2: group the flat sub-folder list into the two-level display
+/// tree: the first '/'-segment of each "a/b" key becomes the parent node
+/// and the full keys beneath it its children (sorted). A key without a
+/// slash is a leaf group with no children; when both "a" and "a/b" exist,
+/// files directly inside "a" render as the parent group's own rows.
+/// Parent order follows the flat (preference) order of first mention.
+fn rack_dir_tree(dirs: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for d in dirs {
+        let top = d.split('/').next().unwrap_or(d.as_str()).to_string();
+        match out.iter_mut().find(|(t, _)| *t == top) {
+            Some((_, kids)) => {
+                if d != &top && !kids.contains(d) {
+                    kids.push(d.clone());
+                }
+            }
+            None => {
+                let mut kids = Vec::new();
+                if d.contains('/') {
+                    kids.push(d.clone());
+                }
+                out.push((top, kids));
+            }
+        }
+    }
+    for (_, kids) in out.iter_mut() {
+        kids.sort();
+    }
+    out
+}
+
 fn rack_file_row(
     ui: &mut egui::Ui,
     app: &mut App,
@@ -10717,8 +10748,18 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                             .find(|o| o.folder == f.path)
                             .map(|o| o.dirs.clone())
                             .unwrap_or_default();
-                        for d in f.dirs_in_order(&pref) {
+                        let ds: Vec<String> =
+                            f.dirs_in_order(&pref).into_iter().map(String::from).collect();
+                        for d in &ds {
                             app.rack_collapsed.insert(format!("{}\u{1}{d}", f.path));
+                        }
+                        // v30 R2: parent nodes collapse too (a separate
+                        // key, so "collapse all" folds the whole forest).
+                        for (top, kids) in rack_dir_tree(&ds) {
+                            if !kids.is_empty() {
+                                app.rack_collapsed
+                                    .insert(format!("{}\u{1}#{top}", f.path));
+                            }
                         }
                     }
                     app.save_config();
@@ -10848,27 +10889,45 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 0
                             }
                         };
-                        // One group header per sub-folder: click collapses,
-                        // right-click re-orders. Root files never group.
-                        let mut group_header =
-                            |ui: &mut egui::Ui,
-                             app: &mut App,
-                             d: &str,
-                             n: usize,
-                             first_primary: bool| -> bool {
-                                let key = format!("{path}\u{1}{d}");
+                        // v30 R2: sub-folders NEST two levels deep —
+                        // "kringle/dry" renders as a child group under a
+                        // single "kringle" parent header instead of a flat
+                        // row of siblings. The parent collapses its entire
+                        // subtree; files directly inside the parent get
+                        // their own rows under it. The first entry of the
+                        // display order is the recordings target and keeps
+                        // the '*' marker.
+                        let first_dir = dirs.first().cloned();
+                        // Shared tree renderer for both grouping modes;
+                        // `filter` picks which files of a group get rows
+                        // (folder view: every kind; type view: one kind).
+                        let mut render_tree = |ui: &mut egui::Ui,
+                                               app: &mut App,
+                                               filter: &dyn Fn(&RackFile) -> bool| {
+                            let mut header = |ui: &mut egui::Ui,
+                                              app: &mut App,
+                                              key_tail: String,
+                                              label: String,
+                                              n: usize,
+                                              marker: bool,
+                                              child: bool,
+                                              fold_dir: String|
+                             -> bool {
+                                let key = format!("{path}\u{1}{key_tail}");
                                 let open = !app.rack_collapsed.contains(&key);
-                                let hw = ui.available_width();
+                                let hw = (ui.available_width() - if child { 14.0 } else { 0.0 })
+                                    .max(24.0);
                                 let hr = ui.add_sized(
                                     egui::vec2(hw, 18.0),
                                     egui::Button::new(
                                         // ASCII +/- only (tofu trap).
                                         RichText::new(format!(
-                                            "{} {} ({}){}",
+                                            "{}{} {} ({}){}",
+                                            if child { "\u{2514} " } else { "" },
                                             if open { "-" } else { "+" },
-                                            d,
+                                            label,
                                             n,
-                                            if first_primary { " *" } else { "" }
+                                            if marker { " *" } else { "" }
                                         ))
                                         .small()
                                         .strong(),
@@ -10876,7 +10935,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 );
                                 if hr.clicked() {
                                     if open {
-                                        app.rack_collapsed.insert(key);
+                                        app.rack_collapsed.insert(key.clone());
                                     } else {
                                         app.rack_collapsed.remove(&key);
                                     }
@@ -10887,8 +10946,9 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                     if ui
                                         .button("up")
                                         .on_hover_text(
-                                            "Move this sub-folder up (the primary top folder \
-                                             receives recordings)",
+                                            "Move this group earlier \u{2014} children swap with \
+                                             siblings; a top-level group moves its whole \
+                                             subtree (the first entry receives recordings)",
                                         )
                                         .clicked()
                                     {
@@ -10901,13 +10961,13 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                 });
                                 if let Some(m) = mv {
-                                    fold = Some((path.clone(), d.to_string(), m));
+                                    fold = Some((path.clone(), fold_dir, m));
                                 }
                                 hr.on_hover_text(format!(
-                                    "sub-folder {d} \u{2014} click to {} \u{b7} right-click to \
-                                     re-order{}",
+                                    "sub-folder {label} \u{2014} click to {} \u{b7} right-click \
+                                     to re-order{}",
                                     if open { "collapse" } else { "expand" },
-                                    if first_primary {
+                                    if marker {
                                         " \u{b7} '*' = recordings land here"
                                     } else {
                                         ""
@@ -10915,32 +10975,98 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 ));
                                 open
                             };
-                        if app.rack_group_by_dir {
-                            // BY SUB-FOLDER: one group per folder, ALL kinds
-                            // together (808-kick, its MIDI loop and its curve
-                            // stack in the same group). Root files come last,
-                            // ungrouped, each still badged by kind.
-                            for (di, d) in dirs.iter().enumerate() {
-                                let mine: Vec<&RackFile> =
-                                    files.iter().filter(|r| &r.dir == d).collect();
-                                if mine.is_empty() {
+                            for (top, kids) in rack_dir_tree(&dirs) {
+                                let prefix = format!("{top}/");
+                                let in_top =
+                                    |r: &RackFile| r.dir == top || r.dir.starts_with(&prefix);
+                                if !files.iter().any(|r| in_top(r) && filter(r)) {
                                     continue;
                                 }
-                                let open =
-                                    group_header(ui, app, d, mine.len(), fi == 0 && di == 0);
-                                if open {
+                                let total = files.iter().filter(|r| in_top(r)).count();
+                                let open = header(
+                                    ui,
+                                    app,
+                                    if kids.is_empty() {
+                                        top.clone()
+                                    } else {
+                                        format!("#{top}")
+                                    },
+                                    top.clone(),
+                                    total,
+                                    fi == 0 && first_dir.as_deref() == Some(top.as_str()),
+                                    false,
+                                    top.clone(),
+                                );
+                                if !open {
+                                    continue;
+                                }
+                                for r in files.iter().filter(|r| r.dir == top && filter(r)) {
+                                    rack_file_row(
+                                        ui,
+                                        app,
+                                        fi,
+                                        &r.name,
+                                        &r.path,
+                                        kind_of(r),
+                                        12.0,
+                                        &path,
+                                        &dirs,
+                                    );
+                                }
+                                for kd in kids {
+                                    let mine: Vec<&RackFile> = files
+                                        .iter()
+                                        .filter(|r| r.dir == kd && filter(r))
+                                        .collect();
+                                    if mine.is_empty() {
+                                        continue;
+                                    }
+                                    let kprefix = format!("{kd}/");
+                                    let kc = files
+                                        .iter()
+                                        .filter(|r| r.dir == kd || r.dir.starts_with(&kprefix))
+                                        .count();
+                                    let kopen = header(
+                                        ui,
+                                        app,
+                                        kd.clone(),
+                                        kd.clone(),
+                                        kc,
+                                        fi == 0 && first_dir.as_deref() == Some(kd.as_str()),
+                                        true,
+                                        kd.clone(),
+                                    );
+                                    if !kopen {
+                                        continue;
+                                    }
                                     for r in mine {
-                                        rack_file_row(ui, app, fi, &r.name, &r.path, kind_of(r), 12.0, &path, &dirs);
+                                        rack_file_row(
+                                            ui,
+                                            app,
+                                            fi,
+                                            &r.name,
+                                            &r.path,
+                                            kind_of(r),
+                                            24.0,
+                                            &path,
+                                            &dirs,
+                                        );
                                     }
                                 }
                             }
+                        };
+                        if app.rack_group_by_dir {
+                            // BY SUB-FOLDER: the nested tree, ALL kinds
+                            // together. Root files come last, ungrouped.
+                            render_tree(ui, app, &|_| true);
                             for r in files.iter().filter(|r| r.dir.is_empty()) {
-                                rack_file_row(ui, app, fi, &r.name, &r.path, kind_of(r), 0.0, &path, &dirs);
+                                rack_file_row(
+                                    ui, app, fi, &r.name, &r.path, kind_of(r), 0.0, &path, &dirs,
+                                );
                             }
                         } else {
                             // BY TYPE (default): AUDIO / MIDI / AUTOMATION
-                            // sections; inside each, sub-folders group in
-                            // display order (v28 layout + user order).
+                            // sections; inside each, the nested tree.
                             for kind in 0u8..3 {
                                 let entries: Vec<&RackFile> =
                                     files.iter().filter(|r| kind_of(r) == kind).collect();
@@ -10958,25 +11084,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 for r in roots {
                                     rack_file_row(ui, app, fi, &r.name, &r.path, kind, 0.0, &path, &dirs);
                                 }
-                                for d in &dirs {
-                                    let mine: Vec<&RackFile> =
-                                        entries.iter().cloned().filter(|r| &r.dir == d).collect();
-                                    if mine.is_empty() {
-                                        continue;
-                                    }
-                                    let open = group_header(
-                                        ui,
-                                        app,
-                                        d,
-                                        files.iter().filter(|r| &r.dir == d).count(),
-                                        fi == 0 && Some(d) == dirs.first(),
-                                    );
-                                    if open {
-                                        for r in mine {
-                                            rack_file_row(ui, app, fi, &r.name, &r.path, kind, 12.0, &path, &dirs);
-                                        }
-                                    }
-                                }
+                                render_tree(ui, app, &|r| kind_of(r) == kind);
                             }
                         }
                     }
@@ -11019,12 +11127,64 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                             .find(|f| f.path == folder)
                             .map(|f| f.dirs_in_order(&pref))
                             .unwrap_or_default();
-                        if let Some(i) = all.iter().position(|x| *x == dir) {
-                            let j = (i as i32 + dlt).clamp(0, all.len().max(1) as i32 - 1) as usize;
-                            if i != j {
-                                let m = all.remove(i);
-                                all.insert(j, m);
-                                if let Some(row) = app
+                        // v30 R2: a child dir swaps with its nearest
+                        // SIBLING (same parent, so the tree re-orders
+                        // inside its family); a top-level group moves its
+                        // whole block past the adjacent top-level group.
+                        let top_of = |x: &str| -> String {
+                            x.split('/').next().unwrap_or("").to_string()
+                        };
+                        let mut moved = false;
+                        if dir.contains('/') {
+                            let pfx = format!("{}/", top_of(&dir));
+                            let sibs: Vec<usize> = all
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, x)| x.starts_with(&pfx))
+                                .map(|(i, _)| i)
+                                .collect();
+                            if let Some(pos) = sibs.iter().position(|i| all[*i] == dir) {
+                                let q = pos as i32 + dlt;
+                                if q >= 0 && (q as usize) < sibs.len() {
+                                    all.swap(sibs[pos], sibs[q as usize]);
+                                    moved = true;
+                                }
+                            }
+                        } else {
+                            let mut tops: Vec<String> = Vec::new();
+                            for x in &all {
+                                let t = top_of(x);
+                                if !tops.contains(&t) {
+                                    tops.push(t);
+                                }
+                            }
+                            if let Some(ti) = tops.iter().position(|t| *t == dir) {
+                                let q = ti as i32 + dlt;
+                                if q >= 0 && (q as usize) < tops.len() {
+                                    let target = tops[q as usize].clone();
+                                    let block: Vec<String> = all
+                                        .iter()
+                                        .filter(|x| top_of(x) == dir)
+                                        .cloned()
+                                        .collect();
+                                    all.retain(|x| top_of(x) != dir);
+                                    let at = if dlt < 0 {
+                                        all.iter()
+                                            .position(|x| top_of(x) == target)
+                                            .unwrap_or(all.len())
+                                    } else {
+                                        all.iter()
+                                            .rposition(|x| top_of(x) == target)
+                                            .map(|i| i + 1)
+                                            .unwrap_or(all.len())
+                                    };
+                                    all.splice(at..at, block);
+                                    moved = true;
+                                }
+                            }
+                        }
+                        if moved {
+                            if let Some(row) = app
                                     .rack_dir_order
                                     .iter_mut()
                                     .find(|o| o.folder == folder)
@@ -11036,10 +11196,9 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                         dirs: all,
                                     });
                                 }
-                                app.save_config();
+                            app.save_config();
                             }
                         }
-                    }
 
                     // Project-only assets: recordings with no rack folder,
                     // dirty edits, and files whose folder was removed.
@@ -23463,6 +23622,87 @@ mod tests {
 
     /// v30 R1/A5: a v29 config (global drum.pads, no kit table) migrates
     /// its pads into the pattern's target-track kit.
+    #[test]
+    fn v30_rack_subfolders_nest() {
+        let mut app = headless_app("v30rack");
+        let ctx = egui::Context::default();
+        let root = app.rack[0].path.clone();
+        let root = std::path::Path::new(&root);
+        // "kringel" with its four sub-folders (and one file of its own),
+        // a leaf folder, and a root file.
+        for rel in [
+            "top.wav",
+            "leaf/l1.wav",
+            "kringel/own.wav",
+            "kringel/dry/a.wav",
+            "kringel/wet/b.wav",
+            "kringel/pad/c.mid",
+            "kringel/verb/d.wav",
+        ] {
+            let q = root.join(rel);
+            std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+            std::fs::write(&q, b"RIFFx").unwrap();
+        }
+        app.rack[0].rescan();
+        app.rack_group_by_dir = true;
+        frame(&mut app, &ctx, vec![]);
+        // ONE parent header for kringel counting every file in the tree
+        // (5 — the four wavs plus the .mid), not four flat siblings.
+        let parents = galley_centers(&mut app, &ctx, "- kringel (5)", false);
+        assert_eq!(parents.len(), 1, "single parent header for kringel");
+        for sub in ["dry", "wet", "pad", "verb"] {
+            let h = galley_centers(&mut app, &ctx, &format!("kringel/{sub} ("), false);
+            assert_eq!(h.len(), 1, "child header kringel/{sub} renders once");
+        }
+        // The parent's own file renders under the parent, and so do the
+        // leaf folder + root file.
+        assert!(!galley_centers(&mut app, &ctx, "own", true).is_empty(), "parent own-file row");
+        assert!(!galley_centers(&mut app, &ctx, "- leaf (1)", false).is_empty());
+        assert!(!galley_centers(&mut app, &ctx, "top", true).is_empty(), "root file row");
+        // Clicking the parent collapses the WHOLE subtree.
+        frame(&mut app, &ctx, vec![moved(parents[0])]);
+        click_pt(&mut app, &ctx, parents[0]);
+        assert!(
+            galley_centers(&mut app, &ctx, "+ kringel (5)", false).len() == 1,
+            "parent header flips to +"
+        );
+        for sub in ["dry", "wet", "pad", "verb"] {
+            assert!(
+                galley_centers(&mut app, &ctx, &format!("kringel/{sub}"), false).is_empty(),
+                "children hide with the parent: {sub}"
+            );
+        }
+        assert!(galley_centers(&mut app, &ctx, "own", true).is_empty(), "own-file hides with parent");
+        // Re-open, then collapse a single child.
+        let p2 = galley_centers(&mut app, &ctx, "+ kringel (5)", false)[0];
+        frame(&mut app, &ctx, vec![moved(p2)]);
+        click_pt(&mut app, &ctx, p2);
+        let wet = &galley_centers(&mut app, &ctx, "- kringel/wet (", false);
+        assert_eq!(wet.len(), 1);
+        frame(&mut app, &ctx, vec![moved(wet[0])]);
+        click_pt(&mut app, &ctx, wet[0]);
+        assert!(galley_centers(&mut app, &ctx, "- kringel/dry (", false).len() == 1,
+            "sibling child stays open");
+        assert!(galley_centers(&mut app, &ctx, "b", true).is_empty(),
+            "collapsed child's rows are gone");
+        // BY-TYPE view carries the same tree (v30: not a flat list).
+        app.rack_group_by_dir = false;
+        let p3 = {
+            frame(&mut app, &ctx, vec![]);
+            let g = galley_centers(&mut app, &ctx, "- kringel (5)", false);
+            // Two sections (AUDIO and MIDI) each carry the tree — the v28
+            // header-count semantics (all kinds) carried over deliberately.
+            assert_eq!(g.len(), 2, "type view nests too (audio + midi)");
+            g[0]
+        };
+        frame(&mut app, &ctx, vec![moved(p3)]);
+        click_pt(&mut app, &ctx, p3);
+        // Collapse state is shared across the sections and both grouping
+        // modes — one key, so every copy of the header flips together.
+        assert_eq!(galley_centers(&mut app, &ctx, "+ kringel (5)", false).len(), 2);
+        assert_eq!(galley_centers(&mut app, &ctx, "- kringel (5)", false).len(), 0);
+    }
+
     #[test]
     fn v30_legacy_drum_pads_migrate_to_kit() {
         let dir = std::env::temp_dir().join(format!("sp-v30legacy-{}", std::process::id()));
