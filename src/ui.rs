@@ -876,6 +876,13 @@ pub struct App {
     /// docks occupy no space and paint no heading.
     show_rack: bool,
     show_mixer: bool,
+    /// v30 R3: scratch name for saving an automation shape preset.
+    auto_preset_name: String,
+    /// v30 R4: the project-value-bindings window is part of the main GUI.
+    show_binds: bool,
+    /// v30 R6: persisted geometry of the three free side windows.
+    side_wins: crate::config::SideWins,
+    side_dirty: bool,
     show_midi: bool,
     /// v25: light egui Visuals for the panel/window chrome. The arrangement
     /// canvas keeps its fixed studio palette either way.
@@ -1353,6 +1360,10 @@ impl App {
             show_settings: false,
             show_rack: cfg.show_rack,
             show_mixer: cfg.show_mixer,
+            auto_preset_name: String::new(),
+            show_binds: cfg.show_binds,
+            side_wins: cfg.side_wins,
+            side_dirty: false,
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
             theme_was_light: None,
@@ -3305,6 +3316,8 @@ impl App {
             show_rack: self.show_rack,
             show_mixer: self.show_mixer,
             show_midi: self.show_midi,
+            show_binds: self.show_binds,
+            side_wins: self.side_wins,
             theme: if self.light_theme { "light" } else { "dark" }.into(),
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
@@ -5139,82 +5152,7 @@ impl App {
                     );
                 });
 
-                // ---- v0.15: MIDI record sources -------------------------
-                // Pick any bindings configured in Settings -> MIDI
-                // Bindings. While this manager is open the picked bindings
-                // are MUTED in the main window (they never fire their
-                // action); with REC armed their raw moves draw the curve
-                // as a percentage of the target's range (0 = min,
-                // 127 = max: 0 -> -inf, 127 -> +6 dB on volume).
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("record:").weak());
-                    let mut any = false;
-                    for (i, bd) in self.midi_binds.iter().enumerate() {
-                        let Some(b) = bd else { continue };
-                        any = true;
-                        let mut on = self.auto_mgr_rec.iter().any(|(s, _)| *s == i);
-                        let tb = ui
-                            .toggle_value(
-                                &mut on,
-                                format!("{} \u{2190} {}", MidiAction::ALL[i].label(), b.label()),
-                            )
-                            .on_hover_text(if on {
-                                "MUTED in the main window while the automation manager is open \u{2014} \
-                                 its moves draw the curve instead"
-                            } else {
-                                "record this binding's moves into the curve"
-                            });
-                        if tb.changed() {
-                            if on {
-                                if !self.auto_mgr_rec.iter().any(|(s, _)| *s == i) {
-                                    self.auto_mgr_rec.push((i, *b));
-                                }
-                            } else {
-                                self.auto_mgr_rec.retain(|(s, _)| *s != i);
-                            }
-                        }
-                    }
-                    if !any {
-                        ui.label(
-                            RichText::new(
-                                "no MIDI bindings yet \u{2014} set them in Settings",
-                            )
-                            .weak()
-                            .italics(),
-                        );
-                    }
-                });
                 ui.horizontal(|ui| {
-                    let recbtn = ui.button(if ed.rec {
-                        RichText::new("\u{25a0} stop").strong()
-                    } else {
-                        RichText::new("\u{25cf} record").strong()
-                    });
-                    if recbtn.on_hover_text(
-                        "arm the manager recorder: raw knob moves from the picked bindings \
-                         become curve nodes (percent of the target's min/max range)",
-                    ).clicked()
-                    {
-                        if ed.rec {
-                            ed.rec = false;
-                        } else {
-                            ed.rec = true;
-                            ed.rec_start = self.backend.engine.pos() as i64;
-                            // Recording APPENDS (never clears): nothing the
-                            // user drew can be destroyed by arming a take.
-                            ed.changed = true;
-                            if !self.backend.engine.transport_on() {
-                                self.backend.cmd(Cmd::PlayAll);
-                            }
-                        }
-                    }
-                    if ed.rec {
-                        ui.label(
-                            RichText::new("recording \u{2014} move a picked binding")
-                                .weak()
-                                .italics(),
-                        );
-                    }
                     if ui
                         .button("Select value\u{2026}")
                         .on_hover_text(
@@ -5603,20 +5541,71 @@ impl App {
                 // The whole point: a usable curve in ONE click. Each preset
                 // REPLACES the node set, mapped over the full length and the
                 // target's own min..max — every endpoint stays editable.
+                // v30 R3: the presets are FILES now (same system as effect
+                // user presets): the nine factory shapes seed into
+                // `<data>/automation presets/` once, live in one list with
+                // whatever the user saved, and can be deleted or added to
+                // from here. Normalised storage = one shape fits any
+                // target and length.
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("presets:").weak());
-                    for p in crate::automation::Preset::ALL {
-                        if ui
-                            .button(p.label())
-                            .on_hover_text(
-                                "replace the whole curve with this shape, spanning the target's full range; edit the endpoints afterwards",
-                            )
-                            .clicked()
-                        {
-                            ed.nodes = crate::automation::preset_nodes(p, len, rmin, rmax);
-                            ed.sel = 0;
-                            ed.drag = None;
-                            ed.changed = true;
+                    if !crate::automation::presets_dir().exists() {
+                        crate::automation::seed_factory_presets();
+                    }
+                    for name in crate::automation::list_presets() {
+                        let btn = ui.button(&name).on_hover_text(
+                            "replace the whole curve with this shape, spanning the \
+                             target's full range; right-click to delete it",
+                        );
+                        if btn.clicked() {
+                            match crate::automation::load_preset(&name) {
+                                Some(sp) => {
+                                    ed.nodes = sp.apply(len, rmin, rmax);
+                                    ed.sel = 0;
+                                    ed.drag = None;
+                                    ed.changed = true;
+                                }
+                                None => self.status = format!("preset \u{201c}{name}\u{201d} is unreadable"),
+                            }
+                        }
+                        let nm = name.clone();
+                        btn.context_menu(|ui| {
+                            if ui.button("delete preset").clicked() {
+                                let _ = crate::automation::delete_preset(&nm);
+                                self.status = format!("preset \u{201c}{nm}\u{201d} deleted");
+                                ui.close();
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("save:").weak());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.auto_preset_name)
+                            .desired_width(110.0)
+                            .hint_text("new preset name"),
+                    );
+                    if ui
+                        .button("save curve")
+                        .on_hover_text(
+                            "store the current node set as a preset (saved normalised, so it \
+                             fits any target and length; the name box picks the file)",
+                        )
+                        .clicked()
+                    {
+                        let nm = self.auto_preset_name.trim().to_string();
+                        if nm.is_empty() {
+                            self.status = "preset: type a name first".into();
+                        } else {
+                            let sp = crate::automation::ShapePreset::from_nodes(
+                                &ed.nodes, len, rmin, rmax,
+                            );
+                            match crate::automation::save_preset(&nm, &sp) {
+                                Ok(()) => {
+                                    self.status = format!("preset \u{201c}{nm}\u{201d} saved");
+                                    self.auto_preset_name = String::new();
+                                }
+                                Err(e) => self.status = format!("preset save failed: {e}"),
+                            }
                         }
                     }
                 });
@@ -9228,6 +9217,12 @@ impl App {
             self.fx_save_pending = false;
             self.save_config();
         }
+        // v30 R6: persist side-window geometry once the drag/resize is
+        // over (same idle-flush pattern as level edits).
+        if self.side_dirty && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.side_dirty = false;
+            self.save_config();
+        }
 
         // v25: status staleness watch — the text is compared at frame top,
         // so every write site stays untouched while the top bar can tell a
@@ -9253,10 +9248,11 @@ impl App {
         if self.show_midi {
             midi_monitor(ui, self);
         }
-        // v29 R7: the bindings rack docks alongside the automation
-        // manager — plugin/mixer MIDI setups travel with the project.
-        // (Must reserve its edge BEFORE central_panels claims it.)
-        if self.auto_edit.is_some() {
+        // v30 R4: the bindings window is a free side window LINKED to the
+        // main GUI — always available (default position beside the mixer),
+        // no longer tied to the automation manager being open. v30 R6:
+        // windows never reserve panel edges, so order does not matter.
+        if self.show_binds {
             value_binds_panel(ui, self);
         }
         central_panels(ui, self);
@@ -10289,20 +10285,68 @@ fn value_user_parse(target: &str, s: &str) -> Option<f32> {
 /// NAMES the plugin publishes through its parameter description, the
 /// documented host-visible value system), the FX chain rows, and the two
 /// global controls.
+/// v30 R6: one free side window of the main GUI. Inline look (same
+/// content, same panels inside) but the user can DRAG it by its title
+/// bar, RESIZE it at the edges, and COLLAPSE or CLOSE it. The geometry
+/// is persisted per `idx` (0 = asset rack, 1 = MIDI bindings,
+/// 2 = MIDI monitor) in config; `fallback` is the classic dock footprint
+/// used until the user moves the window the first time.
+fn side_window(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    idx: usize,
+    title: &str,
+    open: &mut bool,
+    fallback: [f32; 4],
+    body: impl FnOnce(&mut egui::Ui, &mut App),
+) {
+    let old = match idx {
+        0 => app.side_wins.rack,
+        1 => app.side_wins.binds,
+        _ => app.side_wins.monitor,
+    };
+    let known = old[2] > 80.0 && old[3] > 60.0;
+    let pos = if known { [old[0], old[1]] } else { [fallback[0], fallback[1]] };
+    let size = if known { [old[2], old[3]] } else { [fallback[2], fallback[3]] };
+    let resp = egui::Window::new(RichText::new(title).strong())
+        .id(egui::Id::new(("sidewin", idx as u8)))
+        .open(open)
+        .default_pos(egui::pos2(pos[0], pos[1]))
+        .default_size(egui::vec2(size[0], size[1]))
+        .resizable(true)
+        .collapsible(true)
+        // First frame must be fully painted: headless probes (and users
+        // with animations off) would otherwise see the content fade in.
+        .fade_in(false)
+        .show(ui.ctx(), |ui| body(ui, app));
+    if let Some(out) = resp.map(|r| r.response.rect) {
+        // Remember the live rect so the next launch (or window toggle)
+        // restores exactly where the user parked it.
+        let nr = [out.min.x, out.min.y, out.width(), out.height()];
+        if nr.iter().zip(old.iter()).any(|(a, b)| (a - b).abs() > 0.5) {
+            match idx {
+                0 => app.side_wins.rack = nr,
+                1 => app.side_wins.binds = nr,
+                _ => app.side_wins.monitor = nr,
+            }
+            app.side_dirty = true;
+        }
+    }
+}
+
 /// v29 R7: the automation manager's bindings rack — all MIDI-to-VALUE
 /// bindings of the CURRENT project. The target uses the manager's own
 /// picker (searchable `auto_targets` list for the selected track); then
 /// the right widget for the value's nature: knobs run the three-step
 /// axis wizard, booleans capture one message as a switch.
 fn value_binds_panel(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::right("vb_rack")
-        .resizable(true)
-        .default_size(240.0)
-        .min_size(200.0)
-        .show(ui, |ui| {
-            ui.heading(RichText::new("MIDI BINDINGS").strong());
+    let mut vis = app.show_binds;
+    let sr = ui.ctx().input(|i| i.viewport_rect());
+    let fb = [sr.max.x - 556.0, sr.min.y + 46.0, 300.0, 620.0];
+    side_window(ui, app, 1, "MIDI BINDINGS", &mut vis, fb, |ui, app| {
+
             ui.label(
-                RichText::new("project value bindings \u{b7} opens with the manager")
+                RichText::new("project value bindings \u{b7} always linked to the main GUI")
                     .weak()
                     .small(),
             );
@@ -10413,8 +10457,11 @@ fn value_binds_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             }
         });
+    if vis != app.show_binds {
+        app.show_binds = vis;
+        app.save_config();
+    }
 }
-
 /// Label helper for status lines: the binding's target, track-qualified.
 fn describe_binding_target(vb: &crate::config::ValueBind) -> String {
     if vb.target.starts_with("master.") {
@@ -10709,13 +10756,12 @@ fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
 /// draggable row per audio file, project-only assets below, and the
 /// selected-asset toolbar (quantize / trim / remove).
 fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::left("asset_rack")
-        .resizable(true)
-        .default_size(260.0)
-        .min_size(190.0)
-        .show(ui, |ui| {
+    let mut vis = app.show_rack;
+    let sr = ui.ctx().input(|i| i.viewport_rect());
+    let fb = [sr.min.x + 4.0, sr.min.y + 46.0, 340.0, 640.0];
+    side_window(ui, app, 0, "ASSET RACK", &mut vis, fb, |ui, app| {
+
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("ASSET RACK").strong());
                 if ui
                     .button("+ folder")
                     .on_hover_text("Add an audio folder to the rack")
@@ -11370,8 +11416,11 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
         });
+    if vis != app.show_rack {
+        app.show_rack = vis;
+        app.save_config();
+    }
 }
-
 /// The mixer dock: every track's controls, as one strip per track, pinned
 /// to the right like the asset rack. Strip heights come from [`App::track_h`]
 /// and the column is offset by the grid's scroll — so each strip sits exactly
@@ -12304,9 +12353,17 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // v30 R5: stack the lanes FLUSH. Default vertical layout
+                // adds item_spacing.y after every lane row AND after the
+                // separation bar — 6 px per track that quietly diverged
+                // from the mixer's shared pitch (track_h + TRACK_SEP_HIT)
+                // and desynchronised the two panels.
+                let sp = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
                 for t in 0..app.n_tracks {
                     track_block(ui, app, t, avail, px, sr);
                 }
+                ui.spacing_mut().item_spacing.y = sp;
             });
         // The mixer panel mirrors this offset so strips stay aligned.
         app.vscroll = out.state.offset.y;
@@ -14795,17 +14852,17 @@ fn port_list_lr(
 }
 
 fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::bottom("midi")
-        .resizable(true)
-        .min_size(140.0)
-        .default_size(220.0)
-        .show(ui, |ui| {
+    let mut vis = app.show_midi;
+    let sr = ui.ctx().input(|i| i.viewport_rect());
+    let fb = [sr.min.x + 360.0, sr.max.y - 284.0, 520.0, 240.0];
+    side_window(ui, app, 2, "MIDI MONITOR", &mut vis, fb, |ui, app| {
+
             // v25: ONE honest state line instead of a static paragraph.
             // It says what the monitor sees RIGHT NOW; the pw-link
             // instructions moved to its tooltip so the dock stops reading
             // like a wall of documentation.
             ui.horizontal(|ui| {
-                ui.label(RichText::new("MIDI MONITOR").strong());
+                let _ = ();
                 let (state, warn) = match (&app.last_midi, app.midi_sources.is_empty()) {
                     (Some(_), false) => (
                         format!(
@@ -14915,8 +14972,11 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
         });
+    if vis != app.show_midi {
+        app.show_midi = vis;
+        app.save_config();
+    }
 }
-
 fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::left("settings").resizable(true).default_size(410.0).min_size(330.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -14968,6 +15028,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.save_config();
                 }
                 if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
+                    app.save_config();
+                }
+                if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
                     app.save_config();
                 }
             });
@@ -15362,6 +15425,16 @@ mod tests {
             .clone()
     }
 
+    /// v30 R6: the asset rack / bindings / monitor are free windows that
+    /// float OVER the canvas (unlike the old docks, which reserved their
+    /// edge). Pins that click the grid, the mixer or the settings panel
+    /// hide them first so coordinates land on the panel under test.
+    fn clear_canvas(app: &mut App) {
+        app.show_rack = false;
+        app.show_midi = false;
+        app.show_binds = false;
+    }
+
     fn headless_app(tag: &str) -> App {
         std::env::set_var("SLOOPER_NULL_AUDIO", "1");
         let dir = std::env::temp_dir().join(format!("sp-uity-{tag}"));
@@ -15389,6 +15462,10 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        // v30 R3: ...same for XDG_DATA_HOME — automation shape presets
+        // (and anything else data-rooted) must never seed into the real
+        // account folder from a test run.
+        std::env::set_var("XDG_DATA_HOME", &dir);
         // v22: the config isolation alone was not enough — HOME still
         // pointed at the real account, so ANY test that happens to render
         // the plugin/synth window trips the lazy folder scan, and that

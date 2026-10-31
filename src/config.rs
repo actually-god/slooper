@@ -217,8 +217,28 @@ pub struct RackDirOrder {
     pub dirs: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// v30 R6: geometry of the user-movable side windows (asset rack, MIDI
+/// bindings, MIDI monitor). Each entry is `[x, y, w, h]` of the window's
+/// outer rect; all-zero = never moved/resized (built-in default).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SideWins {
+    pub rack: [f32; 4],
+    pub binds: [f32; 4],
+    pub monitor: [f32; 4],
+}
+
+impl Default for SideWins {
+    fn default() -> Self {
+        SideWins {
+            rack: [0.0; 4],
+            binds: [0.0; 4],
+            monitor: [0.0; 4],
+        }
+    }
+}
+
 /// Everything Settings persists.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Keyboard shortcuts as key names (e.g. `"R"`, `"Space"`), one per entry
     /// of `MidiAction::ALL` (same order); null = unbound. Tables from older
@@ -423,6 +443,14 @@ pub struct Config {
     pub show_mixer: bool,
     #[serde(default = "default_true")]
     pub show_midi: bool,
+    /// v30 R4: the project-value-bindings window now belongs to the MAIN
+    /// GUI (it used to exist only while the automation manager was open).
+    #[serde(default = "default_true")]
+    pub show_binds: bool,
+    /// v30 R6: last-used rects [x, y, w, h] of the free side windows.
+    /// A zeroed entry means "use the built-in dock footprint".
+    #[serde(default)]
+    pub side_wins: SideWins,
     /// v25: panel/window theme — "dark" (default) or "light". The
     /// arrangement canvas and piano roll keep their fixed studio palette
     /// either way (contrast for editing is intentional).
@@ -485,6 +513,8 @@ impl Default for Config {
             show_rack: true,
             show_mixer: true,
             show_midi: true,
+            show_binds: true,
+            side_wins: SideWins::default(),
             theme: default_theme(),
         }
     }
@@ -792,6 +822,12 @@ mod tests {
             show_rack: false,
             show_mixer: true,
             show_midi: false,
+            show_binds: true,
+            side_wins: crate::config::SideWins {
+                rack: [1.0, 2.0, 300.0, 400.0],
+                binds: [0.0; 4],
+                monitor: [0.0; 4],
+            },
             theme: "light".into(),
         };
         let s = serde_json::to_string(&cfg).unwrap();
