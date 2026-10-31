@@ -6461,11 +6461,9 @@ impl App {
                             .step_by(1.0)
                             .custom_formatter(|n, _| note_name(n.round().clamp(0.0, 127.0) as u8));
                     }
-                    let mut resp = ui
-                        .add(sl)
-                        // v20 R3: Slider senses DRAG only; union click
-                        // interest so RMB/double-click reach the binding.
-                        .interact(egui::Sense::click());
+                    // v29: no click union (drag-killer); bind_value_controls
+                    // reads slider_click_gestures for the RMB/dbl pair.
+                    let mut resp = ui.add(sl);
                     // v20 R3: right-click = automation asset for this
                     // slider (owner = this track); double-click = Set value.
                     bind_value_controls(&mut resp, self, Some(t), &format!("synth:{k}"), nv);
@@ -8741,6 +8739,24 @@ fn value_menu_items(
     false
 }
 
+/// v29: click gestures for egui 0.36 `Slider`s, which sense DRAG only.
+/// NEVER add `.interact(Sense::click())` to a Slider: the extra same-id
+/// registration covers the slider's OWN widget rect, and a covered
+/// slider stops mapping drag to value — the v29 "mixer sliders are fixed
+/// in place" regression. Raw-input gestures under the hover guard fire
+/// once per release, exactly where the union used to.
+fn slider_click_gestures(resp: &egui::Response) -> (bool, bool) {
+    if !resp.hovered() {
+        return (false, false);
+    }
+    resp.ctx.input(|i| {
+        (
+            i.pointer.button_clicked(egui::PointerButton::Secondary),
+            i.pointer.button_double_clicked(egui::PointerButton::Primary),
+        )
+    })
+}
+
 /// v20 R3: the ONE binding gesture pair for every automatable slider and
 /// readout (strip vol/pan, master vol, synth sliders, fx auto/bridge
 /// sliders): right-click creates the automation asset (selection/longest
@@ -8753,14 +8769,20 @@ fn bind_value_controls(
     target: &str,
     current: f32,
 ) {
-    // An egui Slider senses DRAG only — a secondary click never surfaces
-    // there at all; those controls union click interest at creation (see
-    // the fx wrappers) so `secondary_clicked()` is the ONE signal. Mixing
-    // a hover-press fallback with it would create once per frame phase.
-    if resp.secondary_clicked() {
+    // v29: egui Sliders sense DRAG only, and the old fix — unioning click
+    // interest with `.interact(Sense::click())` — re-registered the same id
+    // and left the slider's own rect COVERED, freezing drag-to-value (the
+    // "mixer sliders fixed in place" report). Gestures now come from
+    // `slider_click_gestures` (raw release-frame clicks under a hover
+    // guard): for click-sensing widgets `secondary_clicked()` and the raw
+    // signal fire on the SAME frame into ONE boolean, so nothing can
+    // double-create. A hover+button_PRESSED fallback WOULD fire once per
+    // phase — never do that here.
+    let (sl_rmb, sl_dbl) = slider_click_gestures(resp);
+    if resp.secondary_clicked() || sl_rmb {
         app.rmb_create_auto(owner, target, current);
     }
-    if resp.double_clicked() {
+    if resp.double_clicked() || sl_dbl {
         let t = owner.unwrap_or(app.selected);
         app.value_dialog = Some((t, target.to_string(), value_user_display(target, current)));
         app.value_dialog_focus = true;
@@ -9669,9 +9691,8 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             .on_hover_text(
                 "Master volume: -inf .. +6 dB. Right-click for exact entry and automation.",
             )
-            // v22: union click sense (Slider is DRAG-only by default —
-            // without this the direct RMB-automation gesture is dead).
-            .interact(egui::Sense::click());
+            // v29: gestures surface via slider_click_gestures (see level_row).
+            ;
         let mut mvr = ui
             .add_sized(
                 egui::vec2(50.0, 18.0),
@@ -11832,18 +11853,17 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         );
         let mut v = midi;
         let sw = (ui.available_width() - 86.0).max(30.0);
-        // v22: `.interact(Sense::click())` is NOT cosmetic — an egui Slider
-        // senses DRAG only, so without the click union the right-click
-        // automation and double-click Set-value gestures NEVER surface
-        // (the reported "right click on mixer sliders does nothing";
-        // v20 added the union only to fxgui/synth sliders).
+        // v29: NO `.interact(Sense::click())` union — it surfaces clicks
+        // but covers the slider's own rect, freezing drag→value mapping
+        // (the "mixer sliders fixed in place" report). The RMB and
+        // double-click gestures ride `slider_click_gestures` inside
+        // `bind_value_controls` instead.
         let mut r = ui
             .add_sized(
                 egui::vec2(sw, 18.0),
                 Slider::new(&mut v, 0..=127).show_value(false),
             )
-            .on_hover_text(hover)
-            .interact(egui::Sense::click());
+            .on_hover_text(hover);
         let mut vr = ui.add_sized(
             egui::vec2(52.0, 18.0),
             egui::Label::new(
@@ -21014,5 +21034,72 @@ mod tests {
             .any(|f| f.dir == "808" && f.name == "808-kick"));
         let ctx = egui::Context::default();
         assert!(!v25_hits(&mut app, &ctx, "808 (").is_empty(), "808 group painted");
+    }
+
+    // ====================================================== v29 pins
+    //
+    // Seven-area release: track↔track asset moves, rack folder controls,
+    // mixer-slider regression, rack asset management, drum machine,
+    // unified per-track record, MIDI bindings side rack.
+
+    /// BUG 3 repro: dragging the mixer volume slider must move the value.
+    #[test]
+    fn v29_mixer_volume_slider_drags() {
+        let mut app = headless_app("v29volfix");
+        let ctx = egui::Context::default();
+        app.trk_vol[0] = 32;
+        frame(&mut app, &ctx, vec![]);
+        // Track-1 vol row: anchored on the UNIQUE readout string (the
+        // master strip paints its own "vol " galley at the top — a
+        // galley_at("vol ") first-hit can be the master row).
+        let readout = format!("{:>5}", db_num(vol_amp(32u8)));
+        let ro = galleys_all(&mut app, &ctx, &readout);
+        assert_eq!(ro.len(), 1, "track-1 readout {readout:?} painted once: {ro:?}");
+        let y = ro[0].y;
+        // The slider track is the gray(60) rect in that row's y band.
+        let track = {
+            let mut out = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(1600.0, 1200.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            }, |ui| app.ui_root(ui));
+            let shapes = out.shapes;
+            let mut hits: Vec<egui::Rect> = shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) => {
+                        let c = r.fill;
+                        if c == egui::Color32::from_gray(60)
+                            && r.rect.left() > 900.0
+                            && (r.rect.center().y - y).abs() < 4.0
+                            && r.rect.width() > 30.0
+                        {
+                            Some(r.rect)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+            assert_eq!(hits.len(), 1, "one slider track in the vol row");
+            hits.pop().unwrap()
+        };
+        let p = egui::pos2(track.center().x, track.center().y);
+        let master0 = app.master_midi;
+        drag_pt(&mut app, &ctx, p, egui::pos2(track.max.x - 4.0, track.center().y));
+        eprintln!(
+            "track rect {track:?} vol {} master {master0} -> {}",
+            app.trk_vol[0], app.master_midi
+        );
+        assert!(
+            app.trk_vol[0] > 32,
+            "dragging the vol slider right must raise track volume (got {})",
+            app.trk_vol[0]
+        );
     }
 }
