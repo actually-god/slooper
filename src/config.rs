@@ -127,7 +127,16 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// v29: sub-folder display order for one rack folder (see
+/// [`Config::rack_dir_order`]).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RackDirOrder {
+    pub folder: String,
+    pub dirs: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
+/// Everything Settings persists.
 pub struct Config {
     /// Keyboard shortcuts as key names (e.g. `"R"`, `"Space"`), one per entry
     /// of `MidiAction::ALL` (same order); null = unbound. Tables from older
@@ -246,11 +255,25 @@ pub struct Config {
     /// recordings are written there.
     #[serde(default)]
     pub rack_folders: Vec<String>,
+    /// v29: collapsed rack sub-folder groups, `"<folder path>\u{1}<dir>"`
+    /// (the view state that used to be session-only).
+    #[serde(default)]
+    pub rack_collapsed: std::collections::BTreeSet<String>,
+    /// v29: per-folder sub-folder display order: `[(folder path, [dirs...])]`.
+    /// Dirs not listed sort alphabetically after the listed ones. The FIRST
+    /// listed (or first alphabetical, if none are) sub-folder of the primary
+    /// folder is where recordings are dropped.
+    #[serde(default)]
+    pub rack_dir_order: Vec<RackDirOrder>,
+    /// v29: group the rack by sub-folder (true) instead of by asset type
+    /// (false, the historical default).
+    #[serde(default)]
+    pub rack_group_by_dir: bool,
     /// Effects folder ("" = default: `effects/` next to the installed
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
     pub fx_dir: String,
-    /// Per-track effect chains (legacy format, pre-VST-in-chain). Loaded
+        /// Per-track effect chains (legacy format, pre-VST-in-chain).
     /// only when `track_chain` is absent; saves write `track_chain` only.
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
@@ -342,6 +365,9 @@ impl Default for Config {
             vol_scale_v2: true,
             project_dir: String::new(),
             rack_folders: Vec::new(),
+            rack_collapsed: Default::default(),
+            rack_dir_order: Vec::new(),
+            rack_group_by_dir: false,
             fx_dir: String::new(),
             track_fx: Vec::new(),
             track_chain: Vec::new(),
@@ -589,6 +615,12 @@ mod tests {
             vol_scale_v2: true,
             project_dir: "/tmp/projects".into(),
             rack_folders: vec!["/tmp/samples".into(), "/tmp/takes".into()],
+            rack_collapsed: ["\u{1}kit-a".to_string()].into_iter().collect(),
+            rack_dir_order: vec![RackDirOrder {
+                folder: "/tmp/samples".into(),
+                dirs: vec!["kick".into(), "snare".into()],
+            }],
+            rack_group_by_dir: true,
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             track_fx: vec![vec![TrackFxSave {

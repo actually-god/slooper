@@ -807,9 +807,18 @@ pub struct App {
     // --- asset rack ---
     rack: Vec<RackFolder>,
     /// v28: sub-folder groups the user collapsed in the rack, keyed
-    /// `"<folder path>\u{1}<dir>"`. In-session view state only: the rack
-    /// opens fully expanded on every start (nothing is hidden by surprise).
+    /// `"<folder path>\u{1}<dir>"`. v29: PERSISTED (config) — the collapse
+    /// setup is restored on every start ("sessions should auto-save the
+    /// user's setup for sub-folders").
     rack_collapsed: std::collections::HashSet<String>,
+    /// v29: per-folder sub-folder display order.
+    rack_dir_order: Vec<crate::config::RackDirOrder>,
+    /// v29: group the rack by sub-folder instead of by asset type.
+    rack_group_by_dir: bool,
+    /// v29: rename dialog: (asset file path, draft stem, focus-once).
+    rack_rename: Option<(String, String, bool)>,
+    /// v29: delete-file confirmation target (full path).
+    rack_confirm_del: Option<String>,
     sel_asset: Option<usize>,
     /// Live input monitoring on/off (Settings → MONITORING, default on).
     monitor_enabled: bool,
@@ -1197,7 +1206,11 @@ impl App {
             marquee_pending: None,
             marquee_base: Vec::new(),
             rack,
-            rack_collapsed: std::collections::HashSet::new(),
+            rack_collapsed: cfg.rack_collapsed.iter().cloned().collect(),
+            rack_dir_order: cfg.rack_dir_order.clone(),
+            rack_group_by_dir: cfg.rack_group_by_dir,
+            rack_rename: None,
+            rack_confirm_del: None,
             sel_asset: None,
             monitor_enabled: cfg.monitor_on,
             preview_enabled: cfg.preview_on,
@@ -3040,6 +3053,9 @@ impl App {
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
+            rack_collapsed: self.rack_collapsed.iter().cloned().collect(),
+            rack_dir_order: self.rack_dir_order.clone(),
+            rack_group_by_dir: self.rack_group_by_dir,
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             editor_probe: self.editor_probe.clone(),
@@ -3098,6 +3114,133 @@ impl App {
                 .unwrap_or("")
                 .to_string(),
         )
+    }
+
+    /// v29: where NEW recordings land — the primary folder's TOP
+    /// sub-folder (display order = user order first, then alphabetical;
+    /// the empty dir "root" never counts). With no sub-folder yet this is
+    /// exactly `primary_folder()`, the pre-v29 behavior. The directory is
+    /// created on demand by the callers' file writes' parents.
+    fn record_dir(&self) -> PathBuf {
+        let root = self.primary_folder();
+        let Some(f) = self.rack.first() else {
+            return root;
+        };
+        let pref = self
+            .rack_dir_order
+            .iter()
+            .find(|o| o.folder == f.path)
+            .map(|o| o.dirs.as_slice())
+            .unwrap_or(&[]);
+        match f.dirs_in_order(pref).into_iter().next() {
+            Some(d) if !d.is_empty() => root.join(d.replace('/', std::path::MAIN_SEPARATOR_STR)),
+            _ => root,
+        }
+    }
+
+    /// v29: rename an asset file (rack rows and project rows share this).
+    /// The file moves, the asset entry follows, ids are UNTOUCHED (asset
+    /// ids are table indices — renaming never shifts the table).
+    fn rack_rename(&mut self, old: &str, new_stem: &str) {
+        let new_stem = project::sanitize_name(new_stem);
+        let oldp = PathBuf::from(old);
+        if new_stem.is_empty() {
+            self.status = "rename: empty name".into();
+            return;
+        }
+        let ext = oldp
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+        let np = oldp.with_file_name(if ext.is_empty() {
+            new_stem.clone()
+        } else {
+            format!("{new_stem}.{ext}")
+        });
+        if np == oldp {
+            self.status = "rename: same name".into();
+            return;
+        }
+        if np.exists() {
+            self.status = format!("rename: {} already exists", np.display());
+            return;
+        }
+        if oldp.exists() {
+            if let Err(e) = std::fs::rename(&oldp, &np) {
+                self.status = format!("rename: {e}");
+                return;
+            }
+        }
+        if let Some(a) = self.assets.iter_mut().find(|a| a.path == oldp) {
+            a.path = np.clone();
+            a.name = new_stem.clone();
+        }
+        for f in self.rack.iter_mut() {
+            f.rescan();
+        }
+        self.status = format!("renamed to \u{201c}{new_stem}\u{201d}");
+        self.push_project();
+    }
+
+    /// v29: move an asset file into another sub-folder (root = its rack
+    /// folder itself). Same-volume `rename(2)`; a dirty asset keeps
+    /// `dirty` so its save lands at the NEW path.
+    fn rack_move(&mut self, old: &str, dest_dir: &Path) {
+        let oldp = PathBuf::from(old);
+        let Some(file) = oldp.file_name() else {
+            self.status = "move: not a file path".into();
+            return;
+        };
+        let np = dest_dir.join(file);
+        if np == oldp {
+            return;
+        }
+        if np.exists() {
+            self.status = format!("move: {} already exists", np.display());
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(dest_dir) {
+            self.status = format!("move: {e}");
+            return;
+        }
+        if oldp.exists() {
+            if let Err(e) = std::fs::rename(&oldp, &np) {
+                self.status = format!("move: {e}");
+                return;
+            }
+        }
+        if let Some(a) = self.assets.iter_mut().find(|a| a.path == oldp) {
+            a.path = np.clone();
+        }
+        for f in self.rack.iter_mut() {
+            f.rescan();
+        }
+        self.status = format!("moved \u{201c}{}\u{201d}", oldp.file_stem().unwrap_or_default().to_string_lossy());
+        self.push_project();
+    }
+
+    /// v29: delete an asset: its clips are removed (ids remap through
+    /// `remove_asset_at`) and the FILE is unlinked.
+    fn rack_del(&mut self, path: &str) {
+        let p = PathBuf::from(path);
+        if let Some(k) = self.assets.iter().position(|a| a.path == p) {
+            self.remove_asset_at(k);
+        }
+        if p.exists() {
+            if let Err(e) = std::fs::remove_file(&p) {
+                self.status = format!("delete: {e}");
+                return;
+            }
+        }
+        for f in self.rack.iter_mut() {
+            f.rescan();
+        }
+        self.status = format!(
+            "deleted \u{201c}{}\u{201d}",
+            p.file_stem().unwrap_or_default().to_string_lossy()
+        );
+        self.push_project();
     }
 
     /// (Re)create track `t`'s synth instance from its binding and push it
@@ -3342,7 +3485,7 @@ impl App {
         };
         auto.normalize(0, f32::INFINITY);
         // Unique file name in the primary rack folder.
-        let dir = self.primary_folder();
+        let dir = self.record_dir();
         let base = format!("auto-t{}", i + 1);
         let mut n = 1u32;
         let path = loop {
@@ -3475,7 +3618,7 @@ impl App {
         let host = host.min(self.n_tracks.saturating_sub(1));
         let len = len.max(1);
         let auto = crate::automation::Automation::flat(target, current, len as i64);
-        let dir = self.primary_folder();
+        let dir = self.record_dir();
         let mut n = 1u32;
         let path = loop {
             let p = dir.join(format!("auto-{n}.slauto"));
@@ -4759,7 +4902,7 @@ impl App {
         name: &str,
         track: usize,
     ) {
-        let dir = self.primary_folder();
+        let dir = self.record_dir();
         let base: String = name
             .chars()
             .map(|c| {
@@ -4993,7 +5136,7 @@ impl App {
             return;
         }
         // Unique name in the primary folder ("take", "take-2", …).
-        let dir = self.primary_folder();
+        let dir = self.record_dir();
         let base = format!("midi-t{}", t + 1);
         let mut n = 1u32;
         let path = loop {
@@ -6186,7 +6329,7 @@ impl App {
     /// clip on `track` at the playhead (snapped), rack refreshed.
     fn save_piano_roll(&mut self, pat: &mut Pattern, track: usize) {
         pat.sort();
-        let dir = self.primary_folder();
+        let dir = self.record_dir();
         let mut n = 1u32;
         let path = loop {
             let name = if n == 1 {
@@ -8372,6 +8515,92 @@ impl App {
         } else {
             self.value_menu_armed = false;
         }
+        // ---- v29: rack rename dialog (Enter/Apply commits) ----
+        if let Some((path, mut draft, focus)) = self.rack_rename.clone() {
+            let mut apply = false;
+            let mut cancel = false;
+            let mut open = true;
+            egui::Window::new("Rename asset")
+                .id(egui::Id::new("rack_rename_win"))
+                .default_pos([420.0, 300.0])
+                .default_size([300.0, 110.0])
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new(path.as_str()).weak().small());
+                    let re = ui.add_sized(
+                        egui::vec2(260.0, 22.0),
+                        egui::TextEdit::singleline(&mut draft)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if focus {
+                        re.request_focus();
+                        if let Some(d) = self.rack_rename.as_mut() {
+                            d.2 = false;
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    if let Some(d) = self.rack_rename.as_mut() {
+                        d.1 = draft.clone();
+                    }
+                    if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            if apply {
+                self.rack_rename(&path, &draft);
+                self.rack_rename = None;
+            } else if cancel || !open {
+                self.rack_rename = None;
+            }
+        }
+        // ---- v29: delete-file confirmation ----
+        if let Some(path) = self.rack_confirm_del.clone() {
+            let mut del = false;
+            let mut cancel = false;
+            let mut open = true;
+            egui::Window::new("Delete asset")
+                .id(egui::Id::new("rack_del_win"))
+                .default_pos([420.0, 320.0])
+                .default_size([340.0, 110.0])
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new(path.as_str()).monospace().small());
+                    ui.label(
+                        "Deletes the FILE and every clip that uses this asset. \u{43}annot be undone.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Delete").color(Color32::from_rgb(255, 120, 120)))
+                            .clicked()
+                        {
+                            del = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if del {
+                self.rack_del(&path);
+                self.rack_confirm_del = None;
+            } else if cancel || !open {
+                self.rack_confirm_del = None;
+            }
+        }
         // ---- Set value dialog ----
         if let Some((track, target, mut txt)) = self.value_dialog.clone() {
             let unit = value_unit_label(&target);
@@ -9265,6 +9494,8 @@ fn rack_file_row(
     fp: &Path,
     kind: u8,
     indent: f32,
+    froot: &str,
+    dirs: &[String],
 ) {
     let sel = app
         .sel_asset
@@ -9315,8 +9546,54 @@ fn rack_file_row(
             dr.dnd_set_drag_payload(k);
         }
     }
+    // v29: right-click asset management — rename, move between
+    // sub-folders, delete (file + clips; ids remap safely).
+    let fp_disp = fp.display().to_string();
+    dr.context_menu(|ui| {
+        if ui.button("rename\u{2026}").clicked() {
+            app.rack_rename = Some((fp_disp.clone(), name.to_string(), true));
+            ui.close();
+        }
+        if !dirs.is_empty() {
+            let mut mv: Option<PathBuf> = None;
+            ui.menu_button("move to", |ui| {
+                if ui
+                    .button("(folder root)")
+                    .on_hover_text("Move out of every sub-folder")
+                    .clicked()
+                {
+                    mv = Some(PathBuf::from(froot));
+                    ui.close();
+                }
+                for d in dirs {
+                    if ui.button(d.as_str()).clicked() {
+                        mv = Some(
+                            std::iter::once(PathBuf::from(froot))
+                                .next()
+                                .unwrap()
+                                .join(d.replace('/', std::path::MAIN_SEPARATOR_STR)),
+                        );
+                        ui.close();
+                    }
+                }
+            });
+            if let Some(dest) = mv {
+                app.rack_move(&fp_disp, &dest);
+            }
+        }
+        if ui
+            .button(RichText::new("delete file").color(Color32::from_rgb(255, 120, 120)))
+            .on_hover_text(
+                "Removes every clip using this asset AND deletes the file on disk",
+            )
+            .clicked()
+        {
+            app.rack_confirm_del = Some(fp_disp.clone());
+            ui.close();
+        }
+    });
     row.on_hover_text(format!(
-        "{} \u{b7} {} \u{b7} click to audition (preview), drag onto a lane to place a clip{}",
+        "{} \u{b7} {} \u{b7} click to audition (preview), drag onto a lane to place a clip \u{b7} right-click to rename / move / delete{}",
         fp.display(),
         match kind {
             1 => "MIDI pattern",
@@ -9379,6 +9656,52 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                 }
             });
+            // v29: whole-rack view controls — collapse/expand every
+            // sub-folder group, and flip the grouping mode (by asset type,
+            // the historical default, vs by sub-folder). All persisted.
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("collapse all")
+                    .on_hover_text("Collapse every sub-folder group")
+                    .clicked()
+                {
+                    for f in &app.rack {
+                        let pref = app
+                            .rack_dir_order
+                            .iter()
+                            .find(|o| o.folder == f.path)
+                            .map(|o| o.dirs.clone())
+                            .unwrap_or_default();
+                        for d in f.dirs_in_order(&pref) {
+                            app.rack_collapsed.insert(format!("{}\u{1}{d}", f.path));
+                        }
+                    }
+                    app.save_config();
+                }
+                if ui
+                    .small_button("expand all")
+                    .on_hover_text("Expand every sub-folder group")
+                    .clicked()
+                {
+                    app.rack_collapsed.clear();
+                    app.save_config();
+                }
+                let gtxt = if app.rack_group_by_dir {
+                    "group: folder"
+                } else {
+                    "group: type"
+                };
+                if ui
+                    .small_button(gtxt)
+                    .on_hover_text(
+                        "Separate assets by TYPE (audio/MIDI/automation) or by SUB-FOLDER \u{2014} click to toggle",
+                    )
+                    .clicked()
+                {
+                    app.rack_group_by_dir = !app.rack_group_by_dir;
+                    app.save_config();
+                }
+            });
             if app.rack.is_empty() {
                 ui.label(
                     RichText::new(
@@ -9402,6 +9725,23 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     let mut rescan = None;
                     let mut browse = None;
                     let mut rm = None;
+                    // v29: sub-folder reorder requests, applied after paint.
+                    let mut fold: Option<(String, String, i32)> = None;
+                    // All sub-folder group keys (display order per folder) —
+                    // drives collapse-all/expand-all and the dir renderer.
+                    let all_dirs: Vec<(String, Vec<String>)> = app
+                        .rack
+                        .iter()
+                        .map(|f| {
+                            let pref = app
+                                .rack_dir_order
+                                .iter()
+                                .find(|o| o.folder == f.path)
+                                .map(|o| o.dirs.clone())
+                                .unwrap_or_default();
+                            (f.path.clone(), f.dirs_in_order(&pref))
+                        })
+                        .collect();
                     for (fi, (path, files, err)) in snap.into_iter().enumerate() {
                         ui.add_space(3.0);
                         ui.separator();
@@ -9416,7 +9756,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                 "{}{}",
                                 path,
                                 if fi == 0 {
-                                    " (primary — recordings are stored here)"
+                                    " (primary \u{2014} recordings drop into its top sub-folder)"
                                 } else {
                                     ""
                                 }
@@ -9441,93 +9781,157 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         });
                         if let Some(e) = err {
                             ui.label(
-                                RichText::new(format!("× {}", e))
+                                RichText::new(format!("\u{d7} {}", e))
                                     .color(Color32::from_rgb(220, 120, 120))
                                     .small(),
                             );
                         }
-                        // Three sections per folder: AUDIO, MIDI, AUTOMATION.
-                        // Section headers show whenever a section has entries
-                        // (previously only when BOTH did, so a folder of pure
-                        // MIDI files carried no label at all), and every row
-                        // additionally carries a kind badge. v28: within a
-                        // section each sub-folder renders as its own group —
-                        // a clickable "− dir (N)" header row (N = entries of
-                        // ALL kinds in that dir) followed by its indented
-                        // rows; "+" = collapsed, click to expand. Root-level
-                        // files keep the classic ungroupped look.
-                        for kind in 0u8..3 {
-                            let entries: Vec<&RackFile> = files
-                                .iter()
-                                .filter(|r| {
-                                    if kind == 0 {
-                                        !r.is_midi && !r.is_auto
-                                    } else if kind == 1 {
-                                        r.is_midi
-                                    } else {
-                                        r.is_auto
-                                    }
-                                })
-                                .collect();
-                            if entries.is_empty() {
-                                continue;
+                        // v29: sub-folders in DISPLAY order (user order
+                        // first, new ones alphabetically). For the PRIMARY
+                        // folder the FIRST entry is the recordings target
+                        // (see `record_dir`) and wears a '*' marker.
+                        let dirs: Vec<String> = all_dirs
+                            .get(fi)
+                            .map(|(_, d)| d.clone())
+                            .unwrap_or_default();
+                        let kind_of = |r: &RackFile| -> u8 {
+                            if r.is_midi {
+                                1
+                            } else if r.is_auto {
+                                2
+                            } else {
+                                0
                             }
-                            let (label, col) = match kind {
-                                1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
-                                2 => ("AUTOMATION", Color32::from_rgb(255, 120, 120)),
-                                _ => ("audio", Color32::from_rgb(210, 175, 120)),
-                            };
-                            ui.label(RichText::new(label).weak().small().color(col));
-                            let mut i = 0usize;
-                            while i < entries.len() {
-                                let d = &entries[i].dir;
-                                let mut j = i + 1;
-                                while j < entries.len() && &entries[j].dir == d {
-                                    j += 1;
-                                }
-                                if d.is_empty() {
-                                    for r in &entries[i..j] {
-                                        rack_file_row(ui, app, fi, &r.name, &r.path, kind, 0.0);
-                                    }
-                                } else {
-                                    let n = files.iter().filter(|r| &r.dir == d).count();
-                                    let key = format!("{path}\u{1}{d}");
-                                    let open = !app.rack_collapsed.contains(&key);
-                                    let hw = ui.available_width();
-                                    let hr = ui.add_sized(
-                                        egui::vec2(hw, 18.0),
-                                        egui::Button::new(
-                                            RichText::new(format!(
-                                                // ASCII +/- only: the default
-                                                // fonts have tofu for most
-                                                // symbol glyphs (skill trap).
-                                                "{} {} ({})",
-                                                if open { "-" } else { "+" },
-                                                d,
-                                                n
-                                            ))
-                                            .small()
-                                            .strong(),
-                                        ),
-                                    );
-                                    if hr.clicked() {
-                                        if open {
-                                            app.rack_collapsed.insert(key);
-                                        } else {
-                                            app.rack_collapsed.remove(&key);
-                                        }
-                                    }
-                                    hr.on_hover_text(format!(
-                                        "sub-folder {d} — click to {}",
-                                        if open { "collapse" } else { "expand" }
-                                    ));
+                        };
+                        // One group header per sub-folder: click collapses,
+                        // right-click re-orders. Root files never group.
+                        let mut group_header =
+                            |ui: &mut egui::Ui,
+                             app: &mut App,
+                             d: &str,
+                             n: usize,
+                             first_primary: bool| -> bool {
+                                let key = format!("{path}\u{1}{d}");
+                                let open = !app.rack_collapsed.contains(&key);
+                                let hw = ui.available_width();
+                                let hr = ui.add_sized(
+                                    egui::vec2(hw, 18.0),
+                                    egui::Button::new(
+                                        // ASCII +/- only (tofu trap).
+                                        RichText::new(format!(
+                                            "{} {} ({}){}",
+                                            if open { "-" } else { "+" },
+                                            d,
+                                            n,
+                                            if first_primary { " *" } else { "" }
+                                        ))
+                                        .small()
+                                        .strong(),
+                                    ),
+                                );
+                                if hr.clicked() {
                                     if open {
-                                        for r in &entries[i..j] {
-                                            rack_file_row(ui, app, fi, &r.name, &r.path, kind, 12.0);
+                                        app.rack_collapsed.insert(key);
+                                    } else {
+                                        app.rack_collapsed.remove(&key);
+                                    }
+                                    app.save_config();
+                                }
+                                let mut mv = None;
+                                hr.context_menu(|ui| {
+                                    if ui
+                                        .button("up")
+                                        .on_hover_text(
+                                            "Move this sub-folder up (the primary top folder \
+                                             receives recordings)",
+                                        )
+                                        .clicked()
+                                    {
+                                        mv = Some(-1i32);
+                                        ui.close();
+                                    }
+                                    if ui.button("down").clicked() {
+                                        mv = Some(1);
+                                        ui.close();
+                                    }
+                                });
+                                if let Some(m) = mv {
+                                    fold = Some((path.clone(), d.to_string(), m));
+                                }
+                                hr.on_hover_text(format!(
+                                    "sub-folder {d} \u{2014} click to {} \u{b7} right-click to \
+                                     re-order{}",
+                                    if open { "collapse" } else { "expand" },
+                                    if first_primary {
+                                        " \u{b7} '*' = recordings land here"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                                open
+                            };
+                        if app.rack_group_by_dir {
+                            // BY SUB-FOLDER: one group per folder, ALL kinds
+                            // together (808-kick, its MIDI loop and its curve
+                            // stack in the same group). Root files come last,
+                            // ungrouped, each still badged by kind.
+                            for (di, d) in dirs.iter().enumerate() {
+                                let mine: Vec<&RackFile> =
+                                    files.iter().filter(|r| &r.dir == d).collect();
+                                if mine.is_empty() {
+                                    continue;
+                                }
+                                let open =
+                                    group_header(ui, app, d, mine.len(), fi == 0 && di == 0);
+                                if open {
+                                    for r in mine {
+                                        rack_file_row(ui, app, fi, &r.name, &r.path, kind_of(r), 12.0, &path, &dirs);
+                                    }
+                                }
+                            }
+                            for r in files.iter().filter(|r| r.dir.is_empty()) {
+                                rack_file_row(ui, app, fi, &r.name, &r.path, kind_of(r), 0.0, &path, &dirs);
+                            }
+                        } else {
+                            // BY TYPE (default): AUDIO / MIDI / AUTOMATION
+                            // sections; inside each, sub-folders group in
+                            // display order (v28 layout + user order).
+                            for kind in 0u8..3 {
+                                let entries: Vec<&RackFile> =
+                                    files.iter().filter(|r| kind_of(r) == kind).collect();
+                                if entries.is_empty() {
+                                    continue;
+                                }
+                                let (label, col) = match kind {
+                                    1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
+                                    2 => ("AUTOMATION", Color32::from_rgb(255, 120, 120)),
+                                    _ => ("audio", Color32::from_rgb(210, 175, 120)),
+                                };
+                                ui.label(RichText::new(label).weak().small().color(col));
+                                let roots: Vec<&RackFile> =
+                                    entries.iter().cloned().filter(|r| r.dir.is_empty()).collect();
+                                for r in roots {
+                                    rack_file_row(ui, app, fi, &r.name, &r.path, kind, 0.0, &path, &dirs);
+                                }
+                                for d in &dirs {
+                                    let mine: Vec<&RackFile> =
+                                        entries.iter().cloned().filter(|r| &r.dir == d).collect();
+                                    if mine.is_empty() {
+                                        continue;
+                                    }
+                                    let open = group_header(
+                                        ui,
+                                        app,
+                                        d,
+                                        files.iter().filter(|r| &r.dir == d).count(),
+                                        fi == 0 && Some(d) == dirs.first(),
+                                    );
+                                    if open {
+                                        for r in mine {
+                                            rack_file_row(ui, app, fi, &r.name, &r.path, kind, 12.0, &path, &dirs);
                                         }
                                     }
                                 }
-                                i = j;
                             }
                         }
                     }
@@ -9553,6 +9957,43 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                             app.rack.clear();
                         }
                         app.save_config();
+                    }
+                    // v29: apply a sub-folder reorder and persist it — this
+                    // is the "the session saves your sub-folder setup" half;
+                    // the primary TOP sub-folder is the recordings target.
+                    if let Some((folder, dir, dlt)) = fold {
+                        let pref = app
+                            .rack_dir_order
+                            .iter()
+                            .find(|o| o.folder == folder)
+                            .map(|o| o.dirs.clone())
+                            .unwrap_or_default();
+                        let mut all: Vec<String> = app
+                            .rack
+                            .iter()
+                            .find(|f| f.path == folder)
+                            .map(|f| f.dirs_in_order(&pref))
+                            .unwrap_or_default();
+                        if let Some(i) = all.iter().position(|x| *x == dir) {
+                            let j = (i as i32 + dlt).clamp(0, all.len().max(1) as i32 - 1) as usize;
+                            if i != j {
+                                let m = all.remove(i);
+                                all.insert(j, m);
+                                if let Some(row) = app
+                                    .rack_dir_order
+                                    .iter_mut()
+                                    .find(|o| o.folder == folder)
+                                {
+                                    row.dirs = all;
+                                } else {
+                                    app.rack_dir_order.push(crate::config::RackDirOrder {
+                                        folder,
+                                        dirs: all,
+                                    });
+                                }
+                                app.save_config();
+                            }
+                        }
                     }
 
                     // Project-only assets: recordings with no rack folder,
@@ -9611,7 +10052,69 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                             if dr.drag_started() {
                                 dr.dnd_set_drag_payload(k);
                             }
-                            row.on_hover_text("part of this project (not a rack file) — draggable");
+                            // v29: same management menu as rack rows (the
+                            // file may live anywhere; move targets are the
+                            // PRIMARY folder's sub-folders).
+                            let apath = app
+                                .assets
+                                .get(k)
+                                .map(|a| a.path.clone())
+                                .unwrap_or_default();
+                            if !apath.as_os_str().is_empty() {
+                                let apdisp = apath.display().to_string();
+                                dr.context_menu(|ui| {
+                                    if ui.button("rename\u{2026}").clicked() {
+                                        app.rack_rename =
+                                            Some((apdisp.clone(), name.clone(), true));
+                                        ui.close();
+                                    }
+                                    if !app.rack.is_empty() {
+                                        let mut mv: Option<std::path::PathBuf> = None;
+                                        ui.menu_button("move to", |ui| {
+                                            let f = &app.rack[0];
+                                            let pref = app
+                                                .rack_dir_order
+                                                .iter()
+                                                .find(|o| o.folder == f.path)
+                                                .map(|o| o.dirs.clone())
+                                                .unwrap_or_default();
+                                            if ui.button("(primary root)").clicked() {
+                                                mv = Some(std::path::PathBuf::from(
+                                                    f.path.trim(),
+                                                ));
+                                                ui.close();
+                                            }
+                                            for d in f.dirs_in_order(&pref) {
+                                                if ui.button(d.as_str()).clicked() {
+                                                    mv = Some(
+                                                        std::path::PathBuf::from(f.path.trim())
+                                                            .join(d.replace(
+                                                                '/',
+                                                                std::path::MAIN_SEPARATOR_STR,
+                                                            )),
+                                                    );
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                        if let Some(dest) = mv {
+                                            app.rack_move(&apdisp, &dest);
+                                        }
+                                    }
+                                    if ui
+                                        .button(RichText::new("delete file").color(
+                                            Color32::from_rgb(255, 120, 120),
+                                        ))
+                                        .clicked()
+                                    {
+                                        app.rack_confirm_del = Some(apdisp.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            row.on_hover_text(
+                                "part of this project (not a rack file) \u{2014} draggable \u{b7} right-click to rename / move / delete",
+                            );
                         }
                     }
 
@@ -21041,6 +21544,199 @@ mod tests {
     // Seven-area release: track↔track asset moves, rack folder controls,
     // mixer-slider regression, rack asset management, drum machine,
     // unified per-track record, MIDI bindings side rack.
+
+    /// v29: collapse all / expand all drive EVERY sub-folder group and
+    /// the state survives a config reload (sessions remember the setup).
+    #[test]
+    fn v29_rack_collapse_expand_all_persists() {
+        let mut app = headless_app("v29fold");
+        let samples = std::env::temp_dir().join("sp-uity-v29fold/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/snare.wav");
+        v28_wav(&samples, "kit-b/hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let p = galley_centers(&mut app, &ctx, "collapse all", true)[0];
+        click_pt(&mut app, &ctx, p);
+        assert_eq!(app.rack_collapsed.len(), 2, "both groups collapsed");
+        assert!(!v25_hits(&mut app, &ctx, "+ kit-a (1)").is_empty(), "kit-a collapsed");
+        assert!(!v25_hits(&mut app, &ctx, "+ kit-b (1)").is_empty(), "kit-b collapsed");
+        let p = galley_centers(&mut app, &ctx, "expand all", true)[0];
+        click_pt(&mut app, &ctx, p);
+        assert!(app.rack_collapsed.is_empty(), "expand all clears");
+        // And back to collapsed; save + fresh App must restore it.
+        let p = galley_centers(&mut app, &ctx, "collapse all", true)[0];
+        click_pt(&mut app, &ctx, p);
+        drop(ctx);
+        app.save_config();
+        let b = App::new(Backend::start());
+        assert_eq!(b.rack_collapsed, app.rack_collapsed, "collapse set restored from config");
+    }
+
+    /// v29: the grouping toggle flips AUDIO/MIDI sections for one
+    /// per-sub-folder group that lists every kind together.
+    #[test]
+    fn v29_rack_group_by_dir_toggle() {
+        let mut app = headless_app("v29gdir");
+        let samples = std::env::temp_dir().join("sp-uity-v29gdir/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/snare.wav");
+        let pat = crate::midipat::Pattern::new(120);
+        pat.save_mid(&samples.join("kit-a/loop.mid")).unwrap();
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Default: separated BY TYPE — the section labels exist.
+        assert!(!v25_hits(&mut app, &ctx, "AUDIO").is_empty(), "type view first");
+        let g = galley_centers(&mut app, &ctx, "group: type", true)[0];
+        click_pt(&mut app, &ctx, g);
+        assert!(app.rack_group_by_dir, "toggle flips the mode");
+        // The section label is lowercase "audio"; the per-row badge is
+        // uppercase "AUDIO" — only the exact label may disappear.
+        assert!(galley_centers(&mut app, &ctx, "audio", true).is_empty(), "no type sections now");
+        // ONE group header for kit-a holding BOTH kinds.
+        let hdrs = v25_hits(&mut app, &ctx, "- kit-a (2)");
+        assert_eq!(hdrs.len(), 1, "one mixed-kind group, got {hdrs:?}");
+        assert!(!v25_hits(&mut app, &ctx, "snare").is_empty(), "audio row shown");
+        assert!(!v25_hits(&mut app, &ctx, "loop").is_empty(), "midi row shown");
+        app.save_config();
+        let cfgsrc = std::fs::read_to_string(format!(
+            "{}/slooper/config.json",
+            std::env::var("XDG_CONFIG_HOME").unwrap()
+        ))
+        .unwrap();
+        assert!(cfgsrc.contains("rack_group_by_dir"), "mode persisted to config");
+    }
+
+    /// v29: right-click a group header, "down" re-orders sub-folders; the
+    /// top sub-folder of the primary folder is the recordings target.
+    #[test]
+    fn v29_rack_subfolder_reorder_sets_record_dir() {
+        let mut app = headless_app("v29reord");
+        let samples = std::env::temp_dir().join("sp-uity-v29reord/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/snare.wav");
+        v28_wav(&samples, "kit-b/hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Alphabetical default: kit-a is the recordings target.
+        assert_eq!(app.record_dir(), samples.join("kit-a"));
+        let h = galley_centers(&mut app, &ctx, "kit-a (1)", false)[0];
+        rmb(&mut app, &ctx, h);
+        let dn = galley_centers(&mut app, &ctx, "down", true);
+        assert_eq!(dn.len(), 1, "context menu offers exactly one \u{201c}down\u{201d}");
+        click_pt(&mut app, &ctx, dn[0]);
+        assert_eq!(
+            app.rack_dir_order.first().map(|o| o.dirs.clone()),
+            Some(vec!["kit-b".to_string(), "kit-a".to_string()]),
+            "kit-a moved down behind kit-b"
+        );
+        assert_eq!(app.record_dir(), samples.join("kit-b"), "top folder = recordings");
+    }
+
+    /// v29: rename from the rack menu renames the FILE on disk, follows
+    /// the asset, and repaints the row under the new stem.
+    #[test]
+    fn v29_rack_rename_asset() {
+        let mut app = headless_app("v29ren");
+        let samples = std::env::temp_dir().join("sp-uity-v29ren/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&samples.join("hat.wav")); // load into the table
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "hat", true)[0];
+        rmb(&mut app, &ctx, h);
+        let rn = galley_centers(&mut app, &ctx, "rename\u{2026}", true)[0];
+        click_pt(&mut app, &ctx, rn);
+        assert!(app.rack_rename.is_some(), "dialog opened");
+        // Type a suffix into the (auto-focused) edit, then Apply.
+        frame(&mut app, &ctx, vec![egui::Event::Text("x".to_string())]);
+        let ap = galley_centers(&mut app, &ctx, "Apply", true)[0];
+        click_pt(&mut app, &ctx, ap);
+        assert!(app.rack_rename.is_none(), "dialog closed");
+        assert!(samples.join("hatx.wav").exists(), "file renamed on disk");
+        assert!(!samples.join("hat.wav").exists(), "old file gone");
+        assert_eq!(app.assets[0].name, "hatx", "asset follows");
+        assert_eq!(app.assets[0].path, samples.join("hatx.wav"));
+        assert!(!v25_hits(&mut app, &ctx, "hatx").is_empty(), "row repaints");
+    }
+
+    /// v29: move into another sub-folder relocates the file in place.
+    #[test]
+    fn v29_rack_move_asset() {
+        let mut app = headless_app("v29mv");
+        let samples = std::env::temp_dir().join("sp-uity-v29mv/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        v28_wav(&samples, "kit-b/filler.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.ensure_asset(&samples.join("hat.wav"));
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "hat", true)[0];
+        rmb(&mut app, &ctx, h);
+        let mt = galley_centers(&mut app, &ctx, "move to", true)[0];
+        click_pt(&mut app, &ctx, mt);
+        // EXACT: the submenu row is "kit-b"; the rack's own group header
+        // ("- kit-b (1)") must not swallow the click.
+        let kit = galley_centers(&mut app, &ctx, "kit-b", true)[0];
+        click_pt(&mut app, &ctx, kit);
+        assert!(samples.join("kit-b/hat.wav").exists(), "file moved");
+        assert!(!samples.join("hat.wav").exists());
+        assert_eq!(app.assets[0].path, samples.join("kit-b/hat.wav"));
+    }
+
+    /// v29: delete removes the clips AND the file, with a confirm step;
+    /// ids remap so later assets keep their meaning.
+    #[test]
+    fn v29_rack_delete_asset_removes_clips_and_file() {
+        let mut app = headless_app("v29del");
+        let samples = std::env::temp_dir().join("sp-uity-v29del/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kick.wav");
+        v28_wav(&samples, "later.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let k = app.ensure_asset(&samples.join("kick.wav")).unwrap();
+        let l = app.ensure_asset(&samples.join("later.wav")).unwrap();
+        assert_eq!(l, k + 1, "later sits after kick");
+        app.arr.insert(0, 0, crate::arrange::Clip::new(k as u32, 0));
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "kick", true)[0];
+        rmb(&mut app, &ctx, h);
+        let d = galley_centers(&mut app, &ctx, "delete file", true)[0];
+        click_pt(&mut app, &ctx, d);
+        assert!(app.rack_confirm_del.is_some(), "confirm dialog opened");
+        assert!(samples.join("kick.wav").exists(), "nothing deleted before confirm");
+        let yes = galley_centers(&mut app, &ctx, "Delete", true)[0];
+        click_pt(&mut app, &ctx, yes);
+        assert!(!samples.join("kick.wav").exists(), "file deleted");
+        assert!(app.rack_confirm_del.is_none(), "dialog closed");
+        assert_eq!(app.assets.len(), 1, "asset table shrank");
+        assert_eq!(app.assets[0].name, "later", "id remap: later is now 0");
+        let mut clips = Vec::new();
+        for t in 0..MAX_LOOPS {
+            for (li, ln) in app.arr.tracks[t].lanes.iter().enumerate() {
+                for c in &ln.clips {
+                    clips.push((t, li, c.asset));
+                }
+            }
+        }
+        assert!(clips.is_empty(), "kick clip gone: {clips:?}");
+    }
 
     /// BUG 3 repro: dragging the mixer volume slider must move the value.
     #[test]

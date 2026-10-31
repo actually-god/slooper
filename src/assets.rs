@@ -206,6 +206,22 @@ impl RackFolder {
         }
     }
 
+    /// v29: sub-folders that exist in this scan, in DISPLAY order: the ones
+    /// in `pref` first (in `pref` order, ignoring vanished dirs), then any
+    /// new one alphabetically. Does NOT include the root (dir "").
+    pub fn dirs_in_order(&self, pref: &[String]) -> Vec<String> {
+        let mut present: std::collections::BTreeSet<&str> =
+            self.files.iter().map(|f| f.dir.as_str()).filter(|d| !d.is_empty()).collect();
+        let mut out: Vec<String> = Vec::new();
+        for p in pref {
+            if present.remove(p.as_str()) {
+                out.push(p.clone());
+            }
+        }
+        out.extend(present.into_iter().map(|d| d.to_string()));
+        out
+    }
+
     /// Re-scan this folder in place.
     pub fn rescan(&mut self) {
         let p = self.path.trim();
