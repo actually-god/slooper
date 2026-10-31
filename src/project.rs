@@ -128,6 +128,9 @@ pub struct Project {
     /// per-project, managed from the automation manager's bindings rack.
     #[serde(default)]
     pub value_binds: Vec<crate::config::ValueBind>,
+    /// v29 R5: the drum machine (pads + velocity grid) of this project.
+    #[serde(default)]
+    pub drum: Option<crate::config::DrumSave>,
 }
 
 impl Project {
@@ -288,6 +291,7 @@ mod tests {
             track_synth_states: vec![],
 
             value_binds: Vec::new(),
+            drum: None,
         }
     }
 
