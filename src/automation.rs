@@ -401,6 +401,132 @@ pub fn target_range(t: &str) -> (f32, f32) {
     }
 }
 
+// ---- v30 R3: shape presets as FILES -------------------------------------
+// The same system the effect user presets use: plain JSON files in
+// `<data>/automation presets/`. The nine factory shapes are seeded there
+// once at first launch (a MISSING file is re-seeded; anything present is
+// the user's copy and stays untouched), so one list, one loader and one
+// delete path cover factory and user presets alike. Nodes are stored
+// NORMALISED — `u` is the fraction of the curve length, `v` the fraction
+// of the target's min..max range — so one preset fits every target and
+// length it is applied to.
+
+pub const PRESET_DIR: &str = "automation presets";
+
+pub fn presets_dir() -> std::path::PathBuf {
+    crate::samples808::data_dir().join(PRESET_DIR)
+}
+
+pub fn preset_path(name: &str) -> std::path::PathBuf {
+    presets_dir().join(format!(
+        "{}.json",
+        crate::fx::sanitize_preset_name(name)
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShapeNode {
+    /// fraction of the curve length, 0..1
+    pub u: f64,
+    /// fraction of the target range, 0..1
+    pub v: f64,
+    #[serde(default, skip_serializing_if = "is_zero_c")]
+    pub c: f32,
+}
+
+/// One normalised shape: every preset is just a node set that survives
+/// retargeting and stretching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShapePreset {
+    pub nodes: Vec<ShapeNode>,
+}
+
+fn clamp01(x: f64) -> f64 {
+    x.clamp(0.0, 1.0)
+}
+
+impl ShapePreset {
+    /// Normalise an editor node set (samples + target units) to 0..1.
+    pub fn from_nodes(nodes: &[Node], len: i64, rmin: f32, rmax: f32) -> Self {
+        let len = len.max(1) as f64;
+        let span = (rmax - rmin).max(1e-9) as f64;
+        ShapePreset {
+            nodes: nodes
+                .iter()
+                .map(|n| ShapeNode {
+                    u: clamp01(n.t.max(0) as f64 / len),
+                    v: clamp01((n.v as f64 - rmin as f64) / span),
+                    c: n.c,
+                })
+                .collect(),
+        }
+    }
+    /// The concrete node set for one (length, target-range) pair.
+    pub fn apply(&self, len: i64, rmin: f32, rmax: f32) -> Vec<Node> {
+        self.nodes
+            .iter()
+            .map(|n| Node {
+                t: (n.u * len as f64).round() as i64,
+                v: rmin + (n.v as f32) * (rmax - rmin),
+                c: n.c,
+            })
+            .collect()
+    }
+}
+
+/// Preset names available on disk, sorted (missing dir = empty list).
+pub fn list_presets() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(presets_dir()) {
+        for e in rd.flatten() {
+            let Some(n) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(name) = n.strip_suffix(".json") {
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+pub fn load_preset(name: &str) -> Option<ShapePreset> {
+    let raw = std::fs::read_to_string(preset_path(name)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+pub fn save_preset(name: &str, sp: &ShapePreset) -> std::io::Result<()> {
+    std::fs::create_dir_all(presets_dir())?;
+    let json = serde_json::to_string_pretty(sp).map_err(std::io::Error::other)?;
+    std::fs::write(preset_path(name), json)
+}
+
+pub fn delete_preset(name: &str) -> std::io::Result<()> {
+    std::fs::remove_file(preset_path(name))
+}
+
+/// Seed the factory shapes (the v26 one-click set) into the preset
+/// folder — ONLY where a file is missing; user copies are never touched.
+pub fn seed_factory_presets() {
+    let _ = std::fs::create_dir_all(presets_dir());
+    for p in Preset::ALL {
+        let f = preset_path(p.label());
+        if f.exists() {
+            continue;
+        }
+        // Generate in the normalised domain directly: len 1e6 samples,
+        // range 0..1 — `from_nodes` then maps to exact u/v fractions.
+        let nodes = preset_nodes(p, 1_000_000, 0.0, 1.0);
+        let sp = ShapePreset::from_nodes(&nodes, 1_000_000, 0.0, 1.0);
+        if let Ok(json) = serde_json::to_string_pretty(&sp) {
+            let _ = std::fs::write(f, json);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
