@@ -430,18 +430,31 @@ extern "C" fn tr_slider(
     if !label.is_empty() {
         sl = sl.text(label.clone());
     }
-    // v20 R3: Slider senses DRAG only; union click interest so the RMB and
-    // double-click gestures below actually fire on it.
-    let r = br.ui.put(rect, sl).interact(egui::Sense::click());
+    // v29: NO `.interact(Sense::click())` union on a Slider — the extra
+    // same-id registration covers the slider's own rect and it stops
+    // mapping drag to value ("sliders fixed in place"). Click gestures
+    // come from raw input under the hover guard instead; the slider
+    // never senses clicks, so neither gesture can double-fire.
+    let r = br.ui.put(rect, sl);
+    let (rmb, dbl) = if r.hovered() {
+        br.ui.input(|i| {
+            (
+                i.pointer.button_clicked(egui::PointerButton::Secondary),
+                i.pointer.button_double_clicked(egui::PointerButton::Primary),
+            )
+        })
+    } else {
+        (false, false)
+    };
     // v20 R3: right-click = create automation asset for this param,
     // double-click = Set value (both land via the editor's request
     // channels; the gestures add no state and cost nothing idle).
-    if r.secondary_clicked() {
+    if r.secondary_clicked() || rmb {
         if let Some(pp) = br.ui.input(|i| i.pointer.interact_pos()) {
             br.note_ctx(&label, v, pp);
         }
     }
-    if r.double_clicked() {
+    if r.double_clicked() || dbl {
         br.note_dbl(&label, v);
     }
     if r.changed() {
@@ -992,20 +1005,29 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 if p.min > 0.0 && p.max / p.min > 50.0 {
                     sl = sl.logarithmic(true);
                 }
+                // v29: raw click gestures instead of the drag-killing
+                // same-id click union (see the bridge slider above).
                 let r = ui
                     .add_sized(Vec2::new(150.0, 0.0), sl)
-                    .on_hover_text(format!("{:.2} … {:.2}", p.min, p.max))
-                    // v20 R3: click interest on a drag-only Slider, else the
-                    // RMB/double-click requests never surface.
-                    .interact(egui::Sense::click());
+                    .on_hover_text(format!("{:.2} … {:.2}", p.min, p.max));
+                let (rmb, dbl) = if r.hovered() {
+                    ui.input(|i| {
+                        (
+                            i.pointer.button_clicked(egui::PointerButton::Secondary),
+                            i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                        )
+                    })
+                } else {
+                    (false, false)
+                };
                 // v0.15: right-click hands the request to the UI layer, which
                 // shows Set value / Create automation asset for `fx:<row>:<k>`.
-                if r.secondary_clicked() {
+                if r.secondary_clicked() || rmb {
                     if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
                         ed.ctx_menu = Some((k, v, pp));
                     }
                 }
-                if r.double_clicked() {
+                if r.double_clicked() || dbl {
                     ed.dbl_set = Some((k, v));
                 }
                 ui.label(&p.label);
