@@ -269,6 +269,10 @@ pub struct Config {
     /// (false, the historical default).
     #[serde(default)]
     pub rack_group_by_dir: bool,
+    /// v29: per-track recording sources `[audio, midi, auto]` — which of
+    /// the three the track's single REC button arms. Defaults to audio.
+    #[serde(default)]
+    pub rec_src: Vec<[bool; 3]>,
     /// Effects folder ("" = default: `effects/` next to the installed
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
@@ -368,6 +372,7 @@ impl Default for Config {
             rack_collapsed: Default::default(),
             rack_dir_order: Vec::new(),
             rack_group_by_dir: false,
+            rec_src: vec![[true, false, false]; 8],
             fx_dir: String::new(),
             track_fx: Vec::new(),
             track_chain: Vec::new(),
@@ -621,6 +626,7 @@ mod tests {
                 dirs: vec!["kick".into(), "snare".into()],
             }],
             rack_group_by_dir: true,
+            rec_src: vec![[true, true, false], [false, false, true]],
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             track_fx: vec![vec![TrackFxSave {

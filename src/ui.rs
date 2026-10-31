@@ -244,9 +244,25 @@ struct MidiRecState {
 #[derive(Clone, Default)]
 struct AutoRecState {
     armed: bool,
-    target: Option<String>,
     start: u64,
+    /// v29: EVERY control moved during the take gets its own capture —
+    /// each one bounces to its own automation clip.
+    caps: Vec<AutoCap>,
+}
+
+/// One control's captured curve inside an armed write-automation take.
+#[derive(Default, Clone)]
+struct AutoCap {
+    target: String,
     nodes: Vec<crate::automation::Node>,
+}
+
+/// v29: which sources a track's single REC button arms.
+#[derive(Clone, Copy)]
+struct RecSrc {
+    audio: bool,
+    midi: bool,
+    auto: bool,
 }
 
 /// v0.11 R5: the automation manager window's editing state.
@@ -872,6 +888,8 @@ pub struct App {
     midi_rec: Vec<MidiRecState>,
     /// v0.11 R5: write-automation recorders + open automation manager.
     auto_rec: Vec<AutoRecState>,
+    /// v29: per-track sources armed by the single REC button.
+    rec_src: Vec<RecSrc>,
     auto_edit: Option<Box<AutoEdit>>,
     /// v0.15: bindings picked as automation-manager record sources
     /// (action slot + bind). While the manager is open these are MUTED in
@@ -1234,6 +1252,20 @@ impl App {
             vst_editors: std::collections::HashMap::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
+            rec_src: (0..MAX_LOOPS)
+                .map(|t| {
+                    let a = cfg
+                        .rec_src
+                        .get(t)
+                        .copied()
+                        .unwrap_or([true, false, false]);
+                    RecSrc {
+                        audio: a[0],
+                        midi: a[1],
+                        auto: a[2],
+                    }
+                })
+                .collect(),
             auto_edit: None,
             auto_mgr_rec: Vec::new(),
             auto_pick_open: false,
@@ -2597,7 +2629,7 @@ impl App {
     /// owning track's rect — walks the track stack (h + separator rows)
     /// out from `from_rect`. y inside the source rect returns `from`.
     fn track_at_y(&self, from: usize, from_rect: &egui::Rect, y: f32) -> usize {
-        let sep = TRACK_SEP_HIT as f32;
+        let sep = TRACK_SEP_HIT;
         let mut t = from;
         if y > from_rect.max.y {
             let mut top = from_rect.max.y + sep;
@@ -3089,6 +3121,11 @@ impl App {
             rack_collapsed: self.rack_collapsed.iter().cloned().collect(),
             rack_dir_order: self.rack_dir_order.clone(),
             rack_group_by_dir: self.rack_group_by_dir,
+            rec_src: self
+                .rec_src
+                .iter()
+                .map(|s| [s.audio, s.midi, s.auto])
+                .collect(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             editor_probe: self.editor_probe.clone(),
@@ -3445,25 +3482,28 @@ impl App {
         };
         let Some(ti) = ti else { return };
         let r = &mut self.auto_rec[ti];
-        match &r.target {
-            None => r.target = Some(target.to_string()),
-            Some(t) if t == target => {}
-            Some(t) => {
-                self.status =
-                    format!("automation: already recording \u{201c}{t}\u{201d} on track {} \u{2014} stop first", ti + 1);
-                return;
+        // v29: any number of controls may move — one capture each.
+        let ci = match r.caps.iter().position(|c| c.target == target) {
+            Some(ci) => ci,
+            None => {
+                r.caps.push(AutoCap {
+                    target: target.to_string(),
+                    nodes: Vec::new(),
+                });
+                r.caps.len() - 1
             }
-        }
+        };
         let trel = self.backend.engine.pos().saturating_sub(r.start) as i64;
         // Throttle: skip a sample of an unchanged value (a slider sitting
         // still must not burn a node every frame).
-        if let Some(last) = r.nodes.last() {
+        let cap = &mut r.caps[ci];
+        if let Some(last) = cap.nodes.last() {
             if (last.v - v).abs() < 1e-4 && (trel - last.t) < (self.sample_rate.max(1) as i64 / 50)
             {
                 return;
             }
         }
-        r.nodes.push(crate::automation::Node {
+        cap.nodes.push(crate::automation::Node {
             t: trel,
             v,
             c: 0.0,
@@ -3485,9 +3525,8 @@ impl App {
             }
             self.auto_rec[i] = AutoRecState {
                 armed: true,
-                target: None,
                 start: self.backend.engine.pos(),
-                nodes: Vec::new(),
+                caps: Vec::new(),
             };
             if !self.backend.engine.transport_on() {
                 self.backend.cmd(Cmd::PlayAll);
@@ -3499,27 +3538,52 @@ impl App {
         }
     }
 
-    /// Turn an armed take into a saved `.slauto` asset + clip (like the
-    /// MIDI take bounce).
+    /// Turn armed takes into saved `.slauto` assets + clips — v29: one pair
+    /// per control that moved (write automation is no longer one-take-one-
+    /// target; each moved control bounces to its own clip).
     fn commit_auto_rec(&mut self, i: usize) {
         let st = std::mem::take(&mut self.auto_rec[i]);
-        if st.target.is_none() || st.nodes.len() < 2 {
+        let caps: Vec<AutoCap> = st
+            .caps
+            .into_iter()
+            .filter(|c| c.nodes.len() >= 2 && !c.target.is_empty())
+            .collect();
+        if caps.is_empty() {
             self.status = "automation rec: no control moved (nothing captured)".into();
             return;
         }
-        let target = st.target.clone().unwrap_or_default();
+        for cap in caps {
+            self.bounce_auto_take(i, st.start, cap.target, cap.nodes);
+        }
+    }
+
+    /// Bounce ONE captured control's curve to a `.slauto` asset + clip at
+    /// the take's start position.
+    fn bounce_auto_take(
+        &mut self,
+        i: usize,
+        start: u64,
+        target: String,
+        nodes: Vec<crate::automation::Node>,
+    ) {
         let sr = self.sample_rate.max(1) as i64;
-        let last = st.nodes.last().map(|n| n.t).unwrap_or(1);
+        let last = nodes.last().map(|n| n.t).unwrap_or(1);
         let len = last.max(sr / 4);
         let mut auto = crate::automation::Automation {
             target: target.clone(),
             len_samples: len,
-            nodes: st.nodes.clone(),
+            nodes,
         };
         auto.normalize(0, f32::INFINITY);
-        // Unique file name in the primary rack folder.
+        // Unique file name in the primary rack folder, named after the
+        // control: auto-t1-vol, auto-t1-pan, ...
         let dir = self.record_dir();
-        let base = format!("auto-t{}", i + 1);
+        let short = target
+            .rsplit('.')
+            .next()
+            .unwrap_or("auto")
+            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-', "-");
+        let base = format!("auto-t{}-{}", i + 1, short);
         let mut n = 1u32;
         let path = loop {
             let name = if n == 1 {
@@ -3552,7 +3616,7 @@ impl App {
             Arc::new(auto),
             false,
         ));
-        let pos = snap_start(st.start, self.snap_unit());
+        let pos = snap_start(start, self.snap_unit());
         let nl0 = self.arr.tracks[i].lanes.len();
         let lane = self.arr.place_auto(i, Clip::new(id, pos), len as u64);
         self.grow_for_lanes(i, nl0);
@@ -7045,6 +7109,46 @@ impl App {
         self.backend.cmd(Cmd::ToggleRecord { i });
     }
 
+    /// v29: the track's ONE record button. Stop wins over start: if any
+    /// source is running on this track, all stop. Otherwise every ticked
+    /// source (audio take / MIDI take / write automation) arms at once.
+    fn toggle_record_all(&mut self, i: usize) {
+        let rec = self.backend.engine.rec_state_of(i) == TR_REC;
+        let midi = self.midi_rec.get(i).is_some_and(|m| m.armed);
+        let auto = self.auto_rec.get(i).is_some_and(|a| a.armed);
+        if rec || midi || auto {
+            if rec {
+                self.toggle_record(i);
+            }
+            if midi {
+                self.toggle_midi_rec(i);
+            }
+            if auto {
+                self.toggle_auto_rec(i);
+            }
+            self.status = format!("track {}: recording stopped", i + 1);
+            return;
+        }
+        let src = match self.rec_src.get(i) {
+            Some(s) => *s,
+            None => return,
+        };
+        if !src.audio && !src.midi && !src.auto {
+            self.status =
+                format!("track {}: tick a source (aud / mid / auto) first", i + 1);
+            return;
+        }
+        if src.audio {
+            self.toggle_record(i);
+        }
+        if src.midi {
+            self.toggle_midi_rec(i);
+        }
+        if src.auto {
+            self.toggle_auto_rec(i);
+        }
+    }
+
     fn clear_track(&mut self, i: usize) {
         self.arr.clear_track(i);
         self.cancel_grid_gestures();
@@ -7795,11 +7899,11 @@ impl App {
     fn fire_midi_action(&mut self, a: MidiAction) {
         match a {
             MidiAction::Select(i) => self.selected = i,
-            MidiAction::RecSelected => self.toggle_record(self.selected),
+            MidiAction::RecSelected => self.toggle_record_all(self.selected),
             MidiAction::ClearSelected => self.clear_track(self.selected),
             MidiAction::PlaySelected => self.backend.cmd(Cmd::ToggleTrackOn { i: self.selected }),
             MidiAction::Export => self.show_export = true,
-            MidiAction::RecLoop(i) => self.toggle_record(i),
+            MidiAction::RecLoop(i) => self.toggle_record_all(i),
             MidiAction::ClearLoop(i) => self.clear_track(i),
             MidiAction::PlayLoop(i) => self.backend.cmd(Cmd::ToggleTrackOn { i }),
             MidiAction::Metronome => {
@@ -9519,6 +9623,7 @@ type RackRow = (String, Vec<RackFile>, Option<String>);
 /// One rack file row: click = load + audition, drag = place a clip.
 /// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
 /// `indent` > 0 marks a row inside a v28 sub-folder group.
+#[allow(clippy::too_many_arguments)] // row + folder/group/mode context
 fn rack_file_row(
     ui: &mut egui::Ui,
     app: &mut App,
@@ -10392,20 +10497,50 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         if head.clicked() {
             app.selected = t;
         }
-        let rec_lbl = if rec { "STOP" } else { "REC" };
+        // v29: ONE record button + source checkboxes. REC arms every
+        // ticked source on this track at once; STOP bounces them all.
+        let any_rec = rec || app.midi_rec[t].armed || app.auto_rec[t].armed;
+        let rec_lbl = if any_rec { "STOP" } else { "REC" };
         if ui
-            .small_button(RichText::new(rec_lbl).color(if rec {
+            .small_button(RichText::new(rec_lbl).color(if any_rec {
                 Color32::from_rgb(255, 90, 90)
             } else {
                 Color32::from_rgb(220, 180, 120)
             }))
             .on_hover_text(
-                "Record: the take becomes an asset plus a clip at the playhead; \
-                 recording over an occupied lane opens a child lane automatically",
+                "Record: arms every ticked source (audio take, MIDI take, \
+                 write automation) on this track at once; stop bounces the \
+                 takes to assets + clips at the playhead",
             )
             .clicked()
         {
-            app.toggle_record(t);
+            app.toggle_record_all(t);
+        }
+        let mut src = app.rec_src[t];
+        let ac = ui
+            .checkbox(&mut src.audio, "a")
+            .on_hover_text(
+                "AUDIO take: the take becomes an asset plus a clip at the \
+                 playhead; recording over an occupied lane opens a child \
+                 lane automatically",
+            );
+        let mc = ui
+            .checkbox(&mut src.midi, "m")
+            .on_hover_text(
+                "MIDI take: captures every UNBOUND incoming MIDI message \
+                 while the take runs; stop turns it into a MIDI asset + clip",
+            );
+        let xc = ui
+            .checkbox(&mut src.auto, "x")
+            .on_hover_text(
+                "Write automation: every control MOVED during the take is \
+                 captured; each control bounces to its own automation clip \
+                 (track controls here; master controls go to the first \
+                 armed track)",
+            );
+        if ac.changed() || mc.changed() || xc.changed() {
+            app.rec_src[t] = src;
+            app.save_config();
         }
         let mute_resp = ui
             .small_button(if on { "on" } else { "mute" })
@@ -10426,37 +10561,6 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             // v0.11 R5: mute rides automation too (1 = muted).
             app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 0.0 } else { 1.0 });
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
-        }
-        let mrec = app.midi_rec[t].armed;
-        if ui
-            .small_button(RichText::new(if mrec { "M\u{25a0}" } else { "MREC" }).color(if mrec {
-                Color32::from_rgb(120, 220, 255)
-            } else {
-                Color32::from_rgb(160, 190, 220)
-            }))
-            .on_hover_text(
-                "MIDI record: captures every UNBOUND incoming MIDI message \
-                 while armed; stop (button again or stop the transport) and \
-                 the take becomes a MIDI asset + clip at the playhead",
-            )
-            .clicked()
-        {
-            app.toggle_midi_rec(t);
-        }
-        // v0.11 R5: write-automation arm (mirrors MREC for MIDI).
-        let arec = app.auto_rec[t].armed;
-        if ui
-            .small_button(RichText::new(if arec { "A\u{25a0}" } else { "AREC" }).color(if arec {
-                Color32::from_rgb(255, 130, 130)
-            } else {
-                Color32::from_rgb(200, 160, 160)
-            }))
-            .on_hover_text(
-                "Automation record: while armed, MOVE any control on this track                  \u{2014} the first one touched becomes the target and its moves                  are captured as an automation curve. Stop (button again) and the                  take becomes a red automation asset + clip at the playhead.",
-            )
-            .clicked()
-        {
-            app.toggle_auto_rec(t);
         }
         if ui
             .small_button("+")
@@ -12170,7 +12274,7 @@ fn grid_context_menu(
             });
             if let Some(tt) = dest {
                 let mut ids: Vec<(usize, usize, usize)> = if app.is_sel(id) {
-                    app.sel_clips.iter().copied().collect()
+                    app.sel_clips.to_vec()
                 } else {
                     vec![id]
                 };
@@ -16389,9 +16493,8 @@ mod tests {
         // --- write recording ---------------------------------------------
         app.auto_rec[0] = crate::ui::AutoRecState {
             armed: true,
-            target: None,
             start: 0,
-            nodes: vec![],
+            caps: vec![],
         };
         app.set_trk_vol(0, 100);
         app.set_trk_vol(0, 60);
@@ -21850,6 +21953,137 @@ mod tests {
         assert!(clips.is_empty(), "kick clip gone: {clips:?}");
     }
 
+    /// v29: the strip's ONE REC button arms every ticked source at once
+    /// (audio + MIDI + automation), STOP clears them together, and the
+    /// checkboxes themselves flip the persisted source mix.
+    #[test]
+    fn v29_record_button_arms_ticked_sources() {
+        let mut app = headless_app("v29recall");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.rec_src[0] = RecSrc {
+            audio: true,
+            midi: true,
+            auto: true,
+        };
+        let recs = galley_centers(&mut app, &ctx, "REC", true);
+        assert!(!recs.is_empty(), "track strips paint a REC button");
+        let p0 = recs[0];
+        click_pt(&mut app, &ctx, p0);
+        frame(&mut app, &ctx, vec![]);
+        // Null-audio never runs the audio callback, so the ENGINE's audio
+        // take state cannot flip in unit tests (e2e covers that path);
+        // the take command is queued regardless. The MIDI + automation
+        // arms and the STOP label prove the unified button.
+        assert!(app.midi_rec[0].armed, "MIDI take armed");
+        assert!(app.auto_rec[0].armed, "write automation armed");
+        // STOP (same button, now red) stops all three.
+        let p0 = galley_centers(&mut app, &ctx, "STOP", true)
+            .into_iter()
+            .min_by(|a, b| {
+                (*a - p0).length_sq().partial_cmp(&(*b - p0).length_sq()).unwrap()
+            })
+            .expect("the REC button became STOP");
+        click_pt(&mut app, &ctx, p0);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.midi_rec[0].armed, "MIDI take stopped");
+        assert!(!app.auto_rec[0].armed, "automation stopped");
+        // Un-ticking AUDIO on track 3 persists through config.
+        // One audio checkbox ("a") per VISIBLE strip (n_tracks of them).
+        let auds = galley_centers(&mut app, &ctx, "a", true);
+        assert_eq!(auds.len(), app.n_tracks, "one aud checkbox per strip");
+        click_pt(&mut app, &ctx, auds[2]);
+        // Default mix is AUDIO-only, so unticking audio empties the strip.
+        assert!(!app.rec_src[2].audio, "checkbox unticked audio");
+        assert!(!app.rec_src[2].midi && !app.rec_src[2].auto, "never ticked");
+        // Tick MIDI back on that strip and confirm REC would arm MIDI only.
+        let mids = galley_centers(&mut app, &ctx, "m", true);
+        click_pt(&mut app, &ctx, mids[2]);
+        assert!(app.rec_src[2].midi && !app.rec_src[2].audio, "mid ticked");
+        app.save_config();
+        let b = App::new(Backend::start());
+        assert!(!b.rec_src[2].audio, "source mix restored from config");
+        assert!(b.rec_src[0].audio && b.rec_src[0].midi && b.rec_src[0].auto, "full mix restored");
+    }
+
+    /// v29: one write-automation take can capture SEVERAL controls — each
+    /// moved control bounces to its own asset + clip.
+    #[test]
+    fn v29_write_auto_multi_target_bounce() {
+        let mut app = headless_app("v29xauto");
+        app.auto_rec[0] = crate::ui::AutoRecState {
+            armed: true,
+            start: 0,
+            caps: vec![],
+        };
+        app.set_trk_vol(0, 100);
+        app.set_trk_vol(0, 60);
+        app.set_trk_pan(0, 20);
+        app.set_trk_pan(0, 90);
+        let nb = app.assets.len();
+        app.toggle_auto_rec(0); // stop + bounce
+        assert_eq!(app.assets.len(), nb + 2, "one asset per moved control");
+        let vol = &app.assets[nb];
+        let pan = &app.assets[nb + 1];
+        assert!(vol.is_auto() && pan.is_auto());
+        assert_eq!(vol.automation.as_ref().unwrap().target, crate::automation::TARGET_TRACK_VOL);
+        assert_eq!(pan.automation.as_ref().unwrap().target, crate::automation::TARGET_TRACK_PAN);
+        assert!(vol.name.contains("vol"), "clip named after the control: {}", vol.name);
+        assert!(pan.name.contains("pan"), "clip named after the control: {}", pan.name);
+        let placed: Vec<u32> = app.arr.tracks[0]
+            .lanes
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .map(|c| c.asset)
+            .filter(|a| (*a as usize) >= nb)
+            .collect();
+        assert_eq!(placed.len(), 2, "both clips on track 1: {placed:?}");
+        // The files are distinct and each parses back to its own target.
+        for (a, tgt) in [(vol, crate::automation::TARGET_TRACK_VOL), (pan, crate::automation::TARGET_TRACK_PAN)] {
+            let txt = std::fs::read_to_string(&a.path).unwrap();
+            let back = crate::automation::Automation::from_json(&txt).unwrap();
+            assert_eq!(back.target, tgt);
+        }
+    }
+
+    /// v29: untick EVERYTHING and REC refuses with a hint instead of
+    /// silently arming nothing.
+    #[test]
+    fn v29_record_button_needs_a_source() {
+        let mut app = headless_app("v29recnone");
+        app.rec_src[0] = RecSrc {
+            audio: false,
+            midi: false,
+            auto: false,
+        };
+        app.toggle_record_all(0);
+        assert_ne!(app.backend.engine.rec_state_of(0), TR_REC);
+        assert!(!app.midi_rec[0].armed && !app.auto_rec[0].armed);
+        assert!(app.status.contains("tick a source"), "hint shown: {}", app.status);
+    }
+
+    /// v29: the record bindings drive the UNIFIED button now — RecSelected
+    /// arms exactly the ticked sources of the selected track.
+    #[test]
+    fn v29_record_binding_arms_checked_sources() {
+        let mut app = headless_app("v29recbind");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.selected = 1;
+        app.rec_src[1] = RecSrc {
+            audio: false,
+            midi: true,
+            auto: false,
+        };
+        app.fire_midi_action(MidiAction::RecSelected);
+        assert!(app.midi_rec[1].armed, "MIDI armed via binding");
+        assert!(!app.auto_rec[1].armed, "unticked stays off");
+        assert_ne!(app.backend.engine.rec_state_of(1), TR_REC, "audio untouched");
+        // Stop via the same binding.
+        app.fire_midi_action(MidiAction::RecSelected);
+        assert!(!app.midi_rec[1].armed, "binding toggles off too");
+    }
+
     /// v29: dragging a clip vertically past its track's rows moves it to
     /// the NEXT TRACK (the pointer's target track), not just a new lane.
     #[test]
@@ -21867,7 +22101,7 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(mid0)]);
         frame(&mut app, &ctx, vec![moved(mid0), btn(mid0, egui::PointerButton::Primary, true)]);
         // Drag down past track 0 into track 1's rows.
-        let in_t1 = egui::pos2(500.0, top0 + app.track_h(0) + TRACK_SEP_HIT as f32 + app.track_h(1) * 0.5);
+        let in_t1 = egui::pos2(500.0, top0 + app.track_h(0) + TRACK_SEP_HIT + app.track_h(1) * 0.5);
         frame(&mut app, &ctx, vec![moved(in_t1)]);
         frame(&mut app, &ctx, vec![moved(in_t1), btn(in_t1, egui::PointerButton::Primary, false)]);
         frame(&mut app, &ctx, vec![]);
