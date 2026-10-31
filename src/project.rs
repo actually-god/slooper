@@ -131,6 +131,9 @@ pub struct Project {
     /// v29 R5: the drum machine (pads + velocity grid) of this project.
     #[serde(default)]
     pub drum: Option<crate::config::DrumSave>,
+    /// v30 R1: per-track drum kits (empty entry = the stock kit).
+    #[serde(default)]
+    pub drum_kits: Vec<Vec<crate::config::DrumPadSave>>,
 }
 
 impl Project {
@@ -292,6 +295,7 @@ mod tests {
 
             value_binds: Vec::new(),
             drum: None,
+            drum_kits: Vec::new(),
         }
     }
 

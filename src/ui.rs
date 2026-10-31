@@ -258,7 +258,10 @@ struct AutoCap {
 }
 
 /// v29 R5: one drum-machine pad (runtime; `asset` is the resolved index
-/// into `App::assets` for `asset_path`).
+/// into `App::assets` for `asset_path`). v30 R1: pads belong to a TRACK
+/// kit — edited in that track's synth module, so every synth can carry a
+/// different patch.
+#[derive(Clone)]
 struct DrumPad {
     name: String,
     asset_path: String,
@@ -268,12 +271,14 @@ struct DrumPad {
     muted: bool,
 }
 
-/// v29 R5: FL-FPC-style drum machine bound to one arrangement track.
-/// The grid is velocity per (pad, step); "Commit" stamps one-shot clips
-/// into the track — one lane per pad — at the playhead.
+/// v30 R1: the pattern builder's pattern (the "Drums" window): a velocity
+/// grid whose rows are the TARGET track's kit pads and whose columns are
+/// one `sub`-th of a beat. The pad sounds live in `App::drum_kits`.
 struct DrumMachine {
-    pads: Vec<DrumPad>,
+    /// Grid columns (steps per bar = metronome beats x sub).
     steps: usize,
+    /// v30 R1: subdivision in STEPS PER BEAT (4 = 16th notes, default).
+    sub: u32,
     grid: Vec<Vec<u8>>,
     track: usize,
     playing: bool,
@@ -283,24 +288,77 @@ struct DrumMachine {
     last_step: usize,
 }
 
+/// v30 R1: pad rows are user-configurable up to this many per kit.
+const DRUM_MAX_PADS: usize = 16;
+
+fn pad_from_save(p: &crate::config::DrumPadSave) -> DrumPad {
+    DrumPad {
+        name: p.name.clone(),
+        asset_path: p.asset.clone(),
+        asset: None,
+        vel: p.vel,
+        muted: p.muted,
+    }
+}
+
+fn pad_to_save(p: &DrumPad) -> crate::config::DrumPadSave {
+    crate::config::DrumPadSave {
+        name: p.name.clone(),
+        asset: p.asset_path.clone(),
+        vel: p.vel,
+        muted: p.muted,
+    }
+}
+
+/// v30 R1: the stock kit (8 silent pads) — identical to the saved
+/// "empty kit" sentinel.
+fn default_drum_kit() -> Vec<DrumPad> {
+    crate::config::default_drum_kit()
+        .iter()
+        .map(pad_from_save)
+        .collect()
+}
+
+/// True when a kit is byte-for-byte the stock kit (never saved).
+fn kit_is_stock(kit: &[DrumPad]) -> bool {
+    let saves: Vec<crate::config::DrumPadSave> = kit.iter().map(pad_to_save).collect();
+    saves == crate::config::default_drum_kit()
+}
+
+/// v30 R1: build the runtime kit table from a saved table. Empty entries
+/// are the stock kit; a v29 file's global `drum.pads` seeds the pattern's
+/// target track (one-time migration).
+fn init_drum_kits(
+    table: &[Vec<crate::config::DrumPadSave>],
+    legacy: Option<&crate::config::DrumSave>,
+) -> Vec<Vec<DrumPad>> {
+    let mut kits: Vec<Vec<DrumPad>> = (0..MAX_LOOPS)
+        .map(|t| {
+            table
+                .get(t)
+                .filter(|k| !k.is_empty())
+                .map(|k| k.iter().map(pad_from_save).collect())
+                .unwrap_or_else(default_drum_kit)
+        })
+        .collect();
+    if let Some(d) = legacy {
+        if !d.pads.is_empty() {
+            let t = (d.track as usize).min(MAX_LOOPS - 1);
+            // Seed only while the track still carries the untouched stock kit.
+            if kit_is_stock(&kits[t]) {
+                kits[t] = d.pads.iter().map(pad_from_save).collect();
+            }
+        }
+    }
+    kits
+}
+
 impl DrumMachine {
     fn defaults() -> Self {
-        let names = [
-            "Kick", "Snare", "Hat", "Open", "Clap", "Tom", "Cow", "Perc",
-        ];
         DrumMachine {
-            pads: names
-                .iter()
-                .map(|n| DrumPad {
-                    name: n.to_string(),
-                    asset_path: String::new(),
-                    asset: None,
-                    vel: 100,
-                    muted: false,
-                })
-                .collect(),
             steps: 16,
-            grid: vec![vec![0u8; 16]; names.len()],
+            sub: 4,
+            grid: vec![vec![0u8; 16]; 8],
             track: 0,
             playing: false,
             step_start: 0,
@@ -310,17 +368,9 @@ impl DrumMachine {
 
     fn to_save(&self) -> crate::config::DrumSave {
         crate::config::DrumSave {
-            pads: self
-                .pads
-                .iter()
-                .map(|p| crate::config::DrumPadSave {
-                    name: p.name.clone(),
-                    asset: p.asset_path.clone(),
-                    vel: p.vel,
-                    muted: p.muted,
-                })
-                .collect(),
+            pads: Vec::new(),
             steps: self.steps as u32,
+            sub: self.sub,
             grid: self.grid.clone(),
             track: self.track as u32,
         }
@@ -328,22 +378,10 @@ impl DrumMachine {
 
     fn from_save(s: &crate::config::DrumSave) -> Self {
         let mut d = DrumMachine::defaults();
-        if !s.pads.is_empty() {
-            d.pads = s
-                .pads
-                .iter()
-                .map(|p| DrumPad {
-                    name: p.name.clone(),
-                    asset_path: p.asset.clone(),
-                    asset: None,
-                    vel: p.vel,
-                    muted: p.muted,
-                })
-                .collect();
-        }
-        d.steps = (s.steps as usize).clamp(4, 64);
+        d.sub = s.sub.clamp(1, 8);
+        d.steps = (s.steps as usize).clamp(2, 256);
         // Keep the grid rectangular (sessions from older builds differ).
-        d.grid = vec![vec![0u8; d.steps]; d.pads.len()];
+        d.grid = vec![vec![0u8; d.steps]; s.grid.len().max(8)];
         for (p, row) in s.grid.iter().enumerate() {
             for (st, v) in row.iter().enumerate() {
                 if p < d.grid.len() && st < d.steps {
@@ -356,18 +394,29 @@ impl DrumMachine {
     }
 
     fn resize(&mut self, steps: usize) {
-        let steps = steps.clamp(4, 64);
+        let steps = steps.clamp(2, 256);
         self.steps = steps;
         for row in self.grid.iter_mut() {
             row.resize(steps, 0);
         }
-        self.grid.resize(self.pads.len(), vec![0u8; steps]);
+        if self.grid.is_empty() {
+            self.grid.push(vec![0u8; steps]);
+        }
     }
 
-    /// One 16th-note step: a bar holds 4 steps per beat at `steps` per bar.
-    fn step_samples(&self, bar: u64) -> u64 {
-        let per_bar = (self.steps.max(1) as u64 / 4).max(1);
-        bar / per_bar.max(1)
+    /// Pad rows follow the target kit: grow on demand (rows never deleted
+    /// — pads past the kit simply never fire or commit).
+    fn ensure_rows(&mut self, n: usize) {
+        while self.grid.len() < n {
+            self.grid.push(vec![0u8; self.steps]);
+        }
+    }
+
+    /// v30 R1: one step's length in samples — `sub` steps per beat, one
+    /// bar holds (metronome) beats x sub steps.
+    fn step_samples(&self, bar: u64, beats: u32) -> u64 {
+        let per_bar = (beats.max(1) as u64 * self.sub.max(1) as u64).max(1);
+        bar / per_bar
     }
 }
 
@@ -1021,6 +1070,9 @@ pub struct App {
     vb_target: Option<String>,
     /// v29 R5: the drum machine (one per project).
     drum: DrumMachine,
+    /// v30 R1: per-track drum kits (index = track). Every track's synth
+    /// module owns its kit, so each synth carries a different patch.
+    drum_kits: Vec<Vec<DrumPad>>,
     show_drums: bool,
     auto_edit: Option<Box<AutoEdit>>,
     /// v0.15: bindings picked as automation-manager record sources
@@ -1406,6 +1458,7 @@ impl App {
                 .as_ref()
                 .map(crate::ui::DrumMachine::from_save)
                 .unwrap_or_else(DrumMachine::defaults),
+            drum_kits: init_drum_kits(&cfg.drum_kits, cfg.drum.as_ref()),
             show_drums: cfg.show_drums,
             auto_edit: None,
             auto_mgr_rec: Vec::new(),
@@ -3332,6 +3385,7 @@ impl App {
                 .collect(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
+            drum_kits: self.kits_for_save(),
             show_drums: self.show_drums,
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
@@ -4018,19 +4072,59 @@ impl App {
         }
     }
 
+    /// v30 R1: the drum kit of one track (pads 1..=16, sounds from the
+    /// asset rack). Owned by the track's synth module — every track (so
+    /// every synth instance) carries its own patch.
+    fn kit(&self, t: usize) -> &[DrumPad] {
+        &self.drum_kits[t.min(MAX_LOOPS - 1)]
+    }
+
+    fn kit_mut(&mut self, t: usize) -> &mut Vec<DrumPad> {
+        &mut self.drum_kits[t.min(MAX_LOOPS - 1)]
+    }
+
+    /// The save table: stock kits collapse to empty vecs, trailing
+    /// empties are trimmed.
+    fn kits_for_save(&self) -> Vec<Vec<crate::config::DrumPadSave>> {
+        let mut tbl: Vec<Vec<crate::config::DrumPadSave>> = self
+            .drum_kits
+            .iter()
+            .map(|k| {
+                if kit_is_stock(k) {
+                    Vec::new()
+                } else {
+                    k.iter().map(pad_to_save).collect()
+                }
+            })
+            .collect();
+        while tbl.last().is_some_and(|k| k.is_empty()) {
+            tbl.pop();
+        }
+        tbl
+    }
+
+    /// Replace the whole kit table from a saved one (project load). The
+    /// optional legacy v29 pattern seeds the target track's kit.
+    fn load_kits(&mut self, table: &[Vec<crate::config::DrumPadSave>], legacy: Option<&crate::config::DrumSave>) {
+        self.drum_kits = init_drum_kits(table, legacy);
+    }
+
     /// v29 R5: re-resolve every pad's asset path against the loaded
     /// asset table (cheap; run before use, not per frame).
     fn drum_resolve(&mut self) {
-        for p in 0..self.drum.pads.len() {
-            let path = self.drum.pads[p].asset_path.clone();
-            if path.is_empty() {
-                self.drum.pads[p].asset = None;
-                continue;
+        // Only pads that actually name a file scan the asset table; the
+        // (stock) rest short-circuits on the empty path.
+        for kit in self.drum_kits.iter_mut() {
+            for p in kit.iter_mut() {
+                if p.asset_path.is_empty() {
+                    p.asset = None;
+                    continue;
+                }
+                p.asset = self
+                    .assets
+                    .iter()
+                    .position(|a| a.path.to_string_lossy() == p.asset_path);
             }
-            self.drum.pads[p].asset = self
-                .assets
-                .iter()
-                .position(|a| a.path.to_string_lossy() == path);
         }
     }
 
@@ -4061,16 +4155,17 @@ impl App {
 
     /// v29 R5: stamp the pattern into the arrangement at the playhead:
     /// one-shot clips per hit, one lane per pad (like FPC bouncing a
-    /// beat). Clip gain carries the per-hit velocity.
+    /// beat). Clip gain carries the per-hit velocity. v30 R1: the pad
+    /// SOUNDS come from the target track's kit.
     fn drum_commit(&mut self) {
         self.drum_resolve();
         let t = self.drum.track.min(self.n_tracks.saturating_sub(1));
-        let step = self.drum.step_samples(self.bar_samples());
+        let step = self.drum.step_samples(self.bar_samples(), self.beats());
         let base = snap_start(self.backend.engine.pos(), self.snap_unit());
+        self.drum.ensure_rows(self.kit(t).len());
         let grid = self.drum.grid.clone();
         let pads: Vec<(Option<usize>, bool)> = self
-            .drum
-            .pads
+            .kit(t)
             .iter()
             .map(|p| (p.asset, p.muted))
             .collect();
@@ -4642,17 +4737,32 @@ impl App {
         }
     }
 
-    /// v29 R5: the drum machine window (toolbar "Drums"). One row per
-    /// pad — editable name, audition, sound picker, default velocity,
-    /// mute — then the velocity grid: click toggles a hit, the mouse
-    /// wheel paints velocity, "play" runs the pattern off the transport
-    /// (auditioning hits), and "commit" bounces it to the arrangement.
+    /// v29 R5 / v30 R1: the drum machine window (toolbar "Drums") = the
+    /// PATTERN BUILDER. Pad sounds, velocities and mutes live in the
+    /// TARGET track's drum kit (its SYNTHS window), so every synth can
+    /// carry a different patch. This window owns: the target track, the
+    /// subdivision selector (16th notes by default), one row per kit pad
+    /// (name, audition, row clear) and the velocity grid — click toggles
+    /// a hit, the mouse wheel paints velocity, "play" runs the pattern
+    /// off the transport (auditioning hits), and "commit" bounces it to
+    /// the arrangement.
     fn drum_window(&mut self, ui: &mut egui::Ui) {
         self.drum_resolve();
         let mut open = self.show_drums;
         let mut dirty = false;
         let mut commit_now = false;
         let ctx = ui.ctx().clone();
+        // v30 R1: ONE grid = ONE bar of the chosen subdivision
+        // (steps per bar = metronome beats x steps per beat).
+        let want = (self.beats().max(1) as usize * self.drum.sub.max(1) as usize).clamp(2, 256);
+        if want != self.drum.steps {
+            self.drum.resize(want);
+            dirty = true;
+        }
+        let trk = self.drum.track.min(self.n_tracks.saturating_sub(1));
+        self.drum.ensure_rows(self.kit(trk).len());
+        // Snapshot: the window closure needs &mut self (audition).
+        let pads: Vec<DrumPad> = self.kit(trk).to_vec();
         egui::Window::new("drum machine")
             .id(egui::Id::new("drum_machine_window"))
             .open(&mut open)
@@ -4674,14 +4784,26 @@ impl App {
                                 }
                             }
                         });
-                    ui.label("steps");
-                    egui::ComboBox::from_id_salt("drum_steps")
-                        .selected_text(self.drum.steps.to_string())
+                    // v30 R1: the step clock is a subdivision of the beat.
+                    let sub = self.drum.sub;
+                    let sub_lbl = SUBDIVISIONS
+                        .iter()
+                        .find(|(s, _)| *s == sub)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("custom");
+                    ui.label("subdivision");
+                    egui::ComboBox::from_id_salt("drum_sub")
+                        .selected_text(format!("{sub_lbl} ({sub}/beat)"))
                         .show_ui(ui, |ui| {
-                            for s in [8usize, 16, 32, 64] {
-                                if ui.selectable_label(self.drum.steps == s, s.to_string()).clicked()
+                            for (s, label) in SUBDIVISIONS.iter() {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.drum.sub,
+                                        *s,
+                                        format!("{label} ({s}/beat)"),
+                                    )
+                                    .changed()
                                 {
-                                    self.drum.resize(s);
                                     dirty = true;
                                 }
                             }
@@ -4712,7 +4834,10 @@ impl App {
                 });
                 // Step clock: while playing, the pattern runs off the
                 // transport position; fired steps audition their hits.
-                let step_s = self.drum.step_samples(self.bar_samples()).max(1);
+                let step_s = self
+                    .drum
+                    .step_samples(self.bar_samples(), self.beats())
+                    .max(1);
                 let cur = if self.drum.playing {
                     (self
                         .backend
@@ -4726,9 +4851,7 @@ impl App {
                 };
                 if self.drum.playing && cur != self.drum.last_step {
                     self.drum.last_step = cur;
-                    let fired: Vec<(usize, u8)> = self
-                        .drum
-                        .pads
+                    let fired: Vec<(usize, u8)> = pads
                         .iter()
                         .enumerate()
                         .filter_map(|(p, pad)| {
@@ -4745,101 +4868,40 @@ impl App {
                     }
                 }
                 egui::Grid::new("drum_grid")
-                    .num_columns(self.drum.steps + 6)
+                    .num_columns(self.drum.steps + 3)
                     .spacing([2.0, 3.0])
                     .show(ui, |ui| {
-                        for p in 0..self.drum.pads.len() {
-                            let mut name = self.drum.pads[p].name.clone();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut name)
-                                        .desired_width(44.0)
-                                        .font(egui::TextStyle::Monospace),
+                        for (p, pad) in pads.iter().enumerate() {
+                            ui.add_sized(
+                                [52.0, 18.0],
+                                egui::Label::new(
+                                    RichText::new(pad.name.clone()).monospace().small(),
                                 )
-                                .changed()
-                            {
-                                self.drum.pads[p].name = name.clone();
-                                dirty = true;
-                            }
-                            let aud = self.drum.pads[p].asset;
+                                .selectable(false),
+                            )
+                            .on_hover_text(format!(
+                                "kit pad {} \u{b7} sound, velocity and mute are \
+                                 edited in this track's SYNTHS window",
+                                p + 1
+                            ));
                             if ui
                                 .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
                                 .on_hover_text("Audition this pad")
                                 .clicked()
                             {
-                                if let Some(k) = aud {
-                                    let v = self.drum.pads[p].vel.max(1);
+                                if let Some(k) = pad.asset {
+                                    let v = pad.vel.max(1);
                                     self.audition_impulse(k, v);
                                 }
-                            }
-                            let cur_path = self.drum.pads[p].asset_path.clone();
-                            let label = cur_path
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or("(sound)")
-                                .trim_end_matches(".wav")
-                                .to_string();
-                            egui::ComboBox::from_id_salt(format!("drum_asset_{p}"))
-                                .selected_text(label)
-                                .width(84.0)
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(cur_path.is_empty(), "(silent)")
-                                        .clicked()
-                                    {
-                                        self.drum.pads[p].asset_path.clear();
-                                        self.drum.pads[p].asset = None;
-                                        dirty = true;
-                                    }
-                                    let items: Vec<(usize, String, String)> = self
-                                        .assets
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, a)| !a.is_midi() && !a.is_auto())
-                                        .map(|(k, a)| {
-                                            let path = a.path.to_string_lossy().to_string();
-                                            let nm = path
-                                                .rsplit('/')
-                                                .next()
-                                                .unwrap_or("?")
-                                                .trim_end_matches(".wav")
-                                                .to_string();
-                                            (k, path, nm)
-                                        })
-                                        .collect();
-                                    for (k, path, nm) in items {
-                                        if ui
-                                            .selectable_label(cur_path == path, nm)
-                                            .clicked()
-                                        {
-                                            self.drum.pads[p].asset_path = path;
-                                            self.drum.pads[p].asset = Some(k);
-                                            dirty = true;
-                                        }
-                                    }
-                                });
-                            ui.add_sized(
-                                [52.0, 16.0],
-                                egui::Slider::new(&mut self.drum.pads[p].vel, 1..=127),
-                            );
-                            let m = self.drum.pads[p].muted;
-                            if ui
-                                .add(
-                                    egui::Button::new(if m { "m" } else { "\u{25cf}" })
-                                        .min_size(egui::vec2(16.0, 18.0)),
-                                )
-                                .on_hover_text("Mute pad")
-                                .clicked()
-                            {
-                                self.drum.pads[p].muted = !m;
-                                dirty = true;
                             }
                             if ui
                                 .add(egui::Button::new("x").min_size(egui::vec2(16.0, 18.0)))
                                 .on_hover_text("Clear this pad's row")
                                 .clicked()
                             {
-                                self.drum.grid[p].iter_mut().for_each(|v| *v = 0);
+                                if let Some(row) = self.drum.grid.get_mut(p) {
+                                    row.iter_mut().for_each(|v| *v = 0);
+                                }
                                 dirty = true;
                             }
                             for s in 0..self.drum.steps {
@@ -4866,17 +4928,17 @@ impl App {
                                     ));
                                 }
                                 let resp = ui.add(b).on_hover_text(format!(
-                                    "pad {} step {} — vel {v} (click toggles, wheel paints)",
+                                    "pad {} step {} \u{2014} vel {v} (click toggles, wheel paints)",
                                     p + 1,
                                     s + 1
                                 ));
                                 if resp.clicked() {
-                                    let dv = self.drum.pads[p].vel.max(1);
+                                    let dv = pad.vel.max(1);
                                     let now = self.drum.grid[p][s];
                                     self.drum.grid[p][s] = if now == 0 { dv } else { 0 };
                                     dirty = true;
                                     if now == 0 {
-                                        if let Some(k) = self.drum.pads[p].asset {
+                                        if let Some(k) = pad.asset {
                                             let dv2 = self.drum.grid[p][s];
                                             self.audition_impulse(k, dv2);
                                         }
@@ -4890,11 +4952,11 @@ impl App {
                                                 delta, unit, ..
                                             } = ev
                                             {
-                                                let s = match unit {
+                                                let sc = match unit {
                                                     egui::MouseWheelUnit::Line => 24.0,
                                                     _ => 1.0,
                                                 };
-                                                acc += delta.y * s;
+                                                acc += delta.y * sc;
                                             }
                                         }
                                         (acc * 0.35) as i32
@@ -4913,6 +4975,15 @@ impl App {
                             ui.end_row();
                         }
                     });
+                ui.label(
+                    RichText::new(format!(
+                        "kit of track {} \u{b7} sounds, velocities and mute: \
+                         this track's SYNTHS window (drum kit)",
+                        trk + 1
+                    ))
+                    .weak()
+                    .small(),
+                );
                 if self.drum.playing {
                     ctx.request_repaint();
                 }
@@ -8167,6 +8238,7 @@ impl App {
                 .collect(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
+            drum_kits: self.kits_for_save(),
         }
     }
 
@@ -8462,6 +8534,9 @@ impl App {
         } else {
             self.drum = DrumMachine::defaults();
         }
+        // v30 R1: kits travel with the project too (legacy v29 pad sets
+        // seed the pattern's target track).
+        self.load_kits(&pr.drum_kits, pr.drum.as_ref());
         self.save_config();
         // Heights are a per-session view; the new arrangement starts fresh.
         for h in self.trk_height.iter_mut() {
@@ -11680,6 +11755,162 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
             });
             if !app.vst_note.is_empty() {
                 ui.label(RichText::new(&app.vst_note).weak().small());
+            }
+
+            // --- v30 R1: this track's drum kit --------------------------
+            // The pattern builder ("Drums") fires THESE pads. The kit is
+            // per track, so every synth can carry a different drum patch.
+            ui.separator();
+            ui.label(
+                RichText::new(format!("DRUM KIT \u{2014} track {}", t + 1)).strong(),
+            );
+            ui.label(
+                RichText::new(
+                    "One sound per pad (from the asset rack); the Drums window \
+                     paints the pattern. Up to 16 pads \u{b7} this kit belongs to \
+                     THIS track, so each synth can play a different patch.",
+                )
+                .weak()
+                .small(),
+            );
+            let audio_rows: Vec<(String, String)> = app
+                .assets
+                .iter()
+                .filter(|a| !a.is_midi() && !a.is_auto())
+                .map(|a| {
+                    let path = a.path.to_string_lossy().to_string();
+                    let nm = path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("?")
+                        .trim_end_matches(".wav")
+                        .to_string();
+                    (path, nm)
+                })
+                .collect();
+            let mut kit = app.kit(t).to_vec();
+            let mut kit_changed = false;
+            let mut remove_pad: Option<usize> = None;
+            for p in 0..kit.len() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut kit[p].name)
+                                .desired_width(56.0)
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .changed()
+                    {
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                        .on_hover_text("Audition this pad")
+                        .clicked()
+                    {
+                        let k = app
+                            .assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
+                        if let Some(k) = k {
+                            let v = kit[p].vel.max(1);
+                            app.audition_impulse(k, v);
+                        }
+                    }
+                    let cur_path = kit[p].asset_path.clone();
+                    let label = cur_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("(sound)")
+                        .trim_end_matches(".wav")
+                        .to_string();
+                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                        .selected_text(label)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(cur_path.is_empty(), "(silent)")
+                                .clicked()
+                            {
+                                kit[p].asset_path.clear();
+                                kit[p].asset = None;
+                                kit_changed = true;
+                            }
+                            for (path, nm) in &audio_rows {
+                                if ui
+                                    .selectable_label(&cur_path == path, nm.as_str())
+                                    .clicked()
+                                {
+                                    kit[p].asset_path = path.clone();
+                                    kit[p].asset = None;
+                                    kit_changed = true;
+                                }
+                            }
+                        });
+                    if ui
+                        .add_sized(
+                            [52.0, 16.0],
+                            egui::Slider::new(&mut kit[p].vel, 1..=127),
+                        )
+                        .on_hover_text("Default paint velocity")
+                        .changed()
+                    {
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
+                            .min_size(egui::vec2(16.0, 18.0)))
+                        .on_hover_text("Mute pad")
+                        .clicked()
+                    {
+                        kit[p].muted = !kit[p].muted;
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                        .on_hover_text("Remove this pad")
+                        .clicked()
+                        && kit.len() > 1
+                    {
+                        remove_pad = Some(p);
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                let full = kit.len() >= DRUM_MAX_PADS;
+                if ui
+                    .add_enabled(!full, egui::Button::new("+ add pad"))
+                    .on_hover_text(if full {
+                        "kit is full (16 pads maximum)"
+                    } else {
+                        "Add a drum track row (max 16)"
+                    })
+                    .clicked()
+                    && !full
+                {
+                    kit.push(DrumPad {
+                        name: format!("Pad {}", kit.len() + 1),
+                        asset_path: String::new(),
+                        asset: None,
+                        vel: 100,
+                        muted: false,
+                    });
+                    kit_changed = true;
+                }
+                ui.label(
+                    RichText::new(format!("{} / {DRUM_MAX_PADS} pads", kit.len()))
+                        .weak()
+                        .small(),
+                );
+            });
+            if let Some(p) = remove_pad {
+                kit.remove(p);
+                kit_changed = true;
+            }
+            if kit_changed {
+                *app.kit_mut(t) = kit;
+                app.drum.ensure_rows(app.kit(t).len());
+                app.save_config();
             }
         });
     app.synth_pick = if open { Some(t) } else { None };
@@ -23006,13 +23237,14 @@ mod tests {
         let ik = app.ensure_asset(&kick).unwrap();
         let ih = app.ensure_asset(&hat).unwrap();
         app.drum.track = 1;
-        app.drum.pads[0].asset_path = kick.to_string_lossy().into_owned();
-        app.drum.pads[2].asset_path = hat.to_string_lossy().into_owned();
+        // v30 R1: pad SOUNDS live in the target track's kit.
+        app.kit_mut(1)[0].asset_path = kick.to_string_lossy().into_owned();
+        app.kit_mut(1)[2].asset_path = hat.to_string_lossy().into_owned();
         app.drum.grid[0][0] = 127;
         app.drum.grid[0][4] = 100;
         app.drum.grid[2][8] = 60;
         app.drum_commit();
-        let step = app.drum.step_samples(app.bar_samples());
+        let step = app.drum.step_samples(app.bar_samples(), app.beats());
         assert!(step > 0);
         let lane_of = |a: &App, l: usize| -> Vec<(u32, u64, f32)> {
             a.arr.tracks[1].lanes[l]
@@ -23030,7 +23262,7 @@ mod tests {
         assert_eq!(lane2.len(), 1, "one hat hit on its own lane");
         assert_eq!(lane2[0].0, ih as u32);
         // Muted pads never commit.
-        app.drum.pads[0].muted = true;
+        app.kit_mut(1)[0].muted = true;
         app.clear_track(1);
         app.drum_commit();
         assert_eq!(app.arr.tracks[1].lanes[0].clips.len(), 0);
@@ -23051,11 +23283,13 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let x = galley_centers(&mut app, &ctx, "x", true);
         // The drum window docks at the left of the screen; its row-clear
-        // column is the only "x" stack near x=393 (rack/mix have their
-        // own delete glyphs elsewhere).
-        let x = x.into_iter().filter(|p| (p.x - 393.0).abs() < 30.0).collect::<Vec<_>>();
+        // column is the only "x" stack near x=127 (v30: the sound combo
+        // and vel slider moved into the kit editor, shifting the column
+        // left of the v29 x=393; mixer/rack delete glyphs live far right).
+        let x = x.into_iter().filter(|p| (p.x - 127.0).abs() < 25.0).collect::<Vec<_>>();
         assert!(x.len() >= 8, "pad rows carry clear buttons, got {x:?}");
         app.drum.grid[0][3] = 55;
+        frame(&mut app, &ctx, vec![moved(x[0])]);
         click_pt(&mut app, &ctx, x[0]);
         assert_eq!(app.drum.grid[0][3], 0, "row clear emptied pad 0");
         app.drum.resize(8);
@@ -23082,6 +23316,170 @@ mod tests {
         assert_eq!(app.drum.grid[1][7], 111, "pattern restored");
         assert_eq!(app.drum.steps, 8);
         assert!(!app.drum.playing, "transport state never travels");
+    }
+
+    /// v30 R1/A1+A5: every arrangement track owns its drum kit — the
+    /// pattern builder fires the TARGET track's sounds, so two tracks can
+    /// play two different patches.
+    #[test]
+    fn v30_drum_kits_are_per_track() {
+        let tmp = std::env::temp_dir().join(format!("sl-v30kit-{}", std::process::id()));
+        let kick = write_test_wav(&tmp, "kick.wav", 4_800, 60.0);
+        let hat = write_test_wav(&tmp, "hat.wav", 2_400, 9_000.0);
+        let mut app = headless_app("v30kit");
+        let ik = app.ensure_asset(&kick).unwrap() as u32;
+        let ih = app.ensure_asset(&hat).unwrap() as u32;
+        app.kit_mut(0)[0].asset_path = kick.to_string_lossy().into_owned();
+        app.kit_mut(1)[0].asset_path = hat.to_string_lossy().into_owned();
+        app.drum.grid[0][0] = 120;
+        app.drum.track = 0;
+        app.drum_commit();
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips[0].asset, ik,
+            "track 1 commits track 1's kit"
+        );
+        app.clear_track(0);
+        app.drum.track = 1;
+        app.drum_commit();
+        assert_eq!(
+            app.arr.tracks[1].lanes[0].clips[0].asset, ih,
+            "the SAME pattern on track 2 fires track 2's patch"
+        );
+        // Kits never bleed into each other.
+        assert!(app.kit(0)[2].asset_path.is_empty());
+        assert!(app.kit(2)[0].asset_path.is_empty(), "stock kits stay silent");
+        // A5: kits travel through config AND project.
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        assert_eq!(cfg.drum_kits[1][0].asset, hat.to_string_lossy());
+        let app2 = App::new(Backend::start());
+        assert_eq!(app2.kit(1)[0].asset_path, hat.to_string_lossy());
+        let pj = app.build_project("v30kit".into());
+        assert_eq!(pj.drum_kits[0][0].asset, kick.to_string_lossy());
+        app.kit_mut(1).clear();
+        app.load_kits(&pj.drum_kits, pj.drum.as_ref());
+        assert_eq!(app.kit(1)[0].asset_path, hat.to_string_lossy(), "project load restores");
+    }
+
+    /// v30 R1/A3: pad rows are user-configurable up to 16 (the kit editor
+    /// lives in the synth module); the stock kit never reaches disk; kits
+    /// persist through config and project.
+    #[test]
+    fn v30_drum_kit_up_to_16_pads() {
+        let mut app = headless_app("v30pads");
+        let ctx = egui::Context::default();
+        assert_eq!(app.kit(0).len(), 8, "stock kit = 8 pads");
+        app.synth_pick = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        for i in 0..8 {
+            let add = galley_centers(&mut app, &ctx, "+ add pad", false);
+            assert!(!add.is_empty(), "kit editor shows add-pad ({i})");
+            // Settle frame first: a click must not race the layout shift
+            // the previous add produced (egui needs a hover frame where the
+            // widget actually is before press+release counts).
+            frame(&mut app, &ctx, vec![moved(add[0])]);
+            click_pt(&mut app, &ctx, add[0]);
+        }
+        assert_eq!(app.kit(0).len(), 16, "8 + 8 adds = 16 pads");
+        let add = galley_centers(&mut app, &ctx, "+ add pad", false);
+        click_pt(&mut app, &ctx, add[0]);
+        assert_eq!(app.kit(0).len(), 16, "16 pads is the cap");
+        // The pattern builder grows a row per new pad.
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.drum.grid.len(), 16, "one grid row per kit pad");
+        // Only changed kits are saved; other tracks keep the stock kit.
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        assert_eq!(cfg.drum_kits[0].len(), 16);
+        let app2 = App::new(Backend::start());
+        assert_eq!(app2.kit(0).len(), 16);
+        assert_eq!(app2.kit(1).len(), 8, "other tracks keep the stock kit");
+        let pj = app.build_project("v30pads".into());
+        assert_eq!(pj.drum_kits[0].len(), 16);
+        // Removing pads stops their rows from committing (a hit on a
+        // deleted row is dead data, never a clip).
+        let tmp = std::env::temp_dir().join(format!("sl-v30pads-{}", std::process::id()));
+        let kick = write_test_wav(&tmp, "kick.wav", 2_400, 60.0);
+        let ik = app.ensure_asset(&kick).unwrap() as u32;
+        app.kit_mut(0)[0].asset_path = kick.to_string_lossy().into_owned();
+        app.kit_mut(0).truncate(1);
+        app.drum_resolve();
+        app.drum.grid[0][0] = 110;
+        app.drum.grid[5][0] = 100;
+        app.drum.track = 0;
+        app.drum_commit();
+        assert_eq!(app.arr.tracks[0].lanes[0].clips[0].asset, ik);
+        let total: usize = app.arr.tracks[0]
+            .lanes
+            .iter()
+            .map(|l| l.clips.len())
+            .sum();
+        assert_eq!(total, 1, "only pad 1 (the survivor) commits");
+    }
+
+    /// v30 R1/A4: the pattern builder offers a subdivision selector —
+    /// 16th notes by default; one grid = one metronome bar of the chosen
+    /// subdivision (triplets included); grid content survives the switch.
+    #[test]
+    fn v30_drum_subdivision_selectable() {
+        let mut app = headless_app("v30sub");
+        let ctx = egui::Context::default();
+        assert_eq!(app.drum.sub, 4, "16th notes are the default");
+        assert_eq!(app.drum.steps, 16, "4/4 of 16ths = 16 steps/bar");
+        let bar = app.bar_samples();
+        assert_eq!(app.drum.step_samples(bar, app.beats()), bar / 16);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        // (the full label is the drum combo's own; the toolbar snap combos
+        // show the bare SUBDIVISIONS labels, so "(4/beat)" disambiguates)
+        let cb = galley_centers(&mut app, &ctx, "sixteenth note (4/beat)", false);
+        assert!(!cb.is_empty(), "combo shows the current subdivision");
+        frame(&mut app, &ctx, vec![moved(cb[0])]);
+        click_pt(&mut app, &ctx, cb[0]);
+        let trip = galley_centers(&mut app, &ctx, "triplet (3/beat)", false);
+        assert!(!trip.is_empty(), "combo offers triplets");
+        frame(&mut app, &ctx, vec![moved(trip[0])]);
+        click_pt(&mut app, &ctx, trip[0]);
+        assert_eq!(app.drum.sub, 3);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.drum.steps, 12, "4/4 of triplet eighths = 12 steps/bar");
+        let bar = app.bar_samples();
+        assert_eq!(app.drum.step_samples(bar, app.beats()), bar / 12);
+        // Grid content is preserved across the resize.
+        assert_eq!(app.drum.grid[0].len(), 12);
+        // And persists.
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        assert_eq!(cfg.drum.unwrap().sub, 3);
+        let mut app2 = App::new(Backend::start());
+        assert_eq!(app2.drum.sub, 3);
+        // A 6/8 bar retunes the grid to one full bar.
+        app2.metro_num = "6".to_string();
+        app2.show_drums = true;
+        frame(&mut app2, &ctx, vec![]);
+        assert_eq!(app2.drum.steps, 18, "6 beats x 3 = 18 triplet steps");
+    }
+
+    /// v30 R1/A5: a v29 config (global drum.pads, no kit table) migrates
+    /// its pads into the pattern's target-track kit.
+    #[test]
+    fn v30_legacy_drum_pads_migrate_to_kit() {
+        let dir = std::env::temp_dir().join(format!("sp-v30legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("slooper")).unwrap();
+        std::fs::write(
+            dir.join("slooper/config.json"),
+            r#"{"drum":{"pads":[{"name":"OldKick","asset":"/s/ok.wav","vel":90,"muted":false}],"steps":16,"grid":[],"track":3}}"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let app = App::new(Backend::start());
+        assert_eq!(app.kit(3).len(), 1, "legacy pads seeded track 4's kit");
+        assert_eq!(app.kit(3)[0].name, "OldKick");
+        assert_eq!(app.kit(3)[0].asset_path, "/s/ok.wav");
+        assert_eq!(app.drum.sub, 4, "old patterns run at the 16th default");
+        assert_eq!(app.kit(0).len(), 8, "other tracks keep the stock kit");
     }
 
     #[test]
@@ -23275,5 +23673,68 @@ mod tests {
             "dragging the vol slider right must raise track volume (got {})",
             app.trk_vol[0]
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_alignment() {
+        let mut app = headless_app("diagalign");
+        let ctx = egui::Context::default();
+        app.n_tracks = 4;
+        // run frames so grid_anchor settles
+        for _ in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 853.0))),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+        }
+        // one more frame, collecting shapes this time
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 853.0))),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut lanes: Vec<egui::Rect> = Vec::new();
+        let mut hair: Vec<f32> = Vec::new();
+        let mut collect = |s: &egui::Shape| {
+            match s {
+                egui::Shape::Rect(r) => {
+                    if r.fill == Color32::from_rgb(24, 24, 29) {
+                        lanes.push(r.rect);
+                    }
+                }
+                _ => {}
+            }
+        };
+        for c in &out.shapes {
+            collect(&c.shape);
+        }
+        // hlines are painted via add(stroke) -> Line segment shape
+        for c in &out.shapes {
+            if let egui::Shape::LineSegment { points, stroke } = &c.shape {
+                if stroke.color == Color32::from_gray(48) && (points[0].y - points[1].y).abs() < 0.01 {
+                    hair.push(points[0].y);
+                }
+            }
+        }
+        lanes.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+        hair.sort_by(|a, b| a.total_cmp(b));
+        eprintln!("grid_anchor={} vscroll={} track_h0={}", app.grid_anchor, app.vscroll, app.track_h(0));
+        eprintln!("lane rects: {:?}", lanes);
+        eprintln!("mixer hairlines: {:?}", hair);
+        // predicted
+        let mut y = app.grid_anchor - app.vscroll;
+        let mut pred = Vec::new();
+        for t in 0..app.n_tracks {
+            pred.push((y, y + app.track_h(t)));
+            y += app.track_h(t) + TRACK_SEP_HIT;
+        }
+        eprintln!("predicted track spans: {:?}", pred);
     }
 }

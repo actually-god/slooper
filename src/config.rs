@@ -55,17 +55,52 @@ pub struct DrumPadSave {
     pub muted: bool,
 }
 
-/// v29 R5: the FL-FPC-style drum machine: a velocity grid of
-/// `steps` columns x pad rows. Committed to the arrangement as one-shot
-/// clips (one lane per pad).
+/// v30 R1: the drum machine PATTERN (the pattern builder): a velocity
+/// grid of `steps` columns x pad rows. The pad SOUNDS (the kit) are NOT
+/// here any more — every track's synth module owns its own kit, so each
+/// synth can carry a different patch. `pads` remains only as a migration
+/// source for v29 files.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DrumSave {
+    /// v30: legacy (v29 global kit). Read once on load to seed the target
+    /// track's kit; saved as an empty vec from now on.
+    #[serde(default)]
     pub pads: Vec<DrumPadSave>,
+    #[serde(default = "default_drum_steps")]
     pub steps: u32,
+    /// v30 R1: grid subdivision in STEPS PER BEAT (4 = 16th notes, the
+    /// historical default). Steps per bar = metronome beats * sub.
+    #[serde(default = "default_drum_sub")]
+    pub sub: u32,
     /// grid[pad][step]: 0 = off, 1..=127 = hit velocity.
+    #[serde(default)]
     pub grid: Vec<Vec<u8>>,
     /// Arrangement track the pattern commits to.
+    #[serde(default)]
     pub track: u32,
+}
+
+fn default_drum_steps() -> u32 {
+    16
+}
+fn default_drum_sub() -> u32 {
+    4
+}
+
+/// v30 R1: the stock drum kit (pattern builder default): 8 silent pads
+/// with FL-flavoured names. An empty saved kit entry always means THIS.
+pub fn default_drum_kit() -> Vec<DrumPadSave> {
+    [
+        "Kick", "Snare", "Hat", "Open", "Clap", "Tom", "Cow", "Perc",
+    ]
+    .iter()
+    .map(|n| DrumPadSave {
+        name: n.to_string(),
+        asset: String::new(),
+        vel: 100,
+        muted: false,
+    })
+    .collect()
 }
 
 /// Axis calibration for one continuous (knob/slider) binding slot: the raw
@@ -327,6 +362,10 @@ pub struct Config {
     /// v29 R5: drum machine state (session copy; project file wins).
     #[serde(default)]
     pub drum: Option<DrumSave>,
+    /// v30 R1: per-track drum kits (index = track, index = pad row).
+    /// An EMPTY entry = the stock 8-pad kit (never written to disk).
+    #[serde(default)]
+    pub drum_kits: Vec<Vec<DrumPadSave>>,
     /// v29 R5: was the drum-machine window open?
     #[serde(default)]
     pub show_drums: bool,
@@ -432,6 +471,7 @@ impl Default for Config {
             rec_src: vec![[true, false, false]; 8],
             value_binds: Vec::new(),
             drum: None,
+            drum_kits: Vec::new(),
             show_drums: false,
             fx_dir: String::new(),
             track_fx: Vec::new(),
@@ -715,9 +755,16 @@ mod tests {
                     },
                 ],
                 steps: 16,
+                sub: 3,
                 grid: vec![vec![0u8; 16], vec![90, 0, 0, 0]],
                 track: 2,
             }),
+            drum_kits: vec![vec![DrumPadSave {
+                name: "Boom".into(),
+                asset: "/s/boom.wav".into(),
+                vel: 70,
+                muted: false,
+            }]],
             show_drums: true,
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
