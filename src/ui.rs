@@ -384,6 +384,10 @@ enum RollGesture {
 /// `scale_axis` flips it so the translation stays continuous and monotonic.
 struct KnobLearn {
     slot: usize,
+    /// v29 R7: when set, the wizard drives a PROJECT VALUE binding
+    /// (value_binds index — usize::MAX appends — , owner track, target)
+    /// instead of an action slot.
+    vslot: Option<(usize, u32, String)>,
     /// Axis (type + channel); `d1` is the last full id seen, shown for
     /// orientation ("which physical knob am I looking at?") only.
     bind: MidiBind,
@@ -580,7 +584,9 @@ pub fn filtered_targets(targets: &[(String, String)], q: &str) -> Vec<(String, S
 /// egui temp data under a fixed id, so both pickers (the checkbox list
 /// and the inline row menu) stay in sync.
 pub fn target_search_box(ui: &mut egui::Ui, placeholder: &str) -> String {
-    let id = egui::Id::new("slooper_target_search");
+    // The placeholder doubles as the identity: two search boxes can be
+    // open at once (manager + bindings rack) and must not share text.
+    let id = egui::Id::new(("slooper_target_search", placeholder));
     let q: String = ui.ctx().data(|d| d.get_temp::<String>(id)).unwrap_or_default();
     let mut q2 = q.clone();
     ui.horizontal(|ui| {
@@ -890,6 +896,15 @@ pub struct App {
     auto_rec: Vec<AutoRecState>,
     /// v29: per-track sources armed by the single REC button.
     rec_src: Vec<RecSrc>,
+    /// v29 R7: per-project MIDI-to-value bindings (automation manager
+    /// side rack). Session copy lives in config; the project file wins.
+    value_binds: Vec<crate::config::ValueBind>,
+    /// v29 R7: a SWITCH binding awaiting its one message
+    /// (idx into value_binds, usize::MAX = draft to be appended).
+    value_learning: Option<(usize, String, u32)>,
+    /// v29 R7: the target picked in the bindings rack (sticky between
+    /// openings; falls back to the manager's current target).
+    vb_target: Option<String>,
     auto_edit: Option<Box<AutoEdit>>,
     /// v0.15: bindings picked as automation-manager record sources
     /// (action slot + bind). While the manager is open these are MUTED in
@@ -1266,6 +1281,9 @@ impl App {
                     }
                 })
                 .collect(),
+            value_binds: cfg.value_binds.clone(),
+            value_learning: None,
+            vb_target: None,
             auto_edit: None,
             auto_mgr_rec: Vec::new(),
             auto_pick_open: false,
@@ -1370,6 +1388,7 @@ impl App {
         self.learning_slot = None;
         self.knob_learn = Some(KnobLearn {
             slot: idx,
+            vslot: None,
             bind: MidiBind {
                 ty: 0xff,
                 ch: 0,
@@ -1385,6 +1404,33 @@ impl App {
         self.status = format!(
             "knob learn: {} — move the knob to define its axis",
             MidiAction::ALL[idx].label()
+        );
+    }
+
+    /// v29 R7: run the SAME three-step knob wizard for a project value
+    /// binding (`idx` into value_binds, usize::MAX = new binding).
+    pub fn arm_value_knob_learn(&mut self, target: &str, track: u32, idx: usize) {
+        self.midi_learning_slot = None;
+        self.learning_slot = None;
+        self.value_learning = None;
+        self.knob_learn = Some(KnobLearn {
+            slot: 0,
+            vslot: Some((idx, track, target.to_string())),
+            bind: MidiBind {
+                ty: 0xff,
+                ch: 0,
+                d1: 0,
+            },
+            has_axis: false,
+            axis_locked: false,
+            last_val: None,
+            lo: 0,
+            hi: 127,
+            locked: false,
+        });
+        self.status = format!(
+            "knob binding: {} — move a control to define its axis",
+            crate::automation::describe_target(target)
         );
     }
 
@@ -1429,6 +1475,31 @@ impl App {
             // Same raw value at both ends: there is nothing to scale against.
             self.knob_learn = Some(kl);
             self.status = "finish needs a maximum different from the minimum — sweep the control and Finish again".into();
+            return;
+        }
+        if let Some((idx, track, target)) = kl.vslot.clone() {
+            let axis = kl.bind.label();
+            let vb = crate::config::ValueBind {
+                target: target.clone(),
+                track,
+                bind: kl.bind,
+                kind: 0,
+                lo: kl.lo,
+                hi: kl.hi,
+            };
+            if idx == usize::MAX {
+                self.value_binds.push(vb);
+            } else if let Some(s) = self.value_binds.get_mut(idx) {
+                *s = vb;
+            }
+            self.save_config();
+            self.status = format!(
+                "bound knob {} \u{2192} {} (raw {}..{})",
+                axis,
+                crate::automation::describe_target(&target),
+                kl.lo,
+                kl.hi
+            );
             return;
         }
         let (slot, lo, hi, bind) = (kl.slot, kl.lo, kl.hi, kl.bind);
@@ -1680,6 +1751,16 @@ impl App {
                 }
             }
             return; // swallow all keys while learning
+        }
+
+        // v29 R7: a switch-binding listener swallows keys too (Escape
+        // cancels; the next MIDI message commits).
+        if self.value_learning.is_some() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.value_learning = None;
+                self.status = "switch binding cancelled".into();
+            }
+            return;
         }
 
         // While a MIDI binding cell is listening, only Delete (clear the
@@ -3126,6 +3207,7 @@ impl App {
                 .iter()
                 .map(|s| [s.audio, s.midi, s.auto])
                 .collect(),
+            value_binds: self.value_binds.clone(),
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             editor_probe: self.editor_probe.clone(),
@@ -3766,11 +3848,56 @@ impl App {
     /// 0..100 % for plugin params) — the 1:1 semantics the requirement
     /// demands (typed -6 = -6 dB, NOT a MIDI position).
     fn apply_user_value(&mut self, track: usize, target: &str, txt: &str) -> bool {
-        use crate::automation::*;
         let Some(v) = value_user_parse(target, txt) else {
             self.status = format!("set value: \u{201c}{txt}\u{201d} is not a number");
             return false;
         };
+        self.apply_target_value(track, target, v)
+    }
+
+    /// v29 R7: drive every value binding this message matches. Knob
+    /// bindings own their axis (type + channel — CC-number drift keeps
+    /// working) and scale raw lo..hi onto the target's range; switches
+    /// toggle boolean targets and set other targets to their maximum.
+    fn apply_value_binds(&mut self, bind: &MidiBind, raw: Option<u8>) {
+        let binds = self.value_binds.clone();
+        for vb in binds {
+            let matched = if vb.kind == 0 {
+                vb.bind.same_axis(bind)
+            } else {
+                vb.bind == *bind
+            };
+            if !matched {
+                continue;
+            }
+            let trk = vb.track as usize;
+            if vb.kind == 0 {
+                let Some(r) = raw else { continue };
+                let n = crate::midi::scale_axis(r, vb.lo, vb.hi) as f32 / 127.0;
+                let (mn, mx) = crate::automation::target_range(&vb.target);
+                let v = mn + (mx - mn) * n;
+                if self.apply_target_value(trk, &vb.target, v) {
+                    self.levels_dirty = true;
+                }
+            } else if vb.target == crate::automation::TARGET_TRACK_MUTE {
+                // Toggle mute (apply_target_value wants 0 = unmute).
+                let on = self.backend.engine.track_on(trk);
+                if self.apply_target_value(trk, &vb.target, if on { 1.0 } else { 0.0 }) {
+                    self.note_auto(trk, &vb.target, if on { 1.0 } else { 0.0 });
+                }
+            } else {
+                let (mn, mx) = crate::automation::target_range(&vb.target);
+                let _ = mn;
+                self.apply_target_value(trk, &vb.target, mx);
+            }
+        }
+    }
+
+    /// v29 R7: apply a value in the TARGET's own domain (the units
+    /// `target_range` describes) straight to the control — shared by the
+    /// "Set value" dialog and by MIDI value bindings.
+    fn apply_target_value(&mut self, track: usize, target: &str, v: f32) -> bool {
+        use crate::automation::*;
         let track = track.min(self.n_tracks - 1);
         match target {
             TARGET_TRACK_VOL => {
@@ -3884,7 +4011,7 @@ impl App {
         } else {
             describe_target(target)
         };
-        self.status = format!("set {name} = {txt} {}", value_unit_label(target));
+        self.status = format!("set {name} = {v:.3} {}", value_unit_label(target));
         true
     }
 
@@ -5092,6 +5219,17 @@ impl App {
         let Some(bind) = MidiBind::from_msg(msg) else {
             return false;
         };
+        // v29 R7: project value bindings claim messages too (knobs own
+        // their axis, switches their exact id).
+        if self.value_binds.iter().any(|vb| {
+            if vb.kind == 0 {
+                vb.bind.same_axis(&bind)
+            } else {
+                vb.bind == bind
+            }
+        }) {
+            return true;
+        }
         for (i, b) in self.midi_binds.iter().enumerate() {
             let Some(b) = b else { continue };
             let hit = if MidiAction::ALL[i].is_continuous() {
@@ -7528,6 +7666,7 @@ impl App {
                 .iter()
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
+            value_binds: self.value_binds.clone(),
         }
     }
 
@@ -7814,6 +7953,10 @@ impl App {
                 .and_then(crate::config::b64_decode);
         }
         self.rebuild_all_synths();
+        // v29 R7: value bindings travel WITH the project — replace the
+        // session copy wholesale (the rack then reflects the project).
+        self.value_binds = pr.value_binds.clone();
+        self.save_config();
         // Heights are a per-session view; the new arrangement starts fresh.
         for h in self.trk_height.iter_mut() {
             *h = 0.0;
@@ -8015,9 +8158,29 @@ impl App {
                     // Bindable messages drive every bound action (Settings →
                     // MIDI Bindings); value/velocity are ignored.
                     if let Some(bind) = MidiBind::from_msg(&msg) {
-                        // Live capture: a row in "listening" state takes the
-                        // first bindable message it sees, like key learning.
-                        if let Some(slot) = self.midi_learning_slot {
+                        // v29 R7: a value-bind SWITCH listener claims the
+                        // first bindable message too.
+                        if let Some((idx, target, track)) = self.value_learning.take() {
+                            let vb = crate::config::ValueBind {
+                                target: target.clone(),
+                                track,
+                                bind,
+                                kind: 1,
+                                lo: 0,
+                                hi: 127,
+                            };
+                            if idx == usize::MAX {
+                                self.value_binds.push(vb);
+                            } else if let Some(s) = self.value_binds.get_mut(idx) {
+                                *s = vb;
+                            }
+                            self.save_config();
+                            self.status = format!(
+                                "bound switch {} \u{2192} {}",
+                                bind.label(),
+                                crate::automation::describe_target(&target)
+                            );
+                        } else if let Some(slot) = self.midi_learning_slot {
                             if self.midi_binds[slot] != Some(bind) {
                                 self.midi_binds[slot] = Some(bind);
                                 // A plain rebind replaces the axis: drop any
@@ -8151,6 +8314,10 @@ impl App {
                                 MidiMsg::ProgramChange { program, .. } => Some(*program),
                                 _ => None,
                             };
+                            // v29 R7: project value bindings drive their
+                            // controls directly (also when action slots use
+                            // the same source — bindings are additive).
+                            self.apply_value_binds(&bind, cval);
                             for i in 0..N_ACTIONS {
                                 if mgr_muted {
                                     break;
@@ -8504,6 +8671,12 @@ impl App {
         }
         if self.show_midi {
             midi_monitor(ui, self);
+        }
+        // v29 R7: the bindings rack docks alongside the automation
+        // manager — plugin/mixer MIDI setups travel with the project.
+        // (Must reserve its edge BEFORE central_panels claims it.)
+        if self.auto_edit.is_some() {
+            value_binds_panel(ui, self);
         }
         central_panels(ui, self);
 
@@ -9521,6 +9694,145 @@ fn value_user_parse(target: &str, s: &str) -> Option<f32> {
 /// NAMES the plugin publishes through its parameter description, the
 /// documented host-visible value system), the FX chain rows, and the two
 /// global controls.
+/// v29 R7: the automation manager's bindings rack — all MIDI-to-VALUE
+/// bindings of the CURRENT project. The target uses the manager's own
+/// picker (searchable `auto_targets` list for the selected track); then
+/// the right widget for the value's nature: knobs run the three-step
+/// axis wizard, booleans capture one message as a switch.
+fn value_binds_panel(ui: &mut egui::Ui, app: &mut App) {
+    egui::Panel::right("vb_rack")
+        .resizable(true)
+        .default_size(240.0)
+        .min_size(200.0)
+        .show(ui, |ui| {
+            ui.heading(RichText::new("MIDI BINDINGS").strong());
+            ui.label(
+                RichText::new("project value bindings \u{b7} opens with the manager")
+                    .weak()
+                    .small(),
+            );
+            ui.separator();
+            let track = app.selected.min(app.n_tracks.saturating_sub(1)) as u32;
+            let mut target = app
+                .vb_target
+                .clone()
+                .or_else(|| app.auto_edit.as_ref().map(|ed| ed.target.clone()))
+                .unwrap_or_else(|| crate::automation::TARGET_TRACK_VOL.to_string());
+            let targets = auto_targets(app, track as usize);
+            let q = target_search_box(ui, "filter binding target");
+            let shown = filtered_targets(&targets, &q);
+            let cur = targets
+                .iter()
+                .find(|(id, _)| id == &target)
+                .map(|(_, l)| l.clone())
+                .unwrap_or_else(|| target.clone());
+            egui::ComboBox::from_id_salt("vb_target")
+                // Prefixed so the rack's combo never impersonates the
+                // manager's own target readout (galley-matching pins).
+                .selected_text(format!("bind to \u{2192} {cur}"))
+                .width(210.0)
+                .show_ui(ui, |ui| {
+                    for (id, label) in shown.iter() {
+                        if ui
+                            .selectable_value(&mut target, id.clone(), label)
+                            .changed()
+                        {
+                            app.vb_target = Some(target.clone());
+                        }
+                    }
+                });
+            let is_bool = target == crate::automation::TARGET_TRACK_MUTE;
+            ui.horizontal(|ui| {
+                let label = if is_bool { "bind switch" } else { "bind knob\u{2026}" };
+                let hover = if is_bool {
+                    "click, then MOVE/PRESS the control \u{b7} every message toggles this value"
+                } else {
+                    "click, then follow the wizard: axis, minimum, maximum \u{b7} the control\u{2019}s full travel drives this value"
+                };
+                if ui
+                    .button(RichText::new(label).strong())
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    app.vb_target = Some(target.clone());
+                    if is_bool {
+                        app.value_learning = Some((usize::MAX, target.clone(), track));
+                        app.status =
+                            "switch binding \u{2014} move or press a control to bind it"
+                                .to_string();
+                    } else {
+                        app.arm_value_knob_learn(&target, track, usize::MAX);
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(RichText::new("bound controls").weak().small());
+            let mut unbind: Option<usize> = None;
+            let mut learn: Option<usize> = None;
+            for (i, vb) in app.value_binds.clone().iter().enumerate() {
+                let lbl = targets
+                    .iter()
+                    .find(|(id, _)| *id == vb.target)
+                    .map(|(_, l)| l.clone())
+                    .unwrap_or_else(|| {
+                        crate::automation::describe_target(&vb.target)
+                    });
+                ui.horizontal(|ui| {
+                    let tail = if vb.kind == 0 {
+                        format!("knob {}..{}", vb.lo, vb.hi)
+                    } else {
+                        "switch".to_string()
+                    };
+                    ui.label(format!(
+                        "{} \u{2192} T{} {} ({})",
+                        vb.bind.label(),
+                        vb.track + 1,
+                        lbl,
+                        tail
+                    ))
+                    .on_hover_text("bound in this project; travels with the project file");
+                    if ui.small_button("relearn").clicked() {
+                        learn = Some(i);
+                    }
+                    if ui.small_button("\u{2715}").on_hover_text("unbind").clicked() {
+                        unbind = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = learn {
+                if let Some(vb) = app.value_binds.get(i) {
+                    let (t, trk, kind) = (vb.target.clone(), vb.track, vb.kind);
+                    if kind == 1 {
+                        app.value_learning = Some((i, t.clone(), trk));
+                        app.status = "switch binding \u{2014} move or press a control".into();
+                    } else {
+                        app.arm_value_knob_learn(&t, trk, i);
+                    }
+                }
+            }
+            if let Some(i) = unbind {
+                if i < app.value_binds.len() {
+                    let vb = app.value_binds.remove(i);
+                    app.save_config();
+                    app.status = format!("unbound: {}", describe_binding_target(&vb));
+                }
+            }
+        });
+}
+
+/// Label helper for status lines: the binding's target, track-qualified.
+fn describe_binding_target(vb: &crate::config::ValueBind) -> String {
+    if vb.target.starts_with("master.") {
+        crate::automation::describe_target(&vb.target)
+    } else {
+        format!(
+            "{} (track {})",
+            crate::automation::describe_target(&vb.target),
+            vb.track + 1
+        )
+    }
+}
+
 fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
     let mut out = vec![
         (
@@ -12934,13 +13246,21 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                 Act::Finish => app.knob_finish(),
                 Act::Cancel => {
                     let kl = app.knob_learn.take().unwrap();
-                    app.status =
-                        format!("cancelled knob learn: {}", MidiAction::ALL[kl.slot].label());
+                    app.status = match &kl.vslot {
+                        Some((_, _, t)) => format!("cancelled knob binding: {t}"),
+                        None => {
+                            format!("cancelled knob learn: {}", MidiAction::ALL[kl.slot].label())
+                        }
+                    };
                 }
                 Act::Restart => {
-                    let slot = app.knob_learn.as_ref().unwrap().slot;
+                    let (slot, vslot) = {
+                        let k = app.knob_learn.as_ref().unwrap();
+                        (k.slot, k.vslot.clone())
+                    };
                     app.knob_learn = Some(KnobLearn {
                         slot,
+                        vslot: vslot.clone(),
                         bind: MidiBind {
                             ty: 0xff,
                             ch: 0,
@@ -12953,10 +13273,13 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                         hi: 127,
                         locked: false,
                     });
-                    app.status = format!(
-                        "knob learn restarted: {} \u{2014} move the knob",
-                        MidiAction::ALL[slot].label()
-                    );
+                    app.status = match &vslot {
+                        Some((_, _, t)) => format!("knob binding restarted: {t} — move the knob"),
+                        None => format!(
+                            "knob learn restarted: {} \u{2014} move the knob",
+                            MidiAction::ALL[slot].label()
+                        ),
+                    };
                 }
             }
         });
@@ -22082,6 +22405,134 @@ mod tests {
         // Stop via the same binding.
         app.fire_midi_action(MidiAction::RecSelected);
         assert!(!app.midi_rec[1].armed, "binding toggles off too");
+    }
+
+    /// v29 R7: a project KNOB binding drives its value across the full
+    /// calibrated raw range, and the bound message is claimed away from
+    /// MIDI-take capture.
+    #[test]
+    fn v29_value_knob_bind_drives_volume() {
+        let mut app = headless_app("v29vbknob");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.value_binds.push(crate::config::ValueBind {
+            target: crate::automation::TARGET_TRACK_VOL.to_string(),
+            track: 0,
+            bind: crate::midi::MidiBind { ty: 1, ch: 0, d1: 20 },
+            kind: 0,
+            lo: 0,
+            hi: 127,
+        });
+        let cc = |v: u8| {
+            crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+                bytes: vec![0xB0, 20, v],
+            })
+        };
+        app.handle_evt(cc(0));
+        assert_eq!(app.trk_vol[0], 0, "raw minimum = fader minimum");
+        app.handle_evt(cc(127));
+        assert_eq!(app.trk_vol[0], 127, "raw maximum = fader maximum");
+        app.handle_evt(cc(64));
+        let mid = app.trk_vol[0];
+        // The fader is dB-law, so raw travel mid is NOT fader mid — but
+        // it must sit strictly between the ends.
+        assert!(mid > 0 && mid < 127, "mid travel drives mid fader: {mid}");
+        let msg = crate::midi::MidiMsg::parse(&[0xB0, 20, 64]).unwrap();
+        assert!(app.midi_msg_is_bound(&msg), "bound CC stays out of MIDI takes");
+        // Knobs OWN their axis (type + channel) — same-channel CCs on
+        // other numbers count too (that is the drift-tolerance design).
+        let other = crate::midi::MidiMsg::parse(&[0xB1, 20, 64]).unwrap();
+        assert!(!app.midi_msg_is_bound(&other), "other channel stays free");
+    }
+
+    /// v29 R7: a SWITCH binding applies its target's maximum on every
+    /// matching message (boolean mute toggles through the engine, which
+    /// null-audio cannot observe — PAN proves the apply path).
+    #[test]
+    fn v29_value_switch_bind_sets_max_on_hit() {
+        let mut app = headless_app("v29vbsw");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_trk_pan(1, 64);
+        app.value_binds.push(crate::config::ValueBind {
+            target: crate::automation::TARGET_TRACK_PAN.to_string(),
+            track: 1,
+            bind: crate::midi::MidiBind { ty: 1, ch: 0, d1: 33 },
+            kind: 1,
+            lo: 0,
+            hi: 127,
+        });
+        let cc = |v: u8| {
+            crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+                bytes: vec![0xB0, 33, v],
+            })
+        };
+        app.handle_evt(cc(9));
+        assert_eq!(app.trk_pan[1], 127, "switch hit applies the maximum");
+        let msg = crate::midi::MidiMsg::parse(&[0xB0, 33, 9]).unwrap();
+        assert!(app.midi_msg_is_bound(&msg), "switch claims its exact message");
+    }
+
+    /// v29 R7: the bindings rack offers the KNOB wizard for continuous
+    /// targets and the SWITCH widget for booleans, stores what it learns,
+    /// and the mix survives a config reload.
+    #[test]
+    fn v29_bindings_rack_learns_and_persists() {
+        let mut app = headless_app("v29vbrack");
+        let ctx = egui::Context::default();
+        app.open_auto_editor(None); // the rack docks with the manager
+        frame(&mut app, &ctx, vec![]);
+        let b = galley_centers(&mut app, &ctx, "bind knob", false);
+        assert!(!b.is_empty(), "volume (continuous) offers the knob widget");
+        click_pt(&mut app, &ctx, b[0]);
+        assert!(app.knob_learn.is_some(), "wizard launched");
+        assert!(
+            app.knob_learn.as_ref().unwrap().vslot.is_some(),
+            "wizard drives a value binding"
+        );
+        app.knob_learn = None;
+        // Boolean target -> the OTHER (switch) widget.
+        app.vb_target = Some(crate::automation::TARGET_TRACK_MUTE.to_string());
+        frame(&mut app, &ctx, vec![]);
+        let s = galley_centers(&mut app, &ctx, "bind switch", false);
+        assert!(!s.is_empty(), "mute (boolean) offers the switch widget");
+        click_pt(&mut app, &ctx, s[0]);
+        assert!(app.value_learning.is_some(), "switch listener armed");
+        app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+            bytes: vec![0xB0, 44, 9],
+        }));
+        assert!(app.value_learning.is_none(), "listener consumed");
+        assert_eq!(app.value_binds.len(), 1, "switch stored");
+        assert_eq!(app.value_binds[0].target, crate::automation::TARGET_TRACK_MUTE);
+        assert_eq!(app.value_binds[0].bind.d1, 44);
+        app.save_config();
+        let b2 = App::new(Backend::start());
+        assert_eq!(b2.value_binds.len(), 1, "session restore keeps bindings");
+    }
+
+    /// v29 R7: bindings are PROJECT state — saved into the file and
+    /// loaded back verbatim.
+    #[test]
+    fn v29_value_binds_saved_in_project() {
+        let mut app = headless_app("v29vbproj");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.value_binds.push(crate::config::ValueBind {
+            target: "fx:0:1".into(),
+            track: 2,
+            bind: crate::midi::MidiBind { ty: 0, ch: 1, d1: 60 },
+            kind: 0,
+            lo: 4,
+            hi: 100,
+        });
+        let pj = app.build_project("vb".into());
+        assert_eq!(pj.value_binds.len(), 1, "project carries bindings");
+        let dir = std::env::temp_dir().join("sp-uity-v29vbproj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vb.slooper");
+        project::save(&path, &pj).unwrap();
+        let back = project::load(&path).unwrap();
+        assert_eq!(back.value_binds, app.value_binds, "file round-trip");
     }
 
     /// v29: dragging a clip vertically past its track's rows moves it to
