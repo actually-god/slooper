@@ -291,6 +291,27 @@ impl Arrangement {
         Some(tr.lanes[to].clips.len() - 1)
     }
 
+    /// v29: move clip `(t, lane, c)` to another track, keeping its
+    /// lane slot (target lanes grow to reach it). Returns `(lane, idx)`.
+    pub fn move_clip_track(
+        &mut self,
+        t: usize,
+        lane: usize,
+        c: usize,
+        to_t: usize,
+    ) -> Option<(usize, usize)> {
+        if to_t == t {
+            return self.move_clip_lane(t, lane, lane, c).map(|ci| (lane, ci));
+        }
+        let cl = self.remove_clip(t, lane, c)?;
+        let tr = self.tracks.get_mut(to_t)?;
+        while tr.lanes.len() <= lane {
+            tr.add_lane();
+        }
+        tr.lanes[lane].clips.push(cl);
+        Some((lane, tr.lanes[lane].clips.len() - 1))
+    }
+
     /// Every `(track, lane, clip)` index placing this asset.
     pub fn clips_of(&self, asset: u32) -> Vec<(usize, usize, usize)> {
         let mut out = Vec::new();
