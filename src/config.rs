@@ -21,6 +21,28 @@ pub struct MidiBinding {
     pub bind: Option<MidiBind>,
 }
 
+/// v29 R7: a MIDI control bound to one VALUE (mixer knob, plugin param)
+/// for the CURRENT PROJECT — unlike action slots, these live in the
+/// project file and in the session config, and are managed from the
+/// automation manager's bindings rack (plugin setups are per project).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ValueBind {
+    /// Automation-domain target id: "track.vol", "master.vol",
+    /// "fx:0:2", "synth:1", ... (see crate::automation).
+    pub target: String,
+    /// Owner track (ignored for master.* targets).
+    pub track: u32,
+    /// The bound control's identity (message type + channel + number).
+    pub bind: crate::midi::MidiBind,
+    /// 0 = KNOB: raw lo..hi scales onto the target's range.
+    /// 1 = SWITCH: a matching message toggles the (boolean) value.
+    pub kind: u8,
+    /// Raw minimum / maximum captured by the knob wizard
+    /// (lo > hi = inverted travel, corrected on apply).
+    pub lo: u8,
+    pub hi: u8,
+}
+
 /// Axis calibration for one continuous (knob/slider) binding slot: the raw
 /// controller values captured when the user swept the control to its minimum
 /// and maximum. Values between are scaled onto the program's 0..=127 space.
@@ -273,6 +295,10 @@ pub struct Config {
     /// the three the track's single REC button arms. Defaults to audio.
     #[serde(default)]
     pub rec_src: Vec<[bool; 3]>,
+    /// v29 R7: session copy of the project's MIDI-value bindings (the
+    /// project file is authoritative on load; this keeps a bare session).
+    #[serde(default)]
+    pub value_binds: Vec<ValueBind>,
     /// Effects folder ("" = default: `effects/` next to the installed
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
@@ -373,6 +399,7 @@ impl Default for Config {
             rack_dir_order: Vec::new(),
             rack_group_by_dir: false,
             rec_src: vec![[true, false, false]; 8],
+            value_binds: Vec::new(),
             fx_dir: String::new(),
             track_fx: Vec::new(),
             track_chain: Vec::new(),
@@ -627,6 +654,18 @@ mod tests {
             }],
             rack_group_by_dir: true,
             rec_src: vec![[true, true, false], [false, false, true]],
+            value_binds: vec![ValueBind {
+                target: "track.vol".into(),
+                track: 1,
+                bind: crate::midi::MidiBind {
+                    ty: 1,
+                    ch: 0,
+                    d1: 7,
+                },
+                kind: 0,
+                lo: 9,
+                hi: 118,
+            }],
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             track_fx: vec![vec![TrackFxSave {

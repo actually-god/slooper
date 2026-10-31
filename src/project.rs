@@ -124,6 +124,10 @@ pub struct Project {
     /// Per-track synth state chunk (base64; index = track).
     #[serde(default)]
     pub track_synth_states: Vec<Option<String>>,
+    /// v29 R7: MIDI bindings to values (mixer / plugin controls) —
+    /// per-project, managed from the automation manager's bindings rack.
+    #[serde(default)]
+    pub value_binds: Vec<crate::config::ValueBind>,
 }
 
 impl Project {
@@ -282,6 +286,8 @@ mod tests {
             track_synths: vec![Some("piano".into())],
             track_synth_params: vec![vec![0.5]],
             track_synth_states: vec![],
+
+            value_binds: Vec::new(),
         }
     }
 
