@@ -257,6 +257,120 @@ struct AutoCap {
     nodes: Vec<crate::automation::Node>,
 }
 
+/// v29 R5: one drum-machine pad (runtime; `asset` is the resolved index
+/// into `App::assets` for `asset_path`).
+struct DrumPad {
+    name: String,
+    asset_path: String,
+    asset: Option<usize>,
+    /// Default paint velocity (1..=127).
+    vel: u8,
+    muted: bool,
+}
+
+/// v29 R5: FL-FPC-style drum machine bound to one arrangement track.
+/// The grid is velocity per (pad, step); "Commit" stamps one-shot clips
+/// into the track — one lane per pad — at the playhead.
+struct DrumMachine {
+    pads: Vec<DrumPad>,
+    steps: usize,
+    grid: Vec<Vec<u8>>,
+    track: usize,
+    playing: bool,
+    /// Engine position when playback was armed (step clock base).
+    step_start: u64,
+    /// Last step fired (audition edge detector).
+    last_step: usize,
+}
+
+impl DrumMachine {
+    fn defaults() -> Self {
+        let names = [
+            "Kick", "Snare", "Hat", "Open", "Clap", "Tom", "Cow", "Perc",
+        ];
+        DrumMachine {
+            pads: names
+                .iter()
+                .map(|n| DrumPad {
+                    name: n.to_string(),
+                    asset_path: String::new(),
+                    asset: None,
+                    vel: 100,
+                    muted: false,
+                })
+                .collect(),
+            steps: 16,
+            grid: vec![vec![0u8; 16]; names.len()],
+            track: 0,
+            playing: false,
+            step_start: 0,
+            last_step: usize::MAX,
+        }
+    }
+
+    fn to_save(&self) -> crate::config::DrumSave {
+        crate::config::DrumSave {
+            pads: self
+                .pads
+                .iter()
+                .map(|p| crate::config::DrumPadSave {
+                    name: p.name.clone(),
+                    asset: p.asset_path.clone(),
+                    vel: p.vel,
+                    muted: p.muted,
+                })
+                .collect(),
+            steps: self.steps as u32,
+            grid: self.grid.clone(),
+            track: self.track as u32,
+        }
+    }
+
+    fn from_save(s: &crate::config::DrumSave) -> Self {
+        let mut d = DrumMachine::defaults();
+        if !s.pads.is_empty() {
+            d.pads = s
+                .pads
+                .iter()
+                .map(|p| DrumPad {
+                    name: p.name.clone(),
+                    asset_path: p.asset.clone(),
+                    asset: None,
+                    vel: p.vel,
+                    muted: p.muted,
+                })
+                .collect();
+        }
+        d.steps = (s.steps as usize).clamp(4, 64);
+        // Keep the grid rectangular (sessions from older builds differ).
+        d.grid = vec![vec![0u8; d.steps]; d.pads.len()];
+        for (p, row) in s.grid.iter().enumerate() {
+            for (st, v) in row.iter().enumerate() {
+                if p < d.grid.len() && st < d.steps {
+                    d.grid[p][st] = *v;
+                }
+            }
+        }
+        d.track = s.track as usize;
+        d
+    }
+
+    fn resize(&mut self, steps: usize) {
+        let steps = steps.clamp(4, 64);
+        self.steps = steps;
+        for row in self.grid.iter_mut() {
+            row.resize(steps, 0);
+        }
+        self.grid.resize(self.pads.len(), vec![0u8; steps]);
+    }
+
+    /// One 16th-note step: a bar holds 4 steps per beat at `steps` per bar.
+    fn step_samples(&self, bar: u64) -> u64 {
+        let per_bar = (self.steps.max(1) as u64 / 4).max(1);
+        bar / per_bar.max(1)
+    }
+}
+
 /// v29: which sources a track's single REC button arms.
 #[derive(Clone, Copy)]
 struct RecSrc {
@@ -905,6 +1019,9 @@ pub struct App {
     /// v29 R7: the target picked in the bindings rack (sticky between
     /// openings; falls back to the manager's current target).
     vb_target: Option<String>,
+    /// v29 R5: the drum machine (one per project).
+    drum: DrumMachine,
+    show_drums: bool,
     auto_edit: Option<Box<AutoEdit>>,
     /// v0.15: bindings picked as automation-manager record sources
     /// (action slot + bind). While the manager is open these are MUTED in
@@ -1284,6 +1401,12 @@ impl App {
             value_binds: cfg.value_binds.clone(),
             value_learning: None,
             vb_target: None,
+            drum: cfg
+                .drum
+                .as_ref()
+                .map(crate::ui::DrumMachine::from_save)
+                .unwrap_or_else(DrumMachine::defaults),
+            show_drums: cfg.show_drums,
             auto_edit: None,
             auto_mgr_rec: Vec::new(),
             auto_pick_open: false,
@@ -3208,6 +3331,8 @@ impl App {
                 .map(|s| [s.audio, s.midi, s.auto])
                 .collect(),
             value_binds: self.value_binds.clone(),
+            drum: Some(self.drum.to_save()),
+            show_drums: self.show_drums,
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             editor_probe: self.editor_probe.clone(),
@@ -3893,6 +4018,95 @@ impl App {
         }
     }
 
+    /// v29 R5: re-resolve every pad's asset path against the loaded
+    /// asset table (cheap; run before use, not per frame).
+    fn drum_resolve(&mut self) {
+        for p in 0..self.drum.pads.len() {
+            let path = self.drum.pads[p].asset_path.clone();
+            if path.is_empty() {
+                self.drum.pads[p].asset = None;
+                continue;
+            }
+            self.drum.pads[p].asset = self
+                .assets
+                .iter()
+                .position(|a| a.path.to_string_lossy() == path);
+        }
+    }
+
+    /// v29 R5: audition a pad impulse at velocity (scaled copy — the
+    /// preview engine has no gain parameter, and impulses are short).
+    fn audition_impulse(&mut self, k: usize, vel: u8) {
+        if self.sample_rate == 0 || vel == 0 {
+            return;
+        }
+        let Some(a) = self.assets.get(k) else {
+            return;
+        };
+        if a.is_auto() || a.is_midi() {
+            return;
+        }
+        let g = (vel as f32 / 127.0).powi(2);
+        let data: Arc<[f32]> = if g >= 0.995 {
+            a.data.clone()
+        } else {
+            let v: Vec<f32> = a.data.iter().map(|s| *s * g).collect();
+            Arc::from(v.into_boxed_slice())
+        };
+        self.backend.cmd(Cmd::PreviewPlay {
+            id: k as u32,
+            samples: data,
+        });
+    }
+
+    /// v29 R5: stamp the pattern into the arrangement at the playhead:
+    /// one-shot clips per hit, one lane per pad (like FPC bouncing a
+    /// beat). Clip gain carries the per-hit velocity.
+    fn drum_commit(&mut self) {
+        self.drum_resolve();
+        let t = self.drum.track.min(self.n_tracks.saturating_sub(1));
+        let step = self.drum.step_samples(self.bar_samples());
+        let base = snap_start(self.backend.engine.pos(), self.snap_unit());
+        let grid = self.drum.grid.clone();
+        let pads: Vec<(Option<usize>, bool)> = self
+            .drum
+            .pads
+            .iter()
+            .map(|p| (p.asset, p.muted))
+            .collect();
+        let nl0 = self.arr.tracks[t].lanes.len();
+        let mut n = 0usize;
+        for (pi, (aid, muted)) in pads.iter().enumerate() {
+            if *muted {
+                continue;
+            }
+            let Some(id) = aid else { continue };
+            let Ok(id32) = u32::try_from(*id) else { continue };
+            while self.arr.tracks[t].lanes.len() <= pi {
+                self.arr.tracks[t].add_lane();
+            }
+            for (si, v) in grid.get(pi).cloned().unwrap_or_default().iter().enumerate() {
+                if *v == 0 {
+                    continue;
+                }
+                let mut cl = Clip::new(id32, base + si as u64 * step);
+                cl.gain = (*v as f32 / 127.0).powi(2).max(0.01);
+                self.arr.insert(t, pi, cl);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            self.status = "drums: nothing to commit (pick pad sounds and paint hits)".into();
+            return;
+        }
+        self.grow_for_lanes(t, nl0);
+        self.push_project();
+        self.status = format!(
+            "drums: {n} hits committed to track {} (one lane per pad)",
+            t + 1
+        );
+    }
+
     /// v29 R7: apply a value in the TARGET's own domain (the units
     /// `target_range` describes) straight to the control — shared by the
     /// "Set value" dialog and by MIDI value bindings.
@@ -4426,6 +4640,291 @@ impl App {
         if !open {
             self.auto_pick_open = false;
         }
+    }
+
+    /// v29 R5: the drum machine window (toolbar "Drums"). One row per
+    /// pad — editable name, audition, sound picker, default velocity,
+    /// mute — then the velocity grid: click toggles a hit, the mouse
+    /// wheel paints velocity, "play" runs the pattern off the transport
+    /// (auditioning hits), and "commit" bounces it to the arrangement.
+    fn drum_window(&mut self, ui: &mut egui::Ui) {
+        self.drum_resolve();
+        let mut open = self.show_drums;
+        let mut dirty = false;
+        let mut commit_now = false;
+        let ctx = ui.ctx().clone();
+        egui::Window::new("drum machine")
+            .id(egui::Id::new("drum_machine_window"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(760.0)
+            .show(&ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("track");
+                    egui::ComboBox::from_id_salt("drum_track")
+                        .selected_text(format!("T{}", self.drum.track + 1))
+                        .show_ui(ui, |ui| {
+                            for t in 0..self.n_tracks {
+                                if ui
+                                    .selectable_label(self.drum.track == t, format!("Track {}", t + 1))
+                                    .clicked()
+                                {
+                                    self.drum.track = t;
+                                    dirty = true;
+                                }
+                            }
+                        });
+                    ui.label("steps");
+                    egui::ComboBox::from_id_salt("drum_steps")
+                        .selected_text(self.drum.steps.to_string())
+                        .show_ui(ui, |ui| {
+                            for s in [8usize, 16, 32, 64] {
+                                if ui.selectable_label(self.drum.steps == s, s.to_string()).clicked()
+                                {
+                                    self.drum.resize(s);
+                                    dirty = true;
+                                }
+                            }
+                        });
+                    let playing = self.drum.playing;
+                    if ui.button(if playing { "\u{25a0} stop" } else { "\u{25b6} play" }).clicked()
+                    {
+                        self.drum.playing = !self.drum.playing;
+                        self.drum.step_start = self.backend.engine.pos();
+                        self.drum.last_step = usize::MAX;
+                    }
+                    if ui.button("clear all").clicked() {
+                        for row in self.drum.grid.iter_mut() {
+                            row.iter_mut().for_each(|v| *v = 0);
+                        }
+                        dirty = true;
+                    }
+                    if ui
+                        .button("commit to track")
+                        .on_hover_text(
+                            "Stamp one-shot clips at the playhead: one lane per \
+                             pad, clip gain = hit velocity.",
+                        )
+                        .clicked()
+                    {
+                        commit_now = true;
+                    }
+                });
+                // Step clock: while playing, the pattern runs off the
+                // transport position; fired steps audition their hits.
+                let step_s = self.drum.step_samples(self.bar_samples()).max(1);
+                let cur = if self.drum.playing {
+                    (self
+                        .backend
+                        .engine
+                        .pos()
+                        .saturating_sub(self.drum.step_start)
+                        / step_s) as usize
+                        % self.drum.steps.max(1)
+                } else {
+                    usize::MAX
+                };
+                if self.drum.playing && cur != self.drum.last_step {
+                    self.drum.last_step = cur;
+                    let fired: Vec<(usize, u8)> = self
+                        .drum
+                        .pads
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(p, pad)| {
+                            let v = self.drum.grid.get(p)?.get(cur).copied().unwrap_or(0);
+                            if !pad.muted && v > 0 {
+                                pad.asset.map(|k| (k, v))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for (k, v) in fired {
+                        self.audition_impulse(k, v);
+                    }
+                }
+                egui::Grid::new("drum_grid")
+                    .num_columns(self.drum.steps + 6)
+                    .spacing([2.0, 3.0])
+                    .show(ui, |ui| {
+                        for p in 0..self.drum.pads.len() {
+                            let mut name = self.drum.pads[p].name.clone();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut name)
+                                        .desired_width(44.0)
+                                        .font(egui::TextStyle::Monospace),
+                                )
+                                .changed()
+                            {
+                                self.drum.pads[p].name = name.clone();
+                                dirty = true;
+                            }
+                            let aud = self.drum.pads[p].asset;
+                            if ui
+                                .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                                .on_hover_text("Audition this pad")
+                                .clicked()
+                            {
+                                if let Some(k) = aud {
+                                    let v = self.drum.pads[p].vel.max(1);
+                                    self.audition_impulse(k, v);
+                                }
+                            }
+                            let cur_path = self.drum.pads[p].asset_path.clone();
+                            let label = cur_path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("(sound)")
+                                .trim_end_matches(".wav")
+                                .to_string();
+                            egui::ComboBox::from_id_salt(format!("drum_asset_{p}"))
+                                .selected_text(label)
+                                .width(84.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(cur_path.is_empty(), "(silent)")
+                                        .clicked()
+                                    {
+                                        self.drum.pads[p].asset_path.clear();
+                                        self.drum.pads[p].asset = None;
+                                        dirty = true;
+                                    }
+                                    let items: Vec<(usize, String, String)> = self
+                                        .assets
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, a)| !a.is_midi() && !a.is_auto())
+                                        .map(|(k, a)| {
+                                            let path = a.path.to_string_lossy().to_string();
+                                            let nm = path
+                                                .rsplit('/')
+                                                .next()
+                                                .unwrap_or("?")
+                                                .trim_end_matches(".wav")
+                                                .to_string();
+                                            (k, path, nm)
+                                        })
+                                        .collect();
+                                    for (k, path, nm) in items {
+                                        if ui
+                                            .selectable_label(cur_path == path, nm)
+                                            .clicked()
+                                        {
+                                            self.drum.pads[p].asset_path = path;
+                                            self.drum.pads[p].asset = Some(k);
+                                            dirty = true;
+                                        }
+                                    }
+                                });
+                            ui.add_sized(
+                                [52.0, 16.0],
+                                egui::Slider::new(&mut self.drum.pads[p].vel, 1..=127),
+                            );
+                            let m = self.drum.pads[p].muted;
+                            if ui
+                                .add(
+                                    egui::Button::new(if m { "m" } else { "\u{25cf}" })
+                                        .min_size(egui::vec2(16.0, 18.0)),
+                                )
+                                .on_hover_text("Mute pad")
+                                .clicked()
+                            {
+                                self.drum.pads[p].muted = !m;
+                                dirty = true;
+                            }
+                            if ui
+                                .add(egui::Button::new("x").min_size(egui::vec2(16.0, 18.0)))
+                                .on_hover_text("Clear this pad's row")
+                                .clicked()
+                            {
+                                self.drum.grid[p].iter_mut().for_each(|v| *v = 0);
+                                dirty = true;
+                            }
+                            for s in 0..self.drum.steps {
+                                let v = self.drum.grid[p][s];
+                                let fill = if v == 0 {
+                                    egui::Color32::from_gray(if s % 4 == 0 { 74 } else { 56 })
+                                } else {
+                                    egui::Color32::from_rgb(90 + v / 2, 55 + v / 4, 55)
+                                };
+                                let mut b = egui::Button::new(
+                                    egui::RichText::new(if v == 0 { " " } else { "\u{25cf}" })
+                                        .color(if v == 0 {
+                                            egui::Color32::from_gray(130)
+                                        } else {
+                                            egui::Color32::WHITE
+                                        }),
+                                )
+                                .fill(fill)
+                                .min_size(egui::vec2(14.0, 18.0));
+                                if cur == s {
+                                    b = b.stroke(egui::Stroke::new(
+                                        1.5,
+                                        ui.visuals().hyperlink_color,
+                                    ));
+                                }
+                                let resp = ui.add(b).on_hover_text(format!(
+                                    "pad {} step {} — vel {v} (click toggles, wheel paints)",
+                                    p + 1,
+                                    s + 1
+                                ));
+                                if resp.clicked() {
+                                    let dv = self.drum.pads[p].vel.max(1);
+                                    let now = self.drum.grid[p][s];
+                                    self.drum.grid[p][s] = if now == 0 { dv } else { 0 };
+                                    dirty = true;
+                                    if now == 0 {
+                                        if let Some(k) = self.drum.pads[p].asset {
+                                            let dv2 = self.drum.grid[p][s];
+                                            self.audition_impulse(k, dv2);
+                                        }
+                                    }
+                                }
+                                if resp.hovered() {
+                                    let d = ui.input(|i| {
+                                        let mut acc = 0.0f32;
+                                        for ev in i.events.iter() {
+                                            if let egui::Event::MouseWheel {
+                                                delta, unit, ..
+                                            } = ev
+                                            {
+                                                let s = match unit {
+                                                    egui::MouseWheelUnit::Line => 24.0,
+                                                    _ => 1.0,
+                                                };
+                                                acc += delta.y * s;
+                                            }
+                                        }
+                                        (acc * 0.35) as i32
+                                    });
+                                    if d != 0 {
+                                        let nv =
+                                            (self.drum.grid[p][s] as i32 + d * 8).clamp(0, 127)
+                                                as u8;
+                                        if nv != self.drum.grid[p][s] {
+                                            self.drum.grid[p][s] = nv;
+                                            dirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if self.drum.playing {
+                    ctx.request_repaint();
+                }
+            });
+        if commit_now {
+            self.drum_commit();
+            dirty = true;
+        }
+        if dirty {
+            self.save_config();
+        }
+        self.show_drums = open;
     }
 
     fn auto_window(&mut self, ui: &mut egui::Ui) {
@@ -7667,6 +8166,7 @@ impl App {
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
             value_binds: self.value_binds.clone(),
+            drum: Some(self.drum.to_save()),
         }
     }
 
@@ -7956,6 +8456,12 @@ impl App {
         // v29 R7: value bindings travel WITH the project — replace the
         // session copy wholesale (the rack then reflects the project).
         self.value_binds = pr.value_binds.clone();
+        // v29 R5: and so does the drum machine.
+        if let Some(d) = pr.drum.as_ref() {
+            self.drum = DrumMachine::from_save(d);
+        } else {
+            self.drum = DrumMachine::defaults();
+        }
         self.save_config();
         // Heights are a per-session view; the new arrangement starts fresh.
         for h in self.trk_height.iter_mut() {
@@ -8715,6 +9221,9 @@ impl App {
             self.auto_window(ui);
             self.auto_pick_window(ui);
         }
+        if self.show_drums {
+            self.drum_window(ui);
+        }
         let sw = self.synth_win;
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
@@ -9142,6 +9651,17 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Export").clicked() {
                     app.show_export = true;
+                }
+                if ui
+                    .button("Drums")
+                    .on_hover_text(
+                        "Drum machine / pattern builder (FL-FPC style): pads = \
+                         impulse sounds, grid = velocity per step. Commit \
+                         stamps the pattern into the arrangement.",
+                    )
+                    .clicked()
+                {
+                    app.show_drums = !app.show_drums;
                 }
                 if ui
                     .button("Load")
@@ -22473,9 +22993,97 @@ mod tests {
         assert!(app.midi_msg_is_bound(&msg), "switch claims its exact message");
     }
 
-    /// v29 R7: the bindings rack offers the KNOB wizard for continuous
-    /// targets and the SWITCH widget for booleans, stores what it learns,
-    /// and the mix survives a config reload.
+
+    /// v29 R5: the drum machine commits its velocity grid to the
+    /// arrangement: one lane per pad, one-shot per hit, clip gain =
+    /// velocity, steps quantized off the bar clock.
+    #[test]
+    fn v29_drum_commit_bounces_one_shot_clips() {
+        let tmp = std::env::temp_dir().join(format!("sl-v29drum-{}", std::process::id()));
+        let kick = write_test_wav(&tmp, "kick.wav", 4_800, 60.0);
+        let hat = write_test_wav(&tmp, "hat.wav", 2_400, 9_000.0);
+        let mut app = headless_app("v29drumc");
+        let ik = app.ensure_asset(&kick).unwrap();
+        let ih = app.ensure_asset(&hat).unwrap();
+        app.drum.track = 1;
+        app.drum.pads[0].asset_path = kick.to_string_lossy().into_owned();
+        app.drum.pads[2].asset_path = hat.to_string_lossy().into_owned();
+        app.drum.grid[0][0] = 127;
+        app.drum.grid[0][4] = 100;
+        app.drum.grid[2][8] = 60;
+        app.drum_commit();
+        let step = app.drum.step_samples(app.bar_samples());
+        assert!(step > 0);
+        let lane_of = |a: &App, l: usize| -> Vec<(u32, u64, f32)> {
+            a.arr.tracks[1].lanes[l]
+                .clips
+                .iter()
+                .map(|c| (c.asset, c.pos, c.gain))
+                .collect()
+        };
+        let lane0 = lane_of(&app, 0);
+        assert_eq!(lane0.len(), 2, "kick hits");
+        assert_eq!(lane0[0], (ik as u32, 0, 1.0_f32));
+        assert!((lane0[1].2 - (100.0f32 / 127.0).powi(2)).abs() < 0.01);
+        assert_eq!(lane0[1].1, 4 * step);
+        let lane2 = lane_of(&app, 2);
+        assert_eq!(lane2.len(), 1, "one hat hit on its own lane");
+        assert_eq!(lane2[0].0, ih as u32);
+        // Muted pads never commit.
+        app.drum.pads[0].muted = true;
+        app.clear_track(1);
+        app.drum_commit();
+        assert_eq!(app.arr.tracks[1].lanes[0].clips.len(), 0);
+        assert_eq!(app.arr.tracks[1].lanes[2].clips.len(), 1);
+    }
+
+    /// v29 R5: the toolbar opens the window; grid edits persist through
+    /// the session config AND the project file.
+    #[test]
+    fn v29_drum_window_paints_and_persists() {
+        let mut app = headless_app("v29drumw");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let d = galley_centers(&mut app, &ctx, "Drums", true);
+        assert!(!d.is_empty(), "toolbar has the Drums button");
+        click_pt(&mut app, &ctx, d[0]);
+        assert!(app.show_drums);
+        frame(&mut app, &ctx, vec![]);
+        let x = galley_centers(&mut app, &ctx, "x", true);
+        // The drum window docks at the left of the screen; its row-clear
+        // column is the only "x" stack near x=393 (rack/mix have their
+        // own delete glyphs elsewhere).
+        let x = x.into_iter().filter(|p| (p.x - 393.0).abs() < 30.0).collect::<Vec<_>>();
+        assert!(x.len() >= 8, "pad rows carry clear buttons, got {x:?}");
+        app.drum.grid[0][3] = 55;
+        click_pt(&mut app, &ctx, x[0]);
+        assert_eq!(app.drum.grid[0][3], 0, "row clear emptied pad 0");
+        app.drum.resize(8);
+        assert_eq!(app.drum.grid[0].len(), 8);
+        app.drum.grid[1][7] = 111;
+        app.show_drums = false;
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        let saved = cfg.drum.clone().expect("drum in session config");
+        assert_eq!(saved.grid[1][7], 111);
+        assert!(!cfg.show_drums);
+        let app2 = App::new(Backend::start());
+        assert_eq!(app2.drum.grid[1][7], 111, "drum grid back from config");
+        let pj = app.build_project("v29drum".into());
+        let saved_p = pj.drum.as_ref().expect("drum in project");
+        assert_eq!(saved_p.grid[1][7], 111);
+        let dir = std::env::temp_dir().join(format!("sl-v29drum-proj-{}", std::process::id()));
+        let path = dir.join("beat.slop");
+        project::save(&path, &pj).unwrap();
+        app.drum.grid[1][7] = 0;
+        app.drum.steps = 16;
+        app.drum.playing = true;
+        app.do_load(&path);
+        assert_eq!(app.drum.grid[1][7], 111, "pattern restored");
+        assert_eq!(app.drum.steps, 8);
+        assert!(!app.drum.playing, "transport state never travels");
+    }
+
     #[test]
     fn v29_bindings_rack_learns_and_persists() {
         let mut app = headless_app("v29vbrack");

@@ -43,6 +43,31 @@ pub struct ValueBind {
     pub hi: u8,
 }
 
+/// v29 R5: one drum-machine pad: a 1-note impulse instrument.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DrumPadSave {
+    pub name: String,
+    /// Asset FILE the pad fires (empty = silent until picked). Stored as
+    /// a path so the project can relink it after reload.
+    pub asset: String,
+    /// Default paint velocity.
+    pub vel: u8,
+    pub muted: bool,
+}
+
+/// v29 R5: the FL-FPC-style drum machine: a velocity grid of
+/// `steps` columns x pad rows. Committed to the arrangement as one-shot
+/// clips (one lane per pad).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DrumSave {
+    pub pads: Vec<DrumPadSave>,
+    pub steps: u32,
+    /// grid[pad][step]: 0 = off, 1..=127 = hit velocity.
+    pub grid: Vec<Vec<u8>>,
+    /// Arrangement track the pattern commits to.
+    pub track: u32,
+}
+
 /// Axis calibration for one continuous (knob/slider) binding slot: the raw
 /// controller values captured when the user swept the control to its minimum
 /// and maximum. Values between are scaled onto the program's 0..=127 space.
@@ -299,6 +324,12 @@ pub struct Config {
     /// project file is authoritative on load; this keeps a bare session).
     #[serde(default)]
     pub value_binds: Vec<ValueBind>,
+    /// v29 R5: drum machine state (session copy; project file wins).
+    #[serde(default)]
+    pub drum: Option<DrumSave>,
+    /// v29 R5: was the drum-machine window open?
+    #[serde(default)]
+    pub show_drums: bool,
     /// Effects folder ("" = default: `effects/` next to the installed
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
@@ -400,6 +431,8 @@ impl Default for Config {
             rack_group_by_dir: false,
             rec_src: vec![[true, false, false]; 8],
             value_binds: Vec::new(),
+            drum: None,
+            show_drums: false,
             fx_dir: String::new(),
             track_fx: Vec::new(),
             track_chain: Vec::new(),
@@ -666,6 +699,26 @@ mod tests {
                 lo: 9,
                 hi: 118,
             }],
+            drum: Some(DrumSave {
+                pads: vec![
+                    DrumPadSave {
+                        name: "Kick".into(),
+                        asset: "/s/kick.wav".into(),
+                        vel: 100,
+                        muted: false,
+                    },
+                    DrumPadSave {
+                        name: "Hat".into(),
+                        asset: "".into(),
+                        vel: 80,
+                        muted: true,
+                    },
+                ],
+                steps: 16,
+                grid: vec![vec![0u8; 16], vec![90, 0, 0, 0]],
+                track: 2,
+            }),
+            show_drums: true,
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             track_fx: vec![vec![TrackFxSave {
