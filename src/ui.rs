@@ -2593,6 +2593,39 @@ impl App {
     /// Height of one track's grid block — and of the mixer strip aligned
     /// with it (both read this, so they can never drift apart). User-resized
     /// via the separation bar under each track; lanes inside share it equally.
+    /// v29: track under a pointer y while a clip drag strays past the
+    /// owning track's rect — walks the track stack (h + separator rows)
+    /// out from `from_rect`. y inside the source rect returns `from`.
+    fn track_at_y(&self, from: usize, from_rect: &egui::Rect, y: f32) -> usize {
+        let sep = TRACK_SEP_HIT as f32;
+        let mut t = from;
+        if y > from_rect.max.y {
+            let mut top = from_rect.max.y + sep;
+            while t + 1 < self.n_tracks {
+                let bottom = top + self.track_h(t + 1);
+                if y <= bottom {
+                    return t + 1;
+                }
+                t += 1;
+                top = bottom + sep;
+            }
+            self.n_tracks.saturating_sub(1)
+        } else if y < from_rect.min.y {
+            let mut bottom = from_rect.min.y - sep;
+            while t > 0 {
+                let top = bottom - self.track_h(t - 1);
+                if y >= top {
+                    return t - 1;
+                }
+                t -= 1;
+                bottom = top - sep;
+            }
+            0
+        } else {
+            from
+        }
+    }
+
     fn track_h(&self, t: usize) -> f32 {
         let lanes = self.arr.tracks[t].lanes.len().max(1) as f32;
         let auto = (lanes * LANE_H).max(TRACK_MIN_H);
@@ -11926,27 +11959,62 @@ fn lane_row(
                 }
                 // Single-clip drag: vertical pointer travel moves the clip
                 // between its track's lanes (groups stay horizontal-only).
+                // v29: past the track's rows it moves to the NEXT TRACK.
                 if let Some(l0) = d.lane0 {
-                    let dl = ((pt.y - rect.center().y) / rect.height().max(1.0)).round() as i64;
                     let (tt, cur, cc, _) = d.items[0];
-                    let nl = app.arr.tracks[tt].lanes.len() as i64;
-                    let target = (l0 as i64 + dl).clamp(0, nl - 1) as usize;
-                    if target != cur {
-                        if let Some(ni) = app.arr.move_clip_lane(tt, cur, target, cc) {
+                    // `rect` is THIS LANE's row; the cross-track walk
+                    // needs the owning track's whole vertical span.
+                    let lanes = app.arr.tracks[t].lanes.len();
+                    let lh = rect.height();
+                    let track_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x, rect.min.y - (k as f32) * lh),
+                        egui::pos2(
+                            rect.max.x,
+                            rect.max.y + ((lanes - 1 - k) as f32) * lh,
+                        ),
+                    );
+                    let target_t = app.track_at_y(t, &track_rect, pt.y);
+                    if target_t != tt {
+                        if let Some((nl, ni)) = app.arr.move_clip_track(tt, cur, cc, target_t) {
                             if let Some(dd) = app.drag_clip.as_mut() {
-                                dd.items[0].1 = target;
-                                dd.items[0].2 = ni;
+                                dd.items[0] = (target_t, nl, ni, dd.items[0].3);
                             }
                             let old = (tt, cur, cc);
                             let fresh = app
                                 .sel_clips
                                 .iter()
-                                .map(|x| if *x == old { (tt, target, ni) } else { *x })
+                                .map(|x| if *x == old { (target_t, nl, ni) } else { *x })
                                 .collect::<Vec<_>>();
                             app.sel_clips = fresh;
                             app.sel_clips.sort();
                             if app.sel_anchor == Some(old) {
-                                app.sel_anchor = Some((tt, target, ni));
+                                app.sel_anchor = Some((target_t, nl, ni));
+                            }
+                        }
+                    } else if tt == t {
+                        // Lane slot only while the drag still lives on this
+                        // block's track; once the clip lives elsewhere this
+                        // block just watches for the pointer coming back.
+                        let dl = ((pt.y - rect.center().y) / rect.height().max(1.0)).round() as i64;
+                        let nl = app.arr.tracks[tt].lanes.len() as i64;
+                        let target = (l0 as i64 + dl).clamp(0, nl - 1) as usize;
+                        if target != cur {
+                            if let Some(ni) = app.arr.move_clip_lane(tt, cur, target, cc) {
+                                if let Some(dd) = app.drag_clip.as_mut() {
+                                    dd.items[0].1 = target;
+                                    dd.items[0].2 = ni;
+                                }
+                                let old = (tt, cur, cc);
+                                let fresh = app
+                                    .sel_clips
+                                    .iter()
+                                    .map(|x| if *x == old { (tt, target, ni) } else { *x })
+                                    .collect::<Vec<_>>();
+                                app.sel_clips = fresh;
+                                app.sel_clips.sort();
+                                if app.sel_anchor == Some(old) {
+                                    app.sel_anchor = Some((tt, target, ni));
+                                }
                             }
                         }
                     }
@@ -12085,6 +12153,50 @@ fn grid_context_menu(
         if ui.button("Delete  (Del)").clicked() {
             app.delete_selection();
             ui.close();
+        }
+        // v29: explicit cross-track move — same selection rules as Delete.
+        {
+            let mut dest: Option<usize> = None;
+            ui.menu_button("Move to track", |ui| {
+                for tt in 0..app.n_tracks {
+                    if tt == t {
+                        continue;
+                    }
+                    if ui.button(format!("Track {}", tt + 1)).clicked() {
+                        dest = Some(tt);
+                        ui.close();
+                    }
+                }
+            });
+            if let Some(tt) = dest {
+                let mut ids: Vec<(usize, usize, usize)> = if app.is_sel(id) {
+                    app.sel_clips.iter().copied().collect()
+                } else {
+                    vec![id]
+                };
+                // Descending so removals never invalidate later indices.
+                ids.sort_unstable();
+                ids.reverse();
+                app.sel_clips.clear();
+                let mut moved = Vec::new();
+                for (ft, fl, fc) in ids {
+                    if ft == tt {
+                        moved.push((ft, fl, fc));
+                        continue;
+                    }
+                    if let Some((nl, nc)) = app.arr.move_clip_track(ft, fl, fc, tt) {
+                        moved.push((tt, nl, nc));
+                    }
+                }
+                for m in moved {
+                    app.sel_clips.push(m);
+                }
+                app.sel_clips.sort();
+                app.sel_clips.dedup();
+                app.sel_anchor = app.sel_clips.first().copied();
+                app.push_project();
+                ui.close();
+            }
         }
         if app
             .assets
@@ -21736,6 +21848,79 @@ mod tests {
             }
         }
         assert!(clips.is_empty(), "kick clip gone: {clips:?}");
+    }
+
+    /// v29: dragging a clip vertically past its track's rows moves it to
+    /// the NEXT TRACK (the pointer's target track), not just a new lane.
+    #[test]
+    fn v29_clip_drag_across_tracks_moves_track() {
+        let mut app = headless_app("v29xtk");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0)); // track 0, lane 0
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]); // settle grid geometry
+        let top0 = app.grid_anchor - app.vscroll;
+        let mid0 = egui::pos2(500.0, top0 + app.track_h(0) * 0.5);
+        frame(&mut app, &ctx, vec![moved(mid0)]);
+        frame(&mut app, &ctx, vec![moved(mid0), btn(mid0, egui::PointerButton::Primary, true)]);
+        // Drag down past track 0 into track 1's rows.
+        let in_t1 = egui::pos2(500.0, top0 + app.track_h(0) + TRACK_SEP_HIT as f32 + app.track_h(1) * 0.5);
+        frame(&mut app, &ctx, vec![moved(in_t1)]);
+        frame(&mut app, &ctx, vec![moved(in_t1), btn(in_t1, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 1).count(), 1, "clip moved to track 1: {ids:?}");
+        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 0).count(), 0, "left track 0");
+        assert!(app.sel_clips.iter().all(|(t, _, _)| *t == 1), "selection followed the track");
+    }
+
+    /// v29: the clip context menu "Move to track" relocates the selection
+    /// in one click and is undoable.
+    #[test]
+    fn v29_clip_context_move_to_track() {
+        let mut app = headless_app("v29ctxmv");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(500.0, top0 + app.track_h(0) * 0.5);
+        // Open the clip context menu exactly like the v15 pin: select,
+        // then press+release Secondary with a moved() in the press frame.
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        // The submenu label carries an arrow suffix, so match by substring.
+        let mv = galley_centers(&mut app, &ctx, "Move to track", false);
+        assert!(!mv.is_empty(), "Move-to-track item present");
+        click_pt(&mut app, &ctx, mv[0]);
+        let t3 = galley_centers(&mut app, &ctx, "Track 3", true);
+        // Other panels also paint "Track 3" labels — the submenu item is
+        // the hit NEAREST the menu anchor, not the first in z-order.
+        let pick = t3
+            .into_iter()
+            .min_by(|a, b| {
+                (*a - mv[0])
+                    .length_sq()
+                    .partial_cmp(&(*b - mv[0]).length_sq())
+                    .unwrap()
+            })
+            .expect("submenu lists Track 3");
+        click_pt(&mut app, &ctx, pick);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 2).count(), 1, "clip now on track 2 (Track 3): {ids:?}");
+        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 0).count(), 0);
+        // The live selection follows the moved clip.
+        assert!(app.sel_clips.iter().all(|(t, _, _)| *t == 2), "selection follows: {:?}", app.sel_clips);
     }
 
     /// BUG 3 repro: dragging the mixer volume slider must move the value.
