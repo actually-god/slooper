@@ -38,7 +38,7 @@ use eframe::Frame;
 use egui::{Color32, RichText, Sense, Slider};
 
 use crate::arrange::{Arrangement, Clip};
-use crate::assets::{Asset, RackFolder};
+use crate::assets::{Asset, RackFile, RackFolder};
 use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
     TR_REC,
@@ -806,6 +806,10 @@ pub struct App {
 
     // --- asset rack ---
     rack: Vec<RackFolder>,
+    /// v28: sub-folder groups the user collapsed in the rack, keyed
+    /// `"<folder path>\u{1}<dir>"`. In-session view state only: the rack
+    /// opens fully expanded on every start (nothing is hidden by surprise).
+    rack_collapsed: std::collections::HashSet<String>,
     sel_asset: Option<usize>,
     /// Live input monitoring on/off (Settings → MONITORING, default on).
     monitor_enabled: bool,
@@ -1087,17 +1091,21 @@ impl App {
                     .collect(),
             ))
         };
-        // Bundled 808 pack: seed it into the app data dir; it becomes the
-        // default rack folder when the user has configured none — takes then
-        // record into it and every 808 voice is one drag away.
-        let seeded = crate::samples808::seed_pack();
+        // Bundled 808 pack: seed it into the app data dir. v28: the default
+        // rack folder is the SAMPLES ROOT (the pack's parent), so every pack
+        // installed under it shows up as its own sub-folder group, takes
+        // record into the primary folder root, and every 808 voice is still
+        // one drag away (under "808").
+        crate::samples808::seed_pack();
         let mut rack: Vec<RackFolder> = cfg
             .rack_folders
             .iter()
             .map(|p| RackFolder::new(p.clone()))
             .collect();
         if rack.is_empty() {
-            rack.push(RackFolder::new(seeded.to_string_lossy().into_owned()));
+            rack.push(RackFolder::new(
+                crate::samples808::samples_root().to_string_lossy().into_owned(),
+            ));
         }
         for f in rack.iter_mut() {
             f.rescan();
@@ -1189,6 +1197,7 @@ impl App {
             marquee_pending: None,
             marquee_base: Vec::new(),
             rack,
+            rack_collapsed: std::collections::HashSet::new(),
             sel_asset: None,
             monitor_enabled: cfg.monitor_on,
             preview_enabled: cfg.preview_on,
@@ -9219,12 +9228,22 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
     out
 }
 
-/// Rack row snapshot: (folder path, [(file name, path, is_midi, is_auto)], error).
-type RackRow = (String, Vec<(String, PathBuf, bool, bool)>, Option<String>);
+/// Rack folder snapshot: (folder path, scanned files — sub-folders included,
+/// dir-then-name sorted —, error).
+type RackRow = (String, Vec<RackFile>, Option<String>);
 
 /// One rack file row: click = load + audition, drag = place a clip.
 /// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
-fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &Path, kind: u8) {
+/// `indent` > 0 marks a row inside a v28 sub-folder group.
+fn rack_file_row(
+    ui: &mut egui::Ui,
+    app: &mut App,
+    fi: usize,
+    name: &str,
+    fp: &Path,
+    kind: u8,
+    indent: f32,
+) {
     let sel = app
         .sel_asset
         .is_some_and(|k| app.assets.get(k).is_some_and(|a| a.path == fp));
@@ -9232,18 +9251,32 @@ fn rack_file_row(ui: &mut egui::Ui, app: &mut App, fi: usize, name: &str, fp: &P
     // leaving most of the row dead to clicks; available_size() sizing made
     // every row fill the panel (the "huge hat" bug).
     let w = ui.available_width();
-    let row = ui.add_sized(
-        egui::vec2(w, 20.0),
-        egui::Button::selectable(sel, RichText::new(name).small()),
-    );
+    let row = ui
+        .horizontal(|ui| {
+            if indent > 0.0 {
+                ui.add_space(indent);
+            }
+            let rw = if indent > 0.0 {
+                (w - indent).max(24.0)
+            } else {
+                w
+            };
+            ui.add_sized(
+                egui::vec2(rw, 20.0),
+                egui::Button::selectable(sel, RichText::new(name).small()),
+            )
+        })
+        .inner;
     // Right-edge kind badge (audio vs MIDI). Painted into the row's own
     // rect, so it costs no layout width and never wraps the name.
     rack_kind_badge(ui, row.rect, kind);
     // ONE click_and_drag response for the row: a separate drag-sense
     // overlay on top would CAPTURE the press and kill clicked().
+    // v28: id keyed by the PATH, not the stem — the same stem can now
+    // exist in several sub-folders (two kits each shipping "kick").
     let dr = ui.interact(
         row.rect,
-        ui.id().with(("rackdrag", fi, name)),
+        ui.id().with(("rackdrag", fi, fp)),
         Sense::click_and_drag(),
     );
     if dr.clicked() {
@@ -9342,16 +9375,7 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                     let snap: Vec<RackRow> = app
                         .rack
                         .iter()
-                        .map(|f| {
-                            (
-                                f.path.clone(),
-                                f.files
-                                    .iter()
-                                    .map(|r| (r.name.clone(), r.path.clone(), r.is_midi, r.is_auto))
-                                    .collect(),
-                                f.err.clone(),
-                            )
-                        })
+                        .map(|f| (f.path.clone(), f.files.clone(), f.err.clone()))
                         .collect();
                     let mut rescan = None;
                     let mut browse = None;
@@ -9400,58 +9424,89 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                                     .small(),
                             );
                         }
-                        // Two sections per folder: AUDIO then MIDI clips.
+                        // Three sections per folder: AUDIO, MIDI, AUTOMATION.
                         // Section headers show whenever a section has entries
                         // (previously only when BOTH did, so a folder of pure
                         // MIDI files carried no label at all), and every row
-                        // additionally carries a kind badge.
-                        let audio: Vec<(String, PathBuf)> = files
-                            .iter()
-                            .filter(|(_, _, m, a)| !*m && !*a)
-                            .map(|(n, p, _, _)| (n.clone(), p.clone()))
-                            .collect();
-                        let midis: Vec<(String, PathBuf)> = files
-                            .iter()
-                            .filter(|(_, _, m, _)| *m)
-                            .map(|(n, p, _, _)| (n.clone(), p.clone()))
-                            .collect();
-                        let autos: Vec<(String, PathBuf)> = files
-                            .iter()
-                            .filter(|(_, _, _, a)| *a)
-                            .map(|(n, p, _, _)| (n.clone(), p.clone()))
-                            .collect();
-                        if !audio.is_empty() {
-                            ui.label(
-                                RichText::new("audio")
-                                    .weak()
-                                    .small()
-                                    .color(Color32::from_rgb(210, 175, 120)),
-                            );
-                        }
-                        for (name, fp) in audio {
-                            rack_file_row(ui, app, fi, &name, &fp, 0);
-                        }
-                        if !midis.is_empty() {
-                            ui.label(
-                                RichText::new("MIDI")
-                                    .weak()
-                                    .small()
-                                    .color(Color32::from_rgb(150, 200, 255)),
-                            );
-                        }
-                        for (name, fp) in midis {
-                            rack_file_row(ui, app, fi, &name, &fp, 1);
-                        }
-                        if !autos.is_empty() {
-                            ui.label(
-                                RichText::new("AUTOMATION")
-                                    .weak()
-                                    .small()
-                                    .color(Color32::from_rgb(255, 120, 120)),
-                            );
-                        }
-                        for (name, fp) in autos {
-                            rack_file_row(ui, app, fi, &name, &fp, 2);
+                        // additionally carries a kind badge. v28: within a
+                        // section each sub-folder renders as its own group —
+                        // a clickable "− dir (N)" header row (N = entries of
+                        // ALL kinds in that dir) followed by its indented
+                        // rows; "+" = collapsed, click to expand. Root-level
+                        // files keep the classic ungroupped look.
+                        for kind in 0u8..3 {
+                            let entries: Vec<&RackFile> = files
+                                .iter()
+                                .filter(|r| {
+                                    if kind == 0 {
+                                        !r.is_midi && !r.is_auto
+                                    } else if kind == 1 {
+                                        r.is_midi
+                                    } else {
+                                        r.is_auto
+                                    }
+                                })
+                                .collect();
+                            if entries.is_empty() {
+                                continue;
+                            }
+                            let (label, col) = match kind {
+                                1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
+                                2 => ("AUTOMATION", Color32::from_rgb(255, 120, 120)),
+                                _ => ("audio", Color32::from_rgb(210, 175, 120)),
+                            };
+                            ui.label(RichText::new(label).weak().small().color(col));
+                            let mut i = 0usize;
+                            while i < entries.len() {
+                                let d = &entries[i].dir;
+                                let mut j = i + 1;
+                                while j < entries.len() && &entries[j].dir == d {
+                                    j += 1;
+                                }
+                                if d.is_empty() {
+                                    for r in &entries[i..j] {
+                                        rack_file_row(ui, app, fi, &r.name, &r.path, kind, 0.0);
+                                    }
+                                } else {
+                                    let n = files.iter().filter(|r| &r.dir == d).count();
+                                    let key = format!("{path}\u{1}{d}");
+                                    let open = !app.rack_collapsed.contains(&key);
+                                    let hw = ui.available_width();
+                                    let hr = ui.add_sized(
+                                        egui::vec2(hw, 18.0),
+                                        egui::Button::new(
+                                            RichText::new(format!(
+                                                // ASCII +/- only: the default
+                                                // fonts have tofu for most
+                                                // symbol glyphs (skill trap).
+                                                "{} {} ({})",
+                                                if open { "-" } else { "+" },
+                                                d,
+                                                n
+                                            ))
+                                            .small()
+                                            .strong(),
+                                        ),
+                                    );
+                                    if hr.clicked() {
+                                        if open {
+                                            app.rack_collapsed.insert(key);
+                                        } else {
+                                            app.rack_collapsed.remove(&key);
+                                        }
+                                    }
+                                    hr.on_hover_text(format!(
+                                        "sub-folder {d} — click to {}",
+                                        if open { "collapse" } else { "expand" }
+                                    ));
+                                    if open {
+                                        for r in &entries[i..j] {
+                                            rack_file_row(ui, app, fi, &r.name, &r.path, kind, 12.0);
+                                        }
+                                    }
+                                }
+                                i = j;
+                            }
                         }
                     }
                     if let Some(fi) = rescan {
@@ -20779,5 +20834,185 @@ mod tests {
             (t - 45_120).abs() < 1_500 && t % 24_000 != 0,
             "seconds mode stays freehand, got {t}"
         );
+    }
+
+    // ------------------- v28: rack sub-folders -------------------
+
+    /// Centers of every painted text galley matching `want` (exact or
+    /// contains) in paint (= layout) order, in a TALL viewport (v25 cull
+    /// trap) with the pointer parked off all rows (hover-text trap).
+    fn galley_centers(app: &mut App, ctx: &egui::Context, want: &str, exact: bool) -> Vec<egui::Pos2> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 2600.0),
+            )),
+            events: vec![moved(egui::pos2(20.0, 2590.0))],
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hits = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let txt = t.galley.text();
+                    let hit = if exact { txt == want } else { txt.contains(want) };
+                    if hit {
+                        let local = t.galley.rect;
+                        return Some(t.pos + (local.center() - local.min));
+                    }
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hits
+    }
+
+    /// A tiny decodable WAV at `rel` under `dir`, creating parent dirs —
+    /// the sub-folder trees the v28 rack pins scan.
+    fn v28_wav(dir: &std::path::Path, rel: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let data: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.1).sin() * 0.4).collect();
+        crate::audio_io::export(
+            &p,
+            48000,
+            &data,
+            crate::audio_io::ExportFormat::Wav,
+        )
+        .unwrap();
+    }
+
+    /// v28 R2/A2: sub-folders become labeled group headers with entry
+    /// counts above indented rows; root files stay ungroupped; groups
+    /// default to expanded.
+    #[test]
+    fn v28_rack_subfolder_groups_painted() {
+        let mut app = headless_app("v28grp");
+        let samples = std::env::temp_dir().join("sp-uity-v28grp/samples");
+        v28_wav(&samples, "kit-a/kick.wav");
+        v28_wav(&samples, "kit-b/snare.wav");
+        v28_wav(&samples, "kit-b/hat.wav");
+        v28_wav(&samples, "kit-b/kick.wav");
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        assert!(!v25_hits(&mut app, &ctx, "kit-a (1)").is_empty(), "kit-a header");
+        assert!(!v25_hits(&mut app, &ctx, "kit-b (3)").is_empty(), "kit-b header");
+        assert!(
+            !v25_hits(&mut app, &ctx, "- kit-a (1)").is_empty(),
+            "expanded default shows the '-' collapse marker"
+        );
+        // Root kick (pre-existing) plus one kick per kit, all as rows.
+        assert_eq!(galley_centers(&mut app, &ctx, "kick", true).len(), 3);
+        assert_eq!(galley_centers(&mut app, &ctx, "snare", true).len(), 1);
+        assert_eq!(galley_centers(&mut app, &ctx, "hat", true).len(), 1);
+    }
+
+    /// v28 A3: the group header toggles collapse; collapsed hides the rows
+    /// and flips to "+"; state survives a rescan within the session.
+    #[test]
+    fn v28_rack_group_collapse_toggle() {
+        let mut app = headless_app("v28col");
+        let samples = std::env::temp_dir().join("sp-uity-v28col/samples");
+        v28_wav(&samples, "kit-b/snare.wav");
+        v28_wav(&samples, "kit-b/hat.wav");
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "kit-b (2)", false)[0];
+        click_pt(&mut app, &ctx, h);
+        assert!(!app.rack_collapsed.is_empty(), "header click collapses");
+        assert!(galley_centers(&mut app, &ctx, "snare", true).is_empty(), "collapsed hides rows");
+        assert!(!v25_hits(&mut app, &ctx, "+ kit-b (2)").is_empty(), "collapsed marker");
+        let h2 = galley_centers(&mut app, &ctx, "kit-b (2)", false)[0];
+        click_pt(&mut app, &ctx, h2);
+        assert!(app.rack_collapsed.is_empty(), "second click expands again");
+        assert_eq!(galley_centers(&mut app, &ctx, "snare", true).len(), 1, "rows return");
+        // A rescan (files on disk unchanged) must not silently re-expand.
+        app.rack_collapsed.insert(format!("{}\u{1}kit-b", app.rack[0].path));
+        app.rack[0].rescan();
+        assert!(galley_centers(&mut app, &ctx, "snare", true).is_empty(), "rescan keeps it collapsed");
+    }
+
+    /// v28 A4: a row inside a sub-folder behaves exactly like a root row —
+    /// click imports the asset (by path) and starts the audition.
+    #[test]
+    fn v28_rack_subfolder_row_click_selects() {
+        let mut app = headless_app("v28clk");
+        let samples = std::env::temp_dir().join("sp-uity-v28clk/samples");
+        v28_wav(&samples, "kit-b/snare.wav");
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let p = galley_centers(&mut app, &ctx, "snare", true)[0];
+        click_pt(&mut app, &ctx, p);
+        let k = app.sel_asset.expect("sub-folder row click selects an asset");
+        assert!(
+            app.assets[k].path.to_string_lossy().contains("kit-b/snare.wav"),
+            "{}",
+            app.assets[k].path.display()
+        );
+        assert!(app.status.starts_with("previewing snare"), "{}", app.status);
+    }
+
+    /// v28 A8: two kits each shipping "kick" stay DISTINCT rows, distinct
+    /// interaction ids and distinct assets (path-keyed).
+    #[test]
+    fn v28_rack_dup_stems_distinct() {
+        let mut app = headless_app("v28dup");
+        let samples = std::env::temp_dir().join("sp-uity-v28dup/samples");
+        v28_wav(&samples, "kit-a/kick.wav");
+        v28_wav(&samples, "kit-b/kick.wav");
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let rows = galley_centers(&mut app, &ctx, "kick", true);
+        assert_eq!(rows.len(), 3, "root + kit-a + kit-b kick rows");
+        click_pt(&mut app, &ctx, rows[1]);
+        let a = app.sel_asset.unwrap();
+        click_pt(&mut app, &ctx, rows[2]);
+        let b = app.sel_asset.unwrap();
+        assert_ne!(a, b, "two kit kicks are distinct assets");
+        let pa = app.assets[a].path.clone();
+        let pb = app.assets[b].path.clone();
+        assert!(
+            pa.to_string_lossy().contains("kit-a/kick") && pb.to_string_lossy().contains("kit-b/kick"),
+            "{pa:?} vs {pb:?}"
+        );
+    }
+
+    /// v28 A5: with NO configured rack folders the rack opens on the
+    /// SAMPLES ROOT, and the seeded 808 pack shows as its sub-folder "808".
+    #[test]
+    fn v28_rack_default_folder_is_samples_root() {
+        std::env::set_var("SLOOPER_NULL_AUDIO", "1");
+        std::env::remove_var("XDG_DATA_HOME"); // deterministic data_dir()
+        let dir = std::env::temp_dir().join("sp-uity-v28def");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("slooper/effects")).unwrap();
+        std::fs::write(dir.join("slooper/config.json"), "{}").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("HOME", &dir);
+        let mut app = App::new(Backend::start());
+        let root = crate::samples808::samples_root();
+        assert_eq!(app.rack.len(), 1, "fresh config gets exactly one folder");
+        assert_eq!(
+            app.rack[0].path,
+            root.display().to_string(),
+            "fresh default = samples root, not the 808 pack dir"
+        );
+        assert!(app.rack[0].err.is_none(), "{:?}", app.rack[0].err);
+        assert!(app
+            .rack[0]
+            .files
+            .iter()
+            .any(|f| f.dir == "808" && f.name == "808-kick"));
+        let ctx = egui::Context::default();
+        assert!(!v25_hits(&mut app, &ctx, "808 (").is_empty(), "808 group painted");
     }
 }
