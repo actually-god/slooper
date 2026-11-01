@@ -423,6 +423,11 @@ pub enum MidiAction {
     /// into a pattern; disarming bounces it to an asset + clip (like an
     /// audio take).
     MidiRec(usize),
+    /// Set the MASTER volume from a continuous controller (0 = -inf dB,
+    /// 127 = the top of the master slider's range). The one standard
+    /// global knob every project wants (v32). Value semantics as
+    /// [`MidiAction::VolLoop`].
+    VolMaster,
     /// Catch-all for action names this build no longer knows (see the enum
     /// doc); never bindable, never fired.
     #[serde(other)]
@@ -439,9 +444,9 @@ impl MidiAction {
     /// v0.2 reshaped this table when overdub/import/dependent/undo/redo were
     /// removed; the old positional tables (length 140 / 25 / 9) are remapped
     /// on load (see `ui::migrate_shortcuts`). New actions must be APPENDED.
-    pub const ALL: [MidiAction; 137] = {
+    pub const ALL: [MidiAction; 138] = {
         // const-friendly construction: the layout is fully arithmetic.
-        let mut a = [MidiAction::Reserved; 137];
+        let mut a = [MidiAction::Reserved; 138];
         a[0] = MidiAction::RecSelected;
         a[1] = MidiAction::ClearSelected;
         a[2] = MidiAction::PlaySelected;
@@ -464,6 +469,10 @@ impl MidiAction {
         a[70] = MidiAction::SelectPrev;
         a[71] = MidiAction::PlayAll;
         a[72] = MidiAction::StopAll;
+        // v32 APPENDED: the master-volume knob sits at the first free
+        // slot after the MIDI-rec family (121..136), keeping every older
+        // positional table valid unchanged.
+        a[137] = MidiAction::VolMaster;
         a
     };
 
@@ -492,6 +501,7 @@ impl MidiAction {
             MidiAction::GainLoop(i) => format!("track {}: gain (knob)", i + 1),
             MidiAction::PanLoop(i) => format!("track {}: pan (knob)", i + 1),
             MidiAction::MidiRec(i) => format!("track {}: MIDI record", i + 1),
+            MidiAction::VolMaster => "master volume (knob)".into(),
             MidiAction::Reserved => String::new(),
         }
     }
@@ -502,7 +512,10 @@ impl MidiAction {
     pub fn is_continuous(self) -> bool {
         matches!(
             self,
-            MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_)
+            MidiAction::VolLoop(_)
+                | MidiAction::GainLoop(_)
+                | MidiAction::PanLoop(_)
+                | MidiAction::VolMaster
         )
     }
 }
@@ -526,6 +539,11 @@ pub fn migrate_shortcuts(old: &[Option<egui::Key>]) -> Vec<Option<egui::Key>> {
     let mut out = vec![None; N_ACTIONS];
     match old.len() {
         n if n == N_ACTIONS => return old.to_vec(),
+        137 => {
+            // v32: only VolMaster (slot 137) was appended — every older
+            // slot keeps its position, the new knob starts unbound.
+            out[..137].copy_from_slice(old);
+        }
         140 => {
             // (old, new) slot pairs; removed actions have no entry.
             for (o, n) in [(0, 0), (2, 1), (3, 2), (5, 3), (87, 68), (88, 69), (89, 70)] {
@@ -743,5 +761,34 @@ mod tests {
         // Labels carry the essentials for the settings UI.
         assert!(bcc.label().contains("CC 7"));
         assert!(bpc.label().contains("PC 11"));
+    }
+
+    /// v32: master volume is a global standard action — APPENDED to the
+    /// table (old save files address slots by index, so positions are
+    /// sacred), continuous (a knob owns its whole axis, like fader/cross),
+    /// and the shortcut-table migration keeps every old binding.
+    #[test]
+    fn v32_volmaster_appended_migrated_and_continuous() {
+        assert_eq!(MidiAction::ALL.len(), 138);
+        assert_eq!(MidiAction::ALL[137], MidiAction::VolMaster);
+        assert_eq!(MidiAction::idx(MidiAction::VolMaster), 137);
+        assert!(MidiAction::VolMaster.is_continuous());
+        assert_eq!(MidiAction::VolMaster.label(), "master volume (knob)");
+        // Positions preserved: the old last row and the first row moved
+        // nowhere.
+        assert_eq!(MidiAction::ALL[0], MidiAction::RecSelected);
+        assert_eq!(MidiAction::ALL[136], MidiAction::MidiRec(15));
+        // A pre-v32 137-slot table keeps every binding; the new row starts
+        // unbound; a current-length table passes through trusted.
+        let old: Vec<Option<egui::Key>> = (0..137)
+            .map(|i| if i == 5 { Some(egui::Key::R) } else { None })
+            .collect();
+        let m = migrate_shortcuts(&old);
+        assert_eq!(m.len(), 138);
+        assert_eq!(m[5], Some(egui::Key::R));
+        assert_eq!(m[137], None);
+        let mut cur = m.clone();
+        cur[137] = Some(egui::Key::Z);
+        assert_eq!(migrate_shortcuts(&cur)[137], Some(egui::Key::Z));
     }
 }

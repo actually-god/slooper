@@ -16,7 +16,7 @@
 //!
 //! If no JACK/PipeWire server is running, the tests skip themselves.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2399,4 +2399,198 @@ fn v23_probe_child_dies_instead_of_the_host() {
             );
         }
     }
+}
+
+/// v32: MIDI source + audio sink in one client. `stage` commands the note:
+/// 0 idle, 1 write note-on next cycle, 2 write note-off next cycle; the
+/// sink copies slooper's output into the shared capture ring.
+struct LiveMidiCapProc {
+    out: Port<MidiOut>,
+    stage: Arc<AtomicUsize>,
+    sink: Port<AudioIn>,
+    ring: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+}
+
+impl ProcessHandler for LiveMidiCapProc {
+    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+        match self.stage.swap(0, Ordering::SeqCst) {
+            1 => {
+                let _ = self
+                    .out
+                    .writer(ps)
+                    .write(&RawMidi { time: 0, bytes: &[0x90, 60, 100] });
+            }
+            2 => {
+                let _ = self
+                    .out
+                    .writer(ps)
+                    .write(&RawMidi { time: 0, bytes: &[0x80, 60, 0] });
+            }
+            _ => {}
+        }
+        let n = ps.n_frames() as usize;
+        if n == 0 {
+            return Control::Continue;
+        }
+        let sink = self.sink.as_slice(ps);
+        let nring = self.ring.len() as u64;
+        let mut w = self.widx.load(Ordering::Relaxed);
+        for s in sink {
+            self.ring[(w % nring) as usize].store(s.to_bits(), Ordering::Relaxed);
+            w += 1;
+        }
+        self.widx.store(w, Ordering::Relaxed);
+        Control::Continue
+    }
+}
+
+/// The bug this pins: MIDI arrived, the monitor blinked, bindings fired,
+/// recording worked — and no synthesizer ever sounded live, for any synth
+/// type, because the realtime path forwarded messages to the UI and nobody
+/// fed the instruments. Playing the keyboard must play through the
+/// selected track's synth with the transport STOPPED (the "live feedback
+/// while recording" the user never heard), a held key must keep sounding,
+/// a BOUND note must stay silent (bound = control traffic, the rule MIDI
+/// recording already used), and the settings gate must gate.
+#[test]
+fn e2e_live_midi_input_plays_synths() {
+    let _g = e2e_lock();
+    let Some((b, client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let stage = Arc::new(AtomicUsize::new(0));
+    let (client, _status) =
+        Client::new("midi_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let midi_out = client
+        .register_port("midi_out", MidiOut::default())
+        .unwrap();
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    client
+        .connect_ports_by_name(
+            &format!("{src_name}:midi_out"),
+            &format!("{client_name}:midi_in"),
+        )
+        .expect("connect to slooper:midi_in");
+    let active = client
+        .activate_async(
+            (),
+            LiveMidiCapProc {
+                out: midi_out,
+                stage: stage.clone(),
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // The bundled piano answers on the default-selected track. NO clips
+    // and the transport never starts: everything this test hears is the
+    // live feed, which pre-v32 did not exist.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(
+        slooper::audio::SynthHandle::Script(inst),
+    ))));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        ring_peak(&ring, &widx, 4800)
+            .map(|p| p < 0.002)
+            .unwrap_or(false),
+        "idle before playing: silent"
+    );
+
+    // Play. The attack is audible within a few blocks...
+    stage.store(1, Ordering::SeqCst);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(3),
+        "live note-on plays the selected track's synth (transport STOPPED)",
+    );
+    let head = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("head");
+    let head_rms = rms(&head);
+    // ...and the held key keeps sounding long after the block its message
+    // arrived in (the synth is still timed, not timed out).
+    std::thread::sleep(Duration::from_millis(500));
+    let mid = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("mid");
+    let mid_rms = rms(&mid);
+    assert!(
+        mid_rms > 0.1 * head_rms,
+        "held key keeps sounding: mid {mid_rms} vs head {head_rms}"
+    );
+    // Release: it decays.
+    stage.store(2, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1400));
+    let tail = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+        .expect("tail");
+    assert!(
+        rms(&tail) < 0.25 * mid_rms,
+        "released key decays: {} vs {mid_rms}",
+        rms(&tail)
+    );
+
+    // Bound note = control traffic: note 60 bound to an action must not
+    // sound live (its release passes through untouched — never a stuck
+    // note).
+    b.engine.set_midi_bound(slooper::audio::BoundSet {
+        exact: vec![slooper::audio::bind_key(0, 0, 60)],
+        axes: vec![],
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    stage.store(1, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    stage.store(2, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        ring_peak(&ring, &widx, sr as usize / 4)
+            .map(|p| p < 0.002)
+            .unwrap_or(false),
+        "a bound note is control traffic: it must not play the synth"
+    );
+
+    // The settings gate: unbound, gate OFF → silent; gate ON → plays again.
+    b.engine.set_midi_bound(slooper::audio::BoundSet::default());
+    b.engine.set_midi_live(false);
+    std::thread::sleep(Duration::from_millis(60));
+    stage.store(1, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        ring_peak(&ring, &widx, sr as usize / 4)
+            .map(|p| p < 0.002)
+            .unwrap_or(false),
+        "live MIDI switched off: the keyboard is silent"
+    );
+    stage.store(2, Ordering::SeqCst);
+    b.engine.set_midi_live(true);
+    std::thread::sleep(Duration::from_millis(120));
+    stage.store(1, Ordering::SeqCst);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(3),
+        "gate back on: the keyboard plays again",
+    );
+    stage.store(2, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = active;
 }
