@@ -1789,6 +1789,10 @@ fn run(
         live_notes: [0i32; MAX_LOOPS],
         bound_cache: engine.midi_bound(),
         bound_gen: engine.midi_bound_gen(),
+        // v32 R7: start at the default unity controls (no boot ramp).
+        amp_env: [1.0; MAX_LOOPS],
+        mon_env: 1.0,
+        g_env: 1.0,
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -3070,6 +3074,14 @@ struct Proc {
     /// v32: last bound-set snapshot + its generation (try_lock refresh).
     bound_cache: Arc<BoundSet>,
     bound_gen: u64,
+    /// v32 R7: block-edge gain smoothing. Every gain multiplied per
+    /// sample (track amp, monitor amp, master gain) linearly ramps from
+    /// this block-start value to the new one across the block; a hard
+    /// step is what the user hears as "static" at loop start/stop and on
+    /// volume jumps. These hold the value at the START of each block.
+    amp_env: [f32; MAX_LOOPS],
+    mon_env: f32,
+    g_env: f32,
 }
 
 /// RT-side snapshot of one effect instance's sliders.
@@ -3236,11 +3248,14 @@ impl Proc {
         false
     }
 
-    fn collect_clips(&self, p0: u64, n: usize, entries: &mut Vec<ClipEntry>) {
+    fn collect_clips(&self, p0: u64, n: usize, hold_mask: u128, entries: &mut Vec<ClipEntry>) {
         entries.clear();
         let span_end = p0.saturating_add(n as u64);
         for (t, track) in self.arr.tracks.iter().enumerate() {
-            if !self.engine.track_on(t) {
+            // v32 R7: a just-muted track keeps its window while its release
+            // ramp is running (hold_mask) — else the fade has nothing to
+            // fade and the mute lands as a hard step.
+            if !self.engine.track_on(t) && (hold_mask >> t) & 1 == 0 {
                 continue;
             }
             for lane in &track.lanes {
@@ -3338,6 +3353,8 @@ fn build_mix_lists(
 impl ProcessHandler for Proc {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
         let n = ps.n_frames() as usize;
+        // v32 R7: one block in units of per-sample step.
+        let inv_n = if n > 0 { 1.0 / n as f32 } else { 0.0 };
 
         // --- v32 live MIDI feed state for this block ----------------------
         // The bound-message snapshot refreshes like every other table
@@ -3524,6 +3541,11 @@ impl ProcessHandler for Proc {
         if !self.engine.monitor_on.load(Ordering::Relaxed) {
             mon_amp = 0.0; // Settings → live input monitoring off
         }
+        // v32 R7: the monitor gain ramps like every other multiplier
+        // (selecting another track / toggling monitor must not click).
+        let mon_a = self.mon_env;
+        let mon_s = (mon_amp - mon_a) * inv_n;
+        self.mon_env = mon_amp;
 
         // Compact list of recording tracks: the sample loop iterates only
         // these instead of all MAX_LOOPS slots per sample.
@@ -3547,11 +3569,24 @@ impl ProcessHandler for Proc {
             && self.arr.tracks.iter().enumerate().any(|(t, tr)| {
                 self.engine.track_on(t) && tr.lanes.iter().any(|l| !l.clips.is_empty())
             });
+        // v32 R7: a release ramp from the previous block still running:
+        // the mix must keep producing (fading) even though the gates
+        // below already closed. The mask doubles as the "collect windows
+        // even when muted" override for the fade blocks.
+        let env_mask: u128 = (0..MAX_LOOPS).fold(0u128, |m, t| {
+            if self.amp_env[t].abs() > 1e-4 {
+                m | (1u128 << t)
+            } else {
+                m
+            }
+        });
+        let env_held = env_mask != 0;
         let metro_on = self.engine.metro().0;
         if in_mask == 0
             && (out_mask_l | out_mask_r) == 0
             && !any_rec
             && !clip_sound
+            && !env_held
             && !metro_on
             && !self.preview_live
         {
@@ -3625,8 +3660,8 @@ impl ProcessHandler for Proc {
         // call `&mut self` effect code while iterating it.
         let mut entries = std::mem::take(&mut self.clip_buf);
         entries.clear();
-        if clip_sound {
-            self.collect_clips(p0, block_n, &mut entries);
+        if clip_sound || env_held {
+            self.collect_clips(p0, block_n, env_mask, &mut entries);
         }
         // MIDI pattern clips of this block, rendered per track through the
         // track's synth into `midi_scratch` (mixed in the sample loop).
@@ -3674,6 +3709,26 @@ impl ProcessHandler for Proc {
             if auto.muted[t] {
                 amp[t] = 0.0;
             }
+        }
+
+        // ---- v32 R7: block-edge gain smoothing ---------------------------
+        // Every per-sample multiplier ramps from last block's value to
+        // this block's target across the block. Tracks that fell SILENT
+        // (mute, transport stop, automation off-clip) keep their mix slot
+        // until the release ramp finishes: audio never gets cut mid-
+        // waveform at a block edge — the "static" at loop start/stop and
+        // volume jumps. Linear across ONE block (~21 ms at 1024/48k),
+        // zero-cost when the target did not move.
+        let mut amp_a = [0.0f32; MAX_LOOPS];
+        let mut amp_s = [0.0f32; MAX_LOOPS];
+        for t in 0..MAX_LOOPS {
+            let tgt = if audible[t] { amp[t] } else { 0.0 };
+            amp_a[t] = self.amp_env[t];
+            amp_s[t] = (tgt - self.amp_env[t]) * inv_n;
+            if !audible[t] && self.amp_env[t].abs() > 1e-4 {
+                audible[t] = true; // hold the slot until the fade ends
+            }
+            self.amp_env[t] = tgt;
         }
 
         // Cache this cycle's input buffers (raw pointers are stable). Only
@@ -3727,6 +3782,10 @@ impl ProcessHandler for Proc {
         let ins = &in_bufs[..nin];
 
         let g = f32::from_bits(self.gain.load(Ordering::Relaxed)) * auto.master_vol.unwrap_or(1.0);
+        // v32 R7: the master knob / master automation ramps too.
+        let g_a = self.g_env;
+        let g_s = (g - g_a) * inv_n;
+        self.g_env = g;
 
         // Metronome grid on the timeline: click k at timeline sample
         // `k * sub_len` (sub = clicks per beat). Track the grid index last
@@ -3777,7 +3836,7 @@ impl ProcessHandler for Proc {
         // chains there is nothing to run at all. `has_entries` is
         // block-constant: the accumulator only needs refilling when this
         // block actually holds clip windows.
-        let mut mixer_live = clip_sound || has_midi;
+        let mut mixer_live = clip_sound || env_held || has_midi;
         let mut chain_mask = [false; MAX_LOOPS];
         let mut any_chain = false;
         for (t, m) in chain_mask.iter_mut().enumerate() {
@@ -3917,13 +3976,16 @@ impl ProcessHandler for Proc {
                 for &tt in &mix_list[..nmix] {
                     let t = tt as usize;
                     let a = acc[t];
+                    // v32 R7: ramped track trim (block-constant `amp` was
+                    // the click at mute toggles / volume jumps).
+                    let av = amp_a[t] + amp_s[t] * i as f32;
                     if vst_mask[t] {
                         // Held back: this track's chain (scripts and
                         // plugins, in chain order) runs block-wise over
                         // the pre-pan sum after the sample loop.
-                        trk_bufs[t][i] = a * amp[t];
+                        trk_bufs[t][i] = a * av;
                     } else {
-                        let m = self.fx_mix(t, a * amp[t]);
+                        let m = self.fx_mix(t, a * av);
                         play_l += m * pgl[t];
                         play_r += m * pgr[t];
                     }
@@ -4011,10 +4073,11 @@ impl ProcessHandler for Proc {
             // with a VST insert on the monitored track its output is held
             // back for the plugin instead of feeding the mix directly.
             let mut mon = 0.0f32;
+            let mon_i = mon_a + mon_s * i as f32;
             if sel_vst {
-                mon_buf[i] = src_in * mon_amp;
+                mon_buf[i] = src_in * mon_i;
             } else {
-                mon = self.fx_mix(sel, src_in * mon_amp);
+                mon = self.fx_mix(sel, src_in * mon_i);
             }
             let clickc = click * F1S2;
             // Pre-master, pre-gain mix; ports get written post-loop (once any
@@ -4059,8 +4122,10 @@ impl ProcessHandler for Proc {
         // Master gain + port writes (moved out of the sample loop so VST
         // inserts can run before the mix leaves the callback).
         for i in 0..n {
-            let v_l = mix_l[i] * g;
-            let v_r = mix_r[i] * g;
+            // v32 R7: ramped master (g_a → g across the block).
+            let gm = g_a + g_s * i as f32;
+            let v_l = mix_l[i] * gm;
+            let v_r = mix_r[i] * gm;
             let av = v_l.abs().max(v_r.abs());
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();

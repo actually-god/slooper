@@ -25094,8 +25094,7 @@ mod tests {
         let row_plus_x = |app: &mut App, ctx: &egui::Context| -> Option<f32> {
             let head = galley_centers(app, ctx, "Track 1", false)
                 .into_iter()
-                .filter(|c| c.x > 1000.0)
-                .next()?;
+                .find(|c| c.x > 1000.0)?;
             let plus = galley_centers(app, ctx, "+", true)
                 .into_iter()
                 .find(|c| c.x > 1000.0 && (c.y - head.y).abs() < 8.0)?;
@@ -25104,8 +25103,7 @@ mod tests {
         let at = |app: &mut App, ctx: &egui::Context, want: &str| -> Option<f32> {
             let head = galley_centers(app, ctx, "Track 1", false)
                 .into_iter()
-                .filter(|c| c.x > 1000.0)
-                .next()?;
+                .find(|c| c.x > 1000.0)?;
             galley_centers(app, ctx, want, true)
                 .into_iter()
                 .find(|c| c.x > 1000.0 && (c.y - head.y).abs() < 14.0)

@@ -2594,3 +2594,131 @@ fn e2e_live_midi_input_plays_synths() {
     std::thread::sleep(Duration::from_millis(300));
     let _ = active;
 }
+
+/// The bug this pins: gain changes were block-CONSTANT multipliers, so
+/// loop start/stop, mutes and volume jumps cut the waveform mid-swing at
+/// a block edge — the "static", everyone heard, on every asset and synth.
+/// With a constant-value (DC) clip the un-smoothed path produces one
+/// 0.5-sized SAMPLE-TO-SAMPLE JUMP per event, while the v32 ramps cap the
+/// delta at amp/block-size. Detecting |Δ| is therefore exact, not fussy.
+#[test]
+fn e2e_no_click_gain_steps() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, _sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("click_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // One constant 0.5 clip: any discontinuity is a single huge Δ.
+    let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 16_000]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![a0]);
+    b.cmd(Cmd::SetProject {
+        assets: table,
+        arr: Arc::new(arr),
+        len: 32_000,
+    });
+    b.cmd(Cmd::SetLoop(true));
+
+    let max_delta = |x: &[f32]| -> f32 {
+        x.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()))
+    };
+    // Capture a SPANK that straddles a command: ring positions are exact,
+    // so the transition itself (not just the aftermath) lands inside.
+    let read_span = |ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, w0: u64, back: u64, fwd: u64| -> Vec<f32> {
+        let n = ring.len() as u64;
+        while widx.load(Ordering::Relaxed).saturating_sub(w0) < fwd {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ((w0 - back)..(w0 + fwd))
+            .map(|i| f32::from_bits(ring[(i % n) as usize].load(Ordering::Relaxed)))
+            .collect()
+    };
+
+    // Play: steady DC, zero deltas (float-exact except the start ramp).
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| (m - 0.5).abs() < 0.05)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "DC clip playing",
+    );
+    let steady = read_ring(&ring, &widx, 4800, Duration::from_millis(500)).expect("steady");
+    assert!(
+        max_delta(&steady) < 0.02,
+        "steady playback shows steps: {}",
+        max_delta(&steady)
+    );
+
+    // STOP: the fade must take the level to zero in small steps — measure
+    // the window that CONTAINS the stop command.
+    let w0 = widx.load(Ordering::Relaxed);
+    b.cmd(Cmd::StopAll);
+    let stop = read_span(&ring, &widx, w0, 480, 4800);
+    assert!(
+        max_delta(&stop) < 0.02,
+        "transport STOP clicked: max sample delta {}",
+        max_delta(&stop)
+    );
+    assert!(
+        stop[stop.len() - 100..].iter().all(|s| s.abs() < 0.02),
+        "stop did not fade to silence"
+    );
+
+    // Play again (the start edge clicked too, pre-v32), then MUTE.
+    let w1 = widx.load(Ordering::Relaxed);
+    b.cmd(Cmd::PlayAll);
+    let play = read_span(&ring, &widx, w1, 480, 4800);
+    assert!(
+        max_delta(&play) < 0.02,
+        "transport PLAY clicked: max sample delta {}",
+        max_delta(&play)
+    );
+    wait_until(
+        || {
+            ring_mean(&ring, &widx, 480)
+                .map(|m| (m - 0.5).abs() < 0.05)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "playing again",
+    );
+    let w2 = widx.load(Ordering::Relaxed);
+    b.cmd(Cmd::ToggleTrackOn { i: 0 });
+    let mute = read_span(&ring, &widx, w2, 480, 4800);
+    assert!(
+        max_delta(&mute) < 0.02,
+        "track MUTE clicked: max sample delta {}",
+        max_delta(&mute)
+    );
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(80));
+    let _ = active;
+}
