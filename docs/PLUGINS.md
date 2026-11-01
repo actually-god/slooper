@@ -412,8 +412,18 @@ Recipe (the GUI installer's PureBasic stub deadlocks under wine — skip it):
 
 AL V is a synth **with an audio input** — the VST2 probe must read
 `effFlagsSynth`, not "no inputs" (v31 fix). Sound stays silent until the
-one-time Arturia login (ASC agent + `Analog Lab V.exe` standalone, laid
-from the ASC installer the same extract way).
+one-time Arturia login. Because the extract route skips the installer's
+registry writes, AL V reports "Error 02: Failed to launch Arturia Software
+Center client!" until you register the client path and start it first:
+
+```
+wine reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Arturia Software Center.exe" /ve /t REG_SZ /d "C:\Program Files\Arturia Software Center\Arturia Software Center.exe" /f
+wine "C:\Program Files\Arturia Software Center\ArturiaSoftwareCenterAgent.exe"   # background
+wine "C:\Program Files\Arturia Software Center\Arturia Software Center.exe"     # login window (do the login HERE, not in AL V's modal)
+```
+
+then start `Analog Lab V.exe`. AL V's own modal email box crashed while
+the client was missing; the ASC client renders its own proper login form.
 
 MiniLab 37 hardware needs nothing: class-compliant MIDI, auto-linked to
 `slooper:midi_in`. Firmware updates need MCC → Windows or a friend.
