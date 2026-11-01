@@ -1149,6 +1149,21 @@ enum Backend {
     V2(RtBackend<vst2::host::PluginInstance>),
 }
 
+/// One queued channel-voice message with its position on the input sample
+/// stream (the plugin receives it `pos - block_start` samples into the
+/// internal block it lands in). v33: sample-exact event delivery.
+#[derive(Clone, Copy)]
+struct QueuedMidi {
+    m: [u8; 3],
+    pos: i64,
+}
+
+/// Soft cap of the pending-MIDI queue. Sized far above the worst case the
+/// RT path can stage in one cycle (JACK full-rate merged MIDI is ~10 msgs
+/// per 512-sample block; this is ~800 blocks' worth) — reaching it means
+/// the plugin stopped consuming, and the overflow is COUNTED, never silent.
+const MIDI_QUEUE_CAP: usize = 8192;
+
 // ------------------------------------------------------------ rt state ---
 
 /// Mutable audio-thread state of a stage entry. Touched exclusively by
@@ -1176,9 +1191,20 @@ struct RtState {
     /// Dry echo filling the startup window until the plugin (plus any
     /// latency it adds) produces its first samples.
     echo: FxRing,
-    /// Channel voice messages fed for instrument use, delivered at the next
-    /// internal 512-block boundary (audio-thread contract, like `process`).
-    pending_midi: Vec<[u8; 3]>,
+    /// Channel voice messages fed for instrument use (audio-thread
+    /// contract, like `process`). v33: each carries the ABSOLUTE input
+    /// sample index it belongs to — delivery hands the plugin a true
+    /// `delta_frames` instead of dumping the whole block's events at
+    /// sample 0, which is what turned fast retriggers into mush.
+    pending_midi: Vec<QueuedMidi>,
+    /// Scratch: this internal block's due events, sorted by position.
+    deliver: Vec<QueuedMidi>,
+    /// Input samples fed / plugin-rendered since load (the MIDI clock).
+    abs_fed: i64,
+    abs_processed: i64,
+    /// Messages discarded because the queue was full (never silent again:
+    /// surfaced through `RtStageEntry::midi_drops`).
+    midi_drops: Arc<AtomicU64>,
     /// VST2-only: stable heap slots for raw events — `api::Events` carries
     /// pointers, so the events must not move. Filled on first use, reused.
     // The Box is load-bearing (address stability), hence no Vec::into_boxed-slice style fix.
@@ -1216,6 +1242,10 @@ pub struct RtStageEntry {
     /// preset the live instance is actually playing (session-only: like
     /// VSTi params, chunks never enter config/project saves in v0.20).
     editor_state: Mutex<Option<Vec<u8>>>,
+    /// v33: messages dropped because the pending queue or the VST3 command
+    /// ring was full. Nonzero means the HOST lost notes; compare against
+    /// `RtState.midi_drops` being identical (same Arc).
+    midi_drops: Arc<AtomicU64>,
 }
 
 /// Raw editor-dispatch handle for a loaded VST2 plugin: just the
@@ -1788,6 +1818,7 @@ fn assemble(
 ) -> RtStageEntry {
     let last: Vec<f32> = (0..descs.len()).map(|k| params.get(k)).collect();
     let seen_gen = params.generation();
+    let midi_drops = Arc::new(AtomicU64::new(0));
     let state = RtState {
         backend: parts.backend,
         hostbuf: parts.hostbuf,
@@ -1803,7 +1834,11 @@ fn assemble(
         in_ring: FxRing::with_capacity(RING_CAP),
         out_ring: FxRing::with_capacity(RING_CAP),
         echo: FxRing::with_capacity(RING_CAP),
-        pending_midi: Vec::new(),
+        pending_midi: Vec::with_capacity(256),
+        deliver: Vec::new(),
+        abs_fed: 0,
+        abs_processed: 0,
+        midi_drops: midi_drops.clone(),
         ev_pool: Vec::new(),
         errors: 0,
     };
@@ -1817,6 +1852,7 @@ fn assemble(
         has_editor,
         vst2,
         editor_state: Mutex::new(editor_state),
+        midi_drops,
     }
 }
 
@@ -1933,7 +1969,7 @@ fn open_v3(
     plugin
         .start_processing()
         .map_err(|e| format!("start: {e}"))?;
-    let (mut runner, control) = RealtimePluginRunner::new(plugin, 256);
+    let (mut runner, control) = RealtimePluginRunner::new(plugin, 4096);
     runner.start().map_err(|e| format!("run: {e}"))?;
     let bufs = AudioBuffers::new(out_ch, out_ch, VST_BLOCK, sample_rate as f64);
     Ok(assemble(
@@ -1960,9 +1996,24 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         host::{HostBuffer, PluginLoader},
         plugin::{Plugin, PluginParameters},
     };
+    // v33: opt-in phase trace (`SLOOPER_OPEN_TRACE=1`) — load-time work
+    // is invisible without it, and "plugins take ages" reports need a
+    // number per handshake step, not a vibe. eprintln only; harmless.
+    let trace = std::env::var_os("SLOOPER_OPEN_TRACE").is_some();
+    let t0 = std::time::Instant::now();
+    let mut last = t0;
+    let lap = |label: &str, last: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        if trace {
+            eprintln!("[open-trace] {label}: {} ms", (now - *last).as_millis());
+        }
+        *last = now;
+    };
     let mut loader = PluginLoader::load(path, Arc::new(Mutex::new(StubHost)))
         .map_err(|e| format!("load: {e}"))?;
+    lap("dlopen", &mut last);
     let mut inst = loader.instance().map_err(|e| format!("instance: {e}"))?;
+    lap("createInstance", &mut last);
     let info = inst.get_info();
     if info.inputs > 2 || info.outputs > 2 {
         return Err("multi-channel plugins are not supported".into());
@@ -1974,9 +2025,11 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     // its absence (that is why VST2 synths seemed fine). Verified against
     // wolf-shaper (0 → 0.5 peak) and Dragonfly.
     inst.init();
+    lap("effOpen", &mut last);
     inst.set_sample_rate(sample_rate as f32);
     inst.set_block_size(VST_BLOCK as i64);
     inst.resume();
+    lap("config+resume", &mut last);
     // v17: record this instantiation for the scan cache (see `cached_entry`).
     note_instantiated(
         path,
@@ -2003,10 +2056,20 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         })
         .collect();
     let params = VstParams::new(&descs);
+    lap("descs scan", &mut last);
     apply_saved(&params, &descs, saved);
-    for (k, d) in descs.iter().enumerate() {
-        if d.writable {
-            params_obj.set_parameter(d.id as i32, params.get(k));
+    // v33: a FRESH open writes NOTHING back — the mirror above is seeded
+    // from the plugin's own current values (the v17 doctrine VST3 already
+    // follows: seed from state, never re-plug the plugin's own face). The
+    // write-back loop only runs on a RESTORE, and only for saved values:
+    // for yabridge plugins every setParameter crosses the Wine boundary,
+    // so the unconditional pass was pure open-time tax (and a silence trap
+    // for plugins whose "current value" readouts are lies).
+    if saved.is_some() {
+        for (k, d) in descs.iter().enumerate() {
+            if d.writable {
+                params_obj.set_parameter(d.id as i32, params.get(k));
+            }
         }
     }
     let out_ch = info.outputs.clamp(1, 2) as usize;
@@ -2014,6 +2077,14 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     // the instance moves into the realtime backend.
     let has_editor = unsafe { ((*inst.raw_effect()).flags & 1) != 0 };
     let vst2 = Some(Vst2Handle::from_instance(&inst));
+    lap("handle+assemble", &mut last);
+    if trace {
+        eprintln!(
+            "[open-trace] TOTAL VST2 {} : {} ms",
+            info.name,
+            t0.elapsed().as_millis()
+        );
+    }
     Ok(assemble(
         info.name,
         RtParts {
@@ -2153,12 +2224,21 @@ impl RtStageEntry {
 
     /// Feed one channel voice message (raw status byte with channel low
     /// nibble). Audio thread only — same contract as [`Self::process`];
-    /// the message is delivered at the start of the next internal block.
+    /// the message lands at the CURRENT input edge: the exact sample the
+    /// next fed audio reaches it (v33; used to be "start of the next
+    /// internal block", which smeared fast retriggers).
     pub fn feed_midi(&self, msg: [u8; 3]) {
         // SAFETY: audio-thread-only access to `state` (see `flush`).
         let s = unsafe { &mut *self.state.get() };
-        if s.pending_midi.len() < 512 {
-            s.pending_midi.push(msg);
+        Self::queue(s, msg, s.abs_fed);
+    }
+
+    /// Queue one message, counting (never silently swallowing) overflow.
+    fn queue(s: &mut RtState, msg: [u8; 3], pos: i64) {
+        if s.pending_midi.len() < MIDI_QUEUE_CAP {
+            s.pending_midi.push(QueuedMidi { m: msg, pos });
+        } else {
+            s.midi_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2203,6 +2283,11 @@ impl RtStageEntry {
         s.out_ring.clear();
         s.echo.clear();
         s.pending_midi.clear();
+        s.deliver.clear();
+        // The sample clock restarts with the audio: pending positions were
+        // relative to it, and there are none left.
+        s.abs_fed = 0;
+        s.abs_processed = 0;
     }
 
     /// Process one engine block: mono in, mono out, internally chunked to
@@ -2218,6 +2303,7 @@ impl RtStageEntry {
         // push/pop/unwrap on the audio thread anymore.
         let dropped = s.in_ring.push_slice(&input[..n]);
         s.echo.push_slice(&input[..n]);
+        s.abs_fed += n as i64;
         if dropped > 0 {
             // History-consistent echo trim: the old code popped the echo in
             // lockstep with in-ring overflow.
@@ -2229,7 +2315,11 @@ impl RtStageEntry {
             s.stage_r.copy_from_slice(&s.stage_l);
             s.stage_ol.fill(0.0);
             s.stage_or.fill(0.0);
+            // v33: deliver this block's due events FIRST — with their true
+            // offset inside this block (see `deliver_midi`) — then render.
+            self.deliver_midi(s);
             self.process_block(s);
+            s.abs_processed += VST_BLOCK as i64;
             let got = s.stage_ol.len().min(VST_BLOCK);
             s.out_ring.push_slice(&s.stage_ol[..got]);
         }
@@ -2255,82 +2345,145 @@ impl RtStageEntry {
         }
     }
 
-    /// Hand pending channel-voice messages to the plugin. VST2 gets raw
-    /// `api::Events` (batches of 2 — the C struct's fixed pointer array);
-    /// VST3 goes through the runner's command ring (pushes never block).
+    /// Process one engine block, stamping `events` (per-slice sample
+    /// offsets, ascending) into the same sample-accurate queue — one call
+    /// per engine block replaces the old per-event split across tiny
+    /// `process` slices, and every message reaches the plugin with its
+    /// true `delta_frames`. Audio thread only.
+    pub fn process_with_midi(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        events: &[(usize, [u8; 3])],
+    ) {
+        // SAFETY: audio-thread-only access to `state` (see `flush`).
+        {
+            let s = unsafe { &mut *self.state.get() };
+            let base = s.abs_fed;
+            for (off, m) in events {
+                Self::queue(s, *m, base + *off as i64);
+            }
+        }
+        self.process(input, output);
+    }
+
+    /// Messages dropped on queue/ring overflow since load. The RT path is
+    /// structurally drop-free below `MIDI_QUEUE_CAP`; this counter exists
+    /// so a regression can never hide.
+    pub fn midi_drops(&self) -> u64 {
+        self.midi_drops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hand this internal block's due channel-voice messages to the plugin,
+    /// each with its true offset (`delta_frames` / `send_midi_at`) inside
+    /// the block about to render. VST2 gets raw `api::Events` (batches of
+    /// 2 — the C struct's fixed pointer array); VST3 goes through the
+    /// runner's command ring (pushes never block; a full ring is COUNTED).
     fn deliver_midi(&self, s: &mut RtState) {
         if s.pending_midi.is_empty() {
             return;
         }
-        let pending = std::mem::take(&mut s.pending_midi);
-        if matches!(s.backend, Backend::V3(_)) {
+        let start = s.abs_processed;
+        let end = start + VST_BLOCK as i64;
+        // Partition in one pass: due events go to `deliver`, later ones
+        // stay queued in fed order (no alloc, no realloc on the RT thread).
+        s.deliver.clear();
+        let mut keep = 0usize;
+        for k in 0..s.pending_midi.len() {
+            let q = s.pending_midi[k];
+            if q.pos < end {
+                s.deliver.push(q);
+            } else {
+                s.pending_midi[keep] = q;
+                keep += 1;
+            }
+        }
+        s.pending_midi.truncate(keep);
+        if s.deliver.is_empty() {
+            return;
+        }
+        // Stable sort on position: the engine feeds offs before ons at the
+        // same sample, and equal positions must keep that order.
+        s.deliver.sort_by_key(|q| q.pos);
+        // Destructure so the delivery loops below may touch `deliver`,
+        // `ev_pool` and `backend` as disjoint fields at once.
+        let RtState { deliver, ev_pool, backend, midi_drops, .. } = s;
+        if matches!(backend, Backend::V3(_)) {
             // The UI holds this lock only for µs-long ring pushes; a brief
             // wait here is bounded well below any block period.
             if let Ok(mut g) = self.control.lock() {
                 if let Some(c) = g.as_mut() {
                     use vst3_host::midi::MidiEvent;
-                    for m in pending {
-                        let ch = MIDI_CHANNELS[(m[0] & 0x0F) as usize];
-                        let (d1, d2) = (m[1], m[2]);
-                        let _ = match m[0] & 0xF0 {
-                            0x90 if d2 > 0 => c.send_midi(MidiEvent::NoteOn {
-                                channel: ch,
-                                note: d1,
-                                velocity: d2,
-                            }),
-                            0x80 | 0x90 => c.send_midi(MidiEvent::NoteOff {
-                                channel: ch,
-                                note: d1,
-                                velocity: d2,
-                            }),
-                            0xB0 => c.send_midi(MidiEvent::ControlChange {
-                                channel: ch,
-                                controller: d1,
-                                value: d2,
-                            }),
-                            0xC0 => c.send_midi(MidiEvent::ProgramChange {
-                                channel: ch,
-                                program: d1,
-                            }),
-                            0xD0 => c.send_midi(MidiEvent::ChannelAftertouch {
-                                channel: ch,
-                                pressure: d1,
-                            }),
-                            0xA0 => c.send_midi(MidiEvent::PolyAftertouch {
-                                channel: ch,
-                                note: d1,
-                                pressure: d2,
-                            }),
-                            0xE0 => c.send_midi(MidiEvent::PitchBend {
-                                channel: ch,
-                                value: ((d2 as u16) << 7) | (d1 as u16),
-                            }),
-                            _ => false,
+                    for q in deliver.iter() {
+                        let delta = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1) as i32;
+                        let ch = MIDI_CHANNELS[(q.m[0] & 0x0F) as usize];
+                        let (d1, d2) = (q.m[1], q.m[2]);
+                        let ok = match q.m[0] & 0xF0 {
+                            0x90 if d2 > 0 => c.send_midi_at(
+                                MidiEvent::NoteOn { channel: ch, note: d1, velocity: d2 },
+                                delta,
+                            ),
+                            0x80 | 0x90 => c.send_midi_at(
+                                MidiEvent::NoteOff { channel: ch, note: d1, velocity: d2 },
+                                delta,
+                            ),
+                            0xB0 => c.send_midi_at(
+                                MidiEvent::ControlChange {
+                                    channel: ch,
+                                    controller: d1,
+                                    value: d2,
+                                },
+                                delta,
+                            ),
+                            0xC0 => c.send_midi_at(
+                                MidiEvent::ProgramChange { channel: ch, program: d1 },
+                                delta,
+                            ),
+                            0xD0 => c.send_midi_at(
+                                MidiEvent::ChannelAftertouch { channel: ch, pressure: d1 },
+                                delta,
+                            ),
+                            0xA0 => c.send_midi_at(
+                                MidiEvent::PolyAftertouch { note: d1, pressure: d2, channel: ch },
+                                delta,
+                            ),
+                            0xE0 => c.send_midi_at(
+                                MidiEvent::PitchBend {
+                                    channel: ch,
+                                    value: ((d2 as u16) << 7) | (d1 as u16),
+                                },
+                                delta,
+                            ),
+                            _ => true,
                         };
+                        if !ok {
+                            midi_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
             return;
         }
         // VST2: the pool grows once, then every event is a reuse.
-        while s.ev_pool.len() < 2 {
+        while ev_pool.len() < 2 {
             // Zeroed raw event: a benign null record until overwritten.
-            s.ev_pool.push(Box::new(unsafe { std::mem::zeroed() }));
+            ev_pool.push(Box::new(unsafe { std::mem::zeroed() }));
         }
         let mut i = 0usize;
-        while i < pending.len() {
-            let take = 2usize.min(pending.len() - i);
-            if let Backend::V2(inst) = &mut s.backend {
+        while i < deliver.len() {
+            let take = 2usize.min(deliver.len() - i);
+            if let Backend::V2(inst) = backend {
                 use vst2::{api, plugin::Plugin};
-                for (k, m) in pending[i..i + take].iter().enumerate() {
+                for (k, q) in deliver[i..i + take].iter().enumerate() {
+                    let delta = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1);
                     let me = api::MidiEvent {
                         event_type: api::EventType::Midi,
                         byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
-                        delta_frames: 0,
+                        delta_frames: delta as i32,
                         flags: 0,
                         note_length: 0,
                         note_offset: 0,
-                        midi_data: [m[0], m[1], m[2]],
+                        midi_data: [q.m[0], q.m[1], q.m[2]],
                         _midi_reserved: 0,
                         detune: 0,
                         note_off_velocity: 0,
@@ -2340,14 +2493,14 @@ impl RtStageEntry {
                     // Identical layout — the crate's own transmute idiom.
                     let mut raw: api::Event = unsafe { std::mem::transmute(me) };
                     raw.event_type = api::EventType::Midi;
-                    *s.ev_pool[k] = raw;
+                    *ev_pool[k] = raw;
                 }
                 let events = api::Events {
                     num_events: take as i32,
                     _reserved: 0,
                     // Boxed slots keep the pointers stable; slot 1 is a
                     // dummy whenever `take == 1`.
-                    events: [s.ev_pool[0].as_mut(), s.ev_pool[1].as_mut()],
+                    events: [ev_pool[0].as_mut(), ev_pool[1].as_mut()],
                 };
                 inst.0.process_events(&events);
             }
@@ -2358,8 +2511,9 @@ impl RtStageEntry {
     /// One VST_BLOCK-sized plugin call; the mono result lands in
     /// `stage_ol` (downmixed from the plugin's output bus). On error the
     /// block passes silence (and `errors` accumulates for diagnostics).
+    /// v33: event delivery moved to `process` — the due-events pass runs
+    /// against the block's start position, before this call.
     fn process_block(&self, s: &mut RtState) {
-        self.deliver_midi(s);
         match &mut s.backend {
             Backend::V3(runner) => {
                 let mut ok = false;

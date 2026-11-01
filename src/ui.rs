@@ -849,6 +849,14 @@ fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str)> {
 /// A selected clip: (track, lane, index into the lane's clip list).
 type ClipId = (usize, usize, usize);
 
+/// A pending async ♪-synth bind: (stem label, loader channel,
+/// open-own-GUI-on-land flag). v33.
+type SynthOpenSlot = Option<(
+    String,
+    std::sync::mpsc::Receiver<Result<std::sync::Arc<crate::vsthost::RtStageEntry>, String>>,
+    bool,
+)>;
+
 /// The whole application: engine backend handle, persistent UI state, and
 /// the per-frame layout cache (`row_h` → [`App::track_rows`]) that keeps the
 /// timeline blocks and the Mixer dock strip-per-track aligned.
@@ -1181,6 +1189,11 @@ pub struct App {
     /// v16: chain rows (track, row) awaiting their load completion, then
     /// the v0.10 auto-open of the plugin's own GUI.
     vst_pending_gui: Vec<(usize, usize)>,
+    /// v33: async ♪-synth binding opens. Track slot while a loader runs.
+    /// The UI must NEVER block on a plugin open — a cold bridged
+    /// instrument takes seconds and froze the whole app during picker/
+    /// project restore.
+    vst_synth_open: Vec<SynthOpenSlot>,
     fx_editor: Option<Box<crate::fxgui::FxEditor>>,
     fx_dir_edit: String,
     fx_note: String,
@@ -1523,6 +1536,7 @@ impl App {
             vst_scan: Vec::new(),
             vst_scan_rx: None,
             vst_pending_gui: Vec::new(),
+            vst_synth_open: (0..MAX_LOOPS).map(|_| None).collect(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
             editor_probe: cfg.editor_probe.clone(),
@@ -2606,6 +2620,42 @@ impl App {
             }
             self.vst_pending_gui = keep;
         }
+        // v33: drain the async ♪-synth binding loaders. Landing swaps the
+        // engine handle (retiring any editor of the previous instance) and
+        // applies the v0.10 standard — a fresh bind opens the plugin's own
+        // GUI once it actually exists.
+        for t in 0..MAX_LOOPS {
+            let done = match self.vst_synth_open.get(t).and_then(|s| s.as_ref()) {
+                Some((_, rx, _)) => match rx.try_recv() {
+                    Ok(Ok(e)) => Some(Ok(e)),
+                    Ok(Err(err)) => Some(Err(err)),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("loader vanished".to_string()))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                },
+                None => None,
+            };
+            let Some(res) = done else { continue };
+            let Some((label, _, open_gui)) = self.vst_synth_open[t].take() else {
+                continue;
+            };
+            match res {
+                Ok(entry) => {
+                    self.land_track_synth_vst(t, entry);
+                    let mut msg = format!("track {t}: synth {label} loaded");
+                    if open_gui && !self.auto_open_synth_gui(t) {
+                        // auto_open records WHY in the status line; keep
+                        // it visible alongside the bind message.
+                        let why = std::mem::take(&mut self.status);
+                        msg = format!("{msg} \u{2014} {why}");
+                    }
+                    self.status = msg;
+                }
+                Err(err) => self.status = format!("track {t}: synth {label}: {err}"),
+            }
+            changed = true;
+        }
         changed
     }
 
@@ -3619,38 +3669,99 @@ impl App {
         self.push_project();
     }
 
-    /// (Re)create track `t`'s synth instance from its binding and push it
-    /// into the engine. Empty binding = "no synth" (engine plays through
-    /// the default piano fallback). Returns success.
+    /// Saved-parameter snapshot + VST3 patch a synth rebuild must re-apply
+    /// (shared by the sync and async binding paths — same semantics).
+    fn synth_saved_and_patch(
+        &mut self,
+        t: usize,
+    ) -> (Option<Vec<f32>>, Option<crate::vsthost::VstPatch>) {
+        // v20: re-apply a preset the user picked in this synth's own GUI
+        // (harvested when that editor last closed). v22: with NO chunk
+        // (always true for VST2 — no state ABI on this host) the saved
+        // cell snapshot is the only patch information that exists.
+        let saved = if self.track_synth_state[t].is_none()
+            && !self.track_synth_params[t].is_empty()
+        {
+            Some(self.track_synth_params[t].clone())
+        } else {
+            None
+        };
+        // v23: chunk + the parameter list harvested with it. Chunks may
+        // omit normalized values — the list keeps knob moves.
+        let patch = self.track_synth_state[t].clone().map(|chunk| {
+            crate::vsthost::VstPatch {
+                chunk,
+                params: std::mem::take(&mut self.synth_patch_params[t]),
+            }
+        });
+        (saved, patch)
+    }
+
+    /// Bind and (re)build the track's synth. (Re)creates the instance from
+    /// its binding and pushes it into the engine; empty binding = "no
+    /// synth" (engine plays through the default piano fallback). v33: VST
+    /// bindings open ASYNCHRONOUSLY — a cold bridged instrument takes
+    /// seconds, and the old synchronous open froze the entire app while
+    /// selecting Analog Lab or restoring a project. The loader lands in
+    /// [`Self::poll_vst_opens`]; script/default synths (microseconds)
+    /// stay synchronous. Returns true when a bind started (or landed).
     fn rebuild_track_synth(&mut self, t: usize) -> bool {
-        let inst = match self.track_synth[t].as_deref().filter(|s| !s.is_empty()) {
+        self.rebuild_track_synth_bind(t, false)
+    }
+
+    /// `rebuild_track_synth` with the v0.10 auto-GUI choice (a fresh ♪
+    /// bind opens the plugin's own window when the load lands).
+    fn rebuild_track_synth_bind(&mut self, t: usize, open_gui_on_land: bool) -> bool {
+        let stem = self.track_synth[t].clone().filter(|s| !s.is_empty());
+        if let Some((kind, path)) = stem.as_deref().and_then(vst_synth_decode) {
+            let (saved, patch) = self.synth_saved_and_patch(t);
+            let rx = crate::vsthost::open_async_with_state(
+                std::path::Path::new(path),
+                kind,
+                self.sample_rate.max(1),
+                saved.as_deref(),
+                patch.as_ref(),
+            );
+            let label = stem.unwrap_or_default();
+            self.vst_synth_open[t] = Some((label.clone(), rx, open_gui_on_land));
+            self.status = format!("track {t}: synth {label} loading…");
+            return true;
+        }
+        self.rebuild_track_synth_sync(t)
+    }
+
+    /// Land a loaded synth binding: retire this track's editor (the
+    /// engine may drop the old plugin the moment the command lands, and
+    /// the editor thread must not outlive the AEffect it drives), then
+    /// swap the handle.
+    fn land_track_synth_vst(
+        &mut self,
+        t: usize,
+        entry: std::sync::Arc<crate::vsthost::RtStageEntry>,
+    ) {
+        if let Some(mut w) = self.vst_editors.remove(&t) {
+            w.close();
+        }
+        let inst = Some(std::sync::Arc::new(SynthHandle::Vst(entry)));
+        self.backend.cmd(Cmd::SetTrackSynth {
+            i: t,
+            synth: inst.clone(),
+        });
+        self.track_synth_inst[t] = inst;
+    }
+
+    /// The fully synchronous rebuild — required by callers whose result
+    /// must be audible on the NEXT sample (preset harvest) and by tests.
+    fn rebuild_track_synth_sync(&mut self, t: usize) -> bool {
+        // v33: owned stem — `synth_saved_and_patch` needs &mut self.
+        let stem = self.track_synth[t].clone().filter(|s| !s.is_empty());
+        let inst = match stem.as_deref() {
             Some(stem) if vst_synth_decode(stem).is_some() => {
                 let (kind, path) = vst_synth_decode(stem).unwrap();
-                // v20: re-apply a preset the user picked in this synth's
-                // own GUI (harvested when that editor last closed).
-                // v22: with NO chunk (always true for VST2 — it has no
-                // state ABI on this host) the saved cell snapshot is the
-                // only patch information that exists, so it must be
-                // applied: that is what makes plugin-GUI edits survive.
-                let saved = if self.track_synth_state[t].is_none()
-                    && !self.track_synth_params[t].is_empty()
-                {
-                    Some(self.track_synth_params[t].clone())
-                } else {
-                    None
-                };
-                // v23: chunk + the parameter list harvested with it (from
-                // the editor closure that triggered this rebuild, if any).
-                // Chunks may omit normalized values — the list is what
-                // keeps knob moves through the plugin GUI after close.
-                let patch = self.track_synth_state[t].clone().map(|chunk| {
-                    crate::vsthost::VstPatch {
-                        chunk,
-                        params: std::mem::take(&mut self.synth_patch_params[t]),
-                    }
-                });
+                let path = path.to_string();
+                let (saved, patch) = self.synth_saved_and_patch(t);
                 match crate::vsthost::open_with_state(
-                    std::path::Path::new(path),
+                    std::path::Path::new(&path),
                     kind,
                     self.sample_rate.max(1),
                     saved.as_deref(),
@@ -3724,37 +3835,24 @@ impl App {
         };
         self.track_synth_params[t].clear();
         self.track_synth_state[t] = None;
-        self.rebuild_track_synth(t);
-        // v0.10 STANDARD: a plugin instrument opens its own GUI the moment
-        // it is bound. v0.11 R3: hosted plugins never fall back to a slider
-        // window -- the plugin's own GUI is the only parameter surface.
-        let gui = if !stem.is_empty() && vst_synth_decode(stem).is_some() {
-            Some(self.auto_open_synth_gui(t))
-        } else {
-            None
-        };
+        // v33: the v0.10 STANDARD (a plugin instrument opens its own GUI
+        // the moment it is bound) now fires when the async load LANDS
+        // (`poll_vst_opens`); VST binds never block the UI to open it.
+        let is_vst = !stem.is_empty() && vst_synth_decode(stem).is_some();
+        self.rebuild_track_synth_bind(t, is_vst);
         self.save_config();
-        // auto_open_synth_gui records why it failed in the status line; keep
-        // that visible alongside the binding message.
-        let gui_note = if gui == Some(false) {
-            std::mem::take(&mut self.status)
-        } else {
-            String::new()
-        };
         let bind_msg = format!(
             "track {}: synth {}",
             t + 1,
             if stem.is_empty() {
                 "default (piano)"
+            } else if is_vst {
+                "loading…"
             } else {
                 stem
             }
         );
-        self.status = if gui_note.is_empty() {
-            bind_msg
-        } else {
-            format!("{bind_msg} \u{2014} {gui_note}")
-        };
+        self.status = bind_msg;
     }
 
     /// Recreate every bound synth plus the shared default piano instance
@@ -8019,7 +8117,10 @@ impl App {
         let Some(patch) = w.take_patch() else { return };
         self.synth_patch_params[t] = patch.params;
         self.track_synth_state[t] = Some(patch.chunk);
-        if self.rebuild_track_synth(t) {
+        // v33: deliberately SYNCHRONOUS — the next note after an editor
+        // close must already sound like the patch just picked (the plugin
+        // is warm; this open is the fast path).
+        if self.rebuild_track_synth_sync(t) {
             self.status = format!("track {}: preset applied", t + 1);
         }
         // v22: persist the freshly harvested patch immediately (the tick
@@ -16173,6 +16274,22 @@ mod tests {
         app.show_binds = false;
     }
 
+    /// v33: pump the GUI loader + UI poller until track `t`'s async synth
+    /// binding lands (or ~15 s pass). `set_track_synth_stem` starts the
+    /// load on the VST GUI thread now; tests must pump what the real event
+    /// loop pumps (`poll_vst_opens` from the tick).
+    fn pump_synth_bind(app: &mut App, t: usize) -> bool {
+        for _ in 0..600 {
+            app.poll_vst_opens();
+            if app.vst_synth_open[t].is_none() {
+                // Landed (Ok or Err): stop on the FIRST verdict.
+                return app.track_synth_inst[t].is_some();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.track_synth_inst[t].is_some()
+    }
+
     fn headless_app(tag: &str) -> App {
         std::env::set_var("SLOOPER_NULL_AUDIO", "1");
         let dir = std::env::temp_dir().join(format!("sp-uity-{tag}"));
@@ -20408,6 +20525,8 @@ mod tests {
         let mut app = headless_app("v10-gui");
         let stem = vst_synth_encode(crate::vsthost::VstKind::V2, &p.to_string_lossy());
         app.set_track_synth_stem(0, &stem);
+        // v33: the bind loads async — pump the loader like the event loop.
+        assert!(pump_synth_bind(&mut app, 0), "async bind never landed");
         // EXACTLY ONE surface takes over a plugin binding: the plugin's
         // own window when its editor is available, the slider window as
         // the fallback when it is not. Never both, never neither.
@@ -20657,6 +20776,8 @@ mod tests {
         }
         let stem = format!("vst2:{}", plugin.display());
         app.set_track_synth_stem(0, &stem);
+        // v33: pump the async loader before asserting the landed state.
+        assert!(pump_synth_bind(&mut app, 0), "async bind never landed");
         // Editor-first: bound, editor open, NO slider window.
         assert!(
             app.track_synth_inst[0].is_some(),
@@ -22486,7 +22607,10 @@ mod tests {
         }
         let mut app = headless_app("v23kr");
         app.track_synth[0] = Some(vst_synth_encode(crate::vsthost::VstKind::V3, &kr));
-        assert!(app.rebuild_track_synth(0), "KR-106 binds as synth");
+        assert!(
+            app.rebuild_track_synth_sync(0),
+            "KR-106 binds as synth (sync path)"
+        );
         let entry = match app.track_synth_inst[0].as_ref() {
             Some(arc) => match arc.as_ref() {
                 crate::audio::SynthHandle::Vst(e) => e.clone(),
