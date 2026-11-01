@@ -354,6 +354,10 @@ pub struct Config {
     /// Live input monitoring master switch (Settings checkbox). Default on.
     #[serde(default = "default_true")]
     pub monitor_on: bool,
+    /// v32: live MIDI input feeds the synthesizers (Settings checkbox;
+    /// default on). Off means MIDI drives only bindings/recording/monitor.
+    #[serde(default = "default_true")]
+    pub midi_live: bool,
     /// Audition rack entries on click (asset preview). Default on.
     #[serde(default = "default_true")]
     pub preview_on: bool,
@@ -509,6 +513,7 @@ impl Default for Config {
             loop_area_end: 0,
             master_vol: default_master_vol(),
             monitor_on: true,
+            midi_live: true,
             preview_on: true,
             preview_secs: default_preview_secs(),
             preview_track: None,
@@ -766,6 +771,7 @@ mod tests {
             loop_area_end: 192_000,
             master_vol: 100,
             monitor_on: false,
+            midi_live: false,
             preview_on: false,
             preview_secs: 2.5,
             preview_track: Some(3),

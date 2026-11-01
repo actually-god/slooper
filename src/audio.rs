@@ -200,6 +200,84 @@ pub struct RawMidiMsg {
     pub bytes: Vec<u8>,
 }
 
+/// The realtime mirror of "this message is CONTROL TRAFFIC": every bound
+/// action binding (Settings ▸ MIDI) and every project value binding. The
+/// rule the MIDI recorder has always used — bound messages drive the app,
+/// they are never recorded — now also gates the LIVE synth feed (v32):
+/// a bound NOTE/CC fires its binding but does not make noise.
+///
+/// Encodings (kept tiny so the RT thread scans them cache-cheaply):
+/// * `exact` — one bound switch: (type 0=NOTE 1=CC 2=PC, channel, d1).
+/// * `axes`  — one continuous (knob) binding: it owns the WHOLE type +
+///   channel axis, exactly like the binding matcher, so a controller whose
+///   CC numbers drift mid-sweep still owns its messages.
+#[derive(Clone, Default, Debug)]
+pub struct BoundSet {
+    pub exact: Vec<u32>,
+    pub axes: Vec<u16>,
+}
+
+/// Pack an exact binding identity: `(ty << 16) | (ch << 8) | d1`.
+pub fn bind_key(ty: u8, ch: u8, d1: u8) -> u32 {
+    ((ty as u32) << 16) | ((ch as u32) << 8) | d1 as u32
+}
+
+/// Pack an axis identity: `(ty << 8) | ch`.
+pub fn axis_key(ty: u8, ch: u8) -> u16 {
+    ((ty as u16) << 8) | ch as u16
+}
+
+impl BoundSet {
+    /// True when a LIVE message is claimed by a binding. `kind` uses the
+    /// pattern-event encoding (0 note-off, 1 CC, 2 chan-press, 3 note-on).
+    /// NOTE-OFF is never claimed: its note-on went through the same
+    /// decision, and dropping the matching key-up is the classic stuck-note
+    /// generator when a binding changes while a key is held.
+    pub fn claims(&self, kind: u8, ch: u8, d1: u8) -> bool {
+        match kind {
+            3 => {
+                self.exact.contains(&bind_key(0, ch, d1)) || self.axes.contains(&axis_key(0, ch))
+            }
+            1 => {
+                self.exact.contains(&bind_key(1, ch, d1)) || self.axes.contains(&axis_key(1, ch))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parse the LIVE-feed subset of a channel voice message into the pattern
+/// event encoding (0 note-off, 1 CC, 2 chan-press, 3 note-on) as
+/// `(kind, ch, d1, d2)`. Program change, pitch bend, poly aftertouch and
+/// system messages return `None` — the synth event vocabulary has no kind
+/// for them (pitch bend needs an ABI addition; tracked for later).
+/// Allocation-free: safe on the realtime thread.
+pub fn live_event_kind(bytes: &[u8]) -> Option<(u8, u8, u8, u8)> {
+    let b0 = *bytes.first()?;
+    // Channel-voice status bytes only (0x80..0xF0); drop system messages
+    // (0xF0..=0xFF) and non-status bytes (<0x80, invalid without running
+    // status, which JACK's reader already resolves).
+    if !(0x80..0xF0).contains(&b0) {
+        return None;
+    }
+    let ch = b0 & 0x0F;
+    match b0 >> 4 {
+        0x9 => {
+            let n = *bytes.get(1)?;
+            let v = bytes.get(2).copied().unwrap_or(0);
+            if v == 0 {
+                Some((0, ch, n, 0))
+            } else {
+                Some((3, ch, n, v))
+            }
+        }
+        0x8 => Some((0, ch, *bytes.get(1)?, 0)),
+        0xB => Some((1, ch, *bytes.get(1)?, *bytes.get(2)?)),
+        0xD => Some((2, ch, 0, *bytes.get(1)?)),
+        _ => None,
+    }
+}
+
 /// A selected output port paired with its stereo routing: bit 0 = left
 /// bus, bit 1 = right bus (3 = mono downmix, the default).
 pub type OutSel = (String, u8);
@@ -591,6 +669,20 @@ pub struct Engine {
     /// Off mutes the pass-through only — levels, recording and playback
     /// are untouched. Gate on the RT thread via `monitor_amp`.
     monitor_on: AtomicBool,
+    /// v32: live MIDI input feeds the synthesizers (Settings checkbox;
+    /// default on). Off means incoming MIDI drives bindings, the recorder
+    /// and the monitor ONLY — no live keyboard sound.
+    midi_live: AtomicBool,
+    /// v32: tracks armed for MIDI pattern recording. Live notes must sound
+    /// on these too (the player must hear the take they are laying down),
+    /// in addition to the selected track. Set from the UI thread as arming
+    /// flips; read per-block on the RT thread.
+    midi_rec_arm: [AtomicBool; MAX_LOOPS],
+    /// v32: live mirror of the bound-message set (see [`BoundSet`]); the RT
+    /// thread refreshes an Arc clone when the generation moves (try_lock —
+    /// never blocks), same pattern as the other project snapshots.
+    midi_bound: std::sync::Mutex<Arc<BoundSet>>,
+    midi_bound_gen: AtomicU64,
     /// Per-track live effect chains. The manager thread swaps the whole
     /// table on `SetTrackEffects`; the RT handler refreshes a cached Arc
     /// clone when `fx_gen` changes (try_lock — never blocks).
@@ -685,6 +777,10 @@ impl Engine {
             pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             selected: AtomicU8::new(0),
             monitor_on: AtomicBool::new(true),
+            midi_live: AtomicBool::new(true),
+            midi_rec_arm: core::array::from_fn(|_| AtomicBool::new(false)),
+            midi_bound: std::sync::Mutex::new(Arc::new(BoundSet::default())),
+            midi_bound_gen: AtomicU64::new(0),
             fx: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| TrackFx::default()))),
             fx_gen: AtomicU64::new(0),
             assets: std::sync::Mutex::new(Arc::new(Vec::new())),
@@ -837,6 +933,43 @@ impl Engine {
     }
     pub fn monitor_on(&self) -> bool {
         self.monitor_on.load(Ordering::Relaxed)
+    }
+    /// v32: live MIDI → synth feed (Settings checkbox).
+    pub fn set_midi_live(&self, on: bool) {
+        self.midi_live.store(on, Ordering::Relaxed);
+    }
+    pub fn midi_live(&self) -> bool {
+        self.midi_live.load(Ordering::Relaxed)
+    }
+    /// v32: MIDI-rec arming mirror (UI keeps this authoritative; the RT
+    /// thread adds armed tracks to the live-feed target set).
+    pub fn set_midi_rec_arm(&self, t: usize, on: bool) {
+        if let Some(a) = self.midi_rec_arm.get(t) {
+            a.store(on, Ordering::Relaxed);
+        }
+    }
+    pub fn midi_rec_arm(&self, t: usize) -> bool {
+        self.midi_rec_arm
+            .get(t)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+    /// v32: publish a fresh bound-message snapshot (bindings/learn/reset/
+    /// project load). The RT thread sees it on the next block via the gen.
+    pub fn set_midi_bound(&self, bs: BoundSet) {
+        if let Ok(mut b) = self.midi_bound.lock() {
+            *b = Arc::new(bs);
+        }
+        self.midi_bound_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn midi_bound(&self) -> Arc<BoundSet> {
+        self.midi_bound
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_else(|_| Arc::new(BoundSet::default()))
+    }
+    pub fn midi_bound_gen(&self) -> u64 {
+        self.midi_bound_gen.load(Ordering::Relaxed)
     }
     /// The pass-through gain actually applied to live input: the selected
     /// track's amp when monitoring is on, hard zero when off. The RT mix
@@ -1650,6 +1783,12 @@ fn run(
         synth_pg: [0u64; MAX_LOOPS],
         mono: Vec::new(),
         sil: Vec::new(),
+        // v32: seeded like every other per-block buffer — the port reader
+        // pushes into `live_ev` on the FIRST message the app ever sees.
+        live_ev: Vec::with_capacity(64),
+        live_notes: [0i32; MAX_LOOPS],
+        bound_cache: engine.midi_bound(),
+        bound_gen: engine.midi_bound_gen(),
     };
 
     let active = match client.activate_async(notif, proc) {
@@ -2477,17 +2616,23 @@ const MIDI_SILENCE_FLOOR: f32 = 1e-4;
 const MIDI_QUIET_BLOCKS: u32 = 6;
 
 impl Proc {
-    /// Render every MIDI pattern clip sounding this block through each
-    /// track's synth into `midi_scratch[t]` (mono). Notes are triggered by
-    /// the pattern; a note whose head was trimmed away (`cut`) stays silent,
+    /// Render every MIDI pattern clip sounding this block AND the live
+    /// keyboard feed through each track's synth into `midi_scratch[t]`
+    /// (mono). Notes are triggered by the pattern; a note whose head was
+    /// trimmed away (`cut`) stays silent,
     /// one already ringing keeps ringing inside the synth until its off
     /// event — contiguous blocks make that seamless, and a transport seek
     /// `all_off`s everything. A track whose schedule is still ringing (or
     /// whose tail has not decayed yet) keeps ADVANCING its synth even on
     /// event-free blocks: the sound lives inside the instrument, and
     /// pausing the synth between events turned every sustained note into a
-    /// one-block blip. Returns whether any track produced sound.
-    fn render_midi_block(&mut self, p0: u64, block_n: usize) -> bool {
+    /// one-block blip. v32: `live_mask` tracks additionally receive the
+    /// raw messages the player is physically sending this block (selected
+    /// track + MIDI-rec armed; bound messages were already filtered) — the
+    /// live feed works with the transport STOPPED, which is exactly when
+    /// auditioning a patch happens. Returns whether any track produced
+    /// sound.
+    fn render_midi_block(&mut self, p0: u64, block_n: usize, live_mask: u128, live_on: bool) -> bool {
         // Clear last block's scratch first (only rows that actually sounded).
         for (t, live) in self.midi_live.iter_mut().enumerate() {
             if *live {
@@ -2495,16 +2640,58 @@ impl Proc {
                 *live = false;
             }
         }
-        if !self.engine.transport_on() || self.midi_cache.is_empty() || block_n == 0 {
-            // Transport stopped (or the pattern table went away) while
-            // something was sounding: silence every voice once so nothing
-            // leaks into the next run, and drop all sustain bookkeeping.
-            if self.midi_sustain.iter().any(|s| *s) || self.midi_ring_to.iter().any(|r| *r != 0) {
-                for h in self.synths_cache.iter().flatten() {
+        // v32: live gate flipped off while keys were counted: those voices
+        // must die NOW — a disabled feed never leaves a synth ringing.
+        if !live_on && self.live_notes.iter().any(|x| *x != 0) {
+            for (t, h) in self
+                .synths_cache
+                .iter()
+                .enumerate()
+                .filter_map(|(t, h)| h.as_ref().map(|h| (t, h)))
+            {
+                if self.live_notes[t] != 0 {
                     h.all_off();
                 }
+            }
+            if self
+                .live_notes
+                .iter()
+                .enumerate()
+                .any(|(t, n)| *n != 0 && self.synths_cache.get(t).map(|s| s.is_none()).unwrap_or(true))
+            {
                 if let Some(d) = &self.dflt_synth {
                     d.all_off();
+                }
+            }
+            self.live_notes = [0i32; MAX_LOOPS];
+        }
+        let pattern_run =
+            self.engine.transport_on() && !self.midi_cache.is_empty() && block_n != 0;
+        if !pattern_run {
+            // Transport stopped (or the pattern table went away) while
+            // pattern voices were sounding: silence them once so nothing
+            // leaks into the next run, and drop all pattern sustain
+            // bookkeeping. v32: a track HOLDING a live key keeps its
+            // voices — the keyboard is not the transport, a held key rings
+            // through a stopped transport until its key-up arrives.
+            if self.midi_sustain.iter().any(|s| *s) || self.midi_ring_to.iter().any(|r| *r != 0) {
+                for (t, h) in self
+                    .synths_cache
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(t, h)| h.as_ref().map(|h| (t, h)))
+                {
+                    if self.live_notes[t].max(0) == 0 {
+                        h.all_off();
+                    }
+                }
+                if let Some(d) = &self.dflt_synth {
+                    let held_on_default = self.live_notes.iter().enumerate().any(|(t, n)| {
+                        *n > 0 && self.synths_cache.get(t).map(|s| s.is_none()).unwrap_or(true)
+                    });
+                    if !held_on_default {
+                        d.all_off();
+                    }
                 }
             }
             for t in 0..MAX_LOOPS {
@@ -2512,6 +2699,10 @@ impl Proc {
                 self.midi_quiet[t] = 0;
                 self.midi_ring_to[t] = 0;
             }
+        }
+        let live_any = live_on
+            && (!self.live_ev.is_empty() || self.live_notes.iter().any(|x| *x > 0));
+        if block_n == 0 || (!pattern_run && !live_any) {
             return false;
         }
         let sr = self.sr.max(1);
@@ -2533,6 +2724,8 @@ impl Proc {
             synths_cache,
             midi_cache,
             sil,
+            live_ev,
+            live_notes,
             ..
         } = self;
         for t in 0..MAX_LOOPS {
@@ -2552,7 +2745,9 @@ impl Proc {
             // Ring horizon: the latest sample this track must keep the
             // synth advancing to (updated from every note staged here).
             let mut ring = midi_ring_to[t];
-            for l in arr.tracks[t].lanes.iter() {
+            // Pattern staging runs only while the transport table is live
+            // (v32: the live feed below runs regardless of transport).
+            for l in arr.tracks[t].lanes.iter().filter(|_| pattern_run) {
                 for cl in l.clips.iter() {
                     let Some(Some(pat)) = midi_cache.get(cl.asset as usize) else {
                         continue;
@@ -2611,14 +2806,27 @@ impl Proc {
                     }
                 }
             }
+            // v32 live feed: this track's synth also plays what the player
+            // is physically sending RIGHT NOW (selected + MIDI-rec-armed
+            // tracks; bound messages were filtered at the port). The same
+            // instrument, the same chain, the same mix — auditioning a
+            // patch and recording a take must sound like the take.
+            let is_live = live_on && ((live_mask >> t) & 1) != 0;
+            if is_live && !live_ev.is_empty() {
+                for &(off, k, ch, d1, d2) in live_ev.iter() {
+                    midi_ev.push((off.min(block_n), k, ch, d1, d2));
+                }
+            }
             // Render this block when it carries staged events OR when the
             // track is still sustaining (a scheduled note rings past this
             // block, or the synth's tail has not decayed yet). Pausing the
             // instrument on event-free blocks is what made every note a
             // one-block blip — the sound between events lives INSIDE the
-            // synth (script voices / the plugin's own ring).
+            // synth (script voices / the plugin's own ring). A physically
+            // held live key counts as sustaining too (v32).
             let has_ev = !midi_ev.is_empty();
-            if !has_ev && !midi_sustain[t] {
+            let holding = is_live && live_notes[t] > 0;
+            if !has_ev && !midi_sustain[t] && !holding {
                 continue;
             }
             let row = &mut midi_scratch[t];
@@ -2717,7 +2925,9 @@ impl Proc {
                 midi_sustain[t] = true;
                 midi_quiet[t] = 0;
             }
-            if ring <= span_end {
+            // Quiet-tail decay runs only once nothing is held physically:
+            // a key-down must never time out mid-press (v32).
+            if ring <= span_end && live_notes[t].max(0) == 0 {
                 let peak = row[..block_n].iter().fold(0.0f32, |m, x| m.max(x.abs()));
                 if peak < MIDI_SILENCE_FLOOR {
                     midi_quiet[t] = midi_quiet[t].saturating_add(1);
@@ -2848,6 +3058,18 @@ struct Proc {
     mono: Vec<f32>,
     /// Reusable zero input for driving a VSTi with no audio side-chain.
     sil: Vec<f32>,
+    /// v32 live MIDI: this block's UNBOUND feedable messages staged as
+    /// `(block offset, kind, ch, d1, d2)` in the pattern event encoding.
+    /// Cleared at block entry by the port reader; capacity is reserved at
+    /// init, the 1024/block cap silently drops pathological floods only.
+    live_ev: Vec<(usize, u8, u8, u8, u8)>,
+    /// v32 live MIDI: physically held keys per track (note-on counted when
+    /// a message is staged, note-off decrements). While > 0 the synth must
+    /// keep advancing event-free blocks — a held key is a ringing key.
+    live_notes: [i32; MAX_LOOPS],
+    /// v32: last bound-set snapshot + its generation (try_lock refresh).
+    bound_cache: Arc<BoundSet>,
+    bound_gen: u64,
 }
 
 /// RT-side snapshot of one effect instance's sliders.
@@ -3117,9 +3339,62 @@ impl ProcessHandler for Proc {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
         let n = ps.n_frames() as usize;
 
+        // --- v32 live MIDI feed state for this block ----------------------
+        // The bound-message snapshot refreshes like every other table
+        // (try_lock + generation). The target set is the selected track —
+        // the same rule the audio monitor follows — PLUS every track
+        // armed for MIDI recording: the player must hear the take they are
+        // laying down. Raw messages stay on the UI channel regardless:
+        // bindings, the recorder and the monitor keep seeing everything.
+        let bg = self.engine.midi_bound_gen();
+        if bg != self.bound_gen {
+            if let Ok(b) = self.engine.midi_bound.try_lock() {
+                self.bound_cache = b.clone();
+                self.bound_gen = bg;
+            }
+        }
+        let midi_live_on = self.engine.midi_live();
+        let mut live_mask: u128 = 0;
+        if midi_live_on {
+            let sel = (self.engine.selected.load(Ordering::Relaxed) as usize).min(MAX_LOOPS - 1);
+            live_mask |= 1u128 << sel;
+            for t in 0..MAX_LOOPS {
+                if self.engine.midi_rec_arm(t) {
+                    live_mask |= 1u128 << t;
+                }
+            }
+        }
+        self.live_ev.clear();
+
         // MIDI: copy events out (bounded channel; count drops if the GUI is slow).
+        let off_cap = n.saturating_sub(1);
         for e in self.midi_in.iter(ps) {
             let bytes = e.bytes.to_vec();
+            // v32: stage the message for the track synths too. Bound
+            // messages are CONTROL TRAFFIC (they drive bindings; the
+            // recorder has always had the same rule) and never feed a
+            // synth; the held-key count keeps a physically held key
+            // ringing across event-free blocks.
+            if live_mask != 0 {
+                if let Some((kind, ch, d1, d2)) = live_event_kind(&bytes) {
+                    if !self.bound_cache.claims(kind, ch, d1) {
+                        if self.live_ev.len() < 1024 {
+                            let off = (e.time) as usize;
+                            self.live_ev.push((off.min(off_cap), kind, ch, d1, d2));
+                        }
+                        let mut m = live_mask;
+                        while m != 0 {
+                            let t = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            match kind {
+                                3 => self.live_notes[t] += 1,
+                                0 => self.live_notes[t] = (self.live_notes[t] - 1).max(0),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
             if self.tx.try_send(Evt::Midi(RawMidiMsg { bytes })).is_err() {
                 self.midi_drops.fetch_add(1, Ordering::Relaxed);
             }
@@ -3355,11 +3630,18 @@ impl ProcessHandler for Proc {
         }
         // MIDI pattern clips of this block, rendered per track through the
         // track's synth into `midi_scratch` (mixed in the sample loop).
-        let has_midi = if clip_sound {
-            self.render_midi_block(p0, block_n)
-        } else {
-            false
-        };
+        // v32: ALWAYS called now — even with the transport stopped it
+        // renders the live keyboard feed (that call is how playing a synth
+        // works while the timeline stands still).
+        let has_midi = self.render_midi_block(p0, block_n, live_mask, midi_live_on);
+        if has_midi {
+            // A track whose synth is sounding is audible even when the
+            // transport is stopped: the live feed rides the track's own
+            // chain × gain × volume × pan, exactly like its clips.
+            for (t, a) in audible.iter_mut().enumerate() {
+                *a |= self.midi_live[t];
+            }
+        }
 
         // --- automation assets (v0.11 R5) --------------------------------
         // Control-rate pass: every automation clip sounding at this block's
@@ -3495,7 +3777,7 @@ impl ProcessHandler for Proc {
         // chains there is nothing to run at all. `has_entries` is
         // block-constant: the accumulator only needs refilling when this
         // block actually holds clip windows.
-        let mut mixer_live = clip_sound;
+        let mut mixer_live = clip_sound || has_midi;
         let mut chain_mask = [false; MAX_LOOPS];
         let mut any_chain = false;
         for (t, m) in chain_mask.iter_mut().enumerate() {
@@ -4516,5 +4798,83 @@ mod tests {
         assert_eq!(snap[0].1, 2);
         e.stop_preview_id(99); // unknown id: no-op, never panics
         assert_eq!(e.preview_snapshot().len(), 1);
+    }
+
+    /// v32: the live-MIDI feed subset. The bug: MIDI reached the UI (the
+    /// monitor blinked, bindings fired, recording armed) and NOTHING fed
+    /// the synths live. The feed speaks exactly the synth's event
+    /// vocabulary — note on/off, CC, channel pressure — and nothing else
+    /// (pitch bend is recorded per-clip and rewritten at its own grid
+    /// resolution; feeding it live would fight that, same reason the
+    /// recorder keeps `live_ev` empty for it).
+    #[test]
+    fn v32_live_event_kind_is_the_feed_vocabulary() {
+        assert_eq!(live_event_kind(&[0x90, 60, 100]), Some((3, 0, 60, 100)));
+        assert_eq!(live_event_kind(&[0x9F, 127, 1]), Some((3, 15, 127, 1)));
+        // note-on vel 0 and 0x8x are the same note-off to the feed.
+        assert_eq!(live_event_kind(&[0x90, 60, 0]), Some((0, 0, 60, 0)));
+        assert_eq!(live_event_kind(&[0x83, 61, 0]), Some((0, 3, 61, 0)));
+        assert_eq!(live_event_kind(&[0xB1, 7, 90]), Some((1, 1, 7, 90)));
+        assert_eq!(live_event_kind(&[0xD2, 40]), Some((2, 2, 0, 40)));
+        // Outside the vocabulary (the e2e monitor's own message list sends
+        // the first two — they must drop, not wedge anything).
+        assert_eq!(live_event_kind(&[0xC2, 11]), None); // program change
+        assert_eq!(live_event_kind(&[0xE0, 0, 64]), None); // pitch bend
+        assert_eq!(live_event_kind(&[0xA0, 60, 9]), None); // poly AT
+        assert_eq!(live_event_kind(&[0xF0, 1, 2]), None); // system
+        assert_eq!(live_event_kind(&[0x3C]), None); // non-status
+        assert_eq!(live_event_kind(&[]), None);
+        // Truncated note-on: velocity 0 reads as a release, never a stuck
+        // note.
+        assert_eq!(live_event_kind(&[0x90, 60]), Some((0, 0, 60, 0)));
+    }
+
+    /// v32: the bound-message exclusion for live playing. Rule (the same
+    /// one MIDI recording already used): bound = control traffic. Note-off
+    /// is NEVER claimed — blocking a bound note-on while its release passes
+    /// is how stuck notes are born, and an unbound key must keep working.
+    /// A bound CC knob owns its whole axis (continuous actions read CC 7
+    /// under a CC 7 label).
+    #[test]
+    fn v32_boundset_claims_only_control_traffic() {
+        let bs = BoundSet {
+            exact: vec![bind_key(0, 0, 36), bind_key(1, 2, 7)],
+            axes: vec![axis_key(1, 5)],
+        };
+        assert!(bs.claims(3, 0, 36), "bound note-on");
+        assert!(!bs.claims(3, 1, 36), "same note, other channel");
+        assert!(!bs.claims(3, 0, 37), "same channel, other note");
+        assert!(bs.claims(1, 2, 7), "bound CC");
+        assert!(bs.claims(1, 5, 42), "a knob owns its whole axis");
+        assert!(!bs.claims(1, 6, 42), "neighbour CC feeds");
+        assert!(!bs.claims(0, 0, 36), "note-off never claimed — no stuck notes");
+        assert!(!bs.claims(2, 3, 0), "channel pressure is unbindable → feeds");
+        assert!(!bs.claims(3, 0, 60), "unbound keys play");
+        assert!(BoundSet::default().axes.is_empty());
+    }
+
+    /// v32: the engine-side live state the UI mirrors on boot and every
+    /// change. Default ON (playing a controller should just work), a
+    /// generation bump on bound-set refresh (the RT pulls at the next
+    /// block), and the per-track recorder mask.
+    #[test]
+    fn v32_engine_live_midi_state() {
+        let e = Engine::new();
+        assert!(e.midi_live(), "live MIDI defaults ON");
+        e.set_midi_live(false);
+        assert!(!e.midi_live());
+        assert!(!e.midi_rec_arm(3));
+        e.set_midi_rec_arm(3, true);
+        assert!(e.midi_rec_arm(3));
+        e.set_midi_rec_arm(3, false);
+        assert!(!e.midi_rec_arm(3));
+        let g0 = e.midi_bound_gen();
+        e.set_midi_bound(BoundSet {
+            exact: vec![bind_key(0, 0, 60)],
+            axes: vec![],
+        });
+        assert_eq!(e.midi_bound_gen(), g0 + 1, "RT refreshes on the gen bump");
+        assert!(e.midi_bound().claims(3, 0, 60));
+        drop(e);
     }
 }

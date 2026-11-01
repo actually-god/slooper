@@ -1023,6 +1023,9 @@ pub struct App {
     sel_asset: Option<usize>,
     /// Live input monitoring on/off (Settings → MONITORING, default on).
     monitor_enabled: bool,
+    /// v32: live MIDI input feeds the synths (Settings ▸ MONITORING).
+    /// Mirrored to the engine; the RT thread gates the live feed on it.
+    midi_live: bool,
     /// Audition rack entries on click (Settings → ASSET PREVIEW).
     preview_enabled: bool,
     /// Text box value for the preview length in seconds.
@@ -1440,6 +1443,7 @@ impl App {
             rack_confirm_del: None,
             sel_asset: None,
             monitor_enabled: cfg.monitor_on,
+            midi_live: cfg.midi_live,
             preview_enabled: cfg.preview_on,
             preview_secs: cfg.preview_secs.max(0.0).to_string(),
             preview_track: cfg.preview_track.map(|t| t as usize),
@@ -3395,6 +3399,7 @@ impl App {
             loop_area_end: self.loop_area.1,
             master_vol: self.master_midi,
             monitor_on: self.monitor_enabled,
+            midi_live: self.midi_live,
             preview_on: self.preview_enabled,
             preview_secs: self.preview_secs_f(),
             preview_track: self.preview_track.map(|t| t as u32),
@@ -3459,6 +3464,11 @@ impl App {
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
         }
+        // v32: every binding edit funnels through save_config, so keeping
+        // the engine's realtime bound-message mirror in sync HERE means it
+        // can never drift from the persisted bindings — no matter which
+        // UI path (learn, project load, reset, unbind) made the change.
+        self.push_bound_snapshot();
     }
 
     // ---- DAW actions -----------------------------------------------------
@@ -5782,6 +5792,9 @@ impl App {
                 start: self.backend.engine.pos(),
                 evs: Vec::new(),
             };
+            // v32: the live feed must cover armed tracks (the player hears
+            // the take they are laying down) — RT reads this mirror.
+            self.backend.engine.set_midi_rec_arm(i, true);
             if !self.backend.engine.transport_on() {
                 self.backend.cmd(Cmd::PlayAll);
             }
@@ -5818,6 +5831,32 @@ impl App {
             }
         }
         false
+    }
+
+    /// v32: publish the realtime mirror of "this message is control
+    /// traffic" — every bound action + project value binding. The RT live
+    /// feed skips exactly what `midi_msg_is_bound` would skip: a bound
+    /// NOTE/CC fires its binding but never makes synth noise. Uses the
+    /// same match semantics as the UI-side matcher (continuous bindings
+    /// own their whole axis; switches match exactly).
+    fn push_bound_snapshot(&self) {
+        let mut bs = crate::audio::BoundSet::default();
+        for (i, b) in self.midi_binds.iter().enumerate() {
+            let Some(b) = b else { continue };
+            if MidiAction::ALL[i].is_continuous() {
+                bs.axes.push(crate::audio::axis_key(b.ty, b.ch));
+            } else {
+                bs.exact.push(crate::audio::bind_key(b.ty, b.ch, b.d1));
+            }
+        }
+        for vb in &self.value_binds {
+            if vb.kind == 0 {
+                bs.axes.push(crate::audio::axis_key(vb.bind.ty, vb.bind.ch));
+            } else {
+                bs.exact.push(crate::audio::bind_key(vb.bind.ty, vb.bind.ch, vb.bind.d1));
+            }
+        }
+        self.backend.engine.set_midi_bound(bs);
     }
 
     /// Push one live message into every armed track's buffer (stamped with
@@ -5866,6 +5905,9 @@ impl App {
     /// rack folder, add the asset and place a clip at the take position.
     fn commit_midi_rec(&mut self, t: usize) {
         let state = std::mem::take(&mut self.midi_rec[t]);
+        // v32: arming is over — drop this track from the RT live-feed set
+        // (BEFORE the empty-take early return, so no path leaves it stuck).
+        self.backend.engine.set_midi_rec_arm(t, false);
         if state.evs.is_empty() {
             self.status = format!("track {}: no MIDI captured", t + 1);
             return;
@@ -8690,6 +8732,8 @@ impl App {
         // v29 R7: value bindings travel WITH the project — replace the
         // session copy wholesale (the rack then reflects the project).
         self.value_binds = pr.value_binds.clone();
+        // v32: the RT live feed mirror follows the project's bindings.
+        self.push_bound_snapshot();
         // v29 R5: and so does the drum machine.
         if let Some(d) = pr.drum.as_ref() {
             self.drum = DrumMachine::from_save(d);
@@ -8811,7 +8855,10 @@ impl App {
             MidiAction::StopAll => self.backend.cmd(Cmd::StopAll),
             // Value-driven knob actions fire only through the MIDI path
             // (handle_evt passes the CC value); a key press has no value.
-            MidiAction::VolLoop(_) | MidiAction::GainLoop(_) | MidiAction::PanLoop(_) => {}
+            MidiAction::VolLoop(_)
+            | MidiAction::GainLoop(_)
+            | MidiAction::PanLoop(_)
+            | MidiAction::VolMaster => {}
             MidiAction::MidiRec(i) => self.toggle_midi_rec(i),
             MidiAction::Reserved => {}
         }
@@ -8841,6 +8888,9 @@ impl App {
                 });
                 self.backend.cmd(Cmd::SetLoop(self.loop_tl));
                 self.backend.cmd(Cmd::SetMonitor(self.monitor_enabled));
+                // v32: live-MIDI feed gate + the bound-message mirror.
+                self.backend.engine.set_midi_live(self.midi_live);
+                self.push_bound_snapshot();
                 self.send_metro();
                 // Effect instances made before the backend was up were
                 // created with rate 0; rebuild every chain at the real rate.
@@ -9099,6 +9149,21 @@ impl App {
                                         MidiAction::PanLoop(t) => {
                                             if let Some(v) = v {
                                                 self.set_trk_pan(t, v);
+                                                self.levels_dirty = true;
+                                            }
+                                        }
+                                        // v32: master volume knob (the
+                                        // global standard binding). Same
+                                        // u8 semantics as the top-bar
+                                        // slider — -inf .. slider top.
+                                        MidiAction::VolMaster => {
+                                            if let Some(v) = v {
+                                                self.master_midi = v;
+                                                self.note_auto(
+                                                    0,
+                                                    crate::automation::TARGET_MASTER_VOL,
+                                                    vol_amp(v),
+                                                );
                                                 self.levels_dirty = true;
                                             }
                                         }
@@ -15666,6 +15731,25 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 app.backend.cmd(Cmd::SetMonitor(app.monitor_enabled));
                 app.save_config();
             }
+            // v32: the LIVE MIDI feed has its own switch. Incoming MIDI
+            // always drives bindings, the recorder and the monitor; this
+            // gate decides whether it also PLAYS the synths (selected
+            // track + MIDI-rec-armed tracks, through their own chains).
+            if ui
+                .checkbox(&mut app.midi_live, "live MIDI input to synths")
+                .on_hover_text(
+                    "When on (default), your MIDI keyboard plays the SELECTED track's \
+                     synth live — with the transport stopped too — and any track armed \
+                     for MIDI recording monitors while you play. Messages bound to a \
+                     control (binding/value bind) stay pure control traffic and never \
+                     make noise, exactly like MIDI recording. Off: MIDI drives only \
+                     bindings, recording and the monitor.",
+                )
+                .changed()
+            {
+                app.backend.engine.set_midi_live(app.midi_live);
+                app.save_config();
+            }
 
             // ---- asset preview --------------------------------------------
             ui.separator();
@@ -15775,10 +15859,14 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 MidiAction::Metronome,
                 MidiAction::SelectNext,
                 MidiAction::SelectPrev,
+                // v32: master volume is THE standard global knob — bound
+                // here it belongs to every project (the u8 value drives
+                // the top-bar master slider directly, -inf .. its top).
+                MidiAction::VolMaster,
             ] {
                 bind_row(ui, app, a);
             }
-            ui.label(RichText::new("per track bindings").weak().small());
+            ui.label(RichText::new("per-track transport bindings").weak().small());
             ui.horizontal(|ui| {
                 ui.label("Track");
                 egui::ComboBox::from_id_salt("bind_loop_sel")
@@ -15789,19 +15877,32 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         }
                     });
             });
-            for off in 0..8usize {
+            for off in 0..5usize {
                 let a = match off {
                     0 => MidiAction::RecLoop(app.bind_loop_sel),
                     1 => MidiAction::ClearLoop(app.bind_loop_sel),
                     2 => MidiAction::PlayLoop(app.bind_loop_sel),
                     3 => MidiAction::Select(app.bind_loop_sel),
-                    4 => MidiAction::VolLoop(app.bind_loop_sel),
-                    5 => MidiAction::GainLoop(app.bind_loop_sel),
-                    6 => MidiAction::PanLoop(app.bind_loop_sel),
                     _ => MidiAction::MidiRec(app.bind_loop_sel),
                 };
                 bind_row(ui, app, a);
             }
+            // v32: the per-track volume/gain/pan KNOB rows are gone from
+            // this menu — they were always deprecated by the project MIDI
+            // BINDINGS window (v29 R7), which binds any target (track
+            // vol/gain/pan, mute, synth + plugin params) per project with
+            // a calibrated min..max sweep. Old saved knob bindings stay
+            // fully live: this removed the menu rows, not the action
+            // slots, so existing configs keep driving the same values.
+            ui.label(
+                RichText::new(
+                    "track values (vol / gain / pan / mute / synth & plugin knobs) \
+                     bind in the MIDI BINDINGS window \u{2014} those bindings travel \
+                     with the project; the rows above are app-global.",
+                )
+                .weak()
+                .small(),
+            );
 
             // ---- audio ports -------------------------------------------------
             ui.separator();
@@ -15945,8 +16046,10 @@ mod tests {
     #[test]
     fn shortcut_table_matches_actions() {
         assert_eq!(SHORTCUT_DEFAULTS.len(), N_ACTIONS);
-        // 121 historical + 16 appended `MidiRec` slots.
-        assert_eq!(N_ACTIONS, 137);
+        // 121 historical + 16 appended `MidiRec` slots + 1 appended v32
+        // `VolMaster` (action tables are appended-only: save files address
+        // slots by index).
+        assert_eq!(N_ACTIONS, 138);
         // Space is the global transport toggle; knob slots are never keyed.
         assert_eq!(
             SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PlayAll)],
@@ -24809,5 +24912,147 @@ mod tests {
         }
         eprintln!("predicted track spans: {:?}", pred);
         drop(out.textures_delta);
+    }
+
+    /// v32: Settings ▸ MONITORING carries the live-MIDI switch. The bug it
+    /// pins: MIDI reached the UI (monitor blinked, bindings fired, recording
+    /// armed) and NO synth was fed live. The checkbox must flip app state,
+    /// mirror to the engine (the RT gate) the same frame, and persist.
+    #[test]
+    fn v32_settings_live_midi_toggle_gates_engine() {
+        let mut app = headless_app("v32livegate");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.midi_live, "live MIDI is ON by default");
+        assert!(
+            app.backend.engine.midi_live(),
+            "engine boots matching the default"
+        );
+        let p = label_center(&mut app, &ctx, "live MIDI input to synths")
+            .expect("MONITORING shows the live-MIDI checkbox");
+        click_pt(&mut app, &ctx, p);
+        assert!(!app.midi_live, "click flips it off");
+        assert!(!app.backend.engine.midi_live(), "the RT gate flips too");
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(
+            cfg_txt.contains("\"midi_live\": false"),
+            "the switch persists: {cfg_txt}"
+        );
+    }
+
+    /// v32: the settings-menu binding list is for GLOBAL standard actions
+    /// only. Master volume joins it (every project, no project to live
+    /// in); the per-track value rows (volume/gain/pan/mute/solo) are
+    /// deprecated there — those bind per PROJECT in the MIDI BINDINGS
+    /// window. Transport/record rows stay (they have no second home).
+    #[test]
+    fn v32_settings_binding_menu_globals_only() {
+        let mut app = headless_app("v32bindmenu");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        // The settings panel is a ScrollArea; its lower rows (the whole
+        // MIDI-bindings section lives below the fold) are laid out but not
+        // PAINTED until scrolled into view, and the shape-scan only sees
+        // painted galleys. Scroll it top-to-bottom and union what appears.
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -6.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let seen = |app: &mut App, ctx: &egui::Context, needle: &str| -> bool {
+            !v25_hits(app, ctx, needle).is_empty()
+        };
+        let mut master = false;
+        let mut play_all = false;
+        let mut midi_rec = false;
+        let mut deprecated: Vec<String> = Vec::new();
+        let dead = [
+            "track 1: volume (knob)",
+            "track 1: gain (knob)",
+            "track 1: pan (knob)",
+            "asset 1: gain (knob)",
+        ];
+        // Hover the settings panel (left column) and scroll all the way down.
+        frame(&mut app, &ctx, vec![moved(egui::pos2(100.0, 400.0))]);
+        for step in 0..80 {
+            let _ = step;
+            if seen(&mut app, &ctx, "master volume (knob)") {
+                master = true;
+            }
+            if seen(&mut app, &ctx, "play all") {
+                play_all = true;
+            }
+            if seen(&mut app, &ctx, "track 1: MIDI record") {
+                midi_rec = true;
+            }
+            for d in dead {
+                if seen(&mut app, &ctx, d) && !deprecated.iter().any(|x| x == d) {
+                    deprecated.push(d.to_string());
+                }
+            }
+            // Scroll another notch down (pointer stays over the panel).
+            frame(&mut app, &ctx, vec![wheel.clone()]);
+        }
+        // Final position.
+        for d in dead {
+            if seen(&mut app, &ctx, d) && !deprecated.iter().any(|x| x == d) {
+                deprecated.push(d.to_string());
+            }
+        }
+        assert!(
+            master,
+            "master volume is a global standard binding row in the menu"
+        );
+        assert!(play_all, "the 'play all' global row stays");
+        assert!(
+            midi_rec,
+            "the per-track MIDI-record row stays (no second home)"
+        );
+        assert!(
+            deprecated.is_empty(),
+            "deprecated per-track value rows still in the settings menu: {deprecated:?}"
+        );
+    }
+
+    /// v32: a bound master-volume knob drives the top-bar master from a
+    /// live CC — including under a different CC number (continuous actions
+    /// own their axis, exactly like the track-fader action already did).
+    #[test]
+    fn v32_master_vol_binding_drives_master() {
+        let mut app = headless_app("v32mvol");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let slot = MidiAction::idx(MidiAction::VolMaster);
+        app.midi_binds[slot] = Some(MidiBind { ty: 1, ch: 0, d1: 41 });
+        // Exact CC 41.
+        app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+            bytes: vec![0xB0, 41, 66],
+        }));
+        assert_eq!(app.master_midi, 66, "bound CC drives the master");
+        // Axis ownership: CC 7 (same channel) drives the same action.
+        app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+            bytes: vec![0xB0, 7, 33],
+        }));
+        assert_eq!(app.master_midi, 33, "a knob owns its whole axis");
+        // The live feed must hear the exclusion (bound = control traffic):
+        // saving pushes the bound set to the engine.
+        app.save_config();
+        let bs = app.backend.engine.midi_bound();
+        assert!(
+            bs.claims(1, 0, 41) && bs.claims(1, 0, 7),
+            "engine bound set covers the whole CC axis it owns"
+        );
+        assert!(!bs.claims(1, 1, 41), "other channels keep their CCs");
+        // The musical payload a synth needs must NOT be claimed by a CC
+        // knob: a note-on on the very channel the master knob owns still
+        // feeds the instrument (else binding master volume would silence
+        // that whole MIDI channel).
+        assert!(
+            !bs.claims(3, 0, 60),
+            "a master-volume knob must not swallow note-ons"
+        );
     }
 }
