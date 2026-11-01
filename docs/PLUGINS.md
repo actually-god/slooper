@@ -434,5 +434,21 @@ it. Fix (shipped in `~/.config/environment.d/yabridge-wine.conf`):
 the one-time login the plugin GUI shows no modal and the audio path
 measures live (probe peak > 0 where pre-login was exact silence).
 
+**License agent = keep it running.** The plugin mutes itself (exact
+silence, no error) whenever `ArturiaSoftwareCenterAgent.exe` is not
+alive — it is a license DAEMON, not installer cruft, and it auto-exits
+when idle. Supervised here by the systemd user unit
+`arturia-asc-agent.service` (`Restart=always`). Killing it silently
+re-gates every running/loaded instance.
+
+**Editor crash-guard ban cache:** a probing child that dies (e.g. the
+login-modal SEH while the agent was dead) caches a `banned` verdict in
+`Config::editor_probe` (keyed by path+mtime) — afterwards the strip
+button opens the parameter-sliders window INSTEAD of the plugin GUI,
+forever. After fixing a GUI crash, delete that path's key from
+`~/.config/slooper/config.json` (app closed) so the next click re-probes.
+With the agent up, AL V's editor opens cleanly under RT load (3/3 soak
+`examples/alv_editor_live`).
+
 MiniLab 37 hardware needs nothing: class-compliant MIDI, auto-linked to
 `slooper:midi_in`. Firmware updates need MCC → Windows or a friend.
