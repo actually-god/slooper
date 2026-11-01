@@ -10901,8 +10901,13 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                 .fold(0.0f32, f32::max)
                 .max(def_h(ids[0]));
             egui::Panel::bottom(egui::Id::new(("dockedge", edge)))
-                .resizable(false)
-                .exact_size(h)
+                // v32 R8: the strip's THICKNESS (its height) must be
+                // resizable too, or windows sharing the bottom edge have
+                // no way to grow taller — nested panels only resize ALONG
+                // the edge. Resizable like a lone bottom dock.
+                .resizable(true)
+                .default_size(h)
+                .min_size(90.0)
                 .show(ui, |ui| {
                     for (n, i) in ids.iter().enumerate() {
                         let b = ui.max_rect();
@@ -10932,7 +10937,8 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                 0 => egui::Panel::left(egui::Id::new(("dockedge", edge))),
                 _ => egui::Panel::right(egui::Id::new(("dockedge", edge))),
             };
-            wpanel = wpanel.resizable(false).exact_size(w);
+            // v32 R8: resizable thickness (see bottom-edge note above).
+            wpanel = wpanel.resizable(true).default_size(w).min_size(220.0);
             wpanel.show(ui, |ui| {
                     for (n, i) in ids.iter().enumerate() {
                         let b = ui.max_rect();
@@ -25134,6 +25140,49 @@ mod tests {
         assert!(
             (plus_c - plus_a).abs() < 0.5 && (on_c - on_a).abs() < 0.5,
             "round trip shifted the strip: on {on_a:.1}→{on_c:.1}, plus {plus_a:.1}→{plus_c:.1}"
+        );
+    }
+
+    #[test]
+    fn v32_shared_bottom_strip_is_resizable() {
+        // v32 R8: two windows sharing the BOTTOM edge used to sit inside a
+        // wrapper panel with resizable(false) — no divider existed, so the
+        // strip could never grow taller. After docking two windows at the
+        // bottom, dragging the strip's top divider upward must move the
+        // persisted thickness (side_wins[..][3]).
+        let mut app = headless_app("v32dock");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Dock MONITOR (2) and MIXER (3) on the bottom edge.
+        for idx in [2usize, 3usize] {
+            let name = ["ASSET RACK", "MIDI BINDINGS", "MIDI MONITOR", "MIXER"][idx];
+            let t = galley_at(&mut app, &ctx, name).expect("dock header");
+            let vp = ctx.viewport_rect();
+            drag_pt(&mut app, &ctx, t.center(), egui::pos2(700.0, vp.max.y - 20.0));
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            assert_eq!(app.side_wins.dock[idx][0], 1, "{name} docked");
+            assert_eq!(app.side_wins.dock[idx][1], 2, "{name} on bottom edge");
+        }
+        // Both share the strip: find its top edge from the recorded heads.
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let strip_top = app.dock_rects[2][1].min(app.dock_rects[3][1]);
+        assert!(strip_top > 100.0, "bottom strip heads visible: {strip_top}");
+        let before = app.side_wins.mixer[3].max(app.side_wins.monitor[3]);
+        // Grab the strip's top divider (a hair BELOW the strip top so the
+        // panel resize handle, not the canvas, owns the press) and pull up.
+        let x = ctx.viewport_rect().center().x;
+        drag_pt(&mut app, &ctx, egui::pos2(x, strip_top + 1.0), egui::pos2(x, strip_top - 260.0));
+        for _ in 0..5 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let after = app.side_wins.mixer[3].max(app.side_wins.monitor[3]);
+        assert!(
+            after > before + 50.0,
+            "bottom strip thickness must follow a divider drag ({before} -> {after})"
         );
     }
 }
