@@ -910,6 +910,9 @@ pub struct App {
     trk_vol: [u8; MAX_LOOPS],
     trk_gain: [u8; MAX_LOOPS],
     trk_pan: [u8; MAX_LOOPS],
+    /// v32 R5: sidechain send mask per track (bit k = source); mirrored
+    /// into the engine atomics on every change.
+    sc_send: [u128; MAX_LOOPS],
     /// Last track selection propagated to the audio engine (input
     /// monitoring follows the selected track's chain/gain/pan).
     sel_sent: usize,
@@ -1297,10 +1300,13 @@ impl App {
         let trk_gain =
             core::array::from_fn(|i| cfg.trk_gain.get(i).copied().unwrap_or(GAIN_UNITY_MIDI));
         let trk_pan = core::array::from_fn(|i| cfg.trk_pan.get(i).copied().unwrap_or(64));
+        // v32 R5: sidechain routes (mixer SC picker) → engine atomics.
+        let sc_send = core::array::from_fn(|i| cfg.sc_send.get(i).copied().unwrap_or(0));
         for t in 0..MAX_LOOPS {
             backend.engine.set_loop_vol(t, vol_amp(trk_vol[t]));
             backend.engine.set_loop_gain(t, gain_amp(trk_gain[t]));
             backend.engine.set_loop_pan(t, pan01(trk_pan[t]));
+            backend.engine.set_sc_send(t, sc_send[t]);
         }
         let sel_in: HashSet<String> = cfg.ports_in.iter().cloned().collect();
         let sel_out: HashMap<String, u8> = cfg
@@ -1389,6 +1395,7 @@ impl App {
             trk_vol,
             trk_gain,
             trk_pan,
+            sc_send,
             sel_sent: usize::MAX,
             levels_dirty: false,
             selected: 0,
@@ -3421,6 +3428,7 @@ impl App {
             show_drums: self.show_drums,
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
+            sc_send: self.sc_send.to_vec(),
             editor_probe: self.editor_probe.clone(),
             track_vst: Vec::new(),
             track_chain: self
@@ -15077,7 +15085,7 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                             ChainRow::Script { stem, .. } => {
                                 let d = app.fx_registry.desc(stem);
                                 (
-                                    "fx",
+                                    if d.map(|d| d.sidechain).unwrap_or(false) { "fx:sc" } else { "fx" },
                                     d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
                                     d.is_some(),
                                 )
@@ -15172,6 +15180,57 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                 Some((3, k)) => app.remove_fx_row(loop_i, k),
                 _ => {}
             }
+            ui.separator();
+
+            // --- sidechain in (v32 R5) ------------------------------------
+            // Which tracks key THIS track's scripted effects. The engine
+            // consumes the mask from the next audio block; saving follows
+            // the same idle-flush as chain edits.
+            ui.label(
+                RichText::new("Sidechain in — tracks whose audio keys this chain:")
+                    .strong()
+                    .small(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let m = app.sc_send[loop_i];
+                for s in 0..MAX_LOOPS {
+                    let bit = 1u128 << s;
+                    let self_bit = s == loop_i;
+                    let on = m & bit != 0;
+                    let lbl = format!("{}", s + 1);
+                    let resp = if on {
+                        ui.button(format!("[{lbl}]")).on_hover_text(if self_bit {
+                            "a track cannot key itself"
+                        } else {
+                            "sidechain source — click to remove"
+                        })
+                    } else {
+                        ui.button(&lbl).on_hover_text(if self_bit {
+                            "a track cannot key itself"
+                        } else {
+                            "click to route this track as a sidechain source"
+                        })
+                    };
+                    if resp.clicked() && !self_bit {
+                        let v = (app.sc_send[loop_i] ^ bit) & !(1u128 << loop_i);
+                        app.sc_send[loop_i] = v;
+                        app.backend.engine.set_sc_send(loop_i, v);
+                        app.fx_save_pending = true;
+                    }
+                }
+                if m != 0 && ui.small_button("none").clicked() {
+                    app.sc_send[loop_i] = 0;
+                    app.backend.engine.set_sc_send(loop_i, 0);
+                    app.fx_save_pending = true;
+                }
+                if m != 0 {
+                    let names: Vec<usize> = (0..MAX_LOOPS)
+                        .filter(|s| m & (1u128 << s) != 0)
+                        .map(|s| s + 1)
+                        .collect();
+                    ui.label(RichText::new(format!("keyed by {names:?}")).weak().small());
+                }
+            });
             ui.separator();
 
             // --- add ------------------------------------------------------

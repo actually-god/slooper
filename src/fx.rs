@@ -30,7 +30,8 @@ mod api {
     include!("effect_api.rs");
 }
 pub use api::{
-    EffectGuiV1, EffectInfoV1, EffectParamV1, GuiApiV1, GuiFrameV1, SLOOPER_EFFECT_ABI,
+    EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectParamV1, GuiApiV1, GuiFrameV1,
+    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2,
     SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
 };
 
@@ -41,6 +42,8 @@ pub const MAX_FX_PER_TRACK: usize = 8;
 
 /// ABI version this build speaks.
 pub const ABI_VERSION: u32 = SLOOPER_EFFECT_ABI;
+/// v32 R5: sidechain-capable ABI generation this build also accepts.
+pub const ABI_VERSION_V2: u32 = SLOOPER_EFFECT_ABI_V2;
 /// Child-GUI ABI version this build speaks.
 pub const GUI_ABI_VERSION: u32 = SLOOPER_EFFECT_GUI_ABI;
 
@@ -66,11 +69,14 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("space_echo.rs", include_str!("../effects/space_echo.rs")),
     ("compressor.rs", include_str!("../effects/compressor.rs")),
     ("chorus.rs", include_str!("../effects/chorus.rs")),
+    ("sidechain_comp.rs", include_str!("../effects/sidechain_comp.rs")),
 ];
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
 /// takes the raw name bytes).
 const ENTRY: &[u8] = b"slooper_effect_info\0";
+/// v32 R5: optional symbol exporting the sidechain-capable v2 vtable.
+const ENTRY_V2: &[u8] = b"slooper_effect_info_v2\0";
 /// Optional symbol exporting the custom child-GUI vtable. Absent = the
 /// effect gets the auto slider window; the audio ABI does not care.
 const GUI_ENTRY: &[u8] = b"slooper_effect_gui\0";
@@ -704,6 +710,9 @@ pub struct EffectDesc {
     pub author: Option<String>,
     pub description: Option<String>,
     pub params: Vec<ParamDesc>,
+    /// v32 R5: loaded through the ABI-v2 entry — the host feeds it the
+    /// track's sidechain bus (mixer shows an "(SC)" tag on these).
+    pub sidechain: bool,
 }
 
 /// The three live callbacks, copied out of the library (plain fn pointers —
@@ -713,6 +722,8 @@ struct EffectFns {
     create: extern "C" fn(sample_rate: f64) -> *mut core::ffi::c_void,
     destroy: extern "C" fn(state: *mut core::ffi::c_void),
     process: extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32,
+    /// ABI v2 sidechain entry (None for v1 scripts — they never see `sc`).
+    process_sc: Option<extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32>,
 }
 
 /// Owning wrapper for a loaded library (raw handle inside ⇒ manual impls;
@@ -847,6 +858,21 @@ impl Instance {
     #[inline]
     pub unsafe fn call_sample(&self, input: f32, params: &[f32; MAX_PARAMS]) -> f32 {
         (self.fns.process)(self.state, input, params.as_ptr())
+    }
+
+    /// v32 R5: `call_sample` with this track's sidechain sample. v1
+    /// scripts (no v2 entry) keep receiving `process` exactly as before.
+    #[inline]
+    pub unsafe fn call_sample_sc(
+        &self,
+        input: f32,
+        params: &[f32; MAX_PARAMS],
+        sc: f32,
+    ) -> f32 {
+        match self.fns.process_sc {
+            Some(f) => f(self.state, input, params.as_ptr(), sc),
+            None => (self.fns.process)(self.state, input, params.as_ptr()),
+        }
     }
 
     /// A brand-new instance of the same effect at the same rate, seeded with
@@ -1235,20 +1261,48 @@ fn sanitize_crate_name(stem: &str) -> String {
 unsafe fn validate(
     lib: &libloading::Library,
 ) -> Result<(EffectDesc, EffectFns, Option<&'static EffectGuiV1>), String> {
-    let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> = lib
-        .get(ENTRY)
-        .map_err(|_| "missing entry point slooper_effect_info — see template.rs".to_string())?;
-    let info = sym();
-    if info.is_null() {
-        return Err("slooper_effect_info returned null".into());
-    }
-    let d = &*info;
-    if d.abi != ABI_VERSION {
-        return Err(format!(
-            "effect ABI version {} (this slooper speaks {ABI_VERSION})",
-            d.abi
-        ));
-    }
+    // v32 R5: v2 side symbol first (sidechain-capable scripts). A script
+    // exporting both symbols lands here; v1-only scripts are unchanged.
+    // The v2 struct's prefix is bit-identical to v1 (validated in the ABI
+    // file), so the common path below reads it as a plain v1 description.
+    let mut process_sc = None;
+    let d: &EffectInfoV1 = match lib.get(ENTRY_V2) {
+        Ok(s) => {
+            let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV2> = s;
+            let p = s();
+            if p.is_null() {
+                return Err("slooper_effect_info_v2 returned null".into());
+            }
+            let v2 = &*p;
+            if v2.abi != ABI_VERSION_V2 {
+                return Err(format!(
+                    "effect ABI v2 version {} (this slooper speaks v2 = {ABI_VERSION_V2})",
+                    v2.abi
+                ));
+            }
+            process_sc = Some(v2.process_sc);
+            std::mem::transmute::<*const EffectInfoV2, *const EffectInfoV1>(v2)
+                .as_ref()
+                .unwrap()
+        }
+        Err(_) => {
+            let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> = lib
+                .get(ENTRY)
+                .map_err(|_| "missing entry point slooper_effect_info — see template.rs".to_string())?;
+            let info = sym();
+            if info.is_null() {
+                return Err("slooper_effect_info returned null".into());
+            }
+            let d = &*info;
+            if d.abi != ABI_VERSION {
+                return Err(format!(
+                    "effect ABI version {} (this slooper speaks {ABI_VERSION})",
+                    d.abi
+                ));
+            }
+            d
+        }
+    };
     let name = read_cstr(d.name).ok_or("effect has no name — DESC.name must be text")?;
     let author = d.author.cast_non_null().and_then(read_cstr);
     let description = d.description.cast_non_null().and_then(read_cstr);
@@ -1305,11 +1359,13 @@ unsafe fn validate(
             author,
             description,
             params,
+            sidechain: process_sc.is_some(),
         },
         EffectFns {
             create: d.create,
             destroy: d.destroy,
             process: d.process,
+            process_sc,
         },
         gui,
     ))
@@ -1612,6 +1668,16 @@ mod tests {
             );
         }
         assert_eq!(reg.desc("space_echo").unwrap().params.len(), 11);
+        // v32 R5: the stock sidechain compressor is the ABI-v2 reference.
+        // It must load (both entry symbols present) and be recognized as
+        // sidechain-capable; every v1 stock effect must not be.
+        {
+            let sc = reg.desc("sidechain_comp").unwrap_or_else(|| panic!("sidechain_comp missing/failed"));
+            assert!(sc.sidechain, "must load through the v2 entry");
+            assert_eq!(sc.params.len(), 6);
+            assert!(!reg.desc("compressor").unwrap().sidechain, "v1 stays v1");
+            assert!(!reg.desc("template").unwrap().sidechain);
+        }
         assert!(
             reg.gui("parametric_eq").is_some(),
             "EQ must expose a child GUI"
@@ -2307,6 +2373,7 @@ mod tests {
                     default: 1.0,
                 },
             ],
+            sidechain: false,
         };
         assert_eq!(seed_values(&[0.9, 1.5, 9.0], &d), vec![0.9, 1.5]);
         assert_eq!(seed_values(&[], &d), vec![0.25, 1.0]);
@@ -2332,6 +2399,7 @@ mod tests {
                 "chorus".to_string(),
                 "compressor".to_string(),
                 "parametric_eq".to_string(),
+                "sidechain_comp".to_string(),
                 "space_echo".to_string(),
                 "template".to_string(),
             ],
@@ -2495,6 +2563,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 "compressor".to_string(),
                 "ok".to_string(),
                 "parametric_eq".to_string(),
+                "sidechain_comp".to_string(),
                 "space_echo".to_string(),
             ]
         );

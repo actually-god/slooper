@@ -136,6 +136,57 @@ pub struct EffectInfoV1 {
 }
 
 // ---------------------------------------------------------------------------
+// ABI v2: sidechain input
+// ---------------------------------------------------------------------------
+// A v2 effect is a v1 effect that ALSO can consume a per-track sidechain
+// signal (SC): the summed audio of other tracks the user routed to this
+// track's strip (mixer: "sidechain in"). Sidechaining is how one track
+// keys another's dynamics — a kick ducking a pad, a vocal keying a reverb.
+//
+// A v2 script exports ONE extra symbol alongside the usual v1 one:
+//
+//     #[no_mangle]
+//     pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
+//
+// The loader tries that symbol first and falls back to
+// `slooper_effect_info` (v1) forever — existing scripts never change.
+// When the host has no SC feed routed to the track, `sc` is exactly 0.0.
+//
+// Feed rules (docs/SIDECHAIN.md has the full picture):
+//   * `sc` is MONO — the post-chain sum of every source track selected on
+//     this strip, taken from the PREVIOUS render block (one block of
+//     detection latency, ~21 ms at 1024/48k; standard practice, inaudible
+//     on any envelope).
+//   * SC never loops within a block, so mutual sends can never self-oscillate.
+//   * Silence on the SC bus is a hard 0.0 — gate on `sc != 0.0` only if a
+//     plugin-semantics "no key means bypass" is wanted; envelope followers
+//     just see silence.
+pub const SLOOPER_EFFECT_ABI_V2: u32 = 2;
+
+/// A v1 layout with one extra entry point appended. The first fields are
+/// bit-identical to [`EffectInfoV1`] (a v2 struct may be read by an older
+/// host as valid v1 — the extra pointer at the end is never touched).
+#[repr(C)]
+pub struct EffectInfoV2 {
+    /// Must be [`SLOOPER_EFFECT_ABI_V2`].
+    pub abi: u32,
+    pub name: *const core::ffi::c_char,
+    pub author: *const core::ffi::c_char,
+    pub description: *const core::ffi::c_char,
+    pub n_params: u32,
+    pub params: *const EffectParamV1,
+    pub create: extern "C" fn(sample_rate: f64) -> *mut core::ffi::c_void,
+    pub destroy: extern "C" fn(state: *mut core::ffi::c_void),
+    pub process:
+        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32,
+    /// Same as `process`, plus the sidechain sample for THIS output sample.
+    /// A v2 effect MUST do its real work here; `process` is kept as the
+    /// graceful fallback (return `input`) for hosts that predate v2.
+    pub process_sc:
+        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32,
+}
+
+// ---------------------------------------------------------------------------
 // OPTIONAL: the child GUI (editor window) contract
 // ---------------------------------------------------------------------------
 // By default slooper gives every effect a child window with one slider
@@ -318,5 +369,6 @@ pub struct EffectGuiV1 {
 // is loaded, so cross-thread sharing is exactly the contract.
 unsafe impl Sync for EffectParamV1 {}
 unsafe impl Sync for EffectInfoV1 {}
+unsafe impl Sync for EffectInfoV2 {}
 unsafe impl Sync for GuiApiV1 {}
 unsafe impl Sync for EffectGuiV1 {}

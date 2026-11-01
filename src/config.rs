@@ -429,6 +429,11 @@ pub struct Config {
     /// a plugin can sit anywhere in the chain (FL Studio mixer model).
     #[serde(default)]
     pub track_chain: Vec<Vec<ChainSave>>,
+    /// v32 R5: sidechain send mask — bit k of `sc_send[t]` means "track k's
+    /// audio keys track t's effect chain" (mixer SC picker). The live copy
+    /// rides the engine atomics (`Engine::set_sc_send`).
+    #[serde(default)]
+    pub sc_send: Vec<u128>,
     /// Extra VST search folders (user-set; the standard system folders are
     /// always scanned on top of these).
     #[serde(default)]
@@ -532,6 +537,7 @@ impl Default for Config {
             fx_dir: String::new(),
             track_fx: Vec::new(),
             track_chain: Vec::new(),
+            sc_send: Vec::new(),
             vst_dirs: Vec::new(),
             editor_probe: Default::default(),
             track_vst: Vec::new(),
@@ -827,6 +833,7 @@ mod tests {
             show_drums: true,
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
+            sc_send: Vec::new(),
             track_fx: vec![vec![TrackFxSave {
                 stem: "template".into(),
                 params: vec![0.5, 4.0],

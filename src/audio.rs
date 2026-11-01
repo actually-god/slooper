@@ -659,6 +659,11 @@ pub struct Engine {
     vol: [AtomicU32; MAX_LOOPS],
     /// Per-track gain trim (linear amplitude as f32 bits; 1.0 = 0 dB).
     trk_gain: [AtomicU32; MAX_LOOPS],
+    /// v32 R5: sidechain SEND mask (bit k = source track, u128 across
+    /// `MAX_LOOPS` split into an atomic lo/hi pair — there is no AtomicU128).
+    /// The self-bit is always cleared: a track never keys itself.
+    sc_send_lo: [AtomicU64; MAX_LOOPS],
+    sc_send_hi: [AtomicU64; MAX_LOOPS],
     /// Per-track stereo pan position as f32 in [0, 1] (0 = hard left,
     /// 0.5 = centre). Equal-power split between the L and R mix buses.
     pan: [AtomicU32; MAX_LOOPS],
@@ -774,6 +779,8 @@ impl Engine {
             track_on: core::array::from_fn(|_| AtomicU8::new(1)),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            sc_send_lo: core::array::from_fn(|_| AtomicU64::new(0)),
+            sc_send_hi: core::array::from_fn(|_| AtomicU64::new(0)),
             pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             selected: AtomicU8::new(0),
             monitor_on: AtomicBool::new(true),
@@ -1045,6 +1052,21 @@ impl Engine {
     /// Set track `i`'s gain trim (linear amplitude; 0 = silence).
     pub fn set_loop_gain(&self, i: usize, amp: f32) {
         self.trk_gain[i].store(amp.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// v32 R5: which tracks key track `i`'s chain (bit k = source track).
+    pub fn sc_send(&self, i: usize) -> u128 {
+        (self.sc_send_hi[i].load(Ordering::Relaxed) as u128) << 64
+            | self.sc_send_lo[i].load(Ordering::Relaxed) as u128
+    }
+
+    /// Route `mask` as track `i`'s sidechain sources. The self-bit is
+    /// cleared on the way in — self-keying is always off (would be
+    /// feeding a track's own output back into its own detector).
+    pub fn set_sc_send(&self, i: usize, mask: u128) {
+        let m = mask & !(1u128 << i);
+        self.sc_send_lo[i].store(m as u64, Ordering::Relaxed);
+        self.sc_send_hi[i].store((m >> 64) as u64, Ordering::Relaxed);
     }
 
     /// Per-track pan position ([0, 1]; 0.5 = centre).
@@ -1763,6 +1785,9 @@ fn run(
         mix_l: Vec::new(),
         mix_r: Vec::new(),
         trk_bufs: vec![Vec::new(); MAX_LOOPS],
+        sc_apply: vec![Vec::new(); MAX_LOOPS],
+        sc_build: vec![Vec::new(); MAX_LOOPS],
+        sc_active: [false; MAX_LOOPS],
         mon_buf: Vec::new(),
         vst_tmp: Vec::new(),
         dflt_synth: engine.default_synth(),
@@ -3031,6 +3056,14 @@ struct Proc {
     /// Held-back track sums (tracks with a plugin in the chain) and monitor
     /// tap; plus the VST scratch buffer for block-wise chain passes.
     trk_bufs: Vec<Vec<f32>>,
+    /// v32 R5: sidechain bus. `sc_apply[t]` is what track `t`'s scripted
+    /// effects read THIS block (the previous block's source sum — one
+    /// block of detection latency, see docs/SIDECHAIN.md); `sc_build[t]`
+    /// accumulates this block's taps for the next one. `sc_active[t]`
+    /// precomputes "mask != 0" so the sample loop stays branch-cheap.
+    sc_apply: Vec<Vec<f32>>,
+    sc_build: Vec<Vec<f32>>,
+    sc_active: [bool; MAX_LOOPS],
     mon_buf: Vec<f32>,
     vst_tmp: Vec<f32>,
     /// v0.11 R5: automation asset table refresh pair.
@@ -3114,7 +3147,7 @@ impl Proc {
     /// volume x gain trim has already been multiplied into `x`). Only for
     /// scripted-only chains; plugin chains go through `run_chain_block`.
     #[inline]
-    fn fx_mix(&mut self, t: usize, x: f32) -> f32 {
+    fn fx_mix(&mut self, t: usize, x: f32, sc: f32) -> f32 {
         let chain = &self.fx_cache[t];
         if chain.is_empty() {
             return x;
@@ -3131,7 +3164,7 @@ impl Proc {
             }
             // SAFETY: the live chain is advanced by this thread only, and
             // `rt.p` holds the instance's current slider snapshot.
-            s = unsafe { inst.call_sample(s, &rt.p) }
+            s = unsafe { inst.call_sample_sc(s, &rt.p, sc) }
         }
         s
     }
@@ -3140,7 +3173,7 @@ impl Proc {
     /// in place — `tmp` is scratch). Scripted slots keep their per-slot
     /// slider snapshots (`fx_rt`); plugins consume/replenish their rings.
     /// The dry input is already trim-scaled; pan/master are folded later.
-    fn run_chain_block(&mut self, t: usize, buf: &mut [f32], tmp: &mut [f32]) {
+    fn run_chain_block(&mut self, t: usize, buf: &mut [f32], tmp: &mut [f32], sc: &[f32]) {
         let n = buf.len().min(tmp.len());
         let Self {
             fx_cache, fx_rt, ..
@@ -3155,8 +3188,10 @@ impl Proc {
                         rt.gen = g;
                     }
                     // SAFETY: audio thread owns the live chain (as fx_mix).
-                    for x in buf[..n].iter_mut() {
-                        *x = unsafe { inst.call_sample(*x, &rt.p) };
+                    for (j, x) in buf[..n].iter_mut().enumerate() {
+                        *x = unsafe {
+                            inst.call_sample_sc(*x, &rt.p, *sc.get(j).unwrap_or(&0.0))
+                        };
                     }
                 }
                 FxKind::Vst(e) => {
@@ -3882,6 +3917,49 @@ impl ProcessHandler for Proc {
             n_acc: nacc,
         } = lists;
 
+        // ---- v32 R5: sidechain bus block setup --------------------------
+        // Sends are read every block from the engine atomics (UI writes
+        // land next block). Edges expand to (source, target) pairs; the
+        // per-sample loop taps ONLY sources that are actually used, and a
+        // project without routing costs one AND per mixed track.
+        let mut sc_src_any = 0u128;
+        let mut n_edge = 0usize;
+        let mut e_src = [0u8; 256];
+        let mut e_tgt = [0u8; 256];
+        let mut sc_any = false;
+        for tg in 0..MAX_LOOPS {
+            let m: u128 = self.engine.sc_send(tg);
+            self.sc_active[tg] = m != 0;
+            if m == 0 {
+                continue;
+            }
+            sc_any = true;
+            sc_src_any |= m;
+            for s in 0..MAX_LOOPS {
+                if (m >> s) & 1 != 0 && n_edge < e_src.len() {
+                    e_src[n_edge] = s as u8;
+                    e_tgt[n_edge] = tg as u8;
+                    n_edge += 1;
+                }
+            }
+        }
+        let mut sc_apply = std::mem::take(&mut self.sc_apply);
+        let mut sc_build = std::mem::take(&mut self.sc_build);
+        if sc_any {
+            for t in 0..MAX_LOOPS {
+                if self.sc_active[t] {
+                    if sc_apply[t].len() < n {
+                        sc_apply[t].resize(n, 0.0);
+                    }
+                    if sc_build[t].len() < n {
+                        sc_build[t].resize(n, 0.0);
+                    }
+                    sc_build[t][..n].fill(0.0);
+                }
+            }
+        }
+        let sc_empty: [f32; 0] = [];
+
         // Per-block mix buffers (taken out of self so the sample loop can
         // call `&mut self` effect code freely; `clip_buf` uses the same trick).
         let mut mix_l = std::mem::take(&mut self.mix_l);
@@ -3979,13 +4057,29 @@ impl ProcessHandler for Proc {
                     // v32 R7: ramped track trim (block-constant `amp` was
                     // the click at mute toggles / volume jumps).
                     let av = amp_a[t] + amp_s[t] * i as f32;
+                    // v32 R5: sidechain tap — the track's dry post-trim
+                    // sum feeds every target that lists it as a source
+                    // (consumed NEXT block: one block of detector lag).
+                    if sc_src_any & (1u128 << t) != 0 {
+                        let tap = a * av;
+                        if tap != 0.0 || n_edge != 0 {
+                            for k in 0..n_edge {
+                                if e_src[k] as usize == t {
+                                    sc_build[e_tgt[k] as usize][i] += tap;
+                                }
+                            }
+                        }
+                    }
                     if vst_mask[t] {
                         // Held back: this track's chain (scripts and
                         // plugins, in chain order) runs block-wise over
                         // the pre-pan sum after the sample loop.
                         trk_bufs[t][i] = a * av;
                     } else {
-                        let m = self.fx_mix(t, a * av);
+                        // v32 R5: this track's scripted chain sees last
+                        // block's sidechain sum (0.0 when no send routed).
+                        let scv = if self.sc_active[t] { sc_apply[t][i] } else { 0.0 };
+                        let m = self.fx_mix(t, a * av, scv);
                         play_l += m * pgl[t];
                         play_r += m * pgr[t];
                     }
@@ -4077,7 +4171,7 @@ impl ProcessHandler for Proc {
             if sel_vst {
                 mon_buf[i] = src_in * mon_i;
             } else {
-                mon = self.fx_mix(sel, src_in * mon_i);
+                mon = self.fx_mix(sel, src_in * mon_i, 0.0);
             }
             let clickc = click * F1S2;
             // Pre-master, pre-gain mix; ports get written post-loop (once any
@@ -4103,7 +4197,11 @@ impl ProcessHandler for Proc {
                     continue;
                 }
                 let (buf, tmp) = (&mut trk_bufs[t], &mut vst_tmp);
-                self.run_chain_block(t, buf, tmp);
+                // v32 R5: scripted slots inside a plugin-bearing chain get
+                // their sidechain row too; the plugin slots ignore it.
+                let scrow: &[f32] =
+                    if self.sc_active[t] { &sc_apply[t] } else { &sc_empty };
+                self.run_chain_block(t, buf, tmp, scrow);
                 for i in 0..n {
                     mix_l[i] += buf[i] * pgl[t];
                     mix_r[i] += buf[i] * pgr[t];
@@ -4111,7 +4209,7 @@ impl ProcessHandler for Proc {
             }
             if sel_vst {
                 let (buf, tmp) = (&mut mon_buf, &mut vst_tmp);
-                self.run_chain_block(sel, buf, tmp);
+                self.run_chain_block(sel, buf, tmp, &sc_empty);
                 for i in 0..n {
                     mix_l[i] += buf[i] * mon_l;
                     mix_r[i] += buf[i] * mon_r;
@@ -4148,6 +4246,10 @@ impl ProcessHandler for Proc {
         self.mix_l = mix_l;
         self.mix_r = mix_r;
         self.trk_bufs = trk_bufs;
+        // v32 R5: publish this block's taps as next block's SC input.
+        std::mem::swap(&mut sc_apply, &mut sc_build);
+        self.sc_apply = sc_apply;
+        self.sc_build = sc_build;
         self.mon_buf = mon_buf;
         self.vst_tmp = vst_tmp;
 
