@@ -22663,6 +22663,41 @@ mod tests {
         assert_eq!(app.side_wins.dock[0][0], 0, "menu floated the rack out");
     }
 
+    /// v30-batch-2: with the mixer docked beside the grid, every Track n
+    /// strip must sit LEVEL with its track row — shared top offset, shared
+    /// per-track heights, no drift as n grows.
+    #[test]
+    fn v30_mixer_strips_align_with_tracks() {
+        let mut app = headless_app("v30align");
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let g = galley_centers(&mut app, &ctx, "T1 track", false);
+        let m = galley_centers(&mut app, &ctx, "Track 1", false);
+        assert!(!g.is_empty() && !m.is_empty(), "grid labels and mixer headers paint");
+        let gy0 = g[0].y;
+        let my0 = m[0].y;
+        for t in 0..app.n_tracks.min(6) {
+            let gy = galley_centers(&mut app, &ctx, &format!("T{} track", t + 1), false);
+            let my = galley_centers(&mut app, &ctx, &format!("Track {}", t + 1), false);
+            if gy.is_empty() || my.is_empty() {
+                continue; // row scrolled out of either panel
+            }
+            // Pick the occurrences on the grid side (x < 400) and the mixer
+            // side (x > 1000) so rack/other galleys never match.
+            let gyy = gy.iter().filter(|c| c.x < 400.0).copied().collect::<Vec<_>>()[0];
+            let myy = my.iter().filter(|c| c.x > 1000.0).copied().collect::<Vec<_>>()[0];
+            assert!(
+                (gyy.y - myy.y).abs() < 6.0,
+                "track {} must sit level: grid y={:.0} mixer y={:.0} (base {gy0:.0}/{my0:.0})",
+                t + 1,
+                gyy.y,
+                myy.y
+            );
+        }
+    }
+
     #[test]
     fn v25_settings_panel_toggles_hide_panels() {
         let mut app = headless_app("v25panels");
