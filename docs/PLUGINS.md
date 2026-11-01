@@ -425,5 +425,14 @@ wine "C:\Program Files\Arturia Software Center\Arturia Software Center.exe"     
 then start `Analog Lab V.exe`. AL V's own modal email box crashed while
 the client was missing; the ASC client renders its own proper login form.
 
+**Accessibility bridge kill-switch (REQUIRED):** interacting with AL V's
+login modal (JUCE a11y init) floods wine's UIA/MSAA stubs and then dies
+with a stack-corruption SEH (`call_stack_handlers invalid frame`),
+taking the yabridge host — and via chain-loader abort, slooper — with
+it. Fix (shipped in `~/.config/environment.d/yabridge-wine.conf`):
+`WINEDLLOVERRIDES="oleacc=disabled,uiautomationcore=disabled"`. After
+the one-time login the plugin GUI shows no modal and the audio path
+measures live (probe peak > 0 where pre-login was exact silence).
+
 MiniLab 37 hardware needs nothing: class-compliant MIDI, auto-linked to
 `slooper:midi_in`. Firmware updates need MCC → Windows or a friend.
