@@ -946,7 +946,11 @@ fn probe_vst3(path: &Path) -> VstEntry {
                 note_instantiated(
                     path,
                     VstKind::V3,
-                    info.name.clone(),
+                    if info.name.trim().is_empty() {
+                        base_label(path)
+                    } else {
+                        info.name.clone()
+                    },
                     info.vendor.clone(),
                     instrument,
                 );
@@ -955,7 +959,11 @@ fn probe_vst3(path: &Path) -> VstEntry {
             VstEntry {
                 path: path.to_path_buf(),
                 kind: VstKind::V3,
-                name: info.name,
+                name: if info.name.trim().is_empty() {
+                    base_label(path)
+                } else {
+                    info.name
+                },
                 vendor: info.vendor,
                 instrument,
                 error: None,
@@ -1000,21 +1008,30 @@ fn probe_vst2(path: &Path) -> VstEntry {
             // down editor machinery every LATER instance still uses: the next
             // effEditOpen dereferences freed C++ statics and dies (SIGSEGV
             // mid-editor-open). Read the metadata, then leak the instance.
+            let instrument = vst2_is_instrument(inst.raw_flags(), info.inputs);
+            // Some bridges (yabridge + Arturia) hand back a blank AEffect
+            // name until their Wine side finishes loading — a blank row in
+            // the synth picker is never acceptable: fall back to the file
+            // stem, which yabridge names after the real product.
+            let name = if info.name.trim().is_empty() {
+                base_label(path)
+            } else {
+                info.name.clone()
+            };
             note_instantiated(
                 path,
                 VstKind::V2,
-                info.name.clone(),
+                name.clone(),
                 info.vendor.clone(),
                 // `flags` (bit 0 = effFlagsSynth) lives on the AEffect;
                 // the loader's plugin::Info drops it.
-                vst2_is_instrument(inst.raw_flags(), info.inputs),
+                instrument,
             );
-            let instrument = vst2_is_instrument(inst.raw_flags(), info.inputs);
             std::mem::forget(inst);
             VstEntry {
                 path: path.to_path_buf(),
                 kind: VstKind::V2,
-                name: info.name,
+                name,
                 vendor: info.vendor,
                 instrument,
                 error: None,

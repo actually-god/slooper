@@ -452,3 +452,22 @@ With the agent up, AL V's editor opens cleanly under RT load (3/3 soak
 
 MiniLab 37 hardware needs nothing: class-compliant MIDI, auto-linked to
 `slooper:midi_in`. Firmware updates need MCC → Windows or a friend.
+
+## Analog Lab V under yabridge: blank name, and the "ERROR 02 / login" dialog
+
+**Blank name (fixed v32).** yabridge hands back an empty `AEffect->name` for
+Analog Lab V when the Wine side has not finished loading at scan time, so the
+synth picker showed a nameless row. `probe_vst2`/`probe_vst3` now fall back to
+the file stem whenever the reported name is blank — yabridge names the wrapper
+after the product, so the row reads "Analog Lab V".
+
+**"ERROR 02: failed to load ASC" + occasional re-login.** This dialog is
+Arturia's own copy, not slooper's: Analog Lab asks the Arturia Software Center
+catalog (`~/.wine/drive_c/ProgramData/ArturiaSC/.../lic.ascd`) to prove the
+login. The license state DOES persist across sessions (that file lives in the
+persistent Wine prefix, not in slooper) — but the Arturia cloud token itself
+expires on THEIR schedule, and a cold prefix can miss the catalog read during
+plugin init. There is no host-side fix: re-login once inside the plugin GUI to
+refresh `lic.ascd`. Speed-up that actually helps: after boot, open Analog Lab
+once before a session (warms the 11 GB prefix page cache), and do not delete
+`~/.wine` — it holds the activation.
