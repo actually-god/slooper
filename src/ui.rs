@@ -4849,7 +4849,15 @@ impl App {
                             }
                         });
                     let playing = self.drum.playing;
-                    if ui.button(if playing { "\u{25a0} stop" } else { "\u{25b6} play" }).clicked()
+                    // v32: reserved slot for the wider label (no reflow
+                    // of the row when the drum machine starts/stops).
+                    let pp_btn = egui::Button::new(if playing {
+                        "\u{25a0} stop"
+                    } else {
+                        "\u{25b6} play"
+                    })
+                    .min_size(egui::vec2(56.0, 0.0));
+                    if ui.add(pp_btn).clicked()
                     {
                         self.drum.playing = !self.drum.playing;
                         self.drum.step_start = self.backend.engine.pos();
@@ -12322,12 +12330,20 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // ticked source on this track at once; STOP bounces them all.
         let any_rec = rec || app.midi_rec[t].armed || app.auto_rec[t].armed;
         let rec_lbl = if any_rec { "STOP" } else { "REC" };
-        if ui
-            .small_button(RichText::new(rec_lbl).color(if any_rec {
+        // v32: label-swapping buttons hold a RESERVED slot (the wider of
+        // their two labels) — a control that grows when its text changes
+        // used to reflow every neighbour in the strip, which read as the
+        // UI "auto-rescaling itself".
+        let rec_btn =
+            egui::Button::new(RichText::new(rec_lbl).color(if any_rec {
                 Color32::from_rgb(255, 90, 90)
             } else {
                 Color32::from_rgb(220, 180, 120)
             }))
+            .small()
+            .min_size(egui::vec2(40.0, 0.0));
+        if ui
+            .add(rec_btn)
             .on_hover_text(
                 "Record: arms every ticked source (audio take, MIDI take, \
                  write automation) on this track at once; stop bounces the \
@@ -12363,8 +12379,12 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             app.rec_src[t] = src;
             app.save_config();
         }
+        // v32: reserved slot — "on"↔"mute" must not move the strip.
+        let mute_btn = egui::Button::new(if on { "on" } else { "mute" })
+            .small()
+            .min_size(egui::vec2(38.0, 0.0));
         let mute_resp = ui
-            .small_button(if on { "on" } else { "mute" })
+            .add(mute_btn)
             .on_hover_text(
                 "While the transport runs, a muted track contributes nothing \
                  (its clips stay on the timeline). Right-click for automation.",
@@ -25053,6 +25073,69 @@ mod tests {
         assert!(
             !bs.claims(3, 0, 60),
             "a master-volume knob must not swallow note-ons"
+        );
+    }
+
+    /// v32: label-swapping buttons must not reflow their row. The "on" ↔
+    /// "mute" and "REC" ↔ "STOP" buttons hold reserved slots (the wider of
+    /// their two labels): toggling track 1 must leave the neighbouring
+    /// controls of that strip pixel-identical. (The user complaint: the UI
+    /// seemed to "auto-rescale itself" whenever button text changed.)
+    #[test]
+    fn v32_mixer_state_swaps_do_not_reflow() {
+        let mut app = headless_app("v32reflow");
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // The '+' child-lane button sits AFTER the mute button on track 1's
+        // strip line (mixer side); locate it by the row header's y so the
+        // probe survives label swaps.
+        let row_plus_x = |app: &mut App, ctx: &egui::Context| -> Option<f32> {
+            let head = galley_centers(app, ctx, "Track 1", false)
+                .into_iter()
+                .filter(|c| c.x > 1000.0)
+                .next()?;
+            let plus = galley_centers(app, ctx, "+", true)
+                .into_iter()
+                .find(|c| c.x > 1000.0 && (c.y - head.y).abs() < 8.0)?;
+            Some(plus.x)
+        };
+        let at = |app: &mut App, ctx: &egui::Context, want: &str| -> Option<f32> {
+            let head = galley_centers(app, ctx, "Track 1", false)
+                .into_iter()
+                .filter(|c| c.x > 1000.0)
+                .next()?;
+            galley_centers(app, ctx, want, true)
+                .into_iter()
+                .find(|c| c.x > 1000.0 && (c.y - head.y).abs() < 14.0)
+                .map(|c| c.x)
+        };
+        let plus_a = row_plus_x(&mut app, &ctx).expect("track 1 strip paints '+'");
+        let on_a = at(&mut app, &ctx, "on").expect("and 'on'");
+        // Null audio does not drain the command queue — drive the engine
+        // state exactly as ToggleTrackOn would.
+        app.backend.engine.set_track_on(0, false);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mute_x = at(&mut app, &ctx, "mute").expect("the WIDER label paints in the strip");
+        let plus_b = row_plus_x(&mut app, &ctx).expect("strip still carries '+' after the swap");
+        assert!(
+            (plus_b - plus_a).abs() < 1.0,
+            "the wider 'mute' label moved the neighbour: x {plus_a:.1} → {plus_b:.1} \
+             (on at {on_a:.1}, mute at {mute_x:.1})"
+        );
+        // And toggling back lands every pixel exactly where it was.
+        app.backend.engine.set_track_on(0, true);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let plus_c = row_plus_x(&mut app, &ctx).expect("strip restored");
+        let on_c = at(&mut app, &ctx, "on").expect("'on' back");
+        assert!(
+            (plus_c - plus_a).abs() < 0.5 && (on_c - on_a).abs() < 0.5,
+            "round trip shifted the strip: on {on_a:.1}→{on_c:.1}, plus {plus_a:.1}→{plus_c:.1}"
         );
     }
 }

@@ -372,23 +372,24 @@ extern "C" fn gui_destroy(gs: *mut core::ffi::c_void) {
 // ---- graph mapping helpers -------------------------------------------------
 const F_LO: f32 = 20.0f32;
 const F_HI: f32 = 20000.0f32;
-/// Top edge of the graph AND the hard ceiling for band gains: +6 dB.
-const DB_TOP: f32 = 6.0f32;
-/// dB per decade on the LOG vertical axis: y = 1 − 10^((db−6)/48), so
-/// −∞ dB sits exactly at the bottom edge and 0 dB lands at y = 25 % —
-/// where the old +9 line sat, between the old +6 and +12 grid lines.
-/// A log axis gives −24 dB (the gain floor) 76 % of the height and every
+/// Top edge of the graph AND the hard ceiling for band gains: +30 dB.
+const DB_TOP: f32 = 30.0f32;
+/// dB per decade on the LOG vertical axis: y = 1 − 10^((db−30)/96), so
+/// −∞ dB sits exactly at the bottom edge and 0 dB lands mid-graph (~51 %).
+/// v32: the gain ceiling moved from +6 to +30 dB, and the span widened to
+/// keep the musical range (+30..−24, 72 % of the height) legible while a
+/// log axis gives the deep cuts all the room below. A log axis means every
 /// real-world gain lives INSIDE the graph, so a node can never be dragged
 /// to a value the view cannot draw (the old bug: drag past the axis edge,
 /// the handle pins to the border but its true position — and hit-test —
 /// live outside, so the mouse can no longer reach it).
-const DB_SPAN: f32 = 48.0f32;
+const DB_SPAN: f32 = 96.0f32;
 /// Grid floor — the lowest LABELLED dB line (the axis itself keeps going
 /// to the −∞ bottom edge below it).
 const DB_GRID_BOT: f32 = -24.0f32;
 /// Gain floor = node drag floor, matching the "gain" param range. Effectively
-/// −∞ for the log axis: −120 dB (linear 1e-6) maps within 0.3 % of the bottom
-/// edge, so a node can be dragged the FULL height of the graph, −∞..+6 dB.
+/// −∞ for the log axis: −120 dB (linear 1e-6) maps within 3 % of the bottom
+/// edge, so a node can be dragged the FULL height of the graph, −∞..+30 dB.
 const DB_BOT: f32 = -120.0f32;
 /// Half of the drawn 8 px handle: handle centres clamp by this margin so the
 /// node body always stays inside the graph window.
@@ -485,7 +486,7 @@ extern "C" fn gui_draw(
     // ---- graph backdrop + grid -------------------------------------------
     unsafe {
         (api.rect_filled)(c, gx, gy, gw, gph, 0.09, 0.10, 0.13, 1.0);
-        // horizontal dB lines every 6 dB on the LOG axis (+6 top edge,
+        // horizontal dB lines every 6 dB on the LOG axis (+30 top edge,
         // −∞ bottom edge — see DB_SPAN); 0 dB is drawn brighter.
         let mut db = DB_GRID_BOT;
         while db <= DB_TOP + 0.1 {
@@ -814,27 +815,27 @@ extern "C" fn gui_draw(
 static PARAMS: [EffectParamV1; 26] = [
     EffectParamV1 { label: c"B1 type".as_ptr(), min: 0.0, max: 7.0, default: 1.0 },
     EffectParamV1 { label: c"B1 freq".as_ptr(), min: 20.0, max: 20000.0, default: 80.0 },
-    EffectParamV1 { label: c"B1 gain".as_ptr(), min: -120.0, max: 6.0, default: 0.0 },
+    EffectParamV1 { label: c"B1 gain".as_ptr(), min: -120.0, max: 30.0, default: 0.0 },
     EffectParamV1 { label: c"B1 Q".as_ptr(), min: 0.1, max: 16.0, default: 0.71 },
     EffectParamV1 { label: c"B2 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B2 freq".as_ptr(), min: 20.0, max: 20000.0, default: 250.0 },
-    EffectParamV1 { label: c"B2 gain".as_ptr(), min: -120.0, max: 6.0, default: 0.0 },
+    EffectParamV1 { label: c"B2 gain".as_ptr(), min: -120.0, max: 30.0, default: 0.0 },
     EffectParamV1 { label: c"B2 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B3 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B3 freq".as_ptr(), min: 20.0, max: 20000.0, default: 800.0 },
-    EffectParamV1 { label: c"B3 gain".as_ptr(), min: -120.0, max: 6.0, default: 0.0 },
+    EffectParamV1 { label: c"B3 gain".as_ptr(), min: -120.0, max: 30.0, default: 0.0 },
     EffectParamV1 { label: c"B3 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B4 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B4 freq".as_ptr(), min: 20.0, max: 20000.0, default: 2500.0 },
-    EffectParamV1 { label: c"B4 gain".as_ptr(), min: -120.0, max: 6.0, default: 0.0 },
+    EffectParamV1 { label: c"B4 gain".as_ptr(), min: -120.0, max: 30.0, default: 0.0 },
     EffectParamV1 { label: c"B4 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B5 type".as_ptr(), min: 0.0, max: 7.0, default: 3.0 },
     EffectParamV1 { label: c"B5 freq".as_ptr(), min: 20.0, max: 20000.0, default: 6000.0 },
-    EffectParamV1 { label: c"B5 gain".as_ptr(), min: -120.0, max: 6.0, default: 0.0 },
+    EffectParamV1 { label: c"B5 gain".as_ptr(), min: -120.0, max: 30.0, default: 0.0 },
     EffectParamV1 { label: c"B5 Q".as_ptr(), min: 0.1, max: 16.0, default: 1.1 },
     EffectParamV1 { label: c"B6 type".as_ptr(), min: 0.0, max: 7.0, default: 2.0 },
     EffectParamV1 { label: c"B6 freq".as_ptr(), min: 20.0, max: 20000.0, default: 11000.0 },
-    EffectParamV1 { label: c"B6 gain".as_ptr(), min: -120.0, max: 6.0, default: 0.0 },
+    EffectParamV1 { label: c"B6 gain".as_ptr(), min: -120.0, max: 30.0, default: 0.0 },
     EffectParamV1 { label: c"B6 Q".as_ptr(), min: 0.1, max: 16.0, default: 0.71 },
     EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 1.0 },
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
