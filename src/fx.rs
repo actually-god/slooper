@@ -1591,6 +1591,26 @@ mod tests {
             );
         }
         assert_eq!(reg.desc("parametric_eq").unwrap().params.len(), 26);
+        // v32: the native EQ must reach +30 dB — through the REAL parsed
+        // descriptor, not a source-grep. The ceiling moved from +6; both
+        // the slider range and the graph axis moved with it.
+        let gains: Vec<&crate::fx::ParamDesc> = reg
+            .desc("parametric_eq")
+            .unwrap()
+            .params
+            .iter()
+            .filter(|p| p.label.contains("gain"))
+            .collect();
+        assert_eq!(gains.len(), 6, "six band gain params");
+        for g in &gains {
+            assert!(
+                (g.max - 30.0).abs() < 1e-3 && (g.min + 120.0).abs() < 1e-3,
+                "{} range {}..{}, want -120..30",
+                g.label,
+                g.min,
+                g.max
+            );
+        }
         assert_eq!(reg.desc("space_echo").unwrap().params.len(), 11);
         assert!(
             reg.gui("parametric_eq").is_some(),
