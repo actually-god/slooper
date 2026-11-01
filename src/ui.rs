@@ -883,6 +883,15 @@ pub struct App {
     /// v30 R6: persisted geometry of the three free side windows.
     side_wins: crate::config::SideWins,
     side_dirty: bool,
+    /// v30-batch-2 docking: window currently carried by a header drag
+    /// (idx, grab offset), its live top-left, the live rect of every
+    /// docked panel, per-window docked-collapse, and the window that
+    /// JUST left the dock (one-frame position hand-off).
+    free_drag: Option<(usize, [f32; 2])>,
+    drag_pos: [f32; 2],
+    dock_rects: [[f32; 4]; 4],
+    dock_collapsed: [bool; 4],
+    dock_just_floated: Option<usize>,
     show_midi: bool,
     /// v25: light egui Visuals for the panel/window chrome. The arrangement
     /// canvas keeps its fixed studio palette either way.
@@ -1364,6 +1373,11 @@ impl App {
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
             side_dirty: false,
+            free_drag: None,
+            drag_pos: [0.0, 0.0],
+            dock_rects: [[0.0; 4]; 4],
+            dock_collapsed: [false; 4],
+            dock_just_floated: None,
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
             theme_was_light: None,
@@ -4768,6 +4782,9 @@ impl App {
         // v30 R1: ONE grid = ONE bar of the chosen subdivision
         // (steps per bar = metronome beats x steps per beat).
         let want = (self.beats().max(1) as usize * self.drum.sub.max(1) as usize).clamp(2, 256);
+        // v30-batch-2: light grey marks every DOWNBEAT — one light column
+        // per beat, i.e. every `sub` steps — never a hardcoded 4.
+        let sub = self.drum.sub.max(1) as usize;
         if want != self.drum.steps {
             self.drum.resize(want);
             dirty = true;
@@ -4920,7 +4937,7 @@ impl App {
                             for s in 0..self.drum.steps {
                                 let v = self.drum.grid[p][s];
                                 let fill = if v == 0 {
-                                    egui::Color32::from_gray(if s % 4 == 0 { 74 } else { 56 })
+                                    egui::Color32::from_gray(if s % sub == 0 { 74 } else { 56 })
                                 } else {
                                     egui::Color32::from_rgb(90 + v / 2, 55 + v / 4, 55)
                                 };
@@ -7410,7 +7427,163 @@ impl App {
                         dirty = true;
                     }
                 }
+                        // --- v30-batch-2: drum kit lives IN the plugin GUI ---------
+            // (moved out of the synth picker; the pattern builder fires THESE pads).
+            // The pattern builder ("Drums") fires THESE pads. The kit is
+            // per track, so every synth can carry a different drum patch.
+            ui.separator();
+            ui.label(
+                RichText::new(format!("DRUM KIT \u{2014} track {}", t + 1)).strong(),
+            );
+            ui.label(
+                RichText::new(
+                    "One sound per pad (from the asset rack); the Drums window \
+                     paints the pattern. Up to 16 pads \u{b7} this kit belongs to \
+                     THIS track, so each synth can play a different patch.",
+                )
+                .weak()
+                .small(),
+            );
+            let audio_rows: Vec<(String, String)> = self
+                .assets
+                .iter()
+                .filter(|a| !a.is_midi() && !a.is_auto())
+                .map(|a| {
+                    let path = a.path.to_string_lossy().to_string();
+                    let nm = path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("?")
+                        .trim_end_matches(".wav")
+                        .to_string();
+                    (path, nm)
+                })
+                .collect();
+            let mut kit = self.kit(t).to_vec();
+            let mut kit_changed = false;
+            let mut remove_pad: Option<usize> = None;
+            for p in 0..kit.len() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut kit[p].name)
+                                .desired_width(56.0)
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .changed()
+                    {
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                        .on_hover_text("Audition this pad")
+                        .clicked()
+                    {
+                        let k = self
+                            .assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
+                        if let Some(k) = k {
+                            let v = kit[p].vel.max(1);
+                            self.audition_impulse(k, v);
+                        }
+                    }
+                    let cur_path = kit[p].asset_path.clone();
+                    let label = cur_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("(sound)")
+                        .trim_end_matches(".wav")
+                        .to_string();
+                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                        .selected_text(label)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(cur_path.is_empty(), "(silent)")
+                                .clicked()
+                            {
+                                kit[p].asset_path.clear();
+                                kit[p].asset = None;
+                                kit_changed = true;
+                            }
+                            for (path, nm) in &audio_rows {
+                                if ui
+                                    .selectable_label(&cur_path == path, nm.as_str())
+                                    .clicked()
+                                {
+                                    kit[p].asset_path = path.clone();
+                                    kit[p].asset = None;
+                                    kit_changed = true;
+                                }
+                            }
+                        });
+                    if ui
+                        .add_sized(
+                            [52.0, 16.0],
+                            egui::Slider::new(&mut kit[p].vel, 1..=127),
+                        )
+                        .on_hover_text("Default paint velocity")
+                        .changed()
+                    {
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
+                            .min_size(egui::vec2(16.0, 18.0)))
+                        .on_hover_text("Mute pad")
+                        .clicked()
+                    {
+                        kit[p].muted = !kit[p].muted;
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                        .on_hover_text("Remove this pad")
+                        .clicked()
+                        && kit.len() > 1
+                    {
+                        remove_pad = Some(p);
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                let full = kit.len() >= DRUM_MAX_PADS;
+                if ui
+                    .add_enabled(!full, egui::Button::new("+ add pad"))
+                    .on_hover_text(if full {
+                        "kit is full (16 pads maximum)"
+                    } else {
+                        "Add a drum track row (max 16)"
+                    })
+                    .clicked()
+                    && !full
+                {
+                    kit.push(DrumPad {
+                        name: format!("Pad {}", kit.len() + 1),
+                        asset_path: String::new(),
+                        asset: None,
+                        vel: 100,
+                        muted: false,
+                    });
+                    kit_changed = true;
+                }
+                ui.label(
+                    RichText::new(format!("{} / {DRUM_MAX_PADS} pads", kit.len()))
+                        .weak()
+                        .small(),
+                );
             });
+            if let Some(p) = remove_pad {
+                kit.remove(p);
+                kit_changed = true;
+            }
+            if kit_changed {
+                *self.kit_mut(t) = kit;
+                self.drum.ensure_rows(self.kit(t).len());
+                self.save_config();
+            }
+                        });
         if dirty {
             self.track_synth_params[t] = inst.values();
             self.save_config();
@@ -9239,22 +9412,11 @@ impl App {
         if self.show_settings {
             settings_panel(ui, self);
         }
-        if self.show_rack {
-            rack_panel(ui, self);
-        }
-        if self.show_mixer {
-            mixer_panel(ui, self);
-        }
-        if self.show_midi {
-            midi_monitor(ui, self);
-        }
-        // v30 R4: the bindings window is a free side window LINKED to the
-        // main GUI — always available (default position beside the mixer),
-        // no longer tied to the automation manager being open. v30 R6:
-        // windows never reserve panel edges, so order does not matter.
-        if self.show_binds {
-            value_binds_panel(ui, self);
-        }
+        // v30-batch-2: rack / bindings / monitor / MIXER all draw through
+        // ONE docking pass: docked windows claim their edge slots (outer
+        // order first), floats ride on top. Must precede central_panels
+        // so docked panels reserve their edge before the grid claims it.
+        side_frames(ui, self);
         central_panels(ui, self);
 
         // Watchdog: a scrub/clip/marquee drag that somehow loses its
@@ -10285,67 +10447,456 @@ fn value_user_parse(target: &str, s: &str) -> Option<f32> {
 /// NAMES the plugin publishes through its parameter description, the
 /// documented host-visible value system), the FX chain rows, and the two
 /// global controls.
-/// v30 R6: one free side window of the main GUI. Inline look (same
-/// content, same panels inside) but the user can DRAG it by its title
-/// bar, RESIZE it at the edges, and COLLAPSE or CLOSE it. The geometry
-/// is persisted per `idx` (0 = asset rack, 1 = MIDI bindings,
-/// 2 = MIDI monitor) in config; `fallback` is the classic dock footprint
-/// used until the user moves the window the first time.
-/// True while `pt` sits inside one of the OPEN free side windows. Lane
-/// strips use this so an OS file drop onto (say) the asset rack imports
-/// into the rack instead of placing a clip on the grid beneath.
+/// True while `pt` sits inside one of the OPEN FREE-FLOATING side
+/// windows. Lane strips use this so an OS file drop onto (say) the asset
+/// rack imports into the rack instead of placing a clip on the grid
+/// beneath. Docked windows are skipped: they never overlap the grid.
 fn over_side_window(app: &App, pt: egui::Pos2) -> bool {
-    let hits = |a: [f32; 4]| {
+    let hits = |idx: usize, a: [f32; 4]| {
         a[2] > 80.0
+            && app.side_wins.dock[idx][0] != 1
             && egui::Rect::from_min_size(egui::pos2(a[0], a[1]), egui::vec2(a[2], a[3]))
                 .contains(pt)
     };
-    (app.show_rack && hits(app.side_wins.rack))
-        || (app.show_binds && hits(app.side_wins.binds))
-        || (app.show_midi && hits(app.side_wins.monitor))
+    (app.show_rack && hits(0, app.side_wins.rack))
+        || (app.show_binds && hits(1, app.side_wins.binds))
+        || (app.show_midi && hits(2, app.side_wins.monitor))
+        || (app.show_mixer && hits(3, app.side_wins.mixer))
 }
 
-fn side_window(
-    ui: &mut egui::Ui,
-    app: &mut App,
-    idx: usize,
-    title: &str,
-    open: &mut bool,
-    fallback: [f32; 4],
-    body: impl FnOnce(&mut egui::Ui, &mut App),
-) {
-    let old = match idx {
+// ---------------------------------------------------------------------------
+// v30-batch-2: DOCKING. Windows 0 = asset rack, 1 = MIDI bindings,
+// 2 = MIDI monitor, 3 = mixer. Each is either docked into an edge slot
+// (0 left / 1 right / 2 bottom, ordered outermost-first within the edge)
+// or a free-floating window. Grab any header/title bar and drag: release
+// over a screen edge (highlighted) to snap in, release mid-screen to pull
+// it out again. Dropping at a different spot along an edge RE-ORDERS the
+// windows stacked there. All state lives in `config.side_wins`.
+// ---------------------------------------------------------------------------
+
+const SNAP_EDGE: f32 = 150.0;
+const SNAP_BOTTOM: f32 = 110.0;
+const WIN_HEAD_H: f32 = 27.0;
+const WIN_BTN_STRIP: f32 = 64.0;
+
+fn win_visible(app: &App, idx: usize) -> bool {
+    match idx {
+        0 => app.show_rack,
+        1 => app.show_binds,
+        2 => app.show_midi,
+        _ => app.show_mixer,
+    }
+}
+fn set_visible(app: &mut App, idx: usize, v: bool) {
+    let changed = win_visible(app, idx) != v;
+    match idx {
+        0 => app.show_rack = v,
+        1 => app.show_binds = v,
+        2 => app.show_midi = v,
+        _ => app.show_mixer = v,
+    }
+    if changed {
+        app.side_dirty = true;
+    }
+}
+fn win_rect(app: &App, idx: usize) -> [f32; 4] {
+    match idx {
         0 => app.side_wins.rack,
         1 => app.side_wins.binds,
-        _ => app.side_wins.monitor,
+        2 => app.side_wins.monitor,
+        _ => app.side_wins.mixer,
+    }
+}
+fn win_title(idx: usize) -> &'static str {
+    ["ASSET RACK", "MIDI BINDINGS", "MIDI MONITOR", "MIXER"][idx]
+}
+fn is_docked(app: &App, idx: usize) -> bool {
+    app.side_wins.dock[idx][0] == 1
+}
+fn dock_edge(app: &App, idx: usize) -> i16 {
+    app.side_wins.dock[idx][1]
+}
+fn dock_order(app: &App, idx: usize) -> i16 {
+    app.side_wins.dock[idx][2]
+}
+fn def_w(idx: usize) -> f32 {
+    match idx {
+        0 => 340.0,
+        1 => 300.0,
+        2 => 520.0,
+        _ => 250.0,
+    }
+}
+fn def_h(idx: usize) -> f32 {
+    match idx {
+        2 => 240.0,
+        3 => 620.0,
+        _ => 640.0,
+    }
+}
+/// Built-in float footprint (never-moved windows) approximating the
+/// classic dock look.
+fn float_footprint(app: &App, idx: usize) -> [f32; 4] {
+    match idx {
+        0 => [8.0, 46.0, 340.0, 640.0],
+        1 => [8.0, 46.0, 300.0, 620.0],
+        2 => [360.0, 560.0, 520.0, 240.0],
+        _ => {
+            let w = app.side_wins.mixer[2].max(250.0);
+            [8.0, 46.0, w, 620.0]
+        }
+    }
+}
+
+fn snap_zone(vp: egui::Rect, pt: egui::Pos2) -> Option<i16> {
+    if pt.x < vp.min.x + SNAP_EDGE {
+        Some(0)
+    } else if pt.x > vp.max.x - SNAP_EDGE {
+        Some(1)
+    } else if pt.y > vp.max.y - SNAP_BOTTOM {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Snap `idx` onto `edge` at drop point `pt`: insert it among the other
+/// docked windows of that edge by position (outer edge first) and
+/// re-pack the edge's orders to 0..n-1.
+fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
+    let mut others: Vec<(i16, usize)> = (0..4)
+        .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge)
+        .map(|i| (dock_order(app, i), i))
+        .collect();
+    others.sort_by_key(|(o, _)| *o);
+    // "Outer-ness": larger = closer to the screen edge along this axis.
+    let outer_of = |i: usize| -> f32 {
+        let r = app.dock_rects[i];
+        match edge {
+            0 => -(r[0]),
+            1 => r[0] + r[2],
+            _ => r[1] + r[3],
+        }
     };
+    let me = match edge {
+        0 => -pt.x,
+        1 => pt.x,
+        _ => pt.y,
+    };
+    let rank = others.iter().filter(|(_, i)| outer_of(*i) > me).count();
+    others.insert(rank.min(others.len()), (0, idx));
+    for (rank, (_, i)) in others.iter().enumerate() {
+        app.side_wins.dock[*i][0] = 1;
+        app.side_wins.dock[*i][1] = edge;
+        app.side_wins.dock[*i][2] = rank as i16;
+    }
+    app.dock_collapsed[idx] = false;
+    app.dock_rects[idx] = [0.0; 4];
+    app.side_dirty = true;
+}
+
+/// Pull `idx` out of its dock and float it at `at` (top-left).
+fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
+    let r = &mut app.side_wins;
+    let rect = match idx {
+        0 => &mut r.rack,
+        1 => &mut r.binds,
+        2 => &mut r.monitor,
+        _ => &mut r.mixer,
+    };
+    rect[0] = at[0];
+    rect[1] = at[1];
+    if rect[2] < 80.0 {
+        rect[2] = def_w(idx);
+    }
+    if rect[3] < 60.0 {
+        rect[3] = def_h(idx);
+    }
+    r.dock[idx][0] = 0;
+    app.dock_rects[idx] = [0.0; 4];
+    app.side_dirty = true;
+}
+
+/// Track a header/title-bar grab across frames: press on a header starts
+/// a carry; release docks (with reorder) or floats.
+fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
+    let (pressed, down, pos) = ui.ctx().input(|i| {
+        (
+            i.pointer.any_pressed(),
+            i.pointer.any_down(),
+            i.pointer.interact_pos(),
+        )
+    });
+    // On the press frame `interact_pos` IS the press position.
+    let press_pos = pos.unwrap_or_default();
+    if pressed && down && app.free_drag.is_none() {
+        // Iterate top-down (floats above docked; higher idx above lower)
+        // so the visually topmost header wins the grab.
+        let mut order: Vec<usize> = (0..4).filter(|i| win_visible(app, *i)).collect();
+        order.sort_by_key(|i| is_docked(app, *i));
+        for idx in order.into_iter().rev() {
+            let r = if is_docked(app, idx) {
+                app.dock_rects[idx]
+            } else {
+                win_rect(app, idx)
+            };
+            if r[2] < 8.0 {
+                continue;
+            }
+            let mut head = egui::Rect::from_min_size(
+                egui::pos2(r[0], r[1]),
+                egui::vec2(r[2], WIN_HEAD_H),
+            );
+            head.max.x -= WIN_BTN_STRIP; // never steal collapse/close
+            if head.contains(press_pos) {
+                app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
+                app.drag_pos = [r[0], r[1]];
+                break;
+            }
+        }
+    }
+    if let Some((idx, grab)) = app.free_drag {
+        if !down {
+            let pt = pos.unwrap_or_else(|| egui::pos2(app.drag_pos[0], app.drag_pos[1]));
+            let vp = ui.ctx().input(|i| i.viewport_rect());
+            match snap_zone(vp, pt) {
+                Some(edge) => dock_at(app, idx, edge, pt),
+                None => {
+                    if is_docked(app, idx) {
+                        undock_to(app, idx, [pt.x - grab[0], pt.y - grab[1]]);
+                        app.dock_just_floated = Some(idx);
+                    } else {
+                        app.side_dirty = true;
+                    }
+                }
+            }
+            app.free_drag = None;
+        } else if let Some(p) = pos {
+            app.drag_pos = [p.x - grab[0], p.y - grab[1]];
+        }
+    }
+}
+
+fn window_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
+    match idx {
+        0 => rack_body(ui, app),
+        1 => value_binds_body(ui, app),
+        2 => monitor_body(ui, app),
+        _ => mixer_body(ui, app),
+    }
+}
+
+/// Shared header row of a docked window; records the panel rect used for
+/// drag grabs, drop ranking and the OS-drop guard.
+fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
+    let r = ui.available_rect_before_wrap();
+    app.dock_rects[idx] = [r.min.x, r.min.y, r.width(), r.height()];
+    let dragging_divider = ui.ctx().input(|i| i.pointer.any_down());
+    {
+        let edge = dock_edge(app, idx);
+        let wr = match idx {
+            0 => &mut app.side_wins.rack,
+            1 => &mut app.side_wins.binds,
+            2 => &mut app.side_wins.monitor,
+            _ => &mut app.side_wins.mixer,
+        };
+        // Persist only the CROSS dimension (panel thickness): width for
+        // left/right docks, height for bottom docks — the along-edge size
+        // is whatever the viewport gives and would churn the config.
+        if edge == 2 {
+            if (wr[3] - r.height()).abs() > 1.5 && r.height() > 40.0 {
+                wr[3] = r.height();
+                if dragging_divider {
+                    app.side_dirty = true;
+                }
+            }
+        } else if (wr[2] - r.width()).abs() > 1.5 && r.width() > 40.0 {
+            wr[2] = r.width();
+            if dragging_divider {
+                app.side_dirty = true;
+            }
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(win_title(idx)).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("x")
+                .on_hover_text("Close this window")
+                .clicked()
+            {
+                set_visible(app, idx, false);
+            }
+            let c = app.dock_collapsed[idx];
+            if ui
+                .small_button(if c { "+" } else { "\u{2013}" })
+                .on_hover_text(if c { "Expand this window" } else { "Collapse this window" })
+                .clicked()
+            {
+                app.dock_collapsed[idx] = !c;
+                app.side_dirty = true;
+            }
+        });
+    });
+    if !app.dock_collapsed[idx] {
+        ui.separator();
+    }
+}
+
+fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
+    let edge = dock_edge(app, idx);
+    let known = win_rect(app, idx);
+    match edge {
+        0 => {
+            egui::Panel::left(egui::Id::new(("dockw", idx)))
+                .resizable(true)
+                .default_size(known[2].max(def_w(idx)))
+                .min_size(170.0)
+                .show(ui, |ui| docked_window(ui, app, idx));
+        }
+        1 => {
+            egui::Panel::right(egui::Id::new(("dockw", idx)))
+                .resizable(true)
+                .default_size(known[2].max(def_w(idx)))
+                .min_size(170.0)
+                .show(ui, |ui| docked_window(ui, app, idx));
+        }
+        _ => {
+            egui::Panel::bottom(egui::Id::new(("dockw", idx)))
+                .resizable(true)
+                .default_size(known[3].max(def_h(idx)))
+                .min_size(110.0)
+                .show(ui, |ui| docked_window(ui, app, idx));
+        }
+    }
+}
+
+fn docked_window(ui: &mut egui::Ui, app: &mut App, idx: usize) {
+    docked_head(ui, app, idx);
+    if !app.dock_collapsed[idx] {
+        window_body(ui, app, idx);
+    }
+}
+
+fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
+    let old = win_rect(app, idx);
     let known = old[2] > 80.0 && old[3] > 60.0;
-    let pos = if known { [old[0], old[1]] } else { [fallback[0], fallback[1]] };
-    let size = if known { [old[2], old[3]] } else { [fallback[2], fallback[3]] };
-    let resp = egui::Window::new(RichText::new(title).strong())
+    let fb = float_footprint(app, idx);
+    let dragging = app.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+    let just = app.dock_just_floated == Some(idx);
+    if just {
+        app.dock_just_floated = None;
+    }
+    let pos = if dragging || just {
+        [app.drag_pos[0], app.drag_pos[1]]
+    } else if known {
+        [old[0], old[1]]
+    } else {
+        [fb[0], fb[1]]
+    };
+    let size = if known {
+        [old[2], old[3]]
+    } else {
+        [fb[2], fb[3]]
+    };
+    let mut vis = win_visible(app, idx);
+    let mut w = egui::Window::new(RichText::new(win_title(idx)).strong())
         .id(egui::Id::new(("sidewin", idx as u8)))
-        .open(open)
-        .default_pos(egui::pos2(pos[0], pos[1]))
-        .default_size(egui::vec2(size[0], size[1]))
+        .open(&mut vis)
         .resizable(true)
         .collapsible(true)
         // Fully FREE: never snap back when dragged (partly) off-screen.
         .constrain(false)
         // First frame must be fully painted: headless probes (and users
         // with animations off) would otherwise see the content fade in.
-        .fade_in(false)
-        .show(ui.ctx(), |ui| body(ui, app));
+        .fade_in(false);
+    if dragging {
+        // The docking pass owns the drag — pin the window under the
+        // pointer so egui's own drag cannot fight it.
+        w = w.current_pos(egui::pos2(pos[0], pos[1]));
+    } else {
+        w = w
+            .default_pos(egui::pos2(pos[0], pos[1]))
+            .default_size(egui::vec2(size[0], size[1]));
+    }
+    let resp = w.show(ui.ctx(), |ui| window_body(ui, app, idx));
+    set_visible(app, idx, vis);
     if let Some(out) = resp.map(|r| r.response.rect) {
         // Remember the live rect so the next launch (or window toggle)
         // restores exactly where the user parked it.
         let nr = [out.min.x, out.min.y, out.width(), out.height()];
         if nr.iter().zip(old.iter()).any(|(a, b)| (a - b).abs() > 0.5) {
-            match idx {
-                0 => app.side_wins.rack = nr,
-                1 => app.side_wins.binds = nr,
-                _ => app.side_wins.monitor = nr,
-            }
+            let cur = &mut app.side_wins;
+            let slot = match idx {
+                0 => &mut cur.rack,
+                1 => &mut cur.binds,
+                2 => &mut cur.monitor,
+                _ => &mut cur.mixer,
+            };
+            *slot = nr;
             app.side_dirty = true;
+        }
+    }
+}
+
+/// THE side-window pass: docked panels claim their edge slots first
+/// (outermost first), floats (and the window currently being carried)
+/// draw on top, and the snap-zone highlight rides above everything.
+/// MUST run before `central_panels` so docked panels reserve their edge.
+fn side_frames(ui: &mut egui::Ui, app: &mut App) {
+    free_drag_pass(ui, app);
+    let carried = app.free_drag.map(|(i, _)| i);
+    for edge in 0..3i16 {
+        let mut ids: Vec<usize> = (0..4)
+            .filter(|i| {
+                win_visible(app, *i)
+                    && is_docked(app, *i)
+                    && dock_edge(app, *i) == edge
+                    && carried != Some(*i)
+            })
+            .collect();
+        ids.sort_by_key(|i| dock_order(app, *i));
+        for i in ids {
+            draw_docked(ui, app, i);
+        }
+    }
+    for i in 0..4 {
+        if win_visible(app, i) && (!is_docked(app, i) || carried == Some(i)) {
+            draw_float(ui, app, i);
+        }
+    }
+    if carried.is_some() {
+        let vp = ui.ctx().input(|i| i.viewport_rect());
+        let pt = ui.ctx().input(|i| i.pointer.interact_pos());
+        if let Some(pt) = pt {
+            if let Some(edge) = snap_zone(vp, pt) {
+                let z = match edge {
+                    0 => egui::Rect::from_min_max(
+                        vp.min,
+                        egui::pos2(vp.min.x + SNAP_EDGE, vp.max.y),
+                    ),
+                    1 => egui::Rect::from_min_max(
+                        egui::pos2(vp.max.x - SNAP_EDGE, vp.min.y),
+                        vp.max,
+                    ),
+                    _ => egui::Rect::from_min_max(
+                        egui::pos2(vp.min.x, vp.max.y - SNAP_BOTTOM),
+                        vp.max,
+                    ),
+                };
+                let lid = egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("dock-zone-hl"),
+                );
+                let p = ui.ctx().layer_painter(lid);
+                p.rect_filled(z, 0.0, Color32::from_rgb(120, 190, 255).linear_multiply(0.12));
+                p.rect_stroke(
+                    z,
+                    0.0,
+                    egui::Stroke::new(2.5, Color32::from_rgb(120, 190, 255)),
+                    egui::StrokeKind::Inside,
+                );
+            }
         }
     }
 }
@@ -10355,11 +10906,7 @@ fn side_window(
 /// picker (searchable `auto_targets` list for the selected track); then
 /// the right widget for the value's nature: knobs run the three-step
 /// axis wizard, booleans capture one message as a switch.
-fn value_binds_panel(ui: &mut egui::Ui, app: &mut App) {
-    let mut vis = app.show_binds;
-    let sr = ui.ctx().input(|i| i.viewport_rect());
-    let fb = [sr.max.x - 556.0, sr.min.y + 46.0, 300.0, 620.0];
-    side_window(ui, app, 1, "MIDI BINDINGS", &mut vis, fb, |ui, app| {
+fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
 
             ui.label(
                 RichText::new("project value bindings \u{b7} always linked to the main GUI")
@@ -10472,13 +11019,8 @@ fn value_binds_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.status = format!("unbound: {}", describe_binding_target(&vb));
                 }
             }
-        });
-    if vis != app.show_binds {
-        app.show_binds = vis;
-        app.save_config();
-    }
 }
-/// Label helper for status lines: the binding's target, track-qualified.
+
 fn describe_binding_target(vb: &crate::config::ValueBind) -> String {
     if vb.target.starts_with("master.") {
         crate::automation::describe_target(&vb.target)
@@ -10772,11 +11314,7 @@ fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
 /// The asset rack: folders (primary first = recordings land there), one
 /// draggable row per audio file, project-only assets below, and the
 /// selected-asset toolbar (quantize / trim / remove).
-fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
-    let mut vis = app.show_rack;
-    let sr = ui.ctx().input(|i| i.viewport_rect());
-    let fb = [sr.min.x + 4.0, sr.min.y + 46.0, 340.0, 640.0];
-    side_window(ui, app, 0, "ASSET RACK", &mut vis, fb, |ui, app| {
+fn rack_body(ui: &mut egui::Ui, app: &mut App) {
 
             ui.horizontal(|ui| {
                 if ui
@@ -11431,23 +11969,8 @@ fn rack_panel(ui: &mut egui::Ui, app: &mut App) {
                         }
                     }
                 });
-        });
-    if vis != app.show_rack {
-        app.show_rack = vis;
-        app.save_config();
-    }
 }
-/// The mixer dock: every track's controls, as one strip per track, pinned
-/// to the right like the asset rack. Strip heights come from [`App::track_h`]
-/// and the column is offset by the grid's scroll — so each strip sits exactly
-/// level with its track, and clips/waveforms get the grid's full height.
-/// Master output section at the TOP of the mixer dock — it lives in the
-/// band between the panel header and the Track 1 strip (level with the
-/// timeline grid header). ONE compact row: "master" label, slider, dB
-/// readout, "0" zeroize and the peak meter — the band is only ~30 px
-/// tall, so a second row would spill onto Track 1's widgets (a two-row
-/// version did: click stealing). v0.15: the dB text box became a plain
-/// readout; exact entry moved to right-click → Set value.
+
 fn master_strip(ui: &mut egui::Ui, app: &mut App) {
     ui.spacing_mut().item_spacing.x = 5.0;
     ui.label(RichText::new("master").strong().small());
@@ -11521,12 +12044,7 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
     }
 }
 
-fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::right("mixer")
-        .resizable(true)
-        .default_size(250.0)
-        .min_size(210.0)
-        .show(ui, |ui| {
+fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             ui.heading(RichText::new("MIXER").strong());
             ui.separator();
             let base = ui.available_rect_before_wrap();
@@ -11605,11 +12123,8 @@ fn mixer_panel(ui: &mut egui::Ui, app: &mut App) {
                 y += th + TRACK_SEP_HIT;
             }
             let _ = ui.allocate_exact_size(base.size(), Sense::hover());
-        });
 }
 
-/// One track's mixer strip: select / record / mute / child lanes, then the
-/// vol-gain-pan stack and the FX chain chips.
 fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
     // v0.15 UI pass: strips live on fixed rects shared with the grid.
     // Anything that does not fit must CLIP, never bleed onto the
@@ -11799,11 +12314,14 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         let is_vst = app.track_synth[t]
             .as_deref()
             .is_some_and(|s| vst_synth_decode(s).is_some());
-        let label = if is_vst { "GUI" } else { "sliders" };
+        // v30-batch-2: ONE honest label — this button opens THIS
+        // instrument's GUI, whether the plugin is a hosted VST or one of
+        // the native Rust synths (whose slider window IS its GUI).
+        let label = "GUI";
         let hover = if is_vst {
             "Open this plugin's own window (its controls live inside it)"
         } else {
-            "This synth's parameters"
+            "Open this plugin's GUI (its parameters live inside it)"
         };
         if ui.small_button(label).on_hover_text(hover).clicked() {
             if is_vst {
@@ -11981,161 +12499,6 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 ui.label(RichText::new(&app.vst_note).weak().small());
             }
 
-            // --- v30 R1: this track's drum kit --------------------------
-            // The pattern builder ("Drums") fires THESE pads. The kit is
-            // per track, so every synth can carry a different drum patch.
-            ui.separator();
-            ui.label(
-                RichText::new(format!("DRUM KIT \u{2014} track {}", t + 1)).strong(),
-            );
-            ui.label(
-                RichText::new(
-                    "One sound per pad (from the asset rack); the Drums window \
-                     paints the pattern. Up to 16 pads \u{b7} this kit belongs to \
-                     THIS track, so each synth can play a different patch.",
-                )
-                .weak()
-                .small(),
-            );
-            let audio_rows: Vec<(String, String)> = app
-                .assets
-                .iter()
-                .filter(|a| !a.is_midi() && !a.is_auto())
-                .map(|a| {
-                    let path = a.path.to_string_lossy().to_string();
-                    let nm = path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("?")
-                        .trim_end_matches(".wav")
-                        .to_string();
-                    (path, nm)
-                })
-                .collect();
-            let mut kit = app.kit(t).to_vec();
-            let mut kit_changed = false;
-            let mut remove_pad: Option<usize> = None;
-            for p in 0..kit.len() {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut kit[p].name)
-                                .desired_width(56.0)
-                                .font(egui::TextStyle::Monospace),
-                        )
-                        .changed()
-                    {
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
-                        .on_hover_text("Audition this pad")
-                        .clicked()
-                    {
-                        let k = app
-                            .assets
-                            .iter()
-                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
-                        if let Some(k) = k {
-                            let v = kit[p].vel.max(1);
-                            app.audition_impulse(k, v);
-                        }
-                    }
-                    let cur_path = kit[p].asset_path.clone();
-                    let label = cur_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("(sound)")
-                        .trim_end_matches(".wav")
-                        .to_string();
-                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
-                        .selected_text(label)
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(cur_path.is_empty(), "(silent)")
-                                .clicked()
-                            {
-                                kit[p].asset_path.clear();
-                                kit[p].asset = None;
-                                kit_changed = true;
-                            }
-                            for (path, nm) in &audio_rows {
-                                if ui
-                                    .selectable_label(&cur_path == path, nm.as_str())
-                                    .clicked()
-                                {
-                                    kit[p].asset_path = path.clone();
-                                    kit[p].asset = None;
-                                    kit_changed = true;
-                                }
-                            }
-                        });
-                    if ui
-                        .add_sized(
-                            [52.0, 16.0],
-                            egui::Slider::new(&mut kit[p].vel, 1..=127),
-                        )
-                        .on_hover_text("Default paint velocity")
-                        .changed()
-                    {
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                            .min_size(egui::vec2(16.0, 18.0)))
-                        .on_hover_text("Mute pad")
-                        .clicked()
-                    {
-                        kit[p].muted = !kit[p].muted;
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
-                        .on_hover_text("Remove this pad")
-                        .clicked()
-                        && kit.len() > 1
-                    {
-                        remove_pad = Some(p);
-                    }
-                });
-            }
-            ui.horizontal(|ui| {
-                let full = kit.len() >= DRUM_MAX_PADS;
-                if ui
-                    .add_enabled(!full, egui::Button::new("+ add pad"))
-                    .on_hover_text(if full {
-                        "kit is full (16 pads maximum)"
-                    } else {
-                        "Add a drum track row (max 16)"
-                    })
-                    .clicked()
-                    && !full
-                {
-                    kit.push(DrumPad {
-                        name: format!("Pad {}", kit.len() + 1),
-                        asset_path: String::new(),
-                        asset: None,
-                        vel: 100,
-                        muted: false,
-                    });
-                    kit_changed = true;
-                }
-                ui.label(
-                    RichText::new(format!("{} / {DRUM_MAX_PADS} pads", kit.len()))
-                        .weak()
-                        .small(),
-                );
-            });
-            if let Some(p) = remove_pad {
-                kit.remove(p);
-                kit_changed = true;
-            }
-            if kit_changed {
-                *app.kit_mut(t) = kit;
-                app.drum.ensure_rows(app.kit(t).len());
-                app.save_config();
-            }
         });
     app.synth_pick = if open { Some(t) } else { None };
 }
@@ -14867,11 +15230,7 @@ fn port_list_lr(
     }
 }
 
-fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
-    let mut vis = app.show_midi;
-    let sr = ui.ctx().input(|i| i.viewport_rect());
-    let fb = [sr.min.x + 360.0, sr.max.y - 284.0, 520.0, 240.0];
-    side_window(ui, app, 2, "MIDI MONITOR", &mut vis, fb, |ui, app| {
+fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
 
             // v25: ONE honest state line instead of a static paragraph.
             // It says what the monitor sees RIGHT NOW; the pw-link
@@ -14987,12 +15346,8 @@ fn midi_monitor(ui: &mut egui::Ui, app: &mut App) {
                         });
                     }
                 });
-        });
-    if vis != app.show_midi {
-        app.show_midi = vis;
-        app.save_config();
-    }
 }
+
 fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::left("settings").resizable(true).default_size(410.0).min_size(330.0).show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {

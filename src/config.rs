@@ -220,11 +220,18 @@ pub struct RackDirOrder {
 /// v30 R6: geometry of the user-movable side windows (asset rack, MIDI
 /// bindings, MIDI monitor). Each entry is `[x, y, w, h]` of the window's
 /// outer rect; all-zero = never moved/resized (built-in default).
+/// v30-batch-2 also carries the mixer (`mixer`) and the DOCK table:
+/// `dock[i] = [docked (0/1), edge (0 left / 1 right / 2 bottom), order]`
+/// for window i (0 rack, 1 bindings, 2 monitor, 3 mixer). Windows snap
+/// into those edge slots and may be pulled back out to float freely.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SideWins {
     pub rack: [f32; 4],
     pub binds: [f32; 4],
     pub monitor: [f32; 4],
+    pub mixer: [f32; 4],
+    pub dock: [[i16; 3]; 4],
 }
 
 impl Default for SideWins {
@@ -233,8 +240,20 @@ impl Default for SideWins {
             rack: [0.0; 4],
             binds: [0.0; 4],
             monitor: [0.0; 4],
+            mixer: [0.0; 4],
+            // Classic layout: rack left, mixer flush right, bindings just
+            // left of the mixer, monitor along the bottom — ALL DOCKED.
+            dock: default_dock(),
         }
     }
+}
+
+/// Classic docked layout (v30-batch-2 default): 0 = docked flag,
+/// edge 0 left / 1 right / 2 bottom; order 0 = closest to the screen
+/// edge within its side. [rack L, bindings right-inner, monitor bottom,
+/// mixer right-outer].
+pub fn default_dock() -> [[i16; 3]; 4] {
+    [[1, 0, 0], [1, 1, 1], [1, 2, 0], [1, 0, 0]]
 }
 
 /// Everything Settings persists.
@@ -827,6 +846,8 @@ mod tests {
                 rack: [1.0, 2.0, 300.0, 400.0],
                 binds: [0.0; 4],
                 monitor: [0.0; 4],
+                mixer: [5.0, 6.0, 250.0, 600.0],
+                dock: [[0, 0, 0], [1, 1, 1], [1, 2, 0], [0, 1, 0]],
             },
             theme: "light".into(),
         };
