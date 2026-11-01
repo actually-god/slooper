@@ -2722,3 +2722,130 @@ fn e2e_no_click_gain_steps() {
     std::thread::sleep(Duration::from_millis(80));
     let _ = active;
 }
+
+/// v32 R5: sidechaining works end to end. Track 0 plays a quiet 110 Hz
+/// key; track 1 plays a steady tone through the stock ABI-v2 Sidechain
+/// Compressor. With the send routed (bit 0 of track 1's mask) the mixed
+/// output must drop — proof that the post-fader tap feeds the SC bus and
+/// a v2 script actually receives it. Unrouted, the tone is untouched.
+#[test]
+fn e2e_sidechain_ducks_target_track() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    // Compile/load the stock sidechain compressor through the REAL
+    // registry (first run compiles with rustc, then the hash cache hits).
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-sc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    // threshold -30 dB, ratio 4, attack 2 ms, release 100 ms, knee 6, depth 1.
+    let vals = [-30.0f32, 4.0, 2.0, 100.0, 6.0, 1.0];
+    let desc = reg.desc("sidechain_comp").expect("stock sidechain_comp present").clone();
+    let inst = reg
+        .create_instance("sidechain_comp", sr as f64, &vals)
+        .expect("sidechain_comp compiles and instantiates");
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("sc_duck", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .unwrap();
+    // Probe the RIGHT bus only: the key track is panned hard left so its
+    // own energy never touches the measured signal — the sink hears the
+    // target tone alone, which is exactly what the duck must move.
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 2)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // Key: 110 Hz sine, hard LEFT (invisible to the probe, but the SC tap
+    // is taken pre-pan). Target: soft DC tone hard RIGHT, -34 dBFS = under
+    // the -30 dB threshold, so it rides unity until the key arrives.
+    let n = 24_000usize;
+    let key: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 110.0 * i as f32 / sr as f32).sin())
+            .collect::<Vec<f32>>(),
+    );
+    let tone: Arc<[f32]> = Arc::from(vec![0.02f32; n]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0)); // key on track 0
+    arr.insert(1, 0, Clip::new(0, 1)); // tone on track 1 (the target)
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![key, tone]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.0); // key hard left
+    b.engine.set_loop_pan(1, 1.0); // tone hard right
+    b.cmd(Cmd::SetTrackEffects {
+        i: 1,
+        chain: TrackFx { slots: Arc::new(vec![FxSlot::scripted(inst, desc)]) },
+    });
+    // Layout writes race the transport; land them before measuring.
+    std::thread::sleep(Duration::from_millis(150));
+
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(
+            &ring,
+            &widx,
+            (sr as u64 * ms / 1000) as usize,
+            Duration::from_millis(500),
+        )
+        .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 480).map(|m| m > 0.005).unwrap_or(false),
+        Duration::from_secs(3),
+        "target tone audible on the probe bus",
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    let open = rms(200);
+    assert!(open > 0.005, "tone must ride the probe bus unkeyed (got {open})");
+
+    // Route the key: track 0 now keys track 1's chain (bit 0).
+    b.engine.set_sc_send(1, 1 << 0);
+    // SC bus lags one block; the compressor needs attack + settle time.
+    std::thread::sleep(Duration::from_millis(400));
+    let ducked = rms(200);
+    b.cmd(Cmd::StopAll);
+
+    // Key sits 20 dB over threshold: ratio 4 puts the steady-state gain
+    // near 0.1x. Anything past a 30% drop can only be real ducking.
+    assert!(
+        ducked < open * 0.7,
+        "SC routing must attenuate the target: open rms {open}, ducked rms {ducked}"
+    );
+    // And it must be REVERSIBLE: dropping the send restores the tone.
+    b.engine.set_sc_send(1, 0);
+    b.cmd(Cmd::PlayAll);
+    std::thread::sleep(Duration::from_millis(500));
+    let restored = rms(200);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        restored > ducked * 1.5,
+        "clearing the send must un-duck: ducked {ducked}, restored {restored}"
+    );
+}
