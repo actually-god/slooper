@@ -253,7 +253,11 @@ impl Default for SideWins {
 /// edge within its side. [rack L, bindings right-inner, monitor bottom,
 /// mixer right-outer].
 pub fn default_dock() -> [[i16; 3]; 4] {
-    [[1, 0, 0], [1, 1, 1], [1, 2, 0], [1, 0, 0]]
+    // Classic layout, spread so the docks can't eat the canvas: rack LEFT,
+    // mixer flush RIGHT (its strips align with the track rows), bindings
+    // and monitor share the BOTTOM edge side by side. Same-edge panels
+    // stack ALONG the edge (ranks order them); the canvas keeps 348..1152.
+    [[1, 0, 0], [1, 2, 1], [1, 2, 0], [1, 1, 0]]
 }
 
 /// Everything Settings persists.
