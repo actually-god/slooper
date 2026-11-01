@@ -1808,6 +1808,9 @@ fn run(
         synth_pg: [0u64; MAX_LOOPS],
         mono: Vec::new(),
         sil: Vec::new(),
+        evq: Vec::new(),
+        own: Vec::new(),
+        owner: [0xFFu8; MAX_LOOPS],
         // v32: seeded like every other per-block buffer — the port reader
         // pushes into `live_ev` on the FIRST message the app ever sees.
         live_ev: Vec::with_capacity(64),
@@ -2470,9 +2473,9 @@ fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32]) {
     }
 }
 
-/// Render staged MIDI events through either synth kind. VSTi timing lands
-/// at internal-block boundaries (≤ `VST_BLOCK` samples late, uniformly —
-/// the same contract as the live path).
+/// Render staged MIDI events through either synth kind. VSTi timing is
+/// sample-exact inside the plugin's internal blocks (v33; the live path
+/// shares `process_with_midi`).
 fn render_midi_any(
     h: &SynthHandle,
     ev: &mut [(u64, u8, u8, u8, u8)],
@@ -2508,38 +2511,35 @@ fn render_midi_vst(
         .map(|(at, k, c, d1, d2)| ((*at - from) as usize, *k, *c, *d1, *d2))
         .collect();
     ev.sort_unstable();
+    ev.dedup();
     let sil = vec![0.0f32; crate::vsthost::VST_BLOCK];
-    let process_seg = |a: usize, b: usize, out: &mut [f32]| {
-        let mut a = a;
-        while a < b {
-            let n = (b - a).min(crate::vsthost::VST_BLOCK).min(out.len() - a);
-            if n == 0 {
-                break;
-            }
-            e.process(&sil[..n], &mut out[a..a + n]);
-            a += n;
-        }
-    };
-    let mut cur = 0usize;
+    // v33: render in internal-block chunks, each fed through
+    // `process_with_midi` with the chunk's events at their exact sample
+    // offsets. (The old split-feed queued everything at delta 0, and its
+    // kind matcher had NO case 2 — pattern channel pressure fell into the
+    // note_on arm and fired ghost notes at key 0 in every export that
+    // used expression.)
+    let mut evq: Vec<(usize, [u8; 3])> = Vec::new();
     let mut i = 0usize;
-    while i < ev.len() {
-        let off = ev[i].0.min(len).min(out.len());
-        if off > cur {
-            process_seg(cur, off, out);
-            cur = off;
-        }
-        while i < ev.len() && ev[i].0.min(len).min(out.len()) == off {
-            let (_, kind, ch, d1, d2) = ev[i];
-            match kind {
-                0 => e.note_off(ch, d1),
-                1 => e.cc(ch, d1, d2),
-                _ => e.note_on(ch, d1, d2),
+    let mut done = 0usize;
+    while done < out.len() {
+        let n = (out.len() - done).min(crate::vsthost::VST_BLOCK);
+        evq.clear();
+        while i < ev.len() && ev[i].0 < done + n {
+            if ev[i].0 >= done {
+                let (off, kind, ch, d1, d2) = ev[i];
+                let m = match kind {
+                    0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
+                    1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                    2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+                    _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+                };
+                evq.push((off - done, m));
             }
             i += 1;
         }
-    }
-    if cur < out.len() {
-        process_seg(cur, out.len(), out);
+        e.process_with_midi(&sil[..n], &mut out[done..done + n], &evq);
+        done += n;
     }
     e.all_notes_off();
 }
@@ -2644,6 +2644,117 @@ const MIDI_SILENCE_FLOOR: f32 = 1e-4;
 /// long enough for the piano's ~70 ms damper release.
 const MIDI_QUIET_BLOCKS: u32 = 6;
 
+/// v33: the track-render gate (issue: "knobs and sliders don't update
+/// unless a note is actively being played"). TRUE = skip this block.
+/// First block is priming (positions only, no audio). Otherwise a block
+/// renders when a pattern plays, live MIDI wants through, OR a plugin
+/// synth is bound to a live track (`vst_open`) — plugins must run every
+/// block or their meters/mod state/VST2-GUI-edited instance freeze
+/// between notes. Script-only rigs keep the quiet-tail pause (free).
+fn render_gate_blocked(block_n: usize, pattern_run: bool, live_any: bool, vst_open: bool) -> bool {
+    block_n == 0 || (!pattern_run && !live_any && !vst_open)
+}
+
+/// The synth slot a live track plays: its own binding if any, else the
+/// project default. TRUE when that resolves to a plugin instance.
+fn slot_is_vst(slot: Option<&std::sync::Arc<SynthHandle>>, dflt: Option<&std::sync::Arc<SynthHandle>>) -> bool {
+    slot.or(dflt).is_some_and(|a| matches!(&**a, SynthHandle::Vst(_)))
+}
+
+/// Stage ONE track's pattern clips — and, when `live`, the raw keyboard
+/// feed — into `ev` as `(block offset, kind, ch, d1, d2)` events, pushing
+/// `ring` past every scheduled note-off. v33: factored out of the track
+/// loop so the OWNER of a shared synth handle can stage its sharers'
+/// events too (one merged stream per plugin instance; see
+/// `render_midi_block`). Kind order puts offs (0) before ons (3) at equal
+/// offsets so a retrigger never kills its own note.
+#[allow(clippy::too_many_arguments)]
+fn stage_track_events(
+    t: usize,
+    arr: &Arrangement,
+    midi_cache: &[Option<Arc<crate::midipat::Pattern>>],
+    live_ev: &[(usize, u8, u8, u8, u8)],
+    live: bool,
+    pattern_run: bool,
+    p0: u64,
+    span_end: u64,
+    block_n: usize,
+    sr: u32,
+    ev: &mut Vec<(usize, u8, u8, u8, u8)>,
+    ring: &mut u64,
+) {
+    for l in arr.tracks[t].lanes.iter().filter(|_| pattern_run) {
+        for cl in l.clips.iter() {
+            let Some(Some(pat)) = midi_cache.get(cl.asset as usize) else {
+                continue;
+            };
+            let avail = pat.len_samples(sr);
+            let span = cl.span(avail);
+            // Clip timeline window vs this block.
+            if cl.end(avail) <= p0 || cl.pos >= span_end {
+                continue;
+            }
+            let base = cl.pos.saturating_sub(cl.cut);
+            for note in pat.notes.iter() {
+                let s0 = pat.ticks_to_samples(note.start, sr);
+                if s0 < cl.cut || s0 - cl.cut >= span {
+                    continue; // head trimmed away or past clip end
+                }
+                let on = base + s0;
+                let len_s = pat.ticks_to_samples(note.len, sr).max(1);
+                if on >= p0 && on < span_end {
+                    let vel = (note.vel as f32 * cl.gain * cl.fade_at(on, avail))
+                        .clamp(0.0, 127.0)
+                        .round() as u8;
+                    if vel > 0 {
+                        ev.push(((on - p0) as usize, 3, note.ch, note.note, vel));
+                    }
+                    let off_tl = on + len_s;
+                    if off_tl >= p0 && off_tl < span_end {
+                        ev.push(((off_tl - p0) as usize, 0, note.ch, note.note, 0));
+                    }
+                    *ring = (*ring).max(off_tl);
+                } else if on < p0 && on + len_s > p0 && on + len_s <= span_end {
+                    // Rang in earlier; its off lands in this block.
+                    ev.push(((on + len_s - p0) as usize, 0, note.ch, note.note, 0));
+                    *ring = (*ring).max(on + len_s);
+                }
+            }
+            for m in pat.ccs.iter() {
+                let s = pat.ticks_to_samples(m.at, sr);
+                if s < cl.cut || s - cl.cut >= span {
+                    continue;
+                }
+                let at = base + s;
+                if at >= p0 && at < span_end {
+                    ev.push(((at - p0) as usize, 1, m.ch, m.num, m.val));
+                }
+            }
+            for m in pat.press.iter() {
+                let s = pat.ticks_to_samples(m.at, sr);
+                if s < cl.cut || s - cl.cut >= span {
+                    continue;
+                }
+                let at = base + s;
+                if at >= p0 && at < span_end {
+                    ev.push(((at - p0) as usize, 2, m.ch, 0, m.val));
+                }
+            }
+        }
+    }
+    // v32 live feed: this track's synth also plays what the player is
+    // physically sending RIGHT NOW (selected + MIDI-rec-armed tracks;
+    // bound messages were filtered at the port). v33: when the track
+    // shares its synth handle, the owner stages this once per INSTANCE —
+    // the exact duplicates that used to land here per sharing track are
+    // what pushed voice-stealing plugins into dropping held notes.
+    if live && !live_ev.is_empty() {
+        for &(off, k, ch, d1, d2) in live_ev.iter() {
+            ev.push((off.min(block_n), k, ch, d1, d2));
+        }
+    }
+}
+
 impl Proc {
     /// Render every MIDI pattern clip sounding this block AND the live
     /// keyboard feed through each track's synth into `midi_scratch[t]`
@@ -2693,6 +2804,9 @@ impl Proc {
                 }
             }
             self.live_notes = [0i32; MAX_LOOPS];
+            // v33: a disabled feed never delivers stale carried messages
+            // either — whatever was staged belongs to the OFF gate.
+            self.live_ev.clear();
         }
         let pattern_run =
             self.engine.transport_on() && !self.midi_cache.is_empty() && block_n != 0;
@@ -2731,7 +2845,21 @@ impl Proc {
         }
         let live_any = live_on
             && (!self.live_ev.is_empty() || self.live_notes.iter().any(|x| *x > 0));
-        if block_n == 0 || (!pattern_run && !live_any) {
+        // v33: with a plugin synth bound to any live track the render path
+        // stays OPEN even fully idle: plugins run every block ("constantly
+        // listening for all inputs") — their meters, mod/LFO displays and
+        // pedal state only advance while process() runs, and a VST2
+        // instrument GUI edits the LIVE instance, so a skipped block is a
+        // frozen knob. Script synths are exempt: pausing them is free and
+        // their sliders are host-side.
+        let vst_open = (0..MAX_LOOPS).any(|t| {
+            self.engine.track_on(t)
+                && slot_is_vst(
+                    self.synths_cache.get(t).and_then(|o| o.as_ref()),
+                    self.dflt_synth.as_ref(),
+                )
+        });
+        if render_gate_blocked(block_n, pattern_run, live_any, vst_open) {
             return false;
         }
         let sr = self.sr.max(1);
@@ -2753,13 +2881,47 @@ impl Proc {
             synths_cache,
             midi_cache,
             sil,
+            evq,
+            own,
+            owner,
             live_ev,
             live_notes,
             ..
         } = self;
-        for t in 0..MAX_LOOPS {
+        // v33: pass 0 — shared-handle ownership for this cycle. Tracks
+        // rendering through the SAME synth instance (unbound tracks on a
+        // shared default synth, or one plugin bound to several strips)
+        // must not each push the live feed and each sum the plugin's one
+        // output: the doubling choked voice-stealing synths (held notes
+        // and pedal sustains died under dense chords) and phase-doubled
+        // the mix. First sounding track owns the instance; only owners
+        // stage (own + sharers' events, deduplicated) and render.
+        own.clear();
+        owner.fill(0xFF);
+        for (t, owner_slot) in owner.iter_mut().enumerate() {
             if !engine.track_on(t) {
                 continue;
+            }
+            let Some(h) = synths_cache
+                .get(t)
+                .cloned()
+                .flatten()
+                .or_else(|| dflt.clone())
+            else {
+                continue;
+            };
+            let ptr = Arc::as_ptr(&h) as usize;
+            *owner_slot = match own.iter().position(|(p, _)| *p == ptr) {
+                Some(i) => own[i].1 as u8,
+                None => {
+                    own.push((ptr, t));
+                    t as u8
+                }
+            };
+        }
+        for t in 0..MAX_LOOPS {
+            if owner[t] != t as u8 {
+                continue; // sharer or no synth: the owner renders
             }
             let handle = match synths_cache
                 .get(t)
@@ -2771,91 +2933,58 @@ impl Proc {
                 None => continue, // no synth loaded at all: silence
             };
             midi_ev.clear();
-            // Ring horizon: the latest sample this track must keep the
-            // synth advancing to (updated from every note staged here).
+            // Ring horizon: the latest sample this instance must keep the
+            // synth advancing to (updated from every staged note-off).
             let mut ring = midi_ring_to[t];
-            // Pattern staging runs only while the transport table is live
-            // (v32: the live feed below runs regardless of transport).
-            for l in arr.tracks[t].lanes.iter().filter(|_| pattern_run) {
-                for cl in l.clips.iter() {
-                    let Some(Some(pat)) = midi_cache.get(cl.asset as usize) else {
-                        continue;
-                    };
-                    let avail = pat.len_samples(sr);
-                    let span = cl.span(avail);
-                    // Clip timeline window vs this block.
-                    if cl.end(avail) <= p0 || cl.pos >= span_end {
-                        continue;
-                    }
-                    let base = cl.pos.saturating_sub(cl.cut);
-                    for note in pat.notes.iter() {
-                        let s0 = pat.ticks_to_samples(note.start, sr);
-                        if s0 < cl.cut || s0 - cl.cut >= span {
-                            continue; // head trimmed away or past clip end
-                        }
-                        let on = base + s0;
-                        let len_s = pat.ticks_to_samples(note.len, sr).max(1);
-                        if on >= p0 && on < span_end {
-                            let vel = (note.vel as f32 * cl.gain * cl.fade_at(on, avail))
-                                .clamp(0.0, 127.0)
-                                .round() as u8;
-                            if vel > 0 {
-                                midi_ev.push(((on - p0) as usize, 3, note.ch, note.note, vel));
-                            }
-                            let off_tl = on + len_s;
-                            if off_tl >= p0 && off_tl < span_end {
-                                midi_ev.push(((off_tl - p0) as usize, 0, note.ch, note.note, 0));
-                            }
-                            ring = ring.max(off_tl);
-                        } else if on < p0 && on + len_s > p0 && on + len_s <= span_end {
-                            // Rang in earlier; its off lands in this block.
-                            midi_ev.push(((on + len_s - p0) as usize, 0, note.ch, note.note, 0));
-                            ring = ring.max(on + len_s);
-                        }
-                    }
-                    for m in pat.ccs.iter() {
-                        let s = pat.ticks_to_samples(m.at, sr);
-                        if s < cl.cut || s - cl.cut >= span {
-                            continue;
-                        }
-                        let at = base + s;
-                        if at >= p0 && at < span_end {
-                            midi_ev.push(((at - p0) as usize, 1, m.ch, m.num, m.val));
-                        }
-                    }
-                    for m in pat.press.iter() {
-                        let s = pat.ticks_to_samples(m.at, sr);
-                        if s < cl.cut || s - cl.cut >= span {
-                            continue;
-                        }
-                        let at = base + s;
-                        if at >= p0 && at < span_end {
-                            midi_ev.push(((at - p0) as usize, 2, m.ch, 0, m.val));
-                        }
-                    }
-                }
+            // v33: the owner stages EVERY sharer's events. Pattern
+            // staging runs only while the transport table is live (v32:
+            // the live feed runs regardless of transport) — and exactly
+            // once per instance.
+            for t2 in (0..MAX_LOOPS).filter(|x| owner[*x] == t as u8) {
+                let live_t = live_on && ((live_mask >> t2) & 1) != 0;
+                stage_track_events(
+                    t2,
+                    &arr,
+                    midi_cache,
+                    live_ev,
+                    live_t,
+                    pattern_run,
+                    p0,
+                    span_end,
+                    block_n,
+                    sr,
+                    midi_ev,
+                    &mut ring,
+                );
             }
-            // v32 live feed: this track's synth also plays what the player
-            // is physically sending RIGHT NOW (selected + MIDI-rec-armed
-            // tracks; bound messages were filtered at the port). The same
-            // instrument, the same chain, the same mix — auditioning a
-            // patch and recording a take must sound like the take.
-            let is_live = live_on && ((live_mask >> t) & 1) != 0;
-            if is_live && !live_ev.is_empty() {
-                for &(off, k, ch, d1, d2) in live_ev.iter() {
-                    midi_ev.push((off.min(block_n), k, ch, d1, d2));
-                }
-            }
+            // (offset, kind) ordering puts offs (kind 0) before ons (kind
+            // 3) at the same sample, so a retrigger never kills its own
+            // note. v33 `dedup` collapses EXACT duplicates (same offset,
+            // kind, ch, data — the signature of the live feed staged via
+            // two sharing tracks); distinct events (two patterns' notes)
+            // always survive.
+            midi_ev.sort_unstable();
+            midi_ev.dedup();
+            let has_ev = !midi_ev.is_empty();
             // Render this block when it carries staged events OR when the
             // track is still sustaining (a scheduled note rings past this
             // block, or the synth's tail has not decayed yet). Pausing the
             // instrument on event-free blocks is what made every note a
             // one-block blip — the sound between events lives INSIDE the
             // synth (script voices / the plugin's own ring). A physically
-            // held live key counts as sustaining too (v32).
-            let has_ev = !midi_ev.is_empty();
-            let holding = is_live && live_notes[t] > 0;
-            if !has_ev && !midi_sustain[t] && !holding {
+            // held live key counts as sustaining too (v32) — on ANY track
+            // sharing this instance.
+            let holding =
+                live_on && (0..MAX_LOOPS).any(|x| owner[x] == t as u8 && live_notes[x] > 0);
+            // v33: PLUGIN instruments run EVERY block ("plugins should be
+            // constantly listening for all inputs"): a plugin's own GUI
+            // state, meters and modulation sources advance only while
+            // process() runs, so an idle-skipped plugin looked frozen and
+            // mod/pedal state lagged until the next note. Script synths
+            // keep the quiet-tail gate — their sliders are host-side and
+            // pausing them is free.
+            let always = matches!(handle.as_ref(), SynthHandle::Vst(_));
+            if !has_ev && !midi_sustain[t] && !holding && !always {
                 continue;
             }
             let row = &mut midi_scratch[t];
@@ -2863,9 +2992,6 @@ impl Proc {
                 row.clear();
                 row.resize(block_n, 0.0);
             }
-            // (offset, kind) ordering puts offs (kind 0) before ons (kind 3)
-            // at the same sample, so a retrigger never kills its own note.
-            midi_ev.sort_unstable();
             match handle.as_ref() {
                 SynthHandle::Script(inst) => {
                     // Sliders: only refetch when the GUI actually moved one.
@@ -2913,42 +3039,48 @@ impl Proc {
                     }
                 }
                 SynthHandle::Vst(e) => {
-                    // A VSTi generates from events: feed each event, drive
-                    // the plugin over silence in between, straight into the
-                    // row. Events land at internal-block boundaries (the
-                    // host's uniform ≤ VST_BLOCK staging delay).
+                    // v33: ONE block call carrying every event at its
+                    // exact sample position (was: process() split at each
+                    // event boundary, all deltas 0 — fast retriggers and
+                    // dense chords arrived smeared to internal-block
+                    // starts). Silence drives generation; the plugin's
+                    // ring and tail stay live.
                     sil.clear();
                     sil.resize(block_n, 0.0);
-                    let mut cur = 0usize;
-                    let mut i = 0usize;
-                    while i < midi_ev.len() {
-                        let off = midi_ev[i].0.min(block_n);
-                        if off > cur {
-                            e.process(&sil[cur..off], &mut row[cur..off]);
-                            cur = off;
-                        }
-                        while i < midi_ev.len() && midi_ev[i].0.min(block_n) == off {
-                            let (_, kind, ch, d1, d2) = midi_ev[i];
-                            match kind {
-                                0 => e.note_off(ch, d1),
-                                1 => e.cc(ch, d1, d2),
-                                2 => e.press(ch, d2),
-                                _ => e.note_on(ch, d1, d2),
-                            }
-                            i += 1;
-                        }
+                    evq.clear();
+                    for &(_off, kind, ch, d1, d2) in midi_ev.iter() {
+                        let m = match kind {
+                            0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
+                            1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                            2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+                            _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+                        };
+                        evq.push(((_off).min(block_n), m));
                     }
-                    if cur < block_n {
-                        e.process(&sil[cur..block_n], &mut row[cur..block_n]);
-                    }
+                    e.process_with_midi(&sil[..block_n], &mut row[..block_n], evq);
                 }
             }
-            midi_live[t] = true;
-            any = true;
+            // Always-running plugins may GENERATE without events (drones,
+            // arpeggiators): open the mix slot on audible output only, so
+            // silent idling costs the sample loop nothing.
+            let sounding = !always
+                || has_ev
+                || midi_sustain[t]
+                || holding
+                || row[..block_n]
+                    .iter()
+                    .fold(0.0f32, |m, x| m.max(x.abs()))
+                    >= MIDI_SILENCE_FLOOR;
+            if sounding {
+                midi_live[t] = true;
+                any = true;
+            }
             // Sustain bookkeeping. Keep advancing while the schedule rings
             // past this block; once nothing is scheduled, stop only after a
             // few near-silent rendered blocks, so the instrument's release
-            // tail plays out fully but a dead track costs no CPU.
+            // tail plays out fully but a dead track costs no CPU. (For
+            // always-running plugins these flags only steer the mix-slot
+            // decision above — rendering never stops.)
             midi_ring_to[t] = ring;
             if has_ev {
                 midi_sustain[t] = true;
@@ -2969,6 +3101,11 @@ impl Proc {
                 }
             }
         }
+        // v33: the live feed is CONSUMED here — an early return above
+        // (idle gate, zero-length block) leaves it staged, and
+        // `Proc::process` carries it into the next cycle instead of
+        // dropping the player's notes.
+        live_ev.clear();
         any
     }
 }
@@ -3095,6 +3232,19 @@ struct Proc {
     mono: Vec<f32>,
     /// Reusable zero input for driving a VSTi with no audio side-chain.
     sil: Vec<f32>,
+    /// v33: (block offset, status message) stream encoded for
+    /// `RtStageEntry::process_with_midi` — one call per block, events at
+    /// their true sample positions.
+    evq: Vec<(usize, [u8; 3])>,
+    /// v33: shared-synth-handle identity for THIS cycle: `(Arc ptr, owner
+    /// track)` pairs, rebuilt from scratch every block (capacity lives on
+    /// after the first one). Two tracks rendering through one plugin
+    /// instance must feed it ONE merged event stream — the doubling this
+    /// replaces is what choked voice-stealing synths under dense chords.
+    own: Vec<(usize, usize)>,
+    /// v33: per-track owner map for `own` (track index of the handle
+    /// owner; 0xFF = track has no synth this cycle).
+    owner: [u8; MAX_LOOPS],
     /// v32 live MIDI: this block's UNBOUND feedable messages staged as
     /// `(block offset, kind, ch, d1, d2)` in the pattern event encoding.
     /// Cleared at block entry by the port reader; capacity is reserved at
@@ -3416,8 +3566,15 @@ impl ProcessHandler for Proc {
                 }
             }
         }
-        self.live_ev.clear();
-
+        // v33: live messages staged but NOT rendered last cycle (idle
+        // early-return, zero-length block, gate flipped off between
+        // cycles) carry over instead of evaporating: their samples are
+        // already in the past, so they fire at the head of this cycle,
+        // in the order they arrived. (Consumption/clear moved into
+        // `render_midi_block` — whoever renders the events clears them.)
+        for e in self.live_ev.iter_mut() {
+            e.0 = 0;
+        }
         // MIDI: copy events out (bounded channel; count drops if the GUI is slow).
         let off_cap = n.saturating_sub(1);
         for e in self.midi_in.iter(ps) {
@@ -3647,6 +3804,8 @@ impl ProcessHandler for Proc {
                 self.midi_quiet[t] = 0;
                 self.midi_ring_to[t] = 0;
             }
+            // v33: staged live messages belong to the abandoned position.
+            self.live_ev.clear();
             // Plugin buffers/rings in every chain: drop stale audio.
             for tf in self.fx_cache.iter() {
                 for s in tf.slots() {
@@ -4994,6 +5153,83 @@ mod tests {
         // Truncated note-on: velocity 0 reads as a release, never a stuck
         // note.
         assert_eq!(live_event_kind(&[0x90, 60]), Some((0, 0, 60, 0)));
+    }
+
+    /// v33: the shared-instance staging contract. One synth handle bound
+    /// to (or defaulted onto) several tracks is fed ONE merged stream:
+    /// each sharer's events are staged, and EXACT duplicates — the live
+    /// keyboard feed seen through every sharing track — collapse to a
+    /// single delivery. Without this the plugin's voice allocator saw
+    /// doubled note-ons and stole held notes under dense chords.
+    #[test]
+    fn v33_shared_instance_stages_the_live_feed_once() {
+        use crate::midipat::Pattern;
+        let mut pat = Pattern::new(120);
+        // One short note at tick 0: 10 ticks at 120 BPM = 500 samples
+        // (PPQ is 480 — a quarter note is 24000 samples here).
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 10,
+        });
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0));
+        let cache: Vec<Option<std::sync::Arc<Pattern>>> =
+            vec![Some(std::sync::Arc::new(pat))];
+        // The keyboard holds C4 — staged ONCE into live_ev by the port.
+        let live_ev = vec![(5usize, 3u8, 0u8, 60u8, 100u8)];
+
+        // Owner staging pass: track 0 (its own clip + live) and track 1
+        // (no clip, live) share this instance.
+        let mut ev = Vec::new();
+        let mut ring = 0u64;
+        stage_track_events(0, &arr, &cache, &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring);
+        stage_track_events(1, &arr, &cache, &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring);
+        ev.sort_unstable();
+        let doubled = ev.len();
+        ev.dedup();
+        assert_eq!(doubled, 4, "pattern on/off + two live copies expected");
+        assert_eq!(
+            ev,
+            vec![(0, 3, 0, 60, 100), (5, 3, 0, 60, 100), (500, 0, 0, 60, 0)],
+            "after dedup: pattern note (on+off) once, live note-on ONCE"
+        );
+        assert_eq!(ring, 500, "ring must track the scheduled note-off");
+
+        // A live note held past the block must survive while `live` is
+        // staged, and the ring keeps the engine advancing to its off.
+        let held = vec![(9usize, 3u8, 2u8, 70u8, 90u8)];
+        let mut ev = Vec::new();
+        stage_track_events(4, &arr, &cache, &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring);
+        assert_eq!(ev, vec![(9, 3, 2, 70, 90)]);
+    }
+
+    /// v33: the "knobs and sliders don't update unless a note is actively
+    /// being played" gate. With a plugin synth bound, idle blocks MUST
+    /// still render — the plugin's meters/mod/pedal state, and for VST2
+    /// the very instance the GUI edits, only advance inside process().
+    /// Script-only rigs keep the free quiet-tail pause; block 0 is priming.
+    #[test]
+    fn v33_render_gate_keeps_plugins_rendering_while_idle() {
+        // Script-only idle: gated (pause, silence).
+        assert!(render_gate_blocked(3, false, false, false));
+        // Plugin synth bound: an idle block is NEVER skipped.
+        assert!(!render_gate_blocked(3, false, false, true));
+        // Playing or live input: never gated, any handle kind.
+        assert!(!render_gate_blocked(3, true, false, false));
+        assert!(!render_gate_blocked(3, false, true, false));
+        // Priming: block 0 always skips audio.
+        assert!(render_gate_blocked(0, true, true, true));
+        // The plugin term must be load-bearing (pre-v33 code gated the
+        // plugin-idle case exactly like script-idle — this fails on it).
+        assert_ne!(
+            render_gate_blocked(3, false, false, false),
+            render_gate_blocked(3, false, false, true),
+            "idle+plugin must differ from idle+script"
+        );
     }
 
     /// v32: the bound-message exclusion for live playing. Rule (the same

@@ -862,6 +862,11 @@ impl Instance {
 
     /// v32 R5: `call_sample` with this track's sidechain sample. v1
     /// scripts (no v2 entry) keep receiving `process` exactly as before.
+    ///
+    /// # Safety
+    /// FFI into a loaded scripted-effect library: `self.state`/`self.fns`
+    /// must come from a successfully opened effect whose owner lock is
+    /// held by the caller, and `params` is the caller's frozen param set.
     #[inline]
     pub unsafe fn call_sample_sc(
         &self,
