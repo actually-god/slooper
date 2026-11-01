@@ -10622,8 +10622,10 @@ fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
 fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
     let (pressed, down, pos) = ui.ctx().input(|i| {
         (
-            i.pointer.any_pressed(),
-            i.pointer.any_down(),
+            // PRIMARY only: a right-press on a header must open the
+            // re-slot menu, never start a window carry.
+            i.pointer.any_pressed() && i.pointer.button_down(egui::PointerButton::Primary),
+            i.pointer.button_down(egui::PointerButton::Primary),
             i.pointer.interact_pos(),
         )
     });
@@ -10703,22 +10705,58 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // Persist only the CROSS dimension (panel thickness): width for
         // left/right docks, height for bottom docks — the along-edge size
         // is whatever the viewport gives and would churn the config.
-        if edge == 2 {
-            if (wr[3] - r.height()).abs() > 1.5 && r.height() > 40.0 {
-                wr[3] = r.height();
-                if dragging_divider {
-                    app.side_dirty = true;
-                }
+        // IMPORTANT: this must NOT latch every frame — the inner rect is
+        // narrower than the reserved thickness by the panel margins, and
+        // feeding it back as next frame's default_size SHRINKS the panel
+        // every frame (a runaway that once starved the grid to a phantom
+        // 1537-px max-rect). Only a real divider drag moves it, and those
+        // clear this threshold immediately.
+        let (cur, size) = if edge == 2 { (wr[3], r.height()) } else { (wr[2], r.width()) };
+        if size > 40.0 && (cur - size).abs() > 24.0 {
+            if edge == 2 {
+                wr[3] = size;
+            } else {
+                wr[2] = size;
             }
-        } else if (wr[2] - r.width()).abs() > 1.5 && r.width() > 40.0 {
-            wr[2] = r.width();
             if dragging_divider {
                 app.side_dirty = true;
+            }
+        } else if cur < 40.0 && size > 40.0 {
+            // first record (never-moved window)
+            if edge == 2 {
+                wr[3] = size;
+            } else {
+                wr[2] = size;
             }
         }
     }
     ui.horizontal(|ui| {
-        ui.label(RichText::new(win_title(idx)).strong());
+        let title = ui.label(RichText::new(win_title(idx)).strong());
+        // v30-batch-2: one-stop dock menu on the header title — every
+        // window can be re-slotted (or floated out) without a precise
+        // drag; the drag-to-edge gesture stays as the quick path.
+        title.context_menu(|ui| {
+            let cur = dock_edge(app, idx);
+            for (e, name) in [(0i16, "left"), (1, "right"), (2, "bottom")] {
+                if e == cur {
+                    continue;
+                }
+                if ui.button(format!("dock to the {name} edge")).clicked() {
+                    let r = app.dock_rects[idx];
+                    let mid = egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+                    dock_at(app, idx, e, mid);
+                    app.save_config();
+                    ui.close();
+                }
+            }
+            if ui.button("float out (free window)").clicked() {
+                let r = app.dock_rects[idx];
+                undock_to(app, idx, [r[0], r[1]]);
+                app.dock_just_floated = Some(idx);
+                app.save_config();
+                ui.close();
+            }
+        });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .small_button("x")
@@ -10767,6 +10805,78 @@ fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                 .default_size(known[3].max(def_h(idx)))
                 .min_size(110.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
+        }
+    }
+}
+
+/// One docked edge. Several windows on the SAME edge must tile ALONG the
+/// edge (bottom: side by side; left/right: stacked vertically) — separate
+/// same-edge side panels would each claim their own thickness and together
+/// eat the canvas. So: one wrapper panel across the edge (uniform
+/// thickness) whose interior is split by nested opposite-orientation
+/// panels, each resizable along the edge and each owning one window.
+fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) {
+    if ids.len() == 1 {
+        draw_docked(ui, app, ids[0]);
+        return;
+    }
+    match edge {
+        2 => {
+            let h = ids
+                .iter()
+                .map(|i| win_rect(app, *i)[3])
+                .fold(0.0f32, f32::max)
+                .max(def_h(ids[0]));
+            egui::Panel::bottom(egui::Id::new(("dockedge", edge)))
+                .resizable(false)
+                .exact_size(h)
+                .show(ui, |ui| {
+                    for (n, i) in ids.iter().enumerate() {
+                        let b = ui.max_rect();
+                        if n + 1 == ids.len() {
+                            // The last window fills the rest of the strip.
+                            egui::Panel::bottom(egui::Id::new(("dockfill", *i)))
+                                .resizable(false)
+                                .exact_size(b.height())
+                                .show(ui, |ui| docked_window(ui, app, *i));
+                        } else {
+                            egui::Panel::left(egui::Id::new(("dockw", *i)))
+                                .resizable(true)
+                                .default_size(win_rect(app, *i)[2].max(def_w(*i)))
+                                .min_size(170.0)
+                                .show(ui, |ui| docked_window(ui, app, *i));
+                        }
+                    }
+                });
+        }
+        _ => {
+            let w = ids
+                .iter()
+                .map(|i| win_rect(app, *i)[2])
+                .fold(0.0f32, f32::max)
+                .max(def_w(ids[0]));
+            let mut wpanel = match edge {
+                0 => egui::Panel::left(egui::Id::new(("dockedge", edge))),
+                _ => egui::Panel::right(egui::Id::new(("dockedge", edge))),
+            };
+            wpanel = wpanel.resizable(false).exact_size(w);
+            wpanel.show(ui, |ui| {
+                    for (n, i) in ids.iter().enumerate() {
+                        let b = ui.max_rect();
+                        if n + 1 == ids.len() {
+                            egui::Panel::left(egui::Id::new(("dockfill", *i)))
+                                .resizable(false)
+                                .exact_size(b.width())
+                                .show(ui, |ui| docked_window(ui, app, *i));
+                        } else {
+                            egui::Panel::top(egui::Id::new(("dockw", *i)))
+                                .resizable(true)
+                                .default_size(win_rect(app, *i)[3].max(def_h(*i)))
+                                .min_size(110.0)
+                                .show(ui, |ui| docked_window(ui, app, *i));
+                        }
+                    }
+                });
         }
     }
 }
@@ -10856,8 +10966,8 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             })
             .collect();
         ids.sort_by_key(|i| dock_order(app, *i));
-        for i in ids {
-            draw_docked(ui, app, i);
+        if !ids.is_empty() {
+            draw_docked_edge(ui, app, edge, &ids);
         }
     }
     for i in 0..4 {
@@ -12045,8 +12155,8 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
 }
 
 fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
-            ui.heading(RichText::new("MIXER").strong());
-            ui.separator();
+            // v30-batch-2: the dock/window header carries the title, so
+            // the old in-panel MIXER heading is gone (it double-stacked).
             let base = ui.available_rect_before_wrap();
             // Clip to the visible column, then lay strips out on absolute
             // rects shifted by the grid's vertical scroll (shared offset —
@@ -12701,8 +12811,23 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
 
 fn central_panels(ui: &mut egui::Ui, app: &mut App) {
     egui::CentralPanel::default().show(ui, |ui| {
-        grid_toolbar(ui, app);
-        clip_props_strip(ui, app);
+        // v30-batch-2: the toolbar row is an UNBOUNDED horizontal layout
+        // (a Slider's Extend-mode text makes its desired width infinite),
+        // and its used width LEAKS BACK into the panel ui's max_rect — the
+        // phantom max starved every sibling row below it (with the docks
+        // claiming real edges the leak pushed widgets off-screen: the
+        // clip-strip's fade-out slider vanished). The scope fences it.
+        let fence = ui.max_rect();
+        let start = ui.cursor().min;
+        let rect = egui::Rect::from_min_max(start, fence.max);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            grid_toolbar(ui, app);
+        });
+        let start2 = ui.cursor().min;
+        let rect2 = egui::Rect::from_min_max(start2, fence.max);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect2), |ui| {
+            clip_props_strip(ui, app);
+        });
         ui.separator();
         let sr = app.sample_rate.max(1) as f64;
         let total = app.total_len().max(1);
@@ -12776,15 +12901,26 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
     let name = a.name.clone();
     let sr = app.sample_rate.max(1) as f64;
     let span = cl.span(a.samples());
-    ui.horizontal(|ui| {
+    // v30-batch-2: WRAPPED — with the side windows docked the row is far
+    // narrower than the old dockless canvas; unwrapped it silently pushed
+    // the fade-out slider past the clip rect (invisible, unclickable).
+    ui.horizontal_wrapped(|ui| {
+        // v30-batch-2: keep the strip COMPACT — with the side windows
+        // docked by default the canvas is ~500 px, and a Slider's
+        // Extend-mode text label makes unwrapped rows overflow silently.
         ui.label(
-            RichText::new(format!("clip: {name} \u{b7} {:.2}s", span as f64 / sr))
+            RichText::new(format!("{name} \u{b7} {:.2}s", span as f64 / sr))
                 .strong()
                 .small(),
         );
         // gain, in dB (the house convention: everything the user edits is dB)
         let mut db: f32 = (20.0f32 * cl.gain.max(1e-4).log10()).clamp(-60.0, 12.0);
-        let r = ui.add(
+        // v30-batch-2: FINITE slider widths. A Slider's text label wraps
+        // with TextWrapMode::Extend, so an unbounded slider reports an
+        // enormous desired width; in the now-narrow WRAPPED strip row (side
+        // windows dock by default) the tail widgets vanished entirely.
+        let r = ui.add_sized(
+            [135.0, 16.0],
             Slider::new(&mut db, -60.0..=12.0)
                 .text("gain")
                 .step_by(0.5)
@@ -12803,7 +12939,8 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
             ("fade out", cl.fade_out, false),
         ] {
             let mut ms = cur as f64 * 1000.0 / sr;
-            let r = ui.add(
+            let r = ui.add_sized(
+                [130.0, 16.0],
                 Slider::new(&mut ms, 0.0..=5000.0)
                     .text(label)
                     .step_by(5.0)
@@ -15413,6 +15550,52 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 .weak()
                 .small(),
             );
+            // v30-batch-2: one-click layout moves. "Dock all" snaps every
+            // visible window back into the standard edge slots (the state
+            // this app opens with); "Float all" undocks everything into
+            // free windows where they stand — the classic pre-docking
+            // look. Per-window slotting: drag a dock header to any edge,
+            // or right-click the dock header title.
+            ui.horizontal(|ui| {
+                if ui
+                    .button("dock all windows")
+                    .on_hover_text(
+                        "Snap every visible window back into its dock slot \
+                         (rack left, mixer right, bindings + monitor bottom).",
+                    )
+                    .clicked()
+                {
+                    let def = crate::config::default_dock();
+                    for (d, f) in app.side_wins.dock.iter_mut().zip(def) {
+                        *d = f;
+                    }
+                    app.side_dirty = true;
+                    app.save_config();
+                }
+                if ui
+                    .button("float all windows")
+                    .on_hover_text(
+                        "Undock every window into a free-floating window \
+                         (the classic layout) — drag headers to re-place, \
+                         drop on an edge to re-dock.",
+                    )
+                    .clicked()
+                {
+                    for i in 0..4usize {
+                        if app.side_wins.dock[i][0] == 1 {
+                            let r = app.dock_rects[i];
+                            let base = float_footprint(app, i);
+                            let at = if r[2] > 8.0 {
+                                [r[0], r[1]]
+                            } else {
+                                [base[0], base[1]]
+                            };
+                            undock_to(app, i, at);
+                        }
+                    }
+                    app.save_config();
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label("theme:");
                 egui::ComboBox::from_id_salt("theme_cb")
@@ -15796,20 +15979,6 @@ mod tests {
             .clone()
     }
 
-    /// v30 R6: the asset rack / bindings / monitor are free windows that
-    /// float OVER the canvas (unlike the old docks, which reserved their
-    /// edge). Pins that click the grid, the mixer or the settings panel
-    /// hide them first so coordinates land on the panel under test.
-    /// v30 R6: keep the three free windows OPEN but push them off-screen
-    /// (their geometry is "known" once set) so clicks land on whatever
-    /// panel sits beneath — for pins that need the windows' galleys to
-    /// exist yet must click the main GUI underneath.
-    fn park_side_wins(app: &mut App) {
-        app.side_wins.rack = [-3000.0, -3000.0, 340.0, 640.0];
-        app.side_wins.binds = [-3000.0, -2300.0, 300.0, 620.0];
-        app.side_wins.monitor = [-3000.0, -1600.0, 520.0, 240.0];
-    }
-
     fn clear_canvas(app: &mut App) {
         app.show_rack = false;
         app.show_midi = false;
@@ -15933,6 +16102,8 @@ mod tests {
     fn v11_clip_trim_clips_paint_without_stretch() {
         let mut app = headless_app("v11stretch");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app); // v30-batch-2: windows default DOCKED now
+
         frame(&mut app, &ctx, vec![]);
         let mut pat = crate::midipat::Pattern::new(120);
         pat.len_ticks = 32 * 480; // 16 s at 120 BPM = 640 px @ 40 px/s
@@ -16137,9 +16308,9 @@ mod tests {
     /// so its heading text renders further left).
     #[test]
     fn settings_panel_pops_up_left_of_the_rack() {
-        // v25 pinned "settings docks left of the rack". v30 R6: the rack is
-        // a free window that floats wherever the user parked it — opening
-        // SETTINGS must not move or hide it any more.
+        // SETTINGS docks to the LEFT of the asset rack. v30-batch-2: with
+        // the rack DOCKED (the default), opening SETTINGS stacks left and
+        // shifts the docked rack right; a FLOATING rack never moves.
         let mut app = headless_app("settings");
         let ctx = egui::Context::default();
         app.show_binds = false;
@@ -16154,10 +16325,30 @@ mod tests {
         assert!(!settings.is_empty(), "settings heading painted");
         assert!(!rack.is_empty(), "rack still painted with settings open");
         assert!(
-            (rack[0].x - rack0[0].x).abs() < 0.5,
-            "opening settings shifted the free rack window: {} -> {}",
+            settings[0].x < rack[0].x,
+            "SETTINGS must sit left of the rack: {} vs {}",
+            settings[0].x,
+            rack[0].x
+        );
+        assert!(
+            rack[0].x > rack0[0].x + 50.0,
+            "dock-stacking must shift the docked rack right: {} -> {}",
             rack0[0].x,
             rack[0].x
+        );
+        // ... and the FREE window ignores panel stacking entirely.
+        app.side_wins.dock[0][0] = 0;
+        app.side_wins.rack = [700.0, 300.0, 340.0, 400.0];
+        frame(&mut app, &ctx, vec![]);
+        let f0 = galley_centers(&mut app, &ctx, "ASSET RACK", false);
+        assert_eq!(f0.len(), 1, "floating rack title painted alone");
+        app.show_settings = false;
+        let f1 = galley_centers(&mut app, &ctx, "ASSET RACK", false);
+        assert!(
+            (f1[0].x - f0[0].x).abs() < 0.5,
+            "opening/closing settings moved the FREE rack window: {} -> {}",
+            f0[0].x,
+            f1[0].x
         );
     }
 
@@ -16227,58 +16418,29 @@ mod tests {
         for _ in 0..4 {
             frame(&mut app, &ctx, vec![]);
         }
-        let p = egui::pos2(700.0, 246.0);
-        frame(&mut app, &ctx, vec![moved(p)]);
-        frame(&mut app, &ctx, vec![moved(p)]);
+        // v30-batch-2: right-click the dropped clip BODY: the clip menu
+        // opens (the empty-grid variant of this menu is covered by
+        // v15_ui_rmb_grid_menu_no_destructive_clear on a clean grid;
+        // the docked rack re-rows track 2's lanes, so fixed grid points
+        // below the clip are no longer stable anchors).
+        let cp = galley_centers(&mut app, &ctx, "kick", false)
+            .into_iter()
+            .find(|c| c.x > 400.0)
+            .expect("clip galley on the grid (not the rack row)");
+        frame(&mut app, &ctx, vec![moved(cp)]);
         frame(
             &mut app,
             &ctx,
-            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+            vec![moved(cp), btn(cp, egui::PointerButton::Secondary, true)],
         );
-        frame(
-            &mut app,
-            &ctx,
-            vec![btn(p, egui::PointerButton::Secondary, false)],
-        );
-        assert_eq!(
-            total(&app),
-            1,
-            "right-click kept the clips (no more instant clear)"
-        );
-        // Right on the clip body: the clip menu opens.
-        if galley_at(&mut app, &ctx, "Duplicate").is_some() {
-            let del = galley_at(&mut app, &ctx, "Delete")
-                .expect("Delete item")
-                .center();
-            frame(
-                &mut app,
-                &ctx,
-                vec![moved(del), btn(del, egui::PointerButton::Primary, true)],
-            );
-            frame(
-                &mut app,
-                &ctx,
-                vec![btn(del, egui::PointerButton::Primary, false)],
-            );
-            assert_eq!(total(&app), 0, "menu Delete removed the clip");
-        } else {
-            // Right-click landed on empty grid: the track menu with an
-            // explicit Clear item must be there instead.
-            let cl = galley_at(&mut app, &ctx, "Clear this track")
-                .expect("Clear item")
-                .center();
-            frame(
-                &mut app,
-                &ctx,
-                vec![moved(cl), btn(cl, egui::PointerButton::Primary, true)],
-            );
-            frame(
-                &mut app,
-                &ctx,
-                vec![btn(cl, egui::PointerButton::Primary, false)],
-            );
-            assert_eq!(total(&app), 0, "menu Clear emptied the track");
-        }
+        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let del = galley_at(&mut app, &ctx, "Delete")
+            .expect("clip menu opened on the clip body")
+            .center();
+        frame(&mut app, &ctx, vec![moved(del), btn(del, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(del, egui::PointerButton::Primary, false)]);
+        assert_eq!(total(&app), 0, "menu Delete removed the clip");
     }
 
     #[test]
@@ -16622,6 +16784,11 @@ mod tests {
     fn clipboard_survives_real_click_flow() {
         let mut app = headless_app("clipflow");
         let ctx = egui::Context::default();
+        // v30-batch-2: windows default DOCKED. Hide only the windows this
+        // pin never touches; the rack STAYS docked (its rows start the DnD).
+        app.show_binds = false;
+        app.show_midi = false;
+
         frame_keys(&mut app, &ctx, vec![]); // layout pass
                                             // 1. Rack DnD drop onto a lane (same recipe as the DnD pin test).
         // v30 R6: the rack floats, so anchor on the painted row galley —
@@ -19898,17 +20065,11 @@ mod tests {
 
         // Property strip for exactly one selected clip.
         assert!(
-            has_text(&mut app, &ctx, "clip: sine"),
+            has_text(&mut app, &ctx, "sine \u{b7}"),
             "strip names the clip"
         );
-        assert!(
-            has_text(&mut app, &ctx, "fade in"),
-            "fade-in slider present"
-        );
-        assert!(
-            has_text(&mut app, &ctx, "fade out"),
-            "fade-out slider present"
-        );
+        assert!(!v25_hits(&mut app, &ctx, "fade in").is_empty(), "fade-in slider present");
+        assert!(!v25_hits(&mut app, &ctx, "fade out").is_empty(), "fade-out slider present");
 
         // S splits at the playhead.
         frame_keys(
@@ -19938,7 +20099,7 @@ mod tests {
         app.sel_clips.clear();
         frame_keys(&mut app, &ctx, vec![]);
         assert!(
-            !has_text(&mut app, &ctx, "clip: sine"),
+            !has_text(&mut app, &ctx, "sine \u{b7}"),
             "strip hides without a selection"
         );
     }
@@ -20886,6 +21047,8 @@ mod tests {
     fn v18_osdrop_wav_on_grid_places_clip() {
         let mut app = headless_app("v18dropg");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app); // v30-batch-2: windows default DOCKED now
+
         frame(&mut app, &ctx, vec![]);
         let wav = write_test_wav(
             &std::env::temp_dir().join("sp-uity-v18dropg").join("in"),
@@ -20935,6 +21098,8 @@ mod tests {
     fn v18_osdrop_midi_file_places_clip() {
         let mut app = headless_app("v18dropmid");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app); // v30-batch-2: windows default DOCKED now
+
         frame(&mut app, &ctx, vec![]);
         let dir = std::env::temp_dir().join("sp-uity-v18dropmid").join("in");
         std::fs::create_dir_all(&dir).unwrap();
@@ -21753,6 +21918,8 @@ mod tests {
     fn v18_vertical_clip_drag_moves_lane_and_reclick_works() {
         let mut app = headless_app("v18vertdrag");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app); // v30-batch-2: windows default DOCKED now
+
         clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
@@ -21797,6 +21964,8 @@ mod tests {
     fn v18_cut_during_armed_edge_resize_does_not_panic() {
         let mut app = headless_app("v18cutresize");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app); // v30-batch-2: windows default DOCKED now
+
         clear_canvas(&mut app);
         frame_keys(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
@@ -22450,11 +22619,57 @@ mod tests {
 
     /// Settings ▸ GUI ▸ panels: hiding a panel really unpaints it, and the
     /// choice persists.
+    /// v30-batch-2: the layout escape hatches. "Float all" must produce
+    /// free windows from the all-docked default, and "dock all" must snap
+    /// everything back into the standard slots (the pre-patch look stays
+    /// one click away in BOTH directions).
+    #[test]
+    fn v30_layout_buttons_round_trip() {
+        let mut app = headless_app("v30lay");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "all docked by default");
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "float all windows").expect("float-all button");
+        click_pt(&mut app, &ctx, p);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.side_wins.dock.iter().all(|d| d[0] == 0), "all floated");
+        assert!(app.side_wins.rack[2] > 80.0, "float geometry recorded");
+        let p = label_center(&mut app, &ctx, "dock all windows").expect("dock-all button");
+        click_pt(&mut app, &ctx, p);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "snapped back to slots");
+        // And the dock header title carries the re-slot menu.
+        let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack dock header");
+        let tp = t.center();
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let f = galley_at(&mut app, &ctx, "float out (free window)").expect("dock menu on the title");
+        click_pt(&mut app, &ctx, f.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock[0][0], 0, "menu floated the rack out");
+    }
+
     #[test]
     fn v25_settings_panel_toggles_hide_panels() {
         let mut app = headless_app("v25panels");
         let ctx = egui::Context::default();
-        park_side_wins(&mut app);
+        // v30-batch-2: no parking — all four windows default DOCKED, so
+        // every header paints and SETTINGS (a left panel added first)
+        // stacks left of the rack dock with its checkboxes clickable.
         frame(&mut app, &ctx, vec![]);
         assert!(!v25_hits(&mut app, &ctx, "ASSET RACK").is_empty(), "rack default on");
         assert!(!v25_hits(&mut app, &ctx, "MIXER").is_empty(), "mixer default on");
@@ -23991,8 +24206,15 @@ mod tests {
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
         assert_eq!(app.kit(0).len(), 8, "stock kit = 8 pads");
-        app.synth_pick = Some(0);
+        // v30-batch-2: the kit editor lives in the plugin's GUI (the
+        // script-synth slider window), NOT in the synth picker.
+        app.set_track_synth_stem(0, "piano");
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
+        assert!(
+            !v25_hits(&mut app, &ctx, "DRUM KIT").is_empty(),
+            "kit editor lives in the plugin GUI"
+        );
         for i in 0..8 {
             let add = galley_centers(&mut app, &ctx, "+ add pad", false);
             assert!(!add.is_empty(), "kit editor shows add-pad ({i})");
@@ -24252,31 +24474,30 @@ mod tests {
         let mut app = headless_app("v30sw");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        assert!(app.side_wins.rack[2] > 80.0, "rack geometry captured on first frame");
-        let before = app.side_wins;
-        // Rack drag: the window follows the pointer.
-        // Park the rack far RIGHT — a downward move would land it on the
-        // monitor's title bar and steal that window's later drag.
-        let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack title bar");
-        drag_pt(&mut app, &ctx, t.center(), t.center() + egui::vec2(700.0, 0.0));
+        // v30-batch-2: windows START DOCKED. Grab the rack's dock header
+        // and release mid-screen: it lifts out into a free float and its
+        // geometry is captured.
+        let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack dock header");
+        drag_pt(&mut app, &ctx, t.center(), egui::pos2(900.0, 400.0));
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!((app.side_wins.rack[0] - before.rack[0]).abs() > 50.0, "rack moved");
-        // Monitor drag too (any window moves, not one hardcoded spot).
-        let m0 = app.side_wins.monitor;
-        let mt = galley_at(&mut app, &ctx, "MIDI MONITOR").expect("monitor title bar");
-        drag_pt(&mut app, &ctx, mt.center(), mt.center() + egui::vec2(-150.0, -300.0));
+        assert_eq!(app.side_wins.dock[0][0], 0, "rack floated out of the dock");
+        assert!(app.side_wins.rack[2] > 80.0, "float geometry captured");
+        // Drag the float's title to the LEFT edge: it snaps back into a
+        // dock slot (edge 0 = left).
+        let t2 = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack float title");
+        drag_pt(&mut app, &ctx, t2.center(), egui::pos2(20.0, 400.0));
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!((app.side_wins.monitor[1] - m0[1]).abs() > 100.0, "monitor moved");
-        // Geometry persists to config once the drag settles.
+        assert_eq!(app.side_wins.dock[0], [1, 0, 0], "rack re-docked left");
+        // Geometry + dock state persist to config once the drag settles.
         app.save_config();
         let cfg_txt = std::fs::read_to_string(crate::config::Config::path()).unwrap_or_default();
         assert!(cfg_txt.contains("\"side_wins\""), "geometry persists");
         let app2 = App::new(Backend::start());
-        assert_eq!(app2.side_wins.monitor, app.side_wins.monitor, "window lands back where the user parked it");
+        assert_eq!(app2.side_wins.dock[0], [1, 0, 0], "dock state survives restart");
     }
 
     #[test]
