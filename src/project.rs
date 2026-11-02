@@ -27,6 +27,11 @@ pub const FORMAT: &str = "slooper-project";
 /// migrated on load. v3 (0.6.0) adds non-destructive clip trims
 /// (`cut`/`play_len`, defaulted when absent) and the configured track count.
 pub const VERSION: u32 = 3;
+
+/// v34 R8: the folder a picker should open at, remembered per picker
+/// ("export", "rack", ...). Stored as pairs so an old file simply has
+/// none (`serde(default)`).
+pub type ProjDirs = Vec<(String, String)>;
 /// File extension (no dot) of project files.
 pub const EXT: &str = "slooper";
 
@@ -115,6 +120,9 @@ pub struct Project {
     pub name: String,
     pub metro: ProjMetro,
     pub quantize: ProjQuantize,
+    /// v34 R8: last-opened folder per picker, saved with the project.
+    #[serde(default)]
+    pub dirs: ProjDirs,
     /// Saved playhead position (samples).
     pub playhead: u64,
     pub tracks: Vec<ProjTrack>,
@@ -268,6 +276,7 @@ mod tests {
                 loop_tl: false,
             },
             playhead: 12_345,
+            dirs: Vec::new(),
             tracks: vec![ProjTrack {
                 h: 0.0,
                 vol: 100,
