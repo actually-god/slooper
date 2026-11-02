@@ -12369,6 +12369,32 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                     app.save_config();
                                 }
+                                // v34 R15: releasing an in-app asset drag
+                                // on a folder header MOVES the file into
+                                // that folder — dragging beats menu diving.
+                                if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx()) {
+                                    ui.painter().rect_stroke(
+                                        hr.rect,
+                                        3.0,
+                                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if let Some(a) = hr.dnd_release_payload::<usize>().map(|a| *a) {
+                                    if let Some(pth) = app
+                                        .assets
+                                        .get(a)
+                                        .map(|x| x.path.to_string_lossy().into_owned())
+                                    {
+                                        let dest = PathBuf::from(&path).join(
+                                            fold_dir.replace(
+                                                '/',
+                                                std::path::MAIN_SEPARATOR_STR,
+                                            ),
+                                        );
+                                        app.rack_move(&pth, &dest);
+                                    }
+                                }
                                 let mut mv = None;
                                 hr.context_menu(|ui| {
                                     if ui
@@ -25437,6 +25463,55 @@ mod tests {
         app.kit_mut(1).clear();
         app.load_kits(&pj.drum_kits, pj.drum.as_ref());
         assert_eq!(app.kit(1)[0].asset_path, hat.to_string_lossy(), "project load restores");
+    }
+
+    /// v34 R15: dragging a rack row onto a sub-folder header moves the
+    /// file on disk (no context-menu dive).
+    #[test]
+    fn v34_rack_drag_onto_folder_header_moves_file() {
+        let mut app = headless_app("v34dragmv");
+        let samples = std::env::temp_dir().join("sp-uity-v34dragmv/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        v28_wav(&samples, "kit-b/filler.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.ensure_asset(&samples.join("hat.wav"));
+        frame(&mut app, &ctx, vec![]);
+        let hat = galley_centers(&mut app, &ctx, "hat", true)[0];
+        // Real drag: press the row, exceed the dnd threshold (arms the
+        // usize payload via dnd_set_drag_payload), hover the header,
+        // release.
+        frame(&mut app, &ctx, vec![moved(hat)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(hat, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(hat + egui::vec2(80.0, 0.0))]);
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<usize>(&ctx),
+            "rack drag arms the asset payload"
+        );
+        // SUBSTRING match: the header reads "- kit-b (1)".
+        let hdr = galley_centers(&mut app, &ctx, "kit-b", false)
+            .first()
+            .copied()
+            .expect("kit-b folder header visible");
+        frame(&mut app, &ctx, vec![moved(hdr)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(hdr, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            samples.join("kit-b/hat.wav").exists(),
+            "drag onto folder header moved the file"
+        );
+        assert!(!samples.join("hat.wav").exists());
     }
 
     /// v34 R5: kit pad rows accept dropped sounds — an in-app drag of a
