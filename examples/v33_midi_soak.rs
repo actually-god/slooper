@@ -12,6 +12,8 @@
 use std::process::Command;
 use std::{fs, path::Path};
 
+use slooper::vsthost::StageEntry;
+
 const ORACLE_SO: &str = "/tmp/oracle.so";
 const ORACLE_SRC: &str = "examples/oracle.c";
 const STATS: &str = "/tmp/oracle_stats.json";
@@ -52,7 +54,8 @@ fn main() {
 
     let load = slooper::vsthost::open(Path::new(ORACLE_SO), slooper::vsthost::VstKind::V2, 48_000, None)
         .expect("oracle open");
-    let e = load.entry;
+    let e_arc = load.entry;
+    let e = e_arc.as_any().downcast_ref::<slooper::vsthost::RtStageEntry>().unwrap();
     let sil = vec![0f32; 512];
 
     let run = |e: &slooper::vsthost::RtStageEntry, blocks: usize| {
@@ -191,5 +194,5 @@ fn main() {
 
     println!("(final process_calls = {:.0})", get(&stats(), "process_calls"));
     // Never drop plugin instances in probes (skill rule).
-    std::mem::forget(e);
+    std::mem::forget(e_arc.clone());
 }

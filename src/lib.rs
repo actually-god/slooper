@@ -18,6 +18,7 @@
 pub mod arrange;
 pub mod assets;
 pub mod audio;
+pub mod claphost;
 pub mod audio_io;
 pub mod automation;
 pub mod config;

@@ -8,7 +8,7 @@
 //   cargo run --release --example v17_synth_probe [path.vst3]
 use std::path::Path;
 
-use slooper::vsthost::{default_vst_dirs, open, scan, VstKind};
+use slooper::vsthost::{default_vst_dirs, open, scan, StageEntry, VstKind};
 
 fn main() {
     let path = std::env::args()
@@ -28,7 +28,11 @@ fn main() {
     eprintln!("[probe] scan done: {} entries", found.len());
     eprintln!("[probe] opening {path} (instance #1)");
     let load = open(Path::new(&path), VstKind::V3, 48_000, None).expect("open vst3");
-    let entry = load.entry;
+    let entry_arc = load.entry;
+    let entry = entry_arc
+        .as_any()
+        .downcast_ref::<slooper::vsthost::RtStageEntry>()
+        .unwrap();
     eprintln!("[probe] opened: {} instrument", entry.name());
     entry.note_on(0, 60, 110);
     let mut out = vec![0f32; 512];

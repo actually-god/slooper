@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use slooper::vsthost::{open, VstKind};
+use slooper::vsthost::{open, StageEntry, VstKind};
 
 fn peak_of(entry: &slooper::vsthost::RtStageEntry, blocks: usize) -> f32 {
     let mut peak = 0f32;
@@ -29,7 +29,11 @@ fn main() {
         .unwrap_or_else(|| "/home/admin/.vst/yabridge/Analog Lab V.so".to_string());
     let load = open(Path::new(&path), VstKind::V2, 48_000, None)
         .unwrap_or_else(|e| panic!("open {path}: {e}"));
-    let entry = load.entry;
+    let entry_arc = load.entry;
+    let entry = entry_arc
+        .as_any()
+        .downcast_ref::<slooper::vsthost::RtStageEntry>()
+        .unwrap();
     entry.note_on(0, 60, 110);
     let pre = peak_of(&entry, 120); // ~1.3 s of notes, editor NOT yet open
     println!("PRE-EDITOR peak {pre:.5}");
@@ -44,7 +48,7 @@ fn main() {
 
     // RT thread streams BEFORE and DURING editor bring-up — the app's
     // real topology (JACK callback thread vs gui thread).
-    let entry_rt = Arc::clone(&entry);
+    let entry_rt = Arc::clone(&entry_arc);
     let live = Arc::new(AtomicBool::new(true));
     let live2 = live.clone();
     let rt = std::thread::spawn(move || {
@@ -76,5 +80,5 @@ fn main() {
     win.close();
     println!("SURVIVED editor open/close under audio load");
     let _ = rt.join();
-    std::mem::forget(entry);
+    std::mem::forget(entry_arc.clone());
 }

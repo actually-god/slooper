@@ -3,7 +3,7 @@
 //   cargo run --release --example plugin_one -- <path> <V2|V3>
 use std::path::Path;
 
-use slooper::vsthost::{open, scan, VstKind};
+use slooper::vsthost::{open, scan, StageEntry, VstKind};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -37,7 +37,11 @@ fn main() {
             std::process::exit(2);
         }
         Ok(load) => {
-            let entry = load.entry;
+            let entry_arc = load.entry;
+            let entry = entry_arc
+                .as_any()
+                .downcast_ref::<slooper::vsthost::RtStageEntry>()
+                .unwrap();
             if role == "instr" {
                 entry.note_on(0, 60, 110);
                 let mut peak = 0.0f32;
@@ -50,7 +54,7 @@ fn main() {
                     }
                 }
                 entry.all_notes_off();
-                std::mem::forget(entry);
+                std::mem::forget(entry_arc.clone());
                 let v = if peak > 1e-4 { "ALIVE" } else { "SILENT" };
                 println!("{v} instr {name} peak {peak:.4}");
             } else {
@@ -70,7 +74,7 @@ fn main() {
                         diff = diff.max((out[i] - input[i]).abs());
                     }
                 }
-                std::mem::forget(entry);
+                std::mem::forget(entry_arc.clone());
                 let v = if out_peak < 1e-5 {
                     "BLACKHOLE"
                 } else if diff < 1e-6 {
