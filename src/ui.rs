@@ -1099,6 +1099,9 @@ pub struct App {
     /// `ui_root`): sampler window (while open it owns drops, as ever) →
     /// lane strips (place clips at the pointer) → rack panel (import).
     /// Directories become rack folders immediately. Previously only the
+    /// v34 R5: pad rows of the open kit editor publish their rects here
+    /// (per track) so the central OS-drop drain can hit-test them.
+    kit_drop_rects: Vec<(usize, usize, egui::Rect)>,
     /// sampler drop zone listened, so dropping samples from the file
     /// manager did nothing anywhere else in the app.
     os_drops: Vec<std::path::PathBuf>,
@@ -1595,6 +1598,7 @@ impl App {
             export_whole: false,
             export_sel: false,
             export_path: String::new(),
+            kit_drop_rects: Vec::new(),
             export_fmt: 0,
             last_midi: None,
             midi_log: VecDeque::with_capacity(300),
@@ -7903,8 +7907,9 @@ impl App {
             let mut kit = self.kit(t).to_vec();
             let mut kit_changed = false;
             let mut remove_pad: Option<usize> = None;
+            self.kit_drop_rects.retain(|(tt, _, _)| *tt != t);
             for p in 0..kit.len() {
-                ui.horizontal(|ui| {
+                let rowr = ui.horizontal(|ui| {
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut kit[p].name)
@@ -7987,6 +7992,36 @@ impl App {
                         remove_pad = Some(p);
                     }
                 });
+                // v34 R5: every pad row is a drop target. IN-APP drags
+                // (rack rows carry the asset-index payload) land here
+                // directly; OS files are hit-tested centrally against
+                // the rect registered just below.
+                self.kit_drop_rects.push((t, p, rowr.response.rect));
+                let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                    || ui.input(|i| !i.raw.hovered_files.is_empty());
+                if armed {
+                    ui.painter().rect_stroke(
+                        rowr.response.rect,
+                        3.0,
+                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if let Some(a) = rowr
+                    .response
+                    .interact(egui::Sense::hover())
+                    .dnd_release_payload::<usize>()
+                    .map(|a| *a)
+                {
+                    if let Some(path) =
+                        self.assets.get(a).map(|as_| as_.path.to_string_lossy().into_owned())
+                    {
+                        kit[p].asset_path = path;
+                        kit[p].asset = None;
+                        kit_changed = true;
+                        self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
+                    }
+                }
             }
             ui.horizontal(|ui| {
                 let full = kit.len() >= DRUM_MAX_PADS;
@@ -9837,6 +9872,49 @@ impl App {
             if let Some(t) = self.sampler_editor_open() {
                 let paths = std::mem::take(&mut self.os_drops);
                 self.sampler_files_dropped(t, &paths);
+            } else if let Some(t) = self.synth_win {
+                // v34 R5: the open SYNTHS window's drum kit pad rows are
+                // OS-drop targets too — the pad under the pointer adopts
+                // every audio file; anything else falls through to the
+                // end-of-frame rack import as before.
+                let pt = ui.ctx().input(|i| i.pointer.hover_pos());
+                let rows = std::mem::take(&mut self.kit_drop_rects);
+                let hit = rows
+                    .iter()
+                    .rev()
+                    .find(|(tt, _, r)| *tt == t && pt.is_some_and(|q| r.contains(q)))
+                    .map(|(_, p, _)| *p);
+                self.kit_drop_rects = rows;
+                if let Some(p) = hit {
+                    let paths = std::mem::take(&mut self.os_drops);
+                    let mut assigned = 0usize;
+                    let mut rest = Vec::new();
+                    for path in paths {
+                        if crate::assets::is_audio_file(&path) {
+                            if let Some(k) = self.ensure_asset(&path) {
+                                let sp =
+                                    self.assets[k].path.to_string_lossy().into_owned();
+                                if let Some(pad) = self.kit_mut(t).get_mut(p) {
+                                    pad.asset_path = sp;
+                                    pad.asset = None;
+                                }
+                                assigned += 1;
+                                continue;
+                            }
+                        }
+                        rest.push(path);
+                    }
+                    if assigned > 0 {
+                        self.drum.ensure_rows(self.kit(t).len());
+                        self.save_config();
+                        self.status = format!(
+                            "drum kit: pad {} \u{2190} {} dropped sample(s)",
+                            p + 1,
+                            assigned
+                        );
+                    }
+                    self.os_drops = rest;
+                }
             }
         }
         // ---- global wheel routing (must run first thing in the frame) ----
@@ -25359,6 +25437,87 @@ mod tests {
         app.kit_mut(1).clear();
         app.load_kits(&pj.drum_kits, pj.drum.as_ref());
         assert_eq!(app.kit(1)[0].asset_path, hat.to_string_lossy(), "project load restores");
+    }
+
+    /// v34 R5: kit pad rows accept dropped sounds — an in-app drag of a
+    /// rack asset AND an OS file drop onto the row under the pointer —
+    /// so the sound dropdown is no longer the only way.
+    #[test]
+    fn v34_drum_pad_drop_accepts_assets_and_os_files() {
+        let mut app = headless_app("drumdrop");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let kick = std::env::temp_dir().join("sp-uity-drumdrop/samples/kick.wav");
+        // The sandbox fixture asset arrives via the rack folder scan;
+        // make sure one audio asset exists to drag.
+        if app.assets.is_empty() {
+            let k = app
+                .ensure_asset(&kick)
+                .expect("sandbox kick.wav imports");
+            assert!(k < app.assets.len());
+        }
+        let a_idx = app
+            .assets
+            .iter()
+            .position(|a| a.path == kick)
+            .or_else(|| app.assets.iter().position(|a| !a.is_midi() && !a.is_auto()))
+            .expect("one audio asset available");
+        app.set_track_synth_stem(0, "piano");
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !v25_hits(&mut app, &ctx, "DRUM KIT").is_empty(),
+            "kit editor open"
+        );
+        // (a) OS file drop over pad 0's row.
+        let row = app.kit_drop_rects[0].2;
+        frame_files(
+            &mut app,
+            &ctx,
+            vec![moved(row.center())],
+            vec![kick.clone()],
+        );
+        assert_eq!(
+            app.kit(0)[app.kit_drop_rects[0].1].asset_path,
+            kick.to_string_lossy(),
+            "pad adopted the OS-dropped file"
+        );
+        // (b) in-app drag: rack row payload released over pad 1's row.
+        app.kit_mut(0)[1].asset_path.clear();
+        let pad1 = app
+            .kit_drop_rects
+            .iter()
+            .find(|(_, p, _)| *p == 1)
+            .map(|(_, _, r)| *r)
+            .expect("pad 1 row registered");
+        frame(&mut app, &ctx, vec![moved(pad1.center() + egui::vec2(0.0, 2.0))]);
+        // Arm the payload the way egui's dnd does under a real drag:
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                btn(pad1.center(), egui::PointerButton::Primary, true),
+                moved(pad1.center() + egui::vec2(0.0, 60.0)),
+            ],
+        );
+        // If the threshold drag armed no real payload (containers do not
+        // start drags in egui), inject the payload the sampler-zone pin
+        // uses and release over the row instead.
+        if !egui::DragAndDrop::has_payload_of_type::<usize>(&ctx) {
+            egui::DragAndDrop::set_payload(&ctx, a_idx);
+        }
+        frame(&mut app, &ctx, vec![moved(pad1.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(pad1.center(), egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.kit(0)[1].asset_path,
+            app.assets[a_idx].path.to_string_lossy(),
+            "pad 1 adopted the dragged rack asset"
+        );
     }
 
     /// v30 R1/A3: pad rows are user-configurable up to 16 (the kit editor
