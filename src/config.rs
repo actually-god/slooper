@@ -376,7 +376,7 @@ pub struct Config {
     /// v34 R1: the automation manager's OWN snap selector. The manager
     /// used to be beat-snapped in bars mode and free otherwise, with no
     /// way to say "snap my nodes to 1/8".
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub auto_snap_on: bool,
     /// The automation manager's subdivision (same u32 grid values as
     /// `snap_sub`; independent of the main grid's choice).
@@ -526,7 +526,7 @@ impl Default for Config {
             metro_num: default_metro_num(),
             q_sub: default_grid_sub(),
             snap_sub: default_grid_sub(),
-            auto_snap_on: true,
+            auto_snap_on: false,
             auto_snap_sub: default_grid_sub(),
             dir_memo: Default::default(),
             auto_quantize: default_true(),

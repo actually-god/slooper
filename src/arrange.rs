@@ -34,6 +34,12 @@ pub struct Clip {
     pub pos: u64,
     /// Source samples skipped at the start (left trim).
     pub cut: u64,
+    /// v34 R14: silent samples PREPENDED at the clip start — dragging the
+    /// LEFT edge past the beginning of the source no longer stops; it
+    /// pads with silence and delays the audio (mirrors how `play_len`
+    /// past the source pads on the right). Always 0 for MIDI/automation
+    /// clips, whose content has no left source edge.
+    pub pre_pad: u64,
     /// Timeline length to play; `None` = as much of the source as remains
     /// after `cut`. Values past the source pad with silence.
     pub play_len: Option<u64>,
@@ -53,6 +59,7 @@ impl Clip {
             asset,
             pos,
             cut: 0,
+            pre_pad: 0,
             play_len: None,
             gain: 1.0,
             fade_in: 0,
@@ -63,10 +70,16 @@ impl Clip {
     pub fn avail(&self, alen: u64) -> u64 {
         alen.saturating_sub(self.cut)
     }
-    /// Timeline length of this clip (silence tail included when `play_len`
-    /// exceeds the source).
+    /// v34 R14: timeline sample where the SOURCE audio starts (after any
+    /// left pad).
+    pub fn data_start(&self) -> u64 {
+        self.pos.saturating_add(self.pre_pad)
+    }
+    /// Timeline length of this clip (silence pads on either side
+    /// included: `pre_pad` left, silence tail when `play_len` exceeds
+    /// the source).
     pub fn span(&self, alen: u64) -> u64 {
-        self.play_len.unwrap_or_else(|| self.avail(alen)).max(1)
+        (self.pre_pad + self.play_len.unwrap_or_else(|| self.avail(alen))).max(1)
     }
     /// End on the timeline.
     pub fn end(&self, alen: u64) -> u64 {
@@ -74,7 +87,7 @@ impl Clip {
     }
     /// Timeline sample where the SOURCE data ends (silence beyond this).
     pub fn data_end(&self, alen: u64) -> u64 {
-        self.pos.saturating_add(self.avail(alen))
+        self.data_start().saturating_add(self.avail(alen))
     }
     /// Split at absolute timeline sample `at` (strictly inside the clip's
     /// span) into the left/right halves. `None` when `at` is not a valid
@@ -86,15 +99,39 @@ impl Clip {
         if at <= self.pos || at >= self.end(alen) {
             return None;
         }
+        let a0 = self.data_start();
+        if at <= a0 {
+            // The cut falls inside the left pad: ALL the audio belongs to
+            // the RIGHT half (a split in silence keeps the content in one
+            // piece); the left half is the trimmed-down silence stub.
+            let left = Clip {
+                pre_pad: at - self.pos,
+                play_len: Some(0),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+                ..*self
+            };
+            let right = Clip {
+                pos: at,
+                pre_pad: self.pre_pad - (at - self.pos),
+                fade_in: 0,
+                ..*self
+            };
+            return Some((left, right));
+        }
+        let d = at - a0; // consumed audio samples
         let left = Clip {
-            play_len: Some(at - self.pos),
+            play_len: Some(d),
             fade_out: 0,
             ..*self
         };
         let right = Clip {
             pos: at,
-            cut: self.cut + (at - self.pos),
-            play_len: self.play_len.map(|l| l - (at - self.pos)),
+            pre_pad: 0,
+            cut: self.cut + d,
+            // `None` source tail stays open; a bounded tail shrinks.
+            play_len: self.play_len.map(|l| l - d),
             fade_in: 0,
             ..*self
         };
@@ -111,8 +148,11 @@ impl Clip {
             return 0.0;
         }
         let off = s - self.pos;
-        if fi > 0 && off < fi {
-            return off as f32 / fi as f32;
+        // v34 R14: the fade-IN rides the audio (a left pad is already
+        // silence; the ramp must start where the source starts).
+        let aoff = s.saturating_sub(self.data_start());
+        if fi > 0 && aoff < fi {
+            return aoff as f32 / fi as f32;
         }
         if fo > 0 && off + fo >= span {
             return (span - off) as f32 / fo as f32;
@@ -377,6 +417,28 @@ mod tests {
     }
 
     #[test]
+    fn v34_split_with_left_pad() {
+        // 5000-sample asset; clip starts at 1000 with a 800-sample pad.
+        let c = Clip {
+            pre_pad: 800,
+            ..Clip::new(3, 1000)
+        };
+        let alen = 5000;
+        assert_eq!((c.data_start(), c.end(alen)), (1800, 6800));
+        // Split INSIDE the pad: the stub is pure silence, the right half
+        // keeps every sample of audio and the remaining pad.
+        let (l, r) = c.split_at(1300, alen).unwrap();
+        assert_eq!((l.pre_pad, l.play_len, l.end(alen)), (300, Some(0), 1300));
+        assert_eq!((r.pos, r.pre_pad, r.cut, r.end(alen)), (1300, 500, 0, 6800));
+        // Split in the AUDIO: pad stays left, right continues the source.
+        let (l, r) = c.split_at(3000, alen).unwrap();
+        assert_eq!((l.pre_pad, l.play_len, l.end(alen)), (800, Some(1200), 3000));
+        assert_eq!((r.pos, r.pre_pad, r.cut, r.end(alen)), (3000, 0, 1200, 6800));
+        // Re-joined, the right half still ends where the source ends.
+        assert_eq!(r.end(alen), 1800 + 5000 - 1200 + 1200);
+    }
+
+    #[test]
     fn fresh_arrangement() {
         let a = Arrangement::new();
         assert_eq!(a.tracks.len(), MAX_LOOPS);
@@ -480,6 +542,7 @@ mod tests {
             asset: 3,
             pos: 1000,
             cut: 100,
+            pre_pad: 0,
             play_len: Some(1000),
             ..Clip::new(3, 1000)
         };
@@ -494,6 +557,7 @@ mod tests {
             asset: 0,
             pos: 0,
             cut: 0,
+            pre_pad: 0,
             play_len: None,
             ..Clip::new(0, 0)
         };
@@ -516,6 +580,7 @@ mod tests {
             asset: 0,
             pos: 1000,
             cut: 0,
+            pre_pad: 0,
             play_len: Some(1000),
             gain: 1.0,
             fade_in: 100,
