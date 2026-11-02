@@ -976,6 +976,9 @@ pub struct App {
     /// Vertical scroll offset of the track stack, shared with the mixer
     /// panel so each mixer strip stays aligned with its track.
     vscroll: f32,
+    /// v34 R6: the mixer's OWN scroll offset, used while it is bottom-
+    /// docked or floating (the grid's `vscroll` no longer drives it).
+    mixer_scroll: f32,
     /// Per-track grid-block height in points (0 = automatic:
     /// `lanes × LANE_H`). The user drags the separation bar under a track
     /// to resize it; the mixer strip mirrors the same height.
@@ -1446,6 +1449,7 @@ impl App {
                 .collect(),
             sep_drag: None,
             grid_anchor: 0.0,
+            mixer_scroll: 0.0,
             sel_clips: Vec::new(),
             sel_anchor: None,
             last_click_track: None,
@@ -2965,13 +2969,20 @@ impl App {
         self.backend.cmd(Cmd::SetLoopRegion { start: s, end: e });
     }
 
-    /// Height of one track's grid block — and of the mixer strip aligned
-    /// with it (both read this, so they can never drift apart). User-resized
-    /// via the separation bar under each track; lanes inside share it equally.
     /// v29: track under a pointer y while a clip drag strays past the
     /// owning track's rect — walks the track stack (h + separator rows)
     /// out from `from_rect`. y inside the source rect returns `from`.
     fn track_at_y(&self, from: usize, from_rect: &egui::Rect, y: f32) -> usize {
+        self.track_block_at(from, from_rect, y).0
+    }
+
+    /// v34 R17: `(track, block_top, lane)` under a pointer y, walking the
+    /// track stack out from `from_rect` (the lane row that grabbed the
+    /// clip). The cross-track clip drag uses this so the pointer's Y
+    /// inside the TARGET track picks the destination lane — the user drops
+    /// onto the parent or any child, not whatever lane the old
+    /// keep-the-slot rule picked.
+    fn track_block_at(&self, from: usize, from_rect: &egui::Rect, y: f32) -> (usize, f32) {
         let sep = TRACK_SEP_HIT;
         let mut t = from;
         if y > from_rect.max.y {
@@ -2979,26 +2990,50 @@ impl App {
             while t + 1 < self.n_tracks {
                 let bottom = top + self.track_h(t + 1);
                 if y <= bottom {
-                    return t + 1;
+                    return (t + 1, top);
                 }
                 t += 1;
                 top = bottom + sep;
             }
-            self.n_tracks.saturating_sub(1)
+            let t = self.n_tracks.saturating_sub(1);
+            (t, self.block_top(t, from, from_rect))
         } else if y < from_rect.min.y {
             let mut bottom = from_rect.min.y - sep;
             while t > 0 {
                 let top = bottom - self.track_h(t - 1);
                 if y >= top {
-                    return t - 1;
+                    return (t - 1, top);
                 }
                 t -= 1;
                 bottom = top - sep;
             }
-            0
+            (0, self.block_top(0, from, from_rect))
         } else {
-            from
+            (from, from_rect.min.y)
         }
+    }
+
+    /// Top edge of track `t`'s block, walked from the drag's source rect.
+    fn block_top(&self, t: usize, from: usize, from_rect: &egui::Rect) -> f32 {
+        let sep = TRACK_SEP_HIT;
+        let mut y = from_rect.min.y;
+        if t > from {
+            for k in from + 1..=t {
+                y += self.track_h(k - 1) + sep;
+            }
+        } else {
+            for k in (t..from).rev() {
+                y -= self.track_h(k) + sep;
+            }
+        }
+        y
+    }
+
+    /// Lane index inside track `t` at pointer y (clamped to real lanes).
+    fn lane_at(&self, t: usize, top: f32, y: f32) -> usize {
+        let nl = self.arr.tracks[t].lanes.len().max(1);
+        let lh = (self.track_h(t) / nl as f32).max(1.0);
+        (((y - top) / lh).floor().max(0.0) as usize).min(nl - 1)
     }
 
     fn track_h(&self, t: usize) -> f32 {
@@ -3111,6 +3146,54 @@ impl App {
         let mut ids = ids;
         ids.sort();
         self.sel_clips = ids;
+    }
+
+    /// v34 R18: the shift+click RUN anchored at `sel_anchor` and landing
+    /// on clip `hit` (whose start is `hit_pos`): every clip of the anchor's
+    /// TRACK whose span overlaps the [anchor..hit] window — across child
+    /// lanes, not just the clicked lane (the old code collapsed the run
+    /// whenever a child lane entered the click, which read as "shift+click
+    /// doesn't multi-select"). An anchor on another track extends the
+    /// existing selection with the hit clip instead of jumping.
+    fn lane_run_ids(&self, t: usize, hit: (usize, usize, usize)) -> Vec<(usize, usize, usize)> {
+        let anchor = match self.sel_anchor {
+            Some(a) => a,
+            None => return vec![hit],
+        };
+        if anchor.0 != t {
+            let mut ids = self.sel_clips.clone();
+            if !ids.contains(&hit) {
+                ids.push(hit);
+            }
+            ids.sort();
+            return ids;
+        }
+        let clip_at = |id: (usize, usize, usize)| -> Option<(u64, u64)> {
+            let c = self.arr.tracks[id.0].lanes.get(id.1)?.clips.get(id.2)?;
+            Some((c.pos, c.end(self.asset_len(c.asset))))
+        };
+        let (Some((ap, _)), Some((hp, _))) = (clip_at(anchor), clip_at(hit)) else {
+            return vec![hit];
+        };
+        let (lo, hi) = (ap.min(hp), ap.max(hp));
+        let mut ids: Vec<(usize, usize, usize)> = self.arr.tracks[t]
+            .lanes
+            .iter()
+            .enumerate()
+            .flat_map(|(kk, lane)| {
+                lane.clips.iter().enumerate().map(move |(ci, _c)| (kk, ci))
+            })
+            .filter(|(kk, ci)| {
+                let c = &self.arr.tracks[t].lanes[*kk].clips[*ci];
+                c.pos <= hi && c.end(self.asset_len(c.asset)) >= lo
+            })
+            .map(|(kk, ci)| (t, kk, ci))
+            .collect();
+        if !ids.contains(&hit) {
+            ids.push(hit);
+        }
+        ids.sort();
+        ids
     }
 
     /// Remove every selected clip (assets stay in the rack).
@@ -9936,34 +10019,36 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
             ui.heading(RichText::new(title).strong());
             // v25: status display rules —
             //  * fresh message: exactly as written;
-            //  * older than 60 s: gains a dim "· Nm ago" age suffix, so
-            //    history never reads like current state;
-            //  * older than 10 min: dropped in favor of a LIVE idle summary
-            //    (the engine state right now) — a stale "waiting …"-style
-            //    line must never sit in the bar posing as a current fact.
+            //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
+            //    dims continuously, and once it is older than 12 s it is
+            //    replaced by a LIVE idle summary (the engine state right
+            //    now); the full text survives in the hover tooltip. A
+            //    "project saved"-type notice therefore always leaves the
+            //    bar on its own instead of posing as current state (the
+            //    old ladder kept the raw text fully lit for a full
+            //    minute, then carried it for TEN minutes behind a "· Nm
+            //    ago" suffix).
             let age_s = app.status_at.elapsed().as_secs_f64();
-            let (body, tip) = if age_s > 600.0 {
-                let idle = match &app.client_name {
-                    Some(_) => format!("{} Hz · ready", app.sample_rate),
-                    None => "audio engine: offline".to_string(),
-                };
+            let idle = match &app.client_name {
+                Some(_) => format!("{} Hz · ready", app.sample_rate),
+                None => "audio engine: offline".to_string(),
+            };
+            const NOTICE_FADE_SECS: f64 = 12.0;
+            let fade = if age_s <= 6.0 {
+                1.0f32
+            } else {
+                (1.0 - ((age_s - 6.0) / (NOTICE_FADE_SECS - 6.0)) as f32 * 0.85).clamp(0.15, 1.0)
+            };
+            let (body, tip) = if age_s > NOTICE_FADE_SECS {
                 (
                     idle,
-                    format!(
-                        "last message {} min ago: {}",
-                        (age_s / 60.0) as u64,
-                        app.status
-                    ),
-                )
-            } else if age_s >= 60.0 {
-                (
-                    format!("{} · {}m ago", app.status, (age_s / 60.0) as u64),
-                    app.status.clone(),
+                    format!("last message {}s ago: {}", age_s as u64, app.status),
                 )
             } else {
                 (app.status.clone(), app.status.clone())
             };
             let status = match &app.client_name {
+                Some(_) if age_s > NOTICE_FADE_SECS => body,
                 Some(_) => format!("{} Hz · {}", app.sample_rate, body),
                 None => body,
             };
@@ -9974,12 +10059,14 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
             // by hundreds of pixels — mid-session the widgets you had just
             // right-clicked literally moved out from under the cursor, and
             // on a narrow window they vanished off-screen entirely.
+            let weak_c = ui.visuals().weak_text_color();
             ui.add_sized(
                 egui::vec2(300.0, 18.0),
-                egui::Label::new(RichText::new(status).weak()).truncate(),
+                egui::Label::new(RichText::new(status).color(weak_c.linear_multiply(fade)))
+                    .truncate(),
             )
             .on_hover_text(tip);
-            if age_s <= 600.0 {
+            if age_s <= NOTICE_FADE_SECS {
                 if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
                     // v25: zero is shown by the idle summary instead — after
                     // "Stop" the bar reads honestly, not "applied: 0 in / 0
@@ -10700,6 +10787,15 @@ fn dock_edge(app: &App, idx: usize) -> i16 {
 }
 fn dock_order(app: &App, idx: usize) -> i16 {
     app.side_wins.dock[idx][2]
+}
+/// v34 R6: the mixer's vertical-rhythm rule, as one honest function
+/// (pinned): strips track the arrangement grid ONLY while docked to the
+/// left or right edge, where row geometry exists to align against.
+/// Bottom-docked or floating, the mixer owns its own layout and scroll —
+/// tying those placements to the grid is what made it feel welded to the
+/// main GUI.
+fn mixer_independent(app: &App) -> bool {
+    !is_docked(app, 3) || dock_edge(app, 3) == 2
 }
 fn def_w(idx: usize) -> f32 {
     match idx {
@@ -12345,7 +12441,30 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
 fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             // v30-batch-2: the dock/window header carries the title, so
             // the old in-panel MIXER heading is gone (it double-stacked).
-            let base = ui.available_rect_before_wrap();
+            // v34 R6: `max_rect()` not `available_rect_before_wrap()`:
+            // the docked content pass can run twice in one frame, and a
+            // flow-derived rect drifts between the passes — strips then
+            // land ~1700 px below the panel.
+            let base = ui.max_rect();
+            // v34 R6: the mixer shares the grid's vertical rhythm ONLY
+            // while docked LEFT or RIGHT, where every strip must sit level
+            // with its track row. Bottom-docked or floating it is an
+            // independent view: strips start at the panel top, and the
+            // wheel over the mixer scrolls the MIXER — never the grid
+            // (the old always-tied math pinned the strips to `grid_anchor`
+            // even when that anchor lived in a completely different part
+            // of the window, so the bottom/floating mixer seemed welded to
+            // the main GUI's scroll and layout).
+            let tied = !mixer_independent(app);
+            let mut free_scroll = 0.0;
+            if !tied {
+                let over = ui.rect_contains_pointer(base);
+                let d = if over { ui.input(|i| i.smooth_scroll_delta).y } else { 0.0 };
+                if d != 0.0 {
+                    app.mixer_scroll = (app.mixer_scroll - d).max(0.0);
+                }
+                free_scroll = app.mixer_scroll;
+            }
             // Clip to the visible column, then lay strips out on absolute
             // rects shifted by the grid's vertical scroll (shared offset —
             // the alignment is the whole point of this panel). The column
@@ -12354,12 +12473,18 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             // even though the two panels' headers differ in height; any
             // leftover room between panels is intentionally left empty.
             ui.shrink_clip_rect(base);
-            let top = if app.grid_anchor > 0.0 {
-                app.grid_anchor.min(base.max.y)
+            let top = if tied {
+                if app.grid_anchor > 0.0 {
+                    app.grid_anchor.min(base.max.y)
+                } else {
+                    base.min.y
+                }
             } else {
-                base.min.y
+                // Independent mode: right below the master band.
+                base.min.y + 44.0
             };
-            let mut y = top - app.vscroll;
+            let scroll_y = if tied { app.vscroll } else { free_scroll };
+            let mut y = top - scroll_y;
             // Master strip in the header band: from the panel header down
             // to where the track stack begins — the band level with the
             // timeline grid header, directly above the Track 1 strip.
@@ -13863,8 +13988,19 @@ fn lane_row(
                 let pos = s_at(x0, pt.x, sr, px);
                 // Edge of ANY clip wins over everything: trim/extend.
                 if let Some((ci, edge)) = edge_at(app, pt) {
-                    if !app.is_sel((t, k, ci)) {
-                        app.select_one((t, k, ci));
+                    // v34 R18: modifiers drive SELECTION even on an edge
+                    // grab. Clips sit shoulder-to-shoulder on real
+                    // timelines, so most clicks land inside the 7 px edge
+                    // zone — and this branch used to hard-`select_one`,
+                    // silently throwing away the Ctrl/Shift multi-select
+                    // the user was clicking for.
+                    let id = (t, k, ci);
+                    if mods.command {
+                        app.select_toggle(id);
+                    } else if mods.shift && app.sel_anchor.is_some() {
+                        app.select_range(app.lane_run_ids(t, id));
+                    } else if !app.is_sel(id) {
+                        app.select_one(id);
                     }
                     let c = app.arr.tracks[t].lanes[k].clips[ci];
                     app.clip_resize = Some(ClipResize {
@@ -13885,32 +14021,12 @@ fn lane_row(
                             let id = (t, k, ci);
                             if mods.command {
                                 app.select_toggle(id);
-                            } else if mods.shift
-                                && app.sel_anchor.is_some_and(|a| a.0 == t && a.1 == k)
-                            {
-                                // Shift+press: the same-lane run between the
-                                // anchor clip and this one, inclusive.
-                                let apos = app
-                                    .sel_anchor
-                                    .and_then(|(at, ak, ac)| {
-                                        app.arr.tracks[at].lanes[ak].clips.get(ac)
-                                    })
-                                    .map(|c| c.pos)
-                                    .unwrap_or(pos);
-                                let (lo, hi) = (apos.min(pos), apos.max(pos));
-                                // Intersect, don't just compare `pos`: the
-                                // click point sits INSIDE the clicked clip,
-                                // past its start, so a start-only filter
-                                // silently dropped the very clip clicked and
-                                // broke the run at both ends.
-                                let ids: Vec<(usize, usize, usize)> = clips
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, (c, _))| {
-                                        c.pos <= hi && c.end(app.asset_len(c.asset)) >= lo
-                                    })
-                                    .map(|(j, _)| (t, k, j))
-                                    .collect();
+                            } else if mods.shift && app.sel_anchor.is_some() {
+                                // Shift+press: the run from the anchor clip
+                                // to this one, inclusive — v34 R18: across
+                                // the track's child lanes too, not just the
+                                // clicked lane.
+                                let ids = app.lane_run_ids(t, id);
                                 app.select_range(ids);
                             } else if !app.is_sel(id) {
                                 app.select_one(id);
@@ -14074,7 +14190,18 @@ fn lane_row(
                     );
                     let target_t = app.track_at_y(t, &track_rect, pt.y);
                     if target_t != tt {
-                        if let Some((nl, ni)) = app.arr.move_clip_track(tt, cur, cc, target_t) {
+                        // v34 R17: inside the TARGET track the pointer's Y
+                        // picks the lane — drop onto the parent or any
+                        // child, not the lane the old keep-the-slot rule
+                        // chose (which read as "the move locked me to a
+                        // child track").
+                        let tgt_lane = {
+                            let (bt, top) = app.track_block_at(t, &track_rect, pt.y);
+                            app.lane_at(bt, top, pt.y)
+                        };
+                        if let Some((nl, ni)) =
+                            app.arr.move_clip_to(tt, cur, cc, target_t, Some(tgt_lane))
+                        {
                             if let Some(dd) = app.drag_clip.as_mut() {
                                 dd.items[0] = (target_t, nl, ni, dd.items[0].3);
                             }
@@ -14124,34 +14251,13 @@ fn lane_row(
     if resp.drag_stopped() && (app.drag_clip.take().is_some() || app.clip_resize.take().is_some()) {
         app.push_project();
     }
-    if resp.clicked() && !resp.dragged() && !app.scrub_drag && app.drag_clip.is_none() {
-        // Plain click (no drag happened): select the clip under it, or scrub
-        // if the click landed on empty grid.
-        if let Some(pt) = resp.interact_pointer_pos() {
-            if rect.contains(pt) {
-                app.last_click_track = Some(t);
-                let pos = s_at(x0, pt.x, sr, px);
-                match clips
-                    .iter()
-                    .position(|(c, _)| pos >= c.pos && pos < c.end(app.asset_len(c.asset)))
-                {
-                    Some(ci) => {
-                        let mods = ui.input(|i| i.modifiers);
-                        if mods.command {
-                            app.select_toggle((t, k, ci));
-                        } else {
-                            app.select_one((t, k, ci));
-                        }
-                    }
-                    None => {
-                        app.sel_clips.clear();
-                        app.sel_anchor = None;
-                        app.backend.cmd(Cmd::Seek { pos });
-                    }
-                }
-            }
-        }
-    }
+    // v34 R18: the old release-time `clicked()` re-selection block is
+    // GONE. Every press inside this strip already selects/scrubs above
+    // (arm-on-press since v18), so the block only ever did harm: at
+    // release the modifiers may already be dropped (and the handler read
+    // them afresh), so a Ctrl+click toggled IN on press and then plain-
+    // `select_one` the same clip on release — the reported "ctrl/shift
+    // click doesn't multi-select".
     // v0.15: right-click opens a menu — clip actions on a clip, track
     // actions on empty grid. The old "right-click anywhere clears this
     // track" gesture destroyed a whole track on one accidental press and
@@ -14254,20 +14360,43 @@ fn grid_context_menu(
             ui.close();
         }
         // v29: explicit cross-track move — same selection rules as Delete.
+        // v34 R17: the submenu lists the target track's lanes (parent +
+        // every child + "new child") so the user moves the clip to the
+        // lane THEY pick, not the one the keep-the-slot rule picked.
         {
-            let mut dest: Option<usize> = None;
+            let mut dest: Option<(usize, Option<usize>)> = None;
             ui.menu_button("Move to track", |ui| {
                 for tt in 0..app.n_tracks {
                     if tt == t {
                         continue;
                     }
-                    if ui.button(format!("Track {}", tt + 1)).clicked() {
-                        dest = Some(tt);
-                        ui.close();
-                    }
+                    ui.menu_button(format!("Track {}", tt + 1), |ui| {
+                        let nl = app.arr.tracks[tt].lanes.len();
+                        for lane in 0..nl {
+                            let name = if lane == 0 {
+                                "parent".to_string()
+                            } else {
+                                format!("child {}", lane)
+                            };
+                            if ui.button(format!("lane {} ({})", lane + 1, name)).clicked()
+                            {
+                                dest = Some((tt, Some(lane)));
+                                ui.close();
+                            }
+                        }
+                        if ui.button("new child lane").clicked() {
+                            dest = Some((tt, Some(nl)));
+                            ui.close();
+                        }
+                    });
                 }
             });
-            if let Some(tt) = dest {
+            if let Some((tt, lane)) = dest {
+                // A single-clip selection honours the picked lane; a group
+                // keeps its relative lane layout (stacking everyone onto
+                // one lane would silently overlap).
+                let single = app.sel_clips.len() <= 1;
+                let lane = if single { lane } else { None };
                 let mut ids: Vec<(usize, usize, usize)> = if app.is_sel(id) {
                     app.sel_clips.to_vec()
                 } else {
@@ -14283,7 +14412,7 @@ fn grid_context_menu(
                         moved.push((ft, fl, fc));
                         continue;
                     }
-                    if let Some((nl, nc)) = app.arr.move_clip_track(ft, fl, fc, tt) {
+                    if let Some((nl, nc)) = app.arr.move_clip_to(ft, fl, fc, tt, lane) {
                         moved.push((tt, nl, nc));
                     }
                 }
@@ -24992,6 +25121,20 @@ mod tests {
             })
             .expect("submenu lists Track 3");
         click_pt(&mut app, &ctx, pick);
+        // v34 R17: Track N is now a SUBMENU of lanes — pick the parent.
+        frame(&mut app, &ctx, vec![]);
+        let lanes = galley_centers(&mut app, &ctx, "lane 1 (parent)", true);
+        assert!(!lanes.is_empty(), "submenu lists the target's lanes");
+        let lane = lanes
+            .into_iter()
+            .min_by(|a, b| {
+                (*a - pick)
+                    .length_sq()
+                    .partial_cmp(&(*b - pick).length_sq())
+                    .unwrap()
+            })
+            .unwrap();
+        click_pt(&mut app, &ctx, lane);
         frame(&mut app, &ctx, vec![]);
         let ids = clip_ids(&app);
         assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 2).count(), 1, "clip now on track 2 (Track 3): {ids:?}");
@@ -25366,6 +25509,344 @@ mod tests {
         assert!(
             after > before + 50.0,
             "bottom strip thickness must follow a divider drag ({before} -> {after})"
+        );
+    }
+
+    // ==================== v34 batch pins ====================
+
+    /// v34 R18: Ctrl+click inside the 7 px edge zone must TOGGLE the clip,
+    // not hard-replace the selection. Real clips sit shoulder-to-shoulder,
+    /// so most clicks land in an edge zone — and the edge branch used to
+    /// call `select_one`, which is the reported "ctrl/shift click doesn't
+    /// multi-select" bug.
+    #[test]
+    fn v34_ctrl_click_edge_zone_toggles_into_selection() {
+        let mut app = headless_app("v34edgectl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        // Two ADJACENT clips sharing a boundary: the shared border makes
+        // the pointer land in an edge zone of the right-hand clip.
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.arr.insert(0, 0, Clip::new(a, 144_000));
+        frame(&mut app, &ctx, vec![]);
+        let body = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let mut rects = painted_rects(&mut app, &ctx, body);
+        rects.retain(|r| r.width() > 40.0);
+        rects.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+        assert!(rects.len() >= 2, "two adjacent clips painted: {rects:?}");
+        // Plain-select the RIGHT clip first (its center, far from edges).
+        click_pt(&mut app, &ctx, rects[1].center());
+        assert_eq!(app.sel_clips, vec![(0, 0, 1)], "plain click selects one");
+        // Ctrl+click 4 px INSIDE the right clip's left-edge zone.
+        click_mod(
+            &mut app,
+            &ctx,
+            egui::pos2(rects[1].min.x + 4.0, rects[1].center().y),
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(
+            app.sel_clips.len(),
+            2,
+            "ctrl+click on an edge toggles IN, never replaces: {:?}",
+            app.sel_clips
+        );
+        assert!(app.sel_clips.contains(&(0, 0, 1)), "clicked clip stays in");
+    }
+
+    /// v34 R18: the shift+click run spans the track's CHILD lanes too —
+    /// the old code collapsed the whole run to one clip the moment the
+    /// clicked clip lived on a different lane.
+    #[test]
+    fn v34_shift_click_run_spans_child_lanes() {
+        let mut app = headless_app("v34shiftrun");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        let wide = |pos: u64| Clip {
+            play_len: Some(30_000),
+            ..Clip::new(a, pos)
+        };
+        app.arr.insert(0, 0, wide(0));
+        app.arr.insert(0, 0, wide(60_000));
+        app.arr.insert(0, 0, wide(120_000));
+        app.arr.add_lane(0);
+        app.arr.insert(0, 1, wide(120_000));
+        app.arr.add_lane(0);
+        app.arr.insert(0, 2, wide(300_000)); // OUTSIDE the run window
+        frame(&mut app, &ctx, vec![]);
+        // Anchor + hit anchored on PAINTED clip rects (the docked rack
+        // eats the grid's left edge — hardcoded x origins are void).
+        let body = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let mut rects = painted_rects(&mut app, &ctx, body);
+        rects.retain(|r| r.width() > 40.0);
+        rects.sort_by(|a, b| {
+            a.min.y.total_cmp(&b.min.y).then(a.min.x.total_cmp(&b.min.x))
+        });
+        assert!(rects.len() >= 4, "clips painted across lanes: {rects:?}");
+        // lane 0's first clip (leftmost of the lowest y band) + the only
+        // lane-1 rect.
+        let y0 = rects[0].min.y;
+        let anchor = rects[0].center();
+        let hit = *rects
+            .iter()
+            .find(|r| r.min.y > y0 + 10.0)
+            .expect("the child-lane clip painted");
+        // Anchor on the first clip of lane 0.
+        click_pt(&mut app, &ctx, anchor);
+        assert_eq!(app.sel_clips, vec![(0, 0, 0)], "anchor set");
+        // Shift+click the child-lane clip sitting at 120 k.
+        click_mod(&mut app, &ctx, hit.center(), egui::Modifiers::SHIFT);
+        let want: std::collections::BTreeSet<(usize, usize, usize)> =
+            [(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 1, 0)].into_iter().collect();
+        let got: std::collections::BTreeSet<(usize, usize, usize)> =
+            app.sel_clips.iter().copied().collect();
+        assert_eq!(got, want, "run spans lanes: {:?}", app.sel_clips);
+    }
+
+    /// v34 R18: shift+click anchored on ANOTHER track extends the
+    /// selection instead of wiping it.
+    #[test]
+    fn v34_shift_click_across_tracks_extends() {
+        let mut app = headless_app("v34shifttrk");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        let short = Clip {
+            play_len: Some(30_000),
+            ..Clip::new(a, 0)
+        };
+        app.arr.insert(0, 0, short);
+        app.arr.insert(3, 0, Clip { pos: 90_000, ..short });
+        frame(&mut app, &ctx, vec![]);
+        let body = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let mut rects = painted_rects(&mut app, &ctx, body);
+        rects.retain(|r| r.width() > 40.0);
+        rects.sort_by_key(|r| r.min.y as i64);
+        assert_eq!(rects.len(), 2, "one clip per track: {rects:?}");
+        // Track-1 clip spans 0..100 px, track-4 clip spans 300..400 px.
+        click_pt(&mut app, &ctx, rects[0].center());
+        assert_eq!(app.sel_clips, vec![(0, 0, 0)]);
+        let hit = rects[1].center();
+        click_mod(&mut app, &ctx, hit, egui::Modifiers::SHIFT);
+        assert_eq!(
+            app.sel_clips.len(),
+            2,
+            "shift+click on another track ADDS (never wipes): {:?}",
+            app.sel_clips
+        );
+    }
+
+    /// v34 R17: the clip menu moves to an EXPLICIT lane of the target
+    /// track — the user picks parent/child, the collision logic no longer
+    /// does.
+    #[test]
+    fn v34_rmb_move_to_child_lane() {
+        let mut app = headless_app("v34mvlane");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        // Target track 3 (index 2) gets a child lane so the submenu's
+        // explicit "lane 2 (child 1)" choice is exercised.
+        app.arr.add_lane(2);
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(!v25_hits(&mut app, &ctx, "Cut").is_empty(), "clip menu open");
+        let mv = galley_centers(&mut app, &ctx, "Move to track", false);
+        click_pt(&mut app, &ctx, mv[0]);
+        let t3 = galley_centers(&mut app, &ctx, "Track 3", true);
+        let pick = t3
+            .into_iter()
+            .min_by(|a, b| {
+                (*a - mv[0])
+                    .length_sq()
+                    .partial_cmp(&(*b - mv[0]).length_sq())
+                    .unwrap()
+            })
+            .expect("track list");
+        click_pt(&mut app, &ctx, pick);
+        frame(&mut app, &ctx, vec![]);
+        let lanes = galley_centers(&mut app, &ctx, "lane 2 (child 1)", true);
+        assert!(!lanes.is_empty(), "target track lists its lanes");
+        let lane = lanes
+            .into_iter()
+            .min_by(|a, b| {
+                (*a - pick)
+                    .length_sq()
+                    .partial_cmp(&(*b - pick).length_sq())
+                    .unwrap()
+            })
+            .unwrap();
+        click_pt(&mut app, &ctx, lane);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(ids.len(), 1, "still one clip");
+        assert_eq!(
+            (ids[0].0, ids[0].1),
+            (2, 1),
+            "clip moved to track 3 lane 2 (child): {ids:?}"
+        );
+    }
+
+    /// v34 R17: dragging a clip across tracks lands on the LANE under the
+    /// pointer, not on the source clip's old lane slot.
+    #[test]
+    fn v34_cross_track_drag_lands_on_hovered_lane() {
+        let mut app = headless_app("v34drglane");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        // Target track 3 already has a child lane: dragging onto that
+        // child must land the clip THERE (lane 1), not on lane 0.
+        app.arr.add_lane(2);
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let top2 = top0 + 2.0 * (app.track_h(0) + TRACK_SEP_HIT);
+        let lane2 = app.track_h(2) / app.arr.tracks[2].lanes.len() as f32;
+        let from = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        let to = egui::pos2(300.0, top2 + lane2 * 1.5);
+        drag_pt(&mut app, &ctx, from, to);
+        let ids = clip_ids(&app);
+        let on_child = ids.iter().any(|(t, k, _, _)| *t == 2 && *k == 1);
+        assert!(
+            on_child,
+            "clip dropped onto track 3's CHILD lane: {ids:?}",
+        );
+    }
+
+    /// v34 R6: the mixer follows the grid's vertical rhythm ONLY while
+    /// docked left/right; bottom-docked (and floating) it lays out and
+    /// scrolls on its own.
+    #[test]
+    fn v34_mixer_bottom_dock_scrolls_independently() {
+        let mut app = headless_app("v34mixdock");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        // The layout RULE: only left/right docks share the grid rhythm.
+        for (d, edge, want) in [
+            (1, 0, false), // docked left  → tied
+            (1, 1, false), // docked right → tied
+            (1, 2, true),  // docked bottom → independent
+            (0, 1, true),  // floating → independent
+        ] {
+            app.side_wins.dock[3] = [d, edge, 0];
+            assert_eq!(
+                mixer_independent(&app),
+                want,
+                "dock=[{d},{edge}] misclassified"
+            );
+        }
+        // Bottom-dock the mixer, hover its panel and settle (a docked
+        // panel that is NOT hovered is memo-skipped, so every geometric
+        // probe must hold the pointer inside first).
+        app.side_wins.dock[3] = [1, 2, 0];
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // The mixer panel spans the window's lower band; probe a point
+        // comfortably inside it (its content area starts near y = 47).
+        let probe = egui::pos2(700.0, 130.0);
+        frame(&mut app, &ctx, vec![moved(probe)]);
+        // The wheel OVER the mixer must feed the mixer's OWN scroll
+        // offset — this only happens on the INDEPENDENT layout path, so
+        // it doubles as proof that bottom-dock took effect.
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(probe),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -60.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            app.mixer_scroll > 0.0,
+            "bottom-docked mixer scrolls on its own; the grid's vscroll is
+             never the driver on this path"
+        );
+        // And a second wheel keeps accumulating on the mixer's offset.
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(probe),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -60.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(app.mixer_scroll > 0.0);
+    }
+
+    /// v34 R7: a transient notice (like "project saved") fades and is
+    /// replaced by the LIVE engine state after a short window — it never
+    /// sits in the top bar posing as current state.
+    #[test]
+    fn v34_status_notice_fades_out() {
+        let mut app = headless_app("v34notefade");
+        let ctx = egui::Context::default();
+        app.status = "saved project \"demo\"".into();
+        app.status_at = std::time::Instant::now();
+        app.applied = Some((1, 2));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(v25_hits(&mut app, &ctx, "saved project").len(), 1, "fresh notice shows");
+        // Mid-fade (9 s): still readable — fading, not gone.
+        app.status_at -= std::time::Duration::from_secs(9);
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "saved project").len(),
+            1,
+            "still shown while dimming"
+        );
+        // Past the window (15 s): the live state replaced it, the notice
+        // survives only in the tooltip, and the port suffix aged out.
+        app.status_at -= std::time::Duration::from_secs(6);
+        assert!(
+            v25_hits(&mut app, &ctx, "saved project").is_empty(),
+            "the notice must be GONE after the fade window"
+        );
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "audio engine: offline").len(),
+            1,
+            "the bar shows the honest live state instead"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "applied: 1 in / 2 out").is_empty(),
+            "the suffix ages out with its notice"
         );
     }
 }

@@ -300,16 +300,34 @@ impl Arrangement {
         c: usize,
         to_t: usize,
     ) -> Option<(usize, usize)> {
+        self.move_clip_to(t, lane, c, to_t, None)
+    }
+
+    /// v34 R17: like [`Arrangement::move_clip_track`] with an EXPLICIT
+    /// destination lane (`None` = keep the lane slot). The pointer decides
+    /// the lane while dragging, and the right-click menu lists every
+    /// parent/child lane — the user picks where the clip lands, not the
+    /// collision logic.
+    pub fn move_clip_to(
+        &mut self,
+        t: usize,
+        lane: usize,
+        c: usize,
+        to_t: usize,
+        to_lane: Option<usize>,
+    ) -> Option<(usize, usize)> {
         if to_t == t {
-            return self.move_clip_lane(t, lane, lane, c).map(|ci| (lane, ci));
+            let to = to_lane.unwrap_or(lane);
+            return self.move_clip_lane(t, lane, to, c).map(|ci| (to, ci));
         }
         let cl = self.remove_clip(t, lane, c)?;
         let tr = self.tracks.get_mut(to_t)?;
-        while tr.lanes.len() <= lane {
+        let to = to_lane.unwrap_or(lane);
+        while tr.lanes.len() <= to {
             tr.add_lane();
         }
-        tr.lanes[lane].clips.push(cl);
-        Some((lane, tr.lanes[lane].clips.len() - 1))
+        tr.lanes[to].clips.push(cl);
+        Some((to, tr.lanes[to].clips.len() - 1))
     }
 
     /// Every `(track, lane, clip)` index placing this asset.
