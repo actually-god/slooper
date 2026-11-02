@@ -148,11 +148,14 @@ pub enum ChainSave {
         #[serde(default)]
         params: Vec<f32>,
     },
-    /// In-process hosted VST plugin.
+    /// In-process hosted plugin (VST2/VST3/CLAP).
     Vst {
         path: String,
-        /// "VST2" or "VST3".
+        /// "VST2", "VST3" or "CLAP".
         kind: String,
+        /// CLAP only: plugin id inside a multi-plugin file.
+        #[serde(default)]
+        plugin_id: Option<String>,
         /// Display name (UI only; the plugin file is authoritative).
         #[serde(default)]
         name: String,
@@ -666,6 +669,7 @@ impl Config {
                     .unwrap_or_default();
                 if let Some(Some(vs)) = self.track_vst.get(i) {
                     v.push(ChainSave::Vst {
+                        plugin_id: None,
                         path: vs.path.clone(),
                         kind: vs.kind.clone(),
                         name: vs.name.clone(),
@@ -1024,11 +1028,49 @@ mod tests {
         assert!(old.editor_probe.is_empty(), "pre-v23 config loads clean");
     }
 
+    /// v34 pin (R3): CLAP rows persist kind "CLAP" AND the in-file plugin
+    /// id; pre-CLAP project files (no field) must still deserialize.
+    #[test]
+    fn v34_chainsave_clap_carries_plugin_id() {
+        let c = ChainSave::Vst {
+            path: "/home/u/.clap/Camshaft.clap".into(),
+            kind: "CLAP".into(),
+            plugin_id: Some("com.azuriteid.camshaft.comppressor".into()),
+            name: "CamComp".into(),
+            params: vec![0.5],
+            state: Some(b64_encode(b"F1 0.25")),
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"CLAP\""), "{j}");
+        let back: ChainSave = serde_json::from_str(&j).unwrap();
+        match back {
+            ChainSave::Vst { kind, plugin_id, state, .. } => {
+                assert_eq!(kind, "CLAP");
+                assert_eq!(
+                    plugin_id.as_deref(),
+                    Some("com.azuriteid.camshaft.comppressor")
+                );
+                assert_eq!(state.as_deref().and_then(b64_decode), Some(b"F1 0.25".to_vec()));
+            }
+            _ => panic!("variant lost"),
+        }
+        let old: ChainSave = serde_json::from_str(
+            r#"{ "type": "vst", "path": "/x.vst3", "kind": "VST3", "name": "n",
+                 "params": [], "state": null }"#,
+        )
+        .unwrap();
+        match old {
+            ChainSave::Vst { plugin_id, .. } => assert!(plugin_id.is_none()),
+            _ => panic!("variant lost"),
+        }
+    }
+
     /// v22 pin: `ChainSave::Vst` persists the state chunk (project saves),
     /// and pre-v22 files without the key load as `None`.
     #[test]
     fn v22_chainsave_vst_state_roundtrip() {
         let c = ChainSave::Vst {
+            plugin_id: None,
             path: "/host/thing.vst3".into(),
             kind: "VST3".into(),
             name: "Thing".into(),

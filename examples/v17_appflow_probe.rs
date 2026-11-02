@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use slooper::vsthost::{default_vst_dirs, open, scan, VstKind};
+use slooper::vsthost::{default_vst_dirs, open, scan, StageEntry, VstKind};
 
 fn main() {
     let path = format!("{}/.vst3/vitalium.vst3", std::env::var("HOME").unwrap());
@@ -20,7 +20,11 @@ fn main() {
     eprintln!("[flow] opening vitalium (the bound instrument)");
     let load = open(Path::new(&path), VstKind::V3, 48_000, None).expect("open vitalium");
     let entry = load.entry;
-    entry.note_on(0, 60, 110);
+    entry
+        .as_any()
+        .downcast_ref::<slooper::vsthost::RtStageEntry>()
+        .unwrap()
+        .note_on(0, 60, 110);
     let running = Arc::new(AtomicBool::new(true));
     let rt = {
         let running = running.clone();

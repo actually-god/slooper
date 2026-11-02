@@ -8,11 +8,15 @@
 //   cargo run --release --example plugin_audit
 use std::path::Path;
 
-use slooper::vsthost::{default_vst_dirs, open, scan, VstKind};
+use slooper::vsthost::{default_vst_dirs, open, scan, StageEntry, VstKind};
 
 fn instrument_peak(path: &Path, kind: VstKind) -> Result<f32, String> {
     let load = open(path, kind, 48_000, None)?;
-    let entry = load.entry;
+    let entry_arc = load.entry;
+    let entry = entry_arc
+        .as_any()
+        .downcast_ref::<slooper::vsthost::RtStageEntry>()
+        .unwrap();
     entry.note_on(0, 60, 110);
     let mut peak = 0.0f32;
     let mut out = vec![0f32; 512];

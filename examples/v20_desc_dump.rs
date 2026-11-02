@@ -1,6 +1,6 @@
 // v20 probe: dump descs (with ids) AND drive cell writes end-to-end.
 use std::path::Path;
-use slooper::vsthost::{open, VstKind};
+use slooper::vsthost::{open, StageEntry, VstKind};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -10,7 +10,11 @@ fn main() {
         VstKind::V3
     };
     let load = open(Path::new(&a[1]), kind, 48_000, None).expect("open");
-    let e = &load.entry;
+    let e = load
+        .entry
+        .as_any()
+        .downcast_ref::<slooper::vsthost::RtStageEntry>()
+        .unwrap();
     for (k, d) in e.descs().iter().enumerate() {
         println!("{k}\tid={} def={} wr={} {}", d.id, d.default, d.writable, d.name);
     }

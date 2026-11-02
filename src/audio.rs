@@ -112,8 +112,10 @@ pub enum FxKind {
         inst: Arc<crate::fx::Instance>,
         desc: crate::fx::EffectDesc,
     },
-    /// In-process hosted plugin (VST2/VST3), loaded by `vsthost`.
-    Vst(Arc<crate::vsthost::RtStageEntry>),
+    /// In-process hosted plugin (VST2/VST3/CLAP), loaded by `vsthost`
+    /// (CLAP's backend is `claphost`, delivered behind the same
+    /// `StageEntry` surface).
+    Vst(Arc<dyn crate::vsthost::StageEntry>),
 }
 
 /// A chain slot; see [`FxKind`].
@@ -127,7 +129,7 @@ impl FxSlot {
             kind: FxKind::Scripted { inst, desc },
         }
     }
-    pub fn vst(entry: Arc<crate::vsthost::RtStageEntry>) -> Self {
+    pub fn vst(entry: Arc<dyn crate::vsthost::StageEntry>) -> Self {
         Self {
             kind: FxKind::Vst(entry),
         }
@@ -174,7 +176,7 @@ impl TrackFx {
 /// through this enum.
 pub enum SynthHandle {
     Script(Arc<crate::synth::Instance>),
-    Vst(Arc<crate::vsthost::RtStageEntry>),
+    Vst(Arc<dyn crate::vsthost::StageEntry>),
 }
 
 impl SynthHandle {
@@ -726,7 +728,7 @@ pub struct Engine {
     /// the audio chain cache has caught up (`vst_gen` == `vst_refreshed`).
     vsts_gen: AtomicU64,
     vst_refreshed: AtomicU64,
-    vst_held: std::sync::Mutex<Vec<Arc<crate::vsthost::RtStageEntry>>>,
+    vst_held: std::sync::Mutex<Vec<Arc<dyn crate::vsthost::StageEntry>>>,
     /// Jack rate, published once at connect (drives tick math + samplers).
     sample_rate: AtomicU32,
 
@@ -1211,7 +1213,7 @@ impl Engine {
     /// once the audio chain cache has caught up with every swap, so the final
     /// reference of each plugin dies on the caller's (UI) thread rather than
     /// mid-swap on the audio thread.
-    pub fn drain_vst_held(&self) -> Vec<Arc<crate::vsthost::RtStageEntry>> {
+    pub fn drain_vst_held(&self) -> Vec<Arc<dyn crate::vsthost::StageEntry>> {
         if self.vst_gen() == self.vst_refreshed.load(Ordering::Relaxed) {
             core::mem::take(&mut *self.vst_held.lock().unwrap())
         } else {
@@ -2447,7 +2449,7 @@ unsafe impl Send for ClipEntry {}
 /// a no-op when the track has no insert. Fresh per clip, mirroring the
 /// scripted-FX export rule (every clip starts at phase 0; the live chain is
 /// never advanced).
-fn vst_chunk(e: Option<&crate::vsthost::RtStageEntry>, chunk: &mut [f32]) {
+fn vst_chunk(e: Option<&dyn crate::vsthost::StageEntry>, chunk: &mut [f32]) {
     if let Some(e) = e {
         let src = chunk.to_vec();
         e.process(&src, chunk);
@@ -2458,12 +2460,12 @@ fn vst_chunk(e: Option<&crate::vsthost::RtStageEntry>, chunk: &mut [f32]) {
 /// path/kind, current slider values. The live entry is never touched (the
 /// audio thread owns it), so exports and the running mix cannot interfere.
 fn spawn_entry_private(
-    e: &crate::vsthost::RtStageEntry,
+    e: &dyn crate::vsthost::StageEntry,
     sr: u32,
-) -> Option<Arc<crate::vsthost::RtStageEntry>> {
+) -> Option<Arc<dyn crate::vsthost::StageEntry>> {
     let (path, kind) = e.spec().clone();
     let params: Vec<f32> = (0..e.params().len()).map(|k| e.params().get(k)).collect();
-    crate::vsthost::open(&path, kind, sr.max(1), Some(&params))
+    crate::vsthost::open_pid(&path, kind, e.plugin_id(), sr.max(1), Some(&params), None)
         .ok()
         .map(|l| l.entry)
 }
@@ -2496,7 +2498,7 @@ fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32]) {
                 }
             }
             FxKind::Vst(e) => {
-                if let Some(pv) = spawn_entry_private(e, sr) {
+                if let Some(pv) = spawn_entry_private(&**e, sr) {
                     vst_chunk(Some(pv.as_ref()), buf);
                 }
             }
@@ -2522,15 +2524,15 @@ fn render_midi_any(
             }
         }
         SynthHandle::Vst(e) => {
-            if let Some(pv) = spawn_entry_private(e, sr) {
-                render_midi_vst(&pv, ev, from, len, out);
+            if let Some(pv) = spawn_entry_private(&**e, sr) {
+                render_midi_vst(&*pv, ev, from, len, out);
             }
         }
     }
 }
 
 fn render_midi_vst(
-    e: &crate::vsthost::RtStageEntry,
+    e: &dyn crate::vsthost::StageEntry,
     ev: &[(u64, u8, u8, u8, u8)],
     from: u64,
     len: usize,

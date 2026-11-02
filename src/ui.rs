@@ -39,6 +39,7 @@ use egui::{Color32, RichText, Sense, Slider};
 
 use crate::arrange::{Arrangement, Clip};
 use crate::assets::{Asset, RackFile, RackFolder};
+use crate::vsthost::StageEntry as _;
 use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
     TR_REC,
@@ -790,11 +791,14 @@ pub enum ChainRow {
     Vst {
         path: String,
         kind: crate::vsthost::VstKind,
+        /// CLAP only: the plugin inside a multi-plugin file (mirrors
+        /// `config::ChainSave::Vst::plugin_id`).
+        plugin_id: Option<String>,
         name: String,
         params: Vec<f32>,
-        entry: Option<Arc<crate::vsthost::RtStageEntry>>,
+        entry: Option<Arc<dyn crate::vsthost::StageEntry>>,
         open_rx:
-            Option<std::sync::mpsc::Receiver<Result<Arc<crate::vsthost::RtStageEntry>, String>>>,
+            Option<std::sync::mpsc::Receiver<Result<Arc<dyn crate::vsthost::StageEntry>, String>>>,
         /// v20: latest state chunk harvested from this plugin's VST3
         /// shadow editor (see `vstedit::Shared::state`). Session-only —
         /// like VSTi params it never enters config or project saves.
@@ -816,6 +820,7 @@ impl Clone for ChainRow {
             ChainRow::Vst {
                 path,
                 kind,
+                plugin_id,
                 name,
                 params,
                 entry,
@@ -824,6 +829,7 @@ impl Clone for ChainRow {
             } => ChainRow::Vst {
                 path: path.clone(),
                 kind: *kind,
+                plugin_id: plugin_id.clone(),
                 name: name.clone(),
                 params: params.clone(),
                 entry: entry.clone(),
@@ -835,19 +841,30 @@ impl Clone for ChainRow {
 }
 
 /// Plugin-instrument synth bindings reuse the `track_synth` stem table with
-/// a scheme prefix: `"vst3:/abs/x.vst3"` / `"vst2:/abs/x.so"` — absolute
-/// paths can never collide with a script stem name.
-fn vst_synth_encode(kind: crate::vsthost::VstKind, path: &str) -> String {
-    format!("{}:{path}", kind.tag().to_lowercase())
+/// a scheme prefix: `"vst3:/abs/x.vst3"` / `"vst2:/abs/x.so"` /
+/// `"clap:/abs/x.clap#com.vendor.plug"` — absolute paths can never collide
+/// with a script stem name. The `#id` tail addresses one plugin inside a
+/// multi-plugin CLAP file (descriptor ids never contain `'#'`).
+fn vst_synth_encode(kind: crate::vsthost::VstKind, path: &str, plugin_id: Option<&str>) -> String {
+    match plugin_id {
+        Some(id) => format!("{}:{path}#{id}", kind.tag().to_lowercase()),
+        None => format!("{}:{path}", kind.tag().to_lowercase()),
+    }
 }
 
-fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str)> {
-    if let Some(p) = s.strip_prefix("vst3:") {
-        Some((crate::vsthost::VstKind::V3, p))
+fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str, Option<&str>)> {
+    let (kind, rest) = if let Some(p) = s.strip_prefix("vst3:") {
+        (crate::vsthost::VstKind::V3, p)
     } else if let Some(p) = s.strip_prefix("vst2:") {
-        Some((crate::vsthost::VstKind::V2, p))
+        (crate::vsthost::VstKind::V2, p)
+    } else if let Some(p) = s.strip_prefix("clap:") {
+        (crate::vsthost::VstKind::Clap, p)
     } else {
-        None
+        return None;
+    };
+    match (kind, rest.split_once('#')) {
+        (crate::vsthost::VstKind::Clap, Some((p, id))) => Some((kind, p, Some(id))),
+        _ => Some((kind, rest, None)),
     }
 }
 
@@ -858,7 +875,7 @@ type ClipId = (usize, usize, usize);
 /// open-own-GUI-on-land flag). v33.
 type SynthOpenSlot = Option<(
     String,
-    std::sync::mpsc::Receiver<Result<std::sync::Arc<crate::vsthost::RtStageEntry>, String>>,
+    std::sync::mpsc::Receiver<Result<std::sync::Arc<dyn crate::vsthost::StageEntry>, String>>,
     bool,
 )>;
 
@@ -1215,7 +1232,7 @@ pub struct App {
         GuiTarget,
         std::path::PathBuf,
         std::sync::mpsc::Receiver<crate::vsthost::EditorProbe>,
-        std::sync::Arc<crate::vsthost::RtStageEntry>,
+        std::sync::Arc<dyn crate::vsthost::StageEntry>,
     )>,
     /// v23: plugin whose stand-in parameter window is open.
     params_win: Option<GuiTarget>,
@@ -1304,6 +1321,7 @@ impl App {
                                 ChainSave::Vst {
                                     path,
                                     kind,
+                                    plugin_id,
                                     name,
                                     params,
                                     state,
@@ -1312,6 +1330,7 @@ impl App {
                                     Some(ChainRow::Vst {
                                         path: path.clone(),
                                         kind,
+                                        plugin_id: plugin_id.clone(),
                                         name: name.clone(),
                                         params: params.clone(),
                                         entry: None,
@@ -2225,6 +2244,7 @@ impl App {
                 ChainRow::Vst {
                     path,
                     kind,
+                    plugin_id,
                     name,
                     params,
                     entry,
@@ -2248,9 +2268,10 @@ impl App {
                                     chunk: c.to_vec(),
                                     params: Vec::new(),
                                 });
-                            match crate::vsthost::open_with_state(
+                            match crate::vsthost::open_pid(
                                 p,
                                 *kind,
+                                plugin_id.as_deref(),
                                 sr,
                                 Some(params),
                                 patch.as_ref(),
@@ -2300,7 +2321,7 @@ impl App {
     /// so reaping and toggling never care which generation is behind.
     fn plugin_window_open(
         &mut self,
-        entry: &std::sync::Arc<crate::vsthost::RtStageEntry>,
+        entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) -> Result<crate::vstedit::EditorWindow, String> {
         if let Some(h) = entry.vst2_handle() {
             let pth = entry.path().to_string_lossy().into_owned();
@@ -2353,7 +2374,7 @@ impl App {
     }
 
     /// Resolve a GUI target to its live plugin entry (None when gone).
-    fn target_entry(&self, target: GuiTarget) -> Option<std::sync::Arc<crate::vsthost::RtStageEntry>> {
+    fn target_entry(&self, target: GuiTarget) -> Option<std::sync::Arc<dyn crate::vsthost::StageEntry>> {
         match target {
             GuiTarget::Synth(t) => match self.track_synth_inst.get(t)?.as_ref()?.as_ref() {
                 SynthHandle::Vst(e) => Some(e.clone()),
@@ -2373,7 +2394,7 @@ impl App {
     fn open_plugin_gui(
         &mut self,
         target: GuiTarget,
-        entry: std::sync::Arc<crate::vsthost::RtStageEntry>,
+        entry: std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) {
         let path = entry.path().to_string_lossy().into_owned();
         // Escape hatch for development: open without the guard.
@@ -2420,7 +2441,7 @@ impl App {
     fn open_plugin_gui_now(
         &mut self,
         target: GuiTarget,
-        entry: &std::sync::Arc<crate::vsthost::RtStageEntry>,
+        entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) {
         match self.plugin_window_open(entry) {
             Ok(w) => {
@@ -2744,12 +2765,13 @@ impl App {
             return;
         }
         let sr = self.sample_rate.max(48_000);
-        let rx = crate::vsthost::open_async(&e.path, e.kind, sr, None);
+        let rx = crate::vsthost::open_async_pid(&e.path, e.kind, e.plugin_id.as_deref(), sr, None, None);
         self.vst_note = format!("{}: loading…", e.name);
         self.fx_rows[i].push(ChainRow::Vst {
             state: None,
             path: e.path.to_string_lossy().into_owned(),
             kind: e.kind,
+            plugin_id: e.plugin_id.clone(),
             name: e.name.clone(),
             params: Vec::new(),
             entry: None,
@@ -3842,6 +3864,7 @@ impl App {
                             ChainRow::Vst {
                                 path,
                                 kind,
+                                plugin_id,
                                 name,
                                 params,
                                 entry: _,
@@ -3850,6 +3873,7 @@ impl App {
                             } => ChainSave::Vst {
                                 path: path.clone(),
                                 kind: kind.tag().to_string(),
+                                plugin_id: plugin_id.clone(),
                                 name: name.clone(),
                                 params: params.clone(),
                                 state: state.as_deref().map(crate::config::b64_encode),
@@ -4129,11 +4153,12 @@ impl App {
     /// bind opens the plugin's own window when the load lands).
     fn rebuild_track_synth_bind(&mut self, t: usize, open_gui_on_land: bool) -> bool {
         let stem = self.track_synth[t].clone().filter(|s| !s.is_empty());
-        if let Some((kind, path)) = stem.as_deref().and_then(vst_synth_decode) {
+        if let Some((kind, path, plugin_id)) = stem.as_deref().and_then(vst_synth_decode) {
             let (saved, patch) = self.synth_saved_and_patch(t);
-            let rx = crate::vsthost::open_async_with_state(
+            let rx = crate::vsthost::open_async_pid(
                 std::path::Path::new(path),
                 kind,
+                plugin_id,
                 self.sample_rate.max(1),
                 saved.as_deref(),
                 patch.as_ref(),
@@ -4153,7 +4178,7 @@ impl App {
     fn land_track_synth_vst(
         &mut self,
         t: usize,
-        entry: std::sync::Arc<crate::vsthost::RtStageEntry>,
+        entry: std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) {
         if let Some(mut w) = self.vst_editors.remove(&t) {
             w.close();
@@ -4173,12 +4198,13 @@ impl App {
         let stem = self.track_synth[t].clone().filter(|s| !s.is_empty());
         let inst = match stem.as_deref() {
             Some(stem) if vst_synth_decode(stem).is_some() => {
-                let (kind, path) = vst_synth_decode(stem).unwrap();
+                let (kind, path, plugin_id) = vst_synth_decode(stem).unwrap();
                 let path = path.to_string();
                 let (saved, patch) = self.synth_saved_and_patch(t);
-                match crate::vsthost::open_with_state(
+                match crate::vsthost::open_pid(
                     std::path::Path::new(&path),
                     kind,
+                    plugin_id,
                     self.sample_rate.max(1),
                     saved.as_deref(),
                     patch.as_ref(),
@@ -8597,6 +8623,7 @@ impl App {
             let ChainRow::Vst {
                 path,
                 kind,
+                plugin_id,
                 name,
                 entry,
                 open_rx,
@@ -8611,9 +8638,10 @@ impl App {
                 // Cells re-seed from the chunk (saved=None), so the patch's
                 // own parameter values win over the stale config snapshot.
                 *entry = None;
-                *open_rx = Some(crate::vsthost::open_async_with_state(
+                *open_rx = Some(crate::vsthost::open_async_pid(
                     std::path::Path::new(path),
                     *kind,
+                    plugin_id.as_deref(),
                     sr,
                     None,
                     Some(&patch),
@@ -9008,6 +9036,7 @@ impl App {
                         ChainRow::Vst {
                             path,
                             kind,
+                            plugin_id,
                             name,
                             params,
                             entry: _,
@@ -9016,6 +9045,7 @@ impl App {
                         } => ChainSave::Vst {
                             path: path.clone(),
                             kind: kind.tag().to_string(),
+                            plugin_id: plugin_id.clone(),
                             name: name.clone(),
                             params: params.clone(),
                             state: state.as_deref().map(crate::config::b64_encode),
@@ -9336,6 +9366,7 @@ impl App {
                     ChainSave::Vst {
                         path,
                         kind,
+                        plugin_id,
                         name,
                         params,
                         state,
@@ -9344,6 +9375,7 @@ impl App {
                         Some(ChainRow::Vst {
                             path,
                             kind,
+                            plugin_id,
                             name,
                             params,
                             entry: None,
@@ -13492,7 +13524,7 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
     let cur = app.track_synth[t].clone().unwrap_or_default();
     let show = if cur.is_empty() {
         "piano".to_string()
-    } else if let Some((_, p)) = vst_synth_decode(&cur) {
+    } else if let Some((_, p, _)) = vst_synth_decode(&cur) {
         let name = app
             .vst_scan
             .iter()
@@ -13584,11 +13616,15 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 if !e.instrument || e.error.is_some() {
                     continue;
                 }
-                let tag = if e.kind == crate::vsthost::VstKind::V2 { "vst2" } else { "vst3" };
+                let tag: &'static str = match e.kind {
+                    crate::vsthost::VstKind::V2 => "vst2",
+                    crate::vsthost::VstKind::V3 => "vst3",
+                    crate::vsthost::VstKind::Clap => "clap",
+                };
                 rows.push((
                     tag,
                     format!("{} \u{2014} plugin instrument", e.name),
-                    vst_synth_encode(e.kind, &e.path.to_string_lossy()),
+                    vst_synth_encode(e.kind, &e.path.to_string_lossy(), e.plugin_id.as_deref()),
                 ));
             }
             let scanning = !app.vst_scanned || app.vst_scan_rx.is_some();
@@ -22131,7 +22167,7 @@ mod tests {
         let has_editor = load.entry.has_editor();
         drop(load);
         let mut app = headless_app("v10-gui");
-        let stem = vst_synth_encode(crate::vsthost::VstKind::V2, &p.to_string_lossy());
+        let stem = vst_synth_encode(crate::vsthost::VstKind::V2, &p.to_string_lossy(), None);
         app.set_track_synth_stem(0, &stem);
         // v33: the bind loads async — pump the loader like the event loop.
         assert!(pump_synth_bind(&mut app, 0), "async bind never landed");
@@ -22474,11 +22510,38 @@ mod tests {
         crate::vsthost::VstEntry {
             path: std::path::PathBuf::from("/nonexistent/fake-synth.vst3"),
             kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
             name: "FakeSynth".into(),
             vendor: "nosoft".into(),
             instrument: true,
             error: None,
         }
+    }
+
+    /// v34 pin (R3): the synth-binding stem table addresses one plugin
+    /// inside a multi-plugin `.clap` (`clap:path#id`), and VST schemes
+    /// never split on '#'.
+    #[test]
+    fn v34_clap_synth_stem_roundtrip() {
+        let stem = vst_synth_encode(
+            crate::vsthost::VstKind::Clap,
+            "/home/u/.clap/Camshaft.clap",
+            Some("com.azuriteid.camshaft.comppressor"),
+        );
+        assert_eq!(stem, "clap:/home/u/.clap/Camshaft.clap#com.azuriteid.camshaft.comppressor");
+        let (kind, path, pid) = vst_synth_decode(&stem).unwrap();
+        assert_eq!(kind, crate::vsthost::VstKind::Clap);
+        assert_eq!(path, "/home/u/.clap/Camshaft.clap");
+        assert_eq!(pid, Some("com.azuriteid.camshaft.comppressor"));
+        // A clap stem without the tail decodes to "first descriptor".
+        let (kind, path, pid) = vst_synth_decode("clap:/x/Foam.clap").unwrap();
+        assert_eq!(kind, crate::vsthost::VstKind::Clap);
+        assert_eq!(path, "/x/Foam.clap");
+        assert_eq!(pid, None);
+        // VST paths containing '#' must NOT be cut (vst3 scheme is opaque).
+        let (_, path, pid) = vst_synth_decode("vst3:/odd#name.vst3").unwrap();
+        assert_eq!(path, "/odd#name.vst3");
+        assert_eq!(pid, None);
     }
 
     /// v17: the ♪ chip on a mixer strip opens the SYNTHS window (the old
@@ -24119,6 +24182,7 @@ mod tests {
         app.fx_rows[0].push(ChainRow::Vst {
             path: wolf.clone(),
             kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
             name: "wolf".into(),
             params: vec![0.0; entry.descs().len()],
             entry: Some(entry.clone()),
@@ -24178,6 +24242,7 @@ mod tests {
         app.fx_rows[0].push(ChainRow::Vst {
             path: wolf.clone(),
             kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
             name: "wolf".into(),
             params: vec![0.0; entry.descs().len()],
             entry: Some(entry.clone()),
@@ -24214,7 +24279,7 @@ mod tests {
             return;
         }
         let mut app = headless_app("v23kr");
-        app.track_synth[0] = Some(vst_synth_encode(crate::vsthost::VstKind::V3, &kr));
+        app.track_synth[0] = Some(vst_synth_encode(crate::vsthost::VstKind::V3, &kr, None));
         assert!(
             app.rebuild_track_synth_sync(0),
             "KR-106 binds as synth (sync path)"

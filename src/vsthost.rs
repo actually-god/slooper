@@ -53,14 +53,15 @@ const RING_CAP: usize = 1 << 16;
 /// this version moves whole blocks and never allocates or unwraps.
 /// Overflow keeps the NEWEST samples and reports how many oldest were
 /// dropped, so the echo ring can stay history-consistent (v0.6 behavior).
-struct FxRing {
+pub(crate) struct FxRing {
     buf: Vec<f32>,
     head: usize,
     count: usize,
 }
 
 impl FxRing {
-    fn with_capacity(cap: usize) -> Self {
+    // (methods below are host(crate)-shared with claphost)
+    pub(crate) fn with_capacity(cap: usize) -> Self {
         Self {
             buf: vec![0.0f32; cap],
             head: 0,
@@ -68,16 +69,16 @@ impl FxRing {
         }
     }
     #[inline]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.count
     }
     #[inline]
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.head = 0;
         self.count = 0;
     }
     /// Append a block; returns how many oldest samples overflowed away.
-    fn push_slice(&mut self, s: &[f32]) -> usize {
+    pub(crate) fn push_slice(&mut self, s: &[f32]) -> usize {
         let cap = self.buf.len();
         if s.len() >= cap {
             // Bigger than the whole ring: keep its newest window.
@@ -104,13 +105,13 @@ impl FxRing {
         dropped
     }
     /// Drop `n` oldest samples (max `count`).
-    fn drop_front(&mut self, n: usize) {
+    pub(crate) fn drop_front(&mut self, n: usize) {
         let n = n.min(self.count);
         self.head = (self.head + n) % self.buf.len();
         self.count -= n;
     }
     /// Copy out up to `dst.len()` samples; returns how many were taken.
-    fn drain_into(&mut self, dst: &mut [f32]) -> usize {
+    pub(crate) fn drain_into(&mut self, dst: &mut [f32]) -> usize {
         let cap = self.buf.len();
         let n = self.count.min(dst.len());
         let first = (cap - self.head).min(n);
@@ -130,6 +131,9 @@ impl FxRing {
 pub enum VstKind {
     V2,
     V3,
+    /// CLAP 1.x (`src/claphost.rs`); shares this hosting envelope, the
+    /// backend itself is fully separate.
+    Clap,
 }
 
 impl VstKind {
@@ -137,6 +141,7 @@ impl VstKind {
         match self {
             VstKind::V2 => "VST2",
             VstKind::V3 => "VST3",
+            VstKind::Clap => "CLAP",
         }
     }
     /// Round-trip through config strings.
@@ -144,8 +149,115 @@ impl VstKind {
         match s {
             "VST2" => Some(VstKind::V2),
             "VST3" => Some(VstKind::V3),
+            "CLAP" => Some(VstKind::Clap),
             _ => None,
         }
+    }
+}
+
+/// One live plugin (any format) behind one control/audio surface. The VST2
+/// and VST3 backends live in `RtStageEntry`; CLAP in `claphost::
+/// ClapStageEntry`. Chains, synth handles and the UI all traffic in
+/// `Arc<dyn StageEntry>` so a new plugin format is a new implementor, never
+/// a new chain-row variant.
+pub trait StageEntry: Send + Sync {
+    fn name(&self) -> &str;
+    fn path(&self) -> &std::path::Path;
+    fn spec(&self) -> &(std::path::PathBuf, VstKind);
+    fn kind(&self) -> VstKind;
+    /// Concrete type for backend-specific host APIs (probes, editors,
+    /// tests): VST2/VST3 host code downcasts back to `RtStageEntry`.
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// Multi-plugin files (CLAP) address the concrete plugin by id; VST2/3
+    /// single-artifact plugins return None.
+    fn plugin_id(&self) -> Option<&str> {
+        None
+    }
+    fn descs(&self) -> &[VstParamDesc];
+    fn params(&self) -> &std::sync::Arc<VstParams>;
+    fn has_editor(&self) -> bool;
+    fn set_param(&self, index: usize, value: f32);
+    fn set_param_rt(&self, index: usize, value: f32);
+    /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
+    /// Audio thread only.
+    fn process(&self, input: &[f32], output: &mut [f32]);
+    /// [`Self::process`] with per-sample-offset raw MIDI queued first.
+    /// Audio thread only.
+    fn process_with_midi(&self, input: &[f32], output: &mut [f32], events: &[(usize, [u8; 3])]);
+    /// Panic switch (transport stop/seek). Audio thread only.
+    fn all_notes_off(&self);
+    /// Drop all buffered audio (transport seek). Audio thread only.
+    fn flush(&self);
+    fn midi_drops(&self) -> u64;
+    /// Serial state chunk (VST3 shadow-editor harvest, CLAP `clap.state`);
+    /// control thread only.
+    fn chunk(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// VST2 editor dispatch handle (`None` for every other format).
+    fn vst2_handle(&self) -> Option<Vst2Handle> {
+        None
+    }
+    /// VST3 shadow-instance editor; error for every other format.
+    fn open_vst3_editor(&self, _sample_rate: u32) -> Result<crate::vstedit::EditorWindow, String> {
+        Err("this plugin format hosts no editor window".into())
+    }
+}
+
+impl StageEntry for RtStageEntry {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        RtStageEntry::name(self)
+    }
+    fn path(&self) -> &std::path::Path {
+        RtStageEntry::path(self)
+    }
+    fn spec(&self) -> &(std::path::PathBuf, VstKind) {
+        RtStageEntry::spec(self)
+    }
+    fn kind(&self) -> VstKind {
+        RtStageEntry::kind(self)
+    }
+    fn descs(&self) -> &[VstParamDesc] {
+        RtStageEntry::descs(self)
+    }
+    fn params(&self) -> &std::sync::Arc<VstParams> {
+        RtStageEntry::params(self)
+    }
+    fn has_editor(&self) -> bool {
+        RtStageEntry::has_editor(self)
+    }
+    fn set_param(&self, index: usize, value: f32) {
+        RtStageEntry::set_param(self, index, value)
+    }
+    fn set_param_rt(&self, index: usize, value: f32) {
+        RtStageEntry::set_param_rt(self, index, value)
+    }
+    fn process(&self, input: &[f32], output: &mut [f32]) {
+        RtStageEntry::process(self, input, output)
+    }
+    fn process_with_midi(&self, input: &[f32], output: &mut [f32], events: &[(usize, [u8; 3])]) {
+        RtStageEntry::process_with_midi(self, input, output, events)
+    }
+    fn all_notes_off(&self) {
+        RtStageEntry::all_notes_off(self)
+    }
+    fn flush(&self) {
+        RtStageEntry::flush(self)
+    }
+    fn midi_drops(&self) -> u64 {
+        RtStageEntry::midi_drops(self)
+    }
+    fn chunk(&self) -> Option<Vec<u8>> {
+        self.editor_state.lock().unwrap().clone()
+    }
+    fn vst2_handle(&self) -> Option<Vst2Handle> {
+        RtStageEntry::vst2_handle(self)
+    }
+    fn open_vst3_editor(&self, sample_rate: u32) -> Result<crate::vstedit::EditorWindow, String> {
+        RtStageEntry::open_vst3_editor(self, sample_rate)
     }
 }
 
@@ -160,6 +272,9 @@ pub struct VstEntry {
     /// buses): it generates sound from MIDI, so the UI offers it in the
     /// per-track synthesizer slot as well as the effects chain.
     pub instrument: bool,
+    /// CLAP only: the concrete plugin inside a multi-plugin `.clap` file
+    /// (`clap_plugin_descriptor_t.id`); None for VST2/VST3 artifacts.
+    pub plugin_id: Option<String>,
     /// Set when the file looked like a plugin but failed to probe; the
     /// picker shows it greyed out instead of silently hiding broken files.
     pub error: Option<String>,
@@ -212,7 +327,21 @@ pub fn default_vst_dirs() -> Vec<PathBuf> {
     dirs.push(PathBuf::from("/usr/lib64/vst3"));
     dirs.push(PathBuf::from("/usr/local/lib/vst3"));
     dirs.push(PathBuf::from("/usr/local/lib/vst"));
+    // CLAP standard search paths (entry.h): ~/.clap, /usr/lib/clap, plus
+    // CLAP_PATH (colon list). Same directory walk; extension dispatch.
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(&home).join(".clap"));
+    }
+    dirs.push(PathBuf::from("/usr/lib/clap"));
+    dirs.push(PathBuf::from("/usr/local/lib/clap"));
     if let Ok(extra) = std::env::var("VST_PATH") {
+        for p in extra.split(':') {
+            if !p.is_empty() {
+                dirs.push(PathBuf::from(p));
+            }
+        }
+    }
+    if let Ok(extra) = std::env::var("CLAP_PATH") {
         for p in extra.split(':') {
             if !p.is_empty() {
                 dirs.push(PathBuf::from(p));
@@ -298,7 +427,37 @@ pub fn scan_with(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                         continue;
                     }
                 }
-                if name.ends_with(".vst3") {
+                if crate::claphost::is_clap_file(name) && !p.is_dir() {
+                    // One entry PER plugin descriptor (a .clap can host
+                    // several). Probe never instantiates, so unlike VST2
+                    // this is safe on any file, but keep the same
+                    // error-as-greyed-row contract.
+                    seen.push(p.clone());
+                    match crate::claphost::probe(&p) {
+                        Ok(probes) => {
+                            for pr in probes {
+                                out.push(VstEntry {
+                                    path: p.clone(),
+                                    kind: VstKind::Clap,
+                                    name: pr.name,
+                                    vendor: pr.vendor,
+                                    instrument: pr.instrument,
+                                    plugin_id: Some(pr.plugin_id),
+                                    error: None,
+                                });
+                            }
+                        }
+                        Err(err) => out.push(VstEntry {
+                            path: p.clone(),
+                            kind: VstKind::Clap,
+                            name: base_label(&p),
+                            vendor: String::new(),
+                            instrument: false,
+                            plugin_id: None,
+                            error: Some(err),
+                        }),
+                    }
+                } else if name.ends_with(".vst3") {
                     seen.push(p.clone());
                     out.push(probe_vst3(&p));
                 } else if name.ends_with(".vst") && p.is_dir() {
@@ -894,6 +1053,7 @@ fn bridge_error_entry(p: &Path, why: String) -> VstEntry {
         name: format!("{name} (Windows)"),
         vendor: "Wine".to_string(),
         instrument: false,
+        plugin_id: None,
         error: Some(format!(
             "Wine bridge unavailable: {why}. Set WINELOADER to a Wine build that runs {}-bit plugins, then rescan",
             if bridge_needs32(p) { "32" } else { "64" }
@@ -966,6 +1126,7 @@ fn probe_vst3(path: &Path) -> VstEntry {
                 },
                 vendor: info.vendor,
                 instrument,
+                plugin_id: None,
                 error: None,
             }
         }
@@ -975,6 +1136,7 @@ fn probe_vst3(path: &Path) -> VstEntry {
             name: base_label(path),
             vendor: String::new(),
             instrument: false,
+            plugin_id: None,
             error: Some(err.to_string()),
         },
     }
@@ -1034,6 +1196,7 @@ fn probe_vst2(path: &Path) -> VstEntry {
                 name,
                 vendor: info.vendor,
                 instrument,
+                plugin_id: None,
                 error: None,
             }
         }
@@ -1043,6 +1206,7 @@ fn probe_vst2(path: &Path) -> VstEntry {
             name: base_label(path),
             vendor: String::new(),
             instrument: false,
+            plugin_id: None,
             error: Some(err.to_string()),
         },
     }
@@ -1162,7 +1326,7 @@ struct QueuedMidi {
 /// RT path can stage in one cycle (JACK full-rate merged MIDI is ~10 msgs
 /// per 512-sample block; this is ~800 blocks' worth) — reaching it means
 /// the plugin stopped consuming, and the overflow is COUNTED, never silent.
-const MIDI_QUEUE_CAP: usize = 8192;
+pub(crate) const MIDI_QUEUE_CAP: usize = 8192;
 
 // ------------------------------------------------------------ rt state ---
 
@@ -1289,7 +1453,7 @@ unsafe impl Sync for RtStageEntry {}
 /// What [`open`] hands back: the shared entry plus the UI-facing metadata
 /// (also reachable through the entry).
 pub struct VstLoad {
-    pub entry: Arc<RtStageEntry>,
+    pub entry: Arc<dyn StageEntry>,
 }
 
 /// v23: a full patch harvested from a closed VST3 shadow editor — the
@@ -1412,7 +1576,15 @@ fn note_instantiated(path: &Path, kind: VstKind, name: String, vendor: String, i
     INSTANTIATIONS.fetch_add(1, Ordering::Relaxed);
     let Some((mtime, len)) = file_sig(path) else { return };
     let entry =
-        VstEntry { path: path.to_path_buf(), kind, name, vendor, instrument, error: None };
+        VstEntry {
+            path: path.to_path_buf(),
+            kind,
+            name,
+            vendor,
+            instrument,
+            plugin_id: None,
+            error: None,
+        };
     if let Ok(mut c) = lib_cache().lock() {
         c.insert(path.to_path_buf(), CachedLib { mtime, len, entry });
     }
@@ -1552,8 +1724,8 @@ pub fn open_async(
     kind: VstKind,
     sample_rate: u32,
     saved: Option<&[f32]>,
-) -> std::sync::mpsc::Receiver<Result<Arc<RtStageEntry>, String>> {
-    open_async_with_state(path, kind, sample_rate, saved, None)
+) -> std::sync::mpsc::Receiver<Result<Arc<dyn StageEntry>, String>> {
+    open_async_pid(path, kind, None, sample_rate, saved, None)
 }
 
 /// [`open_async`] carrying a VST3 patch (see [`open_with_state`]).
@@ -1563,18 +1735,33 @@ pub fn open_async_with_state(
     sample_rate: u32,
     saved: Option<&[f32]>,
     patch: Option<&VstPatch>,
-) -> std::sync::mpsc::Receiver<Result<Arc<RtStageEntry>, String>> {
+) -> std::sync::mpsc::Receiver<Result<Arc<dyn StageEntry>, String>> {
+    open_async_pid(path, kind, None, sample_rate, saved, patch)
+}
+
+/// [`open_async_with_state`] addressing a plugin inside a multi-plugin
+/// file (CLAP) — one shared body for both spellings.
+pub fn open_async_pid(
+    path: &Path,
+    kind: VstKind,
+    plugin_id: Option<&str>,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    patch: Option<&VstPatch>,
+) -> std::sync::mpsc::Receiver<Result<Arc<dyn StageEntry>, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
     let patch = patch.cloned();
+    let plugin_id = plugin_id.map(|s| s.to_string());
     post(move || {
         // `open_inner` DIRECTLY: this closure already runs on the GUI
         // thread, and `open` would proxy its result back to this very
         // thread — waiting on ourselves = the v16 pump freeze this pin
         // caught ("picked plugin never loaded").
         let _ = tx.send(
-            open_inner(&path, kind, sample_rate, saved.as_deref(), patch.as_ref()).map(|l| l.entry),
+            open_inner(&path, kind, plugin_id.as_deref(), sample_rate, saved.as_deref(), patch.as_ref())
+                .map(|l| l.entry),
         );
     });
     rx
@@ -1604,6 +1791,24 @@ pub fn open(
     open_with_state(path, kind, sample_rate, saved, None)
 }
 
+/// [`open`] addressing one plugin inside a multi-plugin file (CLAP).
+pub fn open_pid(
+    path: &Path,
+    kind: VstKind,
+    plugin_id: Option<&str>,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    patch: Option<&VstPatch>,
+) -> Result<VstLoad, String> {
+    let path = path.to_path_buf();
+    let saved = saved.map(|s| s.to_vec());
+    let patch = patch.cloned();
+    let plugin_id = plugin_id.map(|s| s.to_string());
+    on_gui_thread(move || {
+        open_inner(&path, kind, plugin_id.as_deref(), sample_rate, saved.as_deref(), patch.as_ref())
+    })?
+}
+
 /// v20 (`open` + a VST3 patch): the chunk is applied to the fresh
 /// instance FIRST, then the patch's (id, value) parameter list (v23) —
 /// descriptors, cells, and the plugin's own patch all come up in the
@@ -1619,10 +1824,7 @@ pub fn open_with_state(
     saved: Option<&[f32]>,
     patch: Option<&VstPatch>,
 ) -> Result<VstLoad, String> {
-    let path = path.to_path_buf();
-    let saved = saved.map(|s| s.to_vec());
-    let patch = patch.cloned();
-    on_gui_thread(move || open_inner(&path, kind, sample_rate, saved.as_deref(), patch.as_ref()))?
+    open_pid(path, kind, None, sample_rate, saved, patch)
 }
 
 /// [`open`]'s body. Runs ON the VST GUI thread (the proxy above, or a
@@ -1631,6 +1833,7 @@ pub fn open_with_state(
 fn open_inner(
     path: &Path,
     kind: VstKind,
+    plugin_id: Option<&str>,
     sample_rate: u32,
     saved: Option<&[f32]>,
     patch: Option<&VstPatch>,
@@ -1643,10 +1846,25 @@ fn open_inner(
             .map_err(|w| format!("Windows plugin '{}' unavailable: {w}", path.display()))?;
     }
     let _loader = vst_loader_lock();
+    if kind == VstKind::Clap {
+        // CLAP is a fully separate backend (src/claphost.rs); the VST
+        // loader lock covers it too — dlopen/factory bootstrap are just as
+        // process-global here. The chunk patch (project persistence) rides
+        // `clap.state`; parameters land as events on the first RT block.
+        let entry = crate::claphost::open_unlocked(
+            path,
+            plugin_id,
+            sample_rate,
+            saved,
+            patch.map(|x| x.chunk.as_slice()),
+        )?;
+        return Ok(VstLoad { entry });
+    }
     let entry = match kind {
         VstKind::V3 => open_v3(path, sample_rate, saved, patch)?,
         // VST2 editors edit the live instance: no chunk round-trip exists.
         VstKind::V2 => open_v2(path, sample_rate, saved)?,
+        VstKind::Clap => unreachable!(),
     };
     Ok(VstLoad {
         entry: Arc::new(entry),
@@ -2630,6 +2848,13 @@ impl vst2::host::Host for StubHost {
 mod tests {
     use super::*;
 
+    /// Test entries open as concrete VST stage entries; several tests
+    /// (measure/note_on/field access) need the concrete type.
+    fn rt(e: &Arc<dyn StageEntry>) -> &RtStageEntry {
+        e.as_any().downcast_ref::<RtStageEntry>().expect("VST stage entry")
+    }
+
+
     /// v17 regression: `open_v3` must NOT seed from reported `default_value`
     /// metadata or write params back on a fresh (unsaved) open. Dexed and
     /// JS80P advertise `Output`/level defaults of 0.0 while carrying their
@@ -2780,7 +3005,7 @@ mod tests {
             return;
         }
         let load = open(&bundle, VstKind::V3, 48_000, None).expect("open vitalium");
-        let entry = load.entry;
+        let entry = rt(&load.entry);
         let parent = bundle.parent().unwrap();
         // The crash window: scan the folder WHILE this instance is live.
         let entries = scan(&[parent.to_path_buf()]);
@@ -2831,7 +3056,7 @@ mod tests {
                 return;
             }
         };
-        let entry = &load.entry;
+        let entry = rt(&load.entry);
         // Pre Gain has the strongest clean response on this build (probe:
         // norm 0→1 swings the noise peak ~2.2×); Post Gain 0 was disproven
         // as a mute control (bottoms out near −1 dB on this build).
@@ -2960,7 +3185,7 @@ mod tests {
                 return;
             }
         };
-        let entry = &load.entry;
+        let entry = rt(&load.entry);
         let pre = match entry.descs().iter().position(|d| d.name == "Pre Gain") {
             Some(k) => k,
             None => {
@@ -3058,7 +3283,7 @@ mod tests {
             let Ok(load) = open(&e.path, VstKind::V3, 48_000, None) else {
                 continue;
             };
-            load.entry.note_on(0, 60, 110);
+            rt(&load.entry).note_on(0, 60, 110);
             let mut peak = 0.0f32;
             // ~1 second at 48k in ring-sized chunks.
             for _ in 0..96 {
@@ -3303,7 +3528,7 @@ mod tests {
         );
         let p = root.join("plugins/Monk.dll.so");
         assert!(is_wine_bridged(&p));
-        let err = open_inner(&p, VstKind::V2, 48_000, None, None)
+        let err = open_inner(&p, VstKind::V2, None, 48_000, None, None)
             .err()
             .expect("dead Wine must be refused BEFORE any dlopen");
         assert!(err.contains("unavailable"), "{err}");
@@ -3329,11 +3554,11 @@ mod tests {
         );
         std::env::set_var("SLOOPER_BRIDGE_RETRY_SECS", "0");
         let p = root.join("plugins/Monk.dll.so");
-        let err = open_inner(&p, VstKind::V2, 48_000, None, None)
+        let err = open_inner(&p, VstKind::V2, None, 48_000, None, None)
             .err()
             .expect("first attempt refused while the probe sees a dead Wine");
         assert!(err.contains("unavailable"), "first refusal: {err}");
-        let err2 = open_inner(&p, VstKind::V2, 48_000, None, None)
+        let err2 = open_inner(&p, VstKind::V2, None, 48_000, None, None)
             .err()
             .expect("the synthetic wrapper still fails the REAL load");
         assert!(
