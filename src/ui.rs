@@ -1102,6 +1102,24 @@ pub struct App {
     /// v34 R5: pad rows of the open kit editor publish their rects here
     /// (per track) so the central OS-drop drain can hit-test them.
     kit_drop_rects: Vec<(usize, usize, egui::Rect)>,
+    /// v34 R13: (track, lane, clip, node) of an in-progress MAIN-GUI
+    /// automation node drag (nodes are grabbed right off the clip).
+    auto_node: Option<(usize, usize, usize, usize)>,
+    /// v34 R13: screen dots of every painted automation node (asset,
+    /// node index, pos) refreshed during paint; the global wheel router
+    /// reads them at the START of the next frame so bending a node
+    /// happens before any ScrollArea can eat the wheel.
+    auto_node_pts: Vec<(usize, usize, egui::Pos2)>,
+    /// v34 R13: press point of a strip press that started no gesture; a
+    /// release within a few px of it counts as a clip-body CLICK (egui's
+    /// clicked() is dead after the container's dragged() ran — the repo's
+    /// known trap), which inserts an automation node.
+    auto_press_pt: Option<egui::Pos2>,
+    /// v34 R13: release point of a body click on the grid this frame,
+    /// captured at the very top of ui_root (an `input_mut` query
+    /// anywhere else runs AFTER egui's per-frame housekeeping, which
+    /// swallows every later pointer-press event in the frame).
+    auto_click_pt: Option<egui::Pos2>,
     /// sampler drop zone listened, so dropping samples from the file
     /// manager did nothing anywhere else in the app.
     os_drops: Vec<std::path::PathBuf>,
@@ -1204,6 +1222,10 @@ pub struct App {
     /// v23: filter text of the parameter window (huge plugins expose
     /// thousands of params — without a filter they are unusable).
     params_filter: String,
+    /// v34 R2: name buffer + cached preset list for the parameter bar.
+    params_preset_name: String,
+    params_presets: Vec<String>,
+    params_presets_for: String,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -1599,6 +1621,13 @@ impl App {
             export_sel: false,
             export_path: String::new(),
             kit_drop_rects: Vec::new(),
+            auto_node: None,
+            auto_node_pts: Vec::new(),
+            params_preset_name: String::new(),
+            params_presets: Vec::new(),
+            params_presets_for: String::new(),
+            auto_press_pt: None,
+            auto_click_pt: None,
             export_fmt: 0,
             last_midi: None,
             midi_log: VecDeque::with_capacity(300),
@@ -2464,6 +2493,99 @@ impl App {
         }
     }
 
+    /// v34 R2: folder holding the user presets of one plugin (by name).
+    /// Sanitized so a weird plugin name can never escape the folder.
+    fn param_preset_dir(plugin: &str) -> PathBuf {
+        let slug: String = plugin
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let slug = slug.trim_matches('_').to_string();
+        crate::samples808::data_dir()
+            .join("plugin-presets")
+            .join(if slug.is_empty() { "plugin".into() } else { slug })
+    }
+    /// v34 R2: preset file names shown in the picker (sorted, .json).
+    fn list_param_presets(plugin: &str) -> Vec<String> {
+        let dir = Self::param_preset_dir(plugin);
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
+                    if let Some(stem) = e.path().file_stem() {
+                        out.push(stem.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+    /// v34 R2: snapshot the plugin's current parameter values to a named
+    /// user preset. Works for EVERY hosted plugin — the values ride the
+    /// same host-side cell mirror the sliders and the persistence tick
+    /// use, so no plugin cooperation is required.
+    fn save_param_preset(&mut self, target: GuiTarget, name: &str) -> Result<usize, String> {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            return Err("pick a preset name (no path characters)".into());
+        }
+        let entry = self
+            .target_entry(target)
+            .ok_or_else(|| "plugin is gone".to_string())?;
+        let vals: Vec<(usize, f32)> = entry
+            .descs()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.writable)
+            .map(|(k, _)| (k, entry.params().get(k)))
+            .collect();
+        let json: String = serde_json::to_string(
+            &vals
+                .iter()
+                .map(|(k, v)| (*k as i64, *v as f64))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| e.to_string())?;
+        let dir = Self::param_preset_dir(entry.name());
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("{name}.json")), json).map_err(|e| e.to_string())?;
+        Ok(vals.len())
+    }
+    /// v34 R2: restore a named user preset (writes each value through the
+    /// live entry, so audio and any open editor follow immediately).
+    fn apply_param_preset(&mut self, target: GuiTarget, name: &str) -> Result<usize, String> {
+        let entry = self
+            .target_entry(target)
+            .ok_or_else(|| "plugin is gone".to_string())?;
+        let p = Self::param_preset_dir(entry.name()).join(format!("{name}.json"));
+        let raw = std::fs::read_to_string(p).map_err(|e| format!("load preset: {e}"))?;
+        let vals: Vec<(i64, f64)> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let n_des = entry.descs().len();
+        let mut n = 0;
+        for (k, v) in vals {
+            let k = k as usize;
+            if k < n_des && entry.descs()[k].writable {
+                entry.set_param(k, v as f32);
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+    fn delete_param_preset(&mut self, target: GuiTarget, name: &str) -> Result<(), String> {
+        let entry = self
+            .target_entry(target)
+            .ok_or_else(|| "plugin is gone".to_string())?;
+        let p = Self::param_preset_dir(entry.name()).join(format!("{name}.json"));
+        std::fs::remove_file(p).map_err(|e| format!("delete preset: {e}"))
+    }
+
     /// v23: the stand-in parameter window for a plugin whose own window is
     /// banned. Sliders ride the same cell mirror the plugin GUI drives
     /// (VST3 command ring / VST2 audio-thread poll), and the persistence
@@ -2479,6 +2601,10 @@ impl App {
         };
         let mut open = true;
         let mut new_filter = self.params_filter.clone();
+        // v34 R2: preset-bar actions collected in the closure, run after.
+        let mut do_save = false;
+        let mut do_del = false;
+        let mut load_name: Option<String> = None;
         egui::Window::new(format!("{} \u{2014} parameters", entry.name()))
             .id(egui::Id::new("slooper_params_win"))
             .default_pos([420.0, 140.0])
@@ -2509,6 +2635,42 @@ impl App {
                     .small(),
                 );
                 ui.separator();
+                // v34 R2: user preset bar — save/load the CURRENT value
+                // snapshot for ANY hosted plugin (works even when the
+                // plugin has no usable window of its own).
+                if self.params_presets_for != entry.name() {
+                    let nm = entry.name().to_string();
+                    self.params_presets_for = nm.clone();
+                    self.params_presets = Self::list_param_presets(&nm);
+                }
+                ui.horizontal(|ui| {
+                    ui.label("user preset");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.params_preset_name)
+                            .hint_text("preset name")
+                            .desired_width(130.0),
+                    );
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                    egui::ComboBox::from_id_salt("slooper_param_presets")
+                        .selected_text("Load\u{25be}")
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            let list = self.params_presets.clone();
+                            for p in list {
+                                if ui.selectable_label(false, &p).clicked() {
+                                    load_name = Some(p);
+                                }
+                            }
+                            if !self.params_presets.is_empty() {
+                                ui.separator();
+                                if ui.button("delete named preset").clicked() {
+                                    do_del = true;
+                                }
+                            }
+                        });
+                });
                 let ql = new_filter.trim().to_lowercase();
                 let rows: Vec<(usize, String)> = entry
                     .descs()
@@ -2535,6 +2697,35 @@ impl App {
                     });
             });
         self.params_filter = new_filter;
+        // v34 R2: run the preset-bar actions collected this frame.
+        if do_save {
+            let nm = self.params_preset_name.clone();
+            match self.save_param_preset(target, &nm) {
+                Ok(n) => {
+                    self.status = format!("preset \u{201c}{nm}\u{201d} saved ({n} params)");
+                    let p = self.params_presets_for.clone();
+                    self.params_presets = Self::list_param_presets(&p);
+                }
+                Err(e) => self.status = format!("preset: {e}"),
+            }
+        }
+        if let Some(nm) = load_name {
+            match self.apply_param_preset(target, &nm) {
+                Ok(n) => self.status = format!("preset \u{201c}{nm}\u{201d} loaded ({n} params)"),
+                Err(e) => self.status = format!("preset: {e}"),
+            }
+        }
+        if do_del {
+            let nm = self.params_preset_name.clone();
+            match self.delete_param_preset(target, &nm) {
+                Ok(()) => {
+                    self.status = format!("preset \u{201c}{nm}\u{201d} deleted");
+                    let p = self.params_presets_for.clone();
+                    self.params_presets = Self::list_param_presets(&p);
+                }
+                Err(e) => self.status = format!("preset: {e}"),
+            }
+        }
         if !open {
             self.params_win = None;
         }
@@ -3267,6 +3458,12 @@ impl App {
         self.clip_resize = None;
         self.marquee = None;
         self.marquee_pending = None;
+        // v34 R16: the node grab holds raw (track,lane,clip) indices —
+        // deleting clips/assets mid-drag must not leave it re-pointed at
+        // a neighbour's node (and its guard masked every later press).
+        self.auto_node = None;
+        self.auto_press_pt = None;
+        self.auto_click_pt = None;
     }
 
     fn delete_selection(&mut self) {
@@ -9818,6 +10015,49 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // v34 R13: capture a body-click RELEASE once per frame, HERE at
+        // the top, before any panel's input queries have egui fold the
+        // event list. A release within a few px of this gesture's press
+        // is a click (egui's clicked() is dead after a container drag).
+        {
+            let (rel, _pressed) = ui.ctx().input_mut(|i| {
+                let mut rel = None;
+                let mut pressed = false;
+                for e in i.events.iter() {
+                    if let egui::Event::PointerButton {
+                        pressed: p,
+                        button: egui::PointerButton::Primary,
+                        pos,
+                        ..
+                    } = e
+                    {
+                        if *p {
+                            pressed = true;
+                        } else {
+                            rel = Some(*pos);
+                        }
+                    }
+                }
+                (rel, pressed)
+            });
+            if let Some(rp) = rel {
+                if let Some(pp) = self.auto_press_pt {
+                    if (pp - rp).length() <= 4.0 {
+                        self.auto_click_pt = Some(rp);
+                        // A zero-movement press that armed a clip drag or
+                        // an edge resize was really a click: drop those
+                        // now (egui's drag_stopped never fires without
+                        // movement, so they would sit until the watchdog
+                        // and mask the click from the grid).
+                        if rp == pp {
+                            self.drag_clip = None;
+                            self.clip_resize = None;
+                        }
+                    }
+                }
+                self.auto_press_pt = None;
+            }
+        }
         // v25: theme toggle (Settings ▸ GUI). Panels and windows switch;
         // the fixed-palette custom painters (grid, piano roll, meters) stay
         // as they are — deliberate, and stated in the settings help text.
@@ -9932,6 +10172,55 @@ impl App {
         // flick reports PIXELS.
         let mut zoom_ln = 0.0f32;
         let mut pan = 0.0f32;
+        // v34 R13: plain wheel over an automation NODE bends its
+        // curvature and is consumed HERE (before any panel or scroll
+        // area can claim it). Node dots were registered last frame.
+        let npoints = std::mem::take(&mut self.auto_node_pts);
+        if !npoints.is_empty() {
+            let hp = ui.ctx().input(|i| i.pointer.hover_pos());
+            if let Some(hp) = hp {
+                if let Some((asset, idx, _)) = npoints
+                    .iter()
+                    .find(|(_, _, p)| p.distance(hp) <= 8.0)
+                    .copied()
+                {
+                    let dy = ui.ctx().input_mut(|i| {
+                        let mut d = 0.0f32;
+                        i.events.retain(|e| match e {
+                            egui::Event::MouseWheel { delta, .. } => {
+                                d += delta.y;
+                                false
+                            }
+                            _ => true,
+                        });
+                        d
+                    });
+                    if dy != 0.0 {
+                        let bent = self
+                            .assets
+                            .get_mut(asset)
+                            .and_then(|a| a.automation.as_mut())
+                            .map(|arc| {
+                                if let Some(nd) =
+                                    std::sync::Arc::make_mut(arc).nodes.get_mut(idx)
+                                {
+                                    nd.c = (nd.c + dy.signum() * 0.1).clamp(-1.0, 1.0);
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or(false);
+                        if bent {
+                            self.push_project();
+                            self.status = "automation: curvature bent (wheel)".into();
+                        }
+                    }
+                }
+            }
+            // stale list intentionally dropped: paint repopulates it
+            // again during THIS frame.
+        }
         // v20 R4: TAKE, not copy — the rect re-registers every frame the
         // bpm box paints; if it stops painting (narrow window, different
         // chrome) the swallow zone must vanish with it instead of eating
@@ -10072,6 +10361,7 @@ impl App {
         // must also die on button-up, drag or no drag).
         if !ui.ctx().input(|i| i.pointer.any_down()) {
             self.scrub_drag = false;
+            self.auto_click_pt = None; // v34 R13: consumed (or missed)
             self.drag_clip = None;
             self.clip_resize = None;
             self.marquee = None;
@@ -13241,13 +13531,24 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         } else {
             "Open this plugin's GUI (its parameters live inside it)"
         };
-        if ui.small_button(label).on_hover_text(hover).clicked() {
+        let gbtn = ui.small_button(label).on_hover_text(hover);
+        if gbtn.clicked() {
             if is_vst {
                 app.toggle_synth_gui(t);
             } else {
                 app.synth_win = Some(t);
             }
         }
+        // v34 R2: right-click reaches the host-side parameter window +
+        // user-preset bar for ANY plugin — including ones whose own GUI
+        // works fine (a snapshot of everything you dialed, re-loadable).
+        gbtn.context_menu(|ui| {
+            if ui.button("user presets / parameters").clicked() {
+                app.params_win = Some(GuiTarget::Synth(t));
+                app.params_filter.clear();
+                ui.close();
+            }
+        });
     }
 }
 
@@ -13790,6 +14091,75 @@ fn x_of(x0: f32, pos: u64, sr: f64, px: f64) -> f32 {
 }
 
 /// Samples at x within a strip starting at `x0`.
+/// Screen center of an automation clip's node (v34 R13). The paint and
+/// every gesture share this mapping — pins read the same truth the
+/// pointer hit-tests against.
+fn auto_node_center(
+    app: &App,
+    c: &Clip,
+    n: &crate::automation::Node,
+    x0: f32,
+    sr: f64,
+    px: f64,
+    rect: egui::Rect,
+) -> Option<egui::Pos2> {
+    let (mn, mx) = app
+        .assets
+        .get(c.asset as usize)?
+        .automation
+        .as_ref()
+        .map(|a| crate::automation::target_range(&a.target))
+        .unwrap_or((0.0, 1.0));
+    let x = x_of(x0, c.pos.saturating_add(n.t.max(0) as u64), sr, px);
+    let f = ((n.v - mn) / (mx - mn).max(1e-9)).clamp(0.0, 1.0);
+    let y = rect.max.y - 3.0 - f * (rect.height() - 6.0).max(1.0);
+    Some(egui::pos2(x, y))
+}
+
+/// Value -> screen y on the clip rect (matches the paint + hit mapping).
+fn auto_map_y(app: &App, c: &Clip, v: f32, rect: egui::Rect) -> f32 {
+    let (mn, mx) = app
+        .assets
+        .get(c.asset as usize)
+        .and_then(|a| a.automation.as_ref().map(|a| crate::automation::target_range(&a.target)))
+        .unwrap_or((0.0, 1.0));
+    let f = ((v - mn) / (mx - mn).max(1e-9)).clamp(0.0, 1.0);
+    rect.max.y - 3.0 - f * (rect.height() - 6.0).max(1.0)
+}
+
+/// Nearest node whose dot sits within `r` px of `pt` (v34 R13).
+/// (x0, sr, px) arrive as one tuple so the signature stays in clippy's
+/// good books (v34 R13).
+fn auto_node_hit(
+    app: &App,
+    c: &Clip,
+    pt: egui::Pos2,
+    r: f32,
+    grid: (f32, f64, f64),
+    rect: egui::Rect,
+) -> Option<usize> {
+    let (x0, sr, px) = grid;
+    let auto = app.assets.get(c.asset as usize)?.automation.clone()?;
+    auto.nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| Some((i, auto_node_center(app, c, n, x0, sr, px, rect)?)))
+        .filter(|(_, p)| p.distance(pt) <= r)
+        .min_by(|a, b| a.1.distance(pt).total_cmp(&b.1.distance(pt)))
+        .map(|(i, _)| i)
+}
+
+/// Pointer y -> automation value on the clip's rect (inverse mapping).
+fn auto_val_at_y(app: &App, c: &Clip, y: f32, rect: egui::Rect) -> f32 {
+    let (mn, mx) = app
+        .assets
+        .get(c.asset as usize)
+        .and_then(|a| a.automation.as_ref().map(|a| crate::automation::target_range(&a.target)))
+        .unwrap_or((0.0, 1.0));
+    let f = ((rect.max.y - 3.0 - y) / (rect.height() - 6.0).max(1.0)).clamp(0.0, 1.0);
+    mn + f * (mx - mn)
+}
+
 fn s_at(x0: f32, x: f32, sr: f64, px: f64) -> u64 {
     (((x - x0).max(0.0) as f64 / px) * sr) as u64
 }
@@ -14152,6 +14522,67 @@ fn lane_row(
         } else {
             fill
         };
+        // v34 R13: automation clips show their curve in-line (faintly
+        // always, brighter on hover) and paint NODE DOTS on hover —
+        // grabbable right here, no manager round-trip.
+        if is_auto {
+            if let Some(auto) = app
+                .assets
+                .get(c.asset as usize)
+                .and_then(|a| a.automation.clone())
+            {
+                let hov = hover_pt.is_some_and(|p| cres.contains(p));
+                let span = c.span(alen).max(1);
+                let steps = 48u64;
+                let mut prev: Option<egui::Pos2> = None;
+                for i in 0..=steps {
+                    let off = span.saturating_mul(i) / steps;
+                    let t = (off + c.cut) as i64;
+                    let p = egui::pos2(
+                        x_of(x0, c.pos.saturating_add(off), sr, px),
+                        auto_map_y(app, c, auto.eval(t.max(0)), cres),
+                    );
+                    if let Some(q) = prev {
+                        ui.painter().line_segment(
+                            [q, p],
+                            egui::Stroke::new(
+                                1.2,
+                                if hov {
+                                    Color32::from_rgb(255, 165, 160)
+                                } else {
+                                    Color32::from_rgb(225, 120, 120)
+                                },
+                            ),
+                        );
+                    }
+                    prev = Some(p);
+                }
+                if hover_pt.is_some() {
+                    for (i, nd) in auto.nodes.iter().enumerate() {
+                        if let Some(p) = auto_node_center(app, c, nd, x0, sr, px, cres) {
+                            app.auto_node_pts.push((c.asset as usize, i, p));
+                        }
+                    }
+                }
+                if hov {
+                    let hp = hover_pt.unwrap_or(cres.center());
+                    for nd in auto.nodes.iter() {
+                        if let Some(p) = auto_node_center(app, c, nd, x0, sr, px, cres) {
+                            let big = p.distance(hp) <= 8.0;
+                            ui.painter().circle_filled(
+                                p,
+                                if big { 4.5 } else { 3.0 },
+                                if big {
+                                    Color32::from_rgb(255, 225, 130)
+                                } else {
+                                    Color32::from_rgb(255, 200, 110)
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // v34 R14: a left pad is the mirror of the silence tail — dark
         // hatch in front, the waveform anchored where the AUDIO starts
         // (never stretched to fill the padded rect).
@@ -14474,19 +14905,90 @@ fn lane_row(
     // That drift was the reported "clip length cannot be edited / notes
     // cannot be adjusted" bug in both grids. Press-arming also lets an
     // edge grab SELECT the clip on the way into the drag.
+    // v34 R13 fix: the node-update branch lives inside a press-pointer-pos
+    // gate that is FALSE on the release frame, so the grab could never end
+    // there and every later press saw a stuck gesture. Commit the moment
+    // the button is up, before anything else reads the gesture fields.
+    if let Some((tt, kk, cc, _)) = app.auto_node {
+        // NOTE: `pointer.any_down()` is one frame LATE after a
+        // pointer-warp release (the harness moves and releases in one
+        // frame, so the button state still reads down when the event
+        // list is processed). Gate on the release EVENT itself instead.
+        let released = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    }
+                )
+            })
+        });
+        if released {
+            if let Some(c0) = app
+                .arr
+                .tracks
+                .get(tt)
+                .and_then(|tr| tr.lanes.get(kk))
+                .and_then(|l| l.clips.get(cc))
+                .copied()
+            {
+                if let Some(arc) = app
+                    .assets
+                    .get_mut(c0.asset as usize)
+                    .and_then(|a| a.automation.as_mut())
+                {
+                    std::sync::Arc::make_mut(arc).nodes.sort_by_key(|n| n.t);
+                }
+            }
+            app.auto_node = None;
+            app.push_project();
+            app.status =
+                "automation: node edited \u{b7} drag dots, click to add, RMB deletes, wheel bends"
+                    .into();
+        }
+    }
     let no_gesture = app.drag_clip.is_none()
         && app.clip_resize.is_none()
         && app.marquee.is_none()
         && app.marquee_pending.is_none()
+        && app.auto_node.is_none()
         && !app.scrub_drag;
-    if no_gesture && resp.is_pointer_button_down_on() {
+    // v34 R13: PRIMARY only — is_pointer_button_down_on() fires for the
+    // right button too, which armed a node grab and then blocked the
+    // RMB-to-delete click behind the gesture guard.
+    let primary_down_here = resp.is_pointer_button_down_on()
+        && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+    if no_gesture && primary_down_here {
         if let Some(pt) = resp.interact_pointer_pos() {
             if rect.contains(pt) {
                 app.last_click_track = Some(t);
                 let mods = ui.input(|i| i.modifiers);
                 let pos = s_at(x0, pt.x, sr, px);
-                // Edge of ANY clip wins over everything: trim/extend.
-                if let Some((ci, edge)) = edge_at(app, pt) {
+                // v34 R13: a NODE DOT beats every clip gesture — the dot
+                // is what the user sees under the pointer, even when it
+                // happens to sit on the clip's edge (t=0 / t=end nodes).
+                let node_press = clips
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (c, _))| {
+                        app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto())
+                    })
+                    .find_map(|(ci, (c, _))| {
+                        let alen0 = app.asset_len(c.asset);
+                        let cres0 = egui::Rect::from_min_max(
+                            egui::pos2(x_of(x0, c.pos, sr, px), rect.min.y + 1.0),
+                            egui::pos2(x_of(x0, c.end(alen0), sr, px), rect.max.y - 1.0),
+                        );
+                        auto_node_hit(app, c, pt, 8.0, (x0, sr, px), cres0).map(|idx| (ci, idx))
+                    });
+                app.auto_press_pt = Some(pt);
+                if let Some((ci, idx)) = node_press {
+                    app.auto_node = Some((t, k, ci, idx));
+                    app.select_one((t, k, ci));
+                } else if let Some((ci, edge)) = edge_at(app, pt) {
                     // v34 R18: modifiers drive SELECTION even on an edge
                     // grab. Clips sit shoulder-to-shoulder on real
                     // timelines, so most clicks land inside the 7 px edge
@@ -14519,6 +15021,7 @@ fn lane_row(
                     match hit {
                         Some(ci) => {
                             let id = (t, k, ci);
+                            {
                             if mods.command {
                                 app.select_toggle(id);
                             } else if mods.shift && app.sel_anchor.is_some() {
@@ -14559,6 +15062,7 @@ fn lane_row(
                                     grab: base0.saturating_sub(pos),
                                     lane0,
                                 });
+                            }
                             }
                         }
                         None => {
@@ -14701,6 +15205,56 @@ fn lane_row(
                         };
                     }
                 }
+            } else if let Some((tt, kk, cc, idx)) = app.auto_node {
+                // v34 R13: a grabbed node rides the pointer; release
+                // sorts and syncs.
+                if !ui.input(|i| i.pointer.any_down()) {
+                    if let Some(c0) = app
+                        .arr
+                        .tracks
+                        .get(tt)
+                        .and_then(|tr| tr.lanes.get(kk))
+                        .and_then(|l| l.clips.get(cc))
+                        .copied()
+                    {
+                        if let Some(arc) = app
+                            .assets
+                            .get_mut(c0.asset as usize)
+                            .and_then(|a| a.automation.as_mut())
+                        {
+                            std::sync::Arc::make_mut(arc).nodes.sort_by_key(|n| n.t);
+                        }
+                    }
+                    app.auto_node = None;
+                    app.push_project();
+                    app.status = (
+                        "automation: node edited \u{b7} drag dots, click to add,                          RMB deletes, wheel bends"
+                    )
+                    .into();
+                } else if tt == t && kk == k && cc < clips.len() {
+                    if let Some(pp) = resp.interact_pointer_pos() {
+                        let c0 = clips[cc].0;
+                        let alen0 = app.asset_len(c0.asset);
+                        let cres0 = egui::Rect::from_min_max(
+                            egui::pos2(x_of(x0, c0.pos, sr, px), rect.min.y + 1.0),
+                            egui::pos2(x_of(x0, c0.end(alen0), sr, px), rect.max.y - 1.0),
+                        );
+                        let nt = s_at(x0, pp.x, sr, px)
+                            .saturating_sub(c0.pos)
+                            .saturating_add(c0.cut) as i64;
+                        let v = auto_val_at_y(app, &c0, pp.y, cres0);
+                        if let Some(arc) = app
+                            .assets
+                            .get_mut(c0.asset as usize)
+                            .and_then(|a| a.automation.as_mut())
+                        {
+                            if let Some(nd) = std::sync::Arc::make_mut(arc).nodes.get_mut(idx) {
+                                nd.t = nt.max(0);
+                                nd.v = v;
+                            }
+                        }
+                    }
+                }
             } else if let Some(d) = app.drag_clip.clone() {
                 let new_base = snap_start(s_at(x0, pt.x, sr, px).saturating_add(d.grab), snapu);
                 let dx = new_base as i64 - d.base0 as i64;
@@ -14788,6 +15342,88 @@ fn lane_row(
     }
     if resp.drag_stopped() && (app.drag_clip.take().is_some() || app.clip_resize.take().is_some()) {
         app.push_project();
+    }
+
+    // (auto_click_pt is cleared once per frame at the end of
+    // ui_root — every lane has to see it first.)
+    let body_click_pt = app.auto_click_pt;
+    // v34 R13: CLICK on the body of an automation clip (away from any
+    // node) inserts a node at the pointer; RMB on a node deletes it;
+    // the wheel over a node bends its curvature (and is consumed so the
+    // scroll area never scrolls instead).
+    if app.auto_node.is_none()
+        && app.drag_clip.is_none()
+        && app.clip_resize.is_none()
+        && app.marquee.is_none()
+    {
+        if let Some(hp) = hover_pt {
+            for (ci, (c, _)) in clips.iter().enumerate() {
+                let _ = ci;
+                let alen = app.asset_len(c.asset);
+                if !app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto()) {
+                    continue;
+                }
+                let cres = egui::Rect::from_min_max(
+                    egui::pos2(x_of(x0, c.pos, sr, px), rect.min.y + 1.0),
+                    egui::pos2(x_of(x0, c.end(alen), sr, px), rect.max.y - 1.0),
+                );
+                if !cres.contains(hp) {
+                    continue;
+                }
+                let hit = auto_node_hit(app, c, hp, 8.0, (x0, sr, px), cres);
+                if let Some(idx) = hit {
+                    if resp.secondary_clicked() {
+                        let left = app
+                            .assets
+                            .get_mut(c.asset as usize)
+                            .and_then(|a| a.automation.as_mut())
+                            .map(|arc| {
+                                let arc = std::sync::Arc::make_mut(arc);
+                                if idx < arc.nodes.len() {
+                                    arc.nodes.remove(idx);
+                                }
+                                arc.nodes.len()
+                            });
+                        if left.is_some() {
+                            app.push_project();
+                            app.status = format!(
+                                "automation: node removed ({} left) \u{b7} click clip to add",
+                                left.unwrap_or(0)
+                            );
+                        }
+                    }
+                } else if let Some(bp) = body_click_pt {
+                    if !cres.contains(bp) || hit.is_some() {
+                        continue;
+                    }
+                    let tnew = (s_at(x0, bp.x, sr, px)
+                        .saturating_sub(c.pos)
+                        .saturating_add(c.cut)) as i64;
+                    let v = auto_val_at_y(app, c, bp.y, cres);
+                    let n_nodes = app
+                        .assets
+                        .get_mut(c.asset as usize)
+                        .and_then(|a| a.automation.as_mut())
+                        .map(|arc| {
+                            let arc = std::sync::Arc::make_mut(arc);
+                            arc.nodes.push(crate::automation::Node {
+                                t: tnew.max(0),
+                                v,
+                                c: 0.0,
+                            });
+                            arc.nodes.sort_by_key(|n| n.t);
+                            arc.nodes.len()
+                        });
+                    if n_nodes.is_some() {
+                        app.push_project();
+                        app.status = format!(
+                            "automation: node added ({} nodes) \u{b7} wheel bends, RMB deletes",
+                            n_nodes.unwrap_or(0)
+                        );
+                    }
+                }
+            }
+        }
     }
     // v34 R18: the old release-time `clicked()` re-selection block is
     // GONE. Every press inside this strip already selects/scrubs above
@@ -19918,10 +20554,13 @@ mod tests {
         // clean refusal) BEFORE the temp plugin dir is removed: plugins load
         // their UI assets lazily from beside the binary, and pulling the file
         // out from under effEditOpen kills the process (GL-path crash).
-        let editor = app
-            .fx_vst_editors
-            .remove(&(0, 0))
-            .expect("adding an editor-capable plugin opens its own window");
+        // v23's crash guard opens the window only after the async editor
+        // probe clears the plugin, which can trail the entry landing by
+        // real-time frames — pump for the editor, don't demand it on the
+        // landing tick (environment-timing flake: slow X/wine states
+        // stretched the probe and this raced).
+        let editor = loop_pump(&mut app, &ctx, |a| a.fx_vst_editors.remove(&(0, 0)))
+        .expect("adding an editor-capable plugin opens its own window");
         let t0 = std::time::Instant::now();
         loop {
             if editor.painted() || editor.open_failed() || editor.is_closed() {
@@ -20457,6 +21096,36 @@ mod tests {
         hit.map(|c| egui::Rect::from_center_size(c, egui::vec2(6.0, 10.0)))
     }
 
+    fn galley_at_last(app: &mut App, ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().rev().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text().contains(needle) {
+                    // `galley.rect` is LOCAL to the shape; the absolute
+                    // center is `t.pos + (local.center() - local.min)`.
+                    // Adding then subtracting `t.pos` (the old code)
+                    // collapsed to the raw local center and pointed every
+                    // click at the screen origin.
+                    let local = t.galley.rect;
+                    return Some(t.pos + (local.center() - local.min));
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit.map(|c| egui::Rect::from_center_size(c, egui::vec2(6.0, 10.0)))
+    }
+
     /// Biggest painted rect of an exact fill color.
     fn painted_rect(app: &mut App, ctx: &egui::Context, rgb: (u8, u8, u8)) -> Option<egui::Rect> {
         let raw = egui::RawInput {
@@ -20533,6 +21202,24 @@ mod tests {
         out.textures_delta.clear();
         rects.sort_by(|a, b| a.min.x.partial_cmp(&b.min.x).unwrap());
         rects
+    }
+
+    /// Pump the UI + logic tick until `get()` yields a value (or give up
+    /// after ~10 real seconds). For state that lands on async threads.
+    fn loop_pump<T>(
+        app: &mut App,
+        ctx: &egui::Context,
+        mut get: impl FnMut(&mut App) -> Option<T>,
+    ) -> Option<T> {
+        for _ in 0..400 {
+            if let Some(v) = get(app) {
+                return Some(v);
+            }
+            frame(app, ctx, vec![]);
+            logic_tick(app);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        get(app)
     }
 
     fn click_pt(app: &mut App, ctx: &egui::Context, p: egui::Pos2) {
@@ -25463,6 +26150,179 @@ mod tests {
         app.kit_mut(1).clear();
         app.load_kits(&pj.drum_kits, pj.drum.as_ref());
         assert_eq!(app.kit(1)[0].asset_path, hat.to_string_lossy(), "project load restores");
+    }
+
+    /// One frame, returning the FILLED NODE DOTS painted for automation
+    /// clips (v34 R13 yellow circles).
+    fn node_dots(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<egui::Pos2> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut dots = Vec::new();
+        for sh in out.shapes.iter() {
+            if let egui::epaint::Shape::Circle(c) = &sh.shape {
+                let fill = c.fill;
+                if (fill == egui::Color32::from_rgb(255, 200, 110))
+                    || (fill == egui::Color32::from_rgb(255, 225, 130))
+                {
+                    dots.push(c.center);
+                }
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        dots
+    }
+
+    /// v34 R13: automation nodes render on hover IN THE MAIN GUI and are
+    /// directly draggable; click adds, RMB deletes, wheel bends curvature.
+    #[test]
+    fn v34_auto_nodes_edit_in_main_gui() {
+        use crate::automation::{Automation, Node, TARGET_TRACK_VOL};
+        let mut app = headless_app("autogui");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let mut auto = Automation {
+            target: TARGET_TRACK_VOL.to_string(),
+            len_samples: 48_000,
+            nodes: vec![
+                Node { t: 0, v: 0.0, c: 0.0 },
+                Node { t: 48_000, v: 1.0, c: 0.0 },
+            ],
+        };
+        auto.normalize(0, f32::INFINITY);
+        let idx = app.assets.len();
+        app.assets.push(crate::assets::Asset {
+            id: idx as u32 + 1000,
+            name: "volride".into(),
+            path: app.record_dir().join("volride.slauto"),
+            data: std::sync::Arc::from(vec![0.0f32; 0]),
+            dirty: false,
+            pattern: None,
+            automation: Some(std::sync::Arc::new(auto)),
+        });
+        app.arr.insert(0, 0, crate::arrange::Clip::new(idx as u32, 0));
+        frame(&mut app, &ctx, vec![]);
+        // The clip paints its name — hover THAT to wake the node dots.
+        let clipc = galley_at(&mut app, &ctx, "volride")
+            .expect("automation clip painted")
+            .center();
+
+        let dots = node_dots(&mut app, &ctx, vec![moved(clipc)]);
+        assert!(dots.len() >= 2, "hover paints one dot per node, got {dots:?}");
+        let mut dots = dots;
+        dots.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let right = dots[dots.len() - 1];
+
+        // --- drag the right node left/down ---
+        frame(&mut app, &ctx, vec![moved(right)]);
+        frame(&mut app, &ctx, vec![moved(right + egui::vec2(2.0, 0.0))]);
+        frame(&mut app, &ctx, vec![btn(right, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(right - egui::vec2(60.0, 0.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(right - egui::vec2(60.0, 25.0))],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(right - egui::vec2(60.0, 25.0), egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        let nd = &app.assets[idx].automation.as_ref().unwrap().nodes;
+        assert_eq!(nd.len(), 2, "drag must not add nodes");
+        assert!(
+            nd[1].t < 48_000 && nd[1].t > 24_000,
+            "end node dragged left: t={}",
+            nd[1].t
+        );
+        assert!(nd[1].v > 1.0, "end node dragged up: v={}", nd[1].v);
+
+        // --- click on the body (far from any dot) adds a node ---
+        // Layout can shift while editing (the grid scrolls, bars appear):
+        // re-derive the live geometry, exactly like a user's eyes do.
+        let before = nd.len();
+        let strip_mid = galley_at_last(&mut app, &ctx, "volride")
+            .expect("clip still painted")
+            .center();
+        let dots_now = node_dots(&mut app, &ctx, vec![moved(strip_mid)]);
+        let midx = (dots_now[0].x + dots_now[dots_now.len() - 1].x) * 0.5;
+        let clickp = egui::pos2(midx, strip_mid.y);
+        let near_dots = node_dots(&mut app, &ctx, vec![moved(clickp)]);
+        assert!(
+            near_dots.iter().all(|p| p.distance(clickp) > 10.0),
+            "click point must sit away from node dots"
+        );
+        click_pt(&mut app, &ctx, clickp);
+        let after = app.assets[idx].automation.as_ref().unwrap().nodes.len();
+        assert_eq!(
+            after,
+            before + 1,
+            "click on clip adds a node (status: {})",
+            app.status
+        );
+
+        // --- wheel over a node bends its curvature ---
+        let dots2 = node_dots(&mut app, &ctx, vec![moved(strip_mid)]);
+        assert!(!dots2.is_empty());
+        let left = dots2[0];
+        let c_before = app.assets[idx].automation.as_ref().unwrap().nodes[0].c;
+        frame(&mut app, &ctx, vec![moved(left)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 3.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Start,
+            }],
+        );
+        let c_after = app.assets[idx].automation.as_ref().unwrap().nodes[0].c;
+        assert_ne!(c_before, c_after, "wheel over node bends curvature");
+
+        // --- RMB on a node deletes it ---
+        let dots3 = node_dots(&mut app, &ctx, vec![moved(strip_mid)]);
+        let left = dots3[0];
+        frame(&mut app, &ctx, vec![moved(left)]);
+        frame(&mut app, &ctx, vec![btn(left, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(left, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let final_n = app.assets[idx].automation.as_ref().unwrap().nodes.len();
+        assert_eq!(final_n, after - 1, "RMB over a node deletes it");
+    }
+
+    /// v34 R2: user-preset storage layer — slug scoping, listing, hostile
+    /// names, and honest missing-plugin errors.
+    #[test]
+    fn v34_param_preset_storage_roundtrip() {
+        let mut app = headless_app("v34presets");
+        // Names slug into the sandboxed data dir; traversal cannot escape.
+        let d = App::param_preset_dir("../../evil/name");
+        let root = crate::samples808::data_dir().join("plugin-presets");
+        assert!(d.starts_with(&root) && !d.to_string_lossy().contains(".."));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("warmup.json"), "[[0,0.25],[3,1.0]]").unwrap();
+        let list = App::list_param_presets("../../evil/name");
+        assert_eq!(list, vec!["warmup".to_string()]);
+        // A hostile preset name is refused before any filesystem touch.
+        let bad = app.save_param_preset(GuiTarget::Synth(usize::MAX / 2), "../evil");
+        assert!(
+            matches!(&bad, Err(e) if e.contains("preset name")),
+            "traversal name must be rejected: {bad:?}"
+        );
+        // A real name against a missing plugin reports honestly.
+        let gone = app.save_param_preset(GuiTarget::Synth(usize::MAX / 2), "warmup");
+        assert!(matches!(&gone, Err(e) if e.contains("gone")), "{gone:?}");
     }
 
     /// v34 R15: dragging a rack row onto a sub-folder header moves the
