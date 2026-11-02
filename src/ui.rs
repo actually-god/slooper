@@ -443,6 +443,9 @@ struct AutoEdit {
     /// v0.15: MIDI manager recording — raw moves of the picked bindings
     /// draw the curve (as % of the target's range) instead of acting.
     rec: bool,
+    /// v34 R1: the window's snap selector (mirrored to App on change).
+    snap_on: bool,
+    snap_sub: usize,
     /// Engine position when REC was armed (nodes stamp relative to it).
     rec_start: i64,
     /// v26: canvas length unit — false = seconds, true = BARS of the
@@ -952,6 +955,13 @@ pub struct App {
     /// Index into [`SUBDIVISIONS`] for content quantize / clip snap.
     q_sub: usize,
     snap_sub: usize,
+    /// v34 R1: automation manager snap selector (its own, persisted).
+    auto_snap_on: bool,
+    auto_snap_sub: usize,
+    /// Asset id of the automation curve most recently created or
+    /// overwritten — the "Save (overwrite asset)" fallback when the
+    /// window was not opened from an automation asset.
+    last_auto_asset: Option<u32>,
     /// Quantize every fresh recording's content onto the grid.
     auto_quantize: bool,
     latency_ms: String,
@@ -1436,6 +1446,9 @@ impl App {
                 .unwrap_or(0),
             q_sub: sub_idx(cfg.q_sub),
             snap_sub: sub_idx(cfg.snap_sub),
+            auto_snap_on: cfg.auto_snap_on,
+            auto_snap_sub: sub_idx(cfg.auto_snap_sub),
+            last_auto_asset: None,
             auto_quantize: cfg.auto_quantize,
             latency_ms: if cfg.latency_ms == 0.0 {
                 "0".into()
@@ -3557,6 +3570,8 @@ impl App {
             preview_secs: self.preview_secs_f(),
             preview_track: self.preview_track.map(|t| t as u32),
             snap_on: self.snap_on,
+            auto_snap_on: self.auto_snap_on,
+            auto_snap_sub: SUBDIVISIONS[self.auto_snap_sub].0,
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
@@ -4116,6 +4131,7 @@ impl App {
             Arc::new(auto),
             false,
         ));
+        self.last_auto_asset = Some(id); // v34 R1
         let pos = snap_start(start, self.snap_unit());
         let nl0 = self.arr.tracks[i].lanes.len();
         let lane = self.arr.place_auto(i, Clip::new(id, pos), len as u64);
@@ -4240,6 +4256,7 @@ impl App {
             Arc::new(auto),
             false,
         ));
+        self.last_auto_asset = Some(id); // v34 R1
         let nl0 = self.arr.tracks[host].lanes.len();
         // v20 R3: ALWAYS a new child lane — the requirement's "child
         // track". `place_auto` would reuse lane 0/free lanes; stacking
@@ -4620,7 +4637,16 @@ impl App {
                 )
             }
         };
+        if let Some(k) = k {
+            // v34 R1: opening the manager on a curve makes it the
+            // overwrite target for later unsaved edits too.
+            if self.assets.get(k).is_some_and(|a| a.automation.is_some()) {
+                self.last_auto_asset = self.assets.get(k).map(|a| a.id);
+            }
+        }
         self.auto_edit = Some(Box::new(AutoEdit {
+            snap_on: self.auto_snap_on,
+            snap_sub: self.auto_snap_sub,
             asset: k,
             name,
             target,
@@ -5304,6 +5330,29 @@ impl App {
                                 }
                             }
                         });
+                    // ---- v34 R1: the manager's OWN snap selector ------
+                    // (persisted in config; previously the canvas only
+                    // ever beat-snapped in bars mode, with no choice)
+                    ui.separator();
+                    let mut so = ed.snap_on;
+                    if ui.checkbox(&mut so, "snap").changed() {
+                        ed.snap_on = so;
+                        self.auto_snap_on = so;
+                        self.save_config();
+                    }
+                    let mut ss = ed.snap_sub;
+                    egui::ComboBox::from_id_salt("auto_snap_sub_cb")
+                        .selected_text(SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].1)
+                        .show_ui(ui, |ui| {
+                            for (i, (c, l)) in SUBDIVISIONS.iter().enumerate() {
+                                ui.selectable_value(&mut ss, i, format!("{l} ({c}/beat)"));
+                            }
+                        });
+                    if ss != ed.snap_sub {
+                        ed.snap_sub = ss;
+                        self.auto_snap_sub = ss;
+                        self.save_config();
+                    }
                     // ---- v26: length in SECONDS or in BARS -------------
                     // Bars are the metronome's: length comes from bpm and
                     // beats-per-measure, entering the mode rounds to whole
@@ -5406,10 +5455,16 @@ impl App {
                 // ---- the curve canvas ------------------------------------
                 let (rect, resp) =
                     ui.allocate_at_least(egui::vec2(596.0, 240.0), egui::Sense::click_and_drag());
-                // v26: in bars mode every canvas edit lands on the metronome
-                // beat grid (Alt = freehand) and times label as bar.beat.
+                // v26: in bars mode times label as bar.beat. v34 R1: node
+                // placement follows the manager's own snap selector
+                // (Alt = freehand), not just the beat grid.
                 let bars_mode = ed.len_bars;
-                let snap_beat = bars_mode && !ui.input(|i| i.modifiers.alt);
+                let snap_beat = ed.snap_on && !ui.input(|i| i.modifiers.alt);
+                let snap_u = quantize::unit_samples(
+                    self.sample_rate.max(1),
+                    bpm,
+                    SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].0,
+                );
                 let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
                 let y_of = |v: f32| {
                     rect.max.y
@@ -5418,7 +5473,7 @@ impl App {
                 let t_of = |x: f32| {
                     let raw = ((x - rect.min.x) / rect.width()) as f64 * len as f64;
                     let q = if snap_beat {
-                        (raw / beat_s).round() * beat_s
+                        (raw / snap_u).round() * snap_u
                     } else {
                         raw.round()
                     };
@@ -5887,13 +5942,31 @@ impl App {
             }
         };
         if overwrite {
+            // v34 R1: "Save (overwrite asset)" touches AUTOMATION assets
+            // only — it used to write the curve (and its .slauto JSON
+            // over the file) onto whatever asset id the window happened
+            // to carry, so an audio clip selected when the manager
+            // opened could be overwritten by a curve. With no automation
+            // asset in play, the fallback is the curve the user last
+            // edited or created.
+            let mut target = ed
+                .asset
+                .filter(|k| self.assets.get(*k).is_some_and(|a| a.automation.is_some()));
+            if target.is_none() {
+                target = self.last_auto_asset.and_then(|id| {
+                    self.assets
+                        .iter()
+                        .position(|a| a.id == id && a.automation.is_some())
+                });
+            }
             let mut saved_name: Option<String> = None;
-            if let Some(k) = ed.asset {
+            if let Some(k) = target {
                 if let Some(a) = self.assets.get_mut(k) {
                     a.automation = Some(std::sync::Arc::new(auto.clone()));
                     if std::fs::write(&a.path, &json).is_ok() {
                         a.dirty = false;
                         saved_name = Some(a.name.clone());
+                        self.last_auto_asset = Some(a.id);
                     }
                 }
             }
@@ -5967,6 +6040,7 @@ impl App {
             std::sync::Arc::new(auto.clone()),
             false,
         ));
+        self.last_auto_asset = Some(id); // v34 R1: newest curve = overwrite fallback
         let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
         let lane = self
@@ -18847,6 +18921,90 @@ mod tests {
     /// v0.11 R5 pin: the automation manager buffer -> asset -> clip ->
     /// file round-trip, in-place overwrite, and the write-recorder path
     /// (arm -> move track volume -> stop -> asset + red clip).
+    #[test]
+    fn v34_auto_overwrite_only_touches_automation_assets() {
+        use crate::automation::{Automation, Node, TARGET_TRACK_VOL};
+        let mut app = headless_app("autoovr");
+        app.sample_rate = 48_000;
+        // an automation asset through the manager…
+        app.open_auto_editor(None);
+        let mut ed = app.auto_edit.take().unwrap();
+        ed.target = TARGET_TRACK_VOL.to_string();
+        ed.nodes = vec![
+            Node {
+                t: 0,
+                v: 0.0,
+                c: 0.0,
+            },
+            Node {
+                t: 24_000,
+                v: 1.0,
+                c: 0.0,
+            },
+        ];
+        app.auto_commit(&mut ed, 0, false);
+        let auto_k = app.assets.len() - 1;
+        let auto_path = app.assets[auto_k].path.clone();
+        assert_eq!(app.last_auto_asset, Some(auto_k as u32));
+        // …plus a plain AUDIO asset the rack also holds
+        let audio_id = app.assets.len() as u32;
+        let apath = app.record_dir().join("take-ovr.wav");
+        std::fs::write(&apath, "not-a-curve").unwrap();
+        let apath_for_push = apath.clone();
+        app.assets
+            .push(crate::ui::Asset::audio(
+            audio_id,
+            "take".to_string(),
+            apath_for_push,
+            Arc::from(Vec::<f32>::new().into_boxed_slice()),
+            false,
+        ));
+
+        // The manager is open WITHOUT an automation asset (ed.asset points
+        // at the audio one): overwrite must never stamp a curve onto it.
+        app.open_auto_editor(None);
+        let mut ed = app.auto_edit.take().unwrap();
+        ed.target = TARGET_TRACK_VOL.to_string();
+        ed.asset = Some(audio_id as usize);
+        ed.nodes[0].v = 0.5;
+        app.auto_commit(&mut ed, 0, true);
+        assert!(
+            app.assets[audio_id as usize].automation.is_none(),
+            "overwrite stamped a curve onto a non-automation asset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&apath).unwrap(),
+            "not-a-curve",
+            "the audio file was overwritten"
+        );
+        // With no automation asset selected, the LAST-created curve is
+        // the target.
+        let txt = std::fs::read_to_string(&auto_path).unwrap();
+        let back = Automation::from_json(&txt).unwrap();
+        assert!(
+            (back.nodes[0].v - 0.5).abs() < 1e-6,
+            "overwrite did not fall back to the last automation asset"
+        );
+        // And with NO automation asset in the project at all, overwrite
+        // saves a new one instead of touching anything.
+        let mut bare = headless_app("autoovr-bare");
+        bare.open_auto_editor(None);
+        let mut ed = bare.auto_edit.take().unwrap();
+        ed.asset = Some(0); // whatever the selection was
+        ed.nodes = vec![Node {
+            t: 0,
+            v: 0.3,
+            c: 0.0,
+        }];
+        let before = bare.assets.len();
+        bare.auto_commit(&mut ed, 0, true);
+        assert_eq!(
+            bare.assets.len(),
+            before + 1,
+            "fallback must save a new curve"
+        );
+    }
+
     #[test]
     fn v11_automation_manager_roundtrip_and_write_rec() {
         use crate::automation::{Node, TARGET_TRACK_PAN, TARGET_TRACK_VOL};

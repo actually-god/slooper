@@ -373,6 +373,15 @@ pub struct Config {
     /// the subdivision grid; false = one sample (the minimum resolution).
     #[serde(default = "default_true")]
     pub snap_on: bool,
+    /// v34 R1: the automation manager's OWN snap selector. The manager
+    /// used to be beat-snapped in bars mode and free otherwise, with no
+    /// way to say "snap my nodes to 1/8".
+    #[serde(default = "default_true")]
+    pub auto_snap_on: bool,
+    /// The automation manager's subdivision (same u32 grid values as
+    /// `snap_sub`; independent of the main grid's choice).
+    #[serde(default = "default_grid_sub")]
+    pub auto_snap_sub: u32,
     /// False only in configs written before 0.3.0, where volume was
     /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
     #[serde(default)]
@@ -511,6 +520,8 @@ impl Default for Config {
             metro_num: default_metro_num(),
             q_sub: default_grid_sub(),
             snap_sub: default_grid_sub(),
+            auto_snap_on: true,
+            auto_snap_sub: default_grid_sub(),
             auto_quantize: default_true(),
             loop_tl: default_true(),
             loop_mode: default_loop_mode(),
@@ -748,6 +759,8 @@ mod tests {
     #[test]
     fn config_roundtrip() {
         let cfg = Config {
+            auto_snap_on: false,
+            auto_snap_sub: 8,
             n_tracks: 16,
             shortcuts: vec![Some("R".into()), None, Some("Space".into())],
             midi: vec![MidiBinding {
