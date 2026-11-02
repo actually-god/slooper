@@ -361,6 +361,31 @@ pub fn is_plugin_target(t: &str) -> bool {
 }
 
 /// Human-readable target name for windows and status lines. Plugin
+/// v34 R11: where inside the CURVE a timeline position lands for one
+/// automation clip. `off` is samples from the clip's first frame.
+/// `None` = before the clip (silent — the manual control shows through).
+/// Inside the clip window the source wraps (the R4 clip-window repeat);
+/// past the window the LAST played source sample is held, so the target
+/// keeps the value the curve ended on instead of snapping back.
+pub fn clip_source_pos(
+    len_samples: i64,
+    cut: u64,
+    play_len: Option<u64>,
+    off: i64,
+) -> Option<i64> {
+    if off < 0 || len_samples <= 0 {
+        return None;
+    }
+    let avail = (len_samples - (cut as i64).min(len_samples)).max(1);
+    let win = play_len.map(|w| w as i64).unwrap_or(avail).max(1);
+    Some(if off >= win {
+        // the LAST sample the window actually played
+        (win - 1 + cut as i64).rem_euclid(len_samples)
+    } else {
+        (off + cut as i64).rem_euclid(len_samples)
+    })
+}
+
 /// parameter names are resolved by the caller from the live entry; this is
 /// the generic fallback.
 pub fn describe_target(t: &str) -> String {

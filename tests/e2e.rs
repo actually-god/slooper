@@ -1236,6 +1236,29 @@ fn e2e_export_writes_file() {
         "silence past the last clip"
     );
 
+    // v34 R10 probe: export WHILE the transport rolls, project starts at
+    // nonzero seek, clipped + looped clips — placement must still be exact.
+    b.cmd(Cmd::Seek { pos: 6_321 });
+    b.cmd(Cmd::PlayAll);
+    std::thread::sleep(Duration::from_millis(80));
+    b.cmd(Cmd::ExportTrack {
+        i: 0,
+        path: dir.join("rolling"),
+        fmt: ExportFormat::Wav,
+    });
+    let got_r = wait_for(
+        &b,
+        |e| matches!(e, Evt::Notice(m) if m.contains("exported")),
+        Duration::from_secs(5),
+    );
+    assert!(got_r.is_some(), "no Notice exporting while rolling");
+    let roll = slooper::audio_io::decode_to_mono(&dir.join("rolling.wav"), sr).expect("rolling wav");
+    let seg_r = |a: usize, c: usize| roll[a..c].iter().sum::<f32>() / (c - a) as f32;
+    assert!((seg_r(0, 4_000) - 0.5).abs() < 0.02, "rolling export segment 1");
+    assert!((seg_r(4_000, 8_000) - 0.75).abs() < 0.02, "rolling export segment 2");
+    assert!(seg_r(8_000, 12_000).abs() < 1e-6, "rolling export tail");
+    b.cmd(Cmd::StopAll);
+
     // Whole-project export: nothing is playing, but placement is the truth.
     b.cmd(Cmd::ExportProject {
         path: dir.join("whole"),
