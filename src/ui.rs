@@ -958,6 +958,8 @@ pub struct App {
     /// v34 R1: automation manager snap selector (its own, persisted).
     auto_snap_on: bool,
     auto_snap_sub: usize,
+    /// v34 R8: last folder per picker (config- AND project-persisted).
+    dir_memo: std::collections::HashMap<String, String>,
     /// Asset id of the automation curve most recently created or
     /// overwritten — the "Save (overwrite asset)" fallback when the
     /// window was not opened from an automation asset.
@@ -1042,6 +1044,8 @@ pub struct App {
     rack_group_by_dir: bool,
     /// v29: rename dialog: (asset file path, draft stem, focus-once).
     rack_rename: Option<(String, String, bool)>,
+    /// v34 R15: create-subfolder dialog: (rack folder index, draft name).
+    rack_newsub: Option<(usize, String)>,
     /// v29: delete-file confirmation target (full path).
     rack_confirm_del: Option<String>,
     sel_asset: Option<usize>,
@@ -1449,6 +1453,7 @@ impl App {
             auto_snap_on: cfg.auto_snap_on,
             auto_snap_sub: sub_idx(cfg.auto_snap_sub),
             last_auto_asset: None,
+            dir_memo: cfg.dir_memo.clone(),
             auto_quantize: cfg.auto_quantize,
             latency_ms: if cfg.latency_ms == 0.0 {
                 "0".into()
@@ -1484,6 +1489,7 @@ impl App {
             rack_dir_order: cfg.rack_dir_order.clone(),
             rack_group_by_dir: cfg.rack_group_by_dir,
             rack_rename: None,
+            rack_newsub: None,
             rack_confirm_del: None,
             sel_asset: None,
             monitor_enabled: cfg.monitor_on,
@@ -2857,6 +2863,29 @@ impl App {
         quantize::unit_samples(self.sample_rate, self.bpm(), SUBDIVISIONS[self.q_sub].0)
     }
 
+    /// v34 R8: directory a named picker should open at (if remembered
+    /// and still existing).
+    fn pick_dir(&self, key: &str) -> Option<PathBuf> {
+        self.dir_memo
+            .get(key)
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+    }
+
+    /// Remember a picker's result (a file path remembers its folder).
+    fn note_dir(&mut self, key: &str, path: &std::path::Path) {
+        let dir = if path.is_file() {
+            path.parent().map(|p| p.to_path_buf())
+        } else {
+            Some(path.to_path_buf())
+        };
+        if let Some(d) = dir.filter(|d| d.is_dir()) {
+            self.dir_memo
+                .insert(key.to_string(), d.to_string_lossy().into_owned());
+            self.save_config();
+        }
+    }
+
     fn snap_unit(&self) -> f64 {
         // Snap OFF (main header checkbox) = the program's minimum
         // resolution: one sample. Placement, drags and clip resize then
@@ -3572,6 +3601,7 @@ impl App {
             snap_on: self.snap_on,
             auto_snap_on: self.auto_snap_on,
             auto_snap_sub: SUBDIVISIONS[self.auto_snap_sub].0,
+            dir_memo: self.dir_memo.clone(),
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
@@ -3723,6 +3753,74 @@ impl App {
     /// v29: move an asset file into another sub-folder (root = its rack
     /// folder itself). Same-volume `rename(2)`; a dirty asset keeps
     /// `dirty` so its save lands at the NEW path.
+    /// v34 R15: create a sub-folder inside a rack folder. Nested names
+    /// ("drums/kicks") are allowed; illegal ones fall back to a status.
+    fn rack_sub_add(&mut self, fi: usize, name: &str) {
+        let Some(root) = self.rack.get(fi).map(|f| f.path.clone()) else {
+            return;
+        };
+        let clean: String = name
+            .trim()
+            .trim_start_matches('/')
+            .chars()
+            .filter(|c| *c != '\0')
+            .collect();
+        if clean.is_empty() {
+            self.status = "new folder: empty name".into();
+            return;
+        }
+        let p = Path::new(&root).join(&clean);
+        // Never walk out of the rack folder.
+        if !p.starts_with(Path::new(&root)) {
+            self.status = "new folder: illegal path".into();
+            return;
+        }
+        match std::fs::create_dir_all(&p) {
+            Ok(()) => {
+                if let Some(f) = self.rack.get_mut(fi) {
+                    f.rescan();
+                }
+                self.status = format!("created {}", p.display());
+            }
+            Err(e) => self.status = format!("new folder: {e}"),
+        }
+    }
+
+    /// v34 R15: delete a sub-folder — only when EMPTY, so this can never
+    /// eat samples. Move its files out first (the row menu does that).
+    fn rack_sub_del(&mut self, fi: usize, dir: &str) {
+        let Some(root) = self.rack.get(fi).map(|f| f.path.clone()) else {
+            return;
+        };
+        let p = Path::new(&root).join(dir.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if !p.is_dir() {
+            self.status = "delete folder: not a directory".into();
+            return;
+        }
+        let empty = std::fs::read_dir(&p).map(|mut d| d.next().is_none()).unwrap_or(false);
+        if !empty {
+            self.status =
+                "delete folder: not empty \u{2014} move or delete its files first".into();
+            return;
+        }
+        match std::fs::remove_dir(&p) {
+            Ok(()) => {
+                if let Some(f) = self.rack.get_mut(fi) {
+                    f.rescan();
+                }
+                for o in &mut self.rack_dir_order {
+                    if o.folder == root {
+                        o.dirs.retain(|d| d != dir);
+                    }
+                }
+                self.rack_collapsed.remove(&format!("{root}\u{1}{dir}"));
+                self.status = format!("deleted folder {}", p.display());
+                self.save_config();
+            }
+            Err(e) => self.status = format!("delete folder: {e}"),
+        }
+    }
+
     fn rack_move(&mut self, old: &str, dest_dir: &Path) {
         let oldp = PathBuf::from(old);
         let Some(file) = oldp.file_name() else {
@@ -8699,6 +8797,13 @@ impl App {
             format: project::FORMAT.into(),
             version: project::VERSION,
             name,
+            // v34 R8: every picker's last folder travels with the file.
+            dirs: {
+                let mut d: Vec<(String, String)> =
+                    self.dir_memo.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                d.sort();
+                d
+            },
             n_tracks: Some(self.n_tracks),
             metro: ProjMetro {
                 bpm: self.bpm(),
@@ -9065,6 +9170,10 @@ impl App {
         self.backend.cmd(Cmd::SetLoop(self.loop_tl));
         self.send_loop_region();
         self.proj_name = pr.name.clone();
+        // v34 R8: the project remembers where its pickers were.
+        for (k, v) in &pr.dirs {
+            self.dir_memo.insert(k.clone(), v.clone());
+        }
         self.show_load = false;
         self.send_metro();
         self.backend.cmd(Cmd::Seek { pos: pr.playhead });
@@ -9093,6 +9202,11 @@ impl App {
         use crate::audio_io::ExportFormat;
         let fmt = ExportFormat::ALL[self.export_fmt];
         let mut path = PathBuf::from(self.export_path.trim());
+        // v34 R8: an export remembers where it went.
+        if let Some(par) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            self.dir_memo
+                .insert("export".into(), par.to_string_lossy().into_owned());
+        }
         if path.as_os_str().is_empty() || path.to_string_lossy() == "." {
             // v34 R9: a default name — project + scope, into the project
             // folder — so Export always works and always says what it is.
@@ -10051,6 +10165,48 @@ impl App {
                 self.rack_rename = None;
             } else if cancel || !open {
                 self.rack_rename = None;
+            }
+        }
+        // ---- v34 R15: create sub-folder ------------------------------
+        if let Some((fi, mut draft)) = self.rack_newsub.clone() {
+            let mut create = false;
+            let mut cancel = false;
+            let mut open = true;
+            egui::Window::new("New sub-folder")
+                .id(egui::Id::new("rack_newsub_win"))
+                .resizable(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    if let Some(root) = self.rack.get(fi).map(|f| f.path.clone()) {
+                        ui.label(RichText::new(root).weak().small());
+                    }
+                    let re = ui.add_sized(
+                        egui::vec2(260.0, 22.0),
+                        egui::TextEdit::singleline(&mut draft)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("kit/greens ('/' nests)"),
+                    );
+                    re.request_focus();
+                    if ui.button("Create").clicked() {
+                        create = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        create = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            if create {
+                self.rack_newsub = None;
+                self.rack_sub_add(fi, &draft);
+            } else if cancel || !open {
+                self.rack_newsub = None;
+            } else {
+                self.rack_newsub = Some((fi, draft));
             }
         }
         // ---- v29: delete-file confirmation ----
@@ -11887,10 +12043,12 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                     .on_hover_text("Add an audio folder to the rack")
                     .clicked()
                 {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Add rack folder")
-                        .pick_folder()
-                    {
+                    let mut dlg = rfd::FileDialog::new().set_title("Add rack folder");
+                    if let Some(d) = app.pick_dir("rack") {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        app.note_dir("rack", &p);
                         let mut f = RackFolder::new(p.to_string_lossy().into_owned());
                         f.rescan();
                         app.rack.push(f);
@@ -11976,6 +12134,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                     let mut rescan = None;
                     let mut browse = None;
                     let mut rm = None;
+                    let mut newsub = None;
                     // v29: sub-folder reorder requests, applied after paint.
                     let mut fold: Option<(String, String, i32)> = None;
                     // All sub-folder group keys (display order per folder) —
@@ -12021,6 +12180,13 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 .clicked()
                             {
                                 browse = Some(fi);
+                            }
+                            if ui
+                                .small_button("+ sub")
+                                .on_hover_text("Create a sub-folder inside this folder")
+                                .clicked()
+                            {
+                                newsub = Some(fi);
                             }
                             if ui
                                 .small_button("x")
@@ -12123,6 +12289,23 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     if ui.button("down").clicked() {
                                         mv = Some(1);
                                         ui.close();
+                                    }
+                                    // v34 R15: remove an (empty) sub-folder
+                                    // from disk, not just from the view.
+                                    if !key_tail.is_empty() && !key_tail.starts_with('#') {
+                                        if ui
+                                            .button(RichText::new("delete folder").color(
+                                                Color32::from_rgb(255, 120, 120),
+                                            ))
+                                            .on_hover_text(
+                                                "Delete this sub-folder \u{2014} only when it \
+                                                 holds no files",
+                                            )
+                                            .clicked()
+                                        {
+                                            app.rack_sub_del(fi, &key_tail);
+                                            ui.close();
+                                        }
                                     }
                                 });
                                 if let Some(m) = mv {
@@ -12259,14 +12442,20 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                         }
                     }
                     if let Some(fi) = browse {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .set_title("Rack folder")
-                            .pick_folder()
-                        {
+                        let mut dlg = rfd::FileDialog::new().set_title("Rack folder");
+                        if let Some(d) = app.pick_dir("rack-browse") {
+                            dlg = dlg.set_directory(d);
+                        }
+                        if let Some(p) = dlg.pick_folder() {
+                            app.note_dir("rack-browse", &p);
                             app.rack[fi].path = p.to_string_lossy().into_owned();
                             app.rack[fi].rescan();
                             app.save_config();
                         }
+                    }
+                    if let Some(fi) = newsub {
+                        // v34 R15: a small dialog asks for the name.
+                        app.rack_newsub = Some((fi, String::new()));
                     }
                     if let Some(fi) = rm {
                         if app.rack.len() > 1 || fi != 0 {
@@ -15480,11 +15669,14 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                     } else {
                         format!("{base}-track-{}", app.selected + 1)
                     };
-                    if let Some(p) = rfd::FileDialog::new()
+                    let mut dlg = rfd::FileDialog::new()
                         .set_title("Export destination")
-                        .set_file_name(name)
-                        .save_file()
-                    {
+                        .set_file_name(name);
+                    if let Some(d) = app.pick_dir("export") {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.save_file() {
+                        app.note_dir("export", &p);
                         app.export_path = p.to_string_lossy().into_owned();
                     }
                 }
@@ -15761,8 +15953,12 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
                 if ui.button("Browse…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Effects folder").pick_folder()
-                    {
+                    let mut dlg = rfd::FileDialog::new().set_title("Effects folder");
+                    if let Some(d) = app.pick_dir("effects") {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        app.note_dir("effects", &p);
                         app.fx_dir_edit = p.to_string_lossy().into_owned();
                         app.apply_fx_dir();
                     }
@@ -15829,7 +16025,12 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
             }
             ui.horizontal(|ui| {
                 if ui.button("Add folder…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("VST folder").pick_folder() {
+                    let mut dlg = rfd::FileDialog::new().set_title("VST folder");
+                    if let Some(d) = app.pick_dir("vst") {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        app.note_dir("vst", &p);
                         let d = p.to_string_lossy().into_owned();
                         if !app.vst_dirs.contains(&d) {
                             app.vst_dirs.push(d);
@@ -16338,8 +16539,12 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.save_config();
                 }
                 if ui.button("Browse…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Projects folder").pick_folder()
-                    {
+                    let mut dlg = rfd::FileDialog::new().set_title("Projects folder");
+                    if let Some(d) = app.pick_dir("projects") {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        app.note_dir("projects", &p);
                         app.project_dir = p.to_string_lossy().into_owned();
                         app.save_config();
                     }
@@ -18921,6 +19126,34 @@ mod tests {
     /// v0.11 R5 pin: the automation manager buffer -> asset -> clip ->
     /// file round-trip, in-place overwrite, and the write-recorder path
     /// (arm -> move track volume -> stop -> asset + red clip).
+    #[test]
+    fn v34_dir_memos_travel_with_the_project() {
+        use crate::project;
+        let mut app = headless_app("dirmemo");
+        let dir = app.record_dir();
+        let d = dir.to_string_lossy().into_owned();
+        app.dir_memo.insert("export".into(), d.clone());
+        app.dir_memo.insert("vst".into(), d.clone());
+
+        // saved into the project file…
+        let pr = app.build_project("dirmemo".into());
+        assert!(pr.dirs.iter().any(|(k, v)| k == "export" && v == &d));
+        let file = dir.join("dirmemo.slooper");
+        project::save(&file, &pr).unwrap();
+
+        // …and restored into a fresh session's pickers.
+        let mut app2 = headless_app("dirmemo2");
+        assert!(app2.dir_memo.is_empty(), "fresh app remembers nothing");
+        let back = project::load(&file).unwrap();
+        for (k, v) in &back.dirs {
+            app2.dir_memo.insert(k.clone(), v.clone());
+        }
+        assert_eq!(app2.pick_dir("export").as_deref(), Some(dir.as_path()));
+        // a memo pointing at a dead folder is not offered
+        app2.dir_memo.insert("rack".into(), "/nope/gone".into());
+        assert_eq!(app2.pick_dir("rack"), None);
+    }
+
     #[test]
     fn v34_auto_overwrite_only_touches_automation_assets() {
         use crate::automation::{Automation, Node, TARGET_TRACK_VOL};

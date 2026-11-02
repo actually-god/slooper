@@ -389,6 +389,12 @@ pub struct Config {
     /// Where `.slooper` project files live (empty = `~/slooper-projects`).
     #[serde(default)]
     pub project_dir: String,
+    /// v34 R8: last folder each picker opened, keyed by picker
+    /// ("rack", "rack-browse", "export", "effects", "vst", "projects").
+    /// Every folder/file dialog should open WHERE THE USER LAST WAS, and
+    /// the map also travels with the project (see Project::dirs).
+    #[serde(default)]
+    pub dir_memo: std::collections::HashMap<String, String>,
     /// Asset rack folders, in order. The first entry is the *primary* folder:
     /// recordings are written there.
     #[serde(default)]
@@ -522,6 +528,7 @@ impl Default for Config {
             snap_sub: default_grid_sub(),
             auto_snap_on: true,
             auto_snap_sub: default_grid_sub(),
+            dir_memo: Default::default(),
             auto_quantize: default_true(),
             loop_tl: default_true(),
             loop_mode: default_loop_mode(),
@@ -761,6 +768,7 @@ mod tests {
         let cfg = Config {
             auto_snap_on: false,
             auto_snap_sub: 8,
+            dir_memo: Default::default(),
             n_tracks: 16,
             shortcuts: vec![Some("R".into()), None, Some("Space".into())],
             midi: vec![MidiBinding {
