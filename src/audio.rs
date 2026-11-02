@@ -1446,12 +1446,12 @@ impl Engine {
                     // `cut` (identical to the live callback); `play_len`
                     // past the source contributes silence (nothing summed).
                     let alen = data.len() as u64;
-                    let dstart = cl.pos as usize;
+                    let dstart = cl.data_start() as usize;
                     let dend = cl
                         .data_end(alen)
                         .min(cl.end(alen))
                         .min(len as u64)
-                        .max(cl.pos);
+                        .max(cl.data_start());
                     // v34 R10: when `play_len` exceeds the playable source
                     // by ONE sample, `end` is the binding end and
                     // `data_end` lags it — the loop then read
@@ -1466,11 +1466,10 @@ impl Engine {
                     // indexes with `rem_euclid(alen)`, so every read is in
                     // range. Past the source is silence, per the
                     // documented rule.
-                    let dend = dend.min(cl.pos + alen.saturating_sub(cl.cut)) as usize;
-                    let dend = dend.max(dstart);
+                    let dend = dend.max(dstart as u64) as usize;
                     for k in dstart..dend {
                         any = true;
-                        let s = data[(cl.cut + (k as u64 - cl.pos)) as usize];
+                        let s = data[(cl.cut + (k as u64 - cl.data_start())) as usize];
                         let m = mix(s) * cl.gain * cl.fade_at(k as u64, alen);
                         if span {
                             trk[k] += m;
@@ -1619,10 +1618,10 @@ impl Engine {
             let alen_u = data.len() as u64;
             // Same clip-pinned-at-pos mapping as live playback and
             // render_tracks; the selection window slices the output.
-            let dstart = cl.pos as usize;
-            let dend = cl.data_end(alen_u).min(cl.end(alen_u)).min(cl.pos + alen_u) as usize;
+            let dstart = cl.data_start() as usize;
+            let dend = cl.data_end(alen_u).min(cl.end(alen_u)) as usize;
             let mut chunk: Vec<f32> = (dstart..dend)
-                .map(|k| data[(cl.cut + (k as u64 - cl.pos)) as usize])
+                .map(|k| data[(cl.cut + (k as u64 - cl.data_start())) as usize])
                 .enumerate()
                 .map(|(j, x)| mix(x) * cl.gain * cl.fade_at((dstart + j) as u64, alen_u))
                 .collect();
@@ -3508,7 +3507,7 @@ impl Proc {
                     // Only the part backed by SOURCE data contributes; a
                     // trimmed start (`cut`) shifts the read offset, and a
                     // `play_len` past the data adds nothing (silence).
-                    let dstart = cl.pos;
+                    let dstart = cl.data_start();
                     let dend = cl.data_end(alen).min(c1);
                     let wd0 = w0.max(dstart);
                     let wd1 = w1.min(dend);
@@ -3529,7 +3528,7 @@ impl Proc {
                             i1: (wd1 - p0) as usize,
                             gain: cl.gain,
                             pos: cl.pos,
-                            fi_end: if fi > 0 { cl.pos + fi } else { 0 },
+                            fi_end: if fi > 0 { cl.data_start() + fi } else { 0 },
                             fi_step: if fi > 0 { 1.0 / fi as f32 } else { 0.0 },
                             fo_start: if fo > 0 { cl.end(alen) - fo } else { u64::MAX },
                             fo_end: cl.end(alen),
@@ -4557,7 +4556,6 @@ mod tests {
     /// instances, leaving the live ones untouched) after the vol x gain trim,
     /// and honour per-track play/stop, panning and clip placement.
     #[test]
-    #[test]
     fn v34_automation_clip_window_bounds_and_tail_hold() {
         use crate::automation::clip_source_pos as csp;
         // 1000-sample curve, clip plays the whole thing
@@ -4576,6 +4574,7 @@ mod tests {
         assert_eq!(csp(1000, 200, Some(100), 150), Some(299));
     }
 
+    #[test]
     fn pan_gains_are_equal_power_and_mono_safe() {
         // Hard positions.
         let (l, r) = pan_gains(0.0);

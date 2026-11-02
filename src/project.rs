@@ -51,6 +51,9 @@ pub struct ProjClip {
     /// Source samples skipped at the start (left trim; v3, default 0).
     #[serde(default)]
     pub cut: u64,
+    /// Silence prepended at the clip start (v34 R14; absent = 0).
+    #[serde(default)]
+    pub pre_pad: u64,
     /// Played length in samples; null/absent = rest of the source (v3).
     #[serde(default)]
     pub play_len: Option<u64>,
@@ -293,6 +296,7 @@ mod tests {
                         asset: 0,
                         pos: 0,
                         cut: 0,
+                        pre_pad: 0,
                         play_len: None,
                         gain: 1.0,
                         fade_in: 0,

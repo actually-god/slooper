@@ -636,6 +636,7 @@ struct ClipboardItem {
     t_off: usize,
     asset: u32,
     cut: u64,
+    pre_pad: u64,
     play_len: Option<u64>,
     pos_off: u64,
     gain: f32,
@@ -663,6 +664,7 @@ struct ClipResize {
     pos0: u64,
     cut0: u64,
     end0: u64,
+    pre_pad0: u64,
 }
 
 const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 95, 86);
@@ -3337,6 +3339,7 @@ impl App {
                             t_off: 0,
                             asset: k as u32,
                             cut: 0,
+                            pre_pad: 0,
                             play_len: None,
                             pos_off: 0,
                             gain: 1.0,
@@ -3371,6 +3374,7 @@ impl App {
                     t_off: *t - t0,
                     asset: cl.asset,
                     cut: cl.cut,
+                    pre_pad: cl.pre_pad,
                     play_len: cl.play_len,
                     pos_off: cl.pos - p0,
                     gain: cl.gain,
@@ -3413,7 +3417,8 @@ impl App {
                 .get(it.asset as usize)
                 .map(|a| a.samples())
                 .unwrap_or(0);
-            let span = it.play_len.unwrap_or(alen.saturating_sub(it.cut)).max(1);
+            let span =
+                it.pre_pad + it.play_len.unwrap_or(alen.saturating_sub(it.cut)).max(1);
             let nl0 = *base_lanes
                 .entry(t)
                 .or_insert(self.arr.tracks[t].lanes.len());
@@ -3423,6 +3428,7 @@ impl App {
                     asset: it.asset,
                     pos: pos + it.pos_off,
                     cut: it.cut,
+                    pre_pad: it.pre_pad,
                     play_len: it.play_len,
                     gain: it.gain,
                     fade_in: it.fade_in,
@@ -5557,12 +5563,23 @@ impl App {
                 // placement follows the manager's own snap selector
                 // (Alt = freehand), not just the beat grid.
                 let bars_mode = ed.len_bars;
-                let snap_beat = ed.snap_on && !ui.input(|i| i.modifiers.alt);
-                let snap_u = quantize::unit_samples(
-                    self.sample_rate.max(1),
-                    bpm,
-                    SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].0,
-                );
+                // v34 R1: the manager has its own snap selector. With it
+                // OFF the classic rule survives untouched (bars mode snaps
+                // to the metronome beat, seconds mode is freehand); with
+                // it ON every canvas edit lands on the chosen subdivision.
+                // Alt is freehand over both.
+                let snap_u = if ed.snap_on {
+                    quantize::unit_samples(
+                        self.sample_rate.max(1),
+                        bpm,
+                        SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].0,
+                    )
+                } else if bars_mode {
+                    beat_s
+                } else {
+                    0.0
+                };
+                let snap_beat = snap_u > 0.0 && !ui.input(|i| i.modifiers.alt);
                 let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
                 let y_of = |v: f32| {
                     rect.max.y
@@ -8783,6 +8800,7 @@ impl App {
                                 asset: c.asset,
                                 pos: c.pos,
                                 cut: c.cut,
+                                pre_pad: c.pre_pad,
                                 play_len: c.play_len,
                                 gain: c.gain,
                                 fade_in: c.fade_in,
@@ -9056,6 +9074,7 @@ impl App {
                             asset: c.asset,
                             pos: c.pos,
                             cut: c.cut,
+                            pre_pad: c.pre_pad,
                             play_len: c.play_len,
                             gain: c.gain,
                             fade_in: c.fade_in,
@@ -12292,8 +12311,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                     // v34 R15: remove an (empty) sub-folder
                                     // from disk, not just from the view.
-                                    if !key_tail.is_empty() && !key_tail.starts_with('#') {
-                                        if ui
+                                    if !key_tail.is_empty()
+                                        && !key_tail.starts_with('#')
+                                        && ui
                                             .button(RichText::new("delete folder").color(
                                                 Color32::from_rgb(255, 120, 120),
                                             ))
@@ -12306,7 +12326,6 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                             app.rack_sub_del(fi, &key_tail);
                                             ui.close();
                                         }
-                                    }
                                 });
                                 if let Some(m) = mv {
                                     fold = Some((path.clone(), fold_dir, m));
@@ -14012,7 +14031,7 @@ fn lane_row(
         // when the user dragged an edge (the "clips stretch instead of
         // clip" report). Content now stays anchored per-sample; the trim
         // hides it exactly like the engine does.
-        let vlen = c.span(alen).min(c.avail(alen));
+        let vlen = (c.span(alen) - c.pre_pad).min(c.avail(alen));
         // v0.11 R5: automation clips are the third kind and wear red.
         let is_auto = app
             .assets
@@ -14029,7 +14048,20 @@ fn lane_row(
         } else {
             fill
         };
-        draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres, fill, sel);
+        // v34 R14: a left pad is the mirror of the silence tail — dark
+        // hatch in front, the waveform anchored where the AUDIO starts
+        // (never stretched to fill the padded rect).
+        let ax0 = x_of(x0, c.data_start(), sr, px).max(cres.min.x);
+        let cres_audio =
+            egui::Rect::from_min_max(egui::pos2(ax0, cres.min.y), cres.max);
+        if ax0 > cres.min.x + 0.5 {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(cres.min, egui::pos2(ax0, cres.max.y)),
+                0.0,
+                Color32::from_rgba_premultiplied(10, 10, 14, 160),
+            );
+        }
+        draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres_audio, fill, sel);
         // Extended-past-data tail: silence, hatched dark so it reads as
         // "clip is longer than its source".
         let dend = x_of(x0, c.data_end(alen), sr, px);
@@ -14044,13 +14076,13 @@ fn lane_row(
         // shaded triangle is where the clip is quieter than full level.
         let wedge = Color32::from_black_alpha(120);
         if c.fade_in > 0 {
-            let fx = ((c.fade_in as f64 / sr * px) as f32).min(cres.width());
+            let fx = ((c.fade_in as f64 / sr * px) as f32).min(cres_audio.width());
             if fx > 1.0 {
                 ui.painter().add(egui::Shape::convex_polygon(
                     vec![
-                        egui::pos2(cres.min.x, cres.min.y),
-                        egui::pos2(cres.min.x, cres.max.y),
-                        egui::pos2(cres.min.x + fx, cres.min.y),
+                        egui::pos2(cres_audio.min.x, cres_audio.min.y),
+                        egui::pos2(cres_audio.min.x, cres_audio.max.y),
+                        egui::pos2(cres_audio.min.x + fx, cres_audio.min.y),
                     ],
                     wedge,
                     egui::Stroke::NONE,
@@ -14086,7 +14118,10 @@ fn lane_row(
         let trimmed_right = c.play_len.is_some_and(|l| l < c.avail(alen));
         let extended = c.play_len.is_some_and(|l| l > c.avail(alen));
         if sel && (trimmed_left || trimmed_right || extended) {
-            for bx in [(dend, true), (x_of(x0, c.pos - c.cut, sr, px), false)] {
+            for bx in [
+                (dend, true),
+                (x_of(x0, c.data_start().saturating_sub(c.cut), sr, px), false),
+            ] {
                 let (x, right_of_clip) = bx;
                 if x < rect.min.x - 30.0 || x > rect.max.x + 30.0 {
                     continue;
@@ -14371,6 +14406,7 @@ fn lane_row(
                         pos0: c.pos,
                         end0: c.end(app.asset_len(c.asset)),
                         cut0: c.cut,
+                        pre_pad0: c.pre_pad,
                     });
                 } else {
                     let hit = clips
@@ -14485,13 +14521,16 @@ fn lane_row(
                     // Guaranteed snap at the asset's ORIGINAL boundaries,
                     // regardless of the snap setting.
                     if r.edge == 1 {
-                        let orig_data_end = r.pos0 + alen.saturating_sub(r.cut0);
+                        // `play_len` counts AUDIO; the left pad rides in
+                        // front of it untouched (v34 R14).
+                        let a0 = r.pos0 + r.pre_pad0;
+                        let orig_data_end = a0 + alen.saturating_sub(r.cut0);
                         if (cand as i64 - orig_data_end as i64).abs() <= (unit / 2).max(1) as i64 {
                             cand = orig_data_end;
                         }
-                        // Never smaller than one subdivision.
-                        cand = cand.max(r.pos0 + unit);
-                        let new_len = cand - r.pos0;
+                        // Never smaller than one subdivision of audio.
+                        cand = cand.max(a0 + unit);
+                        let new_len = cand - a0;
                         let avail = alen.saturating_sub(r.cut0);
                         let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
                         cl.play_len = if new_len == avail {
@@ -14500,26 +14539,61 @@ fn lane_row(
                             Some(new_len)
                         };
                     } else {
-                        let orig_start = r.pos0.saturating_sub(r.cut0);
-                        if (cand as i64 - orig_start as i64).abs() <= (unit / 2).max(1) as i64 {
-                            cand = orig_start;
+                        // v34 R14: the LEFT edge works in BOTH directions
+                        // now. The AUDIO start stays pinned at
+                        // pos0+pre_pad0 while the pointer is at or left of
+                        // it (moving left simply prepends silence), and
+                        // moving right eats the pad first, then the
+                        // source (the classic trim). MIDI/automation
+                        // clips have no left source edge to pad, so they
+                        // keep the hard floor at the data start.
+                        let paddable = app
+                            .assets
+                            .get(app.arr.tracks[r.t].lanes[r.lane].clips[r.c].asset as usize)
+                            .map(|a| a.pattern.is_none() && a.automation.is_none())
+                            .unwrap_or(false);
+                        let audio0 = r.pos0 + r.pre_pad0;
+                        let orig_start = if paddable {
+                            0
+                        } else {
+                            audio0.saturating_sub(r.cut0)
+                        };
+                        if (cand as i64 - (audio0 - r.cut0) as i64).abs() <= (unit / 2).max(1) as i64
+                        {
+                            cand = audio0.saturating_sub(r.cut0);
                         }
-                        // Start never moves before the asset's data begins,
-                        // and the clip keeps at least one subdivision.
                         cand = cand.max(orig_start).min(r.end0.saturating_sub(unit));
-                        // cand may sit LEFT of pos0 (re-exposing cut audio):
-                        // signed math, u64 would wrap (debug panics).
-                        let new_cut = (r.cut0 as i64 + (cand as i64 - r.pos0 as i64))
-                            .clamp(0, alen as i64) as u64;
+                        // Moving right eats the pad, then the source;
+                        // moving left reveals hidden source first (a real
+                        // trim-in) and only then prepends silence.
+                        let (new_pad, new_cut) = if cand >= audio0 {
+                            // Edge is past the audio start: silence gone,
+                            // audio skipped from the front.
+                            (0u64, r.cut0 + (cand - audio0))
+                        } else {
+                            let gap = audio0 - cand;
+                            if gap <= r.pre_pad0 {
+                                // Still inside the pad: pure silence edit.
+                                (gap, r.cut0)
+                            } else {
+                                // Pad gone: reveal hidden source first;
+                                // anything past full reveal becomes new
+                                // silence again (R14 both-ends extend).
+                                let reveal = (gap - r.pre_pad0).min(r.cut0);
+                                (gap - reveal, r.cut0 - reveal)
+                            }
+                        };
                         let new_len = r.end0 - cand;
                         let avail = alen.saturating_sub(new_cut);
                         let cl = &mut app.arr.tracks[r.t].lanes[r.lane].clips[r.c];
                         cl.pos = cand;
+                        cl.pre_pad = new_pad;
                         cl.cut = new_cut;
-                        cl.play_len = if new_len >= avail {
+                        let audio_len = new_len.saturating_sub(new_pad);
+                        cl.play_len = if audio_len >= avail {
                             None
                         } else {
-                            Some(new_len)
+                            Some(audio_len)
                         };
                     }
                 }
@@ -16893,6 +16967,19 @@ mod tests {
         // background scan was SIGSEGV-ing later, unrelated tests.) A test
         // that actually wants plugins (v16_plugin_env) swaps HOME itself
         // and restores it, exactly as before.
+        // v34: runtime script synths compile with rustc, and the rustup
+        // shim resolves toolchains through $HOME/.rustup when RUSTUP_HOME
+        // is not exported. With HOME sandboxed every in-test rustc dies
+        // ("rustup could not choose a version"), taking down every
+        // synth/sampler/drum pin. Pin the toolchain dirs to the real
+        // account before the swap.
+        let rh = real_home();
+        if std::env::var_os("RUSTUP_HOME").is_none() {
+            std::env::set_var("RUSTUP_HOME", format!("{rh}/.rustup"));
+        }
+        if std::env::var_os("CARGO_HOME").is_none() {
+            std::env::set_var("CARGO_HOME", format!("{rh}/.cargo"));
+        }
         std::env::set_var("HOME", &dir);
         let mut app = App::new(Backend::start());
         app.drain_events(); // discard the null-audio notice
@@ -18000,6 +18087,7 @@ mod tests {
             asset: a,
             pos,
             cut: 0,
+            pre_pad: 0,
             play_len: Some(len),
             gain: 1.0,
             fade_in: 0,
@@ -18509,6 +18597,7 @@ mod tests {
                 asset: 0,
                 pos: 9_600,
                 cut: 480,
+                pre_pad: 0,
                 play_len: Some(2_400),
                 gain: 1.0,
                 fade_in: 0,
@@ -19038,6 +19127,7 @@ mod tests {
                 asset: k1 as u32,
                 pos: 0,
                 cut: 0,
+                pre_pad: 0,
                 play_len: None,
                 gain: 1.0,
                 fade_in: 0,
@@ -19126,6 +19216,50 @@ mod tests {
     /// v0.11 R5 pin: the automation manager buffer -> asset -> clip ->
     /// file round-trip, in-place overwrite, and the write-recorder path
     /// (arm -> move track volume -> stop -> asset + red clip).
+    #[test]
+    fn v34_pre_pad_delays_audio_and_pads_silence() {
+        let mut app = headless_app("prepad");
+        app.assets.clear();
+        let path = app.record_dir().join("burst.wav");
+        let mut data = vec![0.0f32; 4_800];
+        for x in data.iter_mut().take(100) {
+            *x = 1.0;
+        }
+        app.assets.push(Asset::audio(
+            0,
+            "burst".to_string(),
+            path,
+            std::sync::Arc::from(data.into_boxed_slice()),
+            false,
+        ));
+        let mut cl = Clip::new(0, 5_000);
+        cl.pre_pad = 2_400; // audio lands at 7400..12200
+        app.arr.tracks[0].lanes[0].clips.push(cl);
+        app.backend.engine.set_project(
+            std::sync::Arc::new(
+                app.assets
+                    .iter()
+                    .map(|a| a.data.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            std::sync::Arc::new(app.arr.clone()),
+            app.total_len(),
+        );
+        app.backend.engine.set_midi_assets(std::sync::Arc::new(Vec::new()));
+        app.backend.engine.set_auto_assets(std::sync::Arc::new(Vec::new()));
+        let out = app.backend.engine.render_project().expect("render");
+        assert!(
+            out[5_000..7_400].iter().all(|s| *s == 0.0),
+            "the pad must be silence"
+        );
+        // 1e-3: the summed mix path rounds a hair (unity gain + dither).
+        assert!(
+            out[7_400..7_500].iter().all(|s| (*s - 1.0).abs() < 1e-3),
+            "audio must start at pos + pre_pad, not at pos"
+        );
+        assert!(out[7_500..12_000].iter().all(|s| *s == 0.0));
+    }
+
     #[test]
     fn v34_dir_memos_travel_with_the_project() {
         use crate::project;
@@ -20865,6 +20999,7 @@ mod tests {
                 asset: a,
                 pos: 60_000,
                 cut: 0,
+                pre_pad: 0,
                 play_len: Some(40_000),
                 gain: 1.0,
                 fade_in: 0,
@@ -20878,6 +21013,7 @@ mod tests {
                 asset: a,
                 pos: 130_000,
                 cut: 0,
+                pre_pad: 0,
                 play_len: Some(40_000),
                 gain: 1.0,
                 fade_in: 0,
@@ -20891,6 +21027,7 @@ mod tests {
                 asset: a,
                 pos: 200_000,
                 cut: 0,
+                pre_pad: 0,
                 play_len: Some(40_000),
                 gain: 1.0,
                 fade_in: 0,
@@ -26473,7 +26610,7 @@ mod tests {
         // Parse the PCM16 WAV directly (44-byte canonical header).
         let bytes = std::fs::read(&wav).expect("wav bytes");
         let mut got = Vec::with_capacity((bytes.len() - 44) / 2);
-        for w in bytes[44..].chunks_exact(2) {
+        for w in bytes[44..].as_chunks::<2>().0 {
             got.push(i16::from_le_bytes([w[0], w[1]]) as f32 / 32767.0);
         }
         assert_eq!(
