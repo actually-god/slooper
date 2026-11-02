@@ -291,6 +291,7 @@ pub type AssetTable = Vec<Arc<[f32]>>;
 /// means "no clip sounds on this track for this target" — the manual
 /// control keeps its value. Plugin-parameter targets do not appear here:
 /// they are written straight onto the live instances.
+#[derive(Clone, Copy)]
 struct AutoOut {
     vol: [Option<f32>; MAX_LOOPS],
     gain: [Option<f32>; MAX_LOOPS],
@@ -610,6 +611,12 @@ impl Drop for Backend {
 pub struct Engine {
     /// Per-track raw capture buffers (one take in flight per track).
     rec_bufs: [*mut f32; MAX_LOOPS],
+    /// v34 R11: the last control-rate automation pass, published for the
+    /// GUI (vol/gain/pan in AMPLITUDE space, pan in -1..1, mute as 0/1;
+    /// NAN = "no automation driving this"). The mixer paints its faders
+    /// from these while a target is automated, so the controls visibly
+    /// move with the curve instead of lying still.
+    pub auto_disp: [[AtomicU32; MAX_LOOPS]; 3],
     rec_len: [AtomicU32; MAX_LOOPS],
     rec_state: [AtomicU8; MAX_LOOPS],
     /// Playhead position (samples) when the current take started — reported
@@ -759,6 +766,7 @@ impl Engine {
         }
         Arc::new(Self {
             rec_bufs,
+            auto_disp: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(f32::NAN.to_bits()))),
             rec_len: core::array::from_fn(|_| AtomicU32::new(0)),
             rec_state: core::array::from_fn(|_| AtomicU8::new(TR_IDLE)),
             rec_at: core::array::from_fn(|_| AtomicU64::new(0)),
@@ -1019,6 +1027,13 @@ impl Engine {
     }
 
     // ---- mixer --------------------------------------------------------------
+
+    /// v34 R11: last automation-driven vol/gain/pan for a track, in
+    /// amplitude space (pan in -1..1). NAN = manual control — the mixer
+    /// faders display these so they animate with automation.
+    pub fn auto_live(&self, i: usize) -> [f32; 3] {
+        core::array::from_fn(|k| f32::from_bits(self.auto_disp[k][i].load(Ordering::Relaxed)))
+    }
 
     pub fn track_on(&self, i: usize) -> bool {
         self.track_on[i].load(Ordering::Relaxed) != 0
@@ -1436,7 +1451,23 @@ impl Engine {
                         .data_end(alen)
                         .min(cl.end(alen))
                         .min(len as u64)
-                        .max(cl.pos) as usize;
+                        .max(cl.pos);
+                    // v34 R10: when `play_len` exceeds the playable source
+                    // by ONE sample, `end` is the binding end and
+                    // `data_end` lags it — the loop then read
+                    // `data[alen]`, i.e. one element PAST the asset's
+                    // `Arc<[f32]>` into whatever the allocator neighbour
+                    // holds (often the previous asset's mid-sample). That
+                    // stale value was summed into the export at a position
+                    // that moved with the project length and neighbouring
+                    // assets — the "export starts at a random point, never
+                    // at the clip start, and depends on where the main GUI
+                    // sits" report. The LIVE path can never do this: it
+                    // indexes with `rem_euclid(alen)`, so every read is in
+                    // range. Past the source is silence, per the
+                    // documented rule.
+                    let dend = dend.min(cl.pos + alen.saturating_sub(cl.cut)) as usize;
+                    let dend = dend.max(dstart);
                     for k in dstart..dend {
                         any = true;
                         let s = data[(cl.cut + (k as u64 - cl.pos)) as usize];
@@ -1794,6 +1825,7 @@ fn run(
         midi_cache: engine.midi(),
         midi_cache_gen: engine.midi_gen(),
         auto_cache: engine.auto_assets(),
+        auto_last: AutoOut::default(),
         auto_cache_gen: engine.auto_gen(),
         midi_ev: Vec::new(),
         // One row per track, EXACTLY like trk_bufs: `render_midi_block`
@@ -3206,6 +3238,9 @@ struct Proc {
     /// v0.11 R5: automation asset table refresh pair.
     auto_cache: Arc<Vec<Option<Arc<crate::automation::Automation>>>>,
     auto_cache_gen: u64,
+    /// v34 R11: last control-rate pass; held while the transport is
+    /// stopped so automation does not snap back on pause.
+    auto_last: AutoOut,
     /// MIDI pattern table (parallel to `assets`; refreshed on `midi_gen`).
     midi_cache: Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>,
     midi_cache_gen: u64,
@@ -3373,8 +3408,23 @@ impl Proc {
                     let Some(Some(a)) = self.auto_cache.get(cl.asset as usize).cloned() else {
                         continue;
                     };
-                    let rel =
-                        (pos - cl.pos as i64 + cl.cut as i64).rem_euclid(a.len_samples.max(1));
+                    // v34 R11: the curve drives ONLY its clip window.
+                    //  * before the clip: this clip is silent (another
+                    //    clip or the manual control wins);
+                    //  * inside: the R4 clip-window wrap (repeat);
+                    //  * after the last played sample: HOLD — the curve
+                    //    evaluates at its last played source sample, so
+                    //    the target stays where the automation left it
+                    //    instead of snapping back to the pre-clip knob
+                    //    value the moment the clip scrolls past.
+                    let Some(rel) = crate::automation::clip_source_pos(
+                        a.len_samples,
+                        cl.cut,
+                        cl.play_len,
+                        pos - cl.pos as i64,
+                    ) else {
+                        continue;
+                    };
                     let v = a.eval(rel);
                     match a.target.as_str() {
                         crate::automation::TARGET_TRACK_VOL => out.vol[t] = Some(v),
@@ -3878,11 +3928,24 @@ impl ProcessHandler for Proc {
         // the manual control it targets (a curve wins over the knob it
         // rides while it sounds — FL semantics). Plugin-parameter targets
         // land directly on the live instances' atomics.
-        let auto = if transport {
-            self.eval_automation(p0)
-        } else {
-            AutoOut::default()
-        };
+        // v34 R11: STOPPING keeps the last automation pass — a pause one
+        // sample past an automation clip must not snap every automated
+        // knob back. A play/seek elsewhere re-evaluates at the new
+        // position on the next run block.
+        if transport {
+            self.auto_last = self.eval_automation(p0);
+        }
+        let auto = self.auto_last;
+        // v34 R11: publish the live automation values for the GUI.
+        for t in 0..MAX_LOOPS {
+            let nan = f32::NAN.to_bits();
+            self.engine.auto_disp[0][t]
+                .store(auto.vol[t].map_or(nan, |v| v.to_bits()), Ordering::Relaxed);
+            self.engine.auto_disp[1][t]
+                .store(auto.gain[t].map_or(nan, |v| v.to_bits()), Ordering::Relaxed);
+            self.engine.auto_disp[2][t]
+                .store(auto.pan[t].map_or(nan, |v| v.to_bits()), Ordering::Relaxed);
+        }
         for t in 0..MAX_LOOPS {
             // v22: vol and gain automation COMPOSE — each curve overrides
             // only its own manual control (a gain curve keeps the fader,
@@ -4494,6 +4557,25 @@ mod tests {
     /// instances, leaving the live ones untouched) after the vol x gain trim,
     /// and honour per-track play/stop, panning and clip placement.
     #[test]
+    #[test]
+    fn v34_automation_clip_window_bounds_and_tail_hold() {
+        use crate::automation::clip_source_pos as csp;
+        // 1000-sample curve, clip plays the whole thing
+        assert_eq!(csp(1000, 0, None, -1), None, "before the clip is silent");
+        assert_eq!(csp(1000, 0, None, 0), Some(0));
+        assert_eq!(csp(1000, 0, None, 400), Some(400));
+        // a clip SHORTER than the curve wraps inside its own window
+        assert_eq!(csp(1000, 0, Some(2000), 1500), Some(500));
+        // past the window: HOLD the last played source sample — never a
+        // wrap back to the beginning (that was the "value snaps back" bug)
+        assert_eq!(csp(1000, 0, Some(500), 700), Some(499));
+        assert_eq!(csp(1000, 0, Some(500), 500), Some(499));
+        // a cut start shifts the window; the hold lands on the cut's last
+        // sample, not on the curve head
+        assert_eq!(csp(1000, 200, None, 2000), Some(999));
+        assert_eq!(csp(1000, 200, Some(100), 150), Some(299));
+    }
+
     fn pan_gains_are_equal_power_and_mono_safe() {
         // Hard positions.
         let (l, r) = pan_gains(0.0);

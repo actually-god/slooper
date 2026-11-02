@@ -78,6 +78,12 @@ pub struct ProjTrack {
     pub chain: Vec<crate::config::ChainSave>,
     /// Lane 0 = the track itself, lanes 1.. = child tracks.
     pub lanes: Vec<Vec<ProjClip>>,
+    /// v34 R4: the track's grid-block height in points as the user left
+    /// it (`0` = automatic). A project's own heights used to be dropped
+    /// on load while the SESSION heights from config leaked in, so a
+    /// single old drag made track 1 load MASSIVE forever.
+    #[serde(default)]
+    pub h: f32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -263,6 +269,7 @@ mod tests {
             },
             playhead: 12_345,
             tracks: vec![ProjTrack {
+                h: 0.0,
                 vol: 100,
                 gain: 80,
                 pan: 64,

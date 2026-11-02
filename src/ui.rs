@@ -1057,6 +1057,11 @@ pub struct App {
 
     // --- project file ---
     proj_name: String,
+    /// v34 R10: status lines from the OFF-THREAD export worker (rendering
+    /// a whole project on the manager thread used to starve RT while it
+    /// ran, and the queued snapshot could lag the GUI state on screen).
+    export_tx: std::sync::mpsc::Sender<String>,
+    export_rx: std::sync::mpsc::Receiver<String>,
     /// Text override for the projects folder ("" = `~/slooper-projects`).
     project_dir: String,
     show_save_prompt: bool,
@@ -1228,6 +1233,8 @@ pub struct App {
 
 impl App {
     pub fn new(backend: Backend) -> Self {
+        // v34 R10: export-status channel for the off-thread render.
+        let (__se_tx, __se_rx) = std::sync::mpsc::channel();
         let cfg = Config::load();
         // Effects framework: open (creating/seeding when needed) the folder
         // and compile+load every script; chains rebuild once the engine
@@ -1475,6 +1482,8 @@ impl App {
             snap_on: cfg.snap_on,
             preview_playing: None,
             proj_name: String::new(),
+            export_tx: __se_tx,
+            export_rx: __se_rx,
             project_dir: cfg.project_dir.clone(),
             show_save_prompt: false,
             save_draft: String::new(),
@@ -1597,6 +1606,10 @@ impl App {
     pub fn drain_events(&mut self) {
         while let Ok(evt) = self.backend.evt_rx.try_recv() {
             self.handle_evt(evt);
+        }
+        // v34 R10: off-thread export completions land in the status bar.
+        while let Ok(m) = self.export_rx.try_recv() {
+            self.status = m;
         }
     }
 
@@ -8550,6 +8563,7 @@ impl App {
         let tracks: Vec<ProjTrack> = (0..MAX_LOOPS)
             .map(|t| ProjTrack {
                 vol: self.trk_vol[t],
+                h: self.trk_height.get(t).copied().unwrap_or(0.0).max(0.0),
                 gain: self.trk_gain[t],
                 pan: self.trk_pan[t],
                 on: self.backend.engine.track_on(t),
@@ -8944,9 +8958,15 @@ impl App {
         // seed the pattern's target track).
         self.load_kits(&pr.drum_kits, pr.drum.as_ref());
         self.save_config();
-        // Heights are a per-session view; the new arrangement starts fresh.
-        for h in self.trk_height.iter_mut() {
-            *h = 0.0;
+        // v34 R4: heights travel with the PROJECT. Older files (and any
+        // track they never sized) get the standard automatic height —
+        // never whatever the last session or the global config happened
+        // to remember, which is what made "track 1 loads MASSIVE" stick.
+        for (t, h) in self.trk_height.iter_mut().enumerate() {
+            *h = pr.tracks
+                .get(t)
+                .map(|pt| if pt.h.is_finite() { pt.h.max(0.0) } else { 0.0 })
+                .unwrap_or(0.0);
         }
         self.wave.clear();
         self.sel_asset = None;
@@ -8987,14 +9007,37 @@ impl App {
     }
 
     fn do_export(&mut self) {
+        // v34 R10: the render happens on a WORKER thread against a
+        // snapshot the GUI applies to the engine SYNCHRONOUSLY first.
+        // Previously the export rode the command queue: it could capture
+        // a snapshot that lagged the arrangement on screen (the
+        // "export starts at a random point / depends on where the main
+        // GUI sits" report), and worse, a multi-minute render ran ON the
+        // audio thread — every other queued command (and the RT clock
+        // itself) stalled behind it, so a second export or a transport
+        // move raced the first render's state.
+        use crate::audio_io::ExportFormat;
+        let fmt = ExportFormat::ALL[self.export_fmt];
         let mut path = PathBuf::from(self.export_path.trim());
-        if path.as_os_str().is_empty() {
-            self.status = "export: choose a destination first".into();
-            return;
+        if path.as_os_str().is_empty() || path.to_string_lossy() == "." {
+            // v34 R9: a default name — project + scope, into the project
+            // folder — so Export always works and always says what it is.
+            let dir = self.projects_dir().join(&self.proj_name);
+            let _ = std::fs::create_dir_all(&dir);
+            let stem = if self.export_sel {
+                "selection".to_string()
+            } else if self.export_whole {
+                "project".to_string()
+            } else {
+                format!("track-{}", self.selected + 1)
+            };
+            let base = if self.proj_name.trim().is_empty() {
+                "slooper".to_string()
+            } else {
+                self.proj_name.trim().to_string()
+            };
+            path = dir.join(format!("{base}-{stem}"));
         }
-        let fmt = crate::audio_io::ExportFormat::ALL[self.export_fmt];
-        // The selected format drives the extension: the destination is
-        // picked without one, so switching formats never means re-picking.
         let ext = fmt.extension();
         let has_want = path
             .extension()
@@ -9003,26 +9046,80 @@ impl App {
         if !has_want {
             path.set_extension(ext);
         }
-        if self.export_sel {
+        let items: Option<Vec<(usize, usize, usize)>> = if self.export_sel {
             if self.sel_clips.is_empty() {
                 self.status = "export selection: select at least one clip first".into();
                 return;
             }
-            let mut items = self.sel_clips.clone();
-            items.sort();
-            self.backend.cmd(Cmd::ExportSelection { path, fmt, items });
-            self.show_export = false;
-            return;
-        }
-        if self.export_whole {
-            self.backend.cmd(Cmd::ExportProject { path, fmt });
+            let mut it = self.sel_clips.clone();
+            it.sort();
+            Some(it)
         } else {
-            self.backend.cmd(Cmd::ExportTrack {
-                i: self.selected,
-                path,
-                fmt,
-            });
+            None
+        };
+        let only_track = if !self.export_sel && !self.export_whole {
+            Some(self.selected)
+        } else {
+            None
+        };
+        // Apply the on-screen truth to the engine NOW (same snapshot the
+        // queue would carry — the queued copies below are harmless
+        // duplicates that keep the manager in sync).
+        self.push_project();
+        let engine = self.backend.engine.clone();
+        let done = self.export_tx.clone();
+        let label = path.display().to_string();
+        self.status = format!("exporting → {label} …");
+        // Mirror the snapshot synchronously: the queue may still hold
+        // older SetProject copies from this frame's edits, and the worker
+        // must see exactly the arrangement the user is looking at.
+        {
+            let table: std::sync::Arc<Vec<_>> = std::sync::Arc::new(
+                self.assets
+                    .iter()
+                    .map(|a| a.data.clone())
+                    .collect::<Vec<_>>(),
+            );
+            engine.set_project(table, std::sync::Arc::new(self.arr.clone()), self.total_len());
+            engine.set_midi_assets(std::sync::Arc::new(
+                self.assets
+                    .iter()
+                    .map(|a| a.pattern.clone())
+                    .collect::<Vec<_>>(),
+            ));
+            engine.set_auto_assets(std::sync::Arc::new(
+                self.assets
+                    .iter()
+                    .map(|a| a.automation.clone())
+                    .collect::<Vec<_>>(),
+            ));
         }
+        let worker = std::thread::Builder::new()
+            .name("slooper-export".into())
+            .spawn(move || {
+                let res = (|| -> Result<usize, String> {
+                    let (buf, n) = if let Some(items) = &items {
+                        let (_from, s) =
+                            engine.render_selection(items).ok_or("nothing to export")?;
+                        (s, items.len())
+                    } else if let Some(t) = only_track {
+                        (engine.render_track(t).ok_or("no clips placed in any track")?, 0)
+                    } else {
+                        (engine.render_project().ok_or("no clips placed in any track")?, 0)
+                    };
+                    crate::audio_io::export(&path, engine.sample_rate().max(1), &buf, fmt)?;
+                    Ok(n)
+                })();
+                let msg = match res {
+                    Ok(n) => format!(
+                        "exported {} → {label}",
+                        if n > 0 { format!("{n} clip(s)") } else { "mix".into() }
+                    ),
+                    Err(e) => format!("export: {e}"),
+                };
+                let _ = done.send(msg);
+            });
+        let _ = worker;
         self.show_export = false;
     }
 
@@ -14671,12 +14768,52 @@ const KIND_PAN: u8 = 2;
 /// volume and gain, -100..=100 for pan (0 = centre) — and is typed into
 /// directly, committed with Enter. Text hugs its slider with no filler
 /// padding; every row's slider starts at the same x, so the three line up.
+/// Invert the piecewise-linear gain-trim curve for DISPLAY (the mirror
+/// only ever reads it, so a 7-step binary search over the 0..=127 MIDI
+/// space is plenty).
+fn gain_midi_from_amp(a: f32) -> u8 {
+    if !(a.is_finite()) || a <= 0.0 {
+        return 0;
+    }
+    let mut lo = 0u8;
+    let mut hi = 127u8;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if gain_amp(mid) < a {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
     let label = ["vol ", "gain", "pan "][kind as usize];
     let midi = match kind {
         KIND_VOL => app.trk_vol[i],
         KIND_GAIN => app.trk_gain[i],
         _ => app.trk_pan[i],
+    };
+    // v34 R11: while automation drives this target, the fader DISPLAYS
+    // the live automation value (the slider and its dB readout move with
+    // the curve). The manual value underneath is untouched: automation
+    // rides on top of it, and the moment no clip drives the target the
+    // control falls back to it.
+    let live = app.backend.engine.auto_live(i);
+    let amp = live[kind as usize];
+    let automated = amp.is_finite();
+    let shown = if !automated {
+        midi
+    } else {
+        match kind {
+            KIND_VOL => vol_midi(20.0 * amp.max(f32::MIN_POSITIVE).log10()),
+            KIND_GAIN => gain_midi_from_amp(amp),
+            // pan automation values live in the same 0..=1 space as
+            // pan01(midi)
+            _ => (amp * 127.0 + 0.5) as u8,
+        }
+        .clamp(0, 127)
     };
     let hover = match kind {
         KIND_VOL => "Track playback volume: -inf…+6 dB (0 dB = three-quarters). Right-click for exact entry and automation.",
@@ -14692,9 +14829,19 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // text made rows differ).
         ui.add_sized(
             egui::vec2(30.0, 18.0),
-            egui::Label::new(RichText::new(label).monospace().small()).selectable(false),
+            egui::Label::new(
+                RichText::new(if automated { "auto" } else { label })
+                    .monospace()
+                    .small()
+                    .color(if automated {
+                        egui::Color32::from_rgb(120, 210, 140)
+                    } else {
+                        egui::Visuals::dark().noninteractive().text_color()
+                    }),
+            )
+            .selectable(false),
         );
-        let mut v = midi;
+        let mut v = shown;
         let sw = (ui.available_width() - 86.0).max(30.0);
         // v29: NO `.interact(Sense::click())` union — it surfaces clicks
         // but covers the slider's own rect, freezing drag→value mapping
@@ -14711,13 +14858,13 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
             egui::vec2(52.0, 18.0),
             egui::Label::new(
                 RichText::new(if kind == KIND_PAN {
-                    format!("{:>4}", pan_text(midi))
+                    format!("{:>4}", pan_text(shown))
                 } else {
                     format!(
                         "{:>5}",
                         db_num(match kind {
-                            KIND_VOL => vol_amp(midi),
-                            KIND_GAIN => gain_amp(midi),
+                            KIND_VOL => vol_amp(shown),
+                            KIND_GAIN => gain_amp(shown),
                             _ => 1.0,
                         })
                     )
@@ -15245,12 +15392,19 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                     // No extension here — the Format dropdown adds it at
                     // export time (see `do_export`), so changing the format
                     // never means re-picking the destination.
-                    let name = if app.export_sel {
-                        "slooper-selection".to_string()
-                    } else if app.export_whole {
-                        "slooper-project".to_string()
+                    // v34 R9: the default name says WHICH project and
+                    // WHICH scope it is (project name + track/selection).
+                    let base = if app.proj_name.trim().is_empty() {
+                        "slooper".to_string()
                     } else {
-                        format!("slooper-track-{}", app.selected + 1)
+                        app.proj_name.trim().to_string()
+                    };
+                    let name = if app.export_sel {
+                        format!("{base}-selection")
+                    } else if app.export_whole {
+                        format!("{base}-project")
+                    } else {
+                        format!("{base}-track-{}", app.selected + 1)
                     };
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("Export destination")
@@ -15278,7 +15432,9 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                     cancelled = true;
                 }
                 if ui.button("Export").clicked() {
-                    app.do_export();
+                    eprintln!("PP exporting");
+        app.do_export();
+        eprintln!("PP export queued");
                     done = true;
                 }
             });
@@ -18136,7 +18292,9 @@ mod tests {
         app.export_sel = true;
         app.export_path = "/tmp/slooper-exp-sel.wav".into();
         app.sel_clips.clear();
+        eprintln!("PP exporting");
         app.do_export();
+        eprintln!("PP export queued");
         assert!(
             app.status.contains("select at least one clip"),
             "guard fired: {}",
@@ -18144,7 +18302,9 @@ mod tests {
         );
         app.arr.insert(0, 0, Clip::new(0, 0));
         app.sel_clips = vec![(0, 0, 0)];
-        app.do_export(); // engine writes async; just must not guard-error
+        eprintln!("PP exporting");
+        app.do_export();
+        eprintln!("PP export queued"); // engine writes async; just must not guard-error
         assert!(!app.show_export, "dialog closes when the export is queued");
     }
 
@@ -25848,5 +26008,88 @@ mod tests {
             v25_hits(&mut app, &ctx, "applied: 1 in / 2 out").is_empty(),
             "the suffix ages out with its notice"
         );
+    }
+
+    /// v34 R10: export renders EXACTLY the arrangement on screen — exact
+    /// clip placement, immune to transport position, and no longer riding
+    /// the (droppable, lagging) command queue.
+    #[test]
+    fn v34_export_renders_the_on_screen_state() {
+        use std::sync::Arc;
+        let mut app = headless_app("v34exp");
+        app.sample_rate = 48_000;
+        clear_canvas(&mut app);
+        app.assets.clear();
+        let mut d = vec![0.0f32; 4800];
+        d[0] = 1.0;
+        d[2400] = 0.75;
+        d[4799] = 0.5;
+        app.assets.push(Asset::audio(
+            0,
+            "imp".into(),
+            std::path::PathBuf::from("/tmp/v34imp.wav"),
+            Arc::from(d),
+            false,
+        ));
+        let hits = |out: &[f32]| -> Vec<usize> {
+            out.iter()
+                .enumerate()
+                .filter(|(_, v)| {
+                    (*v - 1.0).abs() < 0.01 || (*v - 0.75).abs() < 0.01 || (*v - 0.5).abs() < 0.01
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        // (a) plain clip: impulses land at pos, pos+2400, pos+4799.
+        app.arr.tracks[0].lanes[0].clips.push(Clip::new(0, 9600));
+        app.backend.engine.set_project(
+            std::sync::Arc::new(
+                app.assets
+                    .iter()
+                    .map(|a| a.data.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            std::sync::Arc::new(app.arr.clone()),
+            app.total_len(),
+        );
+        app.backend.engine.set_midi_assets(std::sync::Arc::new(Vec::new()));
+        app.backend.engine.set_auto_assets(std::sync::Arc::new(Vec::new()));
+        let out = app.backend.engine.render_project().expect("render a");
+        assert_eq!(hits(&out), vec![9600, 12000, 14399], "clip placement must be exact");
+
+        // (b) transport moved: the EXPORT must still render from the
+        // PROJECT start — and via the off-thread worker on the CURRENT
+        // on-screen state (the null backend would have dropped a queued
+        // export command entirely).
+        app.backend.engine.seek_to(70_000);
+        let dir = std::env::temp_dir().join("v34exp-out");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.export_path = dir.join("mix").to_string_lossy().into_owned();
+        app.export_sel = false;
+        app.export_whole = true;
+        app.do_export();
+        let wav = dir.join("mix.wav");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.drain_events();
+            if wav.exists() && !app.status.contains("exporting") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.status.contains("exported"), "status was: {}", app.status);
+        // Parse the PCM16 WAV directly (44-byte canonical header).
+        let bytes = std::fs::read(&wav).expect("wav bytes");
+        let mut got = Vec::with_capacity((bytes.len() - 44) / 2);
+        for w in bytes[44..].chunks_exact(2) {
+            got.push(i16::from_le_bytes([w[0], w[1]]) as f32 / 32767.0);
+        }
+        assert_eq!(
+            hits(&got)[..3],
+            [9600, 12000, 14399],
+            "the WAV must start at the PROJECT start, not the transport"
+        );
+
     }
 }
