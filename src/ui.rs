@@ -3872,15 +3872,32 @@ impl App {
             show_midi: self.show_midi,
             show_binds: self.show_binds,
             side_wins: self.side_wins,
-            dyn_docks: self
-                .dyn_wins
-                .iter()
-                .map(|w| crate::config::DynDock {
-                    kind: w.kind.key(),
-                    dock: w.dock,
-                    rect: w.rect,
-                })
-                .collect(),
+            dyn_docks: {
+                // Merge, never clobber: a startup-time save runs BEFORE
+                // any dynamic window registers its slot, and must not
+                // erase the seeded state of windows not opened yet this
+                // session (live smoke lost the drums dock exactly this
+                // way). Registered windows win over their seed entries.
+                let mut merged: Vec<crate::config::DynDock> = self
+                    .dyn_wins
+                    .iter()
+                    .map(|w| crate::config::DynDock {
+                        kind: w.kind.key(),
+                        dock: w.dock,
+                        rect: w.rect,
+                    })
+                    .collect();
+                for (k, d, r) in &self.dyn_seed {
+                    if !self.dyn_wins.iter().any(|w| w.kind == *k) {
+                        merged.push(crate::config::DynDock {
+                            kind: k.key(),
+                            dock: *d,
+                            rect: *r,
+                        });
+                    }
+                }
+                merged
+            },
             theme: if self.light_theme { "light" } else { "dark" }.into(),
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
@@ -25745,6 +25762,16 @@ mod tests {
         assert!(
             app2.dock_rects[4][2] > 8.0,
             "reopens painted inside the dock"
+        );
+        // A save that runs BEFORE any dynamic window registers (the
+        // startup-save family) must not clobber seeded state.
+        let mut app3 = App::new(Backend::start());
+        app3.save_config();
+        drop(app3);
+        let cfg3 = crate::config::Config::load();
+        assert!(
+            cfg3.dyn_docks.iter().any(|d| d.kind == "drums"),
+            "startup-time save merged the seed instead of erasing it"
         );
         drop(app2);
         settle_plugin_drop();
