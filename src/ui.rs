@@ -11583,6 +11583,10 @@ fn over_side_window(app: &App, pt: egui::Pos2) -> bool {
 // ---------------------------------------------------------------------------
 
 /// What a dynamic window is; also its stable registry key (v35 R5).
+// The unwired kinds are the NEXT windows in the queue — the wiring is a
+// mechanical pass per window (dyn_reg + dyn_dock_skip gate + body fn;
+// see chain_win_body for the template).
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DynKind {
     Params,
@@ -18037,7 +18041,12 @@ mod tests {
             SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PlayAll)],
             Some(egui::Key::Space)
         );
-        assert!(SHORTCUT_DEFAULTS[73..].iter().all(|k| k.is_none()));
+        // v35 R3: the ONLY defaults keyed at/beyond 73 are the two new
+        // goto-edge slots (Home/End); knob slots stay unkeyed.
+        let keyed: Vec<usize> = (73..N_ACTIONS)
+            .filter(|i| SHORTCUT_DEFAULTS[*i].is_some())
+            .collect();
+        assert_eq!(keyed, vec![138, 139], "only GotoStart/GotoEnd are keyed");
         // Every default key is unique (learn mode enforces the same).
         let mut seen: Vec<egui::Key> = SHORTCUT_DEFAULTS.iter().flatten().copied().collect();
         seen.sort_by_key(|k| format!("{k:?}"));
@@ -25024,10 +25033,11 @@ mod tests {
 
     /// v22 pin (the reported "right-click on mixer sliders does nothing"):
     /// an egui Slider senses DRAG only, so the strip sliders union in
-    /// CLICK sense; right-click then creates the automation asset in
-    /// place. The mixer draws the vol row at every strip height, so pin
-    /// vol; the gain row (popup at short heights) is the same code path,
-    /// and its engine target is pinned below.
+    /// CLICK sense and the right-click does something. v35 R7: that
+    /// something is now a MENU — the manager opens BOUND, and nothing is
+    /// created until the user saves. The mixer draws the vol row at every
+    /// strip height, so pin vol; the gain row (popup at short heights) is
+    /// the same code path, and its engine target is pinned below.
     #[test]
     fn v22_mixer_slider_right_click_creates_automation() {
         let mut app = headless_app("v22rmb");
@@ -25035,7 +25045,6 @@ mod tests {
         clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         let before = app.assets.len();
-        let lanes = app.arr.tracks[0].lanes.len();
         let lab = galley_at(&mut app, &ctx, "vol ").expect("mixer strip draws a vol row");
         let p = egui::pos2(lab.max.x + 12.0, lab.center().y);
         frame_keys(
@@ -25048,10 +25057,21 @@ mod tests {
             &ctx,
             vec![btn(p, egui::PointerButton::Secondary, false)],
         );
+        assert_eq!(app.assets.len(), before, "v35 R7: nothing yet");
+        assert!(app.auto_edit.is_none(), "menu first, manager on request");
+        click_label(&mut app, &ctx, "Create automation clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), before, "manager opens, still nothing created");
+        let ed = app.auto_edit.as_ref().expect("manager opened bound");
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+        assert_eq!(ed.asset, None, "unsaved curve");
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
         assert_eq!(
             app.assets.len(),
             before + 1,
-            "right-clicking the slider creates an automation asset"
+            "saving creates the automation asset: {}",
+            app.status
         );
         let au = app.assets
             .last()
@@ -25060,11 +25080,12 @@ mod tests {
             .clone()
             .expect("the new asset is automation");
         assert_eq!(au.target, crate::automation::TARGET_TRACK_VOL);
-        assert_eq!(
-            app.arr.tracks[0].lanes.len(),
-            lanes + 1,
-            "the automation rides a new lane"
-        );
+        let new_ai = app.assets.len() - 1;
+        let placed = app.arr.tracks[0]
+            .lanes
+            .iter()
+            .any(|ln| ln.clips.iter().any(|c| c.asset as usize == new_ai));
+        assert!(placed, "saving also rides a clip on its owner track");
         // Gain is a real target too (the reported "right click on ANY
         // mixer slider"): label, UI range, and — decisively — the engine
         // mapping all exist for track.gain.

@@ -299,7 +299,7 @@ pub type AssetTable = Vec<Arc<[f32]>>;
 /// control keeps its value. Plugin-parameter targets do not appear here:
 /// they are written straight onto the live instances.
 #[derive(Clone, Copy)]
-struct AutoOut {
+pub struct AutoOut {
     vol: [Option<f32>; MAX_LOOPS],
     gain: [Option<f32>; MAX_LOOPS],
     pan: [Option<f32>; MAX_LOOPS],
