@@ -5,22 +5,26 @@
 //     (silence AND exact-passthrough both fail an effect's job only when
 //     the plugin mutes; passthrough still reports as `dry` for triage).
 //
+// v34 (R3): the drive loops use the `StageEntry` trait only, so the audit
+// covers CLAP entries too (multi-plugin files audited per descriptor).
+//
 //   cargo run --release --example plugin_audit
 use std::path::Path;
 
-use slooper::vsthost::{default_vst_dirs, open, scan, StageEntry, VstKind};
+use slooper::vsthost::{default_vst_dirs, open_pid, scan, VstEntry, VstKind};
 
-fn instrument_peak(path: &Path, kind: VstKind) -> Result<f32, String> {
-    let load = open(path, kind, 48_000, None)?;
-    let entry_arc = load.entry;
-    let entry = entry_arc
-        .as_any()
-        .downcast_ref::<slooper::vsthost::RtStageEntry>()
-        .unwrap();
-    entry.note_on(0, 60, 110);
+fn instrument_peak(path: &Path, kind: VstKind, plugin_id: Option<&str>) -> Result<f32, String> {
+    let load = open_pid(path, kind, plugin_id, 48_000, None, None)?;
+    let entry = load.entry;
     let mut peak = 0.0f32;
     let mut out = vec![0f32; 512];
     let silence = [0f32; 512];
+    // Middle C on, then held: the trait's event API (VST2/3 and CLAP alike).
+    let ev = vec![(0usize, [0x90u8, 60, 110])];
+    entry.process_with_midi(&silence, &mut out, &ev);
+    for x in out.iter() {
+        peak = peak.max(x.abs());
+    }
     for _ in 0..120 {
         entry.process(&silence, &mut out);
         for x in out.iter() {
@@ -33,9 +37,9 @@ fn instrument_peak(path: &Path, kind: VstKind) -> Result<f32, String> {
     Ok(peak)
 }
 
-fn effect_peak(path: &Path, kind: VstKind) -> Result<(f32, f32), String> {
+fn effect_peak(path: &Path, kind: VstKind, plugin_id: Option<&str>) -> Result<(f32, f32), String> {
     // open() rejects nothing for effects; drive pink-ish noise in, listen.
-    let load = open(path, kind, 48_000, None)?;
+    let load = open_pid(path, kind, plugin_id, 48_000, None, None)?;
     let entry = load.entry;
     let mut rng = 12345u32;
     let mut out_peak = 0.0f32;
@@ -58,49 +62,76 @@ fn effect_peak(path: &Path, kind: VstKind) -> Result<(f32, f32), String> {
 }
 
 fn main() {
+    // Optional dir filter: `plugin_audit clap` audits only .clap rows.
+    let filter = std::env::args().nth(1);
     let dirs = default_vst_dirs();
     let found = scan(&dirs);
     let mut fails = 0;
     for e in found.iter().filter(|e| e.error.is_none()) {
-        let kind = e.kind;
-        let role = if e.instrument { "instr" } else { "effect" };
-        let (verdict, detail) = if e.instrument {
-            match instrument_peak(&e.path, kind) {
-                Ok(p) if p > 1e-4 => ("ALIVE".to_string(), format!("peak {p:.4}")),
-                Ok(p) => {
-                    fails += 1;
-                    ("SILENT".to_string(), format!("peak {p:.6}"))
-                }
-                Err(err) => {
-                    fails += 1;
-                    ("LOADFAIL".to_string(), err)
-                }
+        if let Some(f) = filter.as_deref() {
+            if f == "clap" && e.kind != VstKind::Clap {
+                continue;
             }
-        } else {
-            match effect_peak(&e.path, kind) {
-                Ok((p, d)) if p > 1e-4 => {
-                    let tag = if d < 1e-6 { "ALIVE-DRY" } else { "ALIVE" };
-                    (tag.to_string(), format!("peak {p:.4} diff {d:.4}"))
-                }
-                Ok((p, _)) => {
-                    fails += 1;
-                    ("SILENT".to_string(), format!("peak {p:.6}"))
-                }
-                Err(err) => {
-                    fails += 1;
-                    ("LOADFAIL".to_string(), err)
-                }
+            if f != "clap" && !e.path.to_string_lossy().contains(f) {
+                continue;
             }
-        };
-        println!(
-            "{verdict:9} {role:6} {:10} {:50} {detail}",
-            format!("{kind:?}"),
-            e.name
-        );
+        }
+        audit_one(e, &mut fails);
     }
     println!(
         "--- {} plugins audited, {fails} failure(s)",
-        found.iter().filter(|e| e.error.is_none()).count()
+        found
+            .iter()
+            .filter(|e| e.error.is_none() && filter_is(e, filter.as_deref()))
+            .count()
     );
     std::process::exit(if fails > 0 { 1 } else { 0 });
+}
+
+fn filter_is(e: &VstEntry, filter: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some("clap") => e.kind == VstKind::Clap,
+        Some(f) => e.path.to_string_lossy().contains(f),
+    }
+}
+
+fn audit_one(e: &VstEntry, fails: &mut i32) {
+    let kind = e.kind;
+    let role = if e.instrument { "instr" } else { "effect" };
+    let pid = e.plugin_id.as_deref();
+    let (verdict, detail) = if e.instrument {
+        match instrument_peak(&e.path, kind, pid) {
+            Ok(p) if p > 1e-4 => ("ALIVE".to_string(), format!("peak {p:.4}")),
+            Ok(p) => {
+                *fails += 1;
+                ("SILENT".to_string(), format!("peak {p:.6}"))
+            }
+            Err(err) => {
+                *fails += 1;
+                ("LOADFAIL".to_string(), err)
+            }
+        }
+    } else {
+        match effect_peak(&e.path, kind, pid) {
+            Ok((p, d)) if p > 1e-4 => {
+                let tag = if d < 1e-6 { "ALIVE-DRY" } else { "ALIVE" };
+                (tag.to_string(), format!("peak {p:.4} diff {d:.4}"))
+            }
+            Ok((p, _)) => {
+                *fails += 1;
+                ("SILENT".to_string(), format!("peak {p:.6}"))
+            }
+            Err(err) => {
+                *fails += 1;
+                ("LOADFAIL".to_string(), err)
+            }
+        }
+    };
+    let idtail = e.plugin_id.as_deref().map(|i| format!(" [{i}]")).unwrap_or_default();
+    println!(
+        "{verdict:9} {role:6} {:10} {:50} {detail}{idtail}",
+        format!("{kind:?}"),
+        e.name
+    );
 }

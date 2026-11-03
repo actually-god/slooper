@@ -3,7 +3,7 @@
 //   cargo run --release --example plugin_one -- <path> <V2|V3>
 use std::path::Path;
 
-use slooper::vsthost::{open, scan, StageEntry, VstKind};
+use slooper::vsthost::{open, scan, VstKind};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

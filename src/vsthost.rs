@@ -1754,15 +1754,21 @@ pub fn open_async_pid(
     let saved = saved.map(|s| s.to_vec());
     let patch = patch.cloned();
     let plugin_id = plugin_id.map(|s| s.to_string());
-    post(move || {
-        // `open_inner` DIRECTLY: this closure already runs on the GUI
-        // thread, and `open` would proxy its result back to this very
-        // thread — waiting on ourselves = the v16 pump freeze this pin
-        // caught ("picked plugin never loaded").
-        let _ = tx.send(
-            open_inner(&path, kind, plugin_id.as_deref(), sample_rate, saved.as_deref(), patch.as_ref())
-                .map(|l| l.entry),
+    // Own thread, then the normal `open_pid` dispatch: VST2/3 proxy their
+    // body onto the GUI thread from here (same as an UI-thread open), CLAP
+    // loads inline under the loader lock. (Running `open_inner` on the GUI
+    // thread directly — the old shape — made CLAP deadlocks permanent; see
+    // `open_pid`.)
+    std::thread::spawn(move || {
+        let r = open_pid(
+            &path,
+            kind,
+            plugin_id.as_deref(),
+            sample_rate,
+            saved.as_deref(),
+            patch.as_ref(),
         );
+        let _ = tx.send(r.map(|l| l.entry));
     });
     rx
 }
@@ -1800,12 +1806,30 @@ pub fn open_pid(
     saved: Option<&[f32]>,
     patch: Option<&VstPatch>,
 ) -> Result<VstLoad, String> {
+    // CLAP NEVER runs on the vst2-gui thread: a JUCE-based CLAP's init
+    // (inside our dlopen, under glibc's loader lock) spawns helper threads
+    // that dlopen themselves — deadlock: the helper blocks on the loader
+    // lock while the GUI thread blocks joining the helper, and every later
+    // proxied control call queues behind the stuck GUI thread (observed as
+    // a "hanging" vst3 test three suites downstream). CLAP carries no
+    // toolkit thread-affinity requirement (no hosted editors, `clap.gui`
+    // unimplemented), so the caller thread + loader lock is enough.
+    if kind == VstKind::Clap {
+        let _loader = vst_loader_lock();
+        let entry = crate::claphost::open_unlocked(
+            path,
+            plugin_id,
+            sample_rate,
+            saved,
+            patch.map(|x| x.chunk.as_slice()),
+        )?;
+        return Ok(VstLoad { entry });
+    }
     let path = path.to_path_buf();
     let saved = saved.map(|s| s.to_vec());
     let patch = patch.cloned();
-    let plugin_id = plugin_id.map(|s| s.to_string());
     on_gui_thread(move || {
-        open_inner(&path, kind, plugin_id.as_deref(), sample_rate, saved.as_deref(), patch.as_ref())
+        open_inner(&path, kind, None, sample_rate, saved.as_deref(), patch.as_ref())
     })?
 }
 
@@ -3027,7 +3051,6 @@ mod tests {
             peak > 1e-4,
             "bound vitalium alive after re-scan, peak {peak}"
         );
-        std::mem::forget(entry);
     }
 
     /// v20 (user report "VST plugins don't apply changes — synths AND EQs,

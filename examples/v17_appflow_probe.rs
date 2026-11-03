@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use slooper::vsthost::{default_vst_dirs, open, scan, StageEntry, VstKind};
+use slooper::vsthost::{default_vst_dirs, open, scan, VstKind};
 
 fn main() {
     let path = format!("{}/.vst3/vitalium.vst3", std::env::var("HOME").unwrap());
