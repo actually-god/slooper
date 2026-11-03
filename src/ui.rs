@@ -432,6 +432,11 @@ struct RecSrc {
 struct AutoEdit {
     /// Existing asset being edited in place (None = unsaved new curve).
     asset: Option<usize>,
+    /// v35 R7: for an UNSAVED bound curve, the track whose control the
+    /// curve is bound to — "Save as new asset + clip" places the clip on
+    /// THIS track (the slider the user right-clicked), not wherever the
+    /// grid selection happens to be. None = use the current selection.
+    host: Option<usize>,
     name: String,
     target: String,
     len_samples: i64,
@@ -588,6 +593,9 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = {
     a[7] = Some(egui::Key::Num4);
     a[68] = Some(egui::Key::M); // metronome on / off
     a[71] = Some(egui::Key::Space); // play / stop all (transport toggle)
+    // v35 R3: the go-to pair — Home / End (rebindable in Settings).
+    a[138] = Some(egui::Key::Home);
+    a[139] = Some(egui::Key::End);
     a
 };
 
@@ -694,6 +702,11 @@ const LANE_MIN_H: f32 = 36.0;
 const TRACK_SEP: f32 = 3.0;
 /// Hit height around the separation bar — it doubles as the resize handle.
 const TRACK_SEP_HIT: f32 = 7.0;
+
+/// v35 R2: empty measures of grid painted PAST the project end — the
+/// playhead can be parked beyond the last measure (engine seek carries the
+/// matching slack, see `audio::SEEK_SLACK`).
+const GRID_TAIL_BARS: u64 = 4;
 /// Loop region modes (see [`App::loop_mode`]); index = config value.
 const LOOP_MODES: [&str; 3] = ["area", "current longest", "whole song"];
 
@@ -764,7 +777,7 @@ pub fn target_search_box(ui: &mut egui::Ui, placeholder: &str) -> String {
                 .desired_width(170.0)
                 .hint_text(placeholder),
         );
-        if !q2.is_empty() && ui.small_button("✕").clicked() {
+        if !q2.is_empty() && ui.small_button("×").clicked() {
             q2.clear();
         }
     });
@@ -1197,6 +1210,18 @@ pub struct App {
     /// swallows right-presses inside it so the automation popup, not the
     /// text-edit cut/copy/paste menu, answers.
     bpm_rect: Option<egui::Rect>,
+    /// v35 R2: last ruler rect (test hook: endpoint deadzone hit-testing).
+    ruler_rect: Option<egui::Rect>,
+    /// v35 R3 test hook: the target + scope label of the last goto_edge().
+    goto_pos: Option<u64>,
+    goto_what: &'static str,
+    /// v35 R1: the engine atomics are the REAL controls — master volume
+    /// pushes only when the UI changed it (dirty), otherwise every frame
+    /// the knob MIRRORS the live atomic (so automation animates it and its
+    /// value persists). `fader_live` blocks the mirror for the one strip
+    /// fader the user is dragging THIS frame.
+    master_dirty: bool,
+    fader_live: Option<(usize, u8)>,
 
     // --- per-track effects framework ---
     fx_registry: fx::Registry,
@@ -1595,6 +1620,11 @@ impl App {
             value_dialog_focus: false,
             value_menu_armed: false,
             bpm_rect: None,
+            ruler_rect: None,
+            goto_pos: None,
+            goto_what: "",
+            master_dirty: true,
+            fader_live: None,
             piano_roll: None,
             fx_registry,
             fx_rows,
@@ -1781,7 +1811,7 @@ impl App {
 
     /// Step 3 done: commit the axis and the raw lo/hi range. lo > hi (an
     /// inverted control) is stored exactly as captured — `scale_axis` flips
-    /// it so the knob still reads low→high continuously.
+    /// it so the knob still reads low-to-high continuously.
     pub fn knob_finish(&mut self) {
         let Some(kl) = self.knob_learn.take() else {
             return;
@@ -1831,13 +1861,13 @@ impl App {
         };
         self.save_config();
         self.status = format!(
-            "bound {} → axis {} (raw {}–{}{})",
+            "bound {} to axis {} (raw {}–{}{})",
             MidiAction::ALL[slot].label(),
             bind.axis_label(),
             lo,
             hi,
             if lo > hi {
-                " — INVERTED control: flipped so the knob still reads low→high"
+                " — INVERTED control: flipped so the knob still reads low-to-high"
             } else if lo == 0 && hi == 127 {
                 ""
             } else {
@@ -3002,8 +3032,13 @@ impl App {
             }
         }
         if let Some((loop_i, target, v)) = ctx_req {
-            // Right-click answers DIRECTLY with the automation asset.
-            self.rmb_create_auto(Some(loop_i), &target, v);
+            // v35 R7: right-click opens the same value mini-menu every
+            // automatable control uses (no direct asset creation).
+            let pos = ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos())
+                .unwrap_or_default();
+            self.value_menu = Some((loop_i, target, v, pos));
         }
         if let Some((loop_i, target, v)) = dbl_req {
             self.value_dialog = Some((loop_i, target.clone(), value_user_display(&target, v)));
@@ -3215,6 +3250,43 @@ impl App {
     /// *area* = the dragged ruler handles (unset end = 2 bars from 0),
     /// *current longest* = 0 → last clip end, *whole song* = 0 → project
     /// end. Degenerate areas collapse back to the 2-bar default.
+    /// v35 R3: jump the playhead to an edge — the selected clips' span,
+    /// else (loop on) the loop region, else the whole project. Records the
+    /// target in `goto_pos` (test hook: the NULL_AUDIO engine never drains
+    /// the Seek, but it carries this exact value).
+    fn goto_edge(&mut self, to_start: bool) {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for &(t, k, c) in self.sel_clips.iter() {
+            if let Some(cl) = self
+                .arr
+                .tracks
+                .get(t)
+                .and_then(|tr| tr.lanes.get(k))
+                .and_then(|ln| ln.clips.get(c))
+            {
+                lo = lo.min(cl.pos);
+                hi = hi.max(cl.end(self.asset_len(cl.asset)));
+            }
+        }
+        let (pos, what) = if hi > lo {
+            (if to_start { lo } else { hi }, "selection")
+        } else if self.loop_tl {
+            let (ls, le) = self.loop_region_eff();
+            (if to_start { ls } else { le }, "loop")
+        } else {
+            (if to_start { 0 } else { self.total_len() }, "project")
+        };
+        self.goto_pos = Some(pos);
+        self.goto_what = what;
+        self.backend.cmd(Cmd::Seek { pos });
+        self.status = format!(
+            "playhead \u{2192} {} of {} ({pos})",
+            if to_start { "start" } else { "end" },
+            what
+        );
+    }
+
     fn loop_region_eff(&self) -> (u64, u64) {
         if self.sample_rate == 0 {
             return (0, 0);
@@ -4479,135 +4551,6 @@ impl App {
         );
     }
 
-    /// v20 R3: the ONE right-click automation creator (replaces the old
-    /// flat-at-playhead path). Geometry follows the user's context, the
-    /// way FL answers "create automation clip":
-    ///
-    /// * clips selected  → asset length = span of the selection
-    ///   (`max(end) - min(pos)`, clip lengths resolved through
-    ///   `Clip::end(asset_len)`), clip placed at `min(pos)`;
-    /// * nothing selected → length = the longest track's end in the
-    ///   project (empty project falls back to 2 s), clip placed at the
-    ///   snapped playhead;
-    /// * host track = the control's OWNER track for track-relative
-    ///   targets (`owner = Some(t)`); for global targets (tempo, master
-    ///   vol) the first selected track, else the longest track;
-    /// * the clip always lands on a NEW child lane of the host (never a
-    ///   reused lane — automation stacked over audio is the point);
-    /// * curve seeded FLAT at the control's current value, so binding it
-    ///   cannot jump the sound;
-    /// * the automation manager opens on the new asset.
-    ///
-    /// Returns the asset id. Direct slider right-clicks call this with no
-    /// menu in between; the bpm/gain/mute menus route their "Create
-    /// automation asset" item through here too, so every entry point
-    /// shares one semantics.
-    fn rmb_create_auto(&mut self, owner: Option<usize>, target: &str, current: f32) -> Option<u32> {
-        if self.sample_rate == 0 {
-            self.status = "automation: wait for the audio engine".into();
-            return None;
-        }
-        // --- selection span ------------------------------------------------
-        let mut sel: Option<(u64, u64, usize)> = None; // (pos, len, first track)
-        if !self.sel_clips.is_empty() {
-            let (mut lo, mut hi, mut ft) = (u64::MAX, 0u64, usize::MAX);
-            for &(t, l, c) in self.sel_clips.iter() {
-                if let Some(cl) = self
-                    .arr
-                    .tracks
-                    .get(t)
-                    .and_then(|tr| tr.lanes.get(l))
-                    .and_then(|ln| ln.clips.get(c))
-                {
-                    lo = lo.min(cl.pos);
-                    hi = hi.max(cl.end(self.asset_len(cl.asset)));
-                    ft = ft.min(t);
-                }
-            }
-            if hi > lo {
-                sel = Some((lo, hi - lo, ft));
-            }
-        }
-        // --- longest track --------------------------------------------------
-        let (mut longest_t, mut longest_end, mut best) = (0usize, 0u64, 0u64);
-        for t in 0..self.n_tracks.min(MAX_LOOPS) {
-            let mut end = 0u64;
-            for ln in &self.arr.tracks[t].lanes {
-                for cl in &ln.clips {
-                    end = end.max(cl.end(self.asset_len(cl.asset)));
-                }
-            }
-            if end > best {
-                best = end;
-                longest_t = t;
-                longest_end = end;
-            }
-        }
-        let fallback = self.sample_rate as u64 * 2;
-        let (pos, len, host) = match (&sel, owner) {
-            (Some((p, l, _)), Some(t)) => (*p, *l, t),
-            (Some((p, l, ft)), None) => (*p, *l, *ft),
-            (None, Some(t)) => (
-                snap_start(self.backend.engine.pos(), self.snap_unit()),
-                longest_end.max(fallback),
-                t,
-            ),
-            (None, None) => (
-                snap_start(self.backend.engine.pos(), self.snap_unit()),
-                longest_end.max(fallback),
-                longest_t,
-            ),
-        };
-        let host = host.min(self.n_tracks.saturating_sub(1));
-        let len = len.max(1);
-        let auto = crate::automation::Automation::flat(target, current, len as i64);
-        let dir = self.record_dir();
-        let mut n = 1u32;
-        let path = loop {
-            let p = dir.join(format!("auto-{n}.slauto"));
-            if !p.exists() {
-                break p;
-            }
-            n += 1;
-        };
-        if let Err(e) = std::fs::write(&path, auto.to_json().unwrap_or_default()) {
-            self.status = format!("automation: {e}");
-            return None;
-        }
-        let id = self.assets.len() as u32;
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.assets.push(Asset::automation_asset(
-            id,
-            name.clone(),
-            path,
-            Arc::new(auto),
-            false,
-        ));
-        self.last_auto_asset = Some(id); // v34 R1
-        let nl0 = self.arr.tracks[host].lanes.len();
-        // v20 R3: ALWAYS a new child lane — the requirement's "child
-        // track". `place_auto` would reuse lane 0/free lanes; stacking
-        // automation visibly above the audio it controls is the point.
-        let lane = self.arr.add_lane(host);
-        self.arr.insert(host, lane, Clip::new(id, pos));
-        self.grow_for_lanes(host, nl0);
-        if let Some(f) = self.rack.first_mut() {
-            f.rescan();
-        }
-        self.push_project();
-        // ...and show it: the manager opens on the new asset, bound.
-        self.open_auto_editor(Some(id as usize));
-        self.status = format!(
-            "\u{201c}{name}\u{201d} = flat {} at {current:.3} on a new lane \u{b7} track {} \u{b7} manager open",
-            crate::automation::describe_target(target),
-            host + 1
-        );
-        Some(id)
-    }
-
     /// v0.15: apply a "Set value" dialog entry to the control it belongs
     /// to. `txt` is USER units (dB for volume/gain, -100..100 for pan, BPM,
     /// 0..100 % for plugin params) — the 1:1 semantics the requirement
@@ -4826,6 +4769,7 @@ impl App {
                 }
             }
             TARGET_MASTER_VOL => {
+                self.master_dirty = true; // v35 R1: real push, not mirror
                 self.master_midi = vol_midi(if v <= 0.0 {
                     f32::NEG_INFINITY
                 } else {
@@ -4910,6 +4854,89 @@ impl App {
         true
     }
 
+    /// v35 R7: span of a FRESH curve — the selected clips when any are
+    /// selected, else the longest track in the arrangement (the "same
+    /// amount of measures" requirement), floor two seconds.
+    fn fresh_auto_len(&self) -> i64 {
+        // v35: ends are REAL timeline ends — Clip::end(asset_len), trimmed
+        // or not. (The old pos + play_len.unwrap_or(0) formula measured an
+        // untrimmed clip as zero-length.)
+        let end_of = |c: &Clip| c.end(self.asset_len(c.asset)) as i64;
+        let span_of = |cs: &[&Clip]| -> i64 {
+            let lo = cs.iter().copied().map(|c| c.pos as i64).min().unwrap_or(0);
+            let hi = cs.iter().copied().map(end_of).max().unwrap_or(0);
+            (hi - lo).max(0)
+        };
+        let sel: Vec<&Clip> = self
+            .sel_clips
+            .iter()
+            .filter_map(|(t, k2, c)| self.arr.tracks.get(*t)?.lanes.get(*k2)?.clips.get(*c))
+            .collect();
+        if !sel.is_empty() {
+            let sp = span_of(&sel);
+            if sp > 0 {
+                return sp;
+            }
+        }
+        // No selection: the longest single track's span.
+        let mut longest = 0i64;
+        for tr in self.arr.tracks.iter() {
+            for ln in tr.lanes.iter() {
+                let cs: Vec<&Clip> = ln.clips.iter().collect();
+                longest = longest.max(span_of(&cs));
+            }
+        }
+        longest.max((self.sample_rate.max(1) * 2) as i64)
+    }
+
+    /// v35 R7: open the automation manager with a FRESH curve already
+    /// bound to `target` and flat at `current` — and create NOTHING else.
+    /// The old right-click path wrote a `.slauto` file, pushed the asset
+    /// and placed a clip before the user saw the curve; now the asset and
+    /// clip appear only when the manager's "Save as new asset + clip"
+    /// button commits, and the clip lands on the bound control's track.
+    fn open_bound_auto(&mut self, owner: Option<usize>, target: &str, current: f32) {
+        if self.sample_rate == 0 {
+            self.status = "automation: wait for the audio engine".into();
+            return;
+        }
+        let len = self.fresh_auto_len().max(1);
+        let nodes = vec![
+            crate::automation::Node {
+                t: 0,
+                v: current,
+                c: 0.0,
+            },
+            crate::automation::Node {
+                t: len,
+                v: current,
+                c: 0.0,
+            },
+        ];
+        self.auto_pick_open = false;
+        self.auto_edit = Some(Box::new(AutoEdit {
+            snap_on: self.auto_snap_on,
+            snap_sub: self.auto_snap_sub,
+            asset: None,
+            host: owner,
+            name: "automation".into(),
+            target: target.to_string(),
+            len_samples: len,
+            nodes,
+            sel: 0,
+            drag: None,
+            changed: false,
+            rec: false,
+            rec_start: 0,
+            len_bars: false,
+        }));
+        self.status = format!(
+            "automation: curve bound to {} \u{2014} save creates the asset + clip{}",
+            crate::automation::describe_target(target),
+            owner.map_or(String::new(), |t| format!(" on track {}", t + 1))
+        );
+    }
+
     /// Open the automation manager editing asset `k` (None = fresh curve).
     fn open_auto_editor(&mut self, k: Option<usize>) {
         let (name, target, len, nodes) = match k
@@ -4926,28 +4953,7 @@ impl App {
                 // v0.15: a FRESH curve spans the SELECTED clips when any
                 // are selected, else the LONGEST track in the arrangement
                 // (the "same amount of measures" requirement).
-                let end_of = |c: &Clip| c.pos as i64 + c.play_len.unwrap_or(0) as i64;
-                let sel_end = self
-                    .sel_clips
-                    .iter()
-                    .filter_map(|(t, k2, c)| self.arr.tracks.get(*t)?.lanes.get(*k2)?.clips.get(*c))
-                    .map(end_of)
-                    .max()
-                    .unwrap_or(0);
-                let longest = self
-                    .arr
-                    .tracks
-                    .iter()
-                    .flat_map(|t| t.lanes.iter())
-                    .flat_map(|l| l.clips.iter())
-                    .map(end_of)
-                    .max()
-                    .unwrap_or(0);
-                let len = if sel_end > 0 {
-                    sel_end
-                } else {
-                    longest.max((self.sample_rate.max(1) * 2) as i64)
-                };
+                let len = self.fresh_auto_len();
                 (
                     "automation".into(),
                     crate::automation::TARGET_TRACK_VOL.to_string(),
@@ -4978,6 +4984,7 @@ impl App {
             snap_on: self.auto_snap_on,
             snap_sub: self.auto_snap_sub,
             asset: k,
+            host: None,
             name,
             target,
             len_samples: len.max(1),
@@ -5412,7 +5419,7 @@ impl App {
                     let pp_btn = egui::Button::new(if playing {
                         "\u{25a0} stop"
                     } else {
-                        "\u{25b6} play"
+                        "play"
                     })
                     .min_size(egui::vec2(56.0, 0.0));
                     if ui.add(pp_btn).clicked()
@@ -5610,12 +5617,14 @@ impl App {
             return;
         };
         let sr = self.sample_rate.max(1) as f64;
+        // v35 R7: a bound-but-unsaved curve belongs to the track whose
+        // control it rides — that is where its clip lands on save.
+        let track = ed.host.unwrap_or(self.selected);
         // v26: metronome maths for the bars view (beat/bar in samples).
         let bpm = self.bpm();
         let beats = self.beats() as f64;
         let beat_s = quantize::beat_samples(self.sample_rate.max(1), bpm).max(1.0);
         let bar_s = (beat_s * beats).max(1.0);
-        let track = self.selected;
         let targets = auto_targets(self, track);
         let mut action: u8 = 0; // 1=save new, 2=overwrite, 3=cancel
 
@@ -6653,7 +6662,7 @@ impl App {
         self.push_project();
         self.save_config();
         self.status = format!(
-            "track {}: MIDI take → clip in lane {} (“{name}”)",
+            "track {}: MIDI take · clip in lane {} (“{name}”)",
             t + 1,
             lane + 1
         );
@@ -8776,7 +8785,7 @@ impl App {
         let lane = self.arr.place_auto(track, Clip::new(id, pos), len);
         self.grow_for_lanes(track, nl0);
         self.push_project();
-        self.status = format!("track {}: recorded → clip in lane {}", track + 1, lane + 1);
+        self.status = format!("track {}: recorded · clip in lane {}", track + 1, lane + 1);
     }
 
     /// Load (or reuse) an asset for a rack file path; returns its index.
@@ -9539,7 +9548,7 @@ impl App {
         let engine = self.backend.engine.clone();
         let done = self.export_tx.clone();
         let label = path.display().to_string();
-        self.status = format!("exporting → {label} …");
+        self.status = format!("exporting: {label} …");
         // Mirror the snapshot synchronously: the queue may still hold
         // older SetProject copies from this frame's edits, and the worker
         // must see exactly the arrangement the user is looking at.
@@ -9582,7 +9591,7 @@ impl App {
                 })();
                 let msg = match res {
                     Ok(n) => format!(
-                        "exported {} → {label}",
+                        "exported {} · {label}",
                         if n > 0 { format!("{n} clip(s)") } else { "mix".into() }
                     ),
                     Err(e) => format!("export: {e}"),
@@ -9627,6 +9636,8 @@ impl App {
             | MidiAction::PanLoop(_)
             | MidiAction::VolMaster => {}
             MidiAction::MidiRec(i) => self.toggle_midi_rec(i),
+            MidiAction::GotoStart => self.goto_edge(true),
+            MidiAction::GotoEnd => self.goto_edge(false),
             MidiAction::Reserved => {}
         }
     }
@@ -9748,7 +9759,7 @@ impl App {
                                 self.knob_cal[slot] = None;
                                 self.save_config();
                                 self.status = format!(
-                                    "bound {} → {}",
+                                    "bound {} to {}",
                                     MidiAction::ALL[slot].label(),
                                     bind.label()
                                 );
@@ -9925,6 +9936,7 @@ impl App {
                                         // slider — -inf .. slider top.
                                         MidiAction::VolMaster => {
                                             if let Some(v) = v {
+                                                self.master_dirty = true;
                                                 self.master_midi = v;
                                                 self.note_auto(
                                                     0,
@@ -10338,9 +10350,54 @@ impl App {
             ));
         }
 
+        // v35 R1: the engine atomics are the REAL controls. Push on user
+        // edits; otherwise MIRROR them, so an automation clip animates the
+        // master knob and the track faders live, and the value the curve
+        // leaves behind persists (and is what a grab starts from).
+        {
+            let block = self.fader_live.take();
+            let eng = &self.backend.engine;
+            for t in 0..self.n_tracks.min(MAX_LOOPS) {
+                let a = eng.loop_vol(t);
+                let m = if a > 0.0 { vol_midi(20.0 * a.log10()) } else { 0 };
+                if block != Some((t, 0)) && m != self.trk_vol[t] {
+                    self.trk_vol[t] = m;
+                }
+                let g = eng.loop_gain(t);
+                let m = gain_midi_from_amp(g);
+                if block != Some((t, 1)) && m != self.trk_gain[t] {
+                    self.trk_gain[t] = m;
+                }
+                let pn = eng.loop_pan(t);
+                let m = (pn.clamp(0.0, 1.0) * 127.0 + 0.5) as u8;
+                if block != Some((t, 2)) && m != self.trk_pan[t] {
+                    self.trk_pan[t] = m;
+                }
+            }
+        }
         // Master volume: same -inf..=+6 dB MIDI mapping as every track.
-        let mamp = vol_amp(self.master_midi);
-        self.backend.gain.store(mamp.to_bits(), Ordering::Relaxed);
+        if self.master_dirty {
+            let mamp = vol_amp(self.master_midi);
+            self.backend.gain.store(mamp.to_bits(), Ordering::Relaxed);
+            self.master_dirty = false;
+        } else {
+            let live = f32::from_bits(self.backend.gain.load(Ordering::Relaxed));
+            let m = if live > 0.0 { vol_midi(20.0 * live.log10()) } else { 0 };
+            if m != self.master_midi {
+                self.master_midi = m;
+            }
+        }
+        // Tempo: automation drives the real metro_bpm atomic — mirror the
+        // readout while transport runs (never while a text field is open).
+        if self.backend.engine.transport_on()
+            && ui.ctx().memory(|m| m.focused().is_none())
+        {
+            let b = self.backend.engine.metro_bpm_now();
+            let cur: f32 = self.metro_bpm.trim().parse().unwrap_or(f32::NAN);
+            if cur != b as f32 {
+                self.metro_bpm = b.to_string();
+            }
+        }
 
         if self.sel_sent != self.selected {
             self.sel_sent = self.selected;
@@ -11025,10 +11082,11 @@ fn value_menu_items(
         return true;
     }
     if ui
-        .button("Create automation asset")
+        .button("Create automation clip")
         .on_hover_text(
-            "Create a red automation asset holding this exact value — spanning the selected \
-             clips (or the longest track) on a new lane — and edit it in the automation manager.",
+            "Open the automation manager with a fresh curve already BOUND to this control, \
+             flat at its current value. Nothing is created on disk or placed on the grid \
+             until the manager's “Save as new asset + clip” button is pressed.",
         )
         .clicked()
     {
@@ -11039,7 +11097,8 @@ fn value_menu_items(
         } else {
             Some(track)
         };
-        app.rmb_create_auto(owner, target, current);
+        // v35 R7: NO eager asset — the bound manager commits only on save.
+        app.open_bound_auto(owner, target, current);
         return true;
     }
     false
@@ -11065,9 +11124,10 @@ fn slider_click_gestures(resp: &egui::Response) -> (bool, bool) {
 
 /// v20 R3: the ONE binding gesture pair for every automatable slider and
 /// readout (strip vol/pan, master vol, synth sliders, fx auto/bridge
-/// sliders): right-click creates the automation asset (selection/longest
-/// geometry, seeded at the control's current value, manager opens) with
-/// NO intermediate menu; double-click opens the Set value dialog.
+/// sliders). v35 R7: right-click opens the value MENU at the pointer
+/// ("Create automation clip" = the manager opens BOUND, no eager asset;
+/// "Set value" = exact-entry dialog) — like right-clicking an asset in the
+/// rack, never an instant asset. Double-click still opens Set value.
 fn bind_value_controls(
     resp: &mut egui::Response,
     app: &mut App,
@@ -11086,7 +11146,13 @@ fn bind_value_controls(
     // phase — never do that here.
     let (sl_rmb, sl_dbl) = slider_click_gestures(resp);
     if resp.secondary_clicked() || sl_rmb {
-        app.rmb_create_auto(owner, target, current);
+        // v35 R7: the mini menu at the pointer (same host as the bpm box).
+        let pos = resp
+            .ctx
+            .input(|i| i.pointer.interact_pos())
+            .unwrap_or_else(|| resp.rect.center());
+        let t = owner.unwrap_or(app.selected);
+        app.value_menu = Some((t, target.to_string(), current, pos));
     }
     if resp.double_clicked() || sl_dbl {
         let t = owner.unwrap_or(app.selected);
@@ -13199,6 +13265,7 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             )
             .on_hover_text("dB");
         if msl.changed() {
+            app.master_dirty = true; // v35 R1
             app.master_midi = mv.clamp(0, 127) as u8;
             let amp = vol_amp(app.master_midi);
             app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
@@ -13214,6 +13281,7 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
             .on_hover_text("Reset master volume to 0 dB")
             .clicked()
         {
+            app.master_dirty = true; // v35 R1
             app.master_midi = VOL_UNITY_MIDI;
             app.levels_dirty = true;
         }
@@ -13927,6 +13995,28 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
         if app.loop_tl && app.loop_mode == 0 {
             ui.label(RichText::new("(drag the ruler handles)").weak().small());
         }
+        // v35 R3: skip to the beginning / end of the selection, loop, or
+        // project. Vector glyphs (bar + triangle) — no font dependency.
+        if skip_button(ui, true)
+            .on_hover_text(
+                "Go to start (default key: Home). With clips selected jumps to \
+                 the start of the selection; with loop on, to the loop \
+                 start; otherwise to the project start.",
+            )
+            .clicked()
+        {
+            app.goto_edge(true);
+        }
+        if skip_button(ui, false)
+            .on_hover_text(
+                "Go to end (default key: End). With clips selected jumps to \
+                 the end of the selection; with loop on, to the loop end; \
+                 otherwise to the project end.",
+            )
+            .clicked()
+        {
+            app.goto_edge(false);
+        }
         ui.separator();
         if ui
             .button(RichText::new("\u{2702} split").strong())
@@ -13976,7 +14066,11 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         let sr = app.sample_rate.max(1) as f64;
         let total = app.total_len().max(1);
         let px = app.px_per_sec as f64;
-        let w = ((total as f64 / sr) * px).max(640.0) as f32;
+        // v35 R2: the grid runs GRID_TAIL_BARS measures PAST the project
+        // end so the playhead can be placed beyond the last measure (the
+        // engine seek carries the same slack).
+        let tail = app.bar_samples() * GRID_TAIL_BARS;
+        let w = (((total + tail) as f64 / sr) * px).max(640.0) as f32;
         if ui.input(|i| !i.pointer.any_down()) {
             app.scrub_drag = false;
         }
@@ -14288,11 +14382,58 @@ fn paint_grid(
     }
 }
 
+/// v35 R2: half-width of the loop-endpoint DEADZONE. A press that lands
+/// inside it arms the endpoint drag and NEVER seeks the playhead (the old
+/// code only armed on `drag_started`, so a plain click near a handle moved
+/// the playhead instead — "the endpoint clickbox doesn't register"). A
+/// press OUTSIDE the zone scrubs as always, so the playhead can still be
+/// dragged THROUGH the endpoints.
+const RULER_HANDLE_HIT: f32 = 8.0;
+
 /// Timeline ruler: measure grid, bar numbers, and the scrub handle — press
 /// or drag anywhere here to move the global playhead. Pinned above the track
 /// scroll so it is always visible; shares its x window with the lane strips.
+/// v35 R3: skip-to-start / skip-to-end button with a vector glyph (a bar
+/// plus a filled triangle, FL-style). No font-glyph dependency — the skip
+/// characters tofu in the default font.
+fn skip_button(ui: &mut egui::Ui, to_start: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_at_least(egui::vec2(22.0, 19.0), egui::Sense::click());
+    let p = ui.painter();
+    if resp.hovered() || resp.clicked() {
+        p.rect_filled(
+            r.shrink(1.0),
+            3.0,
+            egui::Color32::from_white_alpha(if resp.clicked() { 40 } else { 16 }),
+        );
+    }
+    let fg = if resp.hovered() {
+        egui::Color32::from_rgb(240, 244, 255)
+    } else {
+        egui::Color32::from_rgb(205, 210, 226)
+    };
+    let c = r.center().y;
+    let (tb, tip) = if to_start {
+        (r.min.x + 4.0, r.min.x + 16.0)
+    } else {
+        (r.max.x - 6.0, r.max.x - 16.0)
+    };
+    p.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(tb, c - 5.0), egui::pos2(tb + 2.0, c + 5.0)),
+        0.5,
+        fg,
+    );
+    let tx = if to_start { r.min.x + 8.0 } else { r.max.x - 8.0 };
+    p.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(tx, c - 5.0), egui::pos2(tx, c + 5.0), egui::pos2(tip, c)],
+        fg,
+        egui::Stroke::NONE,
+    ));
+    resp
+}
+
 fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, 20.0), Sense::click_and_drag());
+    app.ruler_rect = Some(rect); // v35 R2 test hook
     let x0 = rect.min.x - app.hscroll;
     paint_grid(ui, app, rect, px, sr, true, x0);
     // Loop region on the ruler ("grid header"): a shaded span, plus two
@@ -14300,6 +14441,7 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
     let (ls, le) = app.loop_region_eff();
     let hx0 = x_of(x0, ls, sr, px);
     let hx1 = x_of(x0, le, sr, px);
+    let area_handles = app.loop_tl && app.loop_mode == 0 && le > ls;
     if app.loop_tl && le > ls {
         let band = egui::Rect::from_min_max(
             egui::pos2(hx0.max(rect.min.x), rect.min.y),
@@ -14312,7 +14454,7 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                 Color32::from_rgba_premultiplied(90, 150, 230, 55),
             );
         }
-        if app.loop_mode == 0 {
+        if area_handles {
             // Grab bars in loud yellow: this is where the user drags the
             // loop's start/end. They brighten while one is being dragged.
             let dragging = app.drag_loop_handle.is_some();
@@ -14335,20 +14477,30 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
             }
         }
     }
+    // v35 R2: which endpoint (if any) owns the pointer's x — the deadzone.
+    let handle_zone = |x: f32| -> Option<u8> {
+        if !area_handles {
+            return None;
+        }
+        let d0 = (x - hx0).abs();
+        let d1 = (x - hx1).abs();
+        if d0.min(d1) <= RULER_HANDLE_HIT {
+            Some(if d0 <= d1 { 0 } else { 1 })
+        } else {
+            None
+        }
+    };
     if let Some(pt) = resp.interact_pointer_pos() {
-        if resp.drag_started_by(egui::PointerButton::Primary) {
-            app.drag_loop_handle = if app.loop_tl
-                && app.loop_mode == 0
-                && (pt.x - hx0).abs().min((pt.x - hx1).abs()) <= 7.0
-            {
-                Some(if (pt.x - hx0).abs() <= (pt.x - hx1).abs() {
-                    0
-                } else {
-                    1
-                })
-            } else {
-                None
-            };
+        let in_rect = rect.contains(pt);
+        // ARM ON PRESS (v29 gesture rule): a press inside the endpoint
+        // deadzone belongs to the endpoint, whether or not it turns into a
+        // drag. A press outside it never arms a handle — mid-drag crossing
+        // of endpoints therefore keeps scrubbing the playhead THROUGH them.
+        let press_now = resp.ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.button_down(egui::PointerButton::Primary)
+        });
+        if app.drag_loop_handle.is_none() && press_now && in_rect {
+            app.drag_loop_handle = handle_zone(pt.x);
         }
         if let Some(h) = app.drag_loop_handle {
             if resp.dragged() {
@@ -14375,13 +14527,21 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                 app.drag_loop_handle = None;
                 app.save_config();
             }
-        } else if (resp.dragged() || resp.clicked()) && rect.contains(pt) {
+        } else if (resp.dragged() || resp.clicked()) && in_rect {
             let pos = s_at(x0, pt.x, sr, px);
             app.backend.cmd(Cmd::Seek { pos });
         }
     }
+    // v35 R2: a MEANINGFUL cursor — the two-sided horizontal arrow only
+    // where dragging an endpoint is what will happen; a pointing hand over
+    // the clickable ruler body.
     if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        let cur = ui.ctx().input(|i| i.pointer.hover_pos()).unwrap_or_default();
+        ui.ctx().set_cursor_icon(if handle_zone(cur.x).is_some() {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::PointingHand
+        });
     }
 }
 
@@ -15997,6 +16157,9 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
             .selectable(false),
         );
         if r.changed() {
+            // v35 R1: dragging THIS fader owns the control this frame —
+            // the engine-mirror must not fight the pointer.
+            app.fader_live = Some((i, kind));
             match kind {
                 KIND_VOL => app.set_trk_vol(i, v),
                 KIND_GAIN => app.set_trk_gain(i, v),
@@ -16956,7 +17119,7 @@ fn port_list(
         if p.client != last_client {
             last_client = p.client.clone();
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("▸ {}", p.client)).strong());
+            ui.label(RichText::new(format!("· {}", p.client)).strong());
         }
         let short = p.name.split(':').nth(1).unwrap_or(&p.name);
         let mut checked = sel.contains(&p.name);
@@ -16998,7 +17161,7 @@ fn port_list_lr(
         if p.client != last_client {
             last_client = p.client.clone();
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("▸ {}", p.client)).strong());
+            ui.label(RichText::new(format!("· {}", p.client)).strong());
         }
         let short = p.name.split(':').nth(1).unwrap_or(&p.name);
         let entry = sel.get(&p.name).copied().unwrap_or(0u8);
@@ -17573,7 +17736,7 @@ fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
             let re = ui.add(egui::TextEdit::singleline(&mut app.save_draft).desired_width(320.0));
             enter_hit = re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.label(
-                RichText::new(format!("→ {}/<name>.{}", dir.display(), project::EXT))
+                RichText::new(format!("as {}/<name>.{}", dir.display(), project::EXT))
                     .weak()
                     .small(),
             );
@@ -17648,7 +17811,7 @@ mod tests {
         // 121 historical + 16 appended `MidiRec` slots + 1 appended v32
         // `VolMaster` (action tables are appended-only: save files address
         // slots by index).
-        assert_eq!(N_ACTIONS, 138);
+        assert_eq!(N_ACTIONS, 140);
         // Space is the global transport toggle; knob slots are never keyed.
         assert_eq!(
             SHORTCUT_DEFAULTS[MidiAction::idx(MidiAction::PlayAll)],
@@ -23158,9 +23321,13 @@ mod tests {
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         app.arr.insert(0, 0, Clip::new(a, 0));
         app.arr.insert(0, 0, Clip::new(a, 96_000));
-        app.rmb_create_auto(Some(1), crate::automation::TARGET_TRACK_VOL, 0.5);
+        // v35 R7: bind through the manager and SAVE (no eager asset).
+        app.open_bound_auto(Some(1), crate::automation::TARGET_TRACK_VOL, 0.5);
+        frame(&mut app, &ctx, vec![]);
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
         let before = n_clips(&app);
-        assert_eq!(before, 3, "2 audio clips + 1 automation clip");
+        assert_eq!(before, 3, "2 audio clips + 1 automation clip: {}", app.status);
         app.select_one((0, 0, 1));
         frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
         assert_eq!(n_clips(&app), before - 1, "Delete key removed the clip: {}", app.status);
@@ -23191,12 +23358,235 @@ mod tests {
         assert!(app.sel_clips.is_empty());
     }
 
+    /// v35 R4: glyph coverage probe. Every icon-ish codepoint this file
+    /// ships as TEXT must render in egui's default font stack — anything
+    /// else paints a hollow tofu box (the drum-pad mute/remove report).
+    /// While this list has members, replace the glyph (drawn vector or
+    /// ASCII text), never paper over the check.
+    #[test]
+    fn v35_glyph_coverage_probe() {
+        // Every symbol the shipped UI can paint — the probe keeps this list
+        // honest; CI fails if a new glyph lands without coverage (v35 R4).
+        const GLYPHS: &str = "\u{00b7}\u{00d7}\u{2013}\u{2014}\u{2019}\u{201c}\u{201d}\u{2026}\u{2212}\u{221e}\u{2248}\u{2264}\u{2265}\u{25a0}\u{266a}\u{266b}";
+        // One real app frame: the probe then checks the SAME font stack
+        // the shipped UI paints with (custom fonts install on first run).
+        let mut app = headless_app("v35glyphs");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let missing: Vec<String> = ctx.fonts_mut(|f| {
+            let id = egui::FontId::proportional(13.0);
+            GLYPHS
+                .chars()
+                .filter(|c| !f.has_glyph(&id, *c))
+                .map(|c| format!("U+{:04X}", c as u32))
+                .collect()
+        });
+        assert!(missing.is_empty(), "TOFU GLYPHS: {}", missing.join(" "));
+    }
+
+    /// v35 R8: deletion torture. Every delete path in the app, hammered in
+    /// the orders a user actually produces, with frames (paint! engine
+    /// sync!) in between: clip delete by key, remove_asset_at first /
+    /// middle / last while its clips are placed AND while the automation
+    /// manager and piano roll are open on neighbouring ids, select-all
+    /// delete, clear_track under an open selection, delete with the rack
+    /// selection pointing past the end. Must never panic, and every clip's
+    /// asset id must stay in bounds after every step.
+    #[test]
+    fn v35_delete_torture_all_paths() {
+        fn invariant(app: &App, step: &str) {
+            let n = app.assets.len();
+            for tr in app.arr.tracks.iter() {
+                for ln in tr.lanes.iter() {
+                    for c in ln.clips.iter() {
+                        assert!(
+                            (c.asset as usize) < n,
+                            "{step}: clip asset id {} out of bounds ({} assets)",
+                            c.asset,
+                            n
+                        );
+                    }
+                }
+            }
+        }
+        let mut app = headless_app("v35deltorture");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let a0 = push_v20_audio(&mut app, "d0", 96_000);
+        let a1 = push_v20_audio(&mut app, "d1", 48_000);
+        let a2 = push_v20_audio(&mut app, "d2", 12_000);
+        app.assets.push(crate::assets::Asset::midi(
+            app.assets.len() as u32,
+            "d3".into(),
+            std::path::PathBuf::from("/tmp/d3-v35.mid"),
+            {
+                let mut q = Pattern::new(120);
+                q.len_ticks = 4 * PPQ as u32;
+                q.into()
+            },
+            false,
+        ));
+        let a3 = (app.assets.len() - 1) as u32;
+        app.arr.insert(1, 0, Clip::new(a0, 0));
+        app.arr.insert(1, 0, Clip::new(a1, 96_000));
+        app.arr.insert(2, 0, Clip::new(a2, 0));
+        app.arr.insert(2, 1, Clip::new(a3, 48_000));
+        frame(&mut app, &ctx, vec![]);
+        invariant(&app, "setup");
+
+        // (1) Clip delete by Delete key with a stale extra id in the
+        // selection (as if another clip had already been removed).
+        app.sel_clips = vec![(1, 0, 0), (1, 0, 1), (1, 0, 9)];
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        frame(&mut app, &ctx, vec![]);
+        invariant(&app, "after Delete key with stale id");
+
+        // (2) Automation manager open on an auto asset; delete the asset
+        // BEFORE it (id shift) and its own asset (editor must close).
+        app.open_bound_auto(Some(1), crate::automation::TARGET_MASTER_TEMPO, 120.0);
+        frame(&mut app, &ctx, vec![]);
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        let auto_id = app.assets.len() - 1;
+        app.arr.insert(1, 0, crate::arrange::Clip::new(auto_id as u32, 0));
+        frame(&mut app, &ctx, vec![]);
+        app.open_bound_auto(Some(1), crate::automation::TARGET_MASTER_TEMPO, 120.0);
+        frame(&mut app, &ctx, vec![]);
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        let auto2 = app.assets.len() - 1;
+        // A manager opened ON an existing curve (toolbar button on a
+        // selected auto clip) — "Save as new" leaves asset=None, so model
+        // the opened-on-existing state directly.
+        app.auto_edit.as_mut().unwrap().asset = Some(auto2);
+        // delete the FIRST auto asset while the manager sits on the second
+        app.remove_asset_at(auto_id);
+        frame(&mut app, &ctx, vec![]);
+        invariant(&app, "after removing the earlier auto asset");
+        assert_eq!(
+            app.auto_edit.as_ref().map(|e| e.asset),
+            Some(Some(auto2 - 1)),
+            "manager id shifted, editor stays open"
+        );
+        // now delete the manager's own asset: the editor closes with it
+        app.remove_asset_at(app.auto_edit.as_ref().unwrap().asset.unwrap());
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.auto_edit.is_none(), "manager closed with its asset");
+        invariant(&app, "after removing the open auto asset");
+
+        // (3) Piano roll open, delete the FIRST asset (id shift) and then
+        // the roll's own asset (roll closes with it).
+        app.piano_roll = Some(Box::new(PianoRoll {
+            pat: Pattern::new(120),
+            px_per_beat: 90.0,
+            row_h: 11.0,
+            vscroll_px: 396.0,
+            scroll_sec: 0.0,
+            changed: false,
+            gesture: RollGesture::None,
+            canvas_rect: None,
+            new_vel: 100,
+            sel_notes: Vec::new(),
+            sel_anchor: None,
+            drag_notes: Vec::new(),
+            focused: true,
+            win_rect: None,
+            edit_asset: Some(a3),
+        }));
+        frame(&mut app, &ctx, vec![]);
+        app.remove_asset_at(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().edit_asset, Some(a3 - 1));
+        app.remove_asset_at(app.piano_roll.as_ref().unwrap().edit_asset.unwrap() as usize);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.piano_roll.is_none(), "roll closed with its asset");
+        invariant(&app, "after roll-bound removals");
+
+        // (4) select-all + delete everything, then clear_track on top.
+        app.select_all_clips();
+        let had = !app.sel_clips.is_empty();
+        app.delete_selection();
+        frame(&mut app, &ctx, vec![]);
+        assert!(had);
+        for t in 0..4 {
+            app.clear_track(t);
+        }
+        frame(&mut app, &ctx, vec![]);
+        invariant(&app, "after select-all delete + clear_track");
+
+        // (5) Rack selection pointing past the end after a removal — the
+        // asset-window toolbar guards on k < len, but hammer it anyway.
+        app.assets.clear();
+        app.sel_asset = Some(99);
+        frame(&mut app, &ctx, vec![]);
+        invariant(&app, "empty asset table paints");
+    }
+
+    /// v35 R8: the reported repro itself — right-click the grid over a
+    /// loaded track, take "Clear this track's clips", then keep painting.
+    /// Variants: with a clip selected, with the automation manager open on
+    /// one of the doomed clips, with the piano roll open, twice in a row,
+    /// and the menu items that mutate (Delete/Duplicate) followed by a
+    /// later item in the SAME menu pass.
+    #[test]
+    fn v35_clear_track_menu_repro() {
+        let mut app = headless_app("v35cleardel");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let a0 = push_v20_audio(&mut app, "c0", 96_000);
+        let a1 = push_v20_audio(&mut app, "c1", 48_000);
+        app.arr.insert(1, 0, Clip::new(a0, 0));
+        app.arr.insert(1, 0, Clip::new(a1, 96_000));
+        frame(&mut app, &ctx, vec![]);
+        let find = |app: &mut App, ctx: &egui::Context, label: &str| -> Option<egui::Pos2> {
+            label_center(app, ctx, label)
+        };
+        // A point inside track 1's (internal index 1… tracks are internal)
+        // parent-lane strip: sweep rows until the grid menu opens.
+        let mut opened = false;
+        let kick_x = {
+            let rr = app.ruler_rect.expect("ruler");
+            (rr.min.x + 10.0, rr.center().y)
+        };
+        for dy in [10.0, 30.0, 50.0, 80.0, 110.0, 140.0, 170.0, 210.0, 250.0] {
+            let p = egui::pos2(kick_x.0, kick_x.1 + dy);
+            rmb(&mut app, &ctx, p);
+            frame(&mut app, &ctx, vec![]);
+            if find(&mut app, &ctx, "Clear this track's clips").is_some() {
+                opened = true;
+                break;
+            }
+        }
+        assert!(opened, "grid right-click menu with a Clear item must open");
+        let cp = find(&mut app, &ctx, "Clear this track's clips").unwrap();
+        frame(&mut app, &ctx, vec![moved(cp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(cp), btn(cp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(cp), btn(cp, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("cleared"), "{}", app.status);
+        // Clips gone, assets stay, no panic. Repeat immediately.
+        let n = app.assets.len();
+        assert_eq!(n, 2);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+    }
+
     // ---- R3: automation creation by right-click ----------------------------
 
     /// R3a: right-clicking the BPM box opens the mini menu; "Create
-    /// automation asset" produces an AUTO asset + clip at the playhead on
-    /// the owning track, and a second creation gets its own asset (auto-2,
-    /// never overwritten).
+    /// automation clip" opens the manager BOUND (v35 R7: nothing is
+    /// created until the manager saves); saving produces an AUTO asset +
+    /// clip at the playhead on the owning track, and a second creation
+    /// gets its own asset (automation-2, never overwritten).
     #[test]
     fn v18_rmb_tempo_creates_automation_asset_twice() {
         let mut app = headless_app("v18rmbtempo");
@@ -23205,29 +23595,43 @@ mod tests {
         let n0 = app.assets.len();
         let p = app.bpm_rect.expect("bpm rect painted").center();
         rmb(&mut app, &ctx, p);
-        click_label(&mut app, &ctx, "Create automation asset");
+        click_label(&mut app, &ctx, "Create automation clip");
+        // v35 R7: binding creates NOTHING until the manager saves.
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "AUTO asset created: {}", app.status);
+        assert_eq!(app.assets.len(), n0, "no eager asset: {}", app.status);
+        assert!(app.auto_edit.is_some(), "manager open on the bound curve");
+        assert_eq!(
+            app.auto_edit.as_ref().unwrap().target,
+            crate::automation::TARGET_MASTER_TEMPO
+        );
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "AUTO asset on save: {}", app.status);
         assert!(app.assets[n0].is_auto(), "kind = automation");
         let ids = clip_ids(&app);
         assert_eq!(ids.len(), 1, "automation clip placed: {}", app.status);
         assert_eq!(ids[0].0, 0, "placed on the selected track");
-        assert_eq!(app.assets[n0].name, "auto-1");
+        assert_eq!(app.assets[n0].name, "automation");
         // Second creation: its own asset, never overwrite the first. The
         // rect is re-read because the top bar's layout belongs to the app
         // (a v18 pin — it used to JITTER with status text; a real user
         // aims at the CURRENTLY painted box).
         let p = app.bpm_rect.expect("bpm rect still painted").center();
         rmb(&mut app, &ctx, p);
-        click_label(&mut app, &ctx, "Create automation asset");
+        click_label(&mut app, &ctx, "Create automation clip");
+        click_label(&mut app, &ctx, "Save as new asset + clip");
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.assets.len(), n0 + 2, "second asset: {}", app.status);
-        assert_eq!(app.assets[n0 + 1].name, "auto-2", "auto-2 next to auto-1");
+        assert_eq!(
+            app.assets[n0 + 1].name, "automation-2",
+            "automation-2 next to automation"
+        );
     }
 
-    /// R3a-2 (v20 R3 restatement): right-clicking a TRACK volume readout
-    /// in the mixer creates the asset DIRECTLY — no menu in between — and
-    /// binds it to that track's volume target.
+    /// R3a-2 (v20 R3 restated by v35 R7): right-clicking a TRACK volume
+    /// readout in the mixer opens the value MENU (no asset yet); the
+    /// automation item opens the manager bound to THAT track's volume and
+    /// the save lands the asset/clip on that track.
     #[test]
     fn v18_rmb_track_vol_creates_auto_for_that_target() {
         let mut app = headless_app("v18rmbvol");
@@ -23242,7 +23646,18 @@ mod tests {
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "right-click creates directly: {}", app.status);
+        assert_eq!(app.assets.len(), n0, "right-click opens a MENU now: {}", app.status);
+        assert!(app.value_menu.is_some(), "value menu open");
+        click_label(&mut app, &ctx, "Create automation clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0, "still nothing created until save");
+        let ed = app.auto_edit.as_ref().expect("manager opened bound");
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+        assert_eq!(ed.asset, None, "unsaved curve");
+        assert_eq!(ed.host, Some(1), "bound to the track it rides (strips are master + tracks 1..n)");
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "save creates: {}", app.status);
         let auto = app.assets[n0].automation.as_ref().expect("automation attached");
         assert_eq!(auto.target, crate::automation::TARGET_TRACK_VOL);
     }
@@ -23283,13 +23698,6 @@ mod tests {
             .unwrap_or_else(|| panic!("master dB readout {:?} not painted", want))
     }
 
-    fn v20_last_auto(app: &App) -> crate::automation::Automation {
-        app.assets
-            .last()
-            .and_then(|a| a.automation.clone().map(|a| (*a).clone()))
-            .expect("last asset is an automation")
-    }
-
     fn v20_placed(app: &App, asset: u32) -> Option<(usize, usize, crate::arrange::Clip)> {
         (0..MAX_LOOPS).find_map(|t| {
             app.arr.tracks[t].lanes.iter().enumerate().find_map(|(l, ln)| {
@@ -23302,45 +23710,49 @@ mod tests {
         })
     }
 
-    /// R3: right-clicking the track-volume readout creates the asset with
-    /// NO menu in between, FLAT at the control's current value, on a NEW
-    /// child lane of the OWNER track, and opens the manager on it.
+    /// R3 (v35 R7 restatement): right-clicking the track-volume readout
+    /// opens the value MENU (NO direct creation); the automation item
+    /// opens the manager bound FLAT at the control's current value on the
+    /// OWNER track, and only the manager's save places asset + clip.
     #[test]
     fn v20_rmb_slider_creates_auto_clip() {
         let mut app = headless_app("v20rmbauto1");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        app.trk_vol[0] = 32; // strip 1 must read differently from master
+        app.set_trk_vol(0, 32); // strip 1 must read differently from master
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
         let n0 = app.assets.len();
-        let lanes0 = app.arr.tracks[0].lanes.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "direct creation: {}", app.status);
-        let auto = v20_last_auto(&app);
-        assert_eq!(auto.target, crate::automation::TARGET_TRACK_VOL);
+        assert_eq!(app.assets.len(), n0, "RMB alone creates nothing: {}", app.status);
+        assert!(app.value_menu.is_some(), "mini menu at the pointer");
+        click_label(&mut app, &ctx, "Create automation clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0, "binding still creates nothing");
+        let ed = app.auto_edit.as_ref().expect("manager opened bound");
+        assert_eq!(ed.asset, None, "unsaved bound curve");
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+        assert_eq!(ed.host, Some(0), "host = the strip that was right-clicked");
         let cur = vol_amp(app.trk_vol[0]);
         assert!(
-            auto.nodes.iter().all(|n| (n.v - cur).abs() < 1e-6),
+            ed.nodes.iter().all(|n| (n.v - cur).abs() < 1e-6),
             "curve seeded FLAT at the current value (no jump): {:?}",
-            auto.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
+            ed.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
         );
         // Empty project → the documented 2 s fallback length.
-        assert_eq!(auto.len_samples as u64, 48_000 * 2);
-        let (t, lane, cl) = v20_placed(&app, n0 as u32).expect("automation clip placed");
-        // Strip "1" (the one whose readout we right-clicked) is arr track 0.
-        assert_eq!((t, lane), (0, lanes0), "NEW child lane of the OWNER track");
+        assert_eq!(ed.len_samples as u64, 48_000 * 2);
+        park_window(&mut app, &ctx, "Automation", egui::vec2(0.0, -220.0));
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "save creates the asset: {}", app.status);
+        let (t, _lane, cl) = v20_placed(&app, n0 as u32).expect("automation clip placed");
+        assert_eq!(t, 0, "clip on the OWNER track");
         assert_eq!(cl.pos, 0, "no selection → snapped playhead");
-        let ed = app.auto_edit.as_ref().expect("manager opened on the asset");
-        assert_eq!(ed.asset, Some(n0));
-        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
     }
 
-    /// R3: with clips selected the asset spans the SELECTION
-    /// (max end − min pos, lengths via `Clip::end(asset_len)`) and lands
-    /// at the selection's start. Global target (master vol) → host is the
-    /// first selected track.
+    /// R3: with clips selected the bound curve spans the SELECTION
+    /// (max end − min pos, lengths via `Clip::end(asset_len)`).
     #[test]
     fn v20_rmb_auto_clip_uses_selection() {
         let mut app = headless_app("v20rmbsel");
@@ -23356,20 +23768,17 @@ mod tests {
         let p = v20_master_vol_point(&mut app, &ctx);
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "master RMB creates: {}", app.status);
-        let auto = v20_last_auto(&app);
-        assert_eq!(auto.target, crate::automation::TARGET_MASTER_VOL);
+        assert_eq!(app.assets.len(), n0, "no eager asset: {}", app.status);
+        let ed = app.auto_edit.as_ref().expect("bound manager");
+        assert_eq!(ed.target, crate::automation::TARGET_MASTER_VOL);
         // ends: 48k+192k=240k and 96k+96k=192k; min pos 48k → span 192k.
-        assert_eq!(auto.len_samples as u64, 192_000, "selection span");
-        let (t, lane, cl) = v20_placed(&app, n0 as u32).expect("placed");
-        assert_eq!((t, lane), (2, 1), "new lane of the FIRST selected track");
-        assert_eq!(cl.pos, 48_000, "placed at the selection start");
+        assert_eq!(ed.len_samples as u64, 192_000, "selection span");
     }
 
-    /// R3: with nothing selected the length comes from the LONGEST track
-    /// in the project and the host track is that longest track (global
-    /// target).
+    /// R3: with nothing selected the bound curve's length comes from the
+    /// LONGEST track in the project.
     #[test]
     fn v20_rmb_auto_clip_uses_longest_track() {
         let mut app = headless_app("v20rmblong");
@@ -23383,54 +23792,284 @@ mod tests {
         let p = v20_master_vol_point(&mut app, &ctx);
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "creates: {}", app.status);
-        let auto = v20_last_auto(&app);
-        assert_eq!(auto.len_samples as u64, 96_000, "longest-track length");
-        let (t, lane, _cl) = v20_placed(&app, n0 as u32).expect("placed");
-        assert_eq!((t, lane), (3, 1), "new lane on the LONGEST track");
+        assert_eq!(app.assets.len(), n0, "no eager asset");
+        let ed = app.auto_edit.as_ref().expect("bound manager");
+        assert_eq!(ed.len_samples as u64, 96_000, "longest-track length");
     }
 
     /// R3: the seeded value is the control's CURRENT value, not a default —
-    /// moving the fader first must show up in the curve.
+    /// moving the fader first must show up in the bound curve.
     #[test]
     fn v20_rmb_auto_clip_seeded_current() {
         let mut app = headless_app("v20rmbseed");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        app.trk_vol[0] = 32; // distinct readout for the helper
+        app.set_trk_vol(0, 32); // distinct readout for the helper
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "creates: {}", app.status);
+        assert_eq!(app.assets.len(), n0, "no eager asset");
         let want = vol_amp(32);
-        let auto = v20_last_auto(&app);
+        let ed = app.auto_edit.as_ref().expect("bound manager");
         assert!(
-            auto.nodes.iter().all(|n| (n.v - want).abs() < 1e-6),
+            ed.nodes.iter().all(|n| (n.v - want).abs() < 1e-6),
             "seeded at vol_amp(32)={want}: {:?}",
-            auto.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
+            ed.nodes.iter().map(|n| n.v).collect::<Vec<_>>()
         );
     }
 
-    /// R3: the manager opens on the NEW asset, and rack naming keeps
-    /// counting (auto-1, auto-2, never an overwrite).
+    /// R3: the bound manager stays UNSAVED (asset None); only its save
+    /// button produces the asset, named from the buffer ("automation",
+    /// never an overwrite).
     #[test]
     fn v20_rmb_auto_clip_opens_manager() {
         let mut app = headless_app("v20rmbmgr");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        app.trk_vol[0] = 45; // distinct readout for the helper
+        app.set_trk_vol(0, 45); // distinct readout for the helper
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets[n0].name, "auto-1");
         let ed = app.auto_edit.as_ref().expect("manager open");
-        assert_eq!(ed.asset, Some(n0));
+        assert_eq!(ed.asset, None, "unsaved until Save is pressed");
         assert!(!ed.nodes.is_empty(), "manager shows the curve");
+        park_window(&mut app, &ctx, "Automation", egui::vec2(0.0, -220.0));
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0 + 1, "save created: {}", app.status);
+        assert_eq!(app.assets[n0].name, "automation");
+    }
+
+    /// v35 R1 pin: the GUI MIRRORS the engine's real control values, so
+    /// an automation write lands on the knob (and the value it leaves
+    /// behind is what the fader shows and a grab starts from).
+    #[test]
+    fn v35_ui_mirrors_real_engine_values() {
+        let mut app = headless_app("v35mirror");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let want_v = 0.25f32;
+        app.backend.engine.set_loop_vol(2, want_v);
+        app.backend.gain.store(0.5f32.to_bits(), Ordering::Relaxed);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_vol[2], vol_midi(20.0 * want_v.log10()));
+        assert_eq!(app.master_midi, vol_midi(20.0 * 0.5f32.log10()));
+        // And the master no longer fights back: a plain frame must not
+        // re-push the stale mirror over the engine's value.
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            f32::from_bits(app.backend.gain.load(Ordering::Relaxed)),
+            0.5
+        );
+    }
+
+    /// v35 R2 pin: loop-endpoint DEADZONE. A press inside the handle zone
+    /// arms the endpoint (never a playhead move); a press outside it never
+    /// arms a handle (so playhead drags cross endpoints freely). Dragging
+    /// inside the zone moves the loop endpoint, snapped.
+    #[test]
+    fn v35_ruler_endpoint_deadzone() {
+        let mut app = headless_app("v35rdead");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.loop_tl = true;
+        app.loop_mode = 0;
+        let bar = app.bar_samples();
+        app.loop_area = (bar, 2 * bar);
+        app.send_loop_region();
+        frame(&mut app, &ctx, vec![]);
+        let rr = app.ruler_rect.expect("ruler rect recorded");
+        let sr = app.sample_rate.max(1) as f64;
+        let px = app.px_per_sec as f64;
+        let x0 = rr.min.x - app.hscroll;
+        let hx0 = x_of(x0, bar, sr, px);
+        let hx1 = x_of(x0, 2 * bar, sr, px);
+        let y = rr.center().y;
+        // (a) plain CLICK exactly on the end handle: dead zone — the press
+        // arms the endpoint, no seek, and the region does not move.
+        frame(&mut app, &ctx, vec![moved(egui::pos2(hx1, y))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(hx1, y)),
+                btn(egui::pos2(hx1, y), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.drag_loop_handle,
+            Some(1),
+            "press inside the deadzone arms the END endpoint"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(hx1, y)),
+                btn(egui::pos2(hx1, y), egui::PointerButton::Primary, false),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.loop_area, (bar, 2 * bar), "a click does not move it");
+        // (b) DRAG inside the zone: the endpoint follows (snapped +2 bars).
+        let dst = hx1 + 2.0 * (bar as f64 / sr * px) as f32;
+        frame(&mut app, &ctx, vec![moved(egui::pos2(hx1, y))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(hx1, y)),
+                btn(egui::pos2(hx1, y), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(hx1 - 30.0, y))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(dst, y))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(dst, y)),
+                btn(egui::pos2(dst, y), egui::PointerButton::Primary, false),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.loop_area,
+            (bar, 4 * bar),
+            "endpoint drag lands snapped: {:?}",
+            app.loop_area
+        );
+        assert_eq!(app.drag_loop_handle, None, "released");
+        // (c) press well OUTSIDE the zone (mid-region): never arms.
+        let mid = egui::pos2((hx0 + hx1) * 0.5, y);
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(mid), btn(mid, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.drag_loop_handle, None,
+            "press outside the deadzone scrubs, never grabs"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(mid), btn(mid, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+    }
+
+    /// v35 R2 pin: the grid runs empty measures PAST the project end —
+    /// the ruler (and with it the clickable playhead area) is longer than
+    /// the arrangement, so the bar can be placed beyond the last measure.
+    #[test]
+    fn v35_ruler_extends_past_the_end() {
+        let mut app = headless_app("v35rtail");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // Shrink the scale so total + 4 bars fits the headless viewport —
+        // the ruler ALLOCATES min(needed, avail), and we must measure the
+        // NEED, not the viewport.
+        app.px_per_sec = 40.0;
+        frame(&mut app, &ctx, vec![]);
+        let rr = app.ruler_rect.expect("ruler rect recorded");
+        let sr = app.sample_rate.max(1) as f64;
+        let px = app.px_per_sec as f64;
+        let total = app.total_len().max(1);
+        let need = ((total + 4 * app.bar_samples()) as f64 / sr * px) as f32;
+        assert!(
+            rr.width() >= need - 1.0,
+            "ruler must paint >= 4 bars past the end: w={} need={} (total={total})",
+            rr.width(),
+            need
+        );
+    }
+
+    /// v35 R3 pin: `goto_edge` scope — selected clips > loop region >
+    /// project — plus the Home/End default keys reaching the dispatcher.
+    #[test]
+    fn v35_goto_edge_scope_and_keys() {
+        let mut app = headless_app("v35goto");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        let alen = app.asset_len(a);
+        assert!(alen > 0);
+        app.arr.insert(0, 0, Clip::new(a, 3 * 48_000));
+        app.arr.insert(0, 0, Clip::new(a, 9 * 48_000 + 12_000));
+        let bar = app.bar_samples();
+        // (1) Selection scope.
+        app.sel_clips = vec![(0, 0, 0), (0, 0, 1)];
+        app.goto_edge(true);
+        assert_eq!(app.goto_pos, Some(3 * 48_000), "start of selection");
+        assert_eq!(app.goto_what, "selection");
+        app.goto_edge(false);
+        assert_eq!(app.goto_pos, Some(9 * 48_000 + 12_000 + alen), "end of selection");
+        // (2) No selection + loop on: the loop region.
+        app.sel_clips.clear();
+        app.loop_tl = true;
+        app.loop_mode = 0;
+        app.loop_area = (bar, 3 * bar);
+        app.send_loop_region();
+        app.goto_edge(true);
+        assert_eq!(app.goto_pos, Some(bar), "loop start");
+        assert_eq!(app.goto_what, "loop");
+        app.goto_edge(false);
+        assert_eq!(app.goto_pos, Some(3 * bar), "loop end");
+        // (3) Loop off: the whole project.
+        app.loop_tl = false;
+        app.send_loop_region();
+        app.goto_edge(true);
+        assert_eq!(app.goto_pos, Some(0), "project start");
+        assert_eq!(app.goto_what, "project");
+        app.goto_edge(false);
+        assert_eq!(app.goto_pos, Some(app.total_len()), "project end");
+        // (4) The default Home/End keys dispatch (binding table path).
+        let t2 = app.total_len();
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::End, Default::default())]);
+        assert_eq!(app.goto_pos, Some(t2), "End key fired: {}", app.status);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Home, Default::default())]);
+        assert_eq!(app.goto_pos, Some(0), "Home key fired: {}", app.status);
+    }
+
+    /// v35 R7 pin: the clip lands on the OWNER of the bound control even
+    /// when the grid selection sits on a DIFFERENT track (the host is the
+    /// slider's track, not the selection).
+    #[test]
+    fn v35_slider_menu_binds_owner_not_selection() {
+        let mut app = headless_app("v35host");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let a1 = push_v20_audio(&mut app, "v35h", 96_000);
+        app.arr.insert(5, 0, crate::arrange::Clip::new(a1, 0));
+        app.set_trk_vol(0, 24); // distinct track-1 readout
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((5, 0, 0));
+        let p = v20_track1_vol_point(&mut app, &ctx);
+        rmb(&mut app, &ctx, p);
+        click_label(&mut app, &ctx, "Create automation clip");
+        frame(&mut app, &ctx, vec![]);
+        let ed = app.auto_edit.as_ref().expect("bound manager");
+        assert_eq!(ed.host, Some(0), "host = track 1, not selected track 6");
+        park_window(&mut app, &ctx, "Automation", egui::vec2(0.0, -220.0));
+        click_label(&mut app, &ctx, "Save as new asset + clip");
+        frame(&mut app, &ctx, vec![]);
+        let (t, _l, _c) = v20_placed(&app, (app.assets.len() - 1) as u32).expect("placed");
+        assert_eq!(t, 0, "clip landed on the OWNER track");
     }
 
     /// R3: double-click still opens Set value (vol/pan/master/synth/fx).
@@ -23439,7 +24078,7 @@ mod tests {
         let mut app = headless_app("v20dblval");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        app.trk_vol[0] = 32; // distinct readout for the helper
+        app.set_trk_vol(0, 32); // distinct readout for the helper
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
         for _ in 0..2 {
@@ -23558,8 +24197,9 @@ mod tests {
         }
     }
 
-    /// R3/R4: the fx auto-slider grid answers right-click DIRECTLY with an
-    /// automation asset bound to `fx:<slot>:<param>`.
+    /// R3/R4 (v35 R7): the fx auto-slider grid answers right-click with
+    /// the value menu; the automation item opens the manager bound to
+    /// `fx:<slot>:<param>` without creating an asset.
     #[test]
     fn v20_fx_auto_slider_rmb_auto() {
         let mut app = headless_app("v20fxauto");
@@ -23586,16 +24226,22 @@ mod tests {
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "fx slider RMB creates: {}", app.status);
-        let auto = v20_last_auto(&app);
-        assert_eq!(auto.target, "fx:0:0", "bound to chorus 'rate'");
-        assert_eq!(app.auto_edit.as_ref().expect("manager open").asset, Some(n0));
+        assert_eq!(app.assets.len(), n0, "fx slider RMB creates nothing: {}", app.status);
+        assert!(app.value_menu.is_some(), "value menu opens");
+        click_label(&mut app, &ctx, "Create automation clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0, "no eager asset");
+        let ed = app.auto_edit.as_ref().expect("manager open bound");
+        assert_eq!(ed.target, "fx:0:0", "bound to chorus 'rate'");
+        assert_eq!(ed.asset, None, "unsaved curve");
+        assert_eq!(ed.host, Some(0));
     }
 
-    /// R4: bridge widgets (a custom-GUI script's own knobs) answer the SAME
-    /// gestures — right-click creates the bound asset through the label→
-    /// param map, no GUI-ABI change. space_echo's canvas knob caption is
-    /// "tone 3.6kHz"; the knob circle sits ~30 px above that caption.
+    /// R4 (v35 R7): bridge widgets (a custom-GUI script's own knobs) answer
+    /// the SAME gestures — right-click opens the value menu bound through
+    /// the label→param map, no GUI-ABI change. space_echo's canvas knob
+    /// caption is "tone 3.6kHz"; the knob circle sits ~30 px above that
+    /// caption.
     #[test]
     fn v20_fx_bridge_slider_rmb_auto() {
         let mut app = headless_app("v20fxbridge");
@@ -23619,7 +24265,7 @@ mod tests {
         // the 44 px knob by click time. Settle (probe twice, click off the
         // SECOND reading) and retry once from a fresh sample.
         let n0 = app.assets.len();
-        let mut made = false;
+        let mut armed = false;
         for _ in 0..2 {
             let _ = galley_at(&mut app, &ctx, "tone ");
             let cap = galley_at(&mut app, &ctx, "tone ")
@@ -23627,14 +24273,23 @@ mod tests {
             let p = egui::pos2(cap.center().x, cap.center().y - 30.0);
             rmb(&mut app, &ctx, p);
             frame(&mut app, &ctx, vec![]);
-            if app.assets.len() == n0 + 1 {
-                made = true;
+            if app
+                .value_menu
+                .as_ref()
+                .is_some_and(|(_, tgt, _, _)| tgt == "fx:0:2")
+            {
+                armed = true;
                 break;
             }
         }
-        assert!(made, "bridge knob RMB creates: {}", app.status);
-        let auto = v20_last_auto(&app);
-        assert_eq!(auto.target, "fx:0:2", "bound to space_echo 'tone' (param 2)");
+        assert!(armed, "bridge knob RMB opens the bound menu: {}", app.status);
+        assert_eq!(app.assets.len(), n0, "no eager asset");
+        click_label(&mut app, &ctx, "Create automation clip");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets.len(), n0, "still nothing until save");
+        let ed = app.auto_edit.as_ref().expect("manager open bound");
+        assert_eq!(ed.target, "fx:0:2", "bound to space_echo 'tone' (param 2)");
+        assert_eq!(ed.asset, None);
     }
 
     /// R5: the manager's target combo (a `ComboBox::show_ui` site — the
@@ -23644,10 +24299,10 @@ mod tests {
     fn v20_combo_picks_land() {
         let mut app = headless_app("v20combo");
         let ctx = egui::Context::default();
-        app.trk_vol[0] = 32;
+        app.set_trk_vol(0, 32);
         frame(&mut app, &ctx, vec![]);
-        // Manager on a fresh track-volume asset.
-        app.rmb_create_auto(Some(0), crate::automation::TARGET_TRACK_VOL, vol_amp(32));
+        // Manager on a fresh track-volume asset (v35 R7: bound, unsaved).
+        app.open_bound_auto(Some(0), crate::automation::TARGET_TRACK_VOL, vol_amp(32));
         frame(&mut app, &ctx, vec![]);
         let btn = label_center(&mut app, &ctx, "track volume (linear)")
             .expect("combo shows the current target");
@@ -26995,7 +27650,7 @@ mod tests {
         let mut app = headless_app("v29volfix");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        app.trk_vol[0] = 32;
+        app.set_trk_vol(0, 32);
         frame(&mut app, &ctx, vec![]);
         // Track-1 vol row: anchored on the UNIQUE readout string (the
         // master strip paints its own "vol " galley at the top — a

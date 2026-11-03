@@ -70,6 +70,11 @@ pub const PREVIEW_TRANSIENT: u32 = u32::MAX;
 /// Per-track recording capacity: ~60 s @ 48 kHz (~30 s @ 96 kHz).
 pub const LOOP_CAP: u32 = 2_880_000;
 
+/// v35 R2: how far PAST the project end the playhead may be placed
+/// (seek/slack). The grid paints a short tail of empty measures; this cap
+/// simply keeps `pos` a sane sample count.
+pub const SEEK_SLACK: u64 = 64 * 48_000;
+
 // Per-track recording states (AtomicU8 in the engine).
 pub const TR_IDLE: u8 = 0;
 pub const TR_REC: u8 = 1;
@@ -1010,9 +1015,15 @@ impl Engine {
     }
 
     /// Request a playhead move. RT swaps `seek` at block start, so this is
-    /// safe while the transport runs (scrubbing).
+    /// safe while the transport runs (scrubbing). v35 R2: the playhead is
+    /// placeable PAST the project end — up to [`SEEK_SLACK`] samples beyond
+    /// it — so the user can park it in the tail grid, paste clips there,
+    /// and arm recording beyond the last measure. Playing from past the end
+    /// still restarts from the top (PlayAll guard) and a non-looping run
+    /// parks at the project end.
     pub fn seek_to(&self, p: u64) {
-        let p = p.min(self.proj_len.load(Ordering::Relaxed));
+        let cap = self.proj_len.load(Ordering::Relaxed).saturating_add(SEEK_SLACK);
+        let p = p.min(cap);
         self.pos.store(p, Ordering::Relaxed);
         self.seek.store(p, Ordering::Relaxed);
     }
@@ -1029,10 +1040,39 @@ impl Engine {
     }
 
     // ---- mixer --------------------------------------------------------------
+    /// v35 R1: automation drives REAL controls. While a curve owns its
+    /// target, the value also lands on the manual control itself (the
+    /// engine atomic every fallback / mirror / export reads): pausing
+    /// holds it, seeking outside the clip keeps it, and the user grabs
+    /// the control FROM the automated value. (Master out is stored by the
+    /// caller — the atomic lives on the Backend.) Called once per RT block
+    /// after the control-rate pass — RT-safe (atomic stores only).
+    pub fn apply_auto_real(&self, auto: &AutoOut) {
+        for t in 0..MAX_LOOPS {
+            if let Some(v) = auto.vol[t] {
+                self.vol[t].store(v.max(0.0).to_bits(), Ordering::Relaxed);
+            }
+            if let Some(g) = auto.gain[t] {
+                self.trk_gain[t].store(g.max(0.0).to_bits(), Ordering::Relaxed);
+            }
+            if let Some(pn) = auto.pan[t] {
+                self.pan[t].store(pn.to_bits(), Ordering::Relaxed);
+            }
+        }
+        if let Some(tb) = auto.tempo {
+            self.metro_bpm.store(tb, Ordering::Relaxed);
+        }
+    }
 
+    
     /// v34 R11: last automation-driven vol/gain/pan for a track, in
     /// amplitude space (pan in -1..1). NAN = manual control — the mixer
     /// faders display these so they animate with automation.
+    /// v35 R1: live metro tempo (the real control automation drives).
+    pub fn metro_bpm_now(&self) -> u32 {
+        self.metro_bpm.load(Ordering::Relaxed)
+    }
+
     pub fn auto_live(&self, i: usize) -> [f32; 3] {
         core::array::from_fn(|k| f32::from_bits(self.auto_disp[k][i].load(Ordering::Relaxed)))
     }
@@ -3839,7 +3879,9 @@ impl ProcessHandler for Proc {
         // --- transport position for this block ------------------------------
         let prev_pos = self.pos;
         if let Some(p) = seek {
-            self.pos = p.min(proj_len);
+            // v35 R2: the SEEK_SLACK cap matches `Engine::seek_to` — RT
+            // must not re-clamp a legal past-the-end placement.
+            self.pos = p.min(proj_len + SEEK_SLACK);
         }
         if seek.is_some() {
             // A jump in the timeline: nothing that was ringing still applies.
@@ -3935,6 +3977,12 @@ impl ProcessHandler for Proc {
         // position on the next run block.
         if transport {
             self.auto_last = self.eval_automation(p0);
+            // v35 R1: automation drives REAL controls (see apply_auto_real).
+            self.engine.apply_auto_real(&self.auto_last);
+            if let Some(mv) = self.auto_last.master_vol {
+                // (the master atomic lives on the Backend; Proc holds the clone)
+                self.gain.store(mv.max(0.0).to_bits(), Ordering::Relaxed);
+            }
         }
         let auto = self.auto_last;
         // v34 R11: publish the live automation values for the GUI.
@@ -4039,7 +4087,10 @@ impl ProcessHandler for Proc {
         }
         let ins = &in_bufs[..nin];
 
-        let g = f32::from_bits(self.gain.load(Ordering::Relaxed)) * auto.master_vol.unwrap_or(1.0);
+        // v35 R1: master automation now WRITES self.gain (real value),
+        // so the multiplier is gone — reading the atomic already includes
+        // the curve, and it holds the last automated value when stopped.
+        let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
         // v32 R7: the master knob / master automation ramps too.
         let g_a = self.g_env;
         let g_s = (g - g_a) * inv_n;
@@ -4624,6 +4675,47 @@ mod tests {
         assert_eq!(e.loop_pan(3), 0.0, "clamped to full left");
     }
 
+    /// v35 R1 pin: an automation clip drives the REAL control. Rendering
+    /// the whole project walks the curve; the engine atomic behind the
+    /// manual knob must end AT the curve's tail and HOLD there (nothing
+    /// v35 R1 pin: automation writes REAL controls. `apply_auto_real` is
+    /// the one function the RT block calls after the control-rate pass;
+    /// driving it directly is driving the shipped code path (the offline
+    /// render path intentionally uses manual values, so it cannot stand
+    /// in for this test). A later pass without a target must not reset
+    /// the stored value — pause holds, grab continues from it.
+    #[test]
+    fn v35_automation_writes_real_controls() {
+        let e = Engine::new();
+        let mut a = AutoOut::new();
+        a.vol[1] = Some(0.3);
+        a.gain[2] = Some(0.5);
+        a.pan[3] = Some(-0.25);
+        a.tempo = Some(96);
+        e.apply_auto_real(&a);
+        assert!(
+            (e.loop_vol(1) - 0.3).abs() < 1e-6,
+            "track vol real value: {}",
+            e.loop_vol(1)
+        );
+        assert!((e.loop_gain(2) - 0.5).abs() < 1e-6, "gain real value");
+        assert!(
+            (e.loop_pan(3) + 0.25).abs() < 1e-6,
+            "pan real value: {}",
+            e.loop_pan(3)
+        );
+        assert_eq!(e.metro_bpm_now(), 96, "tempo real value");
+        // Untargeted controls keep the manual value.
+        assert!((e.loop_vol(0) - 1.0).abs() < 1e-6, "untargeted vol");
+        // A block with no active clip does not snap anything back.
+        e.apply_auto_real(&AutoOut::new());
+        assert!(
+            (e.loop_vol(1) - 0.3).abs() < 1e-6,
+            "pause holds the real value"
+        );
+        assert_eq!(e.metro_bpm_now(), 96, "tempo holds");
+    }
+
     #[test]
     fn seek_clamps_and_publishes() {
         let e = Engine::new();
@@ -4632,9 +4724,24 @@ mod tests {
         assert_eq!(e.pos(), 400);
         assert_eq!(e.take_seek(), Some(400));
         assert_eq!(e.take_seek(), None);
-        // Seeks clamp to the project end.
+        // v35 R2: past the project end the playhead rides the tail grid —
+        // clamped at `SEEK_SLACK` samples BEYOND the end, not at it.
         e.seek_to(5000);
-        assert_eq!(e.pos(), 1000);
+        assert_eq!(e.pos(), 5000, "past-the-end placement is legal");
+        e.seek_to(u64::MAX);
+        assert_eq!(e.pos(), 1000 + SEEK_SLACK, "clamped at end + slack");
+    }
+
+    /// v35 R2 pin: the playhead can be placed beyond the last measure.
+    #[test]
+    fn v35_seek_placeable_beyond_project_end() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 1000);
+        e.seek_to(1000 + 700);
+        assert_eq!(e.pos(), 1700);
+        // A shrinking project pulls an over-tail playhead back in bounds.
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 900);
+        assert_eq!(e.pos(), 900, "project shrink keeps the playhead in bounds");
     }
 
     #[test]
