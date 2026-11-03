@@ -2680,6 +2680,8 @@ impl App {
             .default_pos([420.0, 140.0])
             .default_width(460.0)
             .default_height(460.0)
+            .min_width(80.0)
+            .min_height(70.0)
             .open(&mut open);
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -5429,7 +5431,9 @@ impl App {
             .id(egui::Id::new("drum_machine_window"))
             .open(&mut open)
             .resizable(true)
-            .default_width(760.0);
+            .default_width(760.0)
+            .min_width(80.0)
+            .min_height(70.0);
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
@@ -5735,6 +5739,8 @@ impl App {
                 .id(egui::Id::new("dynwin-auto"))
                 .default_pos([190.0, 320.0])
                 .default_width(620.0)
+                .min_width(80.0)
+                .min_height(70.0)
                 .open(&mut open);
             if dragging {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -7146,7 +7152,9 @@ impl App {
                 .default_size([
                     (screen.width() - 64.0).clamp(560.0, 2600.0),
                     (screen.height() - 150.0).clamp(380.0, 2000.0),
-                ]);
+                ])
+                .min_width(80.0)
+                .min_height(70.0);
             if dragging {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
@@ -8137,7 +8145,9 @@ impl App {
         let mut w = egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
             .id(egui::Id::new(("synthwin", t)))
             .open(&mut open)
-            .default_size([320.0, 340.0]);
+            .default_size([320.0, 340.0])
+            .min_width(80.0)
+            .min_height(70.0);
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
@@ -12231,7 +12241,7 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // clear this threshold immediately.
         let cross = edge == 2 || edge == 3;
         let (cur, size) = if cross { (wr[3], r.height()) } else { (wr[2], r.width()) };
-        if size > 40.0 && (cur - size).abs() > 24.0 {
+        if size > 16.0 && (cur - size).abs() > 24.0 {
             if cross {
                 wr[3] = size;
             } else {
@@ -12310,28 +12320,28 @@ fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
             egui::Panel::left(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[2].max(def_w(idx)))
-                .min_size(48.0)
+                .min_size(20.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
         1 => {
             egui::Panel::right(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[2].max(def_w(idx)))
-                .min_size(48.0)
+                .min_size(20.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
         3 => {
             egui::Panel::top(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[3].max(def_h(idx)))
-                .min_size(48.0)
+                .min_size(20.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
         _ => {
             egui::Panel::bottom(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[3].max(def_h(idx)))
-                .min_size(48.0)
+                .min_size(20.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
     }
@@ -12367,7 +12377,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                 // the edge. Resizable like a lone bottom dock.
                 .resizable(true)
                 .default_size(h)
-                .min_size(48.0)
+                .min_size(20.0)
                 .show(ui, |ui| {
                     // v35 R6: fair-share defaults — a freshly added dock
                     // must not be squeezed to zero by its neighbours' old
@@ -12399,7 +12409,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             )))
                                 .resizable(true)
                                 .default_size(want.min(cap).max(48.0))
-                                .min_size(48.0)
+                                .min_size(20.0)
                                 .show(ui, |ui| docked_window(ui, app, *i));
                         }
                     }
@@ -12417,7 +12427,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
             };
             // v32 R8: resizable thickness (see bottom-edge note above).
             // v35 R6: thinner floors — docked stacks squeeze to a border.
-            wpanel = wpanel.resizable(true).default_size(w).min_size(120.0);
+            wpanel = wpanel.resizable(true).default_size(w).min_size(56.0);
             wpanel.show(ui, |ui| {
                     // v35 R6: fair-share defaults (see bottom-edge note).
                     let strip = ui.max_rect().height();
@@ -12442,7 +12452,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
                                 .resizable(true)
                                 .default_size(sz)
-                                .min_size(48.0)
+                                .min_size(20.0)
                                 .show(ui, |ui| {
                                     egui::ScrollArea::vertical()
                                         .id_salt(("dockstack", *i))
@@ -12495,7 +12505,11 @@ fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         .constrain(false)
         // First frame must be fully painted: headless probes (and users
         // with animations off) would otherwise see the content fade in.
-        .fade_in(false);
+        .fade_in(false)
+        // v35: shrink far below the content width — a docked stack must
+        // be squeezable to a sliver; clipped body beats locked size.
+        .min_width(80.0)
+        .min_height(70.0);
     if dragging {
         // The docking pass owns the drag — pin the window under the
         // pointer so egui's own drag cannot fight it.
@@ -14174,7 +14188,8 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
     let mut w = egui::Window::new(RichText::new(format!("SYNTHS \u{2014} track {}", t + 1)).strong())
         .id(egui::Id::new(("dynwin-synthpick", t)))
         .open(&mut open)
-        .min_width(540.0)
+        .min_width(240.0)
+        .min_height(120.0)
         .default_height(460.0);
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
@@ -17267,7 +17282,8 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     let mut w = egui::Window::new(RichText::new(format!("MIXER CHAIN — track {}", loop_i + 1)).strong())
         .id(egui::Id::new(("dynwin-chain", loop_i)))
         .open(&mut open)
-        .min_width(560.0)
+        .min_width(240.0)
+        .min_height(120.0)
         .default_height(480.0);
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
@@ -24206,6 +24222,72 @@ mod tests {
         settle_plugin_drop();
     }
 
+    /// v35: the DOCK GESTURE for dynamic windows — press on a floating
+    /// sub-window's title bar carries it, the blue snap-zone outline
+    /// paints while the pointer is in an edge zone, release docks. The
+    /// registry-level pins above use `dock_at` directly and cannot see
+    /// a broken arm/preview/release chain (the exact user-reported
+    /// failure: no outline, no dock for the new classes).
+    #[test]
+    fn v35_drag_dyn_window_snaps_and_docks() {
+        let mut app = headless_app("v35dragdyn");
+        let ctx = egui::Context::default();
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        let wr = app.dyn_wins[0].rect;
+        assert!(wr[2] > 8.0, "floating drums recorded their rect");
+
+        // Press the DRUM MACHINE title bar.
+        let from = galley_at(&mut app, &ctx, "drum machine")
+            .expect("drum machine title visible")
+            .center();
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        assert_eq!(
+            app.free_drag.map(|(i, _)| i),
+            Some(4),
+            "press on a dynamic window title arms the carry"
+        );
+
+        // Mid-air over the right zone: the blue snap outline must paint.
+        let dst = egui::pos2(1380.0, 400.0);
+        frame(&mut app, &ctx, vec![moved(from + (dst - from) * 0.5)]);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            events: vec![moved(dst)],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        // egui 0.36: rect_stroke tessellates as a stroked RectShape.
+        let blue = out.shapes.iter().any(|cs| {
+            matches!(&cs.shape, egui::epaint::Shape::Rect(r)
+                if r.stroke.color == egui::Color32::from_rgb(120, 190, 255))
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        assert!(blue, "blue snap-zone outline paints during the carry");
+
+        // Release inside the zone: docked.
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)],
+        );
+        assert!(is_docked(&app, 4), "release in the right zone docks");
+        assert_eq!(dock_edge(&app, 4), 1, "docked to the RIGHT edge");
+        drop(app);
+        settle_plugin_drop();
+    }
+
     /// v35 R8: deletion torture. Every delete path in the app, hammered in
     /// the orders a user actually produces, with frames (paint! engine
     /// sync!) in between: clip delete by key, remove_asset_at first /
@@ -25765,7 +25847,7 @@ mod tests {
         );
         // A save that runs BEFORE any dynamic window registers (the
         // startup-save family) must not clobber seeded state.
-        let mut app3 = App::new(Backend::start());
+        let app3 = App::new(Backend::start());
         app3.save_config();
         drop(app3);
         let cfg3 = crate::config::Config::load();
