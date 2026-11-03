@@ -2683,6 +2683,9 @@ impl App {
             .min_width(80.0)
             .min_height(70.0)
             .open(&mut open);
+        if let Some(r) = self.dyn_rect(idx) {
+            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
@@ -5434,6 +5437,9 @@ impl App {
             .default_width(760.0)
             .min_width(80.0)
             .min_height(70.0);
+        if let Some(r) = self.dyn_rect(idx) {
+            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
@@ -5742,6 +5748,9 @@ impl App {
                 .min_width(80.0)
                 .min_height(70.0)
                 .open(&mut open);
+            if let Some(r) = self.dyn_rect(idx) {
+                w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            }
             if dragging {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
@@ -7155,6 +7164,9 @@ impl App {
                 ])
                 .min_width(80.0)
                 .min_height(70.0);
+            if let Some(r) = self.dyn_rect(idx) {
+                w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            }
             if dragging {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
@@ -8148,6 +8160,9 @@ impl App {
             .default_size([320.0, 340.0])
             .min_width(80.0)
             .min_height(70.0);
+        if let Some(r) = self.dyn_rect(idx) {
+            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
@@ -10798,6 +10813,15 @@ impl App {
             .resize(4 + self.dyn_wins.len(), [0.0; 4]);
         self.dock_collapsed.resize(4 + self.dyn_wins.len(), false);
         4 + self.dyn_wins.len() - 1
+    }
+
+    /// v35: persisted float rect — applied as the window's default so a
+    /// docked-then-floated window reopens at its saved spot after restart.
+    fn dyn_rect(&self, idx: usize) -> Option<[f32; 4]> {
+        self.dyn_wins
+            .get(idx.saturating_sub(4))
+            .map(|d| d.rect)
+            .filter(|r| r[2] > 8.0 && r[3] > 8.0)
     }
 
     /// v35: store a floating dynamic window's new rect and mark config
@@ -14191,6 +14215,9 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
         .min_width(240.0)
         .min_height(120.0)
         .default_height(460.0);
+    if let Some(r) = app.dyn_rect(idx) {
+        w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+    }
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
     }
@@ -17285,6 +17312,9 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
         .min_width(240.0)
         .min_height(120.0)
         .default_height(480.0);
+    if let Some(r) = app.dyn_rect(idx) {
+        w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+    }
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
     }
@@ -25808,6 +25838,40 @@ mod tests {
     /// a track synth just make the intent explicit.
     fn settle_plugin_drop() {
         crate::test_hush_vendor_exit_trap();
+    }
+
+    /// v35: a FLOATING dynamic window restores its persisted rect at
+    /// startup — before this, every builder re-opened at its hardcoded
+    /// default_pos and the saved rect was only bookkeeping (live smoke:
+    /// the seeded drums rect was ignored and the window drifted).
+    #[test]
+    fn v35_float_rect_restores_at_startup() {
+        let mut app = headless_app("v35floatrect");
+        let ctx = egui::Context::default();
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        // Simulate an end-of-drag rect, persist, restart.
+        app.dyn_wins[0].rect = [640.0, 260.0, 700.0, 400.0];
+        app.save_config();
+        drop(app);
+        let mut app2 = App::new(Backend::start());
+        app2.show_drums = true;
+        // FRESH context: a restart has no egui area state, exactly like
+        // the real process booting again.
+        let ctx2 = egui::Context::default();
+        frame(&mut app2, &ctx2, vec![]);
+        // The float must have reopened at the saved top-left: its title
+        // galley sits at the SAVED row (y) and horizontally centered in
+        // the restored 700-px window (a default-placed window titles at
+        // ~y 40 / x 380 — both out of these boxes).
+        let hits = galleys_all(&mut app2, &ctx2, "drum machine");
+        assert!(
+            hits.iter()
+                .any(|p| p.x > 900.0 && p.x < 1120.0 && p.y > 255.0 && p.y < 300.0),
+            "float title not at restored rect: {hits:?}"
+        );
+        drop(app2);
+        settle_plugin_drop();
     }
 
     /// v35: dynamic windows PERSIST their dock state — a drums window
