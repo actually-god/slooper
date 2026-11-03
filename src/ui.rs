@@ -2654,19 +2654,49 @@ impl App {
             self.params_win = None;
             return;
         };
+        // v35: PARAMETERS window joins the dock system — registry slot,
+        // shared body, floating chrome (with carry) owned here.
+        let idx = self.dyn_reg(
+            DynKind::Params,
+            format!("{} \u{2014} parameters", entry.name()),
+        );
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
         let mut open = true;
-        let mut new_filter = self.params_filter.clone();
-        // v34 R2: preset-bar actions collected in the closure, run after.
-        let mut do_save = false;
-        let mut do_del = false;
-        let mut load_name: Option<String> = None;
-        egui::Window::new(format!("{} \u{2014} parameters", entry.name()))
+        let mut w = egui::Window::new(format!("{} \u{2014} parameters", entry.name()))
             .id(egui::Id::new("slooper_params_win"))
             .default_pos([420.0, 140.0])
             .default_width(460.0)
             .default_height(460.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
+            .open(&mut open);
+        if dragging {
+            w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+        }
+        let resp = w.show(ctx, |ui| self.params_body(ui, target, &entry));
+        if !open {
+            self.params_win = None;
+        }
+        if let Some(out) = resp.map(|r| r.response.rect) {
+            self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+        }
+    }
+
+    /// v35: PARAMETERS body — ONE body shared by the floating window and
+    /// the docked panel: filter, preset bar and the slider mirror all
+    /// behave identically either way.
+    fn params_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        target: GuiTarget,
+        entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
+    ) {
+        let mut new_filter = self.params_filter.clone();
+        // v34 R2: preset-bar actions collected in the body, run after.
+        let mut do_save = false;
+        let mut do_del = false;
+        let mut load_name: Option<String> = None;
                 let total = entry.descs().iter().filter(|d| d.writable).count();
                 ui.horizontal(|ui| {
                     ui.label("filter");
@@ -2750,7 +2780,6 @@ impl App {
                             }
                         }
                     });
-            });
         self.params_filter = new_filter;
         // v34 R2: run the preset-bar actions collected this frame.
         if do_save {
@@ -2780,9 +2809,6 @@ impl App {
                 }
                 Err(e) => self.status = format!("preset: {e}"),
             }
-        }
-        if !open {
-            self.params_win = None;
         }
     }
 
@@ -5354,8 +5380,35 @@ impl App {
     /// off the transport (auditioning hits), and "commit" bounces it to
     /// the arrangement.
     fn drum_window(&mut self, ui: &mut egui::Ui) {
-        self.drum_resolve();
+        // v35: DRUM MACHINE joins the dock system — registry slot, one
+        // shared body, floating chrome (with carry tracking) owned here.
+        let idx = self.dyn_reg(DynKind::Drums, "DRUM MACHINE".into());
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
         let mut open = self.show_drums;
+        let ctx = ui.ctx().clone();
+        let mut w = egui::Window::new("drum machine")
+            .id(egui::Id::new("drum_machine_window"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(760.0);
+        if dragging {
+            w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+        }
+        let resp = w.show(&ctx, |ui| self.drum_win_body(ui));
+        self.show_drums = open;
+        if let Some(out) = resp.map(|r| r.response.rect) {
+            self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+        }
+    }
+
+    /// v35: DRUM MACHINE body — ONE body shared by the floating window
+    /// and the docked panel: prep, grid, commit and persist live in here,
+    /// so both placements behave identically.
+    fn drum_win_body(&mut self, ui: &mut egui::Ui) {
+        self.drum_resolve();
         let mut dirty = false;
         let mut commit_now = false;
         let ctx = ui.ctx().clone();
@@ -5371,14 +5424,8 @@ impl App {
         }
         let trk = self.drum.track.min(self.n_tracks.saturating_sub(1));
         self.drum.ensure_rows(self.kit(trk).len());
-        // Snapshot: the window closure needs &mut self (audition).
+        // Snapshot: the body needs &mut self for audition clicks.
         let pads: Vec<DrumPad> = self.kit(trk).to_vec();
-        egui::Window::new("drum machine")
-            .id(egui::Id::new("drum_machine_window"))
-            .open(&mut open)
-            .resizable(true)
-            .default_width(760.0)
-            .show(&ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("track");
                     egui::ComboBox::from_id_salt("drum_track")
@@ -5605,7 +5652,6 @@ impl App {
                 if self.drum.playing {
                     ctx.request_repaint();
                 }
-            });
         if commit_now {
             self.drum_commit();
             dirty = true;
@@ -5613,11 +5659,23 @@ impl App {
         if dirty {
             self.save_config();
         }
-        self.show_drums = open;
     }
 
     fn auto_window(&mut self, ui: &mut egui::Ui) {
-        use crate::automation::{Automation, Node};
+        // v35: AUTOMATION manager joins the dock system — the floating
+        // chrome is owned here; the dock paints the body via auto_pass.
+        let idx = self.dyn_reg(DynKind::Auto, "Automation".into());
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        self.auto_pass(ui, idx, false);
+    }
+
+    /// v35: the automation manager's take→paint→restore pass.
+    /// `docked` = paint the body directly inside a dock panel (the dock
+    /// header owns close/carry); otherwise paint the classic floating
+    /// chrome, tracking the dock carry like every other dockable.
+    fn auto_pass(&mut self, ui: &mut egui::Ui, idx: usize, docked: bool) {
         let Some(mut ed) = self.auto_edit.take() else {
             return;
         };
@@ -5632,13 +5690,51 @@ impl App {
         let bar_s = (beat_s * beats).max(1.0);
         let targets = auto_targets(self, track);
         let mut action: u8 = 0; // 1=save new, 2=overwrite, 3=cancel
-
         let mut open = true;
-        egui::Window::new("Automation")
-            .default_pos([190.0, 320.0])
-            .default_width(620.0)
-            .open(&mut open)
-            .show(ui.ctx(), |ui| {
+        if docked {
+            self.auto_inner(ui, &mut ed, &targets, sr, bpm, beats, beat_s, bar_s, &mut action);
+        } else {
+            let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+            let mut w = egui::Window::new("Automation")
+                .id(egui::Id::new("dynwin-auto"))
+                .default_pos([190.0, 320.0])
+                .default_width(620.0)
+                .open(&mut open);
+            if dragging {
+                w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+            }
+            let resp = w.show(ui.ctx(), |ui| {
+                self.auto_inner(ui, &mut ed, &targets, sr, bpm, beats, beat_s, bar_s, &mut action)
+            });
+            if let Some(out) = resp.map(|r| r.response.rect) {
+                self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+            }
+        }
+        if action == 1 || action == 2 {
+            self.auto_commit(&mut ed, track, action == 2);
+        }
+        // Save keeps the editor open on the (now-saved) buffer; Close or
+        // the window X discards unsaved edits like the piano roll.
+        self.auto_edit = if action == 3 || !open { None } else { Some(ed) };
+    }
+
+    /// v35: automation manager body — ONE body shared by the floating
+    /// window and the docked panel; chrome, carry and buffer persistence
+    /// live in auto_pass.
+    #[allow(clippy::too_many_arguments)]
+    fn auto_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        ed: &mut AutoEdit,
+        targets: &[(String, String)],
+        sr: f64,
+        bpm: u32,
+        beats: f64,
+        beat_s: f64,
+        bar_s: f64,
+        action: &mut u8,
+    ) {
+        use crate::automation::{Automation, Node};
                 let (rmin, rmax) = crate::automation::target_range(&ed.target);
                 let len = ed.len_samples.max(1);
                 // v23: target list can be thousands deep (plugin params)
@@ -6258,25 +6354,18 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Save as new asset + clip").clicked() {
-                        action = 1;
+                        *action = 1;
                     }
                     if ed.asset.is_some() && ui.button("Save (overwrite asset)").clicked() {
-                        action = 2;
+                        *action = 2;
                     }
                     if ui.button("Close").clicked() {
-                        action = 3;
+                        *action = 3;
                     }
                     if ed.changed {
                         ui.label(RichText::new("unsaved").weak().italics());
                     }
                 });
-            });
-        if action == 1 || action == 2 {
-            self.auto_commit(&mut ed, track, action == 2);
-        }
-        // Save keeps the editor open on the (now-saved) buffer; Close or
-        // the window X discards unsaved edits like the piano roll.
-        self.auto_edit = if action == 3 || !open { None } else { Some(ed) };
     }
 
     /// Persist the automation manager buffer: overwrite the source asset
@@ -6803,6 +6892,20 @@ impl App {
     /// fullscreen, closes with its X, and owns the keyboard while focused
     /// (space can never start the transport behind it).
     fn piano_roll_window(&mut self, ui: &mut egui::Ui) {
+        // v35: PIANO ROLL joins the dock system — the floating chrome is
+        // owned here; the dock paints the body via roll_pass.
+        let idx = self.dyn_reg(DynKind::Roll, "\u{266b} Piano roll".into());
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        self.roll_pass(ui, idx, false);
+    }
+
+    /// v35: the roll's take→paint→restore pass. `docked` = paint the
+    /// body directly inside a dock panel (the dock header owns the
+    /// close); otherwise paint the classic floating chrome, tracking the
+    /// dock carry like every other dockable.
+    fn roll_pass(&mut self, ui: &mut egui::Ui, idx: usize, docked: bool) {
         let mut roll = match self.piano_roll.take() {
             Some(r) => r,
             None => return,
@@ -6989,17 +7092,174 @@ impl App {
                 .clamp(0.0, (128.0 * roll.row_h - 40.0).max(0.0));
         }
 
-        let screen = ui.ctx().viewport_rect();
-        let resp = egui::Window::new("\u{266b} Piano roll")
-            .id(egui::Id::new("piano_roll_win"))
-            .open(&mut open)
-            // Fill the GUI: open near-fullscreen so composing gets room.
-            .default_pos(egui::pos2(36.0, 70.0))
-            .default_size([
-                (screen.width() - 64.0).clamp(560.0, 2600.0),
-                (screen.height() - 150.0).clamp(380.0, 2000.0),
-            ])
-            .show(ui, |ui| {
+        let mut resp = None;
+        if docked {
+            self.roll_inner(
+                ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
+                &mut save, &mut clear, &mut preview, &mut bar_delta, &mut audition,
+                &mut placed,
+            );
+        } else {
+            let screen = ui.ctx().viewport_rect();
+            let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+            let mut w = egui::Window::new("\u{266b} Piano roll")
+                .id(egui::Id::new("piano_roll_win"))
+                .open(&mut open)
+                // Fill the GUI: open near-fullscreen so composing gets room.
+                .default_pos(egui::pos2(36.0, 70.0))
+                .default_size([
+                    (screen.width() - 64.0).clamp(560.0, 2600.0),
+                    (screen.height() - 150.0).clamp(380.0, 2000.0),
+                ]);
+            if dragging {
+                w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+            }
+            resp = w.show(ui, |ui| {
+                self.roll_inner(
+                    ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
+                    &mut save, &mut clear, &mut preview, &mut bar_delta, &mut audition,
+                    &mut placed,
+                )
+            });
+            if let Some(out) = resp.as_ref().map(|r| r.response.rect) {
+                self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+            }
+        }
+        // Keyboard focus: the LAST primary click decides. Inside the
+        // window → the roll owns Ctrl+C/V/A, Delete and swallows the
+        // global shortcuts; outside → the main GUI takes them back.
+        if let Some(win) = resp.as_ref() {
+            // Store the FULL window frame (title bar included) so tests
+            // and title-bar logic never have to re-scan stale geometry.
+            let rect = win.response.rect;
+            roll.win_rect = Some(rect);
+            if let Some(click) = ui.ctx().input(|i| {
+                if i.pointer.button_clicked(egui::PointerButton::Primary) {
+                    i.pointer.hover_pos()
+                } else {
+                    None
+                }
+            }) {
+                roll.focused = rect.contains(click);
+            }
+        } else if docked {
+            // Same focus rule against the dock panel's recorded rect.
+            let d = self.dock_rects[idx];
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(d[0], d[1]),
+                egui::vec2(d[2], d[3]),
+            );
+            roll.win_rect = Some(rect);
+            if let Some(click) = ui.ctx().input(|i| {
+                if i.pointer.button_clicked(egui::PointerButton::Primary) {
+                    i.pointer.hover_pos()
+                } else {
+                    None
+                }
+            }) {
+                roll.focused = rect.contains(click);
+            }
+        }
+        // A key in the piano strip was clicked: play it (deferred — the
+        // renderer needs &mut self, which the window closure holds open).
+        if let Some(n) = audition {
+            self.audition_note(n);
+        }
+        if let Some(n) = placed {
+            self.audition_note(n);
+        }
+        // ---- toolbar actions deferred (need &mut self) ----
+        if bar_delta != 0 {
+            let bar = 4 * PPQ as u32;
+            let pat = &mut roll.pat;
+            if bar_delta > 0 {
+                pat.len_ticks += bar;
+            } else if pat.len_ticks > bar {
+                pat.len_ticks -= bar;
+                let lim = pat.len_ticks;
+                pat.notes.retain(|n| n.start < lim);
+                for n in pat.notes.iter_mut() {
+                    let end = (n.start + n.len).min(lim);
+                    n.len = end.saturating_sub(n.start).max(1);
+                }
+                pat.ccs.retain(|m| m.at < lim);
+                pat.press.retain(|m| m.at < lim);
+            }
+            roll.changed = true;
+            roll.sel_notes.clear();
+            roll.sel_anchor = None;
+        }
+        if clear {
+            roll.pat.notes.clear();
+            roll.pat.ccs.clear();
+            roll.pat.press.clear();
+            roll.sel_notes.clear();
+            roll.sel_anchor = None;
+            roll.changed = true;
+        }
+        if preview {
+            let pat = roll.pat.clone();
+            match self.render_pattern_preview(&pat) {
+                Some(buf) => {
+                    // Edit echo, not an audition: replace anything playing.
+                    self.backend.cmd(Cmd::PreviewStop { id: None });
+                    self.backend.cmd(Cmd::PreviewPlay {
+                        id: crate::audio::PREVIEW_TRANSIENT,
+                        samples: buf,
+                    });
+                    self.preview_playing = Some("piano roll".into());
+                }
+                None => self.status = "preview: no synth available".into(),
+            }
+        }
+        if save {
+            match roll.edit_asset {
+                Some(id) => self.update_piano_roll_asset(&mut roll.pat, id),
+                None => self.save_piano_roll(&mut roll.pat, sel),
+            }
+            roll.sel_notes.clear();
+            roll.sel_anchor = None;
+        }
+        if !open {
+            // The X closes the roll for real (was: reopened next frame,
+            // leaving quit as the only escape).
+            self.status = "piano roll closed (unsaved changes are kept until quit)".into();
+            return;
+        }
+        // Watchdog (mirrors the main grid's post-frame reaper): gestures
+        // ARM on press, so an armed gesture must die on button-up even
+        // when no drag ever started — a click's release lands on whatever
+        // widget holds the pointer (often the title bar), never on the
+        // canvas response, so without this a no-travel click sticks the
+        // roll in Move and every later press is ignored. Runs AFTER the
+        // window paints so a real drag's drag_stopped() commits first.
+        if !matches!(roll.gesture, RollGesture::None) && !ui.ctx().input(|i| i.pointer.any_down()) {
+            roll.gesture = RollGesture::None;
+            roll.drag_notes.clear();
+        }
+        self.piano_roll = Some(roll);
+    }
+
+    /// v35: piano roll body — ONE body shared by the floating window and
+    /// the docked panel; chrome, focus, deferred actions and the buffer
+    /// restore live in roll_pass.
+    #[allow(clippy::too_many_arguments)]
+    fn roll_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        roll: &mut PianoRoll,
+        sec_per_beat: f64,
+        step_sec: f64,
+        min_len_ticks: u32,
+        playhead: u64,
+        sr: u32,
+        save: &mut bool,
+        clear: &mut bool,
+        preview: &mut bool,
+        bar_delta: &mut i32,
+        audition: &mut Option<u8>,
+        placed: &mut Option<u8>,
+    ) {
                 // ---- toolbar ----
                 ui.horizontal(|ui| {
                     // FL-style routing: pick the TRACK whose instrument AND
@@ -7056,14 +7316,14 @@ impl App {
                         .on_hover_text("One bar shorter (notes beyond it are dropped)")
                         .clicked()
                     {
-                        bar_delta = -1;
+                        *bar_delta = -1;
                     }
                     if ui
                         .small_button("+bar")
                         .on_hover_text("One bar longer")
                         .clicked()
                     {
-                        bar_delta = 1;
+                        *bar_delta = 1;
                     }
                     if ui
                         .small_button("quantize")
@@ -7085,10 +7345,10 @@ impl App {
                         )
                         .clicked()
                     {
-                        preview = true;
+                        *preview = true;
                     }
                     if ui.small_button("clear").clicked() {
-                        clear = true;
+                        *clear = true;
                     }
                     if ui
                         .small_button(RichText::new("save").strong())
@@ -7098,7 +7358,7 @@ impl App {
                         )
                         .clicked()
                     {
-                        save = true;
+                        *save = true;
                     }
                     ui.label(
                         RichText::new(format!(
@@ -7477,7 +7737,7 @@ impl App {
                                         fresh: true,
                                     };
                                     // Placement feedback: hear the note now.
-                                    placed = Some(row);
+                                    *placed = Some(row);
                                     roll.changed = true;
                                 }
                             }
@@ -7592,7 +7852,7 @@ impl App {
                         && pt.y <= grid_bot
                         && resp.clicked_by(egui::PointerButton::Primary)
                     {
-                        audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
+                        *audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
                     }
                 }
                 if hot_edge {
@@ -7695,103 +7955,6 @@ impl App {
                         .small(),
                     );
                 });
-            });
-        // Keyboard focus: the LAST primary click decides. Inside the
-        // window → the roll owns Ctrl+C/V/A, Delete and swallows the
-        // global shortcuts; outside → the main GUI takes them back.
-        if let Some(win) = resp.as_ref() {
-            // Store the FULL window frame (title bar included) so tests
-            // and title-bar logic never have to re-scan stale geometry.
-            let rect = win.response.rect;
-            roll.win_rect = Some(rect);
-            if let Some(click) = ui.ctx().input(|i| {
-                if i.pointer.button_clicked(egui::PointerButton::Primary) {
-                    i.pointer.hover_pos()
-                } else {
-                    None
-                }
-            }) {
-                roll.focused = rect.contains(click);
-            }
-        }
-        // A key in the piano strip was clicked: play it (deferred — the
-        // renderer needs &mut self, which the window closure holds open).
-        if let Some(n) = audition {
-            self.audition_note(n);
-        }
-        if let Some(n) = placed {
-            self.audition_note(n);
-        }
-        // ---- toolbar actions deferred (need &mut self) ----
-        if bar_delta != 0 {
-            let bar = 4 * PPQ as u32;
-            let pat = &mut roll.pat;
-            if bar_delta > 0 {
-                pat.len_ticks += bar;
-            } else if pat.len_ticks > bar {
-                pat.len_ticks -= bar;
-                let lim = pat.len_ticks;
-                pat.notes.retain(|n| n.start < lim);
-                for n in pat.notes.iter_mut() {
-                    let end = (n.start + n.len).min(lim);
-                    n.len = end.saturating_sub(n.start).max(1);
-                }
-                pat.ccs.retain(|m| m.at < lim);
-                pat.press.retain(|m| m.at < lim);
-            }
-            roll.changed = true;
-            roll.sel_notes.clear();
-            roll.sel_anchor = None;
-        }
-        if clear {
-            roll.pat.notes.clear();
-            roll.pat.ccs.clear();
-            roll.pat.press.clear();
-            roll.sel_notes.clear();
-            roll.sel_anchor = None;
-            roll.changed = true;
-        }
-        if preview {
-            let pat = roll.pat.clone();
-            match self.render_pattern_preview(&pat) {
-                Some(buf) => {
-                    // Edit echo, not an audition: replace anything playing.
-                    self.backend.cmd(Cmd::PreviewStop { id: None });
-                    self.backend.cmd(Cmd::PreviewPlay {
-                        id: crate::audio::PREVIEW_TRANSIENT,
-                        samples: buf,
-                    });
-                    self.preview_playing = Some("piano roll".into());
-                }
-                None => self.status = "preview: no synth available".into(),
-            }
-        }
-        if save {
-            match roll.edit_asset {
-                Some(id) => self.update_piano_roll_asset(&mut roll.pat, id),
-                None => self.save_piano_roll(&mut roll.pat, sel),
-            }
-            roll.sel_notes.clear();
-            roll.sel_anchor = None;
-        }
-        if !open {
-            // The X closes the roll for real (was: reopened next frame,
-            // leaving quit as the only escape).
-            self.status = "piano roll closed (unsaved changes are kept until quit)".into();
-            return;
-        }
-        // Watchdog (mirrors the main grid's post-frame reaper): gestures
-        // ARM on press, so an armed gesture must die on button-up even
-        // when no drag ever started — a click's release lands on whatever
-        // widget holds the pointer (often the title bar), never on the
-        // canvas response, so without this a no-travel click sticks the
-        // roll in Move and every later press is ignored. Runs AFTER the
-        // window paints so a real drag's drag_stopped() commits first.
-        if !matches!(roll.gesture, RollGesture::None) && !ui.ctx().input(|i| i.pointer.any_down()) {
-            roll.gesture = RollGesture::None;
-            roll.drag_notes.clear();
-        }
-        self.piano_roll = Some(roll);
     }
 
     /// In-place edit-save: overwrite the MIDI asset the roll was opened
@@ -7920,6 +8083,42 @@ impl App {
     /// Auto sliders for a track's live synth instance (values ride the
     /// instance atomics, exactly like effect params).
     fn synth_sliders_window(&mut self, ui: &mut egui::Ui, t: usize) {
+        // v35: the synth slider window joins the dock system — registry
+        // slot, shared body, floating chrome (with carry) owned here.
+        let Some(stem) = self.track_synth[t].clone() else {
+            self.synth_win = None;
+            return;
+        };
+        let idx = self.dyn_reg(
+            DynKind::Synth(t),
+            format!("\u{266a} {stem} \u{b7} track {}", t + 1),
+        );
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+        let mut open = true;
+        let mut w = egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
+            .id(egui::Id::new(("synthwin", t)))
+            .open(&mut open)
+            .default_size([320.0, 340.0]);
+        if dragging {
+            w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+        }
+        let resp = w.show(ui, |ui| self.synth_sliders_body(ui, t));
+        if !open {
+            self.synth_win = None;
+        }
+        if let Some(out) = resp.map(|r| r.response.rect) {
+            self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+        }
+    }
+
+    /// v35: synth slider body — ONE body shared by the floating window
+    /// and the docked panel. The guard-closes still clear the OWNER flag
+    /// from in here, so a docked window dies the same way (e.g. when a
+    /// plugin replaced the script synth).
+    fn synth_sliders_body(&mut self, ui: &mut egui::Ui, t: usize) {
         let Some(stem) = self.track_synth[t].clone() else {
             self.synth_win = None;
             return;
@@ -7959,13 +8158,7 @@ impl App {
             .filter(|(_, a)| a.pattern.is_none())
             .map(|(k, a)| (k, a.name.clone()))
             .collect();
-        let mut open = true;
         let mut dirty = false;
-        egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
-            .id(egui::Id::new(("synthwin", t)))
-            .open(&mut open)
-            .default_size([320.0, 340.0])
-            .show(ui, |ui| {
                 if let Some(d) = &desc.description {
                     ui.label(RichText::new(d).weak().small());
                 }
@@ -8295,13 +8488,9 @@ impl App {
                 self.drum.ensure_rows(self.kit(t).len());
                 self.save_config();
             }
-                        });
         if dirty {
             self.track_synth_params[t] = inst.values();
             self.save_config();
-        }
-        if !open {
-            self.synth_win = None;
         }
     }
 
@@ -11583,10 +11772,8 @@ fn over_side_window(app: &App, pt: egui::Pos2) -> bool {
 // ---------------------------------------------------------------------------
 
 /// What a dynamic window is; also its stable registry key (v35 R5).
-// The unwired kinds are the NEXT windows in the queue — the wiring is a
-// mechanical pass per window (dyn_reg + dyn_dock_skip gate + body fn;
-// see chain_win_body for the template).
-#[allow(dead_code)]
+/// Every kind is wired: registry slot + `dyn_body` dispatch + an owner
+/// that paints its own floating chrome when the dock does not hold it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DynKind {
     Params,
@@ -11820,7 +12007,14 @@ fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
     if rect[3] < 60.0 {
         rect[3] = def_h(idx);
     }
-    r.dock[idx][0] = 0;
+    // v35: DYNAMIC windows carry their dock state in dyn_wins — indexing
+    // the length-4 SideWins.dock here with idx >= 4 panicked (the very
+    // first float-out drag of any docked dynamic window).
+    if prim {
+        app.side_wins.dock[idx][0] = 0;
+    } else {
+        app.dyn_wins[idx - 4].dock[0] = 0;
+    }
     app.dock_rects[idx] = [0.0; 4];
     app.side_dirty = true;
 }
@@ -11905,9 +12099,19 @@ fn window_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
 fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     match app.dyn_wins[idx - 4].kind {
         DynKind::Chain(loop_i) => chain_win_body(ui, app, loop_i),
-        k => {
-            let _ = k;
-            ui.label(RichText::new("(docked window)").weak());
+        DynKind::Synths(loop_i) => synth_pick_body(ui, app, loop_i),
+        // v35 take/restore windows: the *_pass fn owns the take→paint→
+        // restore cycle; `true` = no floating chrome (the dock paints).
+        DynKind::Roll => app.roll_pass(ui, idx, true),
+        DynKind::Auto => app.auto_pass(ui, idx, true),
+        DynKind::Drums => app.drum_win_body(ui),
+        DynKind::Synth(t) => app.synth_sliders_body(ui, t),
+        DynKind::Params => {
+            if let Some(target) = app.params_win {
+                if let Some(entry) = app.target_entry(target) {
+                    app.params_body(ui, target, &entry);
+                }
+            }
         }
     }
 }
@@ -13865,16 +14069,41 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
 /// around the one bound to this track, and binds on click (a plugin
 /// selection keeps the v0.10 standard: its own window opens with it).
 fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
+    // v35: the SYNTHS picker joins the dock system — registry slot, one
+    // shared body, floating chrome (with carry tracking) owned here.
+    let idx = app.dyn_reg(
+        DynKind::Synths(t),
+        format!("SYNTHS \u{2014} track {}", t + 1),
+    );
+    if app.dyn_dock_skip(idx) {
+        return;
+    }
+    let dragging = app.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+    let mut open = true;
+    let mut w = egui::Window::new(RichText::new(format!("SYNTHS \u{2014} track {}", t + 1)).strong())
+        .id(egui::Id::new(("dynwin-synthpick", t)))
+        .open(&mut open)
+        .min_width(540.0)
+        .default_height(460.0);
+    if dragging {
+        w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
+    }
+    let resp = w.show(ui, |ui| synth_pick_body(ui, app, t));
+    if !open {
+        app.synth_pick = None;
+    }
+    if let Some(out) = resp.map(|r| r.response.rect) {
+        app.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+    }
+}
+
+/// v35: SYNTHS picker body — ONE body shared by the floating window and
+/// the docked panel.
+fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
     if !app.vst_scanned && app.vst_scan_rx.is_none() {
         app.vst_rescan();
     }
     let cur = app.track_synth[t].clone().unwrap_or_default();
-    let mut open = true;
-    egui::Window::new(RichText::new(format!("SYNTHS \u{2014} track {}", t + 1)).strong())
-        .open(&mut open)
-        .min_width(540.0)
-        .default_height(460.0)
-        .show(ui, |ui| {
             ui.label(RichText::new("Synthesizers (click binds to this track):").strong());
             // (tag, label, stem-to-bind) for every choice: the default,
             // every script synth, every scanned plugin instrument.
@@ -14026,9 +14255,6 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
             if !app.vst_note.is_empty() {
                 ui.label(RichText::new(&app.vst_note).weak().small());
             }
-
-        });
-    app.synth_pick = if open { Some(t) } else { None };
 }
 
 /// The toolbar row above the timeline: quantize / snap controls, asset
@@ -21849,20 +22075,15 @@ mod tests {
         let x_of = |t_ticks: u32| gx0 + (t_ticks as f64 / 480.0 * ppb as f64) as f32;
         let y_of = |n: i32| c.max.y - 10.0 - n as f32 * 9.0 - 9.0;
 
-        // Focus the roll: click the title bar (does not draw a note).
-        // Anchor on the stored frame rect — a shape-scan title position
-        // goes stale as soon as the window's first-use auto-placement
-        // settles, and the click then lands outside the moved window.
-        let wr = app
-            .piano_roll
-            .as_ref()
-            .unwrap()
-            .win_rect
-            .expect("roll frame rect");
+        // Focus the roll: click INSIDE the frame, off the title bar.
+        // v35: a title-bar tap now arms a dock carry (the drag-to-edge
+        // gesture), so it is no longer a harmless focus click — the next
+        // pointer move would slide the window. A click on the piano-key
+        // strip (left of the grid) focuses like any in-frame click.
         click_pt(
             &mut app,
             &ctx,
-            egui::pos2(wr.min.x + wr.width() * 0.5, wr.min.y + 10.0),
+            egui::pos2(c.min.x + 8.0, (c.min.y + c.max.y) * 0.5),
         );
         assert!(
             app.piano_roll.as_ref().unwrap().focused,
@@ -23736,6 +23957,160 @@ mod tests {
         frame(&mut app, &ctx, vec![]); // and frames cleanly
     }
 
+    /// v35: every dynamic window class joins the dock system. Per kind:
+    /// registry slot, ONE shared body (painted once floating, once
+    /// docked — the double-paint regression family), dock close clears
+    /// the OWNER's own state, reopen reuses the slot at its edge.
+    /// (MIXER CHAIN pins above; PARAMETERS needs a real plugin and rides
+    /// the v23 wolf-shaper pin.)
+    #[test]
+    fn v35_all_window_classes_dock() {
+        let painted = |ctx: &egui::Context, app: &mut App, needle: &str| -> usize {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let n = out
+                .shapes
+                .iter()
+                .filter(|cs| {
+                    matches!(&cs.shape, egui::epaint::Shape::Text(t) if t.galley.text() == needle)
+                })
+                .count();
+            out.textures_delta.clear();
+            n
+        };
+        let mut app = headless_app("v35dockall");
+        let ctx = egui::Context::default();
+
+        // ---- DRUM MACHINE (slot 4) ----
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 5, "drums slot registered");
+        assert!(
+            !is_docked(&app, 4),
+            "starts floating like the chain window"
+        );
+        assert_eq!(
+            painted(&ctx, &mut app, "sixteenth note (4/beat)"),
+            1,
+            "floating drums paint their body exactly once"
+        );
+        dock_at(&mut app, 4, 1, egui::pos2(1380.0, 300.0));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dock_rects[4][2] > 8.0, "docked drums painted");
+        assert_eq!(
+            painted(&ctx, &mut app, "sixteenth note (4/beat)"),
+            1,
+            "no owner ghost next to the docked body"
+        );
+        set_visible(&mut app, 4, false);
+        assert!(!app.show_drums, "dock close clears show_drums");
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true; // reopen: SAME slot, still at its edge
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 5, "slot reused on reopen");
+        assert!(app.dock_rects[4][2] > 8.0, "reopens docked");
+        set_visible(&mut app, 4, false);
+
+        // ---- PIANO ROLL (slot 5): the take/restore family ----
+        app.piano_roll = Some(Box::new(PianoRoll {
+            pat: Pattern::new(120),
+            px_per_beat: 90.0,
+            row_h: 11.0,
+            vscroll_px: 0.0,
+            scroll_sec: 0.0,
+            changed: false,
+            gesture: RollGesture::None,
+            canvas_rect: None,
+            new_vel: 100,
+            sel_notes: Vec::new(),
+            sel_anchor: None,
+            drag_notes: Vec::new(),
+            focused: false,
+            win_rect: None,
+            edit_asset: None,
+        }));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 6, "roll slot registered");
+        assert_eq!(painted(&ctx, &mut app, "preview:"), 1, "floating roll once");
+        dock_at(&mut app, 5, 0, egui::pos2(80.0, 300.0));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dock_rects[5][2] > 8.0, "docked roll painted");
+        assert_eq!(
+            painted(&ctx, &mut app, "preview:"),
+            1,
+            "no owner ghost next to the docked roll"
+        );
+        assert!(
+            app.piano_roll.as_ref().unwrap().canvas_rect.is_some(),
+            "the docked roll paints its canvas (body runs identically)"
+        );
+        // Float out: state survives the transition.
+        undock_to(&mut app, 5, [300.0, 220.0]);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!is_docked(&app, 5), "undocked");
+        assert!(app.piano_roll.is_some(), "buffer survives undock");
+        set_visible(&mut app, 5, false);
+        assert!(app.piano_roll.is_none(), "dock close kills the roll");
+
+        // ---- Automation manager (slot 6) ----
+        app.open_auto_editor(None);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 7, "automation slot registered");
+        assert_eq!(
+            painted(&ctx, &mut app, "target"),
+            1,
+            "floating manager paints once"
+        );
+        dock_at(&mut app, 6, 2, egui::pos2(600.0, 800.0));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dock_rects[6][3] > 8.0, "docked manager painted");
+        assert_eq!(painted(&ctx, &mut app, "target"), 1, "no ghost");
+        set_visible(&mut app, 6, false);
+        assert!(app.auto_edit.is_none(), "dock close discards the buffer");
+
+        // ---- SYNTHS picker (slot 7) ----
+        app.synth_pick = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 8, "picker slot registered");
+        assert_eq!(
+            painted(&ctx, &mut app, "Synthesizers (click binds to this track):"),
+            1,
+            "floating picker paints once"
+        );
+        dock_at(&mut app, 7, 3, egui::pos2(600.0, 8.0));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dock_rects[7][2] > 8.0, "picker painted on the top edge");
+        set_visible(&mut app, 7, false);
+        assert_eq!(app.synth_pick, None, "dock close clears the picker owner");
+
+        // ---- Script-synth sliders (slot 8) ----
+        app.set_track_synth_stem(0, "sampler");
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 9, "sliders slot registered");
+        assert!(!is_docked(&app, 8), "starts floating");
+        dock_at(&mut app, 8, 1, egui::pos2(1380.0, 90.0));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dock_rects[8][2] > 8.0, "docked sliders painted");
+        set_visible(&mut app, 8, false);
+        assert_eq!(app.synth_win, None, "dock close clears synth_win");
+        frame(&mut app, &ctx, vec![]); // and frames cleanly
+    }
+
     /// v35 R8: deletion torture. Every delete path in the app, hammered in
     /// the orders a user actually produces, with frames (paint! engine
     /// sync!) in between: clip delete by key, remove_asset_at first /
@@ -25233,6 +25608,20 @@ mod tests {
         } else {
             panic!("row gone");
         }
+        // v35: the PARAMETERS window is a first-class dockable — shared
+        // body, dock close clears the OWNER (the chain window pins the
+        // rest of the mechanism; this needs a real entry to exist).
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(win_count(&app), 5, "params slot registered");
+        let idx = 4;
+        dock_at(&mut app, idx, 1, egui::pos2(1380.0, 300.0));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dock_rects[idx][2] > 8.0, "docked params painted");
+        set_visible(&mut app, idx, false);
+        assert_eq!(app.params_win, None, "dock close clears the owner");
+        frame(&mut app, &ctx, vec![]); // and frames cleanly
         std::mem::forget(entry);
     }
 
