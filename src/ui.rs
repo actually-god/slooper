@@ -936,8 +936,12 @@ pub struct App {
     /// JUST left the dock (one-frame position hand-off).
     free_drag: Option<(usize, [f32; 2])>,
     drag_pos: [f32; 2],
-    dock_rects: [[f32; 4]; 4],
-    dock_collapsed: [bool; 4],
+    dock_rects: Vec<[f32; 4]>,
+    dock_collapsed: Vec<bool>,
+    /// v35 R5: dynamic windows (plugin params, FX chain, synth, drums,
+    /// piano roll, automation manager). Index = 4 + position; they dock,
+    /// stack, re-order and float exactly like the four primary panels.
+    dyn_wins: Vec<DynWin>,
     dock_just_floated: Option<usize>,
     show_midi: bool,
     /// v25: light egui Visuals for the panel/window chrome. The arrangement
@@ -1491,8 +1495,9 @@ impl App {
             side_dirty: false,
             free_drag: None,
             drag_pos: [0.0, 0.0],
-            dock_rects: [[0.0; 4]; 4],
-            dock_collapsed: [false; 4],
+            dock_rects: vec![[0.0; 4]; 4],
+            dock_collapsed: vec![false; 4],
+            dyn_wins: Vec::new(),
             dock_just_floated: None,
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
@@ -10536,6 +10541,29 @@ impl App {
         }
     }
 
+    /// v35 R5: get-or-create the dock registry slot for a dynamic window.
+    fn dyn_reg(&mut self, kind: DynKind, title: String) -> usize {
+        if let Some(n) = self.dyn_wins.iter().position(|w| w.kind == kind) {
+            self.dyn_wins[n].title = title;
+            return 4 + n;
+        }
+        self.dyn_wins.push(DynWin {
+            kind,
+            title,
+            dock: [0, 1, 0],
+            rect: [0.0; 4],
+        });
+        self.dock_rects
+            .resize(4 + self.dyn_wins.len(), [0.0; 4]);
+        self.dock_collapsed.resize(4 + self.dyn_wins.len(), false);
+        3 + self.dyn_wins.len()
+    }
+    /// True while the dock pass owns the window this frame — the owner
+    /// must skip its floating copy (dynamic windows only).
+    fn dyn_dock_skip(&self, idx: usize) -> bool {
+        is_docked(self, idx) && self.free_drag.map(|(i, _)| i != idx).unwrap_or(true)
+    }
+
     /// v0.15: the two right-click popups every automatable value answers
     /// with — the desktop-style mini menu (for widgets that cannot host an
     /// egui context menu: the bpm box, FX-script bridge sliders) and the
@@ -11554,17 +11582,67 @@ fn over_side_window(app: &App, pt: egui::Pos2) -> bool {
 // windows stacked there. All state lives in `config.side_wins`.
 // ---------------------------------------------------------------------------
 
+/// What a dynamic window is; also its stable registry key (v35 R5).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DynKind {
+    Params,
+    Chain(usize),
+    Synth(usize),
+    Drums,
+    Roll,
+    Auto,
+    Synths(usize),
+}
+pub(crate) struct DynWin {
+    kind: DynKind,
+    title: String,
+    /// [docked?, edge 0..4, order along edge] — same encoding as the
+    /// primary windows' `side_wins.dock`.
+    dock: [i16; 3],
+    rect: [f32; 4],
+}
+
+/// Visibility of a dynamic window is owned by the very flag that opens it
+/// (one authority — closing from the dock header clears the real state, so
+/// a docked window cannot resurrect itself on the next frame).
+fn dyn_open(app: &App, k: DynKind) -> bool {
+    match k {
+        DynKind::Params => app.params_win.is_some(),
+        DynKind::Chain(t) => app.fx_window == Some(t),
+        DynKind::Synth(t) => app.synth_win == Some(t),
+        DynKind::Drums => app.show_drums,
+        DynKind::Roll => app.piano_roll.is_some(),
+        DynKind::Auto => app.auto_edit.is_some(),
+        DynKind::Synths(t) => app.synth_pick == Some(t),
+    }
+}
+fn dyn_set(app: &mut App, k: DynKind, v: bool) {
+    match k {
+        DynKind::Params => app.params_win = if v { app.params_win } else { None },
+        DynKind::Chain(_) => app.fx_window = if v { app.fx_window } else { None },
+        DynKind::Synth(_) => app.synth_win = if v { app.synth_win } else { None },
+        DynKind::Drums => app.show_drums = v,
+        DynKind::Roll => app.piano_roll = if v { app.piano_roll.take() } else { None },
+        DynKind::Auto => app.auto_edit = if v { app.auto_edit.take() } else { None },
+        DynKind::Synths(_) => app.synth_pick = if v { app.synth_pick } else { None },
+    }
+}
+
 const SNAP_EDGE: f32 = 150.0;
 const SNAP_BOTTOM: f32 = 110.0;
 const WIN_HEAD_H: f32 = 27.0;
 const WIN_BTN_STRIP: f32 = 64.0;
 
+fn win_count(app: &App) -> usize {
+    4 + app.dyn_wins.len()
+}
 fn win_visible(app: &App, idx: usize) -> bool {
     match idx {
         0 => app.show_rack,
         1 => app.show_binds,
         2 => app.show_midi,
-        _ => app.show_mixer,
+        3 => app.show_mixer,
+        _ => dyn_open(app, app.dyn_wins[idx - 4].kind),
     }
 }
 fn set_visible(app: &mut App, idx: usize, v: bool) {
@@ -11573,7 +11651,11 @@ fn set_visible(app: &mut App, idx: usize, v: bool) {
         0 => app.show_rack = v,
         1 => app.show_binds = v,
         2 => app.show_midi = v,
-        _ => app.show_mixer = v,
+        3 => app.show_mixer = v,
+        _ => {
+            let k = app.dyn_wins[idx - 4].kind;
+            dyn_set(app, k, v);
+        }
     }
     if changed {
         app.side_dirty = true;
@@ -11584,20 +11666,39 @@ fn win_rect(app: &App, idx: usize) -> [f32; 4] {
         0 => app.side_wins.rack,
         1 => app.side_wins.binds,
         2 => app.side_wins.monitor,
-        _ => app.side_wins.mixer,
+        3 => app.side_wins.mixer,
+        _ => app.dyn_wins[idx - 4].rect,
     }
 }
-fn win_title(idx: usize) -> &'static str {
-    ["ASSET RACK", "MIDI BINDINGS", "MIDI MONITOR", "MIXER"][idx]
+fn win_title(app: &App, idx: usize) -> String {
+    match idx {
+        0 => "ASSET RACK".into(),
+        1 => "MIDI BINDINGS".into(),
+        2 => "MIDI MONITOR".into(),
+        3 => "MIXER".into(),
+        _ => app.dyn_wins[idx - 4].title.clone(),
+    }
 }
 fn is_docked(app: &App, idx: usize) -> bool {
-    app.side_wins.dock[idx][0] == 1
+    if idx < 4 {
+        app.side_wins.dock[idx][0] == 1
+    } else {
+        app.dyn_wins[idx - 4].dock[0] == 1
+    }
 }
 fn dock_edge(app: &App, idx: usize) -> i16 {
-    app.side_wins.dock[idx][1]
+    if idx < 4 {
+        app.side_wins.dock[idx][1]
+    } else {
+        app.dyn_wins[idx - 4].dock[1]
+    }
 }
 fn dock_order(app: &App, idx: usize) -> i16 {
-    app.side_wins.dock[idx][2]
+    if idx < 4 {
+        app.side_wins.dock[idx][2]
+    } else {
+        app.dyn_wins[idx - 4].dock[2]
+    }
 }
 /// v34 R6: the mixer's vertical-rhythm rule, as one honest function
 /// (pinned): strips track the arrangement grid ONLY while docked to the
@@ -11613,7 +11714,8 @@ fn def_w(idx: usize) -> f32 {
         0 => 340.0,
         1 => 300.0,
         2 => 520.0,
-        _ => 250.0,
+        3 => 250.0,
+        _ => 440.0,
     }
 }
 fn def_h(idx: usize) -> f32 {
@@ -11630,10 +11732,11 @@ fn float_footprint(app: &App, idx: usize) -> [f32; 4] {
         0 => [8.0, 46.0, 340.0, 640.0],
         1 => [8.0, 46.0, 300.0, 620.0],
         2 => [360.0, 560.0, 520.0, 240.0],
-        _ => {
+        3 => {
             let w = app.side_wins.mixer[2].max(250.0);
             [8.0, 46.0, w, 620.0]
         }
+        _ => [420.0, 140.0, 440.0, 440.0],
     }
 }
 
@@ -11644,6 +11747,8 @@ fn snap_zone(vp: egui::Rect, pt: egui::Pos2) -> Option<i16> {
         Some(1)
     } else if pt.y > vp.max.y - SNAP_BOTTOM {
         Some(2)
+    } else if pt.y < vp.min.y + SNAP_BOTTOM {
+        Some(3)
     } else {
         None
     }
@@ -11653,7 +11758,8 @@ fn snap_zone(vp: egui::Rect, pt: egui::Pos2) -> Option<i16> {
 /// docked windows of that edge by position (outer edge first) and
 /// re-pack the edge's orders to 0..n-1.
 fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
-    let mut others: Vec<(i16, usize)> = (0..4)
+    let n = win_count(app);
+    let mut others: Vec<(i16, usize)> = (0..n)
         .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge)
         .map(|i| (dock_order(app, i), i))
         .collect();
@@ -11664,20 +11770,24 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
         match edge {
             0 => -(r[0]),
             1 => r[0] + r[2],
+            3 => -(r[1]),
             _ => r[1] + r[3],
         }
     };
     let me = match edge {
         0 => -pt.x,
         1 => pt.x,
+        3 => -pt.y,
         _ => pt.y,
     };
     let rank = others.iter().filter(|(_, i)| outer_of(*i) > me).count();
     others.insert(rank.min(others.len()), (0, idx));
     for (rank, (_, i)) in others.iter().enumerate() {
-        app.side_wins.dock[*i][0] = 1;
-        app.side_wins.dock[*i][1] = edge;
-        app.side_wins.dock[*i][2] = rank as i16;
+        if *i < 4 {
+            app.side_wins.dock[*i] = [1, edge, rank as i16];
+        } else {
+            app.dyn_wins[*i - 4].dock = [1, edge, rank as i16];
+        }
     }
     app.dock_collapsed[idx] = false;
     app.dock_rects[idx] = [0.0; 4];
@@ -11687,11 +11797,16 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
 /// Pull `idx` out of its dock and float it at `at` (top-left).
 fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
     let r = &mut app.side_wins;
-    let rect = match idx {
-        0 => &mut r.rack,
-        1 => &mut r.binds,
-        2 => &mut r.monitor,
-        _ => &mut r.mixer,
+    let prim = idx < 4;
+    let rect = if prim {
+        match idx {
+            0 => &mut r.rack,
+            1 => &mut r.binds,
+            2 => &mut r.monitor,
+            _ => &mut r.mixer,
+        }
+    } else {
+        &mut app.dyn_wins[idx - 4].rect
     };
     rect[0] = at[0];
     rect[1] = at[1];
@@ -11723,7 +11838,8 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
     if pressed && down && app.free_drag.is_none() {
         // Iterate top-down (floats above docked; higher idx above lower)
         // so the visually topmost header wins the grab.
-        let mut order: Vec<usize> = (0..4).filter(|i| win_visible(app, *i)).collect();
+        let n = win_count(app);
+        let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
         order.sort_by_key(|i| is_docked(app, *i));
         for idx in order.into_iter().rev() {
             let r = if is_docked(app, idx) {
@@ -11773,11 +11889,26 @@ fn window_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         0 => rack_body(ui, app),
         1 => value_binds_body(ui, app),
         2 => monitor_body(ui, app),
-        _ => mixer_body(ui, app),
+        3 => mixer_body(ui, app),
+        // v35 R5: dynamic windows paint the SAME body whether floating or
+        // docked — one dispatch, no duplicated widgets.
+        _ => dyn_body(ui, app, idx),
     }
 }
 
-/// Shared header row of a docked window; records the panel rect used for
+/// v35 R5: body dispatch for dynamic windows. Each kind shares ONE body
+/// function with its floating twin, so docked and floating cannot drift.
+fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
+    match app.dyn_wins[idx - 4].kind {
+        DynKind::Chain(loop_i) => chain_win_body(ui, app, loop_i),
+        k => {
+            let _ = k;
+            ui.label(RichText::new("(docked window)").weak());
+        }
+    }
+}
+
+/// Header row of a docked window; records the panel rect used for
 /// drag grabs, drop ranking and the OS-drop guard.
 fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     let r = ui.available_rect_before_wrap();
@@ -11785,11 +11916,16 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     let dragging_divider = ui.ctx().input(|i| i.pointer.any_down());
     {
         let edge = dock_edge(app, idx);
-        let wr = match idx {
-            0 => &mut app.side_wins.rack,
-            1 => &mut app.side_wins.binds,
-            2 => &mut app.side_wins.monitor,
-            _ => &mut app.side_wins.mixer,
+        let prim = idx < 4;
+        let wr = if prim {
+            match idx {
+                0 => &mut app.side_wins.rack,
+                1 => &mut app.side_wins.binds,
+                2 => &mut app.side_wins.monitor,
+                _ => &mut app.side_wins.mixer,
+            }
+        } else {
+            &mut app.dyn_wins[idx - 4].rect
         };
         // Persist only the CROSS dimension (panel thickness): width for
         // left/right docks, height for bottom docks — the along-edge size
@@ -11800,9 +11936,10 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // every frame (a runaway that once starved the grid to a phantom
         // 1537-px max-rect). Only a real divider drag moves it, and those
         // clear this threshold immediately.
-        let (cur, size) = if edge == 2 { (wr[3], r.height()) } else { (wr[2], r.width()) };
+        let cross = edge == 2 || edge == 3;
+        let (cur, size) = if cross { (wr[3], r.height()) } else { (wr[2], r.width()) };
         if size > 40.0 && (cur - size).abs() > 24.0 {
-            if edge == 2 {
+            if cross {
                 wr[3] = size;
             } else {
                 wr[2] = size;
@@ -11812,7 +11949,7 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
             }
         } else if cur < 40.0 && size > 40.0 {
             // first record (never-moved window)
-            if edge == 2 {
+            if cross {
                 wr[3] = size;
             } else {
                 wr[2] = size;
@@ -11820,13 +11957,13 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         }
     }
     ui.horizontal(|ui| {
-        let title = ui.label(RichText::new(win_title(idx)).strong());
+        let title = ui.label(RichText::new(win_title(app, idx)).strong());
         // v30-batch-2: one-stop dock menu on the header title — every
         // window can be re-slotted (or floated out) without a precise
         // drag; the drag-to-edge gesture stays as the quick path.
         title.context_menu(|ui| {
             let cur = dock_edge(app, idx);
-            for (e, name) in [(0i16, "left"), (1, "right"), (2, "bottom")] {
+            for (e, name) in [(0i16, "left"), (1, "right"), (2, "bottom"), (3, "top")] {
                 if e == cur {
                     continue;
                 }
@@ -11873,26 +12010,35 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
 fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     let edge = dock_edge(app, idx);
     let known = win_rect(app, idx);
+    // v35 R6: minimums down to an interactable border + header only, so
+    // stacks of docks can be squeezed to nearly nothing and pulled back.
     match edge {
         0 => {
             egui::Panel::left(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[2].max(def_w(idx)))
-                .min_size(170.0)
+                .min_size(48.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
         1 => {
             egui::Panel::right(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[2].max(def_w(idx)))
-                .min_size(170.0)
+                .min_size(48.0)
+                .show(ui, |ui| docked_window(ui, app, idx));
+        }
+        3 => {
+            egui::Panel::top(egui::Id::new(("dockw", idx)))
+                .resizable(true)
+                .default_size(known[3].max(def_h(idx)))
+                .min_size(48.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
         _ => {
             egui::Panel::bottom(egui::Id::new(("dockw", idx)))
                 .resizable(true)
                 .default_size(known[3].max(def_h(idx)))
-                .min_size(110.0)
+                .min_size(48.0)
                 .show(ui, |ui| docked_window(ui, app, idx));
         }
     }
@@ -11910,21 +12056,32 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
         return;
     }
     match edge {
-        2 => {
+        2 | 3 => {
             let h = ids
                 .iter()
                 .map(|i| win_rect(app, *i)[3])
                 .fold(0.0f32, f32::max)
                 .max(def_h(ids[0]));
-            egui::Panel::bottom(egui::Id::new(("dockedge", edge)))
+            let wrap = if edge == 3 {
+                egui::Panel::top(egui::Id::new(("dockedge", edge)))
+            } else {
+                egui::Panel::bottom(egui::Id::new(("dockedge", edge)))
+            };
+            wrap
                 // v32 R8: the strip's THICKNESS (its height) must be
                 // resizable too, or windows sharing the bottom edge have
                 // no way to grow taller — nested panels only resize ALONG
                 // the edge. Resizable like a lone bottom dock.
                 .resizable(true)
                 .default_size(h)
-                .min_size(90.0)
+                .min_size(48.0)
                 .show(ui, |ui| {
+                    // v35 R6: fair-share defaults — a freshly added dock
+                    // must not be squeezed to zero by its neighbours' old
+                    // solo sizes. Each window asks for what it recorded,
+                    // capped at its share of what is left.
+                    let strip = ui.max_rect().width();
+                    let mut alloc = 0.0f32;
                     for (n, i) in ids.iter().enumerate() {
                         let b = ui.max_rect();
                         if n + 1 == ids.len() {
@@ -11934,10 +12091,22 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                                 .exact_size(b.height())
                                 .show(ui, |ui| docked_window(ui, app, *i));
                         } else {
-                            egui::Panel::left(egui::Id::new(("dockw", *i)))
+                            let rec = win_rect(app, *i)[2].max(0.0);
+                            let want = if rec > 8.0 { rec } else { def_w(*i) };
+                            let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
+                            alloc += want.min(cap);
+                            // Id salted by stack depth: egui caches a
+                            // resizable panel's size by Id, so when the
+                            // stack changes the fair-share default must
+                            // apply afresh (else old solo sizes persist).
+                            egui::Panel::left(egui::Id::new((
+                                "dockw",
+                                *i,
+                                ids.len(),
+                            )))
                                 .resizable(true)
-                                .default_size(win_rect(app, *i)[2].max(def_w(*i)))
-                                .min_size(170.0)
+                                .default_size(want.min(cap).max(48.0))
+                                .min_size(48.0)
                                 .show(ui, |ui| docked_window(ui, app, *i));
                         }
                     }
@@ -11954,8 +12123,12 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                 _ => egui::Panel::right(egui::Id::new(("dockedge", edge))),
             };
             // v32 R8: resizable thickness (see bottom-edge note above).
-            wpanel = wpanel.resizable(true).default_size(w).min_size(220.0);
+            // v35 R6: thinner floors — docked stacks squeeze to a border.
+            wpanel = wpanel.resizable(true).default_size(w).min_size(120.0);
             wpanel.show(ui, |ui| {
+                    // v35 R6: fair-share defaults (see bottom-edge note).
+                    let strip = ui.max_rect().height();
+                    let mut alloc = 0.0f32;
                     for (n, i) in ids.iter().enumerate() {
                         let b = ui.max_rect();
                         if n + 1 == ids.len() {
@@ -11964,11 +12137,26 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                                 .exact_size(b.width())
                                 .show(ui, |ui| docked_window(ui, app, *i));
                         } else {
-                            egui::Panel::top(egui::Id::new(("dockw", *i)))
+                            let rec = win_rect(app, *i)[3].max(0.0);
+                            let want = if rec > 8.0 { rec } else { def_h(*i) };
+                            let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
+                            alloc += want.min(cap);
+                            // egui sizes top panels to CONTENT desired
+                            // height, which would let one stacked window
+                            // devour the strip; cap the content to the
+                            // window's share in a scroll viewport.
+                            let sz = want.min(cap).max(48.0);
+                            egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
                                 .resizable(true)
-                                .default_size(win_rect(app, *i)[3].max(def_h(*i)))
-                                .min_size(110.0)
-                                .show(ui, |ui| docked_window(ui, app, *i));
+                                .default_size(sz)
+                                .min_size(48.0)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(("dockstack", *i))
+                                        .auto_shrink([false, false])
+                                        .max_height(sz)
+                                        .show(ui, |ui| docked_window(ui, app, *i));
+                                });
                         }
                     }
                 });
@@ -12005,7 +12193,7 @@ fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         [fb[2], fb[3]]
     };
     let mut vis = win_visible(app, idx);
-    let mut w = egui::Window::new(RichText::new(win_title(idx)).strong())
+    let mut w = egui::Window::new(RichText::new(win_title(app, idx)).strong())
         .id(egui::Id::new(("sidewin", idx as u8)))
         .open(&mut vis)
         .resizable(true)
@@ -12031,15 +12219,19 @@ fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // restores exactly where the user parked it.
         let nr = [out.min.x, out.min.y, out.width(), out.height()];
         if nr.iter().zip(old.iter()).any(|(a, b)| (a - b).abs() > 0.5) {
-            let cur = &mut app.side_wins;
-            let slot = match idx {
-                0 => &mut cur.rack,
-                1 => &mut cur.binds,
-                2 => &mut cur.monitor,
-                _ => &mut cur.mixer,
-            };
-            *slot = nr;
-            app.side_dirty = true;
+            if idx < 4 {
+                let cur = &mut app.side_wins;
+                let slot = match idx {
+                    0 => &mut cur.rack,
+                    1 => &mut cur.binds,
+                    2 => &mut cur.monitor,
+                    _ => &mut cur.mixer,
+                };
+                *slot = nr;
+                app.side_dirty = true;
+            } else {
+                app.dyn_wins[idx - 4].rect = nr;
+            }
         }
     }
 }
@@ -12051,8 +12243,9 @@ fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
 fn side_frames(ui: &mut egui::Ui, app: &mut App) {
     free_drag_pass(ui, app);
     let carried = app.free_drag.map(|(i, _)| i);
-    for edge in 0..3i16 {
-        let mut ids: Vec<usize> = (0..4)
+    let n = win_count(app);
+    for edge in 0..4i16 {
+        let mut ids: Vec<usize> = (0..n)
             .filter(|i| {
                 win_visible(app, *i)
                     && is_docked(app, *i)
@@ -12065,7 +12258,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             draw_docked_edge(ui, app, edge, &ids);
         }
     }
-    for i in 0..4 {
+    for i in 0..n {
         if win_visible(app, i) && (!is_docked(app, i) || carried == Some(i)) {
             draw_float(ui, app, i);
         }
@@ -12083,6 +12276,10 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                     1 => egui::Rect::from_min_max(
                         egui::pos2(vp.max.x - SNAP_EDGE, vp.min.y),
                         vp.max,
+                    ),
+                    3 => egui::Rect::from_min_max(
+                        vp.min,
+                        egui::pos2(vp.max.x, vp.min.y + SNAP_BOTTOM),
                     ),
                     _ => egui::Rect::from_min_max(
                         egui::pos2(vp.min.x, vp.max.y - SNAP_BOTTOM),
@@ -16730,12 +16927,37 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     if !app.vst_scanned && app.vst_scan_rx.is_none() {
         app.vst_rescan();
     }
+    // v35 R5: the chain window is a first-class DOCKABLE: registry slot,
+    // one shared body, floating only when not held by a dock edge.
+    let idx = app.dyn_reg(
+        DynKind::Chain(loop_i),
+        format!("MIXER CHAIN — track {}", loop_i + 1),
+    );
+    if app.dyn_dock_skip(idx) {
+        return;
+    }
+    let dragging = app.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
     let mut open = true;
-    egui::Window::new(RichText::new(format!("MIXER CHAIN — track {}", loop_i + 1)).strong())
+    let mut w = egui::Window::new(RichText::new(format!("MIXER CHAIN — track {}", loop_i + 1)).strong())
+        .id(egui::Id::new(("dynwin-chain", loop_i)))
         .open(&mut open)
         .min_width(560.0)
-        .default_height(480.0)
-        .show(ui, |ui| {
+        .default_height(480.0);
+    if dragging {
+        w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
+    }
+    let resp = w.show(ui, |ui| chain_win_body(ui, app, loop_i));
+    if !open {
+        app.fx_window = None;
+    }
+    if let Some(out) = resp.map(|r| r.response.rect) {
+        app.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+    }
+}
+
+/// v35 R5: MIXER CHAIN body — ONE body shared by the floating window and
+/// the docked panel, so the two can never drift apart.
+fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             // --- chain (audio order, top first) ---------------------------
             ui.label(RichText::new("Chain (top = first):").strong());
             let mut act: Option<(u8, usize)> = None; // 0 open, 1 up, 2 down, 3 remove
@@ -17067,8 +17289,6 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
                 .weak()
                 .small(),
             );
-        });
-    app.fx_window = if open { Some(loop_i) } else { None };
 }
 
 /// Small ↑/↓ reorder button with a DRAWN arrow. egui's default font stack
@@ -23382,6 +23602,85 @@ mod tests {
                 .collect()
         });
         assert!(missing.is_empty(), "TOFU GLYPHS: {}", missing.join(" "));
+    }
+    /// v35 R5/R6 pin: the MIXER CHAIN window is a first-class dockable —
+    /// it docks to an edge (body painted by the panel, owner skips its
+    /// float), stacks with a primary panel on the same edge, floats out,
+    /// and its close button clears the OWNER state (no zombie registry).
+    #[test]
+    fn v35_chain_window_docks_and_stacks() {
+        let mut app = headless_app("v35dock");
+        let ctx = egui::Context::default();
+        app.fx_window = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let idx = 4; // first dynamic slot
+        assert_eq!(win_count(&app), 5, "chain window registered");
+        assert!(!is_docked(&app, idx), "starts floating");
+
+        // Dock right, then frame: the panel owns the body this frame.
+        dock_at(&mut app, idx, 1, egui::pos2(1380.0, 300.0));
+        assert!(is_docked(&app, idx));
+        frame(&mut app, &ctx, vec![]);
+        let r = app.dock_rects[idx];
+        assert!(r[2] > 8.0, "docked chain painted nothing");
+        assert!(r[0] > 700.0, "docked on the RIGHT edge, got x={}", r[0]);
+        // A re-tiled stack settles within a couple of frames (egui sizes
+        // resizable panels from memory written the frame before).
+        // A painted-text scanner (same evidence `galleys_all` gathers,
+        // taken straight from the frame output).
+        let painted = |app: &mut App, needle: &str| -> usize {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            out.shapes
+                .iter()
+                .filter(|cs| {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        t.galley.text() == needle
+                    } else {
+                        false
+                    }
+                })
+                .count()
+        };
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            painted(&mut app, "Chain (top = first):"),
+            1,
+            "one shared body, painted once"
+        );
+
+        // Stack a primary panel on the SAME edge — re-order keeps both.
+        app.show_mixer = true;
+        dock_at(&mut app, 3, 1, egui::pos2(1380.0, 80.0));
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+            if app.dock_rects[3][2] > 8.0 && app.dock_rects[idx][2] > 8.0 {
+                break;
+            }
+        }
+        assert_ne!(dock_order(&app, idx), dock_order(&app, 3), "tiled apart");
+        assert!(app.dock_rects[idx][2] > 8.0, "chain still painted");
+        assert!(app.dock_rects[3][2] > 8.0, "mixer still painted");
+
+        // TOP edge (R6: all four directions).
+        dock_at(&mut app, idx, 3, egui::pos2(600.0, 8.0));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(dock_edge(&app, idx), 3);
+        assert!(app.dock_rects[idx][1] < 120.0, "top strip is at the top");
+
+        // Float out, then close from the dock state: owner clears too.
+        dock_at(&mut app, idx, 1, egui::pos2(1380.0, 300.0));
+        set_visible(&mut app, idx, false);
+        assert!(app.fx_window.is_none(), "close clears the OWNER flag");
+        assert!(!win_visible(&app, idx), "no zombie window");
+        frame(&mut app, &ctx, vec![]); // and frames cleanly
     }
 
     /// v35 R8: deletion torture. Every delete path in the app, hammered in
