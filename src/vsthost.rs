@@ -1806,6 +1806,10 @@ pub fn open_pid(
     saved: Option<&[f32]>,
     patch: Option<&VstPatch>,
 ) -> Result<VstLoad, String> {
+    // Test builds only: arm the vendor-teardown exit hush (see
+    // `test_hush_vendor_exit_trap`). Every plugin open funnels here.
+    #[cfg(test)]
+    crate::test_hush_vendor_exit_trap();
     // CLAP NEVER runs on the vst2-gui thread: a JUCE-based CLAP's init
     // (inside our dlopen, under glibc's loader lock) spawns helper threads
     // that dlopen themselves — deadlock: the helper blocks on the loader

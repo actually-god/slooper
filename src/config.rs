@@ -237,6 +237,26 @@ pub struct SideWins {
     pub dock: [[i16; 3]; 4],
 }
 
+/// v35: dock/rect state for ONE dynamic window class instance — the
+/// plugin-class windows that join the dock system. `kind` is the DynKind
+/// key: "params" | "drums" | "roll" | "auto" | "chain:<track>" |
+/// "synth:<track>" | "synths:<track>". `dock` uses the same encoding as
+/// SideWins: [docked (0/1), edge (0 left / 1 right / 2 bottom / 3 top),
+/// order along the edge].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DynDock {
+    pub kind: String,
+    pub dock: [i16; 3],
+    pub rect: [f32; 4],
+}
+
+impl Default for DynDock {
+    fn default() -> Self {
+        DynDock { kind: String::new(), dock: [0, 1, 0], rect: [0.0; 4] }
+    }
+}
+
 impl Default for SideWins {
     fn default() -> Self {
         SideWins {
@@ -501,6 +521,11 @@ pub struct Config {
     /// A zeroed entry means "use the built-in dock footprint".
     #[serde(default)]
     pub side_wins: SideWins,
+    /// v35: docked/floating state of the DYNAMIC windows (mixer chain,
+    /// parameters, synth sliders, drums, roll, automation, SYNTHS picker
+    /// — per track where applicable). Kinds absent here start floating.
+    #[serde(default)]
+    pub dyn_docks: Vec<DynDock>,
     /// v25: panel/window theme — "dark" (default) or "light". The
     /// arrangement canvas and piano roll keep their fixed studio palette
     /// either way (contrast for editing is intentional).
@@ -570,6 +595,7 @@ impl Default for Config {
             show_midi: true,
             show_binds: true,
             side_wins: SideWins::default(),
+            dyn_docks: Vec::new(),
             theme: default_theme(),
         }
     }
@@ -891,12 +917,18 @@ mod tests {
                 mixer: [5.0, 6.0, 250.0, 600.0],
                 dock: [[0, 0, 0], [1, 1, 1], [1, 2, 0], [0, 1, 0]],
             },
+            dyn_docks: vec![crate::config::DynDock {
+                kind: "chain:1".into(),
+                dock: [1, 3, 0],
+                rect: [4.0, 5.0, 440.0, 300.0],
+            }],
             theme: "light".into(),
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back.shortcuts, cfg.shortcuts);
         assert_eq!(back.midi, cfg.midi);
+        assert_eq!(back.dyn_docks, cfg.dyn_docks, "v35 dynamic dock state round-trips");
         assert!((back.gui_scale - 1.25).abs() < f32::EPSILON);
         assert!((back.latency_ms - 12.5).abs() < f32::EPSILON);
         assert_eq!(back.metro_bpm, 96);
