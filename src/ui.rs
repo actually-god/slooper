@@ -929,6 +929,9 @@ pub struct App {
     show_binds: bool,
     /// v30 R6: persisted geometry of the three free side windows.
     side_wins: crate::config::SideWins,
+    /// v35: dock state loaded from config, applied when a dynamic window
+    /// registers its registry slot for the FIRST time this session.
+    dyn_seed: Vec<(DynKind, [i16; 3], [f32; 4])>,
     side_dirty: bool,
     /// v30-batch-2 docking: window currently carried by a header drag
     /// (idx, grab offset), its live top-left, the live rect of every
@@ -1492,6 +1495,13 @@ impl App {
             auto_preset_name: String::new(),
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
+            dyn_seed: cfg
+                .dyn_docks
+                .iter()
+                .filter_map(|d| {
+                    DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect))
+                })
+                .collect(),
             side_dirty: false,
             free_drag: None,
             drag_pos: [0.0, 0.0],
@@ -2679,7 +2689,7 @@ impl App {
             self.params_win = None;
         }
         if let Some(out) = resp.map(|r| r.response.rect) {
-            self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+            self.dyn_remember(idx, out);
         }
     }
 
@@ -3862,6 +3872,15 @@ impl App {
             show_midi: self.show_midi,
             show_binds: self.show_binds,
             side_wins: self.side_wins,
+            dyn_docks: self
+                .dyn_wins
+                .iter()
+                .map(|w| crate::config::DynDock {
+                    kind: w.kind.key(),
+                    dock: w.dock,
+                    rect: w.rect,
+                })
+                .collect(),
             theme: if self.light_theme { "light" } else { "dark" }.into(),
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
@@ -5400,7 +5419,7 @@ impl App {
         let resp = w.show(&ctx, |ui| self.drum_win_body(ui));
         self.show_drums = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
-            self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+            self.dyn_remember(idx, out);
         }
     }
 
@@ -5707,7 +5726,7 @@ impl App {
                 self.auto_inner(ui, &mut ed, &targets, sr, bpm, beats, beat_s, bar_s, &mut action)
             });
             if let Some(out) = resp.map(|r| r.response.rect) {
-                self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+                self.dyn_remember(idx, out);
             }
         }
         if action == 1 || action == 2 {
@@ -5740,7 +5759,7 @@ impl App {
                 // v23: target list can be thousands deep (plugin params)
                 // — search box drives the combo's contents.
                 let q = target_search_box(ui, "filter automation target");
-                let shown = filtered_targets(&targets, &q);
+                let shown = filtered_targets(targets, &q);
                 ui.horizontal(|ui| {
                     ui.label("target");
                     let cur = targets
@@ -7122,7 +7141,7 @@ impl App {
                 )
             });
             if let Some(out) = resp.as_ref().map(|r| r.response.rect) {
-                self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+                self.dyn_remember(idx, out);
             }
         }
         // Keyboard focus: the LAST primary click decides. Inside the
@@ -8110,7 +8129,7 @@ impl App {
             self.synth_win = None;
         }
         if let Some(out) = resp.map(|r| r.response.rect) {
-            self.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+            self.dyn_remember(idx, out);
         }
     }
 
@@ -10736,16 +10755,34 @@ impl App {
             self.dyn_wins[n].title = title;
             return 4 + n;
         }
+        let (dock, rect) = self
+            .dyn_seed
+            .iter()
+            .find(|(k, _, _)| *k == kind)
+            .map(|(_, d, r)| (*d, *r))
+            .unwrap_or(([0, 1, 0], [0.0; 4]));
         self.dyn_wins.push(DynWin {
             kind,
             title,
-            dock: [0, 1, 0],
-            rect: [0.0; 4],
+            dock,
+            rect,
         });
         self.dock_rects
             .resize(4 + self.dyn_wins.len(), [0.0; 4]);
         self.dock_collapsed.resize(4 + self.dyn_wins.len(), false);
-        3 + self.dyn_wins.len()
+        4 + self.dyn_wins.len() - 1
+    }
+
+    /// v35: store a floating dynamic window's new rect and mark config
+    /// dirty (mirrors what the primary draw_float does — without the
+    /// dirty flag a dragged window would reopen at the old spot).
+    fn dyn_remember(&mut self, idx: usize, rect: egui::Rect) {
+        let nr = [rect.min.x, rect.min.y, rect.width(), rect.height()];
+        let old = self.dyn_wins[idx - 4].rect;
+        self.dyn_wins[idx - 4].rect = nr;
+        if nr.iter().zip(old.iter()).any(|(a, b)| (a - b).abs() > 0.5) {
+            self.side_dirty = true;
+        }
     }
     /// True while the dock pass owns the window this frame — the owner
     /// must skip its floating copy (dynamic windows only).
@@ -11793,6 +11830,37 @@ pub(crate) struct DynWin {
     rect: [f32; 4],
 }
 
+impl DynKind {
+    /// Stable config key (v35 persistence): "params" | "drums" | "roll"
+    /// | "auto" | "chain:<track>" | "synth:<track>" | "synths:<track>".
+    fn key(self) -> String {
+        match self {
+            DynKind::Params => "params".into(),
+            DynKind::Chain(t) => format!("chain:{t}"),
+            DynKind::Synth(t) => format!("synth:{t}"),
+            DynKind::Drums => "drums".into(),
+            DynKind::Roll => "roll".into(),
+            DynKind::Auto => "auto".into(),
+            DynKind::Synths(t) => format!("synths:{t}"),
+        }
+    }
+    fn from_key(s: &str) -> Option<DynKind> {
+        let mut parts = s.splitn(2, ':');
+        let head = parts.next()?;
+        let arg = parts.next().and_then(|a| a.parse::<usize>().ok());
+        Some(match (head, arg) {
+            ("params", _) => DynKind::Params,
+            ("drums", _) => DynKind::Drums,
+            ("roll", _) => DynKind::Roll,
+            ("auto", _) => DynKind::Auto,
+            ("chain", Some(t)) => DynKind::Chain(t),
+            ("synth", Some(t)) => DynKind::Synth(t),
+            ("synths", Some(t)) => DynKind::Synths(t),
+            _ => return None,
+        })
+    }
+}
+
 /// Visibility of a dynamic window is owned by the very flag that opens it
 /// (one authority — closing from the dock header clears the real state, so
 /// a docked window cannot resurrect itself on the next frame).
@@ -12438,7 +12506,13 @@ fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                 *slot = nr;
                 app.side_dirty = true;
             } else {
+                // v35: a released float-drag of a DYNAMIC window is a
+                // config-worthy move (primaries set side_dirty above).
+                let old = app.dyn_wins[idx - 4].rect;
                 app.dyn_wins[idx - 4].rect = nr;
+                if nr.iter().zip(old.iter()).any(|(a, b)| (a - b).abs() > 0.5) {
+                    app.side_dirty = true;
+                }
             }
         }
     }
@@ -14093,7 +14167,7 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
         app.synth_pick = None;
     }
     if let Some(out) = resp.map(|r| r.response.rect) {
-        app.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+        app.dyn_remember(idx, out);
     }
 }
 
@@ -17186,7 +17260,7 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
         app.fx_window = None;
     }
     if let Some(out) = resp.map(|r| r.response.rect) {
-        app.dyn_wins[idx - 4].rect = [out.min.x, out.min.y, out.width(), out.height()];
+        app.dyn_remember(idx, out);
     }
 }
 
@@ -23955,6 +24029,8 @@ mod tests {
         assert!(app.fx_window.is_none(), "close clears the OWNER flag");
         assert!(!win_visible(&app, idx), "no zombie window");
         frame(&mut app, &ctx, vec![]); // and frames cleanly
+        drop(app);
+        settle_plugin_drop();
     }
 
     /// v35: every dynamic window class joins the dock system. Per kind:
@@ -24109,6 +24185,8 @@ mod tests {
         set_visible(&mut app, 8, false);
         assert_eq!(app.synth_win, None, "dock close clears synth_win");
         frame(&mut app, &ctx, vec![]); // and frames cleanly
+        drop(app);
+        settle_plugin_drop();
     }
 
     /// v35 R8: deletion torture. Every delete path in the app, hammered in
@@ -25623,6 +25701,53 @@ mod tests {
         assert_eq!(app.params_win, None, "dock close clears the owner");
         frame(&mut app, &ctx, vec![]); // and frames cleanly
         std::mem::forget(entry);
+    }
+
+    /// v35: vendor teardown (sfizz LeakDetector) can trap at process
+    /// exit after all tests passed — the hush is armed automatically at
+    /// every test-side plugin open (`open_pid`), pins that instantiated
+    /// a track synth just make the intent explicit.
+    fn settle_plugin_drop() {
+        crate::test_hush_vendor_exit_trap();
+    }
+
+    /// v35: dynamic windows PERSIST their dock state — a drums window
+    /// docked to the top edge reopens docked there in a fresh app that
+    /// loads the same config.
+    #[test]
+    fn v35_dynamic_dock_state_persists() {
+        let mut app = headless_app("v35dockpersist");
+        let ctx = egui::Context::default();
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        assert!(!is_docked(&app, 4), "fresh sandbox: floats");
+        dock_at(&mut app, 4, 3, egui::pos2(600.0, 8.0)); // -> TOP edge
+        frame(&mut app, &ctx, vec![]);
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        let d = cfg
+            .dyn_docks
+            .iter()
+            .find(|d| d.kind == "drums")
+            .expect("drums dock persisted");
+        assert_eq!(d.dock[0], 1);
+        assert_eq!(d.dock[1], 3, "top edge saved");
+        drop(app);
+        // fresh app on the same sandbox: the config round-trips through
+        // App::new -> dyn_seed -> dyn_reg.
+        let mut app2 = App::new(Backend::start());
+        app2.show_drums = true;
+        frame(&mut app2, &ctx, vec![]);
+        assert!(is_docked(&app2, 4), "reopens docked");
+        assert_eq!(dock_edge(&app2, 4), 3, "reopens at the top edge");
+        frame(&mut app2, &ctx, vec![]);
+        frame(&mut app2, &ctx, vec![]);
+        assert!(
+            app2.dock_rects[4][2] > 8.0,
+            "reopens painted inside the dock"
+        );
+        drop(app2);
+        settle_plugin_drop();
     }
 
     /// v23 gate pin: a CACHED-SAFE verdict opens the vendor window

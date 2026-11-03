@@ -38,6 +38,30 @@ pub mod vsthost;
 
 pub use midi::{MidiAction, MidiBind, MidiMsg};
 
+/// Test helper: vendored plugins can trap at PROCESS EXIT — sfizz 1.2.3
+/// leaks one `Layer` per synth and its LeakDetector `__builtin_trap()`s
+/// from a static destructor, long after all assertions ran (SIGTRAP
+/// after "test result: ok", outcome a static-destruction order lottery).
+/// Called once from every test-side plugin open: an end-of-process trap
+/// from vendor teardown becomes a clean exit(0) — the tests themselves
+/// already reported. Mid-run traps after results printed still surface:
+/// without a `test result:` line the chunk protocol FAILS the run.
+#[cfg(test)]
+pub fn test_hush_vendor_exit_trap() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    const SIGTRAP: i32 = 5; // glibc/x86-64
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+        fn _exit(code: i32) -> !;
+    }
+    extern "C" fn exit_on_trap(_sig: i32) {
+        unsafe { _exit(0) }
+    }
+    SET.call_once(|| unsafe {
+        signal(SIGTRAP, exit_on_trap as *const () as usize);
+    });
+}
+
 /// Test helper: the REAL account home, immune to the `HOME` swaps that
 /// sandboxed plugin tests perform mid-suite. Resolved from the passwd
 /// database (uid-based), never from the environment.
