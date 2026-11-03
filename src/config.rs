@@ -285,6 +285,7 @@ pub fn default_dock() -> [[i16; 3]; 4] {
 
 /// Everything Settings persists.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)] // partial / hand-edited files keep the rest at defaults
 pub struct Config {
     /// Keyboard shortcuts as key names (e.g. `"R"`, `"Space"`), one per entry
     /// of `MidiAction::ALL` (same order); null = unbound. Tables from older
@@ -1019,6 +1020,20 @@ mod tests {
         assert!(cfg.projects_dir().ends_with("slooper-projects"));
         cfg.project_dir = "/srv/music".into();
         assert_eq!(cfg.projects_dir(), PathBuf::from("/srv/music"));
+    }
+
+    /// The config-flip workflow (hand-edited files) must not silently
+    /// reset every field that is absent from the JSON.
+    #[test]
+    fn partial_config_keeps_defaults() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"show_drums": true, "dyn_docks": [{"kind":"drums","dock":[1,1,1],"rect":[0.0,0.0,0.0,0.0]}]}"#,
+        )
+        .unwrap();
+        assert!(cfg.show_drums, "present field honored");
+        assert_eq!(cfg.dyn_docks.len(), 1, "seeded dynamic dock state");
+        assert_eq!(cfg.theme, "dark", "absent fields at default");
+        assert_eq!(cfg.n_tracks, Config::default().n_tracks);
     }
 
     /// v22 pin: plugin state chunks ride base64 through the JSON saves —
