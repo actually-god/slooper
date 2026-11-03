@@ -428,6 +428,14 @@ pub enum MidiAction {
     /// global knob every project wants (v32). Value semantics as
     /// [`MidiAction::VolLoop`].
     VolMaster,
+    /// v35 R3: jump the playhead to the START of the selected clips, else
+    /// (no selection) the loop-region start while loop is on, else the
+    /// project start. (Also the Home-key default.)
+    GotoStart,
+    /// v35 R3: jump the playhead to the END of the selected clips, else
+    /// (no selection) the loop-region end while loop is on, else the
+    /// project end. (Also the End-key default.)
+    GotoEnd,
     /// Catch-all for action names this build no longer knows (see the enum
     /// doc); never bindable, never fired.
     #[serde(other)]
@@ -444,9 +452,9 @@ impl MidiAction {
     /// v0.2 reshaped this table when overdub/import/dependent/undo/redo were
     /// removed; the old positional tables (length 140 / 25 / 9) are remapped
     /// on load (see `ui::migrate_shortcuts`). New actions must be APPENDED.
-    pub const ALL: [MidiAction; 138] = {
+    pub const ALL: [MidiAction; 140] = {
         // const-friendly construction: the layout is fully arithmetic.
-        let mut a = [MidiAction::Reserved; 138];
+        let mut a = [MidiAction::Reserved; 140];
         a[0] = MidiAction::RecSelected;
         a[1] = MidiAction::ClearSelected;
         a[2] = MidiAction::PlaySelected;
@@ -473,6 +481,9 @@ impl MidiAction {
         // slot after the MIDI-rec family (121..136), keeping every older
         // positional table valid unchanged.
         a[137] = MidiAction::VolMaster;
+        // v35 APPENDED: the go-to-beginning / go-to-end pair (138/139).
+        a[138] = MidiAction::GotoStart;
+        a[139] = MidiAction::GotoEnd;
         a
     };
 
@@ -502,6 +513,8 @@ impl MidiAction {
             MidiAction::PanLoop(i) => format!("track {}: pan (knob)", i + 1),
             MidiAction::MidiRec(i) => format!("track {}: MIDI record", i + 1),
             MidiAction::VolMaster => "master volume (knob)".into(),
+            MidiAction::GotoStart => "go to start (selection/loop/project)".into(),
+            MidiAction::GotoEnd => "go to end (selection/loop/project)".into(),
             MidiAction::Reserved => String::new(),
         }
     }
@@ -544,7 +557,18 @@ pub fn migrate_shortcuts(old: &[Option<egui::Key>]) -> Vec<Option<egui::Key>> {
             // slot keeps its position, the new knob starts unbound.
             out[..137].copy_from_slice(old);
         }
+        138 => {
+            // v34: the table was 138 long with VolMaster last; the v35
+            // go-to pair appends slots 138/139 unbound.
+            out[..138].copy_from_slice(old);
+        }
         140 => {
+            // v0.1.x positional tables. NOTE: v35 made N_ACTIONS 140 (the
+            // go-to pair appended), so a length-140 table is now TRUSTED by
+            // the arm above and this remap is effectively unreachable. A
+            // direct v0.1.x -> v35+ upgrade keeps its keys mapped v0.1-style
+            // (rebind or reset in Settings); every build since v0.2 persists
+            // migrated tables, so no other config carries this shape.
             // (old, new) slot pairs; removed actions have no entry.
             for (o, n) in [(0, 0), (2, 1), (3, 2), (5, 3), (87, 68), (88, 69), (89, 70)] {
                 out[n] = old[o];
@@ -769,7 +793,7 @@ mod tests {
     /// and the shortcut-table migration keeps every old binding.
     #[test]
     fn v32_volmaster_appended_migrated_and_continuous() {
-        assert_eq!(MidiAction::ALL.len(), 138);
+        assert_eq!(MidiAction::ALL.len(), 140);
         assert_eq!(MidiAction::ALL[137], MidiAction::VolMaster);
         assert_eq!(MidiAction::idx(MidiAction::VolMaster), 137);
         assert!(MidiAction::VolMaster.is_continuous());
@@ -784,7 +808,7 @@ mod tests {
             .map(|i| if i == 5 { Some(egui::Key::R) } else { None })
             .collect();
         let m = migrate_shortcuts(&old);
-        assert_eq!(m.len(), 138);
+        assert_eq!(m.len(), 140);
         assert_eq!(m[5], Some(egui::Key::R));
         assert_eq!(m[137], None);
         let mut cur = m.clone();
