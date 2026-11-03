@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use slooper::vsthost::{open, StageEntry, VstKind};
+use slooper::vsthost::{open, VstKind};
 
 fn peak_of(entry: &slooper::vsthost::RtStageEntry, blocks: usize) -> f32 {
     let mut peak = 0f32;
@@ -35,7 +35,7 @@ fn main() {
         .downcast_ref::<slooper::vsthost::RtStageEntry>()
         .unwrap();
     entry.note_on(0, 60, 110);
-    let pre = peak_of(&entry, 120); // ~1.3 s of notes, editor NOT yet open
+    let pre = peak_of(entry, 120); // ~1.3 s of notes, editor NOT yet open
     println!("PRE-EDITOR peak {pre:.5}");
 
     let handle = match entry.vst2_handle() {

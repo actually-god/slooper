@@ -1,6 +1,6 @@
 // v20 probe: dump descs (with ids) AND drive cell writes end-to-end.
 use std::path::Path;
-use slooper::vsthost::{open, StageEntry, VstKind};
+use slooper::vsthost::{open, VstKind};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

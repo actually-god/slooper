@@ -17,7 +17,7 @@
 //   cargo run --release --example v23_sweep -- <path> <V2|V3>
 use std::path::Path;
 
-use slooper::vsthost::{open, StageEntry, VstKind, VST_MAX_PARAMS};
+use slooper::vsthost::{open, VstKind, VST_MAX_PARAMS};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -53,8 +53,6 @@ mod ffi {
 
     pub const CLAP_EVENT_NOTE_ON: u16 = 0;
     pub const CLAP_EVENT_NOTE_OFF: u16 = 1;
-    pub const CLAP_EVENT_NOTE_CHOKE: u16 = 2;
-    pub const CLAP_EVENT_NOTE_END: u16 = 3;
     pub const CLAP_EVENT_PARAM_VALUE: u16 = 5;
     pub const CLAP_EVENT_MIDI: u16 = 10;
     pub const CLAP_PARAM_IS_READONLY: u32 = 1 << 3;
@@ -68,7 +66,6 @@ mod ffi {
     pub static CLAP_EXT_PARAMS_C: &CStr = c"clap.params";
     pub static CLAP_EXT_AUDIO_PORTS_C: &CStr = c"clap.audio-ports";
     pub static CLAP_EXT_STATE_C: &CStr = c"clap.state";
-    pub static CLAP_EXT_LOG_C: &CStr = c"clap.log";
 
     #[repr(C)]
     pub struct ClapVersion {
@@ -324,9 +321,14 @@ impl Default for EvSlot {
 struct HostGlobals {
     log: ffi::ClapHostLog,
     host: ffi::ClapHost,
+    // Read by plugins through the clap_host_t layout (Rust never touches).
+    #[allow(dead_code)]
     name: CString,
+    #[allow(dead_code)]
     vendor: CString,
+    #[allow(dead_code)]
     url: CString,
+    #[allow(dead_code)]
     version: CString,
 }
 
@@ -655,11 +657,9 @@ pub struct ClapStageEntry {
     /// plane (state save/load) uses it under `vst_loader_lock()`. NEVER
     /// destroyed (leak policy).
     plugin: *const ffi::ClapPlugin,
-    params_ext: *const ffi::ClapPluginParams,
     state_ext: *const ffi::ClapPluginState,
     /// 0 = plugin declares no audio input ports (an instrument).
     in_ports: u32,
-    out_channels: u32,
     midi_drops: std::sync::Arc<AtomicU64>,
 }
 
@@ -677,20 +677,8 @@ impl std::fmt::Debug for ClapStageEntry {
 }
 
 impl ClapStageEntry {
-    #[inline]
-    fn raw(&self) -> *const ffi::ClapPlugin {
-        self.plugin
-    }
-
-    /// The plugin's current PLAIN value -> normalized 0..1.
-    fn plain_to_norm(&self, index: usize, plain: f64) -> f32 {
-        let (mn, mx) = self.ranges[index];
-        if (mx - mn).abs() < f64::EPSILON {
-            return 0.0;
-        }
-        (((plain - mn) / (mx - mn)) as f32).clamp(0.0, 1.0)
-    }
-
+    /// Normalized cell value -> the plugin's PLAIN range (converted at the
+    /// event boundary; CLAP params speak plain, slooper cells speak 0..1).
     fn norm_to_plain(&self, index: usize, norm: f32) -> f64 {
         let (mn, mx) = self.ranges[index];
         mn + (mx - mn) * norm as f64
@@ -787,7 +775,7 @@ impl ClapStageEntry {
         }
     }
 
-    fn ev_place<'a>(s: &'a mut RtState, len: usize) -> Option<&'a mut EvSlot> {
+    fn ev_place(s: &mut RtState, len: usize) -> Option<&mut EvSlot> {
         debug_assert!(len <= ffi::EVENT_SLOT);
         if s.ev_count >= EV_POOL_CAP || s.ev_count >= s.ev_pool.len() {
             return None;
@@ -823,7 +811,10 @@ impl ClapStageEntry {
                 flags: 0,
             },
             note_id: id,
-            port_index: -1,
+            // YANES (org.yanes.native) silently drops note events whose
+            // port_index is -1 (spec-wildcard); we host exactly one note
+            // port, and the raw-MIDI path uses port 0 too — send 0.
+            port_index: 0,
             channel,
             key: key as i16,
             velocity: vel,
@@ -1195,7 +1186,7 @@ pub(crate) fn open_unlocked(
         if nout > 0 {
             let mut info: ffi::ClapAudioPortInfo = unsafe { std::mem::zeroed() };
             if unsafe { ((*ports_ext).get)(plugin, 0, false, &mut info) } {
-                out_channels = info.channel_count.max(1).min(2);
+                out_channels = info.channel_count.clamp(1, 2);
             }
         }
     }
@@ -1261,7 +1252,7 @@ pub(crate) fn open_unlocked(
     };
     outbuf_data.slots.resize_with(OUT_RING, EvSlot::default);
 
-    let mut st = RtState {
+    let st = RtState {
         in_ring: FxRing::with_capacity(RING_CAP),
         out_ring: FxRing::with_capacity(RING_CAP),
         echo: FxRing::with_capacity(RING_CAP),
@@ -1321,10 +1312,8 @@ pub(crate) fn open_unlocked(
         spec: (path.to_path_buf(), VstKind::Clap),
         plugin_id,
         plugin,
-        params_ext,
         state_ext,
         in_ports,
-        out_channels,
         midi_drops: std::sync::Arc::new(AtomicU64::new(0)),
     });
     unsafe {
@@ -1342,7 +1331,7 @@ pub(crate) fn open_unlocked(
         s.in_buf.data32 = s.in_chans.as_mut_ptr();
         s.in_buf.channel_count = 2;
         s.out_buf.data32 = s.out_chans.as_mut_ptr();
-        s.out_buf.channel_count = s.out_buf.channel_count.min(2).max(1);
+        s.out_buf.channel_count = s.out_buf.channel_count.clamp(1, 2);
         // Single-channel plugins: only L is fed/drained.
         if s.out_buf.channel_count == 1 {
             s.out_chans.truncate(1);
@@ -1445,7 +1434,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::copy(&src, dir.join("fixtures.clap")).unwrap();
-        let entries = crate::vsthost::scan(&[dir.clone()]);
+        let entries = crate::vsthost::scan(std::slice::from_ref(&dir));
         let _ = std::fs::remove_dir_all(&dir);
         let mut ids: Vec<&str> = entries
             .iter()

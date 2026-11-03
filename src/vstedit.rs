@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::vsthost::{StageEntry as _, Vst2Handle};
+use crate::vsthost::Vst2Handle;
 
 // ------------------------------------------------------------------ xlib FFI
 #[repr(C)]

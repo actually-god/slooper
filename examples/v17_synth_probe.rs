@@ -8,7 +8,7 @@
 //   cargo run --release --example v17_synth_probe [path.vst3]
 use std::path::Path;
 
-use slooper::vsthost::{default_vst_dirs, open, scan, StageEntry, VstKind};
+use slooper::vsthost::{default_vst_dirs, open, scan, VstKind};
 
 fn main() {
     let path = std::env::args()
@@ -69,7 +69,6 @@ fn main() {
     eprintln!("[probe] closing editor");
     win.close();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    eprintln!("[probe] editor closed; dropping instance #1");
-    drop(entry);
+    eprintln!("[probe] editor closed (instance drop is a leak-policy no-op; clippy: ref drop did nothing)");
     eprintln!("[probe] clean exit");
 }

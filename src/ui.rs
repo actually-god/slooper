@@ -39,7 +39,6 @@ use egui::{Color32, RichText, Sense, Slider};
 
 use crate::arrange::{Arrangement, Clip};
 use crate::assets::{Asset, RackFile, RackFolder};
-use crate::vsthost::StageEntry as _;
 use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
     TR_REC,
@@ -853,15 +852,11 @@ fn vst_synth_encode(kind: crate::vsthost::VstKind, path: &str, plugin_id: Option
 }
 
 fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str, Option<&str>)> {
-    let (kind, rest) = if let Some(p) = s.strip_prefix("vst3:") {
-        (crate::vsthost::VstKind::V3, p)
-    } else if let Some(p) = s.strip_prefix("vst2:") {
-        (crate::vsthost::VstKind::V2, p)
-    } else if let Some(p) = s.strip_prefix("clap:") {
-        (crate::vsthost::VstKind::Clap, p)
-    } else {
-        return None;
-    };
+    let (kind, rest) = s
+        .strip_prefix("vst3:")
+        .map(|p| (crate::vsthost::VstKind::V3, p))
+        .or_else(|| s.strip_prefix("vst2:").map(|p| (crate::vsthost::VstKind::V2, p)))
+        .or_else(|| s.strip_prefix("clap:").map(|p| (crate::vsthost::VstKind::Clap, p)))?;
     match (kind, rest.split_once('#')) {
         (crate::vsthost::VstKind::Clap, Some((p, id))) => Some((kind, p, Some(id))),
         _ => Some((kind, rest, None)),
@@ -882,6 +877,15 @@ type SynthOpenSlot = Option<(
 /// The whole application: engine backend handle, persistent UI state, and
 /// the per-frame layout cache (`row_h` → [`App::track_rows`]) that keeps the
 /// timeline blocks and the Mixer dock strip-per-track aligned.
+/// One in-flight editor probe: (target, plugin path, verdict receiver,
+/// entry to open on success).
+type InFlightProbe = (
+    GuiTarget,
+    std::path::PathBuf,
+    std::sync::mpsc::Receiver<crate::vsthost::EditorProbe>,
+    std::sync::Arc<dyn crate::vsthost::StageEntry>,
+);
+
 pub struct App {
     backend: Backend,
 
@@ -1228,12 +1232,7 @@ pub struct App {
     editor_probe: std::collections::BTreeMap<String, (u64, bool)>,
     /// v23: in-flight editor-probe children: (target, plugin path,
     /// verdict receiver, entry to open on success).
-    editor_probes: Vec<(
-        GuiTarget,
-        std::path::PathBuf,
-        std::sync::mpsc::Receiver<crate::vsthost::EditorProbe>,
-        std::sync::Arc<dyn crate::vsthost::StageEntry>,
-    )>,
+    editor_probes: Vec<InFlightProbe>,
     /// v23: plugin whose stand-in parameter window is open.
     params_win: Option<GuiTarget>,
     /// v23: filter text of the parameter window (huge plugins expose

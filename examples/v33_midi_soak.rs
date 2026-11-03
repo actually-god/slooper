@@ -12,8 +12,6 @@
 use std::process::Command;
 use std::{fs, path::Path};
 
-use slooper::vsthost::StageEntry;
-
 const ORACLE_SO: &str = "/tmp/oracle.so";
 const ORACLE_SRC: &str = "examples/oracle.c";
 const STATS: &str = "/tmp/oracle_stats.json";
@@ -71,7 +69,7 @@ fn main() {
     };
 
     // A — fresh open: zero parameter writes (restore must be the only writer).
-    run(&e, 1); // force a stats dump (the oracle dumps per process call)
+    run(e, 1); // force a stats dump (the oracle dumps per process call)
     let a = stats();
     println!(
         "A open: param_sets={:.0} (want 0) opens={:.0} (want 1)",
@@ -84,8 +82,8 @@ fn main() {
         .map(|k| (k * 7, [0x90u8, 48 + k as u8, 100]))
         .collect();
     let want_delta: usize = (0..8).map(|k| k * 7).sum();
-    pm(&e, &chord);
-    run(&e, 24);
+    pm(e, &chord);
+    run(e, 24);
     let s = stats();
     println!(
         "B chord: note_on={:.0} (want 8) voices={:.0} (want 8) ev_total={:.0} (want 8) \
@@ -109,8 +107,8 @@ fn main() {
             (2 + i % 511, [0x80u8, note, 0])
         }))
         .collect();
-    pm(&e, &burst);
-    run(&e, 48);
+    pm(e, &burst);
+    run(e, 48);
     let s = stats();
     println!(
         "C burst: ev_total={:.0} (want 1508) note_on={:.0} (want 758) \
@@ -134,8 +132,8 @@ fn main() {
     let want_d: f64 = (0..40).map(|i| (i * 12 + i * 12 + 4) as f64).sum::<f64>();
     let before = get(&stats(), "delta_sum");
     let on_before = get(&stats(), "note_on");
-    pm(&e, &pairs);
-    run(&e, 12);
+    pm(e, &pairs);
+    run(e, 12);
     let s = stats();
     println!(
         "D retrigger: delta_sum+{:.0} (want {want_d:.0}) note_on+{:.0} (want 40)",
@@ -146,15 +144,15 @@ fn main() {
     // E — sustain: hold 4 notes, then 100 event-free blocks. The engine
     // must keep calling process() (v33 always-run) and voices must stay
     // held the whole time; CC64 (sustain) must be delivered cleanly.
-    pm(&e, &[
+    pm(e, &[
         (3, [0x90u8, 60, 100]),
         (11, [0x90u8, 64, 100]),
         (19, [0x90u8, 67, 100]),
         (27, [0x90u8, 72, 100]),
     ]);
-    run(&e, 4);
+    run(e, 4);
     let mid1 = get(&stats(), "voices");
-    run(&e, 100);
+    run(e, 100);
     let s = stats();
     let vc = get(&s, "voices");
     let pc = get(&s, "process_calls");
@@ -164,8 +162,8 @@ fn main() {
     );
     // Sustain pedal CC + a note that NEVER gets an off: pedal semantics
     // live in the plugin; the oracle must simply see the CC and the on.
-    pm(&e, &[(5, [0xB0u8, 64, 127]), (9, [0x90u8, 65, 90])]);
-    run(&e, 32);
+    pm(e, &[(5, [0xB0u8, 64, 127]), (9, [0x90u8, 65, 90])]);
+    run(e, 32);
     let s = stats();
     println!(
         "E2 pedal: cc={:.0} (want 1) voices={:.0} (want 5 — held note survives)",
@@ -174,7 +172,7 @@ fn main() {
     );
     // Release everything (engine all-notes-off path).
     e.all_notes_off();
-    run(&e, 8);
+    run(e, 8);
     let s = stats();
     println!("E3 release: voices={:.0} (want 0)", get(&s, "voices"));
     let _ = mid1;
@@ -182,9 +180,9 @@ fn main() {
     // F — legacy feed_midi + process (chain-row path) still delivers.
     let on_b = get(&stats(), "note_on");
     e.feed_midi([0x90, 70, 100]);
-    run(&e, 4);
+    run(e, 4);
     e.feed_midi([0x80, 70, 0]);
-    run(&e, 4);
+    run(e, 4);
     let s = stats();
     println!(
         "F legacy: note_on+{:.0} (want 1) voices={:.0} (want 0)",
