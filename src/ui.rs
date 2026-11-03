@@ -12263,7 +12263,12 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
         }
     }
     for i in 0..n {
-        if win_visible(app, i) && (!is_docked(app, i) || carried == Some(i)) {
+        // v35: DYNAMIC windows own their floating chrome (each owner
+        // draws its own Window — custom title/id/size, and take/restore
+        // state the generic chrome cannot host). Drawing them here too
+        // painted every floating dynamic window TWICE (head probe:
+        // body galley x2), one copy fighting the owner for the rect.
+        if i < 4 && win_visible(app, i) && (!is_docked(app, i) || carried == Some(i)) {
             draw_float(ui, app, i);
         }
     }
@@ -23612,6 +23617,45 @@ mod tests {
         });
         assert!(missing.is_empty(), "TOFU GLYPHS: {}", missing.join(" "));
     }
+    /// v35 fix pin: a FLOATING (undocked) dynamic window must paint
+    /// exactly once. The generic dock pass used to draw floats for every
+    /// registry slot — including dynamic ones, whose owners draw their
+    /// own chrome — so an open MIXER CHAIN painted two full windows per
+    /// frame (head probe: body galley count 2).
+    #[test]
+    fn v35_float_window_paints_once() {
+        let mut app = headless_app("v35dbl");
+        let ctx = egui::Context::default();
+        app.fx_window = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let body = out
+            .shapes
+            .iter()
+            .filter(|cs| {
+                matches!(&cs.shape, egui::epaint::Shape::Text(t) if t.galley.text() == "Chain (top = first):")
+            })
+            .count();
+        let title = out
+            .shapes
+            .iter()
+            .filter(|cs| {
+                matches!(&cs.shape, egui::epaint::Shape::Text(t) if t.galley.text().starts_with("MIXER CHAIN"))
+            })
+            .count();
+        assert_eq!(body, 1, "floating chain body must paint ONCE");
+        assert_eq!(title, 1, "floating chain title must paint ONCE");
+    }
+
     /// v35 R5/R6 pin: the MIXER CHAIN window is a first-class dockable —
     /// it docks to an edge (body painted by the panel, owner skips its
     /// float), stacks with a primary panel on the same edge, floats out,
