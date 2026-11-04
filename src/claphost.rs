@@ -496,6 +496,13 @@ pub struct ScanProbe {
 
 pub fn probe(path: &Path) -> Result<Vec<ScanProbe>, String> {
     let _loader = vst_loader_lock();
+    probe_unlocked(path)
+}
+
+/// `probe` WITHOUT the loader lock — v37: this is the body the forked
+/// scan child runs (it inherits the lock as held-by-nobody and MUST NOT
+/// re-take it; the parent holds it across the fork).
+pub(crate) fn probe_unlocked(path: &Path) -> Result<Vec<ScanProbe>, String> {
     let entry = entry_for(path)?;
     let factory = unsafe { factory_of(entry) }.ok_or_else(|| "no clap.plugin-factory".to_string())?;
     let count = unsafe { (factory.get_plugin_count)(factory) };
