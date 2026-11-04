@@ -1358,7 +1358,7 @@ fn default_from_plain(cur: f64, info: &ffi::ClapParamInfo) -> f32 {
 // ================================================================= tests =
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Compile the repo's fixture plugin into `target/clap-fixture/`

@@ -672,33 +672,36 @@ const API_FNS: GuiApiV1 = GuiApiV1 {
 // The window itself
 // ---------------------------------------------------------------------------
 
-/// Draw the editor window; returns false once the user closes it. Param
+/// Draw the editor BODY (preset strip + parameter surface). v36: the
+/// window chrome — floating or docked — belongs to the dock pass /
+/// owner in ui.rs; this draws the content and returns nothing. Param
 /// changes accumulate in `ed.pending` (and ride the live instance
-/// immediately); the caller persists them and may drop the editor.
-pub fn window(ui: &mut Ui, ed: &mut FxEditor) -> bool {
+/// immediately); the caller persists them.
+pub fn body(ui: &mut Ui, ed: &mut FxEditor) {
     // Live effects GUIs (spectrum meters, animated curves) repaint always.
     ui.ctx().request_repaint();
-    let mut open = true;
-    let (hw, hh) = ed.size_hint();
-    // v25: "loop N" was v0.1 vocabulary (the loop-pedal model) — the thing
-    // an effect sits on is a TRACK; every other window already says so.
-    let title = format!("{} \u{2014} track {}", ed.name.clone(), ed.loop_i + 1);
-    egui::Window::new(RichText::new(title).strong())
-        .open(&mut open)
-        .resizable(!ed.is_custom())
-        .default_width(hw + 16.0)
-        .min_width(240.0)
-        .auto_sized()
-        .show(ui, |ui| {
-            preset_strip(ui, ed);
-            ui.separator();
-            if ed.is_custom() {
-                custom_ui(ui, ed, hh);
-            } else {
-                auto_ui(ui, ed);
-            }
-        });
-    open
+    preset_strip(ui, ed);
+    ui.separator();
+    if ed.is_custom() {
+        // v36: the canvas FOLLOWS THE WINDOW (both axes). The script
+        // receives the real size through GuiFrameV1.width/height, so a
+        // resizable window is all a well-behaved custom GUI ever needed;
+        // the hint height is only the opening floor.
+        let hh = ed.size_hint().1;
+        let avail = ui.available_height();
+        let h = if avail.is_finite() {
+            avail.clamp(80.0, 4000.0)
+        } else {
+            hh.clamp(80.0, 4000.0)
+        };
+        custom_ui(ui, ed, h);
+    } else {
+        // v36: docked/short panels scroll instead of clipping rows.
+        egui::ScrollArea::vertical()
+            .id_salt(("fxauto-scroll", ed.loop_i, ed.slot))
+            .auto_shrink([false, false])
+            .show(ui, |ui| auto_ui(ui, ed));
+    }
 }
 
 // ---------------------------------------------------------------------------

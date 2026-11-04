@@ -2727,10 +2727,16 @@ impl App {
                     );
                 });
                 ui.label(
-                    egui::RichText::new(
+                    egui::RichText::new(if entry.has_editor() {
                         "this plugin's own window is disabled (crash guard) \u{b7} changes \
-                         apply live and persist",
-                    )
+                         apply live and persist"
+                    } else {
+                        // v36: this plugin never HAD a window — the
+                        // crash-guard wording made every CLAP window
+                        // look broken. This list IS its GUI.
+                        "this plugin has no window of its own \u{b7} these sliders \
+                         are its GUI \u{b7} changes apply live and persist"
+                    })
                     .weak()
                     .small(),
                 );
@@ -3046,15 +3052,63 @@ impl App {
 
     /// Draw the editor window and flush its param rides into the persisted
     /// chain rows (config save goes through `fx_save_pending`).
+    /// v36: the script-FX editor IS a dock-system window. The owner draws
+    /// the floating chrome (params_window pattern); the dock pass draws
+    /// the docked panel; BOTH paint the one `fx_editor_body`, so the
+    /// editor's param rides, RMB menus and presets behave identically.
+    /// The window is RESIZABLE for auto and custom GUIs alike (v36: a
+    /// custom script GUI receives the real canvas size through
+    /// `GuiFrameV1` — freezing the window at the hint size was the
+    /// "native rust plugins don't allow resizing" report).
     fn fx_editor_window(&mut self, ui: &mut egui::Ui) {
-        let mut closed = false;
+        let Some(ed) = self.fx_editor.as_ref() else {
+            return;
+        };
+        let (t, r) = (ed.loop_i, ed.slot);
+        let title = format!("{} \u{2014} track {}", ed.name, t + 1);
+        let (hw, hh) = ed.size_hint();
+        let idx = self.dyn_reg(DynKind::Fx(t, r), title.clone());
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+        let mut open = true;
+        let mut w = egui::Window::new(RichText::new(title).strong())
+            .id(egui::Id::new(("fxeditor", t, r)))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([hw + 16.0, hh + 64.0])
+            .min_width(240.0)
+            .min_height(140.0);
+        if let Some(rc) = self.dyn_rect(idx) {
+            w = w.default_pos([rc[0], rc[1]]).default_width(rc[2]).default_height(rc[3]);
+        }
+        if dragging {
+            w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+        }
+        let resp = w.show(ui, |ui| self.fx_editor_body(ui, t, r));
+        if !open {
+            self.fx_editor = None;
+        }
+        if let Some(out) = resp.map(|rr| rr.response.rect) {
+            self.dyn_remember(idx, out);
+        }
+    }
+
+    /// v36: THE one editor body — preset strip + auto grid or custom GUI,
+    /// then the per-frame flush of editor requests into host state. Runs
+    /// under the floating chrome AND the docked panel body alike.
+    fn fx_editor_body(&mut self, ui: &mut egui::Ui, t: usize, r: usize) {
         // v20 R3: editor gesture requests (right-click = automation asset,
         // double-click = Set value) — collected here, applied after the
         // borrow of `self.fx_editor` ends (the handlers take `&mut self`).
         let mut ctx_req: Option<(usize, String, f32)> = None;
         let mut dbl_req: Option<(usize, String, f32)> = None;
         if let Some(ed) = self.fx_editor.as_mut() {
-            closed = !crate::fxgui::window(ui, ed);
+            if ed.loop_i != t || ed.slot != r {
+                return;
+            }
+            crate::fxgui::body(ui, ed);
             ctx_req = ed
                 .ctx_menu
                 .take()
@@ -3089,9 +3143,6 @@ impl App {
         if let Some((loop_i, target, v)) = dbl_req {
             self.value_dialog = Some((loop_i, target.clone(), value_user_display(&target, v)));
             self.value_dialog_focus = true;
-        }
-        if closed {
-            self.fx_editor = None;
         }
     }
 
@@ -8579,7 +8630,18 @@ impl App {
             _ => return false, // script synths keep their slider editor
         };
         if !entry.has_editor() {
-            return false;
+            // v36: a plugin with NO window of its own (CLAP per the v34
+            // doctrine, GUI-less VST3) gets the host PARAMETER window —
+            // that IS its editor, and it docks like every other window.
+            // Before v36 this path returned silently: the GUI button was
+            // a dead click for every CLAP instrument.
+            self.params_win = Some(GuiTarget::Synth(t));
+            self.params_filter.clear();
+            self.status = format!(
+                "{}: parameter window opened \u{2014} this plugin has no window of its own",
+                entry.name()
+            );
+            return true;
         }
         // v23: gated open (crash guard); the status line announces what
         // happens either way.
@@ -8638,10 +8700,15 @@ impl App {
             self.open_plugin_gui(GuiTarget::Chain(t, row), entry);
             return;
         }
-        // v0.11 R3: hosted plugins get NO slider window. A plugin with no
-        // drawable editor keeps its current parameter values.
+        // v0.11 R3: hosted plugins with their own window never got a
+        // slider window. v36: a plugin with NO drawable editor now opens
+        // the host parameter window (the v34 doctrine for CLAP: the
+        // slider window IS the editor) instead of the old dead-end
+        // "its controls are not editable" status.
+        self.params_win = Some(GuiTarget::Chain(t, row));
+        self.params_filter.clear();
         self.status = format!(
-            "{}: this plugin has no window to open \u{2014} its controls are not editable",
+            "{}: parameter window opened \u{2014} this plugin has no window of its own",
             entry.name()
         );
     }
@@ -11867,6 +11934,9 @@ pub(crate) enum DynKind {
     Params,
     Chain(usize),
     Synth(usize),
+    /// v36: script (Rust) FX editor window — the plugin GUI itself,
+    /// keyed by (track, chain row).
+    Fx(usize, usize),
     Drums,
     Roll,
     Auto,
@@ -11889,6 +11959,7 @@ impl DynKind {
             DynKind::Params => "params".into(),
             DynKind::Chain(t) => format!("chain:{t}"),
             DynKind::Synth(t) => format!("synth:{t}"),
+            DynKind::Fx(t, r) => format!("fx:{t}:{r}"),
             DynKind::Drums => "drums".into(),
             DynKind::Roll => "roll".into(),
             DynKind::Auto => "auto".into(),
@@ -11896,6 +11967,12 @@ impl DynKind {
         }
     }
     fn from_key(s: &str) -> Option<DynKind> {
+        // v36: the FX editor key carries TWO indices ("fx:<track>:<row>").
+        if let Some(rest) = s.strip_prefix("fx:") {
+            let mut it = rest.splitn(2, ':');
+            let (t, r) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            return Some(DynKind::Fx(t, r));
+        }
         let mut parts = s.splitn(2, ':');
         let head = parts.next()?;
         let arg = parts.next().and_then(|a| a.parse::<usize>().ok());
@@ -11920,6 +11997,10 @@ fn dyn_open(app: &App, k: DynKind) -> bool {
         DynKind::Params => app.params_win.is_some(),
         DynKind::Chain(t) => app.fx_window == Some(t),
         DynKind::Synth(t) => app.synth_win == Some(t),
+        DynKind::Fx(t, r) => app
+            .fx_editor
+            .as_ref()
+            .is_some_and(|e| e.loop_i == t && e.slot == r),
         DynKind::Drums => app.show_drums,
         DynKind::Roll => app.piano_roll.is_some(),
         DynKind::Auto => app.auto_edit.is_some(),
@@ -11931,6 +12012,13 @@ fn dyn_set(app: &mut App, k: DynKind, v: bool) {
         DynKind::Params => app.params_win = if v { app.params_win } else { None },
         DynKind::Chain(_) => app.fx_window = if v { app.fx_window } else { None },
         DynKind::Synth(_) => app.synth_win = if v { app.synth_win } else { None },
+        // v36: dropping the editor IS closing the window (opening needs
+        // the row's live instance + desc, so `true` is a no-op here).
+        DynKind::Fx(_, _) => {
+            if !v {
+                app.fx_editor = None;
+            }
+        }
         DynKind::Drums => app.show_drums = v,
         DynKind::Roll => app.piano_roll = if v { app.piano_roll.take() } else { None },
         DynKind::Auto => app.auto_edit = if v { app.auto_edit.take() } else { None },
@@ -12225,6 +12313,7 @@ fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         DynKind::Auto => app.auto_pass(ui, idx, true),
         DynKind::Drums => app.drum_win_body(ui),
         DynKind::Synth(t) => app.synth_sliders_body(ui, t),
+        DynKind::Fx(t, r) => app.fx_editor_body(ui, t, r),
         DynKind::Params => {
             if let Some(target) = app.params_win {
                 if let Some(entry) = app.target_entry(target) {
@@ -25920,6 +26009,276 @@ mod tests {
             "startup-time save merged the seed instead of erasing it"
         );
         drop(app2);
+        settle_plugin_drop();
+    }
+
+    /// v36 R1: the script (Rust) FX editor window JOINED the dock system
+    /// (DynKind::Fx) — registers once at open, starts floating, the title
+    /// press arms the carry, the drag-to-edge gesture docks it, it paints
+    /// exactly once while docked (no owner ghost), the dock chrome's x
+    /// clears `fx_editor`, a reopen reuses the same slot (still docked),
+    /// and the dock state lands in the config.
+    #[test]
+    fn v36_script_fx_editor_docks() {
+        let mut app = headless_app("v36fxdock");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        if app.fx_registry.desc("chorus").is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(dir.join("chorus.rs"), include_str!("../effects/chorus.rs")).unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, "chorus");
+        frame(&mut app, &ctx, vec![]);
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        let slots: Vec<usize> = app
+            .dyn_wins
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| matches!(w.kind, DynKind::Fx(0, 0)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(slots.len(), 1, "exactly one registry slot for the editor");
+        let p = slots[0];
+        let idx = p + 4;
+        assert!(!is_docked(&app, idx), "opens floating");
+
+        // Press the title bar: arms the carry like every other dynamic
+        // window. The window title is an exact galley; the body may show
+        // fragments of the same words, so match the full title string.
+        let title_text =
+            format!("{} \u{2014} track 1", app.fx_editor.as_ref().unwrap().name);
+        let title = galleys_all(&mut app, &ctx, &title_text)
+            .into_iter()
+            .min_by(|a, b| a.y.total_cmp(&b.y))
+            .expect("editor title painted");
+        frame(&mut app, &ctx, vec![moved(title)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(title, egui::PointerButton::Primary, true)],
+        );
+        assert_eq!(
+            app.free_drag.map(|(i, _)| i),
+            Some(idx),
+            "press on the editor title arms the carry"
+        );
+        // Drag to the right zone and release.
+        let dst = egui::pos2(1380.0, 400.0);
+        frame(&mut app, &ctx, vec![moved(title + (dst - title) * 0.5)]);
+        frame(&mut app, &ctx, vec![moved(dst)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)],
+        );
+        assert!(is_docked(&app, idx), "release in the zone docks");
+        assert_eq!(dock_edge(&app, idx), 1, "docked to the RIGHT edge");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.dock_rects[idx][2] > 8.0,
+            "the docked editor painted its panel"
+        );
+        assert_eq!(
+            galleys_all(&mut app, &ctx, &title_text).len(),
+            1,
+            "docked editor paints ONCE — no owner ghost"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "rate").is_some(),
+            "the editor body (auto grid) renders inside the dock"
+        );
+
+        // The dock chrome's x clears the OWNER state, not just visibility.
+        let dr = app.dock_rects[idx];
+        let close = galleys_all(&mut app, &ctx, "x")
+            .into_iter()
+            .find(|c| {
+                c.x > dr[0] + dr[2] - 90.0
+                    && c.x < dr[0] + dr[2]
+                    && c.y > dr[1]
+                    && c.y < dr[1] + 40.0
+            })
+            .expect("dock header close button");
+        frame(&mut app, &ctx, vec![moved(close)]);
+        frame(&mut app, &ctx, vec![btn(close, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(close, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.fx_editor.is_none(), "dock close cleared the editor");
+
+        // Reopen: the SAME slot answers, still docked where it was.
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        let slots2 = app
+            .dyn_wins
+            .iter()
+            .filter(|w| matches!(w.kind, DynKind::Fx(0, 0)))
+            .count();
+        assert_eq!(slots2, 1, "reopen reused the slot");
+        assert!(is_docked(&app, idx), "reopen lands back in the dock");
+        assert_eq!(dock_edge(&app, idx), 1);
+
+        // Persist: the config carries kind `fx:0:0` docked right.
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        let d = cfg
+            .dyn_docks
+            .iter()
+            .find(|d| d.kind == "fx:0:0")
+            .expect("fx dock persisted");
+        assert_eq!(d.dock[0], 1);
+        assert_eq!(d.dock[1], 1, "right edge saved");
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    /// v36 R2: the script FX editor window RESIZES — including for
+    /// custom-GUI scripts, where the old window was frozen at the GUI's
+    /// size hint (the "native rust plugins don't allow resizing" report).
+    /// A real grip drag grows the recorded (persisted) rect, and the
+    /// frame loop keeps the user's size instead of snapping back.
+    #[test]
+    fn v36_script_fx_editor_resizes() {
+        let mut app = headless_app("v36fxsize");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        if app.fx_registry.desc("space_echo").is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(
+                dir.join("space_echo.rs"),
+                include_str!("../effects/space_echo.rs"),
+            )
+            .unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, "space_echo");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.fx_registry.gui("space_echo").is_some(),
+            "fixture is a custom-GUI script (the frozen window was the report)"
+        );
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        let p = app
+            .dyn_wins
+            .iter()
+            .position(|w| matches!(w.kind, DynKind::Fx(0, 0)))
+            .expect("editor registered");
+        let r0 = app.dyn_wins[p].rect;
+        assert!(r0[2] > 8.0, "floating editor recorded its rect");
+        // Press the bottom-right corner (egui's resize grip) and drag out.
+        let corner = egui::pos2(r0[0] + r0[2] - 3.0, r0[1] + r0[3] - 3.0);
+        let far = corner + egui::vec2(170.0, 130.0);
+        frame(&mut app, &ctx, vec![moved(corner)]);
+        frame(&mut app, &ctx, vec![btn(corner, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(corner + egui::vec2(40.0, 30.0))]);
+        frame(&mut app, &ctx, vec![moved(far)]);
+        frame(&mut app, &ctx, vec![btn(far, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let r1 = app.dyn_wins[p].rect;
+        assert!(
+            r1[2] > r0[2] + 80.0 && r1[3] > r0[3] + 60.0,
+            "resize grip grew the custom-GUI window: {r0:?} -> {r1:?}"
+        );
+        // The user's size STICKS: further frames must not clamp back to
+        // the size hint (that was the pre-v36 frozen-window behavior).
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let r2 = app.dyn_wins[p].rect;
+        assert!(
+            r2[2] > r0[2] + 80.0 && r2[3] > r0[3] + 60.0,
+            "grown size persisted across frames: {r2:?}"
+        );
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    /// v36 R3: a CLAP instrument has no window of its own, so the track
+    /// GUI button opens the host PARAMETER window (dockable) instead of
+    /// dying silently — and the window says so honestly.
+    #[test]
+    fn v36_gui_opens_params_for_editorless_synth() {
+        let Some(path) = crate::claphost::tests::fixture_clap() else {
+            eprintln!("skip: no C compiler for the CLAP fixture");
+            return;
+        };
+        let entry = crate::claphost::open(&path, Some("com.slooper.fixture-sine"), 48_000, None, None)
+            .expect("fixture instrument opens");
+        use crate::vsthost::StageEntry as _;
+        assert!(!entry.has_editor(), "CLAP has no window of its own (v34)");
+        let mut app = headless_app("v36clapgui");
+        let ctx = egui::Context::default();
+        app.track_synth_inst[0] = Some(std::sync::Arc::new(crate::audio::SynthHandle::Vst(
+            entry as std::sync::Arc<dyn crate::vsthost::StageEntry>,
+        )));
+        app.toggle_synth_gui(0);
+        assert_eq!(
+            app.params_win,
+            Some(GuiTarget::Synth(0)),
+            "GUI button opened the parameter window: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("no window of its own"),
+            "status is honest: {}",
+            app.status
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "amp").is_some(),
+            "the params window painted the instrument's sliders"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "no window of its own").is_some(),
+            "the params window says so in its body too"
+        );
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    /// v36 R3 chain-side: the same fallback when the CLAP sits in a track
+    /// effect chain — the row click opens sliders, never the old
+    /// "controls are not editable" dead-end.
+    #[test]
+    fn v36_chain_row_gui_opens_params_for_clap() {
+        let Some(path) = crate::claphost::tests::fixture_clap() else {
+            eprintln!("skip: no C compiler for the CLAP fixture");
+            return;
+        };
+        let entry = crate::claphost::open(&path, Some("com.slooper.fixture-gain"), 48_000, None, None)
+            .expect("fixture effect opens");
+        let entry = entry as std::sync::Arc<dyn crate::vsthost::StageEntry>;
+        let mut app = headless_app("v36claprow");
+        let ctx = egui::Context::default();
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: path.display().to_string(),
+            kind: crate::vsthost::VstKind::Clap,
+            plugin_id: Some("com.slooper.fixture-gain".into()),
+            name: "fixture gain".into(),
+            params: vec![0.0; entry.descs().len()],
+            entry: Some(entry),
+            state: None,
+            open_rx: None,
+        });
+        app.vst_row_gui(0, 0);
+        assert_eq!(
+            app.params_win,
+            Some(GuiTarget::Chain(0, 0)),
+            "row click opened the parameter window: {}",
+            app.status
+        );
+        assert!(app.status.contains("no window of its own"));
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "fixgain").is_some(),
+            "params body painted the effect's sliders"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "no window of its own").is_some(),
+            "params body painted with the honest wording"
+        );
+        drop(app);
         settle_plugin_drop();
     }
 
