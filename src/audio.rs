@@ -767,6 +767,48 @@ pub struct Engine {
     /// does not move while auditioning, so reading `pos` left the bar
     /// permanently static, the v10.2 report).
     preview_pos: AtomicU64,
+    /// v38 R1: piano-roll AUDITION voice pool (see `play_audition`). Each
+    /// voice stages `(relative sample, kind, ch, d1, d2)` events through a
+    /// track's LIVE synth + chain — the offline `bounce_track_preview`
+    /// path re-instantiated the plugin per click (lag, lost clicks, and
+    /// the leaked-instance churn behind "the roll kills the app after a
+    /// while"). Interactive auditions NEVER instantiate plugins anymore.
+    aud_voices: std::sync::Mutex<Arc<Vec<AudVoiceReq>>>,
+    aud_vid: AtomicU64,
+    aud_gen: AtomicU64,
+    /// true while a voice pool exists / held notes ring (RT clears when
+    /// drained; UI sets on every play_audition).
+    aud_on: AtomicBool,
+    /// Samples consumed by the YOUNGEST audition voice (roll playhead).
+    aud_pos: AtomicU64,
+}
+
+/// v38 R1: one requested audition voice. `ev` MUST be sorted by
+/// (sample, kind) — kind order puts offs (0) before ons (3) at equal
+/// samples — the RT advance loop relies on it.
+#[derive(Clone)]
+pub struct AudVoiceReq {
+    pub vid: u64,
+    pub track: usize,
+    pub ev: std::sync::Arc<[(u64, u8, u8, u8, u8)]>,
+}
+
+/// Held (staged-but-not-yet-off) note count of a voice at cursor `cur`.
+/// Used on voice replacement/purge so a dying audition never leaves a
+/// synth ringing. Sorted-`ev` assumption as in `AudVoiceReq`.
+pub fn aud_pending(ev: &[(u64, u8, u8, u8, u8)], cur: u64) -> i32 {
+    let mut p = 0i32;
+    for &(off, kind, ..) in ev.iter() {
+        if off >= cur {
+            break;
+        }
+        match kind {
+            3 => p += 1,
+            0 => p -= 1,
+            _ => {}
+        }
+    }
+    p.max(0)
 }
 
 impl Engine {
@@ -836,6 +878,11 @@ impl Engine {
             preview_gen: AtomicU64::new(0),
             preview_on: AtomicU8::new(0),
             preview_pos: AtomicU64::new(0),
+            aud_voices: std::sync::Mutex::new(Arc::new(Vec::new())),
+            aud_vid: AtomicU64::new(0),
+            aud_gen: AtomicU64::new(0),
+            aud_on: AtomicBool::new(false),
+            aud_pos: AtomicU64::new(0),
         })
     }
 
@@ -1396,6 +1443,62 @@ impl Engine {
         self.preview_gen.load(Ordering::Relaxed)
     }
 
+    // ---- v38 R1 roll audition voices --------------------------------------
+
+    /// Stage `ev` (sorted `(sample, kind, ch, d1, d2)` events relative to
+    /// NOW) through track `t`'s LIVE synth and mixer chain. Works with the
+    /// transport stopped and while the track's play flag is off; script
+    /// synths and the shared default synth work exactly like plugins —
+    /// NOTHING is instantiated here, the sound comes out of the instance
+    /// the audio thread already owns. The pool is bounded (oldest voice
+    /// dropped), mirroring the asset-preview voices.
+    pub fn play_audition(&self, track: usize, ev: Arc<[(u64, u8, u8, u8, u8)]>) {
+        const MAX_AUD_VOICES: usize = 12;
+        if ev.is_empty() {
+            return;
+        }
+        let mut v = (**self.aud_voices.lock().unwrap()).clone();
+        if v.len() >= MAX_AUD_VOICES {
+            v.remove(0);
+        }
+        let vid = self.aud_vid.fetch_add(1, Ordering::Relaxed) + 1;
+        v.push(AudVoiceReq {
+            vid,
+            track,
+            ev,
+        });
+        *self.aud_voices.lock().unwrap() = Arc::new(v);
+        self.aud_pos.store(0, Ordering::Relaxed);
+        self.aud_gen.fetch_add(1, Ordering::SeqCst);
+        self.aud_on.store(true, Ordering::Relaxed);
+    }
+
+    /// Purge every audition voice. The RT thread all-`off`s every track
+    /// that still has a staged-but-not-released audition note (it computes
+    /// held counts itself on the generation bump).
+    pub fn stop_audition(&self) {
+        *self.aud_voices.lock().unwrap() = Arc::new(Vec::new());
+        self.aud_pos.store(0, Ordering::Relaxed);
+        self.aud_gen.fetch_add(1, Ordering::SeqCst);
+        self.aud_on.store(false, Ordering::Relaxed);
+    }
+
+    pub fn audition_active(&self) -> bool {
+        self.aud_on.load(Ordering::Relaxed)
+    }
+
+    pub fn audition_pos(&self) -> u64 {
+        self.aud_pos.load(Ordering::Relaxed)
+    }
+
+    pub fn aud_gen(&self) -> u64 {
+        self.aud_gen.load(Ordering::Relaxed)
+    }
+
+    pub fn audition_snapshot(&self) -> Arc<Vec<AudVoiceReq>> {
+        self.aud_voices.lock().unwrap().clone()
+    }
+
     // ---- offline rendering --------------------------------------------------------
 
     /// Render the current project to mono f32 samples at the project length:
@@ -1917,6 +2020,14 @@ fn run(
         // pushes into `live_ev` on the FIRST message the app ever sees.
         live_ev: Vec::with_capacity(64),
         live_notes: [0i32; MAX_LOOPS],
+        // v38 R1: audition voices start empty; the engine's snapshot is
+        // taken on the first generation bump like every other table.
+        aud: Vec::new(),
+        aud_seen_gen: engine.aud_gen(),
+        aud_held: [0i32; MAX_LOOPS],
+        aud_mask: 0,
+        aud_block: vec![Vec::new(); MAX_LOOPS],
+        aud_purge: 0,
         bound_cache: engine.midi_bound(),
         bound_gen: engine.midi_bound_gen(),
         // v32 R7: start at the default unity controls (no boot ramp).
@@ -1994,11 +2105,15 @@ fn run(
                 // playback — the "something else is processing my audio"
                 // double-voice. Auditions belong to browsing, not mixing.
                 engine.stop_preview();
+                // v38 R1: roll auditions follow the same rule —
+                // audition + real playback would double the voice.
+                engine.stop_audition();
                 engine.set_transport(true);
                 let _ = evt_tx.try_send(Evt::Transport { on: true });
             }
             Ok(Cmd::StopAll) => {
                 engine.stop_preview();
+                engine.stop_audition();
                 engine.set_transport(false);
                 let _ = evt_tx.try_send(Evt::Transport { on: false });
             }
@@ -2875,6 +2990,28 @@ impl Proc {
     /// auditioning a patch happens. Returns whether any track produced
     /// sound.
     fn render_midi_block(&mut self, p0: u64, block_n: usize, live_mask: u128, live_on: bool) -> bool {
+        // v38 R1: the audition pool was replaced/stopped — tracks holding
+        // staged-but-never-off audition notes must die NOW, exactly like
+        // the live-key cleanup below (never dropped silently: a ringing
+        // orphan note is the worst possible feedback).
+        if self.aud_purge != 0 {
+            let mut m = std::mem::take(&mut self.aud_purge);
+            while m != 0 {
+                let t = m.trailing_zeros() as usize;
+                m &= m - 1;
+                if t >= MAX_LOOPS {
+                    continue;
+                }
+                match self.synths_cache.get(t).and_then(|o| o.as_ref()) {
+                    Some(h) => h.all_off(),
+                    None => {
+                        if let Some(d) = &self.dflt_synth {
+                            d.all_off();
+                        }
+                    }
+                }
+            }
+        }
         // Clear last block's scratch first (only rows that actually sounded).
         for (t, live) in self.midi_live.iter_mut().enumerate() {
             if *live {
@@ -2926,13 +3063,16 @@ impl Proc {
                     .enumerate()
                     .filter_map(|(t, h)| h.as_ref().map(|h| (t, h)))
                 {
-                    if self.live_notes[t].max(0) == 0 {
+                    // v38: a ringing AUDITION note is not the transport's
+                    // to kill — the voice owns its note-offs.
+                    if self.live_notes[t].max(0) == 0 && self.aud_held[t] <= 0 {
                         h.all_off();
                     }
                 }
                 if let Some(d) = &self.dflt_synth {
                     let held_on_default = self.live_notes.iter().enumerate().any(|(t, n)| {
-                        *n > 0 && self.synths_cache.get(t).map(|s| s.is_none()).unwrap_or(true)
+                        (*n > 0 || self.aud_held[t] > 0)
+                            && self.synths_cache.get(t).map(|s| s.is_none()).unwrap_or(true)
                     });
                     if !held_on_default {
                         d.all_off();
@@ -2947,6 +3087,10 @@ impl Proc {
         }
         let live_any = live_on
             && (!self.live_ev.is_empty() || self.live_notes.iter().any(|x| *x > 0));
+        // v38 R1: an audition voice in flight (or a held audition note)
+        // opens the render path exactly like a physically held key.
+        let aud_any =
+            !self.aud.is_empty() || self.aud_held.iter().any(|h| *h > 0) || self.aud_purge != 0;
         // v33: with a plugin synth bound to any live track the render path
         // stays OPEN even fully idle: plugins run every block ("constantly
         // listening for all inputs") — their meters, mod/LFO displays and
@@ -2955,13 +3099,13 @@ impl Proc {
         // frozen knob. Script synths are exempt: pausing them is free and
         // their sliders are host-side.
         let vst_open = (0..MAX_LOOPS).any(|t| {
-            self.engine.track_on(t)
+            (self.engine.track_on(t) || ((self.aud_mask >> t) & 1) != 0 || self.aud_held[t] > 0)
                 && slot_is_vst(
                     self.synths_cache.get(t).and_then(|o| o.as_ref()),
                     self.dflt_synth.as_ref(),
                 )
         });
-        if render_gate_blocked(block_n, pattern_run, live_any, vst_open) {
+        if render_gate_blocked(block_n, pattern_run, live_any || aud_any, vst_open) {
             return false;
         }
         let sr = self.sr.max(1);
@@ -2988,6 +3132,9 @@ impl Proc {
             owner,
             live_ev,
             live_notes,
+            aud_mask,
+            aud_held,
+            aud_block,
             ..
         } = self;
         // v33: pass 0 — shared-handle ownership for this cycle. Tracks
@@ -3001,7 +3148,10 @@ impl Proc {
         own.clear();
         owner.fill(0xFF);
         for (t, owner_slot) in owner.iter_mut().enumerate() {
-            if !engine.track_on(t) {
+            // v38 R1: an audition target renders even with its play flag
+            // OFF — auditioning must answer on ANY track, that is the
+            // whole point ("place a note, hear the instrument").
+            if !engine.track_on(t) && (((*aud_mask >> t) & 1) == 0 && aud_held[t] <= 0) {
                 continue;
             }
             let Some(h) = synths_cache
@@ -3058,6 +3208,12 @@ impl Proc {
                     midi_ev,
                     &mut ring,
                 );
+                // v38 R1: this track's due audition events ride the SAME
+                // merged per-instance stream (the sort/dedup below places
+                // them at their exact offsets).
+                if !aud_block[t2].is_empty() {
+                    midi_ev.extend_from_slice(&aud_block[t2]);
+                }
             }
             // (offset, kind) ordering puts offs (kind 0) before ons (kind
             // 3) at the same sample, so a retrigger never kills its own
@@ -3076,8 +3232,11 @@ impl Proc {
             // synth (script voices / the plugin's own ring). A physically
             // held live key counts as sustaining too (v32) — on ANY track
             // sharing this instance.
-            let holding =
-                live_on && (0..MAX_LOOPS).any(|x| owner[x] == t as u8 && live_notes[x] > 0);
+            let holding = (live_on
+                && (0..MAX_LOOPS).any(|x| owner[x] == t as u8 && live_notes[x] > 0))
+                // v38 R1: a held AUDITION note keeps the instance
+                // advancing exactly like a physically held key.
+                || (0..MAX_LOOPS).any(|x| owner[x] == t as u8 && aud_held[x] > 0);
             // v33: PLUGIN instruments run EVERY block ("plugins should be
             // constantly listening for all inputs"): a plugin's own GUI
             // state, meters and modulation sources advance only while
@@ -3189,8 +3348,9 @@ impl Proc {
                 midi_quiet[t] = 0;
             }
             // Quiet-tail decay runs only once nothing is held physically:
-            // a key-down must never time out mid-press (v32).
-            if ring <= span_end && live_notes[t].max(0) == 0 {
+            // a key-down must never time out mid-press (v32). v38: a held
+            // audition note counts the same way.
+            if ring <= span_end && live_notes[t].max(0) == 0 && aud_held[t] <= 0 {
                 let peak = row[..block_n].iter().fold(0.0f32, |m, x| m.max(x.abs()));
                 if peak < MIDI_SILENCE_FLOOR {
                     midi_quiet[t] = midi_quiet[t].saturating_add(1);
@@ -3359,6 +3519,25 @@ struct Proc {
     /// a message is staged, note-off decrements). While > 0 the synth must
     /// keep advancing event-free blocks — a held key is a ringing key.
     live_notes: [i32; MAX_LOOPS],
+    /// v38 R1: live audition voices `(request, cursor-sample)`, refreshed
+    /// on `aud_gen` bumps exactly like `preview_curs` does for asset
+    /// previews. Cursors advance with the RT block clock, so auditions run
+    /// with the transport stopped.
+    aud: Vec<(crate::audio::AudVoiceReq, u64)>,
+    aud_seen_gen: u64,
+    /// Staged-but-not-released AUDITION notes per track. Like
+    /// `live_notes` a held audition note keeps the synth advancing and the
+    /// transport-stop cleanup from killing it mid-voice.
+    aud_held: [i32; MAX_LOOPS],
+    /// Tracks with audition events due THIS block (drives owner-map and
+    /// per-track event merge; rows are cleared for the tracks it names).
+    aud_mask: u128,
+    /// Per-track staging rows for `aud_mask` (capacity lives after the
+    /// first touch; cleared per block for the rows used).
+    aud_block: Vec<Vec<(usize, u8, u8, u8, u8)>>,
+    /// Tracks whose held audition notes were purged (pool replaced) —
+    /// `render_midi_block` all-offs them once.
+    aud_purge: u128,
     /// v32: last bound-set snapshot + its generation (try_lock refresh).
     bound_cache: Arc<BoundSet>,
     bound_gen: u64,
@@ -3989,6 +4168,86 @@ impl ProcessHandler for Proc {
         // v32: ALWAYS called now — even with the transport stopped it
         // renders the live keyboard feed (that call is how playing a synth
         // works while the timeline stands still).
+        // --- v38 R1: audition voices --------------------------------------
+        // Refresh like every preview table (gen check + snapshot), then
+        // advance the pool with the block clock and stage due events.
+        // Voices run whether the transport runs or not — the roll
+        // auditions a patch precisely while the timeline stands still.
+        let ag = self.engine.aud_gen.load(Ordering::Relaxed);
+        if ag != self.aud_seen_gen {
+            self.aud_seen_gen = ag;
+            // A replaced/stopped pool may leave held notes mid-voice:
+            // those tracks get an all-notes-off (queued for the render).
+            for (req, cur) in self.aud.iter() {
+                let pend = aud_pending(req.ev.as_ref(), *cur);
+                if pend > 0 && req.track < MAX_LOOPS {
+                    self.aud_held[req.track] -= pend.min(self.aud_held[req.track].max(0));
+                    self.aud_purge |= 1u128 << req.track;
+                }
+            }
+            let snap = self.engine.audition_snapshot();
+            self.aud = snap.iter().map(|r| (r.clone(), 0u64)).collect();
+        }
+        {
+            // Clear last block's rows first (bounded by aud_mask).
+            let mut m = self.aud_mask;
+            while m != 0 {
+                let t = m.trailing_zeros() as usize;
+                m &= m - 1;
+                if t < MAX_LOOPS {
+                    self.aud_block[t].clear();
+                }
+            }
+            self.aud_mask = 0;
+        }
+        let nn = n as u64;
+        let off_cap = (n.saturating_sub(1)) as u64;
+        let mut i = 0usize;
+        while i < self.aud.len() {
+            let (req, cur) = &mut self.aud[i];
+            let end = cur.saturating_add(nn);
+            let t = req.track.min(MAX_LOOPS - 1);
+            let mut done = true;
+            for &(off, kind, ch, d1, d2) in req.ev.iter() {
+                if off >= end {
+                    done = false;
+                    break; // sorted: everything past is future
+                }
+                if off >= *cur {
+                    let o = (off - *cur).min(off_cap) as usize;
+                    if self.aud_block[t].len() < 1024 {
+                        self.aud_block[t].push((o, kind, ch, d1, d2));
+                        match kind {
+                            3 => self.aud_held[t] += 1,
+                            0 => self.aud_held[t] = (self.aud_held[t] - 1).max(0),
+                            _ => {}
+                        }
+                        self.aud_mask |= 1u128 << t;
+                    }
+                }
+            }
+            *cur = end;
+            // The roll playhead follows the YOUNGEST voice (last added).
+            self.engine.aud_pos.store(*cur, Ordering::Relaxed);
+            if done {
+                self.aud.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if self.aud.is_empty() && !self.aud_held.iter().any(|h| *h > 0) {
+            // aud_on flips off only after OUR generation actually drained
+            // — a voice staged the same frame stays armed (A3's stop
+            // races resolved).
+            if self.engine.aud_gen.load(Ordering::Relaxed) == self.aud_seen_gen
+                && self.engine.aud_on.load(Ordering::Relaxed)
+            {
+                self.engine.aud_on.store(false, Ordering::Relaxed);
+            }
+        }
+        // A voice whose every event is staged can already have retired
+        // while its tail decays; aud_on stays true until the pool drains,
+        // then the roll's stop button flips back on the next UI frame.
         let has_midi = self.render_midi_block(p0, block_n, live_mask, midi_live_on);
         if has_midi {
             // A track whose synth is sounding is audible even when the
