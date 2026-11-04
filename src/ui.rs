@@ -899,9 +899,9 @@ type InFlightProbe = (
     std::sync::Arc<dyn crate::vsthost::StageEntry>,
 );
 
-/// v37 R3: instant-audition render cache — key `(preview track or u32::MAX,
-/// midi note)`, value `(when, mono buffer)`.
-type AuditionCache = std::collections::BTreeMap<(u32, u8), (std::time::Instant, Arc<[f32]>)>;
+// v38 R1: preview-track audition machinery retired — the piano roll
+// now auditions through the LIVE track synth via `Engine::play_audition`
+// instead of bouncing private plugin copies per click.
 
 pub struct App {
     backend: Backend,
@@ -1110,17 +1110,11 @@ pub struct App {
     preview_track: Option<usize>,
     /// Piano-roll note clipboard (Ctrl+C/V while the roll has focus).
     roll_clip: Option<Vec<crate::midipat::Note>>,
-    /// v37 R3: rendered audition-note buffers, keyed by (preview target,
-    /// note). Bouncing a plugin track's note spawns a PRIVATE plugin copy
-    /// every time (100+ ms) — without this cache every piano-key click
-    /// paid the full spawn ("preview takes a long time to start", and the
-    /// repeated spawn reads as "preview does nothing").
-    audition_cache: AuditionCache,
-    /// v37 R3: worker pre-rendering the keyboard range in the background
-    /// (bounce only ever touches PRIVATE plugin copies, so a worker
-    /// thread cannot race the live instances).
-    audition_warm_rx: Option<std::sync::mpsc::Receiver<(u8, Arc<[f32]>)>>,
-    audition_warm_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// v38 R1: cached instance of the DEFAULT audition synth (bundled
+    /// piano). Only used for the no-track preview path (script render —
+    /// instant, no plugin involved); the track path stages live RT
+    /// voices (`Engine::play_audition`) and touches NO instance here.
+    aud_default_inst: Option<std::sync::Arc<crate::synth::Instance>>,
     /// Grid snap enable (main header checkbox). OFF = placement/resize
     /// snaps to ONE SAMPLE — the program's minimum resolution.
     snap_on: bool,
@@ -1600,9 +1594,7 @@ impl App {
             roll_clip: None,
             snap_on: cfg.snap_on,
             preview_playing: None,
-            audition_cache: Default::default(),
-            audition_warm_rx: None,
-            audition_warm_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            aud_default_inst: None,
             proj_name: String::new(),
             export_tx: __se_tx,
             export_rx: __se_rx,
@@ -6985,24 +6977,25 @@ impl App {
         ev
     }
 
-    /// Render staged events through the CURRENT audition target: when a
-    /// piano-roll track is picked, that track's instrument AND its whole
-    /// mixer chain (`bounce_track_preview`); otherwise the default script
-    /// synth. This is what makes "select a track to preview its synth +
-    /// effects" audible in the roll and every rack/key audition.
+    /// Render staged events through the DEFAULT audition synth (the
+    /// bundled piano script). v38 R1: the track-routed audition never
+    /// renders here — it stages a LIVE audition voice
+    /// (`Engine::play_audition`) through the track's own instrument +
+    /// mixer chain, so a track audition is instant, plays the CURRENT
+    /// patch, and instantiates NOTHING (the private-copy bounce this
+    /// replaces re-opened the plugin on every click: lag, swallowed
+    /// clicks, silent failures, and the slow memory/bridge churn that
+    /// eventually killed the app).
     fn audition_render(&mut self, ev: &[(u64, u8, u8, u8, u8)], secs: f32) -> Option<Arc<[f32]>> {
         let sr = self.sample_rate.max(1);
         let n = ((secs.max(0.05)) as usize) * sr as usize;
-        if let Some(t) = self.preview_track {
-            let mut ev = ev.to_vec();
-            // None here only happens with no engine fallback voice yet
-            // (startup race) — degrade to the plain default synth rather
-            // than leave the user mute.
-            if let Some(buf) = self.backend.engine.bounce_track_preview(t, &mut ev, n) {
-                return Some(Arc::from(buf));
-            }
+        let inst = self
+            .aud_default_inst
+            .clone()
+            .or_else(|| self.preview_synth_instance())?;
+        if self.aud_default_inst.is_none() {
+            self.aud_default_inst = Some(inst.clone());
         }
-        let inst = self.preview_synth_instance()?;
         let mut ev = ev.to_vec();
         let mut buf = vec![0.0f32; n];
         crate::audio::render_midi_events(&inst, &mut ev, 0, n, &mut buf);
@@ -7011,103 +7004,91 @@ impl App {
 
     /// One short test note through the audition target (piano-key click,
     /// and the note-placement preview when the user drops a note).
-    /// v37 R3: buffer-cached — rendering through a PLUGIN track spawns a
-    /// private plugin copy per bounce (hundreds of ms), which made every
-    /// click feel dead and then slow; repeats now answer instantly.
+    /// v38 R1: with a track picked the note goes through that track's
+    /// LIVE synth + chain as an RT audition voice — one block of
+    /// latency, the real plugin, zero instantiation, and it answers even
+    /// while the UI thread has its hands full. Status echoes every press
+    /// (input feedback).
     fn audition_note(&mut self, note: u8) {
-        let tag = self
-            .preview_track
-            .map(|t| t as u32)
-            .unwrap_or(u32::MAX);
-        let hit = self
-            .audition_cache
-            .get(&(tag, note))
-            .filter(|(at, _)| at.elapsed().as_secs() < 300)
-            .map(|(_, b)| b.clone());
-        let buf = match hit {
-            Some(b) => b,
-            None => {
-                let sr = self.sample_rate.max(1);
-                let ev: Vec<(u64, u8, u8, u8, u8)> =
-                    vec![(0, 3, 0, note, 100), ((sr as u64) / 3, 0, 0, note, 0)];
-                match self.audition_render(&ev, 0.6) {
-                    Some(b) => {
-                        self.audition_cache
-                            .insert((tag, note), (std::time::Instant::now(), b.clone()));
-                        b
-                    }
-                    None => {
-                        self.status = "audition: no synth available".into();
-                        return;
-                    }
-                }
+        if self.sample_rate == 0 {
+            self.status = "audition: audio engine not running yet".into();
+            return;
+        }
+        let sr = self.sample_rate;
+        let ev: Vec<(u64, u8, u8, u8, u8)> =
+            vec![(0, 3, 0, note, 100), ((sr as u64) / 3, 0, 0, note, 0)];
+        match self.preview_track {
+            Some(t) => {
+                self.backend.engine.play_audition(t, ev.into());
+                self.status =
+                    format!("\u{266a} {nm} \u{b7} through track {}", t + 1, nm = note_name(note));
             }
-        };
-        // Additive (v0.10): repeated note taps stack like a real
-        // keyboard instead of cutting each other off.
+            None => match self.audition_render(&ev, 0.6) {
+                Some(buf) => {
+                    self.backend.cmd(Cmd::PreviewPlay {
+                        id: crate::audio::PREVIEW_TRANSIENT,
+                        samples: buf,
+                    });
+                    self.status = format!(
+                        "\u{266a} {nm} \u{b7} default (piano)",
+                        nm = note_name(note)
+                    );
+                }
+                None => {
+                    self.status = "audition: no synth available".into();
+                    return;
+                }
+            },
+        }
+    }
+
+    /// v38: stop everything the roll may be auditioning (preview voices
+    /// AND audition voices) and clear the "playing" label.
+    fn stop_previews(&mut self) {
+        self.backend.cmd(Cmd::PreviewStop { id: None });
+        self.backend.engine.stop_audition();
+        self.preview_playing = None;
+    }
+
+    /// v38: is any audition playing right now? Drives the roll's
+    /// ▶ preview / ■ stop button, the space-key toggle, and the
+    /// playhead source.
+    fn preview_running(&self) -> bool {
+        self.backend.engine.preview_active() || self.backend.engine.audition_active()
+    }
+
+    /// v38 R1: the roll's LINKED metronome over a LIVE audition — the
+    /// click grid alone is stamped into a transient preview voice,
+    /// phase-locked to tick 0 (the audition starts at "now").
+    fn preview_metro_only(&mut self, pat: &Pattern) {
+        let sr = self.sample_rate.max(1);
+        let secs = (pat.len_samples(sr) as f32 / sr as f32 + 1.0).clamp(0.5, 60.0);
+        let mut b = vec![0.0f32; (secs * sr as f32) as usize];
+        Self::overlay_metro_clicks(&mut b, sr, 60.0 / pat.bpm.max(20) as f32);
         self.backend.cmd(Cmd::PreviewPlay {
             id: crate::audio::PREVIEW_TRANSIENT,
-            samples: buf,
+            samples: Arc::from(b),
         });
-        self.preview_playing = Some(format!("key {note}"));
     }
 
-    /// v37 R3: pre-render the common keyboard range in the BACKGROUND for
-    /// the picked preview target, so the FIRST click through a plugin
-    /// track is as fast as the second. `bounce_track_preview` only ever
-    /// touches private plugin copies (the audio thread owns the live
-    /// ones), so a worker thread is safe. Re-arming bumps the generation
-    /// counter; a stale worker quits at its next send.
-    fn audition_warm_start(&mut self) {
-        use std::sync::atomic::Ordering as AOrd;
-        let Some(t) = self.preview_track else {
-            return;
+    /// v38 R3: "track N · <instrument>" read FROM THE ENGINE TABLE — the
+    /// RT source of truth. The old label read a UI mirror that could
+    /// drift from the instance actually loaded ("tracks are mislabeled
+    /// with their current instruments"); reading the table every frame
+    /// makes drift impossible.
+    fn roll_track_label(&self, t: usize) -> String {
+        let h = self.backend.engine.synths().get(t).cloned().flatten();
+        let inst = match h.as_deref() {
+            Some(crate::audio::SynthHandle::Vst(e)) => e.name().to_string(),
+            Some(crate::audio::SynthHandle::Script(_)) => self
+                .track_synth
+                .get(t)
+                .and_then(|s| s.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "script synth".into()),
+            None => "default (piano)".into(),
         };
-        if self.sample_rate == 0 {
-            return;
-        }
-        let gen = self.audition_warm_gen.fetch_add(1, AOrd::Relaxed) + 1;
-        self.audition_cache.clear();
-        let engine = self.backend.engine.clone();
-        let sr = self.sample_rate;
-        let my = self.audition_warm_gen.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for n in 36u8..=84 {
-                if my.load(AOrd::Relaxed) != gen {
-                    return; // target changed: stop rendering
-                }
-                let mut ev: Vec<(u64, u8, u8, u8, u8)> =
-                    vec![(0, 3, 0, n, 100), ((sr as u64) / 3, 0, 0, n, 0)];
-                let nlen = (sr as f32 * 0.6) as usize;
-                if let Some(b) = engine.bounce_track_preview(t, &mut ev, nlen) {
-                    if tx.send((n, Arc::from(b))).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
-        self.audition_warm_rx = Some(rx);
-    }
-
-    /// v37 R3: drain warmed audition buffers into the cache.
-    fn poll_audition_warm(&mut self) {
-        let tag = self
-            .preview_track
-            .map(|t| t as u32)
-            .unwrap_or(u32::MAX);
-        let mut drained = 0usize;
-        if let Some(rx) = &self.audition_warm_rx {
-            while drained < 4 {
-                if let Ok((n, buf)) = rx.try_recv() {
-                    self.audition_cache
-                        .insert((tag, n), (std::time::Instant::now(), buf));
-                    drained += 1;
-                } else {
-                    break;
-                }
-            }
-        }
+        format!("track {} \u{b7} {}", t + 1, inst)
     }
 
     /// Render a whole pattern through the audition target for PREVIEW.
@@ -7169,23 +7150,43 @@ impl App {
             return;
         }
         if self.preview_playing.as_deref() == Some(self.assets[id].name.as_str()) {
-            self.backend.cmd(Cmd::PreviewStop {
-                id: Some(id as u32),
-            });
-            self.preview_playing = None;
+            self.stop_previews();
+            self.status = "preview stopped".into();
             return;
         }
         let Some(pat) = self.assets[id].pattern.clone() else {
             return;
         };
+        let name = self.assets[id].name.clone();
+        // v38 R1: with a track picked the pattern plays through that
+        // track's LIVE instrument + chain as an RT audition voice (the
+        // per-click private-plugin bounce is gone for good).
+        if let Some(t) = self.preview_track {
+            let mut ev = self.pattern_events(&pat);
+            if ev.is_empty() {
+                self.status = format!("preview: \u{201c}{name}\u{201d} has no notes");
+                return;
+            }
+            ev.sort_unstable();
+            self.backend.engine.play_audition(t, ev.into());
+            if self.metro_on {
+                self.preview_metro_only(&pat);
+            }
+            self.preview_playing = Some(name);
+            self.status = format!(
+                "preview playing \u{b7} {}",
+                self.roll_track_label(t)
+            );
+            return;
+        }
         match self.render_pattern_preview(&pat) {
             Some(buf) => {
-                let name = self.assets[id].name.clone();
                 self.backend.cmd(Cmd::PreviewPlay {
                     id: id as u32,
                     samples: buf,
                 });
                 self.preview_playing = Some(name);
+                self.status = format!("preview playing \u{b7} default (piano)");
             }
             None => self.status = "preview: no synth available".into(),
         }
@@ -7236,7 +7237,12 @@ impl App {
         // move — the bar must follow the preview voice's own cursor or it
         // sits at zero all audition long (the v10.2 "bar never moves"
         // report). Otherwise the transport position as always.
-        let playhead = if self.backend.engine.preview_active() {
+        let playhead = if self.backend.engine.audition_active() {
+            // v38 R4: a LIVE audition moves the bar with the voice's own
+            // RT cursor; otherwise the offline preview voice, then the
+            // transport as always.
+            self.backend.engine.audition_pos()
+        } else if self.backend.engine.preview_active() {
             self.backend.engine.preview_pos()
         } else {
             self.backend.engine.pos()
@@ -7245,6 +7251,7 @@ impl App {
         let mut save = false;
         let mut clear = false;
         let mut preview = false;
+        let mut stop_preview = false;
         let mut audition: Option<u8> = None;
         // Preview fires when a NEW note lands (pointer released after a
         // fresh draw) — immediate audible feedback while composing.
@@ -7321,11 +7328,14 @@ impl App {
             }
             if a {
                 roll.sel_notes = (0..roll.pat.notes.len()).collect();
+                // v38 R6: select-all confirms (was silent).
+                self.status = format!("selected all {} note(s)", roll.sel_notes.len());
             }
             if d && !roll.sel_notes.is_empty() {
                 let mut ids = roll.sel_notes.clone();
                 ids.sort_unstable();
                 ids.dedup();
+                let k = ids.len();
                 for i in ids.into_iter().rev() {
                     if i < roll.pat.notes.len() {
                         roll.pat.notes.remove(i);
@@ -7339,15 +7349,18 @@ impl App {
                 }
                 roll.sel_notes.clear();
                 roll.changed = true;
+                // v38 R6: the delete key answers (was silent — "did my
+                // keypress even do anything?").
+                self.status = format!("deleted {k} note(s)");
             }
             // v37 R3: while the roll owns the keyboard, SPACE is the
             // PREVIEW transport — start/stop the roll's own playback,
-            // never the main (hidden) arrangement transport.
+            // never the main (hidden) arrangement transport. v38 R4: the
+            // state check covers LIVE auditions too, and stopping says so.
             let space = ui.ctx().input(|i| i.key_pressed(egui::Key::Space));
             if space {
-                if self.backend.engine.preview_active() {
-                    self.backend.cmd(Cmd::PreviewStop { id: None });
-                    self.preview_playing = None;
+                if self.preview_running() {
+                    self.stop_previews();
                     self.status = "preview stopped".into();
                 } else {
                     preview = true;
@@ -7409,7 +7422,67 @@ impl App {
             // vertical = two rows per notch (pitch scroll).
             roll.scroll_sec = (roll.scroll_sec - wheel_dx as f64 * 0.25 * sec_per_beat).max(0.0);
         }
-        if wheel_dy != 0.0 {
+        // v38 R5: wheel over a NOTE is a FL-style velocity trim (handled
+        // above; it consumes the wheel). Geometry mirrors roll_inner's
+        // (scrollbar 10 px, key strip 58 px) — the row/second math must
+        // stay identical to the hit test a PRESS uses.
+        let mut vel_trimmed = false;
+        if over_canvas && wheel_dy != 0.0 {
+            if let (Some(hp), Some(cv)) =
+                (ui.ctx().input(|i| i.pointer.hover_pos()), roll.canvas_rect)
+            {
+                let row = ((((cv.max.y - 10.0 + roll.vscroll_px) - hp.y - roll.row_h)
+                    / roll.row_h)
+                    .ceil() as i32)
+                    .clamp(0, 127);
+                let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
+                let sec = roll.scroll_sec + (hp.x - (cv.min.x + 58.0)) as f64 / px_per_sec;
+                let sec_of = |tk: u32| tk as f64 * sec_per_beat / PPQ as f64;
+                let hit = roll
+                    .pat
+                    .notes
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(i, n)| {
+                        let n0 = sec_of(n.start);
+                        let n1 = n0 + sec_of(n.len.max(1));
+                        (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6)
+                            .then_some(i)
+                    });
+                if let Some(i) = hit {
+                    let d: i16 = if wheel_dy > 0.0 { 5 } else { -5 };
+                    let targets: Vec<usize> = if roll.sel_notes.contains(&i) {
+                        roll.sel_notes.clone()
+                    } else {
+                        vec![i]
+                    };
+                    let mut last = 0u8;
+                    for ti in targets.iter() {
+                        if let Some(n) = roll.pat.notes.get_mut(*ti) {
+                            n.vel = ((n.vel as i16 + d).clamp(1, 127)) as u8;
+                            last = n.vel;
+                        }
+                    }
+                    roll.changed = true;
+                    vel_trimmed = true;
+                    self.status = if targets.len() > 1 {
+                        format!(
+                            "velocity of {} selected notes \u{2192} {}",
+                            targets.len(),
+                            last
+                        )
+                    } else {
+                        format!(
+                            "velocity \u{b7} {} \u{2192} {}",
+                            note_name(roll.pat.notes[i].note),
+                            last
+                        )
+                    };
+                }
+            }
+        }
+        if wheel_dy != 0.0 && !vel_trimmed {
             roll.vscroll_px = (roll.vscroll_px + wheel_dy * roll.row_h * 2.0)
                 .clamp(0.0, (128.0 * roll.row_h - 40.0).max(0.0));
         }
@@ -7418,7 +7491,7 @@ impl App {
         if docked {
             self.roll_inner(
                 ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
-                &mut save, &mut clear, &mut preview, &mut audition,
+                &mut save, &mut clear, &mut preview, &mut stop_preview, &mut audition,
                 &mut placed,
             );
         } else {
@@ -7444,7 +7517,7 @@ impl App {
             resp = w.show(ui, |ui| {
                 self.roll_inner(
                     ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
-                    &mut save, &mut clear, &mut preview, &mut audition,
+                    &mut save, &mut clear, &mut preview, &mut stop_preview, &mut audition,
                     &mut placed,
                 )
             });
@@ -7503,6 +7576,8 @@ impl App {
             roll.sel_notes.clear();
             roll.sel_anchor = None;
             roll.changed = true;
+            // v38 R6: a destructive button says it landed.
+            self.status = "pattern cleared \u{b7} the clip on the grid plays empty now too".into();
         }
         // v37 R3: the pattern's length is the notes themselves — end at
         // the LAST note's tail, never a bar count (the old fixed-bar end
@@ -7522,18 +7597,52 @@ impl App {
         }
         if preview {
             let pat = roll.pat.clone();
-            match self.render_pattern_preview(&pat) {
-                Some(buf) => {
-                    // Edit echo, not an audition: replace anything playing.
-                    self.backend.cmd(Cmd::PreviewStop { id: None });
-                    self.backend.cmd(Cmd::PreviewPlay {
-                        id: crate::audio::PREVIEW_TRANSIENT,
-                        samples: buf,
-                    });
-                    self.preview_playing = Some("piano roll".into());
+            match self.preview_track {
+                // v38 R1: the pattern goes through the LIVE track
+                // instrument as an RT audition voice — instant, no
+                // plugin instantiation, and it is the SAME instance the
+                // clips will play. Linked metro joins as a click-only
+                // transient voice, phase-locked to tick 0.
+                Some(t) => {
+                    let mut ev = self.pattern_events(&pat);
+                    if ev.is_empty() {
+                        self.status =
+                            "preview: pattern has no notes yet \u{b7} draw one first".into();
+                    } else {
+                        ev.sort_unstable();
+                        self.backend.engine.play_audition(t, ev.into());
+                        if self.metro_on {
+                            self.preview_metro_only(&pat);
+                        }
+                        self.preview_playing = Some("piano roll".into());
+                        self.status = format!(
+                            "preview playing \u{b7} {} \u{b7} space or STOP ends it",
+                            self.roll_track_label(t)
+                        );
+                    }
                 }
-                None => self.status = "preview: no synth available".into(),
+                None => match self.render_pattern_preview(&pat) {
+                    Some(buf) => {
+                        // Edit echo, not an audition: replace anything playing.
+                        self.backend.cmd(Cmd::PreviewStop { id: None });
+                        self.backend.cmd(Cmd::PreviewPlay {
+                            id: crate::audio::PREVIEW_TRANSIENT,
+                            samples: buf,
+                        });
+                        self.preview_playing = Some("piano roll".into());
+                        self.status =
+                            "preview playing \u{b7} default (piano) \u{b7} space or STOP ends it"
+                                .into();
+                    }
+                    None => self.status = "preview: no synth available".into(),
+                },
             }
+        }
+        // v38 R4: STOP is a first-class state now — the button, SPACE and
+        // the roll closing all land here, and the status line confirms.
+        if stop_preview {
+            self.stop_previews();
+            self.status = "preview stopped".into();
         }
         if save {
             match roll.edit_asset {
@@ -7545,7 +7654,9 @@ impl App {
         }
         if !open {
             // The X closes the roll for real (was: reopened next frame,
-            // leaving quit as the only escape).
+            // leaving quit as the only escape). v38 R4: closing also
+            // stops anything the roll was auditioning.
+            self.stop_previews();
             self.status = "piano roll closed (unsaved changes are kept until quit)".into();
             return;
         }
@@ -7579,6 +7690,7 @@ impl App {
         save: &mut bool,
         clear: &mut bool,
         preview: &mut bool,
+        stop_preview: &mut bool,
         audition: &mut Option<u8>,
         placed: &mut Option<u8>,
     ) {
@@ -7589,11 +7701,11 @@ impl App {
                     ui.label("preview:");
                     let cur_label = match self.preview_track {
                         None => "\u{266a} default (piano)".to_string(),
-                        Some(t) => format!("\u{266a} track {}", t + 1),
+                        Some(t) => format!("\u{266a} {}", self.roll_track_label(t)),
                     };
                     let mut pick: Option<Option<usize>> = None;
                     egui::ComboBox::from_id_salt("roll_track_pick")
-                        .width(150.0)
+                        .width(190.0)
                         .selected_text(RichText::new(cur_label).small())
                         .show_ui(ui, |ui| {
                             if ui
@@ -7604,25 +7716,16 @@ impl App {
                                 pick = Some(None);
                             }
                             ui.separator();
+                            // v38 R3: every row reads the ENGINE TABLE —
+                            // the instrument actually loaded on that
+                            // track right now, never a stale mirror.
                             for t in 0..self.n_tracks {
-                                let lbl = self
-                                    .track_synth_inst
-                                    .get(t)
-                                    .and_then(|h| h.as_ref())
-                                    .map(|h| match h.as_ref() {
-                                        crate::audio::SynthHandle::Vst(e) => e.name().to_string(),
-                                        crate::audio::SynthHandle::Script(_) => {
-                                            self.track_synth[t].clone().unwrap_or_default()
-                                        }
-                                    })
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or_else(|| "piano (default)".into());
                                 if ui
                                     .selectable_label(
                                         self.preview_track == Some(t),
-                                        format!("track {} \u{b7} {}", t + 1, lbl),
+                                        self.roll_track_label(t),
                                     )
-                                    .on_hover_text("Preview through this track's synth AND its effects chain")
+                                    .on_hover_text("Preview through this track's CURRENT instrument AND its effects chain")
                                     .clicked()
                                 {
                                     pick = Some(Some(t));
@@ -7631,20 +7734,30 @@ impl App {
                         });
                     if let Some(v) = pick {
                         self.preview_track = v;
-                        // v37 R3: a new target means a new set of audition
-                        // buffers — drop the cache and re-warm it.
-                        self.audition_warm_start();
                         self.save_config();
+                        // v38 R6: picking a route confirms itself in the
+                        // status line (instant feedback).
+                        self.status = match v {
+                            Some(t) =>
+                                format!("preview \u{b7} {} \u{b7} live instrument + chain", self.roll_track_label(t)),
+                            None => "preview \u{b7} default (piano)".into(),
+                        };
                     }
                     // v37 R3: the roll's LINKED metronome — the same
                     // switch as the main header's, and the pattern preview
                     // carries the click grid stamped into its own audio.
                     if ui
-                        .checkbox(&mut self.metro_on, "\u{1f110} metro")
+                        .checkbox(&mut self.metro_on, "\u{266b} metro")
                         .on_hover_text("Metronome (same switch as the main header) \u{b7} the roll's PREVIEW carries the click grid")
                         .clicked()
                     {
                         self.send_metro();
+                        // v38 R6: the toggle answers in the status line.
+                        self.status = if self.metro_on {
+                            "metronome ON \u{b7} previews carry the click grid".into()
+                        } else {
+                            "metronome OFF".into()
+                        };
                     }
                     if ui
                         .small_button("quantize")
@@ -7653,22 +7766,44 @@ impl App {
                     {
                         let q_step = SUBDIVISIONS[self.q_sub].0.max(1);
                         let step = (PPQ as u32 * 4 / q_step.max(1)).max(1);
+                        let n = roll.pat.notes.len();
                         roll.pat.quantize_grid(step, true);
                         roll.changed = true;
+                        self.status = format!("quantized {n} note(s) to the grid");
                     }
+                    // v38 R4: the preview button SHOWS the audition
+                    // state — while anything is playing it reads STOP in
+                    // red (was: a static green label whether or not audio
+                    // ran, the "no idea if preview is on" complaint).
+                    let running = self.preview_running();
+                    let lbl = if running {
+                        RichText::new("STOP")
+                            .color(Color32::from_rgb(240, 110, 90))
+                            .strong()
+                    } else {
+                        RichText::new("preview")
+                            .color(Color32::from_rgb(120, 220, 160))
+                    };
                     if ui
-                        .small_button(
-                            RichText::new("\u{25b6} preview")
-                                .color(Color32::from_rgb(120, 220, 160)),
-                        )
-                        .on_hover_text(
-                            "Audition through the picked preview track (synth + chain)",
-                        )
+                        .small_button(lbl)
+                        .on_hover_text(if running {
+                            "Stop the audition (SPACE does this too)"
+                        } else {
+                            "Audition through the picked preview track (live instrument + chain). SPACE does this too."
+                        })
                         .clicked()
                     {
-                        *preview = true;
+                        if running {
+                            *stop_preview = true;
+                        } else {
+                            *preview = true;
+                        }
                     }
-                    if ui.small_button("clear").clicked() {
+                    if ui
+                        .small_button("clear")
+                        .on_hover_text("Delete every note, CC and pressure event in this pattern")
+                        .clicked()
+                    {
                         *clear = true;
                     }
                     if ui
@@ -7930,29 +8065,78 @@ impl App {
                             .then_some((i, n0, n1))
                     })
                 };
-                // v37: the resize cursor must reflect what a PRESS would
-                // grab. The old hot-edge test scanned EVERY note, so a
-                // hidden neighbour's cap could light the cursor over the
-                // topmost note's BODY — the "cursor says resize, click
-                // places/moves instead" complaint. Same topmost-note rule
-                // as the press branch below, no exceptions.
-                let hot_edge = hover.is_some_and(|hp| {
-                    if !in_grid(hp) {
-                        return false;
-                    }
-                    match note_hit(&roll.pat.notes, hp) {
-                        Some((_, n0, n1)) => {
-                            (x_of(n0) - hp.x).abs() <= EDGE_PX || (x_of(n1) - hp.x).abs() <= EDGE_PX
+                // v38 R5: MODE CURSOR — say what a press WILL do before
+                // it happens: pointing hand over a note body (select /
+                // drag; wheel trims velocity), side-arrows on an end cap
+                // (extend that end), crosshair on empty grid (place a
+                // note), pointing hand on the piano strip (audition).
+                // v37 rule kept: the SAME topmost-note test a press uses,
+                // no exceptions — a hidden neighbour's cap must never
+                // drive the cursor under the topmost note's body.
+                let hover_icon = hover.and_then(|hp| {
+                    if in_grid(hp) {
+                        match note_hit(&roll.pat.notes, hp) {
+                            Some((_, n0, n1)) => {
+                                if (x_of(n0) - hp.x).abs() <= EDGE_PX
+                                    || (x_of(n1) - hp.x).abs() <= EDGE_PX
+                                {
+                                    Some(egui::CursorIcon::ResizeHorizontal)
+                                } else {
+                                    Some(egui::CursorIcon::PointingHand)
+                                }
+                            }
+                            None => Some(egui::CursorIcon::Crosshair),
                         }
-                        None => false,
+                    } else if hp.x >= rect.min.x
+                        && hp.x < grid_x0
+                        && hp.y >= grid_top
+                        && hp.y <= grid_bot
+                    {
+                        Some(egui::CursorIcon::PointingHand)
+                    } else {
+                        None
                     }
                 });
-                if let Some(pt) = resp.interact_pointer_pos() {
+                // v38 R6: live velocity readout under the cursor while it
+                // hovers a note (the wheel-trim control has no slider, so
+                // it needs to be told the value directly).
+                if let Some(hp) = hover {
+                    if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
+                        if let Some(n) = roll.pat.notes.get(i) {
+                            painter.text(
+                                hp + egui::vec2(14.0, 14.0),
+                                egui::Align2::LEFT_TOP,
+                                format!(
+                                    "{} \u{b7} vel {} \u{b7} wheel to change",
+                                    note_name(n.note),
+                                    n.vel
+                                ),
+                                egui::FontId::proportional(9.0),
+                                Color32::from_rgb(230, 230, 170),
+                            );
+                        }
+                    }
+                }
+                // v38 R2: a click whose press AND release landed in one
+                // event frame (whenever the UI thread has any backlog —
+                // exactly what the old per-click plugin bounce caused)
+                // leaves NO press state for `interact_pointer_pos()` to
+                // see, and the press silently vanished. Recover it from
+                // the raw press event so a fast click always registers.
+                let coalesced_press = ui.input(|i| {
+                    i.pointer.button_pressed(egui::PointerButton::Primary)
+                        && !i.pointer.button_down(egui::PointerButton::Primary)
+                });
+                if let Some(pt) = resp
+                    .interact_pointer_pos()
+                    .or_else(|| if coalesced_press { hover } else { None })
+                {
                     let mods = ui.input(|i| i.modifiers);
                     // Right-click deletes the note under the cursor.
                     if resp.secondary_clicked() && in_grid(pt) {
                         {
                             if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
+                                let nm = note_name(roll.pat.notes[i].note);
                                 roll.pat.notes.remove(i);
                                 roll.sel_notes.retain(|s| *s != i);
                                 for s in roll.sel_notes.iter_mut() {
@@ -7961,25 +8145,23 @@ impl App {
                                     }
                                 }
                                 roll.changed = true;
+                                // v38 R6: the delete announces itself.
+                                self.status = format!("deleted {nm} \u{b7} right-click");
                             }
                         }
                     }
                     // ---- press decides the gesture + selection ----
-                    // (egui 0.36 has no press-edge Response; `is_pointer
-                    // _button_down_on` + "no gesture in flight yet" fires
-                    // exactly once per press and STILL catches presses on
-                    // the press frame — unlike drag_started, which only
-                    // fires after the pointer has already drifted past the
-                    // tiny edge-hit zones. That drift was why "can't grab
-                    // a clip/note edge" felt impossible.)
-                    // v37: PRIMARY ONLY. `is_pointer_button_down_on()`
-                    // answers for any held button, so every right-click
-                    // also armed a draw/resize gesture before the delete
-                    // ran — the source of "right-click delete is
-                    // inconsistent" and notes created-then-deleted on
-                    // empty-grid RMB.
-                    if resp.is_pointer_button_down_on()
-                        && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                    // v38 R2: PRESS-EDGE event (fires exactly once per
+                    // press, even for a press+release coalesced into one
+                    // frame). Replaces `is_pointer_button_down_on()`,
+                    // which is FALSE in a coalesced frame — that test
+                    // plus the per-click plugin bounce behind it is the
+                    // whole "left click does nothing 2/3 of the time"
+                    // story. v37 rule kept: PRIMARY ONLY (the down-on
+                    // test answered for RMB too and stole deletes).
+                    let press_now = coalesced_press
+                        || ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+                    if press_now
                         && matches!(roll.gesture, RollGesture::None)
                         && in_grid(pt)
                     {
@@ -8005,6 +8187,11 @@ impl App {
                                         t0: n0,
                                         end0: n1,
                                     };
+                                    // v38 R6: the grab says what it grabbed.
+                                    self.status = format!(
+                                        "resizing {nm} \u{b7} drag the end, release commits",
+                                        nm = note_name(roll.pat.notes[idx].note)
+                                    );
                                 } else {
                                     // Body press: FL selection semantics.
                                     if mods.command {
@@ -8059,6 +8246,13 @@ impl App {
                                             base,
                                             fresh: false,
                                         };
+                                        // v38 R6: selection echo — also the
+                                        // discovery surface for the wheel
+                                        // velocity trim.
+                                        self.status = format!(
+                                            "selected {} note(s) \u{b7} drag moves \u{b7} wheel over a note trims velocity",
+                                            roll.sel_notes.len()
+                                        );
                                     }
                                 }
                                 roll.changed = true;
@@ -8093,6 +8287,11 @@ impl App {
                                     };
                                     // Placement feedback: hear the note now.
                                     *placed = Some(row);
+                                    // v38 R6: …and see it land.
+                                    self.status = format!(
+                                        "placed {nm} \u{b7} drag for length \u{b7} release to keep",
+                                        nm = note_name(row)
+                                    );
                                     roll.changed = true;
                                 }
                             }
@@ -8162,6 +8361,10 @@ impl App {
                         }
                     }
                     if resp.drag_stopped() {
+                        // v38 R6: every finished drag commits with a word.
+                        let was_fresh = matches!(roll.gesture, RollGesture::Move { fresh: true, .. });
+                        let was_move = matches!(roll.gesture, RollGesture::Move { .. });
+                        let was_resize = matches!(roll.gesture, RollGesture::Resize { .. });
                         if let RollGesture::Marquee { from, add } = roll.gesture {
                             let box_r = egui::Rect::from_two_pos(from, pt);
                             let hits: Vec<usize> = roll
@@ -8192,6 +8395,16 @@ impl App {
                                 roll.sel_notes = hits;
                             }
                             roll.sel_anchor = roll.sel_notes.first().copied();
+                            self.status =
+                                format!("selected {} note(s) by box", roll.sel_notes.len());
+                        } else if was_move && roll.changed {
+                            self.status = if was_fresh {
+                                "note placed \u{b7} wheel over it = velocity".into()
+                            } else {
+                                format!("moved {} note(s)", roll.sel_notes.len().max(1))
+                            };
+                        } else if was_resize && roll.changed {
+                            self.status = "note length changed \u{b7} drag the yellow caps".into();
                         }
                         roll.gesture = RollGesture::None;
                         roll.drag_notes.clear();
@@ -8210,8 +8423,8 @@ impl App {
                         *audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
                     }
                 }
-                if hot_edge {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                if let Some(ic) = hover_icon {
+                    ui.ctx().set_cursor_icon(ic);
                 }
 
                 // ================= scrollbars =================
@@ -10586,15 +10799,14 @@ impl eframe::App for App {
         }
         self.sample_auto_controls();
 
-        // v37 R3: keep the audition cache fed (background pre-render of
-        // the picked preview track) while the piano roll is open.
-        self.poll_audition_warm();
+        // v38 R4: while a roll audition plays, keep the frame clock
+        // alive — the STOP button must flip back and the playhead must
+        // move exactly when the RT voices drain.
         if self.piano_roll.is_some()
-            && self.sample_rate > 0
-            && self.preview_track.is_some()
-            && self.audition_warm_rx.is_none()
+            && (self.backend.engine.preview_active()
+                || self.backend.engine.audition_active())
         {
-            self.audition_warm_start();
+            ctx.request_repaint();
         }
 
         self.handle_shortcuts(ctx);
