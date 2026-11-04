@@ -1705,9 +1705,15 @@ fn e2e_midi_note_sustains_across_blocks() {
 #[test]
 fn e2e_midi_vsti_sustains_live() {
     let _g = e2e_lock();
-    let path = match std::env::var("HOME") {
-        Ok(h) => std::path::PathBuf::from(h).join(".vst3/vitalium.vst3"),
-        Err(_) => return,
+    // v37 R4: plugin under test is selectable — point SLOOPER_E2E_VSTI at
+    // any .vst3/.so instrument to replay the full sustain contract on it
+    // (default: Vitalium).
+    let path = match std::env::var("SLOOPER_E2E_VSTI") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => match std::env::var("HOME") {
+            Ok(h) => std::path::PathBuf::from(h).join(".vst3/vitalium.vst3"),
+            Err(_) => return,
+        },
     };
     if !path.exists() {
         eprintln!("skipping: {} not installed", path.display());
@@ -1748,8 +1754,13 @@ fn e2e_midi_vsti_sustains_live() {
         "sink layout not applied"
     );
 
-    let load = slooper::vsthost::open(&path, slooper::vsthost::VstKind::V3, sr, None)
-        .expect("vitalium must load");
+    let kind = if path.extension().map(|e| e == "vst3").unwrap_or(false) {
+        slooper::vsthost::VstKind::V3
+    } else {
+        slooper::vsthost::VstKind::V2
+    };
+    let load = slooper::vsthost::open(&path, kind, sr, None)
+        .unwrap_or_else(|_| panic!("{} must load", path.display()));
     b.cmd(Cmd::SetTrackSynth {
         i: 0,
         synth: Some(Arc::new(slooper::audio::SynthHandle::Vst(
@@ -2871,4 +2882,86 @@ fn e2e_sidechain_ducks_target_track() {
         restored > ducked * 1.5,
         "clearing the send must un-duck: ducked {ducked}, restored {restored}"
     );
+}
+
+/// v37 R5: while ANY recorder is armed the transport runs STRAIGHT THROUGH
+/// the project end: no park, no auto-stop (this is what truncated every
+/// kind of recording at the arrangement length). When the last recorder
+/// disarms, the normal park/auto-stop behaviour resumes.
+#[test]
+fn e2e_v37_recording_suppresses_park_and_autostop() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, _sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    // The RT callback only runs once the client owns ports (every transport
+    // pin in this file wires a dummy pair first) — without this the
+    // playhead never advances and the test would only measure JACK.
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let mode = Arc::new(AtomicU8::new(0));
+    let const_val = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let (client, _status) =
+        Client::new("daw_test_v37", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            LoopSrcProc {
+                out: out_a,
+                sink,
+                mode: mode.clone(),
+                const_val: const_val.clone(),
+                seed: 0x1234_5678,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![format!("{src_name}:out_a")],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "backend did not apply the layout"
+    );
+    let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![]);
+    b.cmd(Cmd::SetProject {
+        assets: table,
+        arr: Arc::new(Arrangement::new()),
+        len: 24_000, // half a second at 48k
+    });
+    // Park/auto-stop only applies outside loop mode (a looping transport
+    // legally never stops) — this test is about the END-park truncation.
+    b.cmd(Cmd::SetLoop(false));
+    std::thread::sleep(Duration::from_millis(120));
+    b.engine.set_recording(true);
+    b.cmd(Cmd::PlayAll);
+    // Well past the project end: the playhead must keep running and the
+    // transport must NOT have auto-stopped.
+    wait_until(
+        || b.engine.pos() > 3 * 24_000,
+        Duration::from_secs(4),
+        "playhead runs past the project end while recording",
+    );
+    assert!(b.engine.transport_on(), "no auto-stop during a take");
+    // Disarm: normal behaviour resumes at the next block — the transport
+    // parks at the project end and auto-stops.
+    b.engine.set_recording(false);
+    wait_until(
+        || !b.engine.transport_on(),
+        Duration::from_secs(4),
+        "auto-stop fires once nothing records",
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
 }

@@ -657,6 +657,12 @@ pub struct Engine {
     /// Playhead position in timeline samples (published by RT, seeks written
     /// by the manager through `seek`).
     pos: AtomicU64,
+    /// v37 R5: any recorder is armed (audio take / MIDI take / write
+    /// automation) — the transport must NOT park or wrap at the project
+    /// end while a take runs. Truncating the take at the content length is
+    /// what made "record one measure, get one measure" and cut automation
+    /// takes short; the recorded window is the take, not the arrangement.
+    recording: AtomicBool,
     /// Pending seek target; `NO_SEEK` when none. The RT handler swaps this at
     /// block start, which makes seeks race-free against RT position writes.
     seek: AtomicU64,
@@ -785,6 +791,7 @@ impl Engine {
             loop_start: AtomicU64::new(0),
             loop_end: AtomicU64::new(0),
             pos: AtomicU64::new(0),
+            recording: AtomicBool::new(false),
             seek: AtomicU64::new(NO_SEEK),
             // Empty project: an idle timeline as long as a take buffer, so
             // a transport parked on it never wraps/parks on a 1-sample
@@ -933,6 +940,26 @@ impl Engine {
 
     pub fn set_transport(&self, on: bool) {
         self.transport_on.store(on as u8, Ordering::Relaxed);
+    }
+
+    /// v37 R5: mirror of "some recorder is armed" (UI publishes whenever
+    /// any take/MIDI/automation recorder arms or disarms). While set, the
+    /// RT transport runs STRAIGHT THROUGH: no park/auto-stop at the project
+    /// end, no loop wrap — the take window is whatever the user records.
+    pub fn set_recording(&self, on: bool) {
+        self.recording.store(on, Ordering::Relaxed);
+    }
+
+    pub fn recording(&self) -> bool {
+        self.recording.load(Ordering::Relaxed)
+    }
+
+    /// v37 test seam: publish a playhead position exactly the way RT does
+    /// (NULL_AUDIO never starts the RT thread, so headless pins need the
+    /// same single atomic write the RT publish performs).
+    #[cfg(test)]
+    pub fn force_pos(&self, p: u64) {
+        self.pos.store(p, Ordering::Relaxed);
     }
 
     pub fn loop_tl(&self) -> bool {
@@ -1183,8 +1210,10 @@ impl Engine {
         self.arr_gen.fetch_add(1, Ordering::Relaxed);
         self.proj_len.store(len.max(1), Ordering::Relaxed);
         let pl = self.proj_len.load(Ordering::Relaxed);
-        // A project can shrink under the playhead â keep it in bounds.
-        if self.pos.load(Ordering::Relaxed) > pl {
+        // A project can shrink under the playhead — keep it in bounds.
+        // v37 R5: never while a take runs: the playhead is deliberately
+        // beyond the OLD content end during recording.
+        if self.pos.load(Ordering::Relaxed) > pl && !self.recording() {
             self.seek_to(pl);
         }
         // Samplers read the rack through the host table; refresh it with
@@ -3712,7 +3741,12 @@ impl ProcessHandler for Proc {
         let transport = self.engine.transport_on();
         let seek = self.engine.take_seek();
         let proj_len = self.engine.proj_len().max(1);
-        let looping = self.engine.loop_tl();
+        // v37 R5: while ANY recorder is armed the transport runs straight
+        // through: loop wrap AND park/auto-stop at the project end are
+        // suspended, so a take records the whole window the user recorded
+        // (truncating at content length = "MIDI records only 1 bar").
+        let rec_open = self.engine.recording();
+        let looping = self.engine.loop_tl() && !rec_open;
 
         // Project snapshots: refresh Arcs when a generation moved (try_lock —
         // never blocks on the manager thread). Swapping the Arrangement also
@@ -3937,7 +3971,7 @@ impl ProcessHandler for Proc {
             if p0.saturating_add(n as u64) > le {
                 block_n = (le - p0) as usize;
             }
-        } else if advance && p0.saturating_add(n as u64) > proj_len {
+        } else if advance && p0.saturating_add(n as u64) > proj_len && !rec_open {
             block_n = (proj_len - p0.min(proj_len)) as usize;
             auto_stop = true;
         }
@@ -4365,8 +4399,12 @@ impl ProcessHandler for Proc {
             // transport runs the clicks tick off the transport position;
             // with it stopped they tick off the free-running click clock,
             // which leaves the playhead untouched.
+            // v37 R3: while a PREVIEW buffer plays, the free-running click
+            // is muted — the piano roll stamps its pattern-locked click
+            // grid INTO the preview audio (two phase-unsynced metros at
+            // once was unusable for composing).
             let mut click = 0.0f32;
-            if live && metro_on {
+            if live && metro_on && !self.preview_live {
                 let p = if advance {
                     (p0 + i as u64) as f64
                 } else {
@@ -4543,7 +4581,10 @@ impl ProcessHandler for Proc {
                 }
                 self.pos = pos_now;
             } else {
-                self.pos = pos_now.min(proj_len);
+                // v37 R5: a running take runs the playhead PAST the
+                // project end (the arrangement grows when the take
+                // bounces); only the parked/idle transport clamps.
+                self.pos = if rec_open { pos_now } else { pos_now.min(proj_len) };
             }
         }
         // Keep the free-running click clock glued to the playhead while the
@@ -5469,5 +5510,29 @@ mod tests {
         assert_eq!(e.midi_bound_gen(), g0 + 1, "RT refreshes on the gen bump");
         assert!(e.midi_bound().claims(3, 0, 60));
         drop(e);
+    }
+
+    /// v37 R5: the recording flag gates the project-end clamp — while a
+    /// take runs the playhead lives PAST the old content end on purpose
+    /// (this clamp firing mid-take was one more way the app truncated
+    /// recordings at the arrangement length).
+    #[test]
+    fn v37_recording_flag_gates_the_project_end_clamp() {
+        let e = Engine::new();
+        let empty_assets: Arc<crate::audio::AssetTable> = Arc::new(Vec::new());
+        let set = |e: &Engine| {
+            e.set_project(empty_assets.clone(), Arc::new(crate::arrange::Arrangement::new()), 2000)
+        };
+        set(&e);
+        assert!(!e.recording(), "not recording by default");
+        e.force_pos(5000);
+        set(&e);
+        assert_eq!(e.pos(), 2000, "idle: playhead clamps back into the project");
+        e.set_recording(true);
+        assert!(e.recording());
+        e.force_pos(5000);
+        set(&e);
+        assert_eq!(e.pos(), 5000, "recording: playhead runs past the old end");
+        e.set_recording(false);
     }
 }
