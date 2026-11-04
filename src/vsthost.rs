@@ -367,6 +367,20 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<VstEntry> {
 /// from a unit test risks aborting the process, see below — and `false`
 /// for fixtures that must prove sidecar discovery works).
 pub fn scan_with(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
+    // v37: CRASH-ISOLATED SCAN. One hostile vendor module killed EVERY
+    // user-facing scan of this machine (OB-Xf's probe SIGSEGVs the whole
+    // process — and because ~/.clap sorts after ~/.vst3, one bad VST3
+    // silently deleted every CLAP from the picker; the same crash killed
+    // in-app Rescans and the v36 smokes). Every dlopen probe now runs in a
+    // forked child that writes its rows through a pipe and `_exit`s; a
+    // crashing child costs one greyed row, nothing else. The loader lock is
+    // held across each fork+collect so the child can never race a parent
+    // dlopen for glibc's loader lock (the one fork-unsafe lock in play).
+    let _loader = vst_loader_lock();
+    scan_inner(dirs, skip_bridged)
+}
+
+fn scan_inner(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
     let mut out = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
     for root in dirs {
@@ -427,50 +441,31 @@ pub fn scan_with(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                         continue;
                     }
                 }
-                if crate::claphost::is_clap_file(name) && !p.is_dir() {
-                    // One entry PER plugin descriptor (a .clap can host
-                    // several). Probe never instantiates, so unlike VST2
-                    // this is safe on any file, but keep the same
-                    // error-as-greyed-row contract.
+                // v37: every probe dispatches through `probe_isolated` —
+                // one crash-prone file (see `scan_with`) must cost one
+                // greyed row, never the whole registry.
+                let target: Option<(PathBuf, VstKind)> =
+                    if crate::claphost::is_clap_file(name) && !p.is_dir() {
+                        // One entry PER plugin descriptor (a .clap can host
+                        // several). Probe never instantiates, so unlike VST2
+                        // this is safe on any file, but keep the same
+                        // error-as-greyed-row contract.
+                        Some((p.clone(), VstKind::Clap))
+                    } else if name.ends_with(".vst3") {
+                        Some((p.clone(), VstKind::V3))
+                    } else if name.ends_with(".vst") && p.is_dir() {
+                        // VST2 bundle layout (`Foo.vst/Contents/<arch>.so`) —
+                        // what yabridge writes for Windows plugins and what
+                        // many Linux packs ship. Probe the real library inside.
+                        bundle_so(&p).map(|so| (so, VstKind::V2))
+                    } else if name.ends_with(".so") && !p.is_dir() {
+                        Some((p.clone(), VstKind::V2))
+                    } else {
+                        None
+                    };
+                if let Some((lib, kind)) = target {
                     seen.push(p.clone());
-                    match crate::claphost::probe(&p) {
-                        Ok(probes) => {
-                            for pr in probes {
-                                out.push(VstEntry {
-                                    path: p.clone(),
-                                    kind: VstKind::Clap,
-                                    name: pr.name,
-                                    vendor: pr.vendor,
-                                    instrument: pr.instrument,
-                                    plugin_id: Some(pr.plugin_id),
-                                    error: None,
-                                });
-                            }
-                        }
-                        Err(err) => out.push(VstEntry {
-                            path: p.clone(),
-                            kind: VstKind::Clap,
-                            name: base_label(&p),
-                            vendor: String::new(),
-                            instrument: false,
-                            plugin_id: None,
-                            error: Some(err),
-                        }),
-                    }
-                } else if name.ends_with(".vst3") {
-                    seen.push(p.clone());
-                    out.push(probe_vst3(&p));
-                } else if name.ends_with(".vst") && p.is_dir() {
-                    // VST2 bundle layout (`Foo.vst/Contents/<arch>.so`) —
-                    // what yabridge writes for Windows plugins and what
-                    // many Linux packs ship. Probe the real library inside.
-                    if let Some(so) = bundle_so(&p) {
-                        seen.push(p.clone());
-                        out.push(probe_vst2(&so));
-                    }
-                } else if name.ends_with(".so") && !p.is_dir() {
-                    seen.push(p.clone());
-                    out.push(probe_vst2(&p));
+                    out.extend(probe_isolated(&lib, kind));
                 }
             }
         }
@@ -1210,6 +1205,273 @@ fn probe_vst2(path: &Path) -> VstEntry {
             error: Some(err.to_string()),
         },
     }
+}
+
+// =========================== v37: crash-isolated probes ====================
+//
+// WHY: dlopening a vendor library can SIGSEGV/abort the whole process
+// (measured on this host: OB-Xf.vst3's probe segfaults outright, killing
+// the app's Rescan and every plugin row scanned AFTER it — which is how
+// "the CLAP plugin doesn't load at all" manifested: ~/.clap is scanned
+// last). The probe body therefore runs in a forked child that talks back
+// through a pipe and `_exit`s (no destructors, no atexit, no Rust
+// teardown — the child may hold half-initialized plugin globals and that
+// dies with it). Fork-safety: the child must NOT acquire any lock another
+// thread could have held at fork time — `scan_with` holds the loader lock
+// across the whole walk (so no parent dlopen runs concurrently), and the
+// child only calls lock-free bodies: probe_vst3/probe_vst2 take no lock,
+// and CLAP goes through `claphost::probe_unlocked`.
+
+/// Pipe transfer form of a scan row (parent <-> child).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProbeRow {
+    kind: u8,
+    name: String,
+    vendor: String,
+    instrument: bool,
+    plugin_id: Option<String>,
+    error: Option<String>,
+}
+
+fn kind_code(k: VstKind) -> u8 {
+    match k {
+        VstKind::V2 => 0,
+        VstKind::V3 => 1,
+        VstKind::Clap => 2,
+    }
+}
+
+fn kind_of(c: u8) -> VstKind {
+    match c {
+        0 => VstKind::V2,
+        1 => VstKind::V3,
+        _ => VstKind::Clap,
+    }
+}
+
+impl ProbeRow {
+    fn of(e: &VstEntry) -> Self {
+        ProbeRow {
+            kind: kind_code(e.kind),
+            name: e.name.clone(),
+            vendor: e.vendor.clone(),
+            instrument: e.instrument,
+            plugin_id: e.plugin_id.clone(),
+            error: e.error.clone(),
+        }
+    }
+    fn into_entry(self, path: PathBuf) -> VstEntry {
+        VstEntry {
+            path,
+            kind: kind_of(self.kind),
+            name: self.name,
+            vendor: self.vendor,
+            instrument: self.instrument,
+            plugin_id: self.plugin_id,
+            error: self.error,
+        }
+    }
+}
+
+/// THE probe body — identical in the inline path and the child. NOTHING
+/// here may take a process-wide lock (see the module note above).
+fn probe_rows(lib: &Path, kind: VstKind) -> Vec<ProbeRow> {
+    match kind {
+        VstKind::Clap => match crate::claphost::probe_unlocked(lib) {
+            Ok(probes) => probes
+                .into_iter()
+                .map(|pr| ProbeRow {
+                    kind: kind_code(VstKind::Clap),
+                    name: pr.name,
+                    vendor: pr.vendor,
+                    instrument: pr.instrument,
+                    plugin_id: Some(pr.plugin_id),
+                    error: None,
+                })
+                .collect(),
+            Err(err) => vec![ProbeRow {
+                kind: kind_code(VstKind::Clap),
+                name: base_label(lib),
+                vendor: String::new(),
+                instrument: false,
+                plugin_id: None,
+                error: Some(err),
+            }],
+        },
+        VstKind::V3 => vec![ProbeRow::of(&probe_vst3(lib))],
+        VstKind::V2 => vec![ProbeRow::of(&probe_vst2(lib))],
+    }
+}
+
+/// Per-probe child deadline. A cold Wine bridge legitimately needs tens of
+/// seconds; a HUNG probe (deadlock, wineserver wait) must not hang the scan
+/// forever. `SLOOPER_PROBE_TIMEOUT_SECS` overrides (tests use short ones).
+fn probe_timeout_secs() -> u64 {
+    std::env::var("SLOOPER_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90)
+}
+
+/// True while running INSIDE an isolated probe child (belt-and-braces:
+/// nothing in the child re-forks, but plugins sometimes spawn helpers).
+static PROBE_CHILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn in_probe_child() -> bool {
+    PROBE_CHILD.load(Ordering::Relaxed)
+}
+
+fn probe_inline(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
+    probe_rows(lib, kind)
+        .into_iter()
+        .map(|r| r.into_entry(lib.to_path_buf()))
+        .collect()
+}
+
+/// Probe one library file/descriptor set in a forked child. Any abnormal
+/// child death, timeout, or unparsable reply becomes a single greyed error
+/// row — the scan ALWAYS completes.
+fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
+    // Escape hatch / unit-test path: historical inline probes.
+    if std::env::var("SLOOPER_SCAN_INLINE").is_ok() {
+        return probe_inline(lib, kind);
+    }
+    let mut fds = [0i32; 2];
+    // SAFETY: plain pipe(2); fds valid afterwards on success.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return probe_inline(lib, kind);
+    }
+    // SAFETY: fork(2) of a scan-only child; the child only writes to the
+    // pipe and _exit()s (no destructors, no host locks taken — see note).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return probe_inline(lib, kind);
+    }
+    if pid == 0 {
+        PROBE_CHILD.store(true, Ordering::Relaxed);
+        let rows = std::panic::catch_unwind(|| probe_rows(lib, kind)).unwrap_or_default();
+        let json = serde_json::to_vec(&rows).unwrap_or_default();
+        let mut done = 0usize;
+        while done < json.len() {
+            // SAFETY: plain write(2) to the pipe fd.
+            let w = unsafe {
+                libc::write(
+                    fds[1],
+                    json[done..].as_ptr() as *const libc::c_void,
+                    json.len() - done,
+                )
+            };
+            if w <= 0 {
+                break;
+            }
+            done += w as usize;
+        }
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        // _exit: no atexit handlers, no static destructors — the child may
+        // hold half-initialized vendor runtimes and that dies with it.
+        unsafe { libc::_exit(0) }
+    }
+    // ---- parent: read the pipe until EOF with a deadline ----
+    unsafe { libc::close(fds[1]) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(probe_timeout_secs());
+    let mut buf: Vec<u8> = Vec::new();
+    let mut eof = false;
+    let mut chunk = [0u8; 8192];
+    while !eof {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let slice = left.min(std::time::Duration::from_millis(200));
+        let pfd = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll(2) over one fd; timeout in ms (>0, < i32::MAX).
+        let r = unsafe { libc::poll(&pfd as *const libc::pollfd as *mut libc::pollfd, 1, (slice.as_millis().max(1)) as i32) };
+        if r < 0 {
+            break; // EINTR races are fine: the deadline rules.
+        }
+        if r == 0 {
+            continue;
+        }
+        // SAFETY: read(2) into a stack buffer.
+        let n = unsafe {
+            libc::read(fds[0], chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
+        };
+        if n < 0 {
+            break;
+        }
+        if n == 0 {
+            eof = true;
+        } else {
+            buf.extend_from_slice(&chunk[..n as usize]);
+        }
+    }
+    unsafe { libc::close(fds[0]) };
+    // Reap the child (kill past the deadline).
+    let mut status = 0i32;
+    loop {
+        // SAFETY: waitpid(2) on our own child.
+        let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if w != 0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if let Ok(rows) = serde_json::from_slice::<Vec<ProbeRow>>(&buf) {
+        if !rows.is_empty() {
+            let entries: Vec<VstEntry> = rows
+                .into_iter()
+                .map(|r| r.into_entry(lib.to_path_buf()))
+                .collect();
+            // Mirror what the inline probes registered: a SUCCESSFUL probe
+            // marks the library instantiated (identity cache — never
+            // re-probe/re-instantiate it while it is live and unchanged).
+            for e in entries.iter() {
+                if e.error.is_none() && e.kind != VstKind::Clap && e.plugin_id.is_none() {
+                    note_instantiated(lib, e.kind, e.name.clone(), e.vendor.clone(), e.instrument);
+                }
+            }
+            return entries;
+        }
+    }
+    // Child died, hung, or produced garbage: greyed row, scan continues.
+    let why = if buf.is_empty() {
+        format!(
+            "crashed or timed out while loading (isolated probe exit {}) — file skipped to keep the scan alive",
+            if libc::WIFSIGNALED(status) {
+                format!("signal {}", libc::WTERMSIG(status))
+            } else {
+                format!("code {}", libc::WEXITSTATUS(status))
+            }
+        )
+    } else {
+        "probe returned unreadable data".to_string()
+    };
+    vec![VstEntry {
+        path: lib.to_path_buf(),
+        kind,
+        name: base_label(lib),
+        vendor: String::new(),
+        instrument: false,
+        plugin_id: None,
+        error: Some(why),
+    }]
 }
 
 // -------------------------------------------------------------- params ---
@@ -4082,5 +4344,92 @@ mod tests {
         assert!(vst2_is_instrument(0, 0));
         // Plain effect: flag clear, inputs present.
         assert!(!vst2_is_instrument(0, 1));
+    }
+
+    /// v37 R1: a vendor library that SIGSEGVs (or hangs) on dlopen may
+    /// never take the scan down again (measured in the field: OB-Xf.vst3
+    /// killed the whole process, and since ~/.clap scans AFTER ~/.vst3,
+    /// every CLAP silently vanished from the picker). Every probe is
+    /// fork-isolated: the killer becomes ONE greyed row and the rows
+    /// scanned before AND after it still arrive.
+    #[test]
+    fn v37_scan_survives_crashing_probe() {
+        let Some(fixture) = crate::claphost::tests::fixture_clap() else {
+            eprintln!("no cc / clap fixture — skip");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("v37-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Killer 1: dies during dlopen (constructor trap).
+        std::fs::write(
+            dir.join("crash-vst2.so"),
+            compile_probe_fixture(&dir, "crash", "__builtin_trap();"),
+        )
+        .unwrap();
+        // Killer 2: hangs inside dlopen forever (constructor spins).
+        std::fs::write(
+            dir.join("hang-vst2.so"),
+            compile_probe_fixture(&dir, "hang", "for(;;){ volatile int k=0; k++; }"),
+        )
+        .unwrap();
+        // Innocent: the two-plugin CLAP fixture (proves rows AFTER the
+        // killers still land, and multi-descriptor CLAPs survive the pipe).
+        std::fs::copy(&fixture, dir.join("good.clap")).unwrap();
+
+        std::env::set_var("SLOOPER_PROBE_TIMEOUT_SECS", "4");
+        let found = scan_with(&[dir.clone()], true);
+        std::env::remove_var("SLOOPER_PROBE_TIMEOUT_SECS");
+
+        let crash = found
+            .iter()
+            .find(|e| e.path.to_string_lossy().contains("crash-vst2"))
+            .expect("crasher still aborts the scan (no row returned)");
+        assert!(crash.error.is_some(), "crashing file must be a greyed row");
+        let hang = found
+            .iter()
+            .find(|e| e.path.to_string_lossy().contains("hang-vst2"))
+            .expect("hanging file missing");
+        assert!(hang.error.is_some(), "hanging probe must time out greyed");
+        let goods: Vec<_> = found
+            .iter()
+            .filter(|e| e.path.to_string_lossy().ends_with("good.clap"))
+            .collect();
+        assert_eq!(
+            goods.len(),
+            2,
+            "multi-descriptor CLAP must survive the isolated probe: {found:?}"
+        );
+        assert!(goods.iter().all(|e| e.error.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn compile_probe_fixture(dir: &std::path::Path, tag: &str, boom: &str) -> Vec<u8> {
+        // A constructor that dies (or never returns) takes dlopen with it —
+        // exactly the vendor failure mode the isolation must survive.
+        let src = dir.join(format!("{tag}.c"));
+        std::fs::write(
+            &src,
+            format!(
+                "__attribute__((constructor)) static void boom_ctor(void){{ {boom} }}\nint VSTPluginMain(void* f){{ (void)f; return 0; }}\n"
+            ),
+        )
+        .unwrap();
+        let out = dir.join(format!("{tag}.so"));
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        let ok = std::process::Command::new(cc)
+            .args(["-shared", "-fPIC", "-O0"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            panic!("fixture compile failed for {tag}");
+        }
+        std::fs::read(&out).unwrap()
     }
 }
