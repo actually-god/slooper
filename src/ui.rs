@@ -899,6 +899,10 @@ type InFlightProbe = (
     std::sync::Arc<dyn crate::vsthost::StageEntry>,
 );
 
+/// v37 R3: instant-audition render cache — key `(preview track or u32::MAX,
+/// midi note)`, value `(when, mono buffer)`.
+type AuditionCache = std::collections::BTreeMap<(u32, u8), (std::time::Instant, Arc<[f32]>)>;
+
 pub struct App {
     backend: Backend,
 
@@ -1106,6 +1110,17 @@ pub struct App {
     preview_track: Option<usize>,
     /// Piano-roll note clipboard (Ctrl+C/V while the roll has focus).
     roll_clip: Option<Vec<crate::midipat::Note>>,
+    /// v37 R3: rendered audition-note buffers, keyed by (preview target,
+    /// note). Bouncing a plugin track's note spawns a PRIVATE plugin copy
+    /// every time (100+ ms) — without this cache every piano-key click
+    /// paid the full spawn ("preview takes a long time to start", and the
+    /// repeated spawn reads as "preview does nothing").
+    audition_cache: AuditionCache,
+    /// v37 R3: worker pre-rendering the keyboard range in the background
+    /// (bounce only ever touches PRIVATE plugin copies, so a worker
+    /// thread cannot race the live instances).
+    audition_warm_rx: Option<std::sync::mpsc::Receiver<(u8, Arc<[f32]>)>>,
+    audition_warm_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Grid snap enable (main header checkbox). OFF = placement/resize
     /// snaps to ONE SAMPLE — the program's minimum resolution.
     snap_on: bool,
@@ -1585,6 +1600,9 @@ impl App {
             roll_clip: None,
             snap_on: cfg.snap_on,
             preview_playing: None,
+            audition_cache: Default::default(),
+            audition_warm_rx: None,
+            audition_warm_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             proj_name: String::new(),
             export_tx: __se_tx,
             export_rx: __se_rx,
@@ -4534,12 +4552,13 @@ impl App {
             }
         };
         let trel = self.backend.engine.pos().saturating_sub(r.start) as i64;
-        // Throttle: skip a sample of an unchanged value (a slider sitting
-        // still must not burn a node every frame).
+        // Throttle: never re-sample an unchanged value. (v37: the frame
+        // sampler calls this every tick — the old "but allow one node
+        // every 20 ms" exception would burn a node per 20 ms while a
+        // control simply sat still; only genuine movement is interesting.)
         let cap = &mut r.caps[ci];
         if let Some(last) = cap.nodes.last() {
-            if (last.v - v).abs() < 1e-4 && (trel - last.t) < (self.sample_rate.max(1) as i64 / 50)
-            {
+            if (last.v - v).abs() < 1e-4 {
                 return;
             }
         }
@@ -4548,6 +4567,54 @@ impl App {
             v,
             c: 0.0,
         });
+    }
+
+    /// v37 R5: write automation samples the CORE MIXER controls every
+    /// frame while armed, not only on each widget's own change event.
+    /// Event-only capture was the "super low resolution at pickup" report:
+    /// values arriving through paths other than the drag callback
+    /// (keybinds, value binds, the RMB menu) left gaps. A method (not
+    /// inlined) so headless pins can drive it frame by frame.
+    fn sample_auto_controls(&mut self) {
+        if !self.auto_rec.iter().any(|r| r.armed) || !self.backend.engine.transport_on() {
+            return;
+        }
+        for i in 0..MAX_LOOPS {
+            if !self.auto_rec[i].armed {
+                continue;
+            }
+            let targets: Vec<String> =
+                self.auto_rec[i].caps.iter().map(|c| c.target.clone()).collect();
+            for tgt in targets {
+                if let Some(v) = self.current_control_value(i, &tgt) {
+                    self.note_auto(i, &tgt, v);
+                }
+            }
+        }
+    }
+
+    /// v37 R5: current value of a CORE MIXER control in automation-curve
+    /// units, for the per-frame write-automation sampler (a control moved
+    /// through ANY path is captured — sliders, value binds, keybinds, RMB
+    /// menus). Plugin/synth params return None: those capture through
+    /// their own move events already.
+    fn current_control_value(&self, i: usize, target: &str) -> Option<f32> {
+        use crate::automation as au;
+        Some(match target {
+            au::TARGET_TRACK_VOL => vol_amp(self.trk_vol[i]),
+            au::TARGET_TRACK_GAIN => gain_amp(self.trk_gain[i]),
+            au::TARGET_TRACK_PAN => pan01(self.trk_pan[i]),
+            au::TARGET_TRACK_MUTE => {
+                if self.backend.engine.track_on(i) {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            au::TARGET_MASTER_VOL => vol_amp(self.master_midi),
+            au::TARGET_MASTER_TEMPO => self.bpm() as f32,
+            _ => return None,
+        })
     }
 
     /// Arm / stop-and-bounce write automation on track `i` (mirrors
@@ -4583,17 +4650,27 @@ impl App {
     /// target; each moved control bounces to its own clip).
     fn commit_auto_rec(&mut self, i: usize) {
         let st = std::mem::take(&mut self.auto_rec[i]);
+        // v37 R5: the recorded window (stop − start) is the asset length,
+        // exactly like the MIDI/audio takes — not the last node's time.
+        let elapsed = self
+            .backend
+            .engine
+            .pos()
+            .saturating_sub(st.start)
+            .max(1) as i64;
         let caps: Vec<AutoCap> = st
             .caps
             .into_iter()
             .filter(|c| c.nodes.len() >= 2 && !c.target.is_empty())
             .collect();
         if caps.is_empty() {
-            self.status = "automation rec: no control moved (nothing captured)".into();
+            self.status = "automation rec: no control moved (nothing captured) — \
+                           arm REC, then MOVE a control while the transport runs"
+                .into();
             return;
         }
         for cap in caps {
-            self.bounce_auto_take(i, st.start, cap.target, cap.nodes);
+            self.bounce_auto_take(i, st.start, cap.target, cap.nodes, elapsed);
         }
     }
 
@@ -4605,10 +4682,12 @@ impl App {
         start: u64,
         target: String,
         nodes: Vec<crate::automation::Node>,
+        elapsed: i64,
     ) {
         let sr = self.sample_rate.max(1) as i64;
-        let last = nodes.last().map(|n| n.t).unwrap_or(1);
-        let len = last.max(sr / 4);
+        // v37 R5: length = the whole take window (curve holds its last
+        // value past the final node); equal across take types by rule.
+        let len = elapsed.max(sr / 4);
         let mut auto = crate::automation::Automation {
             target: target.clone(),
             len_samples: len,
@@ -6789,8 +6868,11 @@ impl App {
                 }
             }
         }
-        // Notes still held at stop ring to the end of the take.
-        let end_tick = tick(&pat, end);
+        // Notes still held at stop ring to the END OF THE TAKE (the stop
+        // position), v37: before, a held note only rang to its last event,
+        // so an in-progress hold collapsed at commit.
+        let stop_pos = self.backend.engine.pos().max(start + 1);
+        let end_tick = tick(&pat, end.max(stop_pos));
         for ((ch, note), (s, vel, press)) in open {
             let st = tick(&pat, s);
             pat.notes.push(crate::midipat::Note {
@@ -6803,8 +6885,11 @@ impl App {
             });
         }
         pat.sort();
-        // Pad the length to whole bars (min one bar).
-        let bar = 4 * PPQ as u32;
+        // v37 R5: the asset length is the RECORDED WINDOW (stop − start),
+        // not a bar-rounded content end. Takes armed together therefore
+        // bounce to equal-length assets, and the clip covers exactly what
+        // the user played. The old bar-padding silently chopped takes to
+        // "whole bars" (and made everything look one-bar-short-of-run).
         let used = pat
             .notes
             .iter()
@@ -6813,7 +6898,7 @@ impl App {
             .chain(pat.press.iter().map(|m| m.at))
             .max()
             .unwrap_or(1);
-        pat.len_ticks = used.div_ceil(bar).max(1) * bar;
+        pat.len_ticks = tick(&pat, stop_pos).max(used).max(1);
         if pat.is_empty() {
             self.status = format!("track {}: no MIDI captured", t + 1);
             return;
@@ -6926,21 +7011,102 @@ impl App {
 
     /// One short test note through the audition target (piano-key click,
     /// and the note-placement preview when the user drops a note).
+    /// v37 R3: buffer-cached — rendering through a PLUGIN track spawns a
+    /// private plugin copy per bounce (hundreds of ms), which made every
+    /// click feel dead and then slow; repeats now answer instantly.
     fn audition_note(&mut self, note: u8) {
-        let sr = self.sample_rate.max(1);
-        let ev: Vec<(u64, u8, u8, u8, u8)> =
-            vec![(0, 3, 0, note, 100), ((sr as u64) / 3, 0, 0, note, 0)];
-        match self.audition_render(&ev, 0.6) {
-            Some(buf) => {
-                // Additive (v0.10): repeated note taps stack like a real
-                // keyboard instead of cutting each other off.
-                self.backend.cmd(Cmd::PreviewPlay {
-                    id: crate::audio::PREVIEW_TRANSIENT,
-                    samples: buf,
-                });
-                self.preview_playing = Some(format!("key {note}"));
+        let tag = self
+            .preview_track
+            .map(|t| t as u32)
+            .unwrap_or(u32::MAX);
+        let hit = self
+            .audition_cache
+            .get(&(tag, note))
+            .filter(|(at, _)| at.elapsed().as_secs() < 300)
+            .map(|(_, b)| b.clone());
+        let buf = match hit {
+            Some(b) => b,
+            None => {
+                let sr = self.sample_rate.max(1);
+                let ev: Vec<(u64, u8, u8, u8, u8)> =
+                    vec![(0, 3, 0, note, 100), ((sr as u64) / 3, 0, 0, note, 0)];
+                match self.audition_render(&ev, 0.6) {
+                    Some(b) => {
+                        self.audition_cache
+                            .insert((tag, note), (std::time::Instant::now(), b.clone()));
+                        b
+                    }
+                    None => {
+                        self.status = "audition: no synth available".into();
+                        return;
+                    }
+                }
             }
-            None => self.status = "audition: no synth available".into(),
+        };
+        // Additive (v0.10): repeated note taps stack like a real
+        // keyboard instead of cutting each other off.
+        self.backend.cmd(Cmd::PreviewPlay {
+            id: crate::audio::PREVIEW_TRANSIENT,
+            samples: buf,
+        });
+        self.preview_playing = Some(format!("key {note}"));
+    }
+
+    /// v37 R3: pre-render the common keyboard range in the BACKGROUND for
+    /// the picked preview target, so the FIRST click through a plugin
+    /// track is as fast as the second. `bounce_track_preview` only ever
+    /// touches private plugin copies (the audio thread owns the live
+    /// ones), so a worker thread is safe. Re-arming bumps the generation
+    /// counter; a stale worker quits at its next send.
+    fn audition_warm_start(&mut self) {
+        use std::sync::atomic::Ordering as AOrd;
+        let Some(t) = self.preview_track else {
+            return;
+        };
+        if self.sample_rate == 0 {
+            return;
+        }
+        let gen = self.audition_warm_gen.fetch_add(1, AOrd::Relaxed) + 1;
+        self.audition_cache.clear();
+        let engine = self.backend.engine.clone();
+        let sr = self.sample_rate;
+        let my = self.audition_warm_gen.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for n in 36u8..=84 {
+                if my.load(AOrd::Relaxed) != gen {
+                    return; // target changed: stop rendering
+                }
+                let mut ev: Vec<(u64, u8, u8, u8, u8)> =
+                    vec![(0, 3, 0, n, 100), ((sr as u64) / 3, 0, 0, n, 0)];
+                let nlen = (sr as f32 * 0.6) as usize;
+                if let Some(b) = engine.bounce_track_preview(t, &mut ev, nlen) {
+                    if tx.send((n, Arc::from(b))).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        self.audition_warm_rx = Some(rx);
+    }
+
+    /// v37 R3: drain warmed audition buffers into the cache.
+    fn poll_audition_warm(&mut self) {
+        let tag = self
+            .preview_track
+            .map(|t| t as u32)
+            .unwrap_or(u32::MAX);
+        let mut drained = 0usize;
+        if let Some(rx) = &self.audition_warm_rx {
+            while drained < 4 {
+                if let Ok((n, buf)) = rx.try_recv() {
+                    self.audition_cache
+                        .insert((tag, n), (std::time::Instant::now(), buf));
+                    drained += 1;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -6952,7 +7118,49 @@ impl App {
     fn render_pattern_preview(&mut self, pat: &Pattern) -> Option<Arc<[f32]>> {
         let sr = self.sample_rate.max(1);
         let secs = (pat.len_samples(sr) as f32 / sr as f32 + 1.0).clamp(0.5, 60.0);
-        self.audition_render(&self.pattern_events(pat), secs)
+        let buf = self.audition_render(&self.pattern_events(pat), secs)?;
+        // v37 R3: the roll's linked metronome — when the MAIN metro is on,
+        // the pattern preview carries the same three-tone click grid the
+        // transport plays, phase-locked to the pattern grid (the preview
+        // starts at tick 0, so beats land on sec_per_beat multiples).
+        if self.metro_on {
+            let mut b = buf.to_vec();
+            Self::overlay_metro_clicks(&mut b, sr, 60.0 / pat.bpm.max(20) as f32);
+            return Some(Arc::from(b));
+        }
+        Some(buf)
+    }
+
+    /// v37 R3: paint the metronome grid onto a preview render. Click
+    /// tones/decays mirror the RT metronome (1760/1175/880 Hz, 25 ms).
+    fn overlay_metro_clicks(buf: &mut [f32], sr: u32, sec_per_beat: f32) {
+        let beat = (sec_per_beat.max(0.05) * sr as f32) as usize;
+        if beat < 8 {
+            return;
+        }
+        let dur = (sr / 40).max(2) as i64; // 25 ms
+        let decay = sr as f32 * 0.012;
+        let mut k: i64 = 0;
+        while (k * beat as i64) < buf.len() as i64 {
+            let beat_no = (k / beat as i64) % 4;
+            let (f, a) = if beat_no == 0 {
+                (1760.0f32, 0.4f32)
+            } else {
+                (1175.0, 0.28)
+            };
+            let start = k * beat as i64;
+            for i in 0..dur {
+                let at = start + i;
+                if at >= 0 && (at as usize) < buf.len() {
+                    let fi = i as f32;
+                    buf[at as usize] +=
+                        (fi * std::f32::consts::TAU * f / sr as f32).sin()
+                            * (-fi / decay).exp()
+                            * a;
+                }
+            }
+            k += beat as i64;
+        }
     }
 
     /// Audition a MIDI asset through the default synth.
@@ -7037,7 +7245,6 @@ impl App {
         let mut save = false;
         let mut clear = false;
         let mut preview = false;
-        let mut bar_delta: i32 = 0;
         let mut audition: Option<u8> = None;
         // Preview fires when a NEW note lands (pointer released after a
         // fresh draw) — immediate audible feedback while composing.
@@ -7133,6 +7340,19 @@ impl App {
                 roll.sel_notes.clear();
                 roll.changed = true;
             }
+            // v37 R3: while the roll owns the keyboard, SPACE is the
+            // PREVIEW transport — start/stop the roll's own playback,
+            // never the main (hidden) arrangement transport.
+            let space = ui.ctx().input(|i| i.key_pressed(egui::Key::Space));
+            if space {
+                if self.backend.engine.preview_active() {
+                    self.backend.cmd(Cmd::PreviewStop { id: None });
+                    self.preview_playing = None;
+                    self.status = "preview stopped".into();
+                } else {
+                    preview = true;
+                }
+            }
         }
 
         // ---- roll wheel router ----
@@ -7198,7 +7418,7 @@ impl App {
         if docked {
             self.roll_inner(
                 ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
-                &mut save, &mut clear, &mut preview, &mut bar_delta, &mut audition,
+                &mut save, &mut clear, &mut preview, &mut audition,
                 &mut placed,
             );
         } else {
@@ -7224,7 +7444,7 @@ impl App {
             resp = w.show(ui, |ui| {
                 self.roll_inner(
                     ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
-                    &mut save, &mut clear, &mut preview, &mut bar_delta, &mut audition,
+                    &mut save, &mut clear, &mut preview, &mut audition,
                     &mut placed,
                 )
             });
@@ -7276,26 +7496,6 @@ impl App {
             self.audition_note(n);
         }
         // ---- toolbar actions deferred (need &mut self) ----
-        if bar_delta != 0 {
-            let bar = 4 * PPQ as u32;
-            let pat = &mut roll.pat;
-            if bar_delta > 0 {
-                pat.len_ticks += bar;
-            } else if pat.len_ticks > bar {
-                pat.len_ticks -= bar;
-                let lim = pat.len_ticks;
-                pat.notes.retain(|n| n.start < lim);
-                for n in pat.notes.iter_mut() {
-                    let end = (n.start + n.len).min(lim);
-                    n.len = end.saturating_sub(n.start).max(1);
-                }
-                pat.ccs.retain(|m| m.at < lim);
-                pat.press.retain(|m| m.at < lim);
-            }
-            roll.changed = true;
-            roll.sel_notes.clear();
-            roll.sel_anchor = None;
-        }
         if clear {
             roll.pat.notes.clear();
             roll.pat.ccs.clear();
@@ -7303,6 +7503,22 @@ impl App {
             roll.sel_notes.clear();
             roll.sel_anchor = None;
             roll.changed = true;
+        }
+        // v37 R3: the pattern's length is the notes themselves — end at
+        // the LAST note's tail, never a bar count (the old fixed-bar end
+        // made short phrases feel truncated and long ones need "+bar").
+        if roll.changed {
+            let end = roll
+                .pat
+                .notes
+                .iter()
+                .map(|n| n.start + n.len.max(1))
+                .max()
+                .unwrap_or(0)
+                .max(roll.pat.ccs.iter().map(|m| m.at).max().unwrap_or(0))
+                .max(roll.pat.press.iter().map(|m| m.at).max().unwrap_or(0))
+                .max((PPQ as u32) / 4);
+            roll.pat.len_ticks = end;
         }
         if preview {
             let pat = roll.pat.clone();
@@ -7363,7 +7579,6 @@ impl App {
         save: &mut bool,
         clear: &mut bool,
         preview: &mut bool,
-        bar_delta: &mut i32,
         audition: &mut Option<u8>,
         placed: &mut Option<u8>,
     ) {
@@ -7416,21 +7631,20 @@ impl App {
                         });
                     if let Some(v) = pick {
                         self.preview_track = v;
+                        // v37 R3: a new target means a new set of audition
+                        // buffers — drop the cache and re-warm it.
+                        self.audition_warm_start();
                         self.save_config();
                     }
+                    // v37 R3: the roll's LINKED metronome — the same
+                    // switch as the main header's, and the pattern preview
+                    // carries the click grid stamped into its own audio.
                     if ui
-                        .small_button("-bar")
-                        .on_hover_text("One bar shorter (notes beyond it are dropped)")
+                        .checkbox(&mut self.metro_on, "\u{1f110} metro")
+                        .on_hover_text("Metronome (same switch as the main header) \u{b7} the roll's PREVIEW carries the click grid")
                         .clicked()
                     {
-                        *bar_delta = -1;
-                    }
-                    if ui
-                        .small_button("+bar")
-                        .on_hover_text("One bar longer")
-                        .clicked()
-                    {
-                        *bar_delta = 1;
+                        self.send_metro();
                     }
                     if ui
                         .small_button("quantize")
@@ -7469,9 +7683,9 @@ impl App {
                     }
                     ui.label(
                         RichText::new(format!(
-                            "{} notes \u{b7} {} bars \u{b7} {} bpm (metronome)",
+                            "{} notes \u{b7} {}s \u{b7} {} bpm (metronome)",
                             roll.pat.notes.len(),
-                            (roll.pat.len_ticks / (4 * PPQ as u32)).max(1),
+                            roll.pat.len_samples(sr) as f64 / sr.max(1) as f64,
                             roll.pat.bpm
                         ))
                         .weak()
@@ -7584,12 +7798,31 @@ impl App {
                             Color32::from_gray(58)
                         },
                     );
+                    // v37: key separators. Adjacent naturals (B|C) drew as
+                    // one continuous light band, so rows "doubled" and
+                    // people played the wrong octave. A dark hairline under
+                    // EVERY key (strip AND grid row line brightened) makes
+                    // each row readable regardless of black/white pattern.
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.min.x, y + roll.row_h),
+                            egui::pos2(rect.min.x + KEYS_W - 1.0, y + roll.row_h),
+                        ],
+                        egui::Stroke::new(1.0f32, Color32::from_gray(10)),
+                    );
                     painter.line_segment(
                         [
                             egui::pos2(grid_x0, y + roll.row_h),
                             egui::pos2(rect.max.x - SB, y + roll.row_h),
                         ],
-                        egui::Stroke::new(0.5f32, Color32::from_gray(40)),
+                        egui::Stroke::new(
+                            if n.rem_euclid(12) == 11 { 1.0f32 } else { 0.7f32 },
+                            if n.rem_euclid(12) == 11 {
+                                Color32::from_gray(95)
+                            } else {
+                                Color32::from_gray(66)
+                            },
+                        ),
                     );
                     if n.rem_euclid(12) == 0 {
                         painter.text(
@@ -7620,7 +7853,6 @@ impl App {
                 // resize handles, same language as the loop-area handles)
                 const EDGE_PX: f32 = 6.0;
                 let hover = ui.input(|i| i.pointer.hover_pos());
-                let mut hot_edge = false;
                 for (idx, note) in roll.pat.notes.iter().enumerate() {
                     let n = note.note as i32;
                     if n < lo as i32 - 1 || n > hi as i32 + 1 {
@@ -7663,14 +7895,6 @@ impl App {
                             );
                         }
                     }
-                    if let Some(hp) = hover {
-                        let y_in = hp.y >= y && hp.y <= y + roll.row_h;
-                        if y_in
-                            && ((hp.x - x0).abs() <= EDGE_PX || (hp.x - x1).abs() <= EDGE_PX)
-                        {
-                            hot_edge = true;
-                        }
-                    }
                 }
                 // marquee rectangle while rubber-banding
                 if let RollGesture::Marquee { from, .. } = roll.gesture {
@@ -7706,6 +7930,23 @@ impl App {
                             .then_some((i, n0, n1))
                     })
                 };
+                // v37: the resize cursor must reflect what a PRESS would
+                // grab. The old hot-edge test scanned EVERY note, so a
+                // hidden neighbour's cap could light the cursor over the
+                // topmost note's BODY — the "cursor says resize, click
+                // places/moves instead" complaint. Same topmost-note rule
+                // as the press branch below, no exceptions.
+                let hot_edge = hover.is_some_and(|hp| {
+                    if !in_grid(hp) {
+                        return false;
+                    }
+                    match note_hit(&roll.pat.notes, hp) {
+                        Some((_, n0, n1)) => {
+                            (x_of(n0) - hp.x).abs() <= EDGE_PX || (x_of(n1) - hp.x).abs() <= EDGE_PX
+                        }
+                        None => false,
+                    }
+                });
                 if let Some(pt) = resp.interact_pointer_pos() {
                     let mods = ui.input(|i| i.modifiers);
                     // Right-click deletes the note under the cursor.
@@ -7731,7 +7972,14 @@ impl App {
                     // fires after the pointer has already drifted past the
                     // tiny edge-hit zones. That drift was why "can't grab
                     // a clip/note edge" felt impossible.)
+                    // v37: PRIMARY ONLY. `is_pointer_button_down_on()`
+                    // answers for any held button, so every right-click
+                    // also armed a draw/resize gesture before the delete
+                    // ran — the source of "right-click delete is
+                    // inconsistent" and notes created-then-deleted on
+                    // empty-grid RMB.
                     if resp.is_pointer_button_down_on()
+                        && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
                         && matches!(roll.gesture, RollGesture::None)
                         && in_grid(pt)
                     {
@@ -10324,6 +10572,31 @@ impl eframe::App for App {
             100
         }));
 
+        // v37 R5: publish "a recorder is armed" to the RT thread every
+        // tick (atomic write, zero cost when unchanged) — while ANY take /
+        // MIDI / automation recorder is armed the transport must run past
+        // the project end instead of parking on it.
+        let rec_any = (0..MAX_LOOPS).any(|t| {
+            self.backend.engine.rec_state_of(t) == TR_REC
+                || self.midi_rec[t].armed
+                || self.auto_rec[t].armed
+        });
+        if self.backend.engine.recording() != rec_any {
+            self.backend.engine.set_recording(rec_any);
+        }
+        self.sample_auto_controls();
+
+        // v37 R3: keep the audition cache fed (background pre-render of
+        // the picked preview track) while the piano roll is open.
+        self.poll_audition_warm();
+        if self.piano_roll.is_some()
+            && self.sample_rate > 0
+            && self.preview_track.is_some()
+            && self.audition_warm_rx.is_none()
+        {
+            self.audition_warm_start();
+        }
+
         self.handle_shortcuts(ctx);
 
         // v22: land the OS-clipboard seed staged by the last copy (see
@@ -12162,23 +12435,27 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
         .map(|i| (dock_order(app, i), i))
         .collect();
     others.sort_by_key(|(o, _)| *o);
-    // "Outer-ness": larger = closer to the screen edge along this axis.
-    let outer_of = |i: usize| -> f32 {
-        let r = app.dock_rects[i];
+    // v37 R6: rank ALONG the tiling axis. The old rank compared
+    // "outer-ness" (distance to the screen edge) — but EVERY window on
+    // one strip shares that coordinate (they tile side by side, not in
+    // depth), so a middle drop always collapsed to rank 0 or n: docked
+    // windows literally could not be re-ordered between each other.
+    // Now: the drop coordinate along the edge picks the insertion slot
+    // by the neighbours' live centers (bottom/top tile on X, sides on Y).
+    let along = |r: [f32; 4]| -> f32 {
         match edge {
-            0 => -(r[0]),
-            1 => r[0] + r[2],
-            3 => -(r[1]),
-            _ => r[1] + r[3],
+            0 | 1 => r[1] + r[3] * 0.5,
+            _ => r[0] + r[2] * 0.5,
         }
     };
     let me = match edge {
-        0 => -pt.x,
-        1 => pt.x,
-        3 => -pt.y,
-        _ => pt.y,
+        0 | 1 => pt.y,
+        _ => pt.x,
     };
-    let rank = others.iter().filter(|(_, i)| outer_of(*i) > me).count();
+    let rank = others
+        .iter()
+        .filter(|(_, i)| app.dock_rects[*i][2] > 8.0 && along(app.dock_rects[*i]) < me)
+        .count();
     others.insert(rank.min(others.len()), (0, idx));
     for (rank, (_, i)) in others.iter().enumerate() {
         if *i < 4 {
@@ -14139,8 +14416,12 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             );
         });
         if mute_resp.clicked() {
-            // v0.11 R5: mute rides automation too (1 = muted).
-            app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 0.0 } else { 1.0 });
+            // v0.11 R5: mute rides automation too (1 = muted). v37 fix:
+            // the value must be the state the click MOVES TO — a click
+            // while unmuted mutes, so it records 1.0 (this was inverted
+            // here while the value-bind path recorded it correctly, so
+            // mixer-click mutes wrote the wrong polarity curve).
+            app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 1.0 } else { 0.0 });
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
         }
         if ui
@@ -22095,7 +22376,11 @@ mod tests {
         ctx: &egui::Context,
         mut get: impl FnMut(&mut App) -> Option<T>,
     ) -> Option<T> {
-        for _ in 0..400 {
+        // v37: 10 s of budget raced the editor probe under full-suite
+        // parallel load (every plugin sweep test hammering dlopen + X at
+        // once). Generous ceiling — the pump still exits the tick the
+        // editor lands.
+        for _ in 0..1600 {
             if let Some(v) = get(app) {
                 return Some(v);
             }
@@ -29842,5 +30127,222 @@ mod tests {
             "the WAV must start at the PROJECT start, not the transport"
         );
 
+    }
+
+    // ---- v37 R5: recording rework ------------------------------------
+
+    /// v37 R5: a MIDI take's asset length is the RECORDED WINDOW, never a
+    /// bar-rounded length (the "MIDI records only 1 measure" report: the
+    /// window was silently clamped to whole bars of content).
+    #[test]
+    fn v37_midi_rec_take_length_is_the_recorded_window() {
+        let mut app = headless_app("v37recwin");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let rate = app.sample_rate.max(1);
+        let sr = rate as u64;
+        let sel = app.selected;
+        app.backend.engine.force_pos(0);
+        app.toggle_midi_rec(sel);
+        assert!(app.midi_rec[sel].armed);
+        app.backend.engine.force_pos(sr / 2);
+        app.capture_midi_msg(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 60,
+            velocity: 100,
+        });
+        app.backend.engine.force_pos(sr / 2 + 4_800);
+        app.capture_midi_msg(&MidiMsg::NoteOff {
+            channel: 1,
+            note: 60,
+            velocity: 0,
+        });
+        // 2.5 s after arming, not a whole bar of anything:
+        app.backend.engine.force_pos(5 * sr / 2);
+        app.toggle_midi_rec(sel);
+        let pat = app
+            .assets
+            .last()
+            .unwrap()
+            .pattern
+            .clone()
+            .expect("pattern");
+        assert_eq!(
+            pat.len_samples(rate),
+            5 * sr / 2,
+            "take = exactly the recorded window"
+        );
+    }
+
+    /// v37 R5: a note still held at stop rings to the STOP position (was:
+    /// only to its last event, so holds collapsed at commit).
+    #[test]
+    fn v37_midi_rec_held_note_rings_to_stop() {
+        let mut app = headless_app("v37hold");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let rate = app.sample_rate.max(1);
+        let sr = rate as u64;
+        let sel = app.selected;
+        app.backend.engine.force_pos(0);
+        app.toggle_midi_rec(sel);
+        app.backend.engine.force_pos(sr / 2);
+        app.capture_midi_msg(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 64,
+            velocity: 90,
+        });
+        app.backend.engine.force_pos(3 * sr);
+        app.toggle_midi_rec(sel);
+        let pat = app.assets.last().unwrap().pattern.clone().unwrap();
+        let n = &pat.notes[0];
+        let want = pat.samples_to_ticks(5 * sr / 2, rate);
+        assert!(
+            n.len.abs_diff(want) <= 1,
+            "held note rings to stop: {} vs {want}",
+            n.len
+        );
+    }
+
+    /// v37 R5: write automation captures EVERY frame through the core
+    /// sampler (a control moved by a non-widget path is still recorded —
+    /// "resolution at pickup is super low"), and the bounced asset covers
+    /// the whole take window ("only records a very short window").
+    #[test]
+    fn v37_auto_rec_take_length_and_pickup_resolution() {
+        let mut app = headless_app("v37autores");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let sr = app.sample_rate.max(1) as u64;
+        app.backend.engine.force_pos(0);
+        app.backend.engine.set_transport(true);
+        app.auto_rec[0] = AutoRecState {
+            armed: true,
+            start: 0,
+            caps: Vec::new(),
+        };
+        // First movement via the event path creates the capture.
+        app.set_trk_vol(0, 40);
+        assert_eq!(app.auto_rec[0].caps.len(), 1, "vol capture opened");
+        // Further movements arrive OUTSIDE the widget event path: the
+        // frame sampler must add a node for each changed value.
+        let mut added = 0usize;
+        for f in 1..=10u64 {
+            app.trk_vol[0] = 40 + f as u8 * 3;
+            app.backend.engine.force_pos(f * sr / 10);
+            let before = app.auto_rec[0].caps[0].nodes.len();
+            app.sample_auto_controls();
+            added += app.auto_rec[0].caps[0].nodes.len() - before;
+        }
+        assert!(added >= 9, "sampler captured {added}/10 off-event moves");
+        // Commit at 3 s: the asset spans the WHOLE window.
+        app.backend.engine.force_pos(3 * sr);
+        app.toggle_auto_rec(0);
+        let a = app
+            .assets
+            .iter()
+            .rev()
+            .find(|a| a.automation.is_some())
+            .expect("automation asset");
+        assert_eq!(a.automation.as_ref().unwrap().len_samples, 3 * sr as i64);
+    }
+
+    /// v37 R5: takes armed together bounce to EXACTLY equal lengths —
+    /// MIDI and automation here; audio takes take the same recorded-window
+    /// rule by construction (the RT buffer spans start..stop).
+    #[test]
+    fn v37_simultaneous_midi_and_auto_takes_share_exact_length() {
+        let mut app = headless_app("v37samel");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let rate = app.sample_rate.max(1);
+        let sr = rate as u64;
+        let sel = app.selected;
+        app.backend.engine.force_pos(0);
+        app.toggle_midi_rec(sel);
+        app.auto_rec[0] = AutoRecState {
+            armed: true,
+            start: 0,
+            caps: Vec::new(),
+        };
+        app.capture_midi_msg(&MidiMsg::NoteOn {
+            channel: 1,
+            note: 60,
+            velocity: 100,
+        });
+        app.set_trk_vol(0, 60);
+        app.backend.engine.force_pos(sr / 2);
+        app.set_trk_vol(0, 80); // two nodes minimum for a real curve
+        app.backend.engine.force_pos(5 * sr / 2);
+        app.toggle_midi_rec(sel); // MIDI commits at the SAME stop position
+        app.toggle_auto_rec(0);
+        let mlen = app
+            .assets
+            .iter()
+            .rev()
+            .find_map(|a| a.pattern.clone())
+            .expect("midi asset")
+            .len_samples(rate);
+        let alen = app
+            .assets
+            .iter()
+            .rev()
+            .find_map(|a| a.automation.as_ref().map(|au| au.len_samples))
+            .expect("auto asset") as u64;
+        assert_eq!(mlen, 5 * sr / 2, "MIDI take = window");
+        assert_eq!(alen, 5 * sr / 2, "automation take = window");
+    }
+
+    /// v37 R6: dragging a docked window across the SAME strip re-orders
+    /// it ("MIDI bindings to the left of MIDI monitor"). The old rank
+    /// compared outer-edge distances — shared by every window in the
+    /// strip — so a middle drop always collapsed to first-or-last and
+    /// windows could not land between each other.
+    #[test]
+    fn v37_dock_reorder_lands_in_the_middle_slot() {
+        let mut app = headless_app("v37dockord");
+        let ctx = egui::Context::default();
+        app.side_wins.dock[1] = [1, 2, 0]; // BINDINGS, bottom, left
+        app.side_wins.dock[2] = [1, 2, 1]; // MONITOR, bottom, middle
+        app.side_wins.dock[3] = [1, 2, 2]; // MIXER, bottom, right
+        app.show_binds = true;
+        app.show_midi = true;
+        app.show_mixer = true;
+        frame(&mut app, &ctx, vec![]);
+        let (r1, r2, r3) = (
+            app.dock_rects[1],
+            app.dock_rects[2],
+            app.dock_rects[3],
+        );
+        assert!(
+            r1[2] > 8.0 && r2[2] > 8.0 && r3[2] > 8.0,
+            "all three docked panels painted"
+        );
+        assert!(r1[0] < r2[0] && r2[0] < r3[0], "binds | monitor | mixer");
+
+        // Carry the MIXER header and drop it between BINDINGS and the
+        // MONITOR (inside the bottom snap zone).
+        let from = egui::pos2(r3[0] + r3[2] * 0.5, r3[1] + 13.0);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        assert_eq!(app.free_drag.map(|(i, _)| i), Some(3));
+        let dst = egui::pos2(
+            r1[0] + r1[2] + (r2[0] - r1[0] - r1[2]) * 0.5 + 4.0,
+            r3[1] + r3[3] - 20.0,
+        );
+        frame(&mut app, &ctx, vec![moved(dst)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)],
+        );
+        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 2, "stays in the bottom dock");
+        assert_eq!(dock_order(&app, 1), 0, "bindings stays leftmost");
+        assert_eq!(dock_order(&app, 3), 1, "mixer landed in the MIDDLE slot");
+        assert_eq!(dock_order(&app, 2), 2, "monitor pushed right");
     }
 }

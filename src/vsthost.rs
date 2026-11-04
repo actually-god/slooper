@@ -2977,47 +2977,63 @@ impl RtStageEntry {
             }
             return;
         }
-        // VST2: the pool grows once, then every event is a reuse.
-        while ev_pool.len() < 2 {
+        // VST2: ONE `processEvents` call per audio block carrying EVERY due
+        // event (v37 R4). The old path looped the fixed 2-slot `api::Events`
+        // and called processEvents multiple times per block; the VST2 spec
+        // allows exactly one, and plugins that REPLACE the queue on each
+        // call silently dropped the first batch — losing a note-on left a
+        // dead note, losing a note-off left one ringing forever ("no
+        // sustain, every note the same short blip"). The VST2 flexible
+        // array pattern: header + N pointers laid out like `api::Events`.
+        const EV_BATCH_MAX: usize = 64;
+        #[repr(C)]
+        struct EvBatch {
+            num_events: i32,
+            _pad: [u8; 4],
+            _reserved: isize,
+            events: [*mut vst2::api::Event; EV_BATCH_MAX],
+        }
+        // The pool grows once, then every event is a reuse.
+        while ev_pool.len() < deliver.len() {
             // Zeroed raw event: a benign null record until overwritten.
             ev_pool.push(Box::new(unsafe { std::mem::zeroed() }));
         }
-        let mut i = 0usize;
-        while i < deliver.len() {
-            let take = 2usize.min(deliver.len() - i);
-            if let Backend::V2(inst) = backend {
-                use vst2::{api, plugin::Plugin};
-                for (k, q) in deliver[i..i + take].iter().enumerate() {
-                    let delta = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1);
-                    let me = api::MidiEvent {
-                        event_type: api::EventType::Midi,
-                        byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
-                        delta_frames: delta as i32,
-                        flags: 0,
-                        note_length: 0,
-                        note_offset: 0,
-                        midi_data: [q.m[0], q.m[1], q.m[2]],
-                        _midi_reserved: 0,
-                        detune: 0,
-                        note_off_velocity: 0,
-                        _reserved1: 0,
-                        _reserved2: 0,
-                    };
-                    // Identical layout — the crate's own transmute idiom.
-                    let mut raw: api::Event = unsafe { std::mem::transmute(me) };
-                    raw.event_type = api::EventType::Midi;
-                    *ev_pool[k] = raw;
-                }
-                let events = api::Events {
-                    num_events: take as i32,
-                    _reserved: 0,
-                    // Boxed slots keep the pointers stable; slot 1 is a
-                    // dummy whenever `take == 1`.
-                    events: [ev_pool[0].as_mut(), ev_pool[1].as_mut()],
+        if let Backend::V2(inst) = backend {
+            use vst2::{api, plugin::Plugin};
+            let n = deliver.len().min(EV_BATCH_MAX);
+            let mut batch = EvBatch {
+                num_events: n as i32,
+                _pad: [0; 4],
+                _reserved: 0,
+                events: [std::ptr::null_mut(); EV_BATCH_MAX],
+            };
+            for (k, q) in deliver[..n].iter().enumerate() {
+                let delta = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1);
+                let me = api::MidiEvent {
+                    event_type: api::EventType::Midi,
+                    byte_size: std::mem::size_of::<api::MidiEvent>() as i32,
+                    delta_frames: delta as i32,
+                    flags: 0,
+                    note_length: 0,
+                    note_offset: 0,
+                    midi_data: [q.m[0], q.m[1], q.m[2]],
+                    _midi_reserved: 0,
+                    detune: 0,
+                    note_off_velocity: 0,
+                    _reserved1: 0,
+                    _reserved2: 0,
                 };
-                inst.0.process_events(&events);
+                // Identical layout — the crate's own transmute idiom.
+                let mut raw: api::Event = unsafe { std::mem::transmute(me) };
+                raw.event_type = api::EventType::Midi;
+                *ev_pool[k] = raw;
+                batch.events[k] = ev_pool[k].as_mut();
             }
-            i += take;
+            // `EvBatch`'s prefix is layout-identical to `api::Events` with
+            // the trailing pointer array enlarged — exactly what the VST2
+            // spec prescribes for >2 events.
+            let events = unsafe { &*(&batch as *const EvBatch as *const api::Events) };
+            inst.0.process_events(events);
         }
     }
 
@@ -3557,6 +3573,13 @@ mod tests {
         let _ = ran;
     }
 
+    /// Instruments whose sound legitimately ends before the sustain
+    /// window (plucked/one-shot tails) — exempt from the hold check.
+    /// Geonkick's factory-default patch is a decaying FM electric-piano:
+    /// audible at 0.1 s, inaudible by 1.4 s while the key is held
+    /// (measured via examples/plugin_sustain — no host event involved).
+    const NO_SUSTAIN_EXPECTED: &[&str] = &["Geonkick"];
+
     /// Every installed instrument VST3 must actually SOUND when fed a
     /// note. Regression pin for the JUCE-wrapper silent-bus bug:
     /// distrho-ports builds (Vitalium et al.) advertise their buses with
@@ -3579,11 +3602,23 @@ mod tests {
             };
             rt(&load.entry).note_on(0, 60, 110);
             let mut peak = 0.0f32;
-            // ~1 second at 48k in ring-sized chunks.
-            for _ in 0..96 {
+            // v37 R4: hold the note ~2 s and sample the SUSTAIN window
+            // (1.4-1.8 s in). A host that shortens every hold to a blip
+            // passed the old 1 s peak test — the "long and short notes
+            // sound identical" regression. Instruments with a legitimate
+            // dead tail before 1.4 s are listed in NO_SUSTAIN_EXPECTED.
+            const SUSTAIN_FROM: usize = 1_400; // ms into the hold
+            const SUSTAIN_TO: usize = 1_800;
+            let mut sustain_peak = 0.0f32;
+            for i in 0..192usize {
                 let mut out = [0.0f32; 512];
                 load.entry.process(&[0.0f32; 512], &mut out);
-                peak = peak.max(out.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+                let t_ms = i * 512 * 1000 / 48_000;
+                let p = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                peak = peak.max(p);
+                if (SUSTAIN_FROM..SUSTAIN_TO).contains(&t_ms) {
+                    sustain_peak = sustain_peak.max(p);
+                }
             }
             load.entry.all_notes_off();
             assert!(
@@ -3592,6 +3627,18 @@ mod tests {
                  (unactivated output bus?)",
                 e.path.display()
             );
+            if !NO_SUSTAIN_EXPECTED
+                .iter()
+                .any(|p| e.path.to_string_lossy().contains(p))
+            {
+                assert!(
+                    sustain_peak > 1e-4,
+                    "{}: note died before 1.4 s — holds are being shortened \
+                     (add to NO_SUSTAIN_EXPECTED only if the instrument \
+                     genuinely has a plucked/dead tail)",
+                    e.path.display()
+                );
+            }
             checked += 1;
         }
         // Informational: CI has no instruments installed.
@@ -4378,7 +4425,7 @@ mod tests {
         std::fs::copy(&fixture, dir.join("good.clap")).unwrap();
 
         std::env::set_var("SLOOPER_PROBE_TIMEOUT_SECS", "4");
-        let found = scan_with(&[dir.clone()], true);
+        let found = scan_with(std::slice::from_ref(&dir), true);
         std::env::remove_var("SLOOPER_PROBE_TIMEOUT_SECS");
 
         let crash = found
