@@ -114,6 +114,18 @@ extern "C" {
         depth: *mut u32,
     ) -> c_int;
     fn XGetWindowAttributes(d: *mut Display, w: XWindow, attrs: *mut XWindowAttributes) -> c_int;
+    /// v36: WM size restrictions. `XSetWMNormalHints` writes WM_NORMAL_HINTS
+    /// so a window manager refuses resizes the plugin cannot follow;
+    /// `XGetWMNormalHints` reads them back (pinned from a second X
+    /// connection, the same short-lived-probe pattern as `request_wm_delete`).
+    fn XSetWMNormalHints(d: *mut Display, w: XWindow, hints: *const XSizeHints) -> c_int;
+    #[allow(dead_code)] // read back only from the v36 pins (test-only probe)
+    fn XGetWMNormalHints(
+        d: *mut Display,
+        w: XWindow,
+        hints_return: *mut XSizeHints,
+        supplied_return: *mut c_long,
+    ) -> c_int;
     fn XChangeWindowAttributes(
         d: *mut Display,
         w: XWindow,
@@ -196,6 +208,66 @@ const EFF_EDIT_SIZE: i32 = 78;
 /// unusable — a mapped-but-never-exposed window reads all-zero under a
 /// compositing manager, indistinguishable from drawn black.
 const CONTAINER_BG: u64 = 0x2A16B4;
+
+/// v36: `XSizeHints` (X11/Xutil.h) — the WM_NORMAL_HINTS payload. Layout
+/// must match the C struct exactly: one `long` then the int block
+/// (position/size, min, max, resize increments, aspect pairs, base size,
+/// gravity).
+#[repr(C)]
+struct XSizeHints {
+    flags: c_long,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    min_width: c_int,
+    min_height: c_int,
+    max_width: c_int,
+    max_height: c_int,
+    width_inc: c_int,
+    height_inc: c_int,
+    min_aspect_x: c_int,
+    min_aspect_y: c_int,
+    max_aspect_x: c_int,
+    max_aspect_y: c_int,
+    base_width: c_int,
+    base_height: c_int,
+    win_gravity: c_int,
+}
+const PMIN_SIZE: c_long = 1 << 4;
+const PMAX_SIZE: c_long = 1 << 5;
+
+/// v36: pin the editor container's WM size hints. A fixed-size plugin
+/// editor gets PMinSize|PMaxSize locked to its own rect, so dragging the
+/// WM frame can no longer expose the sentinel (blue) background — the
+/// reported "VST windows just add blue background" on resize — because
+/// the WM refuses the resize outright. `None` releases the pin (only
+/// ever written for plugins that never advertise resizing).
+unsafe fn lock_wm_size(d: *mut Display, win: XWindow, size: Option<(i32, i32)>) {
+    let mut h: XSizeHints = std::mem::zeroed();
+    h.flags = PMIN_SIZE | PMAX_SIZE;
+    match size {
+        Some((w, hh)) => {
+            let (w, hh) = (w.max(1), hh.max(1));
+            h.min_width = w;
+            h.min_height = hh;
+            h.max_width = w;
+            h.max_height = hh;
+            h.base_width = w;
+            h.base_height = hh;
+        }
+        None => {
+            // Release: hints present but effectively unbounded (max 0 =
+            // "unset" per convention every WM honours).
+            h.min_width = 1;
+            h.min_height = 1;
+            h.base_width = 1;
+            h.base_height = 1;
+        }
+    }
+    XSetWMNormalHints(d, win, &h);
+    XFlush(d);
+}
 
 // VST2 editor opcodes (aeff.h / vestige.h, cross-checked against the
 // vendored vst2 crate's OpCode enum).
@@ -799,6 +871,11 @@ const VERIFY_PATIENCE: Duration = Duration::from_secs(3);
 
 struct Editor {
     handle: Vst2Handle,
+    /// v36: `Some(size)` while the WM frame is pinned to a fixed editor
+    /// size (plugin refused `effEditCanSizeWindow`). User resizes that
+    /// slip through snap back to this; a plugin-driven size change
+    /// re-pins it. `None` = freely resizable plugin, hints untouched.
+    fixed: Option<(i32, i32)>,
     /// v22: live readback plumbing — the plugin's own GUI writes
     /// `AEffect::params` directly; the host cell mirror never hears about
     /// it unless the pump reads the instance back (see `sync_cells`).
@@ -882,6 +959,7 @@ unsafe fn make_editor(
     EDITORS_ACTIVE.fetch_add(1, Ordering::Relaxed);
     Some(Editor {
         handle,
+        fixed: None,
         cells,
         ncell,
         d,
@@ -991,7 +1069,16 @@ impl Editor {
                     // clipped or sentinel-coloured strips (the "GUIs don't
                     // fully work" report).
                     if let Some((w, h)) = resized {
-                        if (w, h) != *last_container
+                        // v36: pinned (fixed-size) editor — any WM resize
+                        // that still arrives (maximize, a WM that ignores
+                        // hints) snaps straight back; never routed to the
+                        // plugin, which cannot follow it.
+                        if let Some((fw, fh)) = self.fixed {
+                            if (w as i32, h as i32) != (fw, fh) {
+                                XResizeWindow(self.d, self.win, fw, fh);
+                                XFlush(self.d);
+                            }
+                        } else if (w, h) != *last_container
                             && w >= 8
                             && h >= 8
                             && (last_container.0 != 0 || (w, h) != (640, 420))
@@ -1039,6 +1126,22 @@ impl Editor {
                     // ~1/EDITOR_TICK_MS instead of the old 33 Hz.
                     self.handle
                         .dispatch(EFF_EDIT_IDLE, 0, 0, ptr::null_mut(), 0.0);
+                    // v36: audioMasterSizeWindow — the plugin asked to
+                    // resize its own window (FLTK editors and friends do
+                    // this from idle). Grow the container to exactly what
+                    // it asked for; a pinned editor re-pins at the new
+                    // size, a resizable one stays free.
+                    if let Some((w, h)) = vst2::host::take_size_request(self.handle.as_usize()) {
+                        if w >= 8 && h >= 8 {
+                            if self.fixed.is_some() {
+                                self.fixed = Some((w, h));
+                                lock_wm_size(self.d, self.win, Some((w, h)));
+                            }
+                            XResizeWindow(self.d, self.win, w, h);
+                            self.shared.width.store(w, Ordering::SeqCst);
+                            self.shared.height.store(h, Ordering::SeqCst);
+                        }
+                    }
                     // Window-system housekeeping on a timer (v16): child
                     // count for the UI, the dead-editor watchdog, and the
                     // plugin's preferred rect. Healthy editors do not
@@ -1075,6 +1178,13 @@ impl Editor {
                             if (w, h) != *last_size && w > 0 && h > 0 {
                                 *last_size = (w, h);
                                 XResizeWindow(self.d, self.win, w, h);
+                                // v36: a pinned editor whose PLUGIN
+                                // changed the size (preset load, patch)
+                                // re-pins to the new native size.
+                                if self.fixed.is_some() {
+                                    self.fixed = Some((w, h));
+                                    lock_wm_size(self.d, self.win, Some((w, h)));
+                                }
                             }
                         }
                     }
@@ -1119,6 +1229,29 @@ impl Editor {
         }
         let mut protocols = [self.wm_delete];
         XSetWMProtocols(self.d, self.win, protocols.as_mut_ptr(), 1);
+        // v36: does the plugin reflow when its window changes size?
+        // `effEditCanSizeWindow` (VST2.4) is the vendor's word on it —
+        // and if the answer is no, pin the frame to the editor rect so
+        // dragging the border cannot expose the sentinel background (the
+        // "blue background on resize" report). Old 2.3 plugins that
+        // resize via raw ConfigureNotify keep the pre-v36 behavior only
+        // when they also answer yes here.
+        let (can, rect) = {
+            let _loader = crate::vsthost::vst_loader_lock();
+            let can = self
+                .handle
+                .dispatch(EFF_EDIT_CAN_SIZE, 0, 0, ptr::null_mut(), 0.0)
+                != 0;
+            (can, edit_rect(&self.handle))
+        };
+        self.fixed = if can {
+            None
+        } else {
+            rect.filter(|(w, h)| *w >= 8 && *h >= 8)
+        };
+        if let Some(s) = self.fixed {
+            lock_wm_size(self.d, self.win, Some(s));
+        }
         XFlush(self.d);
     }
 
@@ -1185,6 +1318,10 @@ struct Editor3 {
     /// The shadow instance, owned by the GUI thread. `Option` so
     /// teardown can retire it under the loader lock exactly once.
     plugin: Option<vst3_host::Plugin>,
+    /// v36: `Some(size)` while the WM frame is pinned (the view reported
+    /// `canResize == false`, or a plugin-side request pinned it). Same
+    /// contract as the VST2 editor's field.
+    fixed: Option<(i32, i32)>,
     /// VST3 parameter ids in `VstParams`-cell order: cell index =
     /// position, value = id (`performEdit` reports ids).
     ids: Vec<u32>,
@@ -1479,6 +1616,7 @@ unsafe fn make_editor3(
     EDITORS_ACTIVE.fetch_add(1, Ordering::Relaxed);
     Some(Editor3 {
         plugin: Some(plugin),
+        fixed: None,
         ids,
         params,
         sr: sample_rate,
@@ -1552,8 +1690,23 @@ impl Editor3 {
                             Ok(Some((w, h))) if w > 0 && h > 0 => Some((w, h)),
                             _ => None,
                         };
+                        // v36: query the view's resize stance BEFORE the
+                        // `self.decorate()` borrow (plugin is borrowed
+                        // mutably until teardown).
+                        let can_resize = plugin.attached_editor_can_resize();
                         self.shared.painted.store(true, Ordering::SeqCst);
                         self.decorate();
+                        // v36: pin the frame when the view itself says it
+                        // cannot resize (size-constraint query). `None` /
+                        // unknown = conservative: leave the frame free,
+                        // exactly the pre-v36 behavior.
+                        self.fixed = match (can_resize, attached) {
+                            (Some(false), Some((w, h))) => Some((w, h)),
+                            _ => None,
+                        };
+                        if let Some(s) = self.fixed {
+                            lock_wm_size(self.d, self.win, Some(s));
+                        }
                         self.phase = match attached {
                             Some((w, h)) => {
                                 self.shared.width.store(w, Ordering::SeqCst);
@@ -1649,12 +1802,26 @@ impl Editor3 {
                     if let Some((w, h)) = plugin.take_editor_resize_request() {
                         if w > 0 && h > 0 {
                             XResizeWindow(self.d, self.win, w, h);
+                            // v36: a pinned view whose PLUGIN chose the
+                            // new size re-pins to it.
+                            if self.fixed.is_some() {
+                                self.fixed = Some((w, h));
+                                lock_wm_size(self.d, self.win, Some((w, h)));
+                            }
                         }
                     }
                     // The window manager resized our frame: ask the view
                     // to relayout into it (R1b parity with VST2).
                     if let Some((w, h)) = resized {
-                        if (w, h) != *last_container && w >= 8 && h >= 8 {
+                        // v36: pinned view — snap a slipped WM resize back
+                        // instead of telling the view to relayout into a
+                        // size it refused.
+                        if let Some((fw, fh)) = self.fixed {
+                            if (w as i32, h as i32) != (fw, fh) {
+                                XResizeWindow(self.d, self.win, fw, fh);
+                                XFlush(self.d);
+                            }
+                        } else if (w, h) != *last_container && w >= 8 && h >= 8 {
                             *last_container = (w, h);
                             let _ = plugin.resize_editor(w as i32, h as i32);
                         }
@@ -1708,6 +1875,12 @@ impl Editor3 {
                                 if (w, h) != *last_size {
                                     *last_size = (w, h);
                                     XResizeWindow(self.d, self.win, w, h);
+                                    // v36: re-pin a fixed view that
+                                    // changed its own size (preset etc).
+                                    if self.fixed.is_some() {
+                                        self.fixed = Some((w, h));
+                                        lock_wm_size(self.d, self.win, Some((w, h)));
+                                    }
                                 }
                             }
                         }
@@ -2759,5 +2932,127 @@ mod tests {
             XFlush(d);
             XCloseDisplay(d);
         }
+    }
+
+    /// WM_NORMAL_HINTS readback: (flags, min, max).
+    type WmHints = (c_long, (i32, i32), (i32, i32));
+
+    /// v36 R4: read WM_NORMAL_HINTS from a SECOND connection, the way a
+    /// window manager does (same short-lived-probe pattern as
+    /// `request_wm_delete`). `None` = no hints property on the window.
+    unsafe fn wm_normal_hints(xid: u64) -> Option<WmHints> {
+        let d = XOpenDisplay(ptr::null());
+        if d.is_null() {
+            return None;
+        }
+        XSetErrorHandler(Some(x_error_noop));
+        let mut h: XSizeHints = std::mem::zeroed();
+        let mut supplied: c_long = 0;
+        let ok = XGetWMNormalHints(d, xid, &mut h, &mut supplied) != 0;
+        XCloseDisplay(d);
+        if ok {
+            Some((h.flags, (h.min_width, h.min_height), (h.max_width, h.max_height)))
+        } else {
+            None
+        }
+    }
+
+    /// v36 R4: the WM size-pin mechanism, pinned WITHOUT any plugin:
+    /// `lock_wm_size` must produce hints an external X client reads back
+    /// with the exact flags and min==max rect (an XSizeHints field-order
+    /// bug shows up right here), and the release path must leave the
+    /// window unbounded.
+    #[test]
+    fn v36_wm_size_hints_roundtrip() {
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("skip: no X11 display");
+            return;
+        }
+        unsafe {
+            let d = XOpenDisplay(ptr::null());
+            assert!(!d.is_null(), "display opens");
+            XSetErrorHandler(Some(x_error_noop));
+            let win = XCreateSimpleWindow(d, root_window(d), 10, 10, 300, 200, 0, 0, 0);
+            XFlush(d);
+            assert_eq!(wm_normal_hints(win).map(|h| h.0), None, "no hints before the pin");
+            lock_wm_size(d, win, Some((317, 211)));
+            let (flags, min, max) = wm_normal_hints(win).expect("hints written");
+            assert_ne!(flags & PMIN_SIZE, 0, "PMinSize must be set");
+            assert_ne!(flags & PMAX_SIZE, 0, "PMaxSize must be set");
+            assert_eq!(min, (317, 211), "min at the editor rect");
+            assert_eq!(max, (317, 211), "max at the editor rect");
+            lock_wm_size(d, win, None);
+            let (_, min, max) = wm_normal_hints(win).expect("release still writes hints");
+            assert_eq!(min, (1, 1));
+            assert_eq!(max, (0, 0), "max 0/0 = unbounded");
+            XDestroyWindow(d, win);
+            XFlush(d);
+            XCloseDisplay(d);
+        }
+    }
+
+    /// v36 R4 (SMOKE): a REAL fixed-size VST2 editor must carry the pin:
+    /// if WM_NORMAL_HINTS exist on the container they pin min == max ==
+    /// exactly the plugin's own rect (the blue-sentinel-on-resize fix —
+    /// the WM cannot resize the window, so the sentinel background can
+    /// never be exposed). An editor that answers `effEditCanSizeWindow`
+    /// yes writes no pin at all; either way the invariant holds.
+    #[test]
+    fn v36_fixed_editor_locks_wm_size() {
+        let Some(mut w) = v16_editor("v36lock") else {
+            return;
+        };
+        std::thread::sleep(Duration::from_millis(600));
+        let size = w.editor_size();
+        assert!(size.0 > 0 && size.1 > 0, "editor negotiated a rect");
+        match unsafe { wm_normal_hints(w.xid()) } {
+            Some((flags, min, max)) => {
+                assert_ne!(flags & PMIN_SIZE, 0, "pinned editor sets PMinSize");
+                assert_ne!(flags & PMAX_SIZE, 0, "pinned editor sets PMaxSize");
+                assert_eq!(min, max, "fixed editor pins min == max");
+                assert_eq!(min, size, "pin sits at the plugin's own rect {size:?}");
+            }
+            None => {
+                eprintln!("[v36] editor answers effEditCanSizeWindow yes — unpinned by design");
+            }
+        }
+        w.close();
+    }
+
+    /// v36 R4 (SMOKE): the same invariant for a VST3 shadow editor —
+    /// pinned views (or none, when the view reports it can resize) but
+    /// never a pin at the WRONG size, which would make a good editor
+    /// look broken.
+    #[test]
+    fn v36_vst3_fixed_view_locks_wm_size() {
+        let Some(path) = vst3_smoke_gate() else {
+            eprintln!("skip: gated");
+            return;
+        };
+        let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("wolf-shaper VST3 loads");
+        let entry = &load.entry;
+        let mut win = entry.open_vst3_editor(48_000).expect("shadow editor opens");
+        let mut waited = 0u32;
+        while !win.painted() && !win.is_closed() && waited < 8_000 {
+            std::thread::sleep(Duration::from_millis(100));
+            waited += 100;
+        }
+        if !win.painted() {
+            eprintln!("skip: VST3 editor never painted");
+            win.close();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let size = win.editor_size();
+        if let Some((flags, min, max)) = unsafe { wm_normal_hints(win.xid()) } {
+            assert_ne!(flags & PMIN_SIZE, 0, "pin sets PMinSize");
+            assert_ne!(flags & PMAX_SIZE, 0, "pin sets PMaxSize");
+            assert_eq!(min, max, "pinned view pins min == max");
+            assert_eq!(min, size, "pin sits at the view's own rect {size:?}");
+        } else {
+            eprintln!("[v36] VST3 view can resize (or size unknown) — unpinned by design");
+        }
+        win.close();
     }
 }

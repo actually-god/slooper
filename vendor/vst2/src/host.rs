@@ -1065,6 +1065,33 @@ impl<T: Float> HostBuffer<T> {
 /// [reserved field]: ../api/struct.AEffect.html#structfield.reserved1
 static mut LOAD_POINTER: *mut c_void = 0 as *mut c_void;
 
+// ---------------------------------------------------------------------------
+// v36 (slooper): audioMasterSizeWindow side channel.
+//
+// A plugin asking to be resized reaches us through the raw master callback,
+// which only knows the `Host` trait — while the editor pump that OWNS the
+// container window lives in the host application. So requests park here,
+// keyed by `AEffect` pointer, and the pump drains them each beat.
+// ---------------------------------------------------------------------------
+static SIZE_REQUESTS: std::sync::Mutex<
+    Vec<(usize, (i32, i32))>,
+> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_size_request(effect: usize, width: i32, height: i32) {
+    if let Ok(mut v) = SIZE_REQUESTS.lock() {
+        v.retain(|(k, _)| *k != effect);
+        v.push((effect, (width, height)));
+    }
+}
+
+/// Take this instance's pending `audioMasterSizeWindow` request, if any.
+/// Host editor pumps call this once per beat.
+pub fn take_size_request(effect: usize) -> Option<(i32, i32)> {
+    let mut v = SIZE_REQUESTS.lock().ok()?;
+    let idx = v.iter().position(|(k, _)| *k == effect)?;
+    Some(v.remove(idx).1)
+}
+
 /// Function passed to plugin to handle dispatching host opcodes.
 extern "C" fn callback_wrapper<T: Host>(
     effect: *mut AEffect,
@@ -1100,6 +1127,17 @@ extern "C" fn callback_wrapper<T: Host>(
 #[cfg(test)]
 mod tests {
     use crate::host::HostBuffer;
+
+    /// v36: the size-request side channel parks per instance and drains
+    /// exactly once (the dispatch arm forwards straight into it).
+    #[test]
+    fn v36_size_window_side_channel() {
+        let fake = 0xdead_beef_usize;
+        assert_eq!(crate::host::take_size_request(fake), None);
+        super::note_size_request(fake, 800, 600);
+        assert_eq!(crate::host::take_size_request(fake), Some((800, 600)));
+        assert_eq!(crate::host::take_size_request(fake), None);
+    }
 
     #[test]
     fn host_buffer() {

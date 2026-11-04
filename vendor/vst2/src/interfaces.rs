@@ -385,6 +385,18 @@ pub fn host_dispatch(
         }
         Ok(OpCode::GetBlockSize) => return host.get_block_size(),
 
+        // v36 (slooper): audioMasterSizeWindow — the plugin requests its
+        // window be resized (VST 2.4: `value` = width, `opt` = height —
+        // the SDK contract, the doc comment above predates checking it).
+        // The `Host` trait has no resize hook and the editor pump that
+        // owns the container lives elsewhere, so park the request keyed
+        // by the instance pointer; the pump drains it via
+        // `take_size_request`. Returns 1 = "host handled it".
+        Ok(OpCode::SizeWindow) => {
+            crate::host::note_size_request(effect as usize, value as i32, opt as i32);
+            return 1;
+        }
+
         _ => {
             trace!("VST: Got unimplemented host opcode ({:?})", opcode);
             trace!(

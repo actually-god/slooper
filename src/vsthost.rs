@@ -1424,6 +1424,11 @@ impl Vst2Handle {
     pub(crate) fn from_instance(inst: &vst2::host::PluginInstance) -> Self {
         Self(inst.raw_effect())
     }
+    /// v36: the `AEffect` address as a key for the vendored crate's
+    /// `audioMasterSizeWindow` side channel (`take_size_request`).
+    pub fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
     /// Raw `AEffect::dispatcher` call with a VST2 opcode number.
     pub fn dispatch(
         &self,
