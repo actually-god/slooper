@@ -57,7 +57,7 @@ impl Biquad {
 fn k_stage1(sr: f32) -> Biquad {
     let gain_db = 3.99984385397f64;
     let q = 0.7071752369554193f64;
-    let fc = 1681.9744509555319f64;
+    let fc = 1_681.974_450_955_532_f64;
     let k = (std::f64::consts::PI * fc / sr as f64).tan();
     let vh = 10.0f64.powf(gain_db / 20.0);
     let vb = vh.powf(0.499666774155);
@@ -138,7 +138,7 @@ impl LufsMeter {
 
     /// Feed an interleaved stereo block (may be any length).
     pub fn push_stereo(&mut self, data: &[f32]) {
-        for pair in data.chunks_exact(2) {
+        for pair in data.as_chunks::<2>().0 {
             let (l, r) = (pair[0], pair[1]);
             // Guard: plugins/feedback can hand the master non-finite values.
             let l = if l.is_finite() { l } else { 0.0 };
@@ -314,7 +314,7 @@ impl Spectrum {
     /// Feed interleaved stereo; keeps (L+R)/2 (Ableton-Spectrum "mono"
     /// input) as the analyzer signal.
     pub fn push(&mut self, data: &[f32]) {
-        for pair in data.chunks_exact(2) {
+        for pair in data.as_chunks::<2>().0 {
             let m = (pair[0] + pair[1]) * 0.5;
             self.circ[self.wpos] = m;
             self.wpos = (self.wpos + 1) % self.n;
@@ -459,7 +459,9 @@ impl MeterRing {
         for _ in 0..n {
             let slot = t & self.mask;
             out.push(f32::from_bits(self.buf[slot * 2].load(Ordering::Relaxed)));
-            out.push(f32::from_bits(self.buf[slot * 2 + 1].load(Ordering::Relaxed)));
+            out.push(f32::from_bits(
+                self.buf[slot * 2 + 1].load(Ordering::Relaxed),
+            ));
             t += 1;
         }
         self.tail.store(t, Ordering::Release);
@@ -506,7 +508,7 @@ impl MasterMeter {
     pub fn feed(&mut self, data: &[f32]) {
         let (mut lp, mut rp) = (0.0f32, 0.0f32);
         let mut clip = false;
-        for pair in data.chunks_exact(2) {
+        for pair in data.as_chunks::<2>().0 {
             let (l, r) = (pair[0].abs(), pair[1].abs());
             if l > lp {
                 lp = l;
@@ -531,12 +533,24 @@ impl MasterMeter {
 
     /// Per UI frame: decay the instantaneous peaks and the holds.
     pub fn tick(&mut self) {
-        self.l_peak *= 0.75;
-        self.r_peak *= 0.75;
+        // Ballistics order matters: the hold compares against THIS
+        // frame's peak BEFORE the decay (otherwise a sustained signal
+        // reads 2.5 dB low forever), then the instantaneous peak decays
+        // for the next frame. Hold falls 0.35 dB/frame toward the floor.
         let ld = 20.0 * (self.l_peak.max(1e-9)).log10();
         let rd = 20.0 * (self.r_peak.max(1e-9)).log10();
-        self.l_hold = if ld > self.l_hold { ld } else { self.l_hold - 0.35 };
-        self.r_hold = if rd > self.r_hold { rd } else { self.r_hold - 0.35 };
+        self.l_peak *= 0.75;
+        self.r_peak *= 0.75;
+        self.l_hold = if ld > self.l_hold {
+            ld
+        } else {
+            (self.l_hold - 0.35).max(-120.0)
+        };
+        self.r_hold = if rd > self.r_hold {
+            rd
+        } else {
+            (self.r_hold - 0.35).max(-120.0)
+        };
     }
 }
 
@@ -557,17 +571,17 @@ mod tests {
     fn k_weight_stage1_matches_bs1770_spec_at_48k() {
         // ITU-R BS.1770-4 Table 1 (48 kHz) constants.
         let f = k_stage1(48_000.0);
-        assert!((f.b0 - 1.53512485958697).abs() < 1e-6, "b0 {}", f.b0);
-        assert!((f.b1 - (-2.69169618940638)).abs() < 1e-6, "b1 {}", f.b1);
-        assert!((f.b2 - 1.19839281085285).abs() < 1e-6, "b2 {}", f.b2);
-        assert!((f.a1 - (-1.69065929318241)).abs() < 1e-6, "a1 {}", f.a1);
-        assert!((f.a2 - 0.73248077421585).abs() < 1e-6, "a2 {}", f.a2);
+        assert!((f.b0 - 1.535_124_9).abs() < 1e-6, "b0 {}", f.b0);
+        assert!((f.b1 - (-2.691_696_2)).abs() < 1e-6, "b1 {}", f.b1);
+        assert!((f.b2 - 1.198_392_9).abs() < 1e-6, "b2 {}", f.b2);
+        assert!((f.a1 - (-1.690_659_3)).abs() < 1e-6, "a1 {}", f.a1);
+        assert!((f.a2 - 0.732_480_76).abs() < 1e-6, "a2 {}", f.a2);
         let g = k_stage2(48_000.0);
         assert!((g.b0 - 1.0).abs() < 1e-6);
         assert!((g.b1 - (-2.0)).abs() < 1e-6);
         assert!((g.b2 - 1.0).abs() < 1e-6);
-        assert!((g.a1 - (-1.99004745483398)).abs() < 1e-6, "hp a1 {}", g.a1);
-        assert!((g.a2 - 0.990072265970116).abs() < 1e-6, "hp a2 {}", g.a2);
+        assert!((g.a1 - (-1.990_047_5)).abs() < 1e-6, "hp a1 {}", g.a1);
+        assert!((g.a2 - 0.990_072_25).abs() < 1e-6, "hp a2 {}", g.a2);
     }
 
     #[test]
@@ -605,7 +619,10 @@ mod tests {
         // mixed loud/silent 400 ms gating blocks straddling the boundary
         // (standard behaviour — measured: −0.71 dB, not the −6.02 dB an
         // ungated mean would give).
-        assert!((loud - after).abs() < 0.9, "{loud} vs {after} after silence");
+        assert!(
+            (loud - after).abs() < 0.9,
+            "{loud} vs {after} after silence"
+        );
         assert!(after > -21.0, "gated I drifted down to {after}");
         // A meter shorter than one 400 ms gating block reports nothing.
         let mut m2 = LufsMeter::new(sr);
@@ -678,7 +695,10 @@ mod tests {
                 best_i = i;
             }
         }
-        assert!(best_i.abs_diff(want_bin) <= 1, "peak bin {best_i} want {want_bin}");
+        assert!(
+            best_i.abs_diff(want_bin) <= 1,
+            "peak bin {best_i} want {want_bin}"
+        );
         assert!((best + 20.0).abs() < 1.5, "peak level {best} dB want ≈ -20");
         // Bins far from the tone sit 30+ dB down.
         assert!(s.db[300] < best - 30.0);
@@ -723,5 +743,42 @@ mod tests {
         m.tick();
         assert!(m.l_peak < before);
         assert!(m.l_hold > -1.0); // held value near 0 dB
+    }
+
+    #[test]
+    fn live_path_ring_to_master_meter_reads_calibration() {
+        // The exact UI wiring: RT writes interleaved blocks, the frame
+        // loop drains and feeds. A 1 kHz sine at -20 dBFS must read
+        // I = -20.0 LUFS through the ring (see the calibration pin).
+        let sr = 48_000u32;
+        let ring = MeterRing::new();
+        let mut mm = MasterMeter::new(sr);
+        let mut full = Vec::new();
+        write_sine(&mut full, sr, 1000.0, 0.1, 3 * 48_000);
+        let frames = full.len() / 2;
+        let mut i = 0usize;
+        while i < frames {
+            let n = (frames - i).min(256); // RT callback size
+            let blk = &full[i * 2..(i + n) * 2];
+            assert_eq!(ring.write(blk), n, "ring keeps up with 256-frame blocks");
+            // "UI frame": drain what's there, feed, tick.
+            let mut buf = Vec::new();
+            let got = ring.drain(&mut buf, 4_800);
+            assert!(got > 0);
+            mm.feed(&buf);
+            mm.tick();
+            i += n;
+        }
+        let integ = mm.lufs.integrated().expect("integrated after 3 s");
+        assert!(
+            (integ - (-20.0)).abs() < 0.1,
+            "live path I = {integ} for -20 dBFS tone"
+        );
+        assert!(!mm.clip, "quiet tone must not clip");
+        assert!((mm.l_hold - (-20.0)).abs() < 1.0, "hold {}", mm.l_hold);
+        assert_eq!(mm.frames_fed, frames as u64);
+        // Drained ring is empty again (UI never re-feeds stale audio).
+        let mut buf = Vec::new();
+        assert_eq!(ring.drain(&mut buf, 4_800), 0);
     }
 }

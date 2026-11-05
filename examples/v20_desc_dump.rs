@@ -1,6 +1,6 @@
 // v20 probe: dump descs (with ids) AND drive cell writes end-to-end.
-use std::path::Path;
 use slooper::vsthost::{open, VstKind};
+use std::path::Path;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -16,7 +16,10 @@ fn main() {
         .downcast_ref::<slooper::vsthost::RtStageEntry>()
         .unwrap();
     for (k, d) in e.descs().iter().enumerate() {
-        println!("{k}\tid={} def={} wr={} {}", d.id, d.default, d.writable, d.name);
+        println!(
+            "{k}\tid={} def={} wr={} {}",
+            d.id, d.default, d.writable, d.name
+        );
     }
     // Deterministic noise.
     let mut st = 0x2545_F491_u32;
@@ -46,11 +49,7 @@ fn main() {
         println!("EFFECT idx {k:<2} {:<24} v0={p0:.4} v1={p1:.4}", d.name);
     }
     // Cell-only write on the LAST writable param, then re-measure (the fix path).
-    let last = e
-        .descs()
-        .iter()
-        .rposition(|d| d.writable)
-        .unwrap();
+    let last = e.descs().iter().rposition(|d| d.writable).unwrap();
     // simulate the editor drain: generation bump through the public mirror is
     // not pub — use set_param for the probe, then measure.
     e.set_param(last, 0.5);

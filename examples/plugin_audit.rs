@@ -128,7 +128,11 @@ fn audit_one(e: &VstEntry, fails: &mut i32) {
             }
         }
     };
-    let idtail = e.plugin_id.as_deref().map(|i| format!(" [{i}]")).unwrap_or_default();
+    let idtail = e
+        .plugin_id
+        .as_deref()
+        .map(|i| format!(" [{i}]"))
+        .unwrap_or_default();
     println!(
         "{verdict:9} {role:6} {:10} {:50} {detail}{idtail}",
         format!("{kind:?}"),

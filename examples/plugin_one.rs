@@ -14,7 +14,10 @@ fn main() {
         for e in found {
             println!(
                 "ENTRY {:?} inst={} err={:?} :: {}",
-                e.kind, e.instrument, e.error, e.path.display()
+                e.kind,
+                e.instrument,
+                e.error,
+                e.path.display()
             );
         }
         std::process::exit(0);

@@ -593,7 +593,7 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = {
     a[7] = Some(egui::Key::Num4);
     a[68] = Some(egui::Key::M); // metronome on / off
     a[71] = Some(egui::Key::Space); // play / stop all (transport toggle)
-    // v35 R3: the go-to pair — Home / End (rebindable in Settings).
+                                    // v35 R3: the go-to pair — Home / End (rebindable in Settings).
     a[138] = Some(egui::Key::Home);
     a[139] = Some(egui::Key::End);
     a
@@ -768,7 +768,10 @@ pub fn target_search_box(ui: &mut egui::Ui, placeholder: &str) -> String {
     // The placeholder doubles as the identity: two search boxes can be
     // open at once (manager + bindings rack) and must not share text.
     let id = egui::Id::new(("slooper_target_search", placeholder));
-    let q: String = ui.ctx().data(|d| d.get_temp::<String>(id)).unwrap_or_default();
+    let q: String = ui
+        .ctx()
+        .data(|d| d.get_temp::<String>(id))
+        .unwrap_or_default();
     let mut q2 = q.clone();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("search").weak().small());
@@ -868,8 +871,14 @@ fn vst_synth_decode(s: &str) -> Option<(crate::vsthost::VstKind, &str, Option<&s
     let (kind, rest) = s
         .strip_prefix("vst3:")
         .map(|p| (crate::vsthost::VstKind::V3, p))
-        .or_else(|| s.strip_prefix("vst2:").map(|p| (crate::vsthost::VstKind::V2, p)))
-        .or_else(|| s.strip_prefix("clap:").map(|p| (crate::vsthost::VstKind::Clap, p)))?;
+        .or_else(|| {
+            s.strip_prefix("vst2:")
+                .map(|p| (crate::vsthost::VstKind::V2, p))
+        })
+        .or_else(|| {
+            s.strip_prefix("clap:")
+                .map(|p| (crate::vsthost::VstKind::Clap, p))
+        })?;
     match (kind, rest.split_once('#')) {
         (crate::vsthost::VstKind::Clap, Some((p, id))) => Some((kind, p, Some(id))),
         _ => Some((kind, rest, None)),
@@ -1474,7 +1483,9 @@ impl App {
             .collect();
         if rack.is_empty() {
             rack.push(RackFolder::new(
-                crate::samples808::samples_root().to_string_lossy().into_owned(),
+                crate::samples808::samples_root()
+                    .to_string_lossy()
+                    .into_owned(),
             ));
         }
         for f in rack.iter_mut() {
@@ -1619,11 +1630,7 @@ impl App {
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
             rec_src: (0..MAX_LOOPS)
                 .map(|t| {
-                    let a = cfg
-                        .rec_src
-                        .get(t)
-                        .copied()
-                        .unwrap_or([true, false, false]);
+                    let a = cfg.rec_src.get(t).copied().unwrap_or([true, false, false]);
                     RecSrc {
                         audio: a[0],
                         midi: a[1],
@@ -1983,10 +1990,7 @@ impl App {
                 (i.modifiers.command && i.key_pressed(egui::Key::X))
                     || i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
                 (i.modifiers.command && i.key_pressed(egui::Key::V))
-                    || i
-                        .events
-                        .iter()
-                        .any(|e| matches!(e, egui::Event::Paste(_))),
+                    || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
             )
         });
         if ctx.text_edit_focused() {
@@ -2327,12 +2331,10 @@ impl App {
                             // patch header (params empty: the row's cell
                             // snapshot rides `saved` and was kept fresh by
                             // the persistence tick).
-                            let patch = state
-                                .as_deref()
-                                .map(|c| crate::vsthost::VstPatch {
-                                    chunk: c.to_vec(),
-                                    params: Vec::new(),
-                                });
+                            let patch = state.as_deref().map(|c| crate::vsthost::VstPatch {
+                                chunk: c.to_vec(),
+                                params: Vec::new(),
+                            });
                             match crate::vsthost::open_pid(
                                 p,
                                 *kind,
@@ -2439,7 +2441,10 @@ impl App {
     }
 
     /// Resolve a GUI target to its live plugin entry (None when gone).
-    fn target_entry(&self, target: GuiTarget) -> Option<std::sync::Arc<dyn crate::vsthost::StageEntry>> {
+    fn target_entry(
+        &self,
+        target: GuiTarget,
+    ) -> Option<std::sync::Arc<dyn crate::vsthost::StageEntry>> {
         match target {
             GuiTarget::Synth(t) => match self.track_synth_inst.get(t)?.as_ref()?.as_ref() {
                 SynthHandle::Vst(e) => Some(e.clone()),
@@ -2484,7 +2489,11 @@ impl App {
                 self.params_filter.clear();
             }
             None => {
-                if self.editor_probes.iter().any(|(_, p, _, _)| p.display().to_string() == path) {
+                if self
+                    .editor_probes
+                    .iter()
+                    .any(|(_, p, _, _)| p.display().to_string() == path)
+                {
                     self.status = "plugin window still being checked \u{2014} one moment".into();
                     return;
                 }
@@ -2494,7 +2503,8 @@ impl App {
                 std::thread::spawn(move || {
                     let _ = tx.send(crate::vsthost::probe_editor(&pth, kind));
                 });
-                self.editor_probes.push((target, std::path::PathBuf::from(&path), rx, entry));
+                self.editor_probes
+                    .push((target, std::path::PathBuf::from(&path), rx, entry));
                 self.status =
                     "first window for this plugin is safety-checked in a child process \u{2014} one moment"
                         .into();
@@ -2556,8 +2566,10 @@ impl App {
                             self.save_config();
                         }
                     }
-                    self.status =
-                        format!("{why} \u{2014} window disabled by the crash guard, {}", entry.name());
+                    self.status = format!(
+                        "{why} \u{2014} window disabled by the crash guard, {}",
+                        entry.name()
+                    );
                     if self.target_alive(target, &ps) {
                         self.params_win = Some(target);
                         self.params_filter.clear();
@@ -2595,7 +2607,11 @@ impl App {
         let slug = slug.trim_matches('_').to_string();
         crate::samples808::data_dir()
             .join("plugin-presets")
-            .join(if slug.is_empty() { "plugin".into() } else { slug })
+            .join(if slug.is_empty() {
+                "plugin".into()
+            } else {
+                slug
+            })
     }
     /// v34 R2: preset file names shown in the picker (sorted, .json).
     fn list_param_presets(plugin: &str) -> Vec<String> {
@@ -2680,7 +2696,9 @@ impl App {
     /// Huge plugins publish thousands of params, hence the filter box:
     /// at most 400 rows are laid out per frame.
     fn params_window(&mut self, ctx: &egui::Context) {
-        let Some(target) = self.params_win else { return };
+        let Some(target) = self.params_win else {
+            return;
+        };
         let Some(entry) = self.target_entry(target) else {
             self.params_win = None;
             return;
@@ -2705,7 +2723,10 @@ impl App {
             .min_height(70.0)
             .open(&mut open);
         if let Some(r) = self.dyn_rect(idx) {
-            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            w = w
+                .default_pos([r[0], r[1]])
+                .default_width(r[2])
+                .default_height(r[3]);
         }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -2733,95 +2754,96 @@ impl App {
         let mut do_save = false;
         let mut do_del = false;
         let mut load_name: Option<String> = None;
-                let total = entry.descs().iter().filter(|d| d.writable).count();
-                ui.horizontal(|ui| {
-                    ui.label("filter");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut new_filter)
-                            .hint_text("parameter name")
-                            .desired_width(200.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("{total} params"))
-                            .weak()
-                            .small(),
-                    );
-                });
-                ui.label(
-                    egui::RichText::new(if entry.has_editor() {
-                        "this plugin's own window is disabled (crash guard) \u{b7} changes \
-                         apply live and persist"
-                    } else {
-                        // v36: this plugin never HAD a window — the
-                        // crash-guard wording made every CLAP window
-                        // look broken. This list IS its GUI.
-                        "this plugin has no window of its own \u{b7} these sliders \
-                         are its GUI \u{b7} changes apply live and persist"
-                    })
+        let total = entry.descs().iter().filter(|d| d.writable).count();
+        ui.horizontal(|ui| {
+            ui.label("filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut new_filter)
+                    .hint_text("parameter name")
+                    .desired_width(200.0),
+            );
+            ui.label(
+                egui::RichText::new(format!("{total} params"))
                     .weak()
                     .small(),
-                );
-                ui.separator();
-                // v34 R2: user preset bar — save/load the CURRENT value
-                // snapshot for ANY hosted plugin (works even when the
-                // plugin has no usable window of its own).
-                if self.params_presets_for != entry.name() {
-                    let nm = entry.name().to_string();
-                    self.params_presets_for = nm.clone();
-                    self.params_presets = Self::list_param_presets(&nm);
-                }
-                ui.horizontal(|ui| {
-                    ui.label("user preset");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.params_preset_name)
-                            .hint_text("preset name")
-                            .desired_width(130.0),
-                    );
-                    if ui.button("Save").clicked() {
-                        do_save = true;
-                    }
-                    egui::ComboBox::from_id_salt("slooper_param_presets")
-                        .selected_text("Load\u{25be}")
-                        .width(150.0)
-                        .show_ui(ui, |ui| {
-                            let list = self.params_presets.clone();
-                            for p in list {
-                                if ui.selectable_label(false, &p).clicked() {
-                                    load_name = Some(p);
-                                }
-                            }
-                            if !self.params_presets.is_empty() {
-                                ui.separator();
-                                if ui.button("delete named preset").clicked() {
-                                    do_del = true;
-                                }
-                            }
-                        });
-                });
-                let ql = new_filter.trim().to_lowercase();
-                let rows: Vec<(usize, String)> = entry
-                    .descs()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| d.writable)
-                    .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
-                    .take(400)
-                    .map(|(k, d)| (k, d.name.clone()))
-                    .collect();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (k, name) in rows {
-                            let mut v = entry.params().get(k);
-                            let s = ui.add(
-                                egui::Slider::new(&mut v, 0.0..=1.0)
-                                    .text(name.chars().take(24).collect::<String>()),
-                            );
-                            if s.changed() {
-                                entry.set_param(k, v);
-                            }
+            );
+        });
+        ui.label(
+            egui::RichText::new(if entry.has_editor() {
+                "this plugin's own window is disabled (crash guard) \u{b7} changes \
+                         apply live and persist"
+            } else {
+                // v36: this plugin never HAD a window — the
+                // crash-guard wording made every CLAP window
+                // look broken. This list IS its GUI.
+                "this plugin has no window of its own \u{b7} these sliders \
+                         are its GUI \u{b7} changes apply live and persist"
+            })
+            .weak()
+            .small(),
+        );
+        ui.separator();
+        // v34 R2: user preset bar — save/load the CURRENT value
+        // snapshot for ANY hosted plugin (works even when the
+        // plugin has no usable window of its own).
+        if self.params_presets_for != entry.name() {
+            let nm = entry.name().to_string();
+            self.params_presets_for = nm.clone();
+            self.params_presets = Self::list_param_presets(&nm);
+        }
+        ui.horizontal(|ui| {
+            ui.label("user preset");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.params_preset_name)
+                    .hint_text("preset name")
+                    .desired_width(130.0),
+            );
+            if ui.button("Save").clicked() {
+                do_save = true;
+            }
+            egui::ComboBox::from_id_salt("slooper_param_presets")
+                .selected_text("Load\u{25be}")
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    let list = self.params_presets.clone();
+                    for p in list {
+                        if ui.selectable_label(false, &p).clicked() {
+                            load_name = Some(p);
                         }
-                    });
+                    }
+                    if !self.params_presets.is_empty() {
+                        ui.separator();
+                        if ui.button("delete named preset").clicked() {
+                            do_del = true;
+                        }
+                    }
+                });
+        });
+        let ql = new_filter.trim().to_lowercase();
+        let rows: Vec<(usize, String)> = entry
+            .descs()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.writable)
+            .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
+            .take(400)
+            .map(|(k, d)| (k, d.name.clone()))
+            .collect();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (k, name) in rows {
+                    let mut v = entry.params().get(k);
+                    let before = v;
+                    let s = ui.add(
+                        egui::Slider::new(&mut v, 0.0..=1.0)
+                            .text(name.chars().take(24).collect::<String>()),
+                    );
+                    if p_changed(&s, before, &mut v) {
+                        entry.set_param(k, v);
+                    }
+                }
+            });
         self.params_filter = new_filter;
         // v34 R2: run the preset-bar actions collected this frame.
         if do_save {
@@ -2867,7 +2889,8 @@ impl App {
             return;
         }
         let sr = self.sample_rate.max(48_000);
-        let rx = crate::vsthost::open_async_pid(&e.path, e.kind, e.plugin_id.as_deref(), sr, None, None);
+        let rx =
+            crate::vsthost::open_async_pid(&e.path, e.kind, e.plugin_id.as_deref(), sr, None, None);
         self.vst_note = format!("{}: loading…", e.name);
         self.fx_rows[i].push(ChainRow::Vst {
             state: None,
@@ -3102,7 +3125,10 @@ impl App {
             .min_width(240.0)
             .min_height(140.0);
         if let Some(rc) = self.dyn_rect(idx) {
-            w = w.default_pos([rc[0], rc[1]]).default_width(rc[2]).default_height(rc[3]);
+            w = w
+                .default_pos([rc[0], rc[1]])
+                .default_width(rc[2])
+                .default_height(rc[3]);
         }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -3643,9 +3669,7 @@ impl App {
             .lanes
             .iter()
             .enumerate()
-            .flat_map(|(kk, lane)| {
-                lane.clips.iter().enumerate().map(move |(ci, _c)| (kk, ci))
-            })
+            .flat_map(|(kk, lane)| lane.clips.iter().enumerate().map(move |(ci, _c)| (kk, ci)))
             .filter(|(kk, ci)| {
                 let c = &self.arr.tracks[t].lanes[*kk].clips[*ci];
                 c.pos <= hi && c.end(self.asset_len(c.asset)) >= lo
@@ -3809,8 +3833,8 @@ impl App {
         let Some(cb) = self.clipboard.clone() else {
             // v21: an empty clipboard used to return in SILENCE — with a
             // fresh session that read as "Ctrl+V does nothing".
-            self.status = "paste: clipboard is empty \u{b7} select clips, then Ctrl+C copies them"
-                .into();
+            self.status =
+                "paste: clipboard is empty \u{b7} select clips, then Ctrl+C copies them".into();
             return;
         };
         let t_target = self
@@ -3829,8 +3853,7 @@ impl App {
                 .get(it.asset as usize)
                 .map(|a| a.samples())
                 .unwrap_or(0);
-            let span =
-                it.pre_pad + it.play_len.unwrap_or(alen.saturating_sub(it.cut)).max(1);
+            let span = it.pre_pad + it.play_len.unwrap_or(alen.saturating_sub(it.cut)).max(1);
             let nl0 = *base_lanes
                 .entry(t)
                 .or_insert(self.arr.tracks[t].lanes.len());
@@ -4244,10 +4267,11 @@ impl App {
             self.status = "delete folder: not a directory".into();
             return;
         }
-        let empty = std::fs::read_dir(&p).map(|mut d| d.next().is_none()).unwrap_or(false);
+        let empty = std::fs::read_dir(&p)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
         if !empty {
-            self.status =
-                "delete folder: not empty \u{2014} move or delete its files first".into();
+            self.status = "delete folder: not empty \u{2014} move or delete its files first".into();
             return;
         }
         match std::fs::remove_dir(&p) {
@@ -4298,7 +4322,10 @@ impl App {
         for f in self.rack.iter_mut() {
             f.rescan();
         }
-        self.status = format!("moved \u{201c}{}\u{201d}", oldp.file_stem().unwrap_or_default().to_string_lossy());
+        self.status = format!(
+            "moved \u{201c}{}\u{201d}",
+            oldp.file_stem().unwrap_or_default().to_string_lossy()
+        );
         self.push_project();
     }
 
@@ -4335,8 +4362,7 @@ impl App {
         // (harvested when that editor last closed). v22: with NO chunk
         // (always true for VST2 — no state ABI on this host) the saved
         // cell snapshot is the only patch information that exists.
-        let saved = if self.track_synth_state[t].is_none()
-            && !self.track_synth_params[t].is_empty()
+        let saved = if self.track_synth_state[t].is_none() && !self.track_synth_params[t].is_empty()
         {
             Some(self.track_synth_params[t].clone())
         } else {
@@ -4344,12 +4370,12 @@ impl App {
         };
         // v23: chunk + the parameter list harvested with it. Chunks may
         // omit normalized values — the list keeps knob moves.
-        let patch = self.track_synth_state[t].clone().map(|chunk| {
-            crate::vsthost::VstPatch {
+        let patch = self.track_synth_state[t]
+            .clone()
+            .map(|chunk| crate::vsthost::VstPatch {
                 chunk,
                 params: std::mem::take(&mut self.synth_patch_params[t]),
-            }
-        });
+            });
         (saved, patch)
     }
 
@@ -4566,11 +4592,8 @@ impl App {
                 return;
             }
         }
-        cap.nodes.push(crate::automation::Node {
-            t: trel,
-            v,
-            c: 0.0,
-        });
+        cap.nodes
+            .push(crate::automation::Node { t: trel, v, c: 0.0 });
     }
 
     /// v37 R5: write automation samples the CORE MIXER controls every
@@ -4587,8 +4610,11 @@ impl App {
             if !self.auto_rec[i].armed {
                 continue;
             }
-            let targets: Vec<String> =
-                self.auto_rec[i].caps.iter().map(|c| c.target.clone()).collect();
+            let targets: Vec<String> = self.auto_rec[i]
+                .caps
+                .iter()
+                .map(|c| c.target.clone())
+                .collect();
             for tgt in targets {
                 if let Some(v) = self.current_control_value(i, &tgt) {
                     self.note_auto(i, &tgt, v);
@@ -4656,12 +4682,7 @@ impl App {
         let st = std::mem::take(&mut self.auto_rec[i]);
         // v37 R5: the recorded window (stop − start) is the asset length,
         // exactly like the MIDI/audio takes — not the last node's time.
-        let elapsed = self
-            .backend
-            .engine
-            .pos()
-            .saturating_sub(st.start)
-            .max(1) as i64;
+        let elapsed = self.backend.engine.pos().saturating_sub(st.start).max(1) as i64;
         let caps: Vec<AutoCap> = st
             .caps
             .into_iter()
@@ -4701,11 +4722,10 @@ impl App {
         // Unique file name in the primary rack folder, named after the
         // control: auto-t1-vol, auto-t1-pan, ...
         let dir = self.record_dir();
-        let short = target
-            .rsplit('.')
-            .next()
-            .unwrap_or("auto")
-            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-', "-");
+        let short = target.rsplit('.').next().unwrap_or("auto").replace(
+            |c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+            "-",
+        );
         let base = format!("auto-t{}-{}", i + 1, short);
         let mut n = 1u32;
         let path = loop {
@@ -4840,7 +4860,11 @@ impl App {
 
     /// Replace the whole kit table from a saved one (project load). The
     /// optional legacy v29 pattern seeds the target track's kit.
-    fn load_kits(&mut self, table: &[Vec<crate::config::DrumPadSave>], legacy: Option<&crate::config::DrumSave>) {
+    fn load_kits(
+        &mut self,
+        table: &[Vec<crate::config::DrumPadSave>],
+        legacy: Option<&crate::config::DrumSave>,
+    ) {
         self.drum_kits = init_drum_kits(table, legacy);
     }
 
@@ -4899,11 +4923,8 @@ impl App {
         let base = snap_start(self.backend.engine.pos(), self.snap_unit());
         self.drum.ensure_rows(self.kit(t).len());
         let grid = self.drum.grid.clone();
-        let pads: Vec<(Option<usize>, bool)> = self
-            .kit(t)
-            .iter()
-            .map(|p| (p.asset, p.muted))
-            .collect();
+        let pads: Vec<(Option<usize>, bool)> =
+            self.kit(t).iter().map(|p| (p.asset, p.muted)).collect();
         let nl0 = self.arr.tracks[t].lanes.len();
         let mut n = 0usize;
         for (pi, (aid, muted)) in pads.iter().enumerate() {
@@ -4911,7 +4932,9 @@ impl App {
                 continue;
             }
             let Some(id) = aid else { continue };
-            let Ok(id32) = u32::try_from(*id) else { continue };
+            let Ok(id32) = u32::try_from(*id) else {
+                continue;
+            };
             while self.arr.tracks[t].lanes.len() <= pi {
                 self.arr.tracks[t].add_lane();
             }
@@ -5572,7 +5595,10 @@ impl App {
             .min_width(80.0)
             .min_height(70.0);
         if let Some(r) = self.dyn_rect(idx) {
-            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            w = w
+                .default_pos([r[0], r[1]])
+                .default_width(r[2])
+                .default_height(r[3]);
         }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -5606,7 +5632,10 @@ impl App {
             .min_width(80.0)
             .min_height(70.0);
         if let Some(r) = self.dyn_rect(idx) {
-            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            w = w
+                .default_pos([r[0], r[1]])
+                .default_width(r[2])
+                .default_height(r[3]);
         }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -5664,19 +5693,18 @@ impl App {
                          (dBFS). Red clip LED lights on any full-scale sample.",
                     );
                     if clip {
-                        let (r, _) = ui.allocate_exact_size(
-                            egui::vec2(10.0, 10.0),
-                            Sense::hover(),
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            r.shrink(1.5),
+                            1.0,
+                            Color32::from_rgb(235, 60, 50),
                         );
-                        ui.painter()
-                            .rect_filled(r.shrink(1.5), 1.0, Color32::from_rgb(235, 60, 50));
                     }
                 });
             });
             ui.separator();
             // ---- vertical stereo meters (FL/Ableton master-strip look) ----
-            let (mrect, _) =
-                ui.allocate_exact_size(egui::vec2(58.0, meter_h), Sense::hover());
+            let (mrect, _) = ui.allocate_exact_size(egui::vec2(58.0, meter_h), Sense::hover());
             let (l_amp, r_amp) = match self.meter_state.as_ref() {
                 Some(ms) => (ms.l_peak, ms.r_peak),
                 None => (0.0, 0.0),
@@ -5686,8 +5714,14 @@ impl App {
                 mrect,
                 l_amp,
                 r_amp,
-                self.meter_state.as_ref().map(|m| m.l_hold).unwrap_or(-120.0),
-                self.meter_state.as_ref().map(|m| m.r_hold).unwrap_or(-120.0),
+                self.meter_state
+                    .as_ref()
+                    .map(|m| m.l_hold)
+                    .unwrap_or(-120.0),
+                self.meter_state
+                    .as_ref()
+                    .map(|m| m.r_hold)
+                    .unwrap_or(-120.0),
                 self.meter_state.as_ref().is_some_and(|m| m.clip),
             );
             ui.separator();
@@ -5697,7 +5731,12 @@ impl App {
                     Some(ms) => (ms.lufs.momentary(), ms.lufs.short_term()),
                     None => (None, None),
                 };
-                lufs_row(ui, "M", m, "Momentary loudness (BS.1770 400 ms window) — the live reading.");
+                lufs_row(
+                    ui,
+                    "M",
+                    m,
+                    "Momentary loudness (BS.1770 400 ms window) — the live reading.",
+                );
                 lufs_row(ui, "S", s, "Short-term loudness (3 s window).");
                 lufs_row(
                     ui,
@@ -5756,232 +5795,214 @@ impl App {
         self.drum.ensure_rows(self.kit(trk).len());
         // Snapshot: the body needs &mut self for audition clicks.
         let pads: Vec<DrumPad> = self.kit(trk).to_vec();
-                ui.horizontal(|ui| {
-                    ui.label("track");
-                    egui::ComboBox::from_id_salt("drum_track")
-                        .selected_text(format!("T{}", self.drum.track + 1))
-                        .show_ui(ui, |ui| {
-                            for t in 0..self.n_tracks {
-                                if ui
-                                    .selectable_label(self.drum.track == t, format!("Track {}", t + 1))
-                                    .clicked()
-                                {
-                                    self.drum.track = t;
-                                    dirty = true;
-                                }
-                            }
-                        });
-                    // v30 R1: the step clock is a subdivision of the beat.
-                    let sub = self.drum.sub;
-                    let sub_lbl = SUBDIVISIONS
-                        .iter()
-                        .find(|(s, _)| *s == sub)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("custom");
-                    ui.label("subdivision");
-                    egui::ComboBox::from_id_salt("drum_sub")
-                        .selected_text(format!("{sub_lbl} ({sub}/beat)"))
-                        .show_ui(ui, |ui| {
-                            for (s, label) in SUBDIVISIONS.iter() {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.drum.sub,
-                                        *s,
-                                        format!("{label} ({s}/beat)"),
-                                    )
-                                    .changed()
-                                {
-                                    dirty = true;
-                                }
-                            }
-                        });
-                    let playing = self.drum.playing;
-                    // v32: reserved slot for the wider label (no reflow
-                    // of the row when the drum machine starts/stops).
-                    let pp_btn = egui::Button::new(if playing {
-                        "\u{25a0} stop"
-                    } else {
-                        "play"
-                    })
-                    .min_size(egui::vec2(56.0, 0.0));
-                    if ui.add(pp_btn).clicked()
-                    {
-                        self.drum.playing = !self.drum.playing;
-                        self.drum.step_start = self.backend.engine.pos();
-                        self.drum.last_step = usize::MAX;
+        ui.horizontal(|ui| {
+            ui.label("track");
+            egui::ComboBox::from_id_salt("drum_track")
+                .selected_text(format!("T{}", self.drum.track + 1))
+                .show_ui(ui, |ui| {
+                    for t in 0..self.n_tracks {
+                        if ui
+                            .selectable_label(self.drum.track == t, format!("Track {}", t + 1))
+                            .clicked()
+                        {
+                            self.drum.track = t;
+                            dirty = true;
+                        }
                     }
-                    if ui.button("clear all").clicked() {
-                        for row in self.drum.grid.iter_mut() {
+                });
+            // v30 R1: the step clock is a subdivision of the beat.
+            let sub = self.drum.sub;
+            let sub_lbl = SUBDIVISIONS
+                .iter()
+                .find(|(s, _)| *s == sub)
+                .map(|(_, l)| *l)
+                .unwrap_or("custom");
+            ui.label("subdivision");
+            egui::ComboBox::from_id_salt("drum_sub")
+                .selected_text(format!("{sub_lbl} ({sub}/beat)"))
+                .show_ui(ui, |ui| {
+                    for (s, label) in SUBDIVISIONS.iter() {
+                        if ui
+                            .selectable_value(&mut self.drum.sub, *s, format!("{label} ({s}/beat)"))
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                    }
+                });
+            let playing = self.drum.playing;
+            // v32: reserved slot for the wider label (no reflow
+            // of the row when the drum machine starts/stops).
+            let pp_btn = egui::Button::new(if playing { "\u{25a0} stop" } else { "play" })
+                .min_size(egui::vec2(56.0, 0.0));
+            if ui.add(pp_btn).clicked() {
+                self.drum.playing = !self.drum.playing;
+                self.drum.step_start = self.backend.engine.pos();
+                self.drum.last_step = usize::MAX;
+            }
+            if ui.button("clear all").clicked() {
+                for row in self.drum.grid.iter_mut() {
+                    row.iter_mut().for_each(|v| *v = 0);
+                }
+                dirty = true;
+            }
+            if ui
+                .button("commit to track")
+                .on_hover_text(
+                    "Stamp one-shot clips at the playhead: one lane per \
+                             pad, clip gain = hit velocity.",
+                )
+                .clicked()
+            {
+                commit_now = true;
+            }
+        });
+        // Step clock: while playing, the pattern runs off the
+        // transport position; fired steps audition their hits.
+        let step_s = self
+            .drum
+            .step_samples(self.bar_samples(), self.beats())
+            .max(1);
+        let cur = if self.drum.playing {
+            (self
+                .backend
+                .engine
+                .pos()
+                .saturating_sub(self.drum.step_start)
+                / step_s) as usize
+                % self.drum.steps.max(1)
+        } else {
+            usize::MAX
+        };
+        if self.drum.playing && cur != self.drum.last_step {
+            self.drum.last_step = cur;
+            let fired: Vec<(usize, u8)> = pads
+                .iter()
+                .enumerate()
+                .filter_map(|(p, pad)| {
+                    let v = self.drum.grid.get(p)?.get(cur).copied().unwrap_or(0);
+                    if !pad.muted && v > 0 {
+                        pad.asset.map(|k| (k, v))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (k, v) in fired {
+                self.audition_impulse(k, v);
+            }
+        }
+        egui::Grid::new("drum_grid")
+            .num_columns(self.drum.steps + 3)
+            .spacing([2.0, 3.0])
+            .show(ui, |ui| {
+                for (p, pad) in pads.iter().enumerate() {
+                    ui.add_sized(
+                        [52.0, 18.0],
+                        egui::Label::new(RichText::new(pad.name.clone()).monospace().small())
+                            .selectable(false),
+                    )
+                    .on_hover_text(format!(
+                        "kit pad {} \u{b7} sound, velocity and mute are \
+                                 edited in this track's SYNTHS window",
+                        p + 1
+                    ));
+                    if ui
+                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                        .on_hover_text("Audition this pad")
+                        .clicked()
+                    {
+                        if let Some(k) = pad.asset {
+                            let v = pad.vel.max(1);
+                            self.audition_impulse(k, v);
+                        }
+                    }
+                    if ui
+                        .add(egui::Button::new("x").min_size(egui::vec2(16.0, 18.0)))
+                        .on_hover_text("Clear this pad's row")
+                        .clicked()
+                    {
+                        if let Some(row) = self.drum.grid.get_mut(p) {
                             row.iter_mut().for_each(|v| *v = 0);
                         }
                         dirty = true;
                     }
-                    if ui
-                        .button("commit to track")
-                        .on_hover_text(
-                            "Stamp one-shot clips at the playhead: one lane per \
-                             pad, clip gain = hit velocity.",
-                        )
-                        .clicked()
-                    {
-                        commit_now = true;
-                    }
-                });
-                // Step clock: while playing, the pattern runs off the
-                // transport position; fired steps audition their hits.
-                let step_s = self
-                    .drum
-                    .step_samples(self.bar_samples(), self.beats())
-                    .max(1);
-                let cur = if self.drum.playing {
-                    (self
-                        .backend
-                        .engine
-                        .pos()
-                        .saturating_sub(self.drum.step_start)
-                        / step_s) as usize
-                        % self.drum.steps.max(1)
-                } else {
-                    usize::MAX
-                };
-                if self.drum.playing && cur != self.drum.last_step {
-                    self.drum.last_step = cur;
-                    let fired: Vec<(usize, u8)> = pads
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(p, pad)| {
-                            let v = self.drum.grid.get(p)?.get(cur).copied().unwrap_or(0);
-                            if !pad.muted && v > 0 {
-                                pad.asset.map(|k| (k, v))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for (k, v) in fired {
-                        self.audition_impulse(k, v);
-                    }
-                }
-                egui::Grid::new("drum_grid")
-                    .num_columns(self.drum.steps + 3)
-                    .spacing([2.0, 3.0])
-                    .show(ui, |ui| {
-                        for (p, pad) in pads.iter().enumerate() {
-                            ui.add_sized(
-                                [52.0, 18.0],
-                                egui::Label::new(
-                                    RichText::new(pad.name.clone()).monospace().small(),
-                                )
-                                .selectable(false),
-                            )
-                            .on_hover_text(format!(
-                                "kit pad {} \u{b7} sound, velocity and mute are \
-                                 edited in this track's SYNTHS window",
-                                p + 1
-                            ));
-                            if ui
-                                .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
-                                .on_hover_text("Audition this pad")
-                                .clicked()
-                            {
-                                if let Some(k) = pad.asset {
-                                    let v = pad.vel.max(1);
-                                    self.audition_impulse(k, v);
-                                }
-                            }
-                            if ui
-                                .add(egui::Button::new("x").min_size(egui::vec2(16.0, 18.0)))
-                                .on_hover_text("Clear this pad's row")
-                                .clicked()
-                            {
-                                if let Some(row) = self.drum.grid.get_mut(p) {
-                                    row.iter_mut().for_each(|v| *v = 0);
-                                }
-                                dirty = true;
-                            }
-                            for s in 0..self.drum.steps {
-                                let v = self.drum.grid[p][s];
-                                let fill = if v == 0 {
-                                    egui::Color32::from_gray(if s % sub == 0 { 74 } else { 56 })
+                    for s in 0..self.drum.steps {
+                        let v = self.drum.grid[p][s];
+                        let fill = if v == 0 {
+                            egui::Color32::from_gray(if s % sub == 0 { 74 } else { 56 })
+                        } else {
+                            egui::Color32::from_rgb(90 + v / 2, 55 + v / 4, 55)
+                        };
+                        let mut b = egui::Button::new(
+                            egui::RichText::new(if v == 0 { " " } else { "\u{25cf}" }).color(
+                                if v == 0 {
+                                    egui::Color32::from_gray(130)
                                 } else {
-                                    egui::Color32::from_rgb(90 + v / 2, 55 + v / 4, 55)
-                                };
-                                let mut b = egui::Button::new(
-                                    egui::RichText::new(if v == 0 { " " } else { "\u{25cf}" })
-                                        .color(if v == 0 {
-                                            egui::Color32::from_gray(130)
-                                        } else {
-                                            egui::Color32::WHITE
-                                        }),
-                                )
-                                .fill(fill)
-                                .min_size(egui::vec2(14.0, 18.0));
-                                if cur == s {
-                                    b = b.stroke(egui::Stroke::new(
-                                        1.5,
-                                        ui.visuals().hyperlink_color,
-                                    ));
-                                }
-                                let resp = ui.add(b).on_hover_text(format!(
-                                    "pad {} step {} \u{2014} vel {v} (click toggles, wheel paints)",
-                                    p + 1,
-                                    s + 1
-                                ));
-                                if resp.clicked() {
-                                    let dv = pad.vel.max(1);
-                                    let now = self.drum.grid[p][s];
-                                    self.drum.grid[p][s] = if now == 0 { dv } else { 0 };
-                                    dirty = true;
-                                    if now == 0 {
-                                        if let Some(k) = pad.asset {
-                                            let dv2 = self.drum.grid[p][s];
-                                            self.audition_impulse(k, dv2);
-                                        }
-                                    }
-                                }
-                                if resp.hovered() {
-                                    let d = ui.input(|i| {
-                                        let mut acc = 0.0f32;
-                                        for ev in i.events.iter() {
-                                            if let egui::Event::MouseWheel {
-                                                delta, unit, ..
-                                            } = ev
-                                            {
-                                                let sc = match unit {
-                                                    egui::MouseWheelUnit::Line => 24.0,
-                                                    _ => 1.0,
-                                                };
-                                                acc += delta.y * sc;
-                                            }
-                                        }
-                                        (acc * 0.35) as i32
-                                    });
-                                    if d != 0 {
-                                        let nv =
-                                            (self.drum.grid[p][s] as i32 + d * 8).clamp(0, 127)
-                                                as u8;
-                                        if nv != self.drum.grid[p][s] {
-                                            self.drum.grid[p][s] = nv;
-                                            dirty = true;
-                                        }
-                                    }
+                                    egui::Color32::WHITE
+                                },
+                            ),
+                        )
+                        .fill(fill)
+                        .min_size(egui::vec2(14.0, 18.0));
+                        if cur == s {
+                            b = b.stroke(egui::Stroke::new(1.5, ui.visuals().hyperlink_color));
+                        }
+                        let resp = ui.add(b).on_hover_text(format!(
+                            "pad {} step {} \u{2014} vel {v} (click toggles, wheel paints)",
+                            p + 1,
+                            s + 1
+                        ));
+                        if resp.clicked() {
+                            let dv = pad.vel.max(1);
+                            let now = self.drum.grid[p][s];
+                            self.drum.grid[p][s] = if now == 0 { dv } else { 0 };
+                            dirty = true;
+                            if now == 0 {
+                                if let Some(k) = pad.asset {
+                                    let dv2 = self.drum.grid[p][s];
+                                    self.audition_impulse(k, dv2);
                                 }
                             }
-                            ui.end_row();
                         }
-                    });
-                ui.label(
-                    RichText::new(format!(
-                        "kit of track {} \u{b7} sounds, velocities and mute: \
-                         this track's SYNTHS window (drum kit)",
-                        trk + 1
-                    ))
-                    .weak()
-                    .small(),
-                );
-                if self.drum.playing {
-                    ctx.request_repaint();
+                        if resp.hovered() {
+                            let d = ui.input(|i| {
+                                let mut acc = 0.0f32;
+                                for ev in i.events.iter() {
+                                    if let egui::Event::MouseWheel { delta, unit, .. } = ev {
+                                        let sc = match unit {
+                                            egui::MouseWheelUnit::Line => 24.0,
+                                            _ => 1.0,
+                                        };
+                                        acc += delta.y * sc;
+                                    }
+                                }
+                                (acc * 0.35) as i32
+                            });
+                            if d != 0 {
+                                let nv = (self.drum.grid[p][s] as i32 + d * 8).clamp(0, 127) as u8;
+                                if nv != self.drum.grid[p][s] {
+                                    self.drum.grid[p][s] = nv;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    }
+                    ui.end_row();
                 }
+            });
+        ui.label(
+            RichText::new(format!(
+                "kit of track {} \u{b7} sounds, velocities and mute: \
+                         this track's SYNTHS window (drum kit)",
+                trk + 1
+            ))
+            .weak()
+            .small(),
+        );
+        if self.drum.playing {
+            ctx.request_repaint();
+        }
         if commit_now {
             self.drum_commit();
             dirty = true;
@@ -6022,7 +6043,17 @@ impl App {
         let mut action: u8 = 0; // 1=save new, 2=overwrite, 3=cancel
         let mut open = true;
         if docked {
-            self.auto_inner(ui, &mut ed, &targets, sr, bpm, beats, beat_s, bar_s, &mut action);
+            self.auto_inner(
+                ui,
+                &mut ed,
+                &targets,
+                sr,
+                bpm,
+                beats,
+                beat_s,
+                bar_s,
+                &mut action,
+            );
         } else {
             let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
             let mut w = egui::Window::new("Automation")
@@ -6033,13 +6064,26 @@ impl App {
                 .min_height(70.0)
                 .open(&mut open);
             if let Some(r) = self.dyn_rect(idx) {
-                w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+                w = w
+                    .default_pos([r[0], r[1]])
+                    .default_width(r[2])
+                    .default_height(r[3]);
             }
             if dragging {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
             let resp = w.show(ui.ctx(), |ui| {
-                self.auto_inner(ui, &mut ed, &targets, sr, bpm, beats, beat_s, bar_s, &mut action)
+                self.auto_inner(
+                    ui,
+                    &mut ed,
+                    &targets,
+                    sr,
+                    bpm,
+                    beats,
+                    beat_s,
+                    bar_s,
+                    &mut action,
+                )
             });
             if let Some(out) = resp.map(|r| r.response.rect) {
                 self.dyn_remember(idx, out);
@@ -6070,13 +6114,13 @@ impl App {
         action: &mut u8,
     ) {
         use crate::automation::{Automation, Node};
-                let (rmin, rmax) = crate::automation::target_range(&ed.target);
-                let len = ed.len_samples.max(1);
-                // v23: target list can be thousands deep (plugin params)
-                // — search box drives the combo's contents.
-                let q = target_search_box(ui, "filter automation target");
-                let shown = filtered_targets(targets, &q);
-                ui.horizontal(|ui| {
+        let (rmin, rmax) = crate::automation::target_range(&ed.target);
+        let len = ed.len_samples.max(1);
+        // v23: target list can be thousands deep (plugin params)
+        // — search box drives the combo's contents.
+        let q = target_search_box(ui, "filter automation target");
+        let shown = filtered_targets(targets, &q);
+        ui.horizontal(|ui| {
                     ui.label("target");
                     let cur = targets
                         .iter()
@@ -6153,7 +6197,8 @@ impl App {
                         });
                     if ed.len_bars {
                         let mut bars = ed.len_samples as f64 / bar_s;
-                        if ui
+                        let before = bars;
+                        let br = ui
                             .add(
                                 egui::DragValue::new(&mut bars)
                                     .speed(0.25)
@@ -6166,7 +6211,8 @@ impl App {
                                 bpm,
                                 beats as i64
                             ))
-                            .changed()
+                            ;
+                        if p_changed(&br, before, &mut bars)
                         {
                             ed.len_samples =
                                 ((bars * beats).round().max(1.0) * beat_s).round() as i64;
@@ -6183,20 +6229,22 @@ impl App {
                         );
                     } else {
                         let mut secs = ed.len_samples as f64 / sr;
-                        if ui
+                        let before = secs;
+                        let bs = ui
                             .add(
                                 egui::DragValue::new(&mut secs)
                                     .speed(0.05)
                                     .range(0.05..=600.0),
                             )
-                            .changed()
+                            ;
+                        if p_changed(&bs, before, &mut secs)
                         {
                             ed.len_samples = ((secs * sr) as i64).max((sr / 10.0) as i64);
                             ed.changed = true;
                         }
                     }
                 });
-                ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
                     ui.label("name");
                     if ui
                         .add(egui::TextEdit::singleline(&mut ed.name).desired_width(160.0))
@@ -6213,494 +6261,501 @@ impl App {
                     );
                 });
 
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Select value\u{2026}")
-                        .on_hover_text(
-                            "choose which value this curve drives: the mixer strips, the \
+        ui.horizontal(|ui| {
+            if ui
+                .button("Select value\u{2026}")
+                .on_hover_text(
+                    "choose which value this curve drives: the mixer strips, the \
                              master, and a static 1:1 panel per plugin showing every \
                              parameter at its current value \u{b7} click one to bind",
-                        )
-                        .clicked()
-                    {
-                        self.auto_pick_open = true;
-                    }
-                });
+                )
+                .clicked()
+            {
+                self.auto_pick_open = true;
+            }
+        });
 
-                // ---- the curve canvas ------------------------------------
-                let (rect, resp) =
-                    ui.allocate_at_least(egui::vec2(596.0, 240.0), egui::Sense::click_and_drag());
-                // v26: in bars mode times label as bar.beat. v34 R1: node
-                // placement follows the manager's own snap selector
-                // (Alt = freehand), not just the beat grid.
-                let bars_mode = ed.len_bars;
-                // v34 R1: the manager has its own snap selector. With it
-                // OFF the classic rule survives untouched (bars mode snaps
-                // to the metronome beat, seconds mode is freehand); with
-                // it ON every canvas edit lands on the chosen subdivision.
-                // Alt is freehand over both.
-                let snap_u = if ed.snap_on {
-                    quantize::unit_samples(
-                        self.sample_rate.max(1),
-                        bpm,
-                        SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].0,
-                    )
-                } else if bars_mode {
-                    beat_s
-                } else {
-                    0.0
-                };
-                let snap_beat = snap_u > 0.0 && !ui.input(|i| i.modifiers.alt);
-                let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
-                let y_of = |v: f32| {
-                    rect.max.y
-                        - ((v - rmin) / (rmax - rmin).max(1e-9)).clamp(0.0, 1.0) * rect.height()
-                };
-                let t_of = |x: f32| {
-                    let raw = ((x - rect.min.x) / rect.width()) as f64 * len as f64;
-                    let q = if snap_beat {
-                        (raw / snap_u).round() * snap_u
-                    } else {
-                        raw.round()
-                    };
-                    q.clamp(0.0, len as f64) as i64
-                };
-                let pos_label = |t: i64| {
-                    if bars_mode {
-                        let bar = (t as f64 / bar_s) as i64 + 1;
-                        let beat = (((t as f64 % bar_s) / beat_s).floor() as i64 + 1)
-                            .min(beats as i64);
-                        format!("{bar}.{beat}")
-                    } else {
-                        format!("{:.2}s", t as f64 / sr)
-                    }
-                };
-                let v_of = |y: f32| {
-                    let f = ((rect.max.y - y) / rect.height()) as f64;
-                    (rmin as f64 + f.clamp(0.0, 1.0) * (rmax - rmin).max(1e-9) as f64) as f32
-                };
-                ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));
-                ui.painter().rect_stroke(
-                    rect,
-                    0.0,
-                    egui::Stroke::new(1.0, Color32::from_gray(60)),
-                    egui::StrokeKind::Inside,
-                );
-                // grid with ABSOLUTE value labels (the FL difference)
-                if bars_mode {
-                    // v26: metronome grid \u{b7} minor line per beat, major
-                    // line + 1-based bar number per bar. Sub-beat spacing
-                    // below 3 px would mud the canvas, so beats fade out.
-                    let beats_i = beats as i64;
-                    let beat_px = (beat_s / len as f64) as f32 * rect.width();
-                    let bar_px = beat_px * beats as f32;
-                    let lbl_every = if bar_px < 26.0 {
-                        (26.0 / bar_px).ceil() as i64
-                    } else {
-                        1
-                    };
-                    let mut bi = 1i64;
-                    while (bi as f64) * beat_s < len as f64 {
-                        let is_bar = bi % beats_i == 0;
-                        if is_bar || beat_px >= 3.0 {
-                            let gx = x_of((bi as f64 * beat_s).round() as i64);
-                            ui.painter().line_segment(
-                                [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
-                                egui::Stroke::new(
-                                    1.0,
-                                    Color32::from_gray(if is_bar { 52 } else { 32 }),
-                                ),
-                            );
-                            if is_bar && bi / beats_i % lbl_every.max(1) == 0 {
-                                ui.painter().text(
-                                    egui::pos2(gx + 2.0, rect.max.y - 8.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    format!("{}", bi / beats_i),
-                                    egui::FontId::proportional(9.0),
-                                    Color32::from_gray(130),
-                                );
-                            }
-                        }
-                        bi += 1;
-                    }
-                } else {
-                    for gi in 1..8 {
-                        let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
-                        ui.painter().line_segment(
-                            [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
-                            egui::Stroke::new(1.0, Color32::from_gray(35)),
-                        );
-                        let gt = len as f64 * gi as f64 / 8.0;
+        // ---- the curve canvas ------------------------------------
+        let (rect, resp) =
+            ui.allocate_at_least(egui::vec2(596.0, 240.0), egui::Sense::click_and_drag());
+        // v26: in bars mode times label as bar.beat. v34 R1: node
+        // placement follows the manager's own snap selector
+        // (Alt = freehand), not just the beat grid.
+        let bars_mode = ed.len_bars;
+        // v34 R1: the manager has its own snap selector. With it
+        // OFF the classic rule survives untouched (bars mode snaps
+        // to the metronome beat, seconds mode is freehand); with
+        // it ON every canvas edit lands on the chosen subdivision.
+        // Alt is freehand over both.
+        let snap_u = if ed.snap_on {
+            quantize::unit_samples(
+                self.sample_rate.max(1),
+                bpm,
+                SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].0,
+            )
+        } else if bars_mode {
+            beat_s
+        } else {
+            0.0
+        };
+        let snap_beat = snap_u > 0.0 && !ui.input(|i| i.modifiers.alt);
+        let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
+        let y_of = |v: f32| {
+            rect.max.y - ((v - rmin) / (rmax - rmin).max(1e-9)).clamp(0.0, 1.0) * rect.height()
+        };
+        let t_of = |x: f32| {
+            let raw = ((x - rect.min.x) / rect.width()) as f64 * len as f64;
+            let q = if snap_beat {
+                (raw / snap_u).round() * snap_u
+            } else {
+                raw.round()
+            };
+            q.clamp(0.0, len as f64) as i64
+        };
+        let pos_label = |t: i64| {
+            if bars_mode {
+                let bar = (t as f64 / bar_s) as i64 + 1;
+                let beat = (((t as f64 % bar_s) / beat_s).floor() as i64 + 1).min(beats as i64);
+                format!("{bar}.{beat}")
+            } else {
+                format!("{:.2}s", t as f64 / sr)
+            }
+        };
+        let v_of = |y: f32| {
+            let f = ((rect.max.y - y) / rect.height()) as f64;
+            (rmin as f64 + f.clamp(0.0, 1.0) * (rmax - rmin).max(1e-9) as f64) as f32
+        };
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));
+        ui.painter().rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0, Color32::from_gray(60)),
+            egui::StrokeKind::Inside,
+        );
+        // grid with ABSOLUTE value labels (the FL difference)
+        if bars_mode {
+            // v26: metronome grid \u{b7} minor line per beat, major
+            // line + 1-based bar number per bar. Sub-beat spacing
+            // below 3 px would mud the canvas, so beats fade out.
+            let beats_i = beats as i64;
+            let beat_px = (beat_s / len as f64) as f32 * rect.width();
+            let bar_px = beat_px * beats as f32;
+            let lbl_every = if bar_px < 26.0 {
+                (26.0 / bar_px).ceil() as i64
+            } else {
+                1
+            };
+            let mut bi = 1i64;
+            while (bi as f64) * beat_s < len as f64 {
+                let is_bar = bi % beats_i == 0;
+                if is_bar || beat_px >= 3.0 {
+                    let gx = x_of((bi as f64 * beat_s).round() as i64);
+                    ui.painter().line_segment(
+                        [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                        egui::Stroke::new(1.0, Color32::from_gray(if is_bar { 52 } else { 32 })),
+                    );
+                    if is_bar && bi / beats_i % lbl_every.max(1) == 0 {
                         ui.painter().text(
                             egui::pos2(gx + 2.0, rect.max.y - 8.0),
                             egui::Align2::LEFT_CENTER,
-                            format!("{:.2}s", gt / sr),
+                            format!("{}", bi / beats_i),
                             egui::FontId::proportional(9.0),
-                            Color32::from_gray(110),
+                            Color32::from_gray(130),
                         );
                     }
                 }
-                for gi in 1..4 {
-                    let gv = rmin + (rmax - rmin) * gi as f32 / 4.0;
-                    let gy = y_of(gv);
-                    ui.painter().line_segment(
-                        [egui::pos2(rect.min.x, gy), egui::pos2(rect.max.x, gy)],
-                        egui::Stroke::new(1.0, Color32::from_gray(35)),
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.min.x + 2.0, gy - 6.0),
-                        egui::Align2::LEFT_CENTER,
-                        format_gv(gv),
-                        egui::FontId::proportional(9.0),
-                        Color32::from_gray(110),
-                    );
+                bi += 1;
+            }
+        } else {
+            for gi in 1..8 {
+                let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
+                ui.painter().line_segment(
+                    [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                    egui::Stroke::new(1.0, Color32::from_gray(35)),
+                );
+                let gt = len as f64 * gi as f64 / 8.0;
+                ui.painter().text(
+                    egui::pos2(gx + 2.0, rect.max.y - 8.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{:.2}s", gt / sr),
+                    egui::FontId::proportional(9.0),
+                    Color32::from_gray(110),
+                );
+            }
+        }
+        for gi in 1..4 {
+            let gv = rmin + (rmax - rmin) * gi as f32 / 4.0;
+            let gy = y_of(gv);
+            ui.painter().line_segment(
+                [egui::pos2(rect.min.x, gy), egui::pos2(rect.max.x, gy)],
+                egui::Stroke::new(1.0, Color32::from_gray(35)),
+            );
+            ui.painter().text(
+                egui::pos2(rect.min.x + 2.0, gy - 6.0),
+                egui::Align2::LEFT_CENTER,
+                format_gv(gv),
+                egui::FontId::proportional(9.0),
+                Color32::from_gray(110),
+            );
+        }
+        // the curve
+        let sample = Automation {
+            target: ed.target.clone(),
+            len_samples: len,
+            nodes: ed.nodes.clone(),
+        };
+        let mut pts: Vec<egui::Pos2> = Vec::new();
+        let steps = (rect.width() / 2.0).max(2.0) as i64;
+        for i in 0..=steps {
+            let t = (len as f64 * i as f64 / steps as f64) as i64;
+            pts.push(egui::pos2(x_of(t), y_of(sample.eval(t))));
+        }
+        if pts.len() > 1 {
+            // translucent fill under the curve (area = "how much
+            // of the range the curve holds").
+            // v26: ONE convex_polygon over the whole area cannot
+            // represent a concave curve \u{b7} its fan triangulation
+            // left white lenses wherever the curve dipped under a
+            // chord (user screenshot). The area is now a Mesh of
+            // per-sample trapezoids: exact for any curvature, and
+            // unfeathered triangles keep the alpha perfectly even
+            // (no seams between the strips).
+            let base = rect.max.y;
+            let mut mesh = egui::epaint::Mesh::default();
+            let fill = Color32::from_rgba_premultiplied(255, 120, 120, 36);
+            for w in pts.windows(2) {
+                if (w[1].x - w[0].x).abs() < 0.01 {
+                    continue;
                 }
-                // the curve
-                let sample = Automation {
-                    target: ed.target.clone(),
-                    len_samples: len,
-                    nodes: ed.nodes.clone(),
+                let i = mesh.vertices.len() as u32;
+                for q in [
+                    w[0],
+                    w[1],
+                    egui::pos2(w[1].x, base),
+                    egui::pos2(w[0].x, base),
+                ] {
+                    mesh.colored_vertex(q, fill);
+                }
+                mesh.add_triangle(i, i + 1, i + 2);
+                mesh.add_triangle(i, i + 2, i + 3);
+            }
+            ui.painter()
+                .add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
+            for w in pts.windows(2) {
+                ui.painter().line_segment(
+                    [w[0], w[1]],
+                    egui::Stroke::new(1.6, Color32::from_rgb(255, 120, 120)),
+                );
+            }
+        }
+        // nodes
+        for (idx, n) in ed.nodes.iter().enumerate() {
+            let c = egui::pos2(x_of(n.t), y_of(n.v));
+            let sel = idx == ed.sel;
+            ui.painter().circle_filled(
+                c,
+                if sel { 5.0 } else { 3.5 },
+                if sel {
+                    Color32::from_rgb(255, 210, 120)
+                } else {
+                    Color32::from_rgb(255, 120, 120)
+                },
+            );
+            if sel {
+                ui.painter().circle(
+                    c,
+                    8.0,
+                    Color32::TRANSPARENT,
+                    egui::Stroke::new(1.0, Color32::from_rgb(255, 210, 120)),
+                );
+                ui.painter().text(
+                    egui::pos2(c.x + 10.0, c.y - 10.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{:.3} @ {}", n.v, pos_label(n.t)),
+                    egui::FontId::proportional(10.0),
+                    Color32::from_rgb(255, 220, 150),
+                );
+            }
+        }
+        // gestures
+        if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
+            let hit = nearest_auto_node(&ed.nodes, pos, x_of, y_of);
+            match hit {
+                Some(idx) => {
+                    ed.sel = idx;
+                    ed.drag = Some(idx);
+                }
+                None => {
+                    let (t, v) = (t_of(pos.x), v_of(pos.y));
+                    let at = ed
+                        .nodes
+                        .iter()
+                        .position(|n| n.t > t)
+                        .unwrap_or(ed.nodes.len());
+                    ed.nodes.insert(at, Node { t, v, c: 0.0 });
+                    ed.sel = at;
+                    ed.drag = Some(at);
+                    ed.changed = true;
+                }
+            }
+        }
+        // v0.15: arm the drag on PRESS-and-move. clicked() only
+        // fires on release-without-move, so a press straight into
+        // a drag used to move nothing at all.
+        // v0.15: arm the drag at PRESS time (directly on a node).
+        // clicked() only fires on release-without-move, so the old
+        // "arm on click" code never let a press flow into a drag.
+        let just_pressed =
+            resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        if just_pressed {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                    ed.sel = idx;
+                    ed.drag = Some(idx);
+                }
+            }
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                    ed.sel = idx;
+                    ed.drag = Some(idx);
+                }
+            }
+        }
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(idx) = ed.drag {
+                let lo = if idx > 0 {
+                    ed.nodes.get(idx - 1).map(|q| q.t + 1)
+                } else {
+                    None
                 };
-                let mut pts: Vec<egui::Pos2> = Vec::new();
-                let steps = (rect.width() / 2.0).max(2.0) as i64;
-                for i in 0..=steps {
-                    let t = (len as f64 * i as f64 / steps as f64) as i64;
-                    pts.push(egui::pos2(x_of(t), y_of(sample.eval(t))));
-                }
-                if pts.len() > 1 {
-                    // translucent fill under the curve (area = "how much
-                    // of the range the curve holds").
-                    // v26: ONE convex_polygon over the whole area cannot
-                    // represent a concave curve \u{b7} its fan triangulation
-                    // left white lenses wherever the curve dipped under a
-                    // chord (user screenshot). The area is now a Mesh of
-                    // per-sample trapezoids: exact for any curvature, and
-                    // unfeathered triangles keep the alpha perfectly even
-                    // (no seams between the strips).
-                    let base = rect.max.y;
-                    let mut mesh = egui::epaint::Mesh::default();
-                    let fill = Color32::from_rgba_premultiplied(255, 120, 120, 36);
-                    for w in pts.windows(2) {
-                        if (w[1].x - w[0].x).abs() < 0.01 {
-                            continue;
-                        }
-                        let i = mesh.vertices.len() as u32;
-                        for q in [
-                            w[0],
-                            w[1],
-                            egui::pos2(w[1].x, base),
-                            egui::pos2(w[0].x, base),
-                        ] {
-                            mesh.colored_vertex(q, fill);
-                        }
-                        mesh.add_triangle(i, i + 1, i + 2);
-                        mesh.add_triangle(i, i + 2, i + 3);
-                    }
-                    ui.painter()
-                        .add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
-                    for w in pts.windows(2) {
-                        ui.painter().line_segment(
-                            [w[0], w[1]],
-                            egui::Stroke::new(1.6, Color32::from_rgb(255, 120, 120)),
-                        );
-                    }
-                }
-                // nodes
-                for (idx, n) in ed.nodes.iter().enumerate() {
-                    let c = egui::pos2(x_of(n.t), y_of(n.v));
-                    let sel = idx == ed.sel;
-                    ui.painter().circle_filled(
-                        c,
-                        if sel { 5.0 } else { 3.5 },
-                        if sel { Color32::from_rgb(255, 210, 120) } else { Color32::from_rgb(255, 120, 120) },
-                    );
-                    if sel {
-                        ui.painter().circle(c, 8.0, Color32::TRANSPARENT, egui::Stroke::new(1.0, Color32::from_rgb(255, 210, 120)));
-                        ui.painter().text(
-                            egui::pos2(c.x + 10.0, c.y - 10.0),
-                            egui::Align2::LEFT_BOTTOM,
-                            format!("{:.3} @ {}", n.v, pos_label(n.t)),
-                            egui::FontId::proportional(10.0),
-                            Color32::from_rgb(255, 220, 150),
-                        );
-                    }
-                }
-                // gestures
-                if let Some(pos) = resp.interact_pointer_pos().filter(|_| resp.clicked()) {
-                    let hit = nearest_auto_node(&ed.nodes, pos, x_of, y_of);
-                    match hit {
-                        Some(idx) => {
-                            ed.sel = idx;
-                            ed.drag = Some(idx);
-                        }
-                        None => {
-                            let (t, v) = (t_of(pos.x), v_of(pos.y));
-                            let at = ed
-                                .nodes
-                                .iter()
-                                .position(|n| n.t > t)
-                                .unwrap_or(ed.nodes.len());
-                            ed.nodes.insert(
-                                at,
-                                Node { t, v, c: 0.0 },
-                            );
-                            ed.sel = at;
-                            ed.drag = Some(at);
-                            ed.changed = true;
-                        }
-                    }
-                }
-                // v0.15: arm the drag on PRESS-and-move. clicked() only
-                // fires on release-without-move, so a press straight into
-                // a drag used to move nothing at all.
-                // v0.15: arm the drag at PRESS time (directly on a node).
-                // clicked() only fires on release-without-move, so the old
-                // "arm on click" code never let a press flow into a drag.
-                let just_pressed =
-                    resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-                if just_pressed {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
-                            ed.sel = idx;
-                            ed.drag = Some(idx);
-                        }
-                    }
-                }
-                if resp.drag_started() {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
-                            ed.sel = idx;
-                            ed.drag = Some(idx);
-                        }
-                    }
-                }
-                if resp.dragged() {
-                    if let Some(idx) = ed.drag {
-                        let lo = if idx > 0 { ed.nodes.get(idx - 1).map(|q| q.t + 1) } else { None };
-                        let hi = ed.nodes.get(idx + 1).map(|q| q.t - 1);
-                        if let Some(n) = ed.nodes.get_mut(idx) {
-                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                                let mut t = t_of(pos.x);
-                                if let Some(l) = lo {
-                                    t = t.max(l);
-                                }
-                                if let Some(h) = hi {
-                                    t = t.min(h);
-                                }
-                                n.t = t.clamp(0, len);
-                                n.v = v_of(pos.y).clamp(rmin.min(n.v), rmax.max(n.v));
-                                ed.changed = true;
-                            }
-                        }
-                    }
-                }
-                if resp.secondary_clicked() {
-                    let pos = ui.input(|i| i.pointer.interact_pos()).unwrap();
-                    if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
-                        if ed.nodes.len() > 1 {
-                            ed.nodes.remove(idx);
-                            ed.sel = ed.sel.min(ed.nodes.len().saturating_sub(1));
-                            ed.drag = None;
-                            ed.changed = true;
-                        }
-                    }
-                }
-                // v27: double-click a node cycles the curvature of the
-                // segment leading into it (straight \u{b7} settle \u{b7} rush),
-                // the quick gesture for the continuous slider. A
-                // double-click on empty space first ADDS a node (first
-                // click), and the cycle applies to that new node, which is
-                // never a misfire.
-                if resp.double_clicked() {
+                let hi = ed.nodes.get(idx + 1).map(|q| q.t - 1);
+                if let Some(n) = ed.nodes.get_mut(idx) {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                        if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
-                            if let Some(n) = ed.nodes.get_mut(idx) {
-                                n.c = if n.c.abs() < 1e-6 {
-                                    0.75
-                                } else if n.c > 0.0 {
-                                    -0.75
-                                } else {
-                                    0.0
-                                };
-                            }
-                            ed.sel = idx;
-                            ed.changed = true;
+                        let mut t = t_of(pos.x);
+                        if let Some(l) = lo {
+                            t = t.max(l);
                         }
+                        if let Some(h) = hi {
+                            t = t.min(h);
+                        }
+                        n.t = t.clamp(0, len);
+                        n.v = v_of(pos.y).clamp(rmin.min(n.v), rmax.max(n.v));
+                        ed.changed = true;
                     }
                 }
-                if !ui.input(|i| i.pointer.any_down()) {
+            }
+        }
+        if resp.secondary_clicked() {
+            let pos = ui.input(|i| i.pointer.interact_pos()).unwrap();
+            if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                if ed.nodes.len() > 1 {
+                    ed.nodes.remove(idx);
+                    ed.sel = ed.sel.min(ed.nodes.len().saturating_sub(1));
                     ed.drag = None;
+                    ed.changed = true;
                 }
-                resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, double-click a node to cycle its segment curvature, right-click a node to delete it");
-
-                // ---- node editor ------------------------------------------
-                let mut resort: Option<i64> = None;
-                ui.horizontal(|ui| {
-                    if let Some(n) = ed.nodes.get_mut(ed.sel) {
-                        ui.label(format!("node {}", ed.sel + 1));
-                        if bars_mode {
-                            // v26: bars mode edits BEATS (1 beat = the
-                            // metronome's finest whole unit here).
-                            let mut bt = n.t as f64 / beat_s;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut bt)
-                                        .speed(0.25)
-                                        .suffix(" beats")
-                                        .range(0.0..=len as f64 / beat_s),
-                                )
-                                .changed()
-                            {
-                                n.t = (bt * beat_s).round().clamp(0.0, len as f64) as i64;
-                                resort = Some(n.t);
-                                ed.changed = true;
-                            }
+            }
+        }
+        // v27: double-click a node cycles the curvature of the
+        // segment leading into it (straight \u{b7} settle \u{b7} rush),
+        // the quick gesture for the continuous slider. A
+        // double-click on empty space first ADDS a node (first
+        // click), and the cycle applies to that new node, which is
+        // never a misfire.
+        if resp.double_clicked() {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
+                    if let Some(n) = ed.nodes.get_mut(idx) {
+                        n.c = if n.c.abs() < 1e-6 {
+                            0.75
+                        } else if n.c > 0.0 {
+                            -0.75
                         } else {
-                            let mut ts = n.t as f64 / sr;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut ts)
-                                        .speed(0.01)
-                                        .suffix(" s")
-                                        .range(0.0..=len as f64 / sr),
-                                )
-                                .changed()
-                            {
-                                n.t = (ts * sr).round().clamp(0.0, len as f64) as i64;
-                                resort = Some(n.t);
-                                ed.changed = true;
-                            }
-                        }
-                        let mut vv = n.v;
-                        if ui
-                            .add(egui::DragValue::new(&mut vv).speed(0.002).range(rmin..=rmax))
-                            .changed()
-                        {
-                            n.v = vv;
-                            ed.changed = true;
-                        }
-                        // v27: one CONTINUOUS curvature for the segment
-                        // arriving at this node (FL Studio's dial) replaces
-                        // the old four-mode dropdown.
-                        let mut cc = n.c;
-                        if ui
-                            .add_sized(
-                                [140.0, 18.0],
-                                egui::Slider::new(&mut cc, -1.0..=1.0)
-                                    .text("curve")
-                                    .custom_formatter(|v, _| format!("{v:+.2}")),
-                            )
-                            .on_hover_text(
-                                "curvature of the segment arriving at this node: 0 straight \u{b7} \
+                            0.0
+                        };
+                    }
+                    ed.sel = idx;
+                    ed.changed = true;
+                }
+            }
+        }
+        if !ui.input(|i| i.pointer.any_down()) {
+            ed.drag = None;
+        }
+        resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, double-click a node to cycle its segment curvature, right-click a node to delete it");
+
+        // ---- node editor ------------------------------------------
+        let mut resort: Option<i64> = None;
+        ui.horizontal(|ui| {
+            if let Some(n) = ed.nodes.get_mut(ed.sel) {
+                ui.label(format!("node {}", ed.sel + 1));
+                if bars_mode {
+                    // v26: bars mode edits BEATS (1 beat = the
+                    // metronome's finest whole unit here).
+                    let mut bt = n.t as f64 / beat_s;
+                    let before = bt;
+                    let bb = ui.add(
+                        egui::DragValue::new(&mut bt)
+                            .speed(0.25)
+                            .suffix(" beats")
+                            .range(0.0..=len as f64 / beat_s),
+                    );
+                    if p_changed(&bb, before, &mut bt) {
+                        n.t = (bt * beat_s).round().clamp(0.0, len as f64) as i64;
+                        resort = Some(n.t);
+                        ed.changed = true;
+                    }
+                } else {
+                    let mut ts = n.t as f64 / sr;
+                    let before = ts;
+                    let bts = ui.add(
+                        egui::DragValue::new(&mut ts)
+                            .speed(0.01)
+                            .suffix(" s")
+                            .range(0.0..=len as f64 / sr),
+                    );
+                    if p_changed(&bts, before, &mut ts) {
+                        n.t = (ts * sr).round().clamp(0.0, len as f64) as i64;
+                        resort = Some(n.t);
+                        ed.changed = true;
+                    }
+                }
+                let mut vv = n.v;
+                let before = vv;
+                let bv = ui.add(
+                    egui::DragValue::new(&mut vv)
+                        .speed(0.002)
+                        .range(rmin..=rmax),
+                );
+                if p_changed(&bv, before, &mut vv) {
+                    n.v = vv;
+                    ed.changed = true;
+                }
+                // v27: one CONTINUOUS curvature for the segment
+                // arriving at this node (FL Studio's dial) replaces
+                // the old four-mode dropdown.
+                let mut cc = n.c;
+                let before = cc;
+                let bc = ui
+                    .add_sized(
+                        [140.0, 18.0],
+                        egui::Slider::new(&mut cc, -1.0..=1.0)
+                            .text("curve")
+                            .custom_formatter(|v, _| format!("{v:+.2}")),
+                    )
+                    .on_hover_text(
+                        "curvature of the segment arriving at this node: 0 straight \u{b7} \
                                  + rushes away from the previous node and settles in softly \u{b7} \
                                  \u{2212} eases away and rushes in (\u{b1}1 = the old slow/fast \
                                  curves, sine/ease presets build on this)",
-                            )
-                            .changed()
-                        {
-                            n.c = cc;
-                            ed.changed = true;
-                        }
-                        if ui.button("delete").clicked() && ed.nodes.len() > 1 {
-                            ed.nodes.remove(ed.sel);
-                            ed.sel = ed.sel.saturating_sub(1);
-                            ed.changed = true;
-                        }
-                    } else {
-                        ui.label("no node selected \u{2014} click the curve to add one");
-                    }
-                });
-                if let Some(tt) = resort {
-                    ed.nodes.sort_by_key(|n| n.t);
-                    ed.sel = ed.nodes.iter().position(|n| n.t == tt).unwrap_or(ed.sel);
-                }
-
-                // ---- v26: one-click shape presets -----------------------
-                // The whole point: a usable curve in ONE click. Each preset
-                // REPLACES the node set, mapped over the full length and the
-                // target's own min..max — every endpoint stays editable.
-                // v30 R3: the presets are FILES now (same system as effect
-                // user presets): the nine factory shapes seed into
-                // `<data>/automation presets/` once, live in one list with
-                // whatever the user saved, and can be deleted or added to
-                // from here. Normalised storage = one shape fits any
-                // target and length.
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("presets:").weak());
-                    if !crate::automation::presets_dir().exists() {
-                        crate::automation::seed_factory_presets();
-                    }
-                    for name in crate::automation::list_presets() {
-                        let btn = ui.button(&name).on_hover_text(
-                            "replace the whole curve with this shape, spanning the \
-                             target's full range; right-click to delete it",
-                        );
-                        if btn.clicked() {
-                            match crate::automation::load_preset(&name) {
-                                Some(sp) => {
-                                    ed.nodes = sp.apply(len, rmin, rmax);
-                                    ed.sel = 0;
-                                    ed.drag = None;
-                                    ed.changed = true;
-                                }
-                                None => self.status = format!("preset \u{201c}{name}\u{201d} is unreadable"),
-                            }
-                        }
-                        let nm = name.clone();
-                        btn.context_menu(|ui| {
-                            if ui.button("delete preset").clicked() {
-                                let _ = crate::automation::delete_preset(&nm);
-                                self.status = format!("preset \u{201c}{nm}\u{201d} deleted");
-                                ui.close();
-                            }
-                        });
-                    }
-                    ui.separator();
-                    ui.label(RichText::new("save:").weak());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.auto_preset_name)
-                            .desired_width(110.0)
-                            .hint_text("new preset name"),
                     );
-                    if ui
-                        .button("save curve")
-                        .on_hover_text(
-                            "store the current node set as a preset (saved normalised, so it \
-                             fits any target and length; the name box picks the file)",
-                        )
-                        .clicked()
-                    {
-                        let nm = self.auto_preset_name.trim().to_string();
-                        if nm.is_empty() {
-                            self.status = "preset: type a name first".into();
-                        } else {
-                            let sp = crate::automation::ShapePreset::from_nodes(
-                                &ed.nodes, len, rmin, rmax,
-                            );
-                            match crate::automation::save_preset(&nm, &sp) {
-                                Ok(()) => {
-                                    self.status = format!("preset \u{201c}{nm}\u{201d} saved");
-                                    self.auto_preset_name = String::new();
-                                }
-                                Err(e) => self.status = format!("preset save failed: {e}"),
-                            }
+                if p_changed(&bc, before, &mut cc) {
+                    n.c = cc;
+                    ed.changed = true;
+                }
+                if ui.button("delete").clicked() && ed.nodes.len() > 1 {
+                    ed.nodes.remove(ed.sel);
+                    ed.sel = ed.sel.saturating_sub(1);
+                    ed.changed = true;
+                }
+            } else {
+                ui.label("no node selected \u{2014} click the curve to add one");
+            }
+        });
+        if let Some(tt) = resort {
+            ed.nodes.sort_by_key(|n| n.t);
+            ed.sel = ed.nodes.iter().position(|n| n.t == tt).unwrap_or(ed.sel);
+        }
+
+        // ---- v26: one-click shape presets -----------------------
+        // The whole point: a usable curve in ONE click. Each preset
+        // REPLACES the node set, mapped over the full length and the
+        // target's own min..max — every endpoint stays editable.
+        // v30 R3: the presets are FILES now (same system as effect
+        // user presets): the nine factory shapes seed into
+        // `<data>/automation presets/` once, live in one list with
+        // whatever the user saved, and can be deleted or added to
+        // from here. Normalised storage = one shape fits any
+        // target and length.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("presets:").weak());
+            if !crate::automation::presets_dir().exists() {
+                crate::automation::seed_factory_presets();
+            }
+            for name in crate::automation::list_presets() {
+                let btn = ui.button(&name).on_hover_text(
+                    "replace the whole curve with this shape, spanning the \
+                             target's full range; right-click to delete it",
+                );
+                if btn.clicked() {
+                    match crate::automation::load_preset(&name) {
+                        Some(sp) => {
+                            ed.nodes = sp.apply(len, rmin, rmax);
+                            ed.sel = 0;
+                            ed.drag = None;
+                            ed.changed = true;
+                        }
+                        None => {
+                            self.status = format!("preset \u{201c}{name}\u{201d} is unreadable")
                         }
                     }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Save as new asset + clip").clicked() {
-                        *action = 1;
-                    }
-                    if ed.asset.is_some() && ui.button("Save (overwrite asset)").clicked() {
-                        *action = 2;
-                    }
-                    if ui.button("Close").clicked() {
-                        *action = 3;
-                    }
-                    if ed.changed {
-                        ui.label(RichText::new("unsaved").weak().italics());
+                }
+                let nm = name.clone();
+                btn.context_menu(|ui| {
+                    if ui.button("delete preset").clicked() {
+                        let _ = crate::automation::delete_preset(&nm);
+                        self.status = format!("preset \u{201c}{nm}\u{201d} deleted");
+                        ui.close();
                     }
                 });
+            }
+            ui.separator();
+            ui.label(RichText::new("save:").weak());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.auto_preset_name)
+                    .desired_width(110.0)
+                    .hint_text("new preset name"),
+            );
+            if ui
+                .button("save curve")
+                .on_hover_text(
+                    "store the current node set as a preset (saved normalised, so it \
+                             fits any target and length; the name box picks the file)",
+                )
+                .clicked()
+            {
+                let nm = self.auto_preset_name.trim().to_string();
+                if nm.is_empty() {
+                    self.status = "preset: type a name first".into();
+                } else {
+                    let sp = crate::automation::ShapePreset::from_nodes(&ed.nodes, len, rmin, rmax);
+                    match crate::automation::save_preset(&nm, &sp) {
+                        Ok(()) => {
+                            self.status = format!("preset \u{201c}{nm}\u{201d} saved");
+                            self.auto_preset_name = String::new();
+                        }
+                        Err(e) => self.status = format!("preset save failed: {e}"),
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Save as new asset + clip").clicked() {
+                *action = 1;
+            }
+            if ed.asset.is_some() && ui.button("Save (overwrite asset)").clicked() {
+                *action = 2;
+            }
+            if ui.button("Close").clicked() {
+                *action = 3;
+            }
+            if ed.changed {
+                ui.label(RichText::new("unsaved").weak().italics());
+            }
+        });
     }
 
     /// Persist the automation manager buffer: overwrite the source asset
@@ -6916,7 +6971,8 @@ impl App {
             if vb.kind == 0 {
                 bs.axes.push(crate::audio::axis_key(vb.bind.ty, vb.bind.ch));
             } else {
-                bs.exact.push(crate::audio::bind_key(vb.bind.ty, vb.bind.ch, vb.bind.d1));
+                bs.exact
+                    .push(crate::audio::bind_key(vb.bind.ty, vb.bind.ch, vb.bind.d1));
             }
         }
         self.backend.engine.set_midi_bound(bs);
@@ -7194,10 +7250,8 @@ impl App {
                         id: crate::audio::PREVIEW_TRANSIENT,
                         samples: buf,
                     });
-                    self.status = format!(
-                        "\u{266a} {nm} \u{b7} default (piano)",
-                        nm = note_name(note)
-                    );
+                    self.status =
+                        format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
                 }
                 None => {
                     self.status = "audition: no synth available".into();
@@ -7298,10 +7352,9 @@ impl App {
                 let at = start + i;
                 if at >= 0 && (at as usize) < buf.len() {
                     let fi = i as f32;
-                    buf[at as usize] +=
-                        (fi * std::f32::consts::TAU * f / sr as f32).sin()
-                            * (-fi / decay).exp()
-                            * a;
+                    buf[at as usize] += (fi * std::f32::consts::TAU * f / sr as f32).sin()
+                        * (-fi / decay).exp()
+                        * a;
                 }
             }
             k += beat as i64;
@@ -7337,10 +7390,7 @@ impl App {
                 self.preview_metro_only(&pat);
             }
             self.preview_playing = Some(name);
-            self.status = format!(
-                "preview playing \u{b7} {}",
-                self.roll_track_label(t)
-            );
+            self.status = format!("preview playing \u{b7} {}", self.roll_track_label(t));
             return;
         }
         match self.render_pattern_preview(&pat) {
@@ -7595,25 +7645,17 @@ impl App {
             if let (Some(hp), Some(cv)) =
                 (ui.ctx().input(|i| i.pointer.hover_pos()), roll.canvas_rect)
             {
-                let row = ((((cv.max.y - 10.0 + roll.vscroll_px) - hp.y - roll.row_h)
-                    / roll.row_h)
+                let row = ((((cv.max.y - 10.0 + roll.vscroll_px) - hp.y - roll.row_h) / roll.row_h)
                     .ceil() as i32)
                     .clamp(0, 127);
                 let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
                 let sec = roll.scroll_sec + (hp.x - (cv.min.x + 58.0)) as f64 / px_per_sec;
                 let sec_of = |tk: u32| tk as f64 * sec_per_beat / PPQ as f64;
-                let hit = roll
-                    .pat
-                    .notes
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(i, n)| {
-                        let n0 = sec_of(n.start);
-                        let n1 = n0 + sec_of(n.len.max(1));
-                        (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6)
-                            .then_some(i)
-                    });
+                let hit = roll.pat.notes.iter().enumerate().rev().find_map(|(i, n)| {
+                    let n0 = sec_of(n.start);
+                    let n1 = n0 + sec_of(n.len.max(1));
+                    (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6).then_some(i)
+                });
                 if let Some(i) = hit {
                     let d: i16 = if wheel_dy > 0.0 { 5 } else { -5 };
                     let targets: Vec<usize> = if roll.sel_notes.contains(&i) {
@@ -7654,8 +7696,18 @@ impl App {
         let mut resp = None;
         if docked {
             self.roll_inner(
-                ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
-                &mut save, &mut clear, &mut preview, &mut stop_preview, &mut audition,
+                ui,
+                &mut roll,
+                sec_per_beat,
+                step_sec,
+                min_len_ticks,
+                playhead,
+                sr,
+                &mut save,
+                &mut clear,
+                &mut preview,
+                &mut stop_preview,
+                &mut audition,
                 &mut placed,
             );
         } else {
@@ -7673,15 +7725,28 @@ impl App {
                 .min_width(80.0)
                 .min_height(70.0);
             if let Some(r) = self.dyn_rect(idx) {
-                w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+                w = w
+                    .default_pos([r[0], r[1]])
+                    .default_width(r[2])
+                    .default_height(r[3]);
             }
             if dragging {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
             resp = w.show(ui, |ui| {
                 self.roll_inner(
-                    ui, &mut roll, sec_per_beat, step_sec, min_len_ticks, playhead, sr,
-                    &mut save, &mut clear, &mut preview, &mut stop_preview, &mut audition,
+                    ui,
+                    &mut roll,
+                    sec_per_beat,
+                    step_sec,
+                    min_len_ticks,
+                    playhead,
+                    sr,
+                    &mut save,
+                    &mut clear,
+                    &mut preview,
+                    &mut stop_preview,
+                    &mut audition,
                     &mut placed,
                 )
             });
@@ -7709,10 +7774,7 @@ impl App {
         } else if docked {
             // Same focus rule against the dock panel's recorded rect.
             let d = self.dock_rects[idx];
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(d[0], d[1]),
-                egui::vec2(d[2], d[3]),
-            );
+            let rect = egui::Rect::from_min_size(egui::pos2(d[0], d[1]), egui::vec2(d[2], d[3]));
             roll.win_rect = Some(rect);
             if let Some(click) = ui.ctx().input(|i| {
                 if i.pointer.button_clicked(egui::PointerButton::Primary) {
@@ -7769,49 +7831,48 @@ impl App {
             // v38 R6: an empty pattern previews to silence — say so
             // instead of pretending a transport started.
             if pat.notes.is_empty() && pat.ccs.is_empty() && pat.press.is_empty() {
-                self.status =
-                    "preview: nothing to play \u{b7} place a note first".into();
+                self.status = "preview: nothing to play \u{b7} place a note first".into();
             } else {
-            match self.preview_track {
-                // v38 R1: the pattern goes through the LIVE track
-                // instrument as an RT audition voice — instant, no
-                // plugin instantiation, and it is the SAME instance the
-                // clips will play. Linked metro joins as a click-only
-                // transient voice, phase-locked to tick 0.
-                Some(t) => {
-                    let mut ev = self.pattern_events(&pat);
-                    if ev.is_empty() {
-                        self.status =
-                            "preview: pattern has no notes yet \u{b7} draw one first".into();
-                    } else {
-                        ev.sort_unstable();
-                        self.backend.engine.play_audition(t, ev.into());
-                        if self.metro_on {
-                            self.preview_metro_only(&pat);
+                match self.preview_track {
+                    // v38 R1: the pattern goes through the LIVE track
+                    // instrument as an RT audition voice — instant, no
+                    // plugin instantiation, and it is the SAME instance the
+                    // clips will play. Linked metro joins as a click-only
+                    // transient voice, phase-locked to tick 0.
+                    Some(t) => {
+                        let mut ev = self.pattern_events(&pat);
+                        if ev.is_empty() {
+                            self.status =
+                                "preview: pattern has no notes yet \u{b7} draw one first".into();
+                        } else {
+                            ev.sort_unstable();
+                            self.backend.engine.play_audition(t, ev.into());
+                            if self.metro_on {
+                                self.preview_metro_only(&pat);
+                            }
+                            self.preview_playing = Some("piano roll".into());
+                            self.status = format!(
+                                "preview playing \u{b7} {} \u{b7} space or STOP ends it",
+                                self.roll_track_label(t)
+                            );
                         }
-                        self.preview_playing = Some("piano roll".into());
-                        self.status = format!(
-                            "preview playing \u{b7} {} \u{b7} space or STOP ends it",
-                            self.roll_track_label(t)
-                        );
                     }
-                }
-                None => match self.render_pattern_preview(&pat) {
-                    Some(buf) => {
-                        // Edit echo, not an audition: replace anything playing.
-                        self.backend.cmd(Cmd::PreviewStop { id: None });
-                        self.backend.cmd(Cmd::PreviewPlay {
-                            id: crate::audio::PREVIEW_TRANSIENT,
-                            samples: buf,
-                        });
-                        self.preview_playing = Some("piano roll".into());
-                        self.status =
+                    None => match self.render_pattern_preview(&pat) {
+                        Some(buf) => {
+                            // Edit echo, not an audition: replace anything playing.
+                            self.backend.cmd(Cmd::PreviewStop { id: None });
+                            self.backend.cmd(Cmd::PreviewPlay {
+                                id: crate::audio::PREVIEW_TRANSIENT,
+                                samples: buf,
+                            });
+                            self.preview_playing = Some("piano roll".into());
+                            self.status =
                             "preview playing \u{b7} default (piano) \u{b7} space or STOP ends it"
                                 .into();
-                    }
-                    None => self.status = "preview: no synth available".into(),
-                },
-            }
+                        }
+                        None => self.status = "preview: no synth available".into(),
+                    },
+                }
             }
         }
         // v38 R4: STOP is a first-class state now — the button, SPACE and
@@ -7870,8 +7931,8 @@ impl App {
         audition: &mut Option<u8>,
         placed: &mut Option<u8>,
     ) {
-                // ---- toolbar ----
-                ui.horizontal(|ui| {
+        // ---- toolbar ----
+        ui.horizontal(|ui| {
                     // FL-style routing: pick the TRACK whose instrument AND
                     // mixer chain previews this pattern.
                     ui.label("preview:");
@@ -8003,694 +8064,711 @@ impl App {
                         .small(),
                     );
                 });
-                // Pure time conversions (closures over roll.pat would fight
-                // the borrow checker while editing notes).
-                let t_of = |tk: u32| -> f64 { tk as f64 * sec_per_beat / PPQ as f64 };
-                let tick_of = |t: f64| -> u32 { (t.max(0.0) * PPQ as f64 / sec_per_beat).round() as u32 };
-                let snap = |t: f64| (t / step_sec).floor() * step_sec;
-                let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
+        // Pure time conversions (closures over roll.pat would fight
+        // the borrow checker while editing notes).
+        let t_of = |tk: u32| -> f64 { tk as f64 * sec_per_beat / PPQ as f64 };
+        let tick_of = |t: f64| -> u32 { (t.max(0.0) * PPQ as f64 / sec_per_beat).round() as u32 };
+        let snap = |t: f64| (t / step_sec).floor() * step_sec;
+        let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
 
-                // ---- canvas (fills the rest of the window; the manual
-                // scrollbars painted on its edges own their pixels) ----
-                let avail = ui.available_size();
-                let (rect, resp) = ui.allocate_at_least(
-                    egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
-                    Sense::click_and_drag(),
+        // ---- canvas (fills the rest of the window; the manual
+        // scrollbars painted on its edges own their pixels) ----
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_at_least(
+            egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
+            Sense::click_and_drag(),
+        );
+        if rect.width() <= 2.0 || rect.height() <= 2.0 {
+            roll.canvas_rect = Some(rect);
+            return;
+        }
+        // Remembered for the wheel routers on the NEXT frame.
+        roll.canvas_rect = Some(rect);
+        // Owned painter clipped to the canvas (painting before or
+        // after `ui`-mutating widgets never races).
+        let painter = ui.painter_at(rect);
+
+        const SB: f32 = 10.0; // scrollbar thickness
+        const KEYS_W: f32 = 58.0;
+        let grid_x0 = rect.min.x + KEYS_W;
+        let view_w = (rect.max.x - SB - grid_x0).max(40.0);
+        let view_h = (rect.height() - SB).max(40.0);
+        let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
+
+        // Keyboard range visible: derived from the vertical scroll.
+        let v_max = (128.0 * roll.row_h - view_h).max(0.0);
+        roll.vscroll_px = roll.vscroll_px.clamp(0.0, v_max);
+        let lo = ((roll.vscroll_px / roll.row_h).floor() as i32).clamp(0, 127) as u8;
+        let hi = (lo as i32 + (view_h / roll.row_h) as i32 + 2).min(127) as u8;
+        // Pixels from canvas bottom to the bottom of note 0.
+        let s_px = roll.vscroll_px;
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
+        let x_of = |t: f64| grid_x0 + ((t - roll.scroll_sec) * px_per_sec) as f32;
+        // vscroll_px counts keyboard pixels scrolled up from the
+        // bottom, so a row's TOP sits at B + s − (n+1)·r. (The old
+        // sign subtracted s: scrolling then slid the note grid one
+        // way while lo/hi and the keyboard strip moved the other —
+        // the "inverted scroll" users reported, plus notes vanishing
+        // because drawing was culled against lo..hi.)
+        let y_of = |n: i32| rect.max.y - SB + s_px - n as f32 * roll.row_h - roll.row_h;
+        let sec_at = |x: f32| roll.scroll_sec + (x - grid_x0) as f64 / px_per_sec;
+        let row_at = |y: f32| -> i32 {
+            // Exact inverse of y_of: row = ceil((B + s − y)/r) − 1.
+            let b = rect.max.y - SB + s_px;
+            (((b - y - roll.row_h) / roll.row_h).ceil() as i32).clamp(0, 127)
+        };
+
+        // vertical grid: snap steps faint, beats medium, bars strong
+        let visible = view_w as f64 / px_per_sec;
+        let mut tt = (roll.scroll_sec / step_sec).floor() * step_sec;
+        while tt < roll.scroll_sec + visible + step_sec {
+            let x = x_of(tt);
+            if x > grid_x0 {
+                let beats = tt / sec_per_beat;
+                let is_beat = (beats - beats.round()).abs() < 0.01;
+                let is_bar = is_beat && ((beats.round() as i64) % 4 == 0);
+                let col = if is_bar {
+                    Color32::from_gray(120)
+                } else if is_beat {
+                    Color32::from_gray(75)
+                } else {
+                    Color32::from_gray(45)
+                };
+                painter.line_segment(
+                    [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y - SB)],
+                    egui::Stroke::new(if is_bar { 1.4f32 } else { 1.0f32 }, col),
                 );
-                if rect.width() <= 2.0 || rect.height() <= 2.0 {
-                    roll.canvas_rect = Some(rect);
-                    return;
+                if is_bar {
+                    painter.text(
+                        egui::pos2(x + 2.0, rect.min.y + 6.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{}", (beats.round() as i64) / 4 + 1),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_gray(150),
+                    );
                 }
-                // Remembered for the wheel routers on the NEXT frame.
-                roll.canvas_rect = Some(rect);
-                // Owned painter clipped to the canvas (painting before or
-                // after `ui`-mutating widgets never races).
-                let painter = ui.painter_at(rect);
-
-                const SB: f32 = 10.0; // scrollbar thickness
-                const KEYS_W: f32 = 58.0;
-                let grid_x0 = rect.min.x + KEYS_W;
-                let view_w = (rect.max.x - SB - grid_x0).max(40.0);
-                let view_h = (rect.height() - SB).max(40.0);
-                let px_per_sec = roll.px_per_beat as f64 / sec_per_beat;
-
-                // Keyboard range visible: derived from the vertical scroll.
-                let v_max = (128.0 * roll.row_h - view_h).max(0.0);
-                roll.vscroll_px = roll.vscroll_px.clamp(0.0, v_max);
-                let lo = ((roll.vscroll_px / roll.row_h).floor() as i32).clamp(0, 127) as u8;
-                let hi = (lo as i32 + (view_h / roll.row_h) as i32 + 2).min(127) as u8;
-                // Pixels from canvas bottom to the bottom of note 0.
-                let s_px = roll.vscroll_px;
-                painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));
-                let x_of = |t: f64| grid_x0 + ((t - roll.scroll_sec) * px_per_sec) as f32;
-                // vscroll_px counts keyboard pixels scrolled up from the
-                // bottom, so a row's TOP sits at B + s − (n+1)·r. (The old
-                // sign subtracted s: scrolling then slid the note grid one
-                // way while lo/hi and the keyboard strip moved the other —
-                // the "inverted scroll" users reported, plus notes vanishing
-                // because drawing was culled against lo..hi.)
-                let y_of = |n: i32| rect.max.y - SB + s_px - n as f32 * roll.row_h - roll.row_h;
-                let sec_at =
-                    |x: f32| roll.scroll_sec + (x - grid_x0) as f64 / px_per_sec;
-                let row_at = |y: f32| -> i32 {
-                    // Exact inverse of y_of: row = ceil((B + s − y)/r) − 1.
-                    let b = rect.max.y - SB + s_px;
-                    (((b - y - roll.row_h) / roll.row_h).ceil() as i32).clamp(0, 127)
-                };
-
-                // vertical grid: snap steps faint, beats medium, bars strong
-                let visible = view_w as f64 / px_per_sec;
-                let mut tt = (roll.scroll_sec / step_sec).floor() * step_sec;
-                while tt < roll.scroll_sec + visible + step_sec {
-                    let x = x_of(tt);
-                    if x > grid_x0 {
-                        let beats = tt / sec_per_beat;
-                        let is_beat = (beats - beats.round()).abs() < 0.01;
-                        let is_bar = is_beat && ((beats.round() as i64) % 4 == 0);
-                        let col = if is_bar {
-                            Color32::from_gray(120)
-                        } else if is_beat {
-                            Color32::from_gray(75)
-                        } else {
-                            Color32::from_gray(45)
-                        };
-                        painter.line_segment(
-                            [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y - SB)],
-                            egui::Stroke::new(if is_bar { 1.4f32 } else { 1.0f32 }, col),
-                        );
-                        if is_bar {
-                            painter.text(
-                                egui::pos2(x + 2.0, rect.min.y + 6.0),
-                                egui::Align2::LEFT_TOP,
-                                format!("{}", (beats.round() as i64) / 4 + 1),
-                                egui::FontId::proportional(9.0),
-                                Color32::from_gray(150),
-                            );
-                        }
-                    }
-                    tt += step_sec;
-                }
-                // keyboard strip + row lines (only rows intersecting view)
-                for n in lo as i32..=hi as i32 {
-                    let black = matches!((n.rem_euclid(12)) as u8, 1 | 3 | 6 | 8 | 10);
-                    let y = y_of(n);
-                    if y > rect.max.y - SB || y + roll.row_h < rect.min.y {
-                        continue;
-                    }
+            }
+            tt += step_sec;
+        }
+        // keyboard strip + row lines (only rows intersecting view)
+        for n in lo as i32..=hi as i32 {
+            let black = matches!((n.rem_euclid(12)) as u8, 1 | 3 | 6 | 8 | 10);
+            let y = y_of(n);
+            if y > rect.max.y - SB || y + roll.row_h < rect.min.y {
+                continue;
+            }
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, y),
+                    egui::pos2(rect.min.x + KEYS_W - 1.0, y + roll.row_h),
+                ),
+                0.0,
+                if black {
+                    Color32::from_gray(28)
+                } else {
+                    Color32::from_gray(58)
+                },
+            );
+            // v37: key separators. Adjacent naturals (B|C) drew as
+            // one continuous light band, so rows "doubled" and
+            // people played the wrong octave. A dark hairline under
+            // EVERY key (strip AND grid row line brightened) makes
+            // each row readable regardless of black/white pattern.
+            painter.line_segment(
+                [
+                    egui::pos2(rect.min.x, y + roll.row_h),
+                    egui::pos2(rect.min.x + KEYS_W - 1.0, y + roll.row_h),
+                ],
+                egui::Stroke::new(1.0f32, Color32::from_gray(10)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(grid_x0, y + roll.row_h),
+                    egui::pos2(rect.max.x - SB, y + roll.row_h),
+                ],
+                egui::Stroke::new(
+                    if n.rem_euclid(12) == 11 {
+                        1.0f32
+                    } else {
+                        0.7f32
+                    },
+                    if n.rem_euclid(12) == 11 {
+                        Color32::from_gray(95)
+                    } else {
+                        Color32::from_gray(66)
+                    },
+                ),
+            );
+            if n.rem_euclid(12) == 0 {
+                painter.text(
+                    egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
+                    egui::Align2::LEFT_CENTER,
+                    format!("C{}", n.div_euclid(12) - 1),
+                    egui::FontId::proportional(8.0),
+                    Color32::from_gray(225),
+                );
+            }
+        }
+        // pattern end + playhead markers
+        let end_x = x_of(roll.pat.len_samples(sr) as f64 / sr as f64);
+        if end_x > grid_x0 && end_x < rect.max.x {
+            painter.line_segment(
+                [
+                    egui::pos2(end_x, rect.min.y),
+                    egui::pos2(end_x, rect.max.y - SB),
+                ],
+                egui::Stroke::new(1.6f32, Color32::from_rgb(230, 180, 90)),
+            );
+        }
+        let phx = x_of(playhead as f64 / sr as f64);
+        if phx > grid_x0 && phx < rect.max.x - SB {
+            painter.line_segment(
+                [
+                    egui::pos2(phx, rect.min.y),
+                    egui::pos2(phx, rect.max.y - SB),
+                ],
+                egui::Stroke::new(1.4f32, Color32::from_rgb(90, 220, 120)),
+            );
+        }
+        // notes (+ yellow end caps on the selected ones — the
+        // resize handles, same language as the loop-area handles)
+        const EDGE_PX: f32 = 6.0;
+        let hover = ui.input(|i| i.pointer.hover_pos());
+        for (idx, note) in roll.pat.notes.iter().enumerate() {
+            let n = note.note as i32;
+            if n < lo as i32 - 1 || n > hi as i32 + 1 {
+                continue;
+            }
+            let s0 = t_of(note.start);
+            let dur = t_of(note.len.max(1));
+            let x0 = x_of(s0);
+            let x1 = (x_of(s0 + dur)).max(x0 + 2.0);
+            if x1 < grid_x0 || x0 > rect.max.x {
+                continue;
+            }
+            let y = y_of(n);
+            let is_sel = roll.sel_notes.contains(&idx);
+            let dragging = matches!(roll.gesture, RollGesture::Move { idx: d, .. } if d == idx);
+            let col = if dragging {
+                Color32::from_rgb(150, 200, 255)
+            } else if is_sel {
+                Color32::from_rgb(120, 185, 255)
+            } else {
+                Color32::from_rgb(80, 150, 245)
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0.max(grid_x0), y + 1.0),
+                    egui::pos2(x1, y + roll.row_h - 1.0),
+                ),
+                2.0,
+                col,
+            );
+            if is_sel {
+                for ex in [x0, x1] {
                     painter.rect_filled(
                         egui::Rect::from_min_max(
-                            egui::pos2(rect.min.x, y),
-                            egui::pos2(rect.min.x + KEYS_W - 1.0, y + roll.row_h),
+                            egui::pos2((ex - 2.0).max(grid_x0), y + 1.0),
+                            egui::pos2((ex + 2.0).min(rect.max.x), y + roll.row_h - 1.0),
                         ),
-                        0.0,
-                        if black {
-                            Color32::from_gray(28)
-                        } else {
-                            Color32::from_gray(58)
-                        },
-                    );
-                    // v37: key separators. Adjacent naturals (B|C) drew as
-                    // one continuous light band, so rows "doubled" and
-                    // people played the wrong octave. A dark hairline under
-                    // EVERY key (strip AND grid row line brightened) makes
-                    // each row readable regardless of black/white pattern.
-                    painter.line_segment(
-                        [
-                            egui::pos2(rect.min.x, y + roll.row_h),
-                            egui::pos2(rect.min.x + KEYS_W - 1.0, y + roll.row_h),
-                        ],
-                        egui::Stroke::new(1.0f32, Color32::from_gray(10)),
-                    );
-                    painter.line_segment(
-                        [
-                            egui::pos2(grid_x0, y + roll.row_h),
-                            egui::pos2(rect.max.x - SB, y + roll.row_h),
-                        ],
-                        egui::Stroke::new(
-                            if n.rem_euclid(12) == 11 { 1.0f32 } else { 0.7f32 },
-                            if n.rem_euclid(12) == 11 {
-                                Color32::from_gray(95)
-                            } else {
-                                Color32::from_gray(66)
-                            },
-                        ),
-                    );
-                    if n.rem_euclid(12) == 0 {
-                        painter.text(
-                            egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            format!("C{}", n.div_euclid(12) - 1),
-                            egui::FontId::proportional(8.0),
-                            Color32::from_gray(225),
-                        );
-                    }
-                }
-                // pattern end + playhead markers
-                let end_x = x_of(roll.pat.len_samples(sr) as f64 / sr as f64);
-                if end_x > grid_x0 && end_x < rect.max.x {
-                    painter.line_segment(
-                        [egui::pos2(end_x, rect.min.y), egui::pos2(end_x, rect.max.y - SB)],
-                        egui::Stroke::new(1.6f32, Color32::from_rgb(230, 180, 90)),
+                        1.0,
+                        Color32::from_rgb(250, 200, 50),
                     );
                 }
-                let phx = x_of(playhead as f64 / sr as f64);
-                if phx > grid_x0 && phx < rect.max.x - SB {
-                    painter.line_segment(
-                        [egui::pos2(phx, rect.min.y), egui::pos2(phx, rect.max.y - SB)],
-                        egui::Stroke::new(1.4f32, Color32::from_rgb(90, 220, 120)),
-                    );
+            }
+        }
+        // marquee rectangle while rubber-banding
+        if let RollGesture::Marquee { from, .. } = roll.gesture {
+            if let Some(hp) = hover {
+                painter.rect_stroke(
+                    egui::Rect::from_two_pos(from, hp),
+                    0.0,
+                    egui::Stroke::new(1.2f32, Color32::from_rgb(150, 200, 255)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        // ================= gestures =================
+        let grid_top = rect.min.y;
+        let grid_bot = rect.max.y - SB;
+        let in_grid = |pt: egui::Pos2| {
+            pt.x >= grid_x0 && pt.x <= rect.max.x - SB && pt.y >= grid_top && pt.y <= grid_bot
+        };
+        // Topmost note under a point (last drawn wins). Notes are
+        // passed in as an arg so the helper borrows nothing mutable.
+        let note_hit =
+            |notes: &[crate::midipat::Note], pt: egui::Pos2| -> Option<(usize, f64, f64)> {
+                let sec = sec_at(pt.x);
+                let row = row_at(pt.y);
+                if !(0..=127).contains(&row) {
+                    return None;
                 }
-                // notes (+ yellow end caps on the selected ones — the
-                // resize handles, same language as the loop-area handles)
-                const EDGE_PX: f32 = 6.0;
-                let hover = ui.input(|i| i.pointer.hover_pos());
-                for (idx, note) in roll.pat.notes.iter().enumerate() {
-                    let n = note.note as i32;
-                    if n < lo as i32 - 1 || n > hi as i32 + 1 {
-                        continue;
-                    }
-                    let s0 = t_of(note.start);
-                    let dur = t_of(note.len.max(1));
-                    let x0 = x_of(s0);
-                    let x1 = (x_of(s0 + dur)).max(x0 + 2.0);
-                    if x1 < grid_x0 || x0 > rect.max.x {
-                        continue;
-                    }
-                    let y = y_of(n);
-                    let is_sel = roll.sel_notes.contains(&idx);
-                    let dragging = matches!(roll.gesture, RollGesture::Move { idx: d, .. } if d == idx);
-                    let col = if dragging {
-                        Color32::from_rgb(150, 200, 255)
-                    } else if is_sel {
-                        Color32::from_rgb(120, 185, 255)
-                    } else {
-                        Color32::from_rgb(80, 150, 245)
-                    };
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x0.max(grid_x0), y + 1.0),
-                            egui::pos2(x1, y + roll.row_h - 1.0),
-                        ),
-                        2.0,
-                        col,
-                    );
-                    if is_sel {
-                        for ex in [x0, x1] {
-                            painter.rect_filled(
-                                egui::Rect::from_min_max(
-                                    egui::pos2((ex - 2.0).max(grid_x0), y + 1.0),
-                                    egui::pos2((ex + 2.0).min(rect.max.x), y + roll.row_h - 1.0),
-                                ),
-                                1.0,
-                                Color32::from_rgb(250, 200, 50),
-                            );
-                        }
-                    }
-                }
-                // marquee rectangle while rubber-banding
-                if let RollGesture::Marquee { from, .. } = roll.gesture {
-                    if let Some(hp) = hover {
-                        painter.rect_stroke(
-                            egui::Rect::from_two_pos(from, hp),
-                            0.0,
-                            egui::Stroke::new(1.2f32, Color32::from_rgb(150, 200, 255)),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                }
-                // ================= gestures =================
-                let grid_top = rect.min.y;
-                let grid_bot = rect.max.y - SB;
-                let in_grid = |pt: egui::Pos2| {
-                    pt.x >= grid_x0 && pt.x <= rect.max.x - SB && pt.y >= grid_top && pt.y <= grid_bot
-                };
-                // Topmost note under a point (last drawn wins). Notes are
-                // passed in as an arg so the helper borrows nothing mutable.
-                let note_hit = |notes: &[crate::midipat::Note],
-                                pt: egui::Pos2|
-                 -> Option<(usize, f64, f64)> {
-                    let sec = sec_at(pt.x);
-                    let row = row_at(pt.y);
-                    if !(0..=127).contains(&row) {
-                        return None;
-                    }
-                    notes.iter().enumerate().rev().find_map(|(i, n)| {
-                        let n0 = t_of(n.start);
-                        let n1 = n0 + t_of(n.len.max(1));
-                        (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6)
-                            .then_some((i, n0, n1))
-                    })
-                };
-                // v38 R5: MODE CURSOR — say what a press WILL do before
-                // it happens: pointing hand over a note body (select /
-                // drag; wheel trims velocity), side-arrows on an end cap
-                // (extend that end), crosshair on empty grid (place a
-                // note), pointing hand on the piano strip (audition).
-                // v37 rule kept: the SAME topmost-note test a press uses,
-                // no exceptions — a hidden neighbour's cap must never
-                // drive the cursor under the topmost note's body.
-                let hover_icon = hover.and_then(|hp| {
-                    if in_grid(hp) {
-                        match note_hit(&roll.pat.notes, hp) {
-                            Some((_, n0, n1)) => {
-                                if (x_of(n0) - hp.x).abs() <= EDGE_PX
-                                    || (x_of(n1) - hp.x).abs() <= EDGE_PX
-                                {
-                                    Some(egui::CursorIcon::ResizeHorizontal)
-                                } else {
-                                    Some(egui::CursorIcon::PointingHand)
-                                }
-                            }
-                            None => Some(egui::CursorIcon::Crosshair),
-                        }
-                    } else if hp.x >= rect.min.x
-                        && hp.x < grid_x0
-                        && hp.y >= grid_top
-                        && hp.y <= grid_bot
-                    {
-                        Some(egui::CursorIcon::PointingHand)
-                    } else {
-                        None
-                    }
-                });
-                // v38 R6: live velocity readout under the cursor while it
-                // hovers a note (the wheel-trim control has no slider, so
-                // it needs to be told the value directly).
-                if let Some(hp) = hover {
-                    if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
-                        if let Some(n) = roll.pat.notes.get(i) {
-                            painter.text(
-                                hp + egui::vec2(14.0, 14.0),
-                                egui::Align2::LEFT_TOP,
-                                format!(
-                                    "{} \u{b7} vel {} \u{b7} wheel to change",
-                                    note_name(n.note),
-                                    n.vel
-                                ),
-                                egui::FontId::proportional(9.0),
-                                Color32::from_rgb(230, 230, 170),
-                            );
-                        }
-                    }
-                }
-                // v38 R2: a click whose press AND release landed in one
-                // event frame (whenever the UI thread has any backlog —
-                // exactly what the old per-click plugin bounce caused)
-                // leaves NO press state for `interact_pointer_pos()` to
-                // see, and the press silently vanished. Recover it from
-                // the raw press event so a fast click always registers.
-                let coalesced_press = ui.input(|i| {
-                    i.pointer.button_pressed(egui::PointerButton::Primary)
-                        && !i.pointer.button_down(egui::PointerButton::Primary)
-                });
-                if let Some(pt) = resp
-                    .interact_pointer_pos()
-                    .or(if coalesced_press { hover } else { None })
-                {
-                    let mods = ui.input(|i| i.modifiers);
-                    // Right-click deletes the note under the cursor.
-                    if resp.secondary_clicked() && in_grid(pt) {
+                notes.iter().enumerate().rev().find_map(|(i, n)| {
+                    let n0 = t_of(n.start);
+                    let n1 = n0 + t_of(n.len.max(1));
+                    (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6)
+                        .then_some((i, n0, n1))
+                })
+            };
+        // v38 R5: MODE CURSOR — say what a press WILL do before
+        // it happens: pointing hand over a note body (select /
+        // drag; wheel trims velocity), side-arrows on an end cap
+        // (extend that end), crosshair on empty grid (place a
+        // note), pointing hand on the piano strip (audition).
+        // v37 rule kept: the SAME topmost-note test a press uses,
+        // no exceptions — a hidden neighbour's cap must never
+        // drive the cursor under the topmost note's body.
+        let hover_icon = hover.and_then(|hp| {
+            if in_grid(hp) {
+                match note_hit(&roll.pat.notes, hp) {
+                    Some((_, n0, n1)) => {
+                        if (x_of(n0) - hp.x).abs() <= EDGE_PX || (x_of(n1) - hp.x).abs() <= EDGE_PX
                         {
-                            if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
-                                let nm = note_name(roll.pat.notes[i].note);
-                                roll.pat.notes.remove(i);
-                                roll.sel_notes.retain(|s| *s != i);
-                                for s in roll.sel_notes.iter_mut() {
-                                    if *s > i {
-                                        *s -= 1;
-                                    }
-                                }
-                                roll.changed = true;
-                                // v38 R6: the delete announces itself.
-                                self.status = format!("deleted {nm} \u{b7} right-click");
-                            }
+                            Some(egui::CursorIcon::ResizeHorizontal)
+                        } else {
+                            Some(egui::CursorIcon::PointingHand)
                         }
                     }
-                    // ---- press decides the gesture + selection ----
-                    // v38 R2: PRESS-EDGE event (fires exactly once per
-                    // press, even for a press+release coalesced into one
-                    // frame). Replaces `is_pointer_button_down_on()`,
-                    // which is FALSE in a coalesced frame — that test
-                    // plus the per-click plugin bounce behind it is the
-                    // whole "left click does nothing 2/3 of the time"
-                    // story. v37 rule kept: PRIMARY ONLY (the down-on
-                    // test answered for RMB too and stole deletes).
-                    let press_now = coalesced_press
-                        || ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-                    if press_now
-                        && matches!(roll.gesture, RollGesture::None)
-                        && in_grid(pt)
-                    {
-                        let sec = sec_at(pt.x);
-                        let row = (row_at(pt.y).clamp(0, 127)) as u8;
-                        match note_hit(&roll.pat.notes, pt) {
-                            Some((idx, n0, n1)) => {
-                                let x1p = x_of(n1);
-                                let x0p = x_of(n0);
-                                if (x1p - pt.x).abs() <= EDGE_PX || (x0p - pt.x).abs() <= EDGE_PX {
-                                    // Edge cap: resize (loop-area-handle
-                                    // style). Head drag moves the start,
-                                    // tail drag the end.
-                                    let edge =
-                                        if (x1p - pt.x).abs() <= (x0p - pt.x).abs() { 1 } else { 0 };
-                                    if !roll.sel_notes.contains(&idx) {
-                                        roll.sel_notes = vec![idx];
-                                        roll.sel_anchor = Some(idx);
+                    None => Some(egui::CursorIcon::Crosshair),
+                }
+            } else if hp.x >= rect.min.x && hp.x < grid_x0 && hp.y >= grid_top && hp.y <= grid_bot {
+                Some(egui::CursorIcon::PointingHand)
+            } else {
+                None
+            }
+        });
+        // v38 R6: live velocity readout under the cursor while it
+        // hovers a note (the wheel-trim control has no slider, so
+        // it needs to be told the value directly).
+        if let Some(hp) = hover {
+            if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
+                if let Some(n) = roll.pat.notes.get(i) {
+                    painter.text(
+                        hp + egui::vec2(14.0, 14.0),
+                        egui::Align2::LEFT_TOP,
+                        format!(
+                            "{} \u{b7} vel {} \u{b7} wheel to change",
+                            note_name(n.note),
+                            n.vel
+                        ),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_rgb(230, 230, 170),
+                    );
+                }
+            }
+        }
+        // v38 R2: a click whose press AND release landed in one
+        // event frame (whenever the UI thread has any backlog —
+        // exactly what the old per-click plugin bounce caused)
+        // leaves NO press state for `interact_pointer_pos()` to
+        // see, and the press silently vanished. Recover it from
+        // the raw press event so a fast click always registers.
+        let coalesced_press = ui.input(|i| {
+            i.pointer.button_pressed(egui::PointerButton::Primary)
+                && !i.pointer.button_down(egui::PointerButton::Primary)
+        });
+        if let Some(pt) = resp
+            .interact_pointer_pos()
+            .or(if coalesced_press { hover } else { None })
+        {
+            let mods = ui.input(|i| i.modifiers);
+            // Right-click deletes the note under the cursor.
+            if resp.secondary_clicked() && in_grid(pt) {
+                {
+                    if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
+                        let nm = note_name(roll.pat.notes[i].note);
+                        roll.pat.notes.remove(i);
+                        roll.sel_notes.retain(|s| *s != i);
+                        for s in roll.sel_notes.iter_mut() {
+                            if *s > i {
+                                *s -= 1;
+                            }
+                        }
+                        roll.changed = true;
+                        // v38 R6: the delete announces itself.
+                        self.status = format!("deleted {nm} \u{b7} right-click");
+                    }
+                }
+            }
+            // ---- press decides the gesture + selection ----
+            // v38 R2: PRESS-EDGE event (fires exactly once per
+            // press, even for a press+release coalesced into one
+            // frame). Replaces `is_pointer_button_down_on()`,
+            // which is FALSE in a coalesced frame — that test
+            // plus the per-click plugin bounce behind it is the
+            // whole "left click does nothing 2/3 of the time"
+            // story. v37 rule kept: PRIMARY ONLY (the down-on
+            // test answered for RMB too and stole deletes).
+            let press_now = coalesced_press
+                || ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+            if press_now && matches!(roll.gesture, RollGesture::None) && in_grid(pt) {
+                let sec = sec_at(pt.x);
+                let row = (row_at(pt.y).clamp(0, 127)) as u8;
+                match note_hit(&roll.pat.notes, pt) {
+                    Some((idx, n0, n1)) => {
+                        let x1p = x_of(n1);
+                        let x0p = x_of(n0);
+                        if (x1p - pt.x).abs() <= EDGE_PX || (x0p - pt.x).abs() <= EDGE_PX {
+                            // Edge cap: resize (loop-area-handle
+                            // style). Head drag moves the start,
+                            // tail drag the end.
+                            let edge = if (x1p - pt.x).abs() <= (x0p - pt.x).abs() {
+                                1
+                            } else {
+                                0
+                            };
+                            if !roll.sel_notes.contains(&idx) {
+                                roll.sel_notes = vec![idx];
+                                roll.sel_anchor = Some(idx);
+                            }
+                            roll.gesture = RollGesture::Resize {
+                                idx,
+                                edge,
+                                t0: n0,
+                                end0: n1,
+                            };
+                            // v38 R6: the grab says what it grabbed.
+                            self.status = format!(
+                                "resizing {nm} \u{b7} drag the end, release commits",
+                                nm = note_name(roll.pat.notes[idx].note)
+                            );
+                        } else {
+                            // Body press: FL selection semantics.
+                            if mods.command {
+                                match roll.sel_notes.iter().position(|x| *x == idx) {
+                                    Some(p) => {
+                                        roll.sel_notes.remove(p);
                                     }
-                                    roll.gesture = RollGesture::Resize {
-                                        idx,
-                                        edge,
-                                        t0: n0,
-                                        end0: n1,
-                                    };
-                                    // v38 R6: the grab says what it grabbed.
-                                    self.status = format!(
-                                        "resizing {nm} \u{b7} drag the end, release commits",
-                                        nm = note_name(roll.pat.notes[idx].note)
-                                    );
+                                    None => roll.sel_notes.push(idx),
+                                }
+                                roll.sel_notes.sort_unstable();
+                                roll.sel_anchor = Some(idx);
+                            } else if mods.shift {
+                                if let Some(a) =
+                                    roll.sel_anchor.filter(|a| roll.pat.notes.get(*a).is_some())
+                                {
+                                    let (a0, a1) =
+                                        (roll.pat.notes[a].start, roll.pat.notes[idx].start);
+                                    let (lo_t, hi_t) = (a0.min(a1), a0.max(a1));
+                                    roll.sel_notes = roll
+                                        .pat
+                                        .notes
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, n)| n.start >= lo_t && n.start <= hi_t)
+                                        .map(|(i, _)| i)
+                                        .collect();
                                 } else {
-                                    // Body press: FL selection semantics.
-                                    if mods.command {
-                                        match roll.sel_notes.iter().position(|x| *x == idx) {
-                                            Some(p) => {
-                                                roll.sel_notes.remove(p);
-                                            }
-                                            None => roll.sel_notes.push(idx),
-                                        }
-                                        roll.sel_notes.sort_unstable();
-                                        roll.sel_anchor = Some(idx);
-                                    } else if mods.shift {
-                                        if let Some(a) = roll.sel_anchor.filter(|a| {
-                                            roll.pat.notes.get(*a).is_some()
-                                        }) {
-                                            let (a0, a1) = (
-                                                roll.pat.notes[a].start,
-                                                roll.pat.notes[idx].start,
-                                            );
-                                            let (lo_t, hi_t) = (a0.min(a1), a0.max(a1));
-                                            roll.sel_notes = roll
-                                                .pat
-                                                .notes
-                                                .iter()
-                                                .enumerate()
-                                                .filter(|(_, n)| n.start >= lo_t && n.start <= hi_t)
-                                                .map(|(i, _)| i)
-                                                .collect();
-                                        } else {
-                                            roll.sel_notes = vec![idx];
-                                            roll.sel_anchor = Some(idx);
-                                        }
-                                    } else if !roll.sel_notes.contains(&idx) {
-                                        roll.sel_notes = vec![idx];
-                                        roll.sel_anchor = Some(idx);
-                                    }
-                                    // Group move: snapshot every selected
-                                    // note; drag moves them all.
-                                    if roll.sel_notes.contains(&idx) {
-                                        let notes: Vec<(usize, crate::midipat::Note)> = roll
-                                            .sel_notes
-                                            .iter()
-                                            .filter_map(|i| {
-                                                roll.pat.notes.get(*i).copied().map(|n| (*i, n))
-                                            })
-                                            .collect();
-                                        let base = roll.pat.notes[idx].start;
-                                        roll.drag_notes = notes;
-                                        roll.gesture = RollGesture::Move {
-                                            idx,
-                                            off: sec - n0,
-                                            base,
-                                            fresh: false,
-                                        };
-                                        // v38 R6: selection echo — also the
-                                        // discovery surface for the wheel
-                                        // velocity trim.
-                                        self.status = format!(
+                                    roll.sel_notes = vec![idx];
+                                    roll.sel_anchor = Some(idx);
+                                }
+                            } else if !roll.sel_notes.contains(&idx) {
+                                roll.sel_notes = vec![idx];
+                                roll.sel_anchor = Some(idx);
+                            }
+                            // Group move: snapshot every selected
+                            // note; drag moves them all.
+                            if roll.sel_notes.contains(&idx) {
+                                let notes: Vec<(usize, crate::midipat::Note)> = roll
+                                    .sel_notes
+                                    .iter()
+                                    .filter_map(|i| {
+                                        roll.pat.notes.get(*i).copied().map(|n| (*i, n))
+                                    })
+                                    .collect();
+                                let base = roll.pat.notes[idx].start;
+                                roll.drag_notes = notes;
+                                roll.gesture = RollGesture::Move {
+                                    idx,
+                                    off: sec - n0,
+                                    base,
+                                    fresh: false,
+                                };
+                                // v38 R6: selection echo — also the
+                                // discovery surface for the wheel
+                                // velocity trim.
+                                self.status = format!(
                                             "selected {} note(s) \u{b7} drag moves \u{b7} wheel over a note trims velocity",
                                             roll.sel_notes.len()
                                         );
-                                    }
-                                }
-                                roll.changed = true;
-                            }
-                            None => {
-                                if mods.command || mods.shift {
-                                    // Rubber-band on empty space.
-                                    roll.gesture = RollGesture::Marquee {
-                                        from: pt,
-                                        add: mods.shift,
-                                    };
-                                } else {
-                                    // Draw a new note (drag lengthens it).
-                                    let st = tick_of(snap(sec));
-                                    roll.pat.notes.push(crate::midipat::Note {
-                                        ch: 0,
-                                        note: row,
-                                        vel: roll.new_vel,
-                                        press: 0,
-                                        start: st,
-                                        len: min_len_ticks,
-                                    });
-                                    let idx = roll.pat.notes.len() - 1;
-                                    roll.sel_notes = vec![idx];
-                                    roll.sel_anchor = Some(idx);
-                                    roll.drag_notes.clear();
-                                    roll.gesture = RollGesture::Move {
-                                        idx,
-                                        off: 0.0,
-                                        base: st,
-                                        fresh: true,
-                                    };
-                                    // Placement feedback: hear the note now.
-                                    *placed = Some(row);
-                                    // v38 R6: …and see it land.
-                                    self.status = format!(
-                                        "placed {nm} \u{b7} drag for length \u{b7} release to keep",
-                                        nm = note_name(row)
-                                    );
-                                    roll.changed = true;
-                                }
                             }
                         }
-                    } else if resp.dragged() {
-                        match roll.gesture {
-                            RollGesture::Move { idx, off, base, fresh } => {
-                                if idx >= roll.pat.notes.len() {
-                                    roll.gesture = RollGesture::None;
-                                } else if in_grid(pt) {
-                                    let sec = sec_at(pt.x);
-                                    let row = (row_at(pt.y).clamp(0, 127)) as u8;
-                                    if fresh {
-                                        // Fresh draw: the tail follows the
-                                        // pointer (FL stretch-draw).
-                                        let note = &mut roll.pat.notes[idx];
-                                        let tail = tick_of(snap_up(sec));
-                                        note.len = tail.saturating_sub(note.start).max(min_len_ticks);
-                                        note.note = row;
-                                    } else {
-                                        let d = tick_of(snap(sec - off).max(0.0)) as i64
-                                            - base as i64;
-                                        // Snapshot from the press frame —
-                                        // the selection may have changed
-                                        // since; the group moves rigidly.
-                                        let dn = std::mem::take(&mut roll.drag_notes);
-                                        // Pitch shift = rows the pointer
-                                        // moved since the grab.
-                                        let dnote = dn
-                                            .iter()
-                                            .find(|(i, _)| *i == idx)
-                                            .map(|(_, n)| row as i32 - n.note as i32)
-                                            .unwrap_or(0);
-                                        for (i, n) in dn.iter() {
-                                            if let Some(cur) = roll.pat.notes.get_mut(*i) {
-                                                cur.start = (n.start as i64 + d).max(0) as u32;
-                                                cur.note = (n.note as i32 + dnote)
-                                                    .clamp(0, 127)
-                                                    as u8;
-                                            }
-                                        }
-                                        roll.drag_notes = dn;
-                                    }
-                                    roll.changed = true;
-                                }
-                            }
-                            RollGesture::Resize { idx, edge, t0, end0 } => {
-                                if idx < roll.pat.notes.len() && in_grid(pt) {
-                                    let sec = sec_at(pt.x);
-                                    let note = &mut roll.pat.notes[idx];
-                                    let st = tick_of(t0);
-                                    let en = tick_of(end0);
-                                    if edge == 1 {
-                                        let cand = tick_of(snap_up(sec).max(t0 + step_sec));
-                                        note.len = cand.saturating_sub(st).max(min_len_ticks);
-                                    } else {
-                                        let cand = tick_of(snap(sec).max(0.0))
-                                            .min(en.saturating_sub(min_len_ticks));
-                                        note.start = cand;
-                                        note.len = (en - cand).max(min_len_ticks);
-                                    }
-                                    roll.changed = true;
-                                }
-                            }
-                            RollGesture::Marquee { .. } => {} // painted live
-                            RollGesture::None => {}
-                        }
+                        roll.changed = true;
                     }
-                    if resp.drag_stopped() {
-                        // v38 R6: every finished drag commits with a word.
-                        let was_fresh = matches!(roll.gesture, RollGesture::Move { fresh: true, .. });
-                        let was_move = matches!(roll.gesture, RollGesture::Move { .. });
-                        let was_resize = matches!(roll.gesture, RollGesture::Resize { .. });
-                        if let RollGesture::Marquee { from, add } = roll.gesture {
-                            let box_r = egui::Rect::from_two_pos(from, pt);
-                            let hits: Vec<usize> = roll
-                                .pat
-                                .notes
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, n)| {
-                                    let x0 = x_of(t_of(n.start));
-                                    let x1 = x_of(t_of(n.start + n.len.max(1)));
-                                    let y0 = y_of(n.note as i32);
-                                    let yr = egui::Rect::from_min_max(
-                                        egui::pos2(x0.min(x1), y0),
-                                        egui::pos2(x0.max(x1), y0 + roll.row_h),
-                                    );
-                                    box_r.intersects(yr)
-                                })
-                                .map(|(i, _)| i)
-                                .collect();
-                            if add {
-                                for h in hits {
-                                    if !roll.sel_notes.contains(&h) {
-                                        roll.sel_notes.push(h);
-                                    }
-                                }
-                                roll.sel_notes.sort_unstable();
-                            } else {
-                                roll.sel_notes = hits;
-                            }
-                            roll.sel_anchor = roll.sel_notes.first().copied();
-                            self.status =
-                                format!("selected {} note(s) by box", roll.sel_notes.len());
-                        } else if was_move && roll.changed {
-                            self.status = if was_fresh {
-                                "note placed \u{b7} wheel over it = velocity".into()
-                            } else {
-                                format!("moved {} note(s)", roll.sel_notes.len().max(1))
+                    None => {
+                        if mods.command || mods.shift {
+                            // Rubber-band on empty space.
+                            roll.gesture = RollGesture::Marquee {
+                                from: pt,
+                                add: mods.shift,
                             };
-                        } else if was_resize && roll.changed {
-                            self.status = "note length changed \u{b7} drag the yellow caps".into();
+                        } else {
+                            // Draw a new note (drag lengthens it).
+                            let st = tick_of(snap(sec));
+                            roll.pat.notes.push(crate::midipat::Note {
+                                ch: 0,
+                                note: row,
+                                vel: roll.new_vel,
+                                press: 0,
+                                start: st,
+                                len: min_len_ticks,
+                            });
+                            let idx = roll.pat.notes.len() - 1;
+                            roll.sel_notes = vec![idx];
+                            roll.sel_anchor = Some(idx);
+                            roll.drag_notes.clear();
+                            roll.gesture = RollGesture::Move {
+                                idx,
+                                off: 0.0,
+                                base: st,
+                                fresh: true,
+                            };
+                            // Placement feedback: hear the note now.
+                            *placed = Some(row);
+                            // v38 R6: …and see it land.
+                            self.status = format!(
+                                "placed {nm} \u{b7} drag for length \u{b7} release to keep",
+                                nm = note_name(row)
+                            );
+                            roll.changed = true;
                         }
-                        roll.gesture = RollGesture::None;
-                        roll.drag_notes.clear();
-                        // NOTE: the pattern is NOT re-sorted here — sorting
-                        // would invalidate every selection index. Sorting
-                        // happens at save (SMF write) only.
-                    }
-                    // Piano keys: click plays the note through the
-                    // preview track.
-                    if pt.x >= rect.min.x
-                        && pt.x < grid_x0
-                        && pt.y >= grid_top
-                        && pt.y <= grid_bot
-                        && resp.clicked_by(egui::PointerButton::Primary)
-                    {
-                        *audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
                     }
                 }
-                if let Some(ic) = hover_icon {
-                    ui.ctx().set_cursor_icon(ic);
+            } else if resp.dragged() {
+                match roll.gesture {
+                    RollGesture::Move {
+                        idx,
+                        off,
+                        base,
+                        fresh,
+                    } => {
+                        if idx >= roll.pat.notes.len() {
+                            roll.gesture = RollGesture::None;
+                        } else if in_grid(pt) {
+                            let sec = sec_at(pt.x);
+                            let row = (row_at(pt.y).clamp(0, 127)) as u8;
+                            if fresh {
+                                // Fresh draw: the tail follows the
+                                // pointer (FL stretch-draw).
+                                let note = &mut roll.pat.notes[idx];
+                                let tail = tick_of(snap_up(sec));
+                                note.len = tail.saturating_sub(note.start).max(min_len_ticks);
+                                note.note = row;
+                            } else {
+                                let d = tick_of(snap(sec - off).max(0.0)) as i64 - base as i64;
+                                // Snapshot from the press frame —
+                                // the selection may have changed
+                                // since; the group moves rigidly.
+                                let dn = std::mem::take(&mut roll.drag_notes);
+                                // Pitch shift = rows the pointer
+                                // moved since the grab.
+                                let dnote = dn
+                                    .iter()
+                                    .find(|(i, _)| *i == idx)
+                                    .map(|(_, n)| row as i32 - n.note as i32)
+                                    .unwrap_or(0);
+                                for (i, n) in dn.iter() {
+                                    if let Some(cur) = roll.pat.notes.get_mut(*i) {
+                                        cur.start = (n.start as i64 + d).max(0) as u32;
+                                        cur.note = (n.note as i32 + dnote).clamp(0, 127) as u8;
+                                    }
+                                }
+                                roll.drag_notes = dn;
+                            }
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::Resize {
+                        idx,
+                        edge,
+                        t0,
+                        end0,
+                    } => {
+                        if idx < roll.pat.notes.len() && in_grid(pt) {
+                            let sec = sec_at(pt.x);
+                            let note = &mut roll.pat.notes[idx];
+                            let st = tick_of(t0);
+                            let en = tick_of(end0);
+                            if edge == 1 {
+                                let cand = tick_of(snap_up(sec).max(t0 + step_sec));
+                                note.len = cand.saturating_sub(st).max(min_len_ticks);
+                            } else {
+                                let cand = tick_of(snap(sec).max(0.0))
+                                    .min(en.saturating_sub(min_len_ticks));
+                                note.start = cand;
+                                note.len = (en - cand).max(min_len_ticks);
+                            }
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::Marquee { .. } => {} // painted live
+                    RollGesture::None => {}
                 }
-
-                // ================= scrollbars =================
-                // Content extents → thumb sizes. Manual because the canvas
-                // is a painted rect, not a ScrollArea.
-                let content_w = (roll.pat.len_ticks as f64 / PPQ as f64 * roll.px_per_beat as f64)
-                    .max(view_w as f64);
-                let hbar = egui::Rect::from_min_max(
-                    egui::pos2(grid_x0, rect.max.y - SB),
-                    egui::pos2(rect.max.x - SB, rect.max.y),
-                );
-                let vbar = egui::Rect::from_min_max(
-                    egui::pos2(rect.max.x - SB, rect.min.y),
-                    egui::pos2(rect.max.x, rect.max.y - SB),
-                );
-                painter.rect_filled(hbar, 0.0, Color32::from_black_alpha(90));
-                painter.rect_filled(vbar, 0.0, Color32::from_black_alpha(90));
-                let h_max_px = (content_w - view_w as f64).max(0.0);
-                let thumb_w = (view_w as f64 / content_w * view_w as f64)
-                    .clamp(24.0, view_w as f64) as f32;
-                let hx = hbar.min.x
-                    + if h_max_px > 0.0 {
-                        (roll.scroll_sec * px_per_sec / h_max_px) as f32 * (hbar.width() - thumb_w)
+            }
+            if resp.drag_stopped() {
+                // v38 R6: every finished drag commits with a word.
+                let was_fresh = matches!(roll.gesture, RollGesture::Move { fresh: true, .. });
+                let was_move = matches!(roll.gesture, RollGesture::Move { .. });
+                let was_resize = matches!(roll.gesture, RollGesture::Resize { .. });
+                if let RollGesture::Marquee { from, add } = roll.gesture {
+                    let box_r = egui::Rect::from_two_pos(from, pt);
+                    let hits: Vec<usize> = roll
+                        .pat
+                        .notes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| {
+                            let x0 = x_of(t_of(n.start));
+                            let x1 = x_of(t_of(n.start + n.len.max(1)));
+                            let y0 = y_of(n.note as i32);
+                            let yr = egui::Rect::from_min_max(
+                                egui::pos2(x0.min(x1), y0),
+                                egui::pos2(x0.max(x1), y0 + roll.row_h),
+                            );
+                            box_r.intersects(yr)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if add {
+                        for h in hits {
+                            if !roll.sel_notes.contains(&h) {
+                                roll.sel_notes.push(h);
+                            }
+                        }
+                        roll.sel_notes.sort_unstable();
                     } else {
-                        0.0
+                        roll.sel_notes = hits;
+                    }
+                    roll.sel_anchor = roll.sel_notes.first().copied();
+                    self.status = format!("selected {} note(s) by box", roll.sel_notes.len());
+                } else if was_move && roll.changed {
+                    self.status = if was_fresh {
+                        "note placed \u{b7} wheel over it = velocity".into()
+                    } else {
+                        format!("moved {} note(s)", roll.sel_notes.len().max(1))
                     };
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(hx, hbar.min.y + 1.5), egui::pos2(hx + thumb_w, hbar.max.y - 1.5)),
-                    3.0,
-                    Color32::from_gray(120),
-                );
-                let thumb_h = (view_h / (128.0 * roll.row_h) * view_h).clamp(24.0, view_h);
-                let v_frac = if v_max > 0.0 {
-                    (roll.vscroll_px / v_max).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                // Bottom-anchored: fraction 0 (note 0 at the bottom) puts
-                // the thumb at the bar's bottom edge.
-                let vy = vbar.max.y - thumb_h - v_frac * (vbar.height() - thumb_h);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(vbar.min.x + 1.5, vy), egui::pos2(vbar.max.x - 1.5, vy + thumb_h)),
-                    3.0,
-                    Color32::from_gray(120),
-                );
-                // Alloced AFTER the canvas so the bars steal their pixels.
-                let hresp = ui.interact(hbar, egui::Id::new("roll_hsb"), Sense::drag());
-                if hresp.dragged_by(egui::PointerButton::Primary) || hresp.clicked() {
-                    if let Some(hp) = hresp.interact_pointer_pos() {
-                        if h_max_px > 0.0 && hbar.width() > thumb_w {
-                            let r = ((hp.x - hbar.min.x - thumb_w / 2.0)
-                                / (hbar.width() - thumb_w))
-                                .clamp(0.0, 1.0) as f64;
-                            roll.scroll_sec = r * h_max_px / px_per_sec;
-                        }
-                    }
+                } else if was_resize && roll.changed {
+                    self.status = "note length changed \u{b7} drag the yellow caps".into();
                 }
-                if hresp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-                let vresp = ui.interact(vbar, egui::Id::new("roll_vsb"), Sense::drag());
-                if vresp.dragged_by(egui::PointerButton::Primary) || vresp.clicked() {
-                    if let Some(hp) = vresp.interact_pointer_pos() {
-                        if v_max > 0.0 && vbar.height() > thumb_h {
-                            let r = ((vbar.max.y - hp.y - thumb_h / 2.0)
-                                / (vbar.height() - thumb_h))
-                                .clamp(0.0, 1.0) as f64;
-                            roll.vscroll_px = (r * v_max as f64) as f32;
-                        }
-                    }
-                }
-                if vresp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-                }
+                roll.gesture = RollGesture::None;
+                roll.drag_notes.clear();
+                // NOTE: the pattern is NOT re-sorted here — sorting
+                // would invalidate every selection index. Sorting
+                // happens at save (SMF write) only.
+            }
+            // Piano keys: click plays the note through the
+            // preview track.
+            if pt.x >= rect.min.x
+                && pt.x < grid_x0
+                && pt.y >= grid_top
+                && pt.y <= grid_bot
+                && resp.clicked_by(egui::PointerButton::Primary)
+            {
+                *audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
+            }
+        }
+        if let Some(ic) = hover_icon {
+            ui.ctx().set_cursor_icon(ic);
+        }
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add(Slider::new(&mut roll.new_vel, 1..=127).text("vel"))
+        // ================= scrollbars =================
+        // Content extents → thumb sizes. Manual because the canvas
+        // is a painted rect, not a ScrollArea.
+        let content_w =
+            (roll.pat.len_ticks as f64 / PPQ as f64 * roll.px_per_beat as f64).max(view_w as f64);
+        let hbar = egui::Rect::from_min_max(
+            egui::pos2(grid_x0, rect.max.y - SB),
+            egui::pos2(rect.max.x - SB, rect.max.y),
+        );
+        let vbar = egui::Rect::from_min_max(
+            egui::pos2(rect.max.x - SB, rect.min.y),
+            egui::pos2(rect.max.x, rect.max.y - SB),
+        );
+        painter.rect_filled(hbar, 0.0, Color32::from_black_alpha(90));
+        painter.rect_filled(vbar, 0.0, Color32::from_black_alpha(90));
+        let h_max_px = (content_w - view_w as f64).max(0.0);
+        let thumb_w = (view_w as f64 / content_w * view_w as f64).clamp(24.0, view_w as f64) as f32;
+        let hx = hbar.min.x
+            + if h_max_px > 0.0 {
+                (roll.scroll_sec * px_per_sec / h_max_px) as f32 * (hbar.width() - thumb_w)
+            } else {
+                0.0
+            };
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(hx, hbar.min.y + 1.5),
+                egui::pos2(hx + thumb_w, hbar.max.y - 1.5),
+            ),
+            3.0,
+            Color32::from_gray(120),
+        );
+        let thumb_h = (view_h / (128.0 * roll.row_h) * view_h).clamp(24.0, view_h);
+        let v_frac = if v_max > 0.0 {
+            (roll.vscroll_px / v_max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Bottom-anchored: fraction 0 (note 0 at the bottom) puts
+        // the thumb at the bar's bottom edge.
+        let vy = vbar.max.y - thumb_h - v_frac * (vbar.height() - thumb_h);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(vbar.min.x + 1.5, vy),
+                egui::pos2(vbar.max.x - 1.5, vy + thumb_h),
+            ),
+            3.0,
+            Color32::from_gray(120),
+        );
+        // Alloced AFTER the canvas so the bars steal their pixels.
+        let hresp = ui.interact(hbar, egui::Id::new("roll_hsb"), Sense::drag());
+        if hresp.dragged_by(egui::PointerButton::Primary) || hresp.clicked() {
+            if let Some(hp) = hresp.interact_pointer_pos() {
+                if h_max_px > 0.0 && hbar.width() > thumb_w {
+                    let r = ((hp.x - hbar.min.x - thumb_w / 2.0) / (hbar.width() - thumb_w))
+                        .clamp(0.0, 1.0) as f64;
+                    roll.scroll_sec = r * h_max_px / px_per_sec;
+                }
+            }
+        }
+        if hresp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        let vresp = ui.interact(vbar, egui::Id::new("roll_vsb"), Sense::drag());
+        if vresp.dragged_by(egui::PointerButton::Primary) || vresp.clicked() {
+            if let Some(hp) = vresp.interact_pointer_pos() {
+                if v_max > 0.0 && vbar.height() > thumb_h {
+                    let r = ((vbar.max.y - hp.y - thumb_h / 2.0) / (vbar.height() - thumb_h))
+                        .clamp(0.0, 1.0) as f64;
+                    roll.vscroll_px = (r * v_max as f64) as f32;
+                }
+            }
+        }
+        if vresp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+                    let bv0 = roll.new_vel;
+                    let rs = ui
+                        .add(Slider::new(&mut roll.new_vel, 1..=127).text("vel"))
                         .on_hover_text("Velocity of newly drawn notes");
+                    let _ = p_changed(&rs, bv0, &mut roll.new_vel);
                     // The old "px/beat"/"row px" units were engineering
                     // labels, not what the sliders do: they are the two
                     // zoom controls (user complaint: "mislabeled").
-                    ui.add(
+                    let bz0 = roll.px_per_beat;
+                    let rz = ui.add(
                         Slider::new(&mut roll.px_per_beat, 30.0..=400.0).text("zoom time"),
                     )
                     .on_hover_text("Horizontal zoom (pixels per beat) \u{b7} ctrl+wheel over the grid does this too");
-                    ui.add(
+                    let _ = p_changed(&rz, bz0, &mut roll.px_per_beat);
+                    let br0 = roll.row_h;
+                    let rr = ui.add(
                         Slider::new(&mut roll.row_h, 6.0..=22.0).text("zoom rows"),
                     )
                     .on_hover_text("Vertical zoom (pixels per semitone row) \u{b7} alt+wheel over the grid does this too");
+                    let _ = p_changed(&rr, br0, &mut roll.row_h);
                     ui.label(
                         RichText::new(
                             "drag empty = draw \u{b7} drag note = move \u{b7} yellow caps = resize \u{b7} ctrl/shift+drag = box select \u{b7} right-click = delete",
@@ -8783,7 +8861,10 @@ impl App {
             return None;
         }
         let desc = self.synth_registry.desc(&stem)?;
-        desc.params.first().is_some_and(|p| p.label == "asset").then_some(t)
+        desc.params
+            .first()
+            .is_some_and(|p| p.label == "asset")
+            .then_some(t)
     }
 
     /// v18: apply an OS-drop batch to the live sampler on `t`: import
@@ -8818,7 +8899,10 @@ impl App {
         match swapped.and_then(|k| self.assets.get(k).map(|a| a.name.clone())) {
             Some(n) => self.status = format!("track {} sampler: {n} (dropped file)", t + 1),
             None if rejected > 0 => {
-                self.status = format!("sampler: dropped file{} not audio", if rejected == 1 { "" } else { "s" });
+                self.status = format!(
+                    "sampler: dropped file{} not audio",
+                    if rejected == 1 { "" } else { "s" }
+                );
             }
             None => {}
         }
@@ -8849,7 +8933,10 @@ impl App {
             .min_width(80.0)
             .min_height(70.0);
         if let Some(r) = self.dyn_rect(idx) {
-            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            w = w
+                .default_pos([r[0], r[1]])
+                .default_width(r[2])
+                .default_height(r[3]);
         }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -8908,335 +8995,333 @@ impl App {
             .map(|(k, a)| (k, a.name.clone()))
             .collect();
         let mut dirty = false;
-                if let Some(d) = &desc.description {
-                    ui.label(RichText::new(d).weak().small());
-                }
-                if let Some(a) = &desc.author {
-                    ui.label(RichText::new(format!("by {a}")).weak().small());
-                }
-                ui.separator();
-                let vals = inst.values();
-                // A synth whose FIRST param is named "asset" samples rack
-                // audio (the bundled sampler): give it a named picker and a
-                // drop target instead of a blind 0..63 id slider — the user
-                // could not tell which asset any id was, let alone pick one.
-                let sampler = desc.params.first().is_some_and(|p| p.label == "asset");
-                if sampler {
-                    let cur = vals.first().copied().unwrap_or(0.0).round() as usize;
-                    let cur_name = audio_assets
-                        .iter()
-                        .find(|(k, _)| *k == cur)
-                        .map(|(_, n)| n.clone())
-                        .unwrap_or_else(|| "\u{2014} no sample \u{2014}".to_string());
-                    ui.label(
-                        RichText::new(format!("sample: {cur_name}"))
-                            .strong()
+        if let Some(d) = &desc.description {
+            ui.label(RichText::new(d).weak().small());
+        }
+        if let Some(a) = &desc.author {
+            ui.label(RichText::new(format!("by {a}")).weak().small());
+        }
+        ui.separator();
+        let vals = inst.values();
+        // A synth whose FIRST param is named "asset" samples rack
+        // audio (the bundled sampler): give it a named picker and a
+        // drop target instead of a blind 0..63 id slider — the user
+        // could not tell which asset any id was, let alone pick one.
+        let sampler = desc.params.first().is_some_and(|p| p.label == "asset");
+        if sampler {
+            let cur = vals.first().copied().unwrap_or(0.0).round() as usize;
+            let cur_name = audio_assets
+                .iter()
+                .find(|(k, _)| *k == cur)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| "\u{2014} no sample \u{2014}".to_string());
+            ui.label(
+                RichText::new(format!("sample: {cur_name}"))
+                    .strong()
+                    .small(),
+            );
+            let mut picked = None;
+            egui::ComboBox::from_id_salt(("sampler_asset_pick", t))
+                .width(240.0)
+                .selected_text(RichText::new(format!("#{cur}  {cur_name}")).small())
+                .show_ui(ui, |ui| {
+                    if audio_assets.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "no audio assets yet \u{2014} add a rack folder or record",
+                            )
+                            .weak()
                             .small(),
-                    );
-                    let mut picked = None;
-                    egui::ComboBox::from_id_salt(("sampler_asset_pick", t))
-                        .width(240.0)
-                        .selected_text(RichText::new(format!("#{cur}  {cur_name}")).small())
-                        .show_ui(ui, |ui| {
-                            if audio_assets.is_empty() {
-                                ui.label(
-                                    RichText::new(
-                                        "no audio assets yet \u{2014} add a rack folder or record",
-                                    )
-                                    .weak()
-                                    .small(),
-                                );
-                            }
-                            for (k, name) in &audio_assets {
-                                // ComboBox's button response never marks
-                                // `changed` on a pick — watch the popup rows.
-                                if ui
-                                    .selectable_label(cur == *k, format!("#{k} {name}"))
-                                    .clicked()
-                                {
-                                    picked = Some(*k);
-                                }
-                            }
-                        });
-                    if let Some(k) = picked {
-                        inst.set_param(0, k as f32);
-                        dirty = true;
+                        );
                     }
-                    ui.label(
-                        RichText::new(
-                            "or drag an AUDIO asset from the rack \u{2014} or straight from your \
-                             file manager \u{2014} onto this box:",
-                        )
-                        .weak()
-                        .small(),
-                    );
-                    let (drect, dresp) = ui.allocate_at_least(
-                        egui::vec2(ui.available_width(), 34.0),
-                        egui::Sense::hover(),
-                    );
-                    let dragging = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
-                        // v0.13: an OS-level file drag hovering the window
-                        // lights the zone too (winit feeds raw.hovered_files).
-                        || ui.input(|i| !i.raw.hovered_files.is_empty());
-                    let col = if dragging {
-                        Color32::from_rgb(150, 200, 255)
-                    } else {
-                        Color32::from_gray(75)
-                    };
-                    ui.painter().rect_stroke(
-                        drect,
-                        3.0,
-                        egui::Stroke::new(if dragging { 2.0 } else { 1.0 }, col),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().text(
-                        drect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if dragging {
-                            "release to sample this asset"
-                        } else {
-                            "drop zone \u{b7} drag an asset here"
-                        },
-                        egui::FontId::proportional(10.0),
-                        col,
-                    );
-                    if let Some(a) = dresp.dnd_release_payload::<usize>().map(|a| *a) {
-                        if audio_assets.iter().any(|(k, _)| *k == a) {
-                            inst.set_param(0, a as f32);
-                            dirty = true;
-                            self.status = format!(
-                                "track {} sampler: {}",
-                                t + 1,
-                                audio_assets
-                                    .iter()
-                                    .find(|(k, _)| *k == a)
-                                    .map(|(_, n)| n.clone())
-                                    .unwrap_or_default()
-                            );
+                    for (k, name) in &audio_assets {
+                        // ComboBox's button response never marks
+                        // `changed` on a pick — watch the popup rows.
+                        if ui
+                            .selectable_label(cur == *k, format!("#{k} {name}"))
+                            .clicked()
+                        {
+                            picked = Some(*k);
                         }
                     }
-                    // v18: OS-level file drops (file manager → app while
-                    // this window is open) are claimed CENTRALLY at the
-                    // top of `ui_root` (one drain per frame, then the
-                    // sampler swap via `sampler_files_dropped`); by the
-                    // time this window paints the queue is already empty.
-                    ui.separator();
-                }
-                for (k, pd) in desc.params.iter().enumerate() {
-                    if sampler && k == 0 {
-                        continue; // the picker replaces the raw id slider
-                    }
-                    let mut nv = vals.get(k).copied().unwrap_or(pd.default);
-                    // Root note reads as STANDARD notation (C3, C#4, ...):
-                    // the slider steps whole semitones and shows the note
-                    // name instead of the raw MIDI number (AC3.1). The
-                    // stored/passed value is still the MIDI number.
-                    let is_root = sampler && k == 1 && pd.label == "root note";
-                    let mut sl = Slider::new(&mut nv, pd.min..=pd.max).text(&pd.label);
-                    if is_root {
-                        sl = sl
-                            .step_by(1.0)
-                            .custom_formatter(|n, _| note_name(n.round().clamp(0.0, 127.0) as u8));
-                    }
-                    // v29: no click union (drag-killer); bind_value_controls
-                    // reads slider_click_gestures for the RMB/dbl pair.
-                    let mut resp = ui.add(sl);
-                    // v20 R3: right-click = automation asset for this
-                    // slider (owner = this track); double-click = Set value.
-                    bind_value_controls(&mut resp, self, Some(t), &format!("synth:{k}"), nv);
-                    if resp.changed() {
-                        inst.set_param(k, nv);
-                        self.note_auto(t, &format!("synth:{k}"), nv);
-                        dirty = true;
-                    }
-                }
-                        // --- v30-batch-2: drum kit lives IN the plugin GUI ---------
-            // (moved out of the synth picker; the pattern builder fires THESE pads).
-            // The pattern builder ("Drums") fires THESE pads. The kit is
-            // per track, so every synth can carry a different drum patch.
-            ui.separator();
-            ui.label(
-                RichText::new(format!("DRUM KIT \u{2014} track {}", t + 1)).strong(),
-            );
+                });
+            if let Some(k) = picked {
+                inst.set_param(0, k as f32);
+                dirty = true;
+            }
             ui.label(
                 RichText::new(
-                    "One sound per pad (from the asset rack); the Drums window \
-                     paints the pattern. Up to 16 pads \u{b7} this kit belongs to \
-                     THIS track, so each synth can play a different patch.",
+                    "or drag an AUDIO asset from the rack \u{2014} or straight from your \
+                             file manager \u{2014} onto this box:",
                 )
                 .weak()
                 .small(),
             );
-            let audio_rows: Vec<(String, String)> = self
-                .assets
-                .iter()
-                .filter(|a| !a.is_midi() && !a.is_auto())
-                .map(|a| {
-                    let path = a.path.to_string_lossy().to_string();
-                    let nm = path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("?")
-                        .trim_end_matches(".wav")
-                        .to_string();
-                    (path, nm)
-                })
-                .collect();
-            let mut kit = self.kit(t).to_vec();
-            let mut kit_changed = false;
-            let mut remove_pad: Option<usize> = None;
-            self.kit_drop_rects.retain(|(tt, _, _)| *tt != t);
-            for p in 0..kit.len() {
-                let rowr = ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut kit[p].name)
-                                .desired_width(56.0)
-                                .font(egui::TextStyle::Monospace),
-                        )
-                        .changed()
-                    {
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
-                        .on_hover_text("Audition this pad")
-                        .clicked()
-                    {
-                        let k = self
-                            .assets
+            let (drect, dresp) =
+                ui.allocate_at_least(egui::vec2(ui.available_width(), 34.0), egui::Sense::hover());
+            let dragging = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                        // v0.13: an OS-level file drag hovering the window
+                        // lights the zone too (winit feeds raw.hovered_files).
+                        || ui.input(|i| !i.raw.hovered_files.is_empty());
+            let col = if dragging {
+                Color32::from_rgb(150, 200, 255)
+            } else {
+                Color32::from_gray(75)
+            };
+            ui.painter().rect_stroke(
+                drect,
+                3.0,
+                egui::Stroke::new(if dragging { 2.0 } else { 1.0 }, col),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                drect.center(),
+                egui::Align2::CENTER_CENTER,
+                if dragging {
+                    "release to sample this asset"
+                } else {
+                    "drop zone \u{b7} drag an asset here"
+                },
+                egui::FontId::proportional(10.0),
+                col,
+            );
+            if let Some(a) = dresp.dnd_release_payload::<usize>().map(|a| *a) {
+                if audio_assets.iter().any(|(k, _)| *k == a) {
+                    inst.set_param(0, a as f32);
+                    dirty = true;
+                    self.status = format!(
+                        "track {} sampler: {}",
+                        t + 1,
+                        audio_assets
                             .iter()
-                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
-                        if let Some(k) = k {
-                            let v = kit[p].vel.max(1);
-                            self.audition_impulse(k, v);
-                        }
+                            .find(|(k, _)| *k == a)
+                            .map(|(_, n)| n.clone())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            // v18: OS-level file drops (file manager → app while
+            // this window is open) are claimed CENTRALLY at the
+            // top of `ui_root` (one drain per frame, then the
+            // sampler swap via `sampler_files_dropped`); by the
+            // time this window paints the queue is already empty.
+            ui.separator();
+        }
+        for (k, pd) in desc.params.iter().enumerate() {
+            if sampler && k == 0 {
+                continue; // the picker replaces the raw id slider
+            }
+            let mut nv = vals.get(k).copied().unwrap_or(pd.default);
+            // Root note reads as STANDARD notation (C3, C#4, ...):
+            // the slider steps whole semitones and shows the note
+            // name instead of the raw MIDI number (AC3.1). The
+            // stored/passed value is still the MIDI number.
+            let is_root = sampler && k == 1 && pd.label == "root note";
+            let before = nv;
+            let mut sl = Slider::new(&mut nv, pd.min..=pd.max).text(&pd.label);
+            if is_root {
+                sl = sl
+                    .step_by(1.0)
+                    .custom_formatter(|n, _| note_name(n.round().clamp(0.0, 127.0) as u8));
+            }
+            // v29: no click union (drag-killer); bind_value_controls
+            // reads slider_click_gestures for the RMB/dbl pair.
+            let mut resp = ui.add(sl);
+            // v20 R3: right-click = automation asset for this
+            // slider (owner = this track); double-click = Set value.
+            bind_value_controls(&mut resp, self, Some(t), &format!("synth:{k}"), nv);
+            if p_changed(&resp, before, &mut nv) {
+                inst.set_param(k, nv);
+                self.note_auto(t, &format!("synth:{k}"), nv);
+                dirty = true;
+            }
+        }
+        // --- v30-batch-2: drum kit lives IN the plugin GUI ---------
+        // (moved out of the synth picker; the pattern builder fires THESE pads).
+        // The pattern builder ("Drums") fires THESE pads. The kit is
+        // per track, so every synth can carry a different drum patch.
+        ui.separator();
+        ui.label(RichText::new(format!("DRUM KIT \u{2014} track {}", t + 1)).strong());
+        ui.label(
+            RichText::new(
+                "One sound per pad (from the asset rack); the Drums window \
+                     paints the pattern. Up to 16 pads \u{b7} this kit belongs to \
+                     THIS track, so each synth can play a different patch.",
+            )
+            .weak()
+            .small(),
+        );
+        let audio_rows: Vec<(String, String)> = self
+            .assets
+            .iter()
+            .filter(|a| !a.is_midi() && !a.is_auto())
+            .map(|a| {
+                let path = a.path.to_string_lossy().to_string();
+                let nm = path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("?")
+                    .trim_end_matches(".wav")
+                    .to_string();
+                (path, nm)
+            })
+            .collect();
+        let mut kit = self.kit(t).to_vec();
+        let mut kit_changed = false;
+        let mut remove_pad: Option<usize> = None;
+        self.kit_drop_rects.retain(|(tt, _, _)| *tt != t);
+        for p in 0..kit.len() {
+            let rowr = ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut kit[p].name)
+                            .desired_width(56.0)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed()
+                {
+                    kit_changed = true;
+                }
+                if ui
+                    .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                    .on_hover_text("Audition this pad")
+                    .clicked()
+                {
+                    let k = self
+                        .assets
+                        .iter()
+                        .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
+                    if let Some(k) = k {
+                        let v = kit[p].vel.max(1);
+                        self.audition_impulse(k, v);
                     }
-                    let cur_path = kit[p].asset_path.clone();
-                    let label = cur_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("(sound)")
-                        .trim_end_matches(".wav")
-                        .to_string();
-                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
-                        .selected_text(label)
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
+                }
+                let cur_path = kit[p].asset_path.clone();
+                let label = cur_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("(sound)")
+                    .trim_end_matches(".wav")
+                    .to_string();
+                egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                    .selected_text(label)
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(cur_path.is_empty(), "(silent)")
+                            .clicked()
+                        {
+                            kit[p].asset_path.clear();
+                            kit[p].asset = None;
+                            kit_changed = true;
+                        }
+                        for (path, nm) in &audio_rows {
                             if ui
-                                .selectable_label(cur_path.is_empty(), "(silent)")
+                                .selectable_label(&cur_path == path, nm.as_str())
                                 .clicked()
                             {
-                                kit[p].asset_path.clear();
+                                kit[p].asset_path = path.clone();
                                 kit[p].asset = None;
                                 kit_changed = true;
                             }
-                            for (path, nm) in &audio_rows {
-                                if ui
-                                    .selectable_label(&cur_path == path, nm.as_str())
-                                    .clicked()
-                                {
-                                    kit[p].asset_path = path.clone();
-                                    kit[p].asset = None;
-                                    kit_changed = true;
-                                }
-                            }
-                        });
-                    if ui
-                        .add_sized(
-                            [52.0, 16.0],
-                            egui::Slider::new(&mut kit[p].vel, 1..=127),
-                        )
-                        .on_hover_text("Default paint velocity")
-                        .changed()
-                    {
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                            .min_size(egui::vec2(16.0, 18.0)))
-                        .on_hover_text("Mute pad")
-                        .clicked()
-                    {
-                        kit[p].muted = !kit[p].muted;
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
-                        .on_hover_text("Remove this pad")
-                        .clicked()
-                        && kit.len() > 1
-                    {
-                        remove_pad = Some(p);
-                    }
-                });
-                // v34 R5: every pad row is a drop target. IN-APP drags
-                // (rack rows carry the asset-index payload) land here
-                // directly; OS files are hit-tested centrally against
-                // the rect registered just below.
-                self.kit_drop_rects.push((t, p, rowr.response.rect));
-                let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
-                    || ui.input(|i| !i.raw.hovered_files.is_empty());
-                if armed {
-                    ui.painter().rect_stroke(
-                        rowr.response.rect,
-                        3.0,
-                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                if let Some(a) = rowr
-                    .response
-                    .interact(egui::Sense::hover())
-                    .dnd_release_payload::<usize>()
-                    .map(|a| *a)
-                {
-                    if let Some(path) =
-                        self.assets.get(a).map(|as_| as_.path.to_string_lossy().into_owned())
-                    {
-                        kit[p].asset_path = path;
-                        kit[p].asset = None;
-                        kit_changed = true;
-                        self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
-                    }
-                }
-            }
-            ui.horizontal(|ui| {
-                let full = kit.len() >= DRUM_MAX_PADS;
-                if ui
-                    .add_enabled(!full, egui::Button::new("+ add pad"))
-                    .on_hover_text(if full {
-                        "kit is full (16 pads maximum)"
-                    } else {
-                        "Add a drum track row (max 16)"
-                    })
-                    .clicked()
-                    && !full
-                {
-                    kit.push(DrumPad {
-                        name: format!("Pad {}", kit.len() + 1),
-                        asset_path: String::new(),
-                        asset: None,
-                        vel: 100,
-                        muted: false,
+                        }
                     });
+                let before_v = kit[p].vel;
+                let rv = ui
+                    .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
+                    .on_hover_text("Default paint velocity");
+                if p_changed(&rv, before_v, &mut kit[p].vel) {
                     kit_changed = true;
                 }
-                ui.label(
-                    RichText::new(format!("{} / {DRUM_MAX_PADS} pads", kit.len()))
-                        .weak()
-                        .small(),
-                );
+                if ui
+                    .add(
+                        egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
+                            .min_size(egui::vec2(16.0, 18.0)),
+                    )
+                    .on_hover_text("Mute pad")
+                    .clicked()
+                {
+                    kit[p].muted = !kit[p].muted;
+                    kit_changed = true;
+                }
+                if ui
+                    .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                    .on_hover_text("Remove this pad")
+                    .clicked()
+                    && kit.len() > 1
+                {
+                    remove_pad = Some(p);
+                }
             });
-            if let Some(p) = remove_pad {
-                kit.remove(p);
+            // v34 R5: every pad row is a drop target. IN-APP drags
+            // (rack rows carry the asset-index payload) land here
+            // directly; OS files are hit-tested centrally against
+            // the rect registered just below.
+            self.kit_drop_rects.push((t, p, rowr.response.rect));
+            let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                || ui.input(|i| !i.raw.hovered_files.is_empty());
+            if armed {
+                ui.painter().rect_stroke(
+                    rowr.response.rect,
+                    3.0,
+                    egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some(a) = rowr
+                .response
+                .interact(egui::Sense::hover())
+                .dnd_release_payload::<usize>()
+                .map(|a| *a)
+            {
+                if let Some(path) = self
+                    .assets
+                    .get(a)
+                    .map(|as_| as_.path.to_string_lossy().into_owned())
+                {
+                    kit[p].asset_path = path;
+                    kit[p].asset = None;
+                    kit_changed = true;
+                    self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            let full = kit.len() >= DRUM_MAX_PADS;
+            if ui
+                .add_enabled(!full, egui::Button::new("+ add pad"))
+                .on_hover_text(if full {
+                    "kit is full (16 pads maximum)"
+                } else {
+                    "Add a drum track row (max 16)"
+                })
+                .clicked()
+                && !full
+            {
+                kit.push(DrumPad {
+                    name: format!("Pad {}", kit.len() + 1),
+                    asset_path: String::new(),
+                    asset: None,
+                    vel: 100,
+                    muted: false,
+                });
                 kit_changed = true;
             }
-            if kit_changed {
-                *self.kit_mut(t) = kit;
-                self.drum.ensure_rows(self.kit(t).len());
-                self.save_config();
-            }
+            ui.label(
+                RichText::new(format!("{} / {DRUM_MAX_PADS} pads", kit.len()))
+                    .weak()
+                    .small(),
+            );
+        });
+        if let Some(p) = remove_pad {
+            kit.remove(p);
+            kit_changed = true;
+        }
+        if kit_changed {
+            *self.kit_mut(t) = kit;
+            self.drum.ensure_rows(self.kit(t).len());
+            self.save_config();
+        }
         if dirty {
             self.track_synth_params[t] = inst.values();
             self.save_config();
@@ -9453,7 +9538,9 @@ impl App {
                 .fx_vst_editors
                 .get(&(t, r))
                 .and_then(|w| w.state_snapshot());
-            let Some(rows) = self.fx_rows.get_mut(t) else { continue };
+            let Some(rows) = self.fx_rows.get_mut(t) else {
+                continue;
+            };
             let Some(ChainRow::Vst {
                 params,
                 entry,
@@ -9489,7 +9576,8 @@ impl App {
                 continue;
             }
             if let Some(chunk) = self.vst_editors.get(&t).and_then(|w| w.state_snapshot()) {
-                if self.track_synth_state.get(t).map(Option::as_deref) != Some(Some(chunk.as_slice()))
+                if self.track_synth_state.get(t).map(Option::as_deref)
+                    != Some(Some(chunk.as_slice()))
                 {
                     if let Some(slot) = self.track_synth_state.get_mut(t) {
                         *slot = Some(chunk);
@@ -9525,9 +9613,11 @@ impl App {
         if let Some(target) = self.params_win {
             let (snap, dirty2) = match target {
                 GuiTarget::Chain(t, r) => {
-                    let cur = self
-                        .target_entry(target)
-                        .map(|e| (0..e.descs().len()).map(|k| e.params().get(k)).collect::<Vec<f32>>());
+                    let cur = self.target_entry(target).map(|e| {
+                        (0..e.descs().len())
+                            .map(|k| e.params().get(k))
+                            .collect::<Vec<f32>>()
+                    });
                     if let (Some(snap), Some(rows)) = (cur, self.fx_rows.get_mut(t)) {
                         if let Some(ChainRow::Vst { params, .. }) = rows.get_mut(r) {
                             let d = snap.as_slice() != params.as_slice();
@@ -9675,8 +9765,7 @@ impl App {
             None => return,
         };
         if !src.audio && !src.midi && !src.auto {
-            self.status =
-                format!("track {}: tick a source (aud / mid / auto) first", i + 1);
+            self.status = format!("track {}: tick a source (aud / mid / auto) first", i + 1);
             return;
         }
         if src.audio {
@@ -10046,8 +10135,11 @@ impl App {
             name,
             // v34 R8: every picker's last folder travels with the file.
             dirs: {
-                let mut d: Vec<(String, String)> =
-                    self.dir_memo.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut d: Vec<(String, String)> = self
+                    .dir_memo
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 d.sort();
                 d
             },
@@ -10392,7 +10484,8 @@ impl App {
         // never whatever the last session or the global config happened
         // to remember, which is what made "track 1 loads MASSIVE" stick.
         for (t, h) in self.trk_height.iter_mut().enumerate() {
-            *h = pr.tracks
+            *h = pr
+                .tracks
                 .get(t)
                 .map(|pt| if pt.h.is_finite() { pt.h.max(0.0) } else { 0.0 })
                 .unwrap_or(0.0);
@@ -10518,7 +10611,11 @@ impl App {
                     .map(|a| a.data.clone())
                     .collect::<Vec<_>>(),
             );
-            engine.set_project(table, std::sync::Arc::new(self.arr.clone()), self.total_len());
+            engine.set_project(
+                table,
+                std::sync::Arc::new(self.arr.clone()),
+                self.total_len(),
+            );
             engine.set_midi_assets(std::sync::Arc::new(
                 self.assets
                     .iter()
@@ -10541,9 +10638,19 @@ impl App {
                             engine.render_selection(items).ok_or("nothing to export")?;
                         (s, items.len())
                     } else if let Some(t) = only_track {
-                        (engine.render_track(t).ok_or("no clips placed in any track")?, 0)
+                        (
+                            engine
+                                .render_track(t)
+                                .ok_or("no clips placed in any track")?,
+                            0,
+                        )
                     } else {
-                        (engine.render_project().ok_or("no clips placed in any track")?, 0)
+                        (
+                            engine
+                                .render_project()
+                                .ok_or("no clips placed in any track")?,
+                            0,
+                        )
                     };
                     crate::audio_io::export(&path, engine.sample_rate().max(1), &buf, fmt)?;
                     Ok(n)
@@ -10551,7 +10658,11 @@ impl App {
                 let msg = match res {
                     Ok(n) => format!(
                         "exported {} · {label}",
-                        if n > 0 { format!("{n} clip(s)") } else { "mix".into() }
+                        if n > 0 {
+                            format!("{n} clip(s)")
+                        } else {
+                            "mix".into()
+                        }
                     ),
                     Err(e) => format!("export: {e}"),
                 };
@@ -10979,8 +11090,7 @@ impl eframe::App for App {
         // alive — the STOP button must flip back and the playhead must
         // move exactly when the RT voices drain.
         if self.piano_roll.is_some()
-            && (self.backend.engine.preview_active()
-                || self.backend.engine.audition_active())
+            && (self.backend.engine.preview_active() || self.backend.engine.audition_active())
         {
             ctx.request_repaint();
         }
@@ -11064,6 +11174,29 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // v39: FREEZE wheel-scroll while a context menu is open. The
+        // reported symptom: right-click a volume slider (the value menu
+        // appears), wheel over the panel → the panel scrolls out from
+        // under the menu, which reads to the user as the menu closing on
+        // its own. Exception: while the pointer is over the popup's own
+        // layer the wheel stays live — tall menus and automation
+        // submenus must scroll inside themselves.
+        {
+            let ctx = ui.ctx().clone();
+            if ctx.any_popup_open() {
+                let over_popup = ctx.input(|i| {
+                    i.pointer.hover_pos().is_some_and(|p| {
+                        ctx.layer_id_at(p)
+                            // egui 0.36 has no Popup order; menus/popups own the
+                            // Foreground layer (tooltips are Tooltip).
+                            .is_some_and(|l| l.order == egui::Order::Foreground)
+                    })
+                });
+                if !over_popup {
+                    ctx.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                }
+            }
+        }
         // v34 R13: capture a body-click RELEASE once per frame, HERE at
         // the top, before any panel's input queries have egui fold the
         // event list. A release within a few px of this gesture's press
@@ -11181,8 +11314,7 @@ impl App {
                     for path in paths {
                         if crate::assets::is_audio_file(&path) {
                             if let Some(k) = self.ensure_asset(&path) {
-                                let sp =
-                                    self.assets[k].path.to_string_lossy().into_owned();
+                                let sp = self.assets[k].path.to_string_lossy().into_owned();
                                 if let Some(pad) = self.kit_mut(t).get_mut(p) {
                                     pad.asset_path = sp;
                                     pad.asset = None;
@@ -11250,9 +11382,7 @@ impl App {
                             .get_mut(asset)
                             .and_then(|a| a.automation.as_mut())
                             .map(|arc| {
-                                if let Some(nd) =
-                                    std::sync::Arc::make_mut(arc).nodes.get_mut(idx)
-                                {
+                                if let Some(nd) = std::sync::Arc::make_mut(arc).nodes.get_mut(idx) {
                                     nd.c = (nd.c + dy.signum() * 0.1).clamp(-1.0, 1.0);
                                     true
                                 } else {
@@ -11365,7 +11495,11 @@ impl App {
             let eng = &self.backend.engine;
             for t in 0..self.n_tracks.min(MAX_LOOPS) {
                 let a = eng.loop_vol(t);
-                let m = if a > 0.0 { vol_midi(20.0 * a.log10()) } else { 0 };
+                let m = if a > 0.0 {
+                    vol_midi(20.0 * a.log10())
+                } else {
+                    0
+                };
                 if block != Some((t, 0)) && m != self.trk_vol[t] {
                     self.trk_vol[t] = m;
                 }
@@ -11388,16 +11522,18 @@ impl App {
             self.master_dirty = false;
         } else {
             let live = f32::from_bits(self.backend.gain.load(Ordering::Relaxed));
-            let m = if live > 0.0 { vol_midi(20.0 * live.log10()) } else { 0 };
+            let m = if live > 0.0 {
+                vol_midi(20.0 * live.log10())
+            } else {
+                0
+            };
             if m != self.master_midi {
                 self.master_midi = m;
             }
         }
         // Tempo: automation drives the real metro_bpm atomic — mirror the
         // readout while transport runs (never while a text field is open).
-        if self.backend.engine.transport_on()
-            && ui.ctx().memory(|m| m.focused().is_none())
-        {
+        if self.backend.engine.transport_on() && ui.ctx().memory(|m| m.focused().is_none()) {
             let b = self.backend.engine.metro_bpm_now();
             let cur: f32 = self.metro_bpm.trim().parse().unwrap_or(f32::NAN);
             if cur != b as f32 {
@@ -11517,12 +11653,9 @@ impl App {
                     || crate::assets::is_midi_file(path)
                     || crate::assets::is_auto_file(path);
                 match importable.then(|| self.ensure_asset(path)).flatten() {
-                    Some(ai) => names.push(
-                        self.assets
-                            .get(ai)
-                            .map(|a| a.name.clone())
-                            .unwrap_or(shown),
-                    ),
+                    Some(ai) => {
+                        names.push(self.assets.get(ai).map(|a| a.name.clone()).unwrap_or(shown))
+                    }
                     None => bad.push(shown),
                 }
             }
@@ -11563,8 +11696,7 @@ impl App {
             dock,
             rect,
         });
-        self.dock_rects
-            .resize(4 + self.dyn_wins.len(), [0.0; 4]);
+        self.dock_rects.resize(4 + self.dyn_wins.len(), [0.0; 4]);
         self.dock_collapsed.resize(4 + self.dyn_wins.len(), false);
         4 + self.dyn_wins.len() - 1
     }
@@ -11667,8 +11799,7 @@ impl App {
                     ui.label(RichText::new(path.as_str()).weak().small());
                     let re = ui.add_sized(
                         egui::vec2(260.0, 22.0),
-                        egui::TextEdit::singleline(&mut draft)
-                            .font(egui::TextStyle::Monospace),
+                        egui::TextEdit::singleline(&mut draft).font(egui::TextStyle::Monospace),
                     );
                     if focus {
                         re.request_focus();
@@ -12187,7 +12318,8 @@ fn slider_click_gestures(resp: &egui::Response) -> (bool, bool) {
     resp.ctx.input(|i| {
         (
             i.pointer.button_clicked(egui::PointerButton::Secondary),
-            i.pointer.button_double_clicked(egui::PointerButton::Primary),
+            i.pointer
+                .button_double_clicked(egui::PointerButton::Primary),
         )
     })
 }
@@ -12350,10 +12482,7 @@ fn bind_fader_cell(
         );
         p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
         p.rect_filled(
-            egui::Rect::from_min_size(
-                bar.min,
-                egui::vec2(bar.width() * f, bar.height()),
-            ),
+            egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())),
             2.0,
             Color32::from_rgb(96, 104, 132),
         );
@@ -12368,15 +12497,11 @@ fn bind_fader_cell(
     if on {
         bind_overlay(ui, r, &format!("{name} \u{b7} track strip"), id, pick);
     } else {
-        ui.interact(
-            r,
-            ui.id().with(("stripoff", id)),
-            egui::Sense::hover(),
-        )
-        .on_hover_text(
-            "an automation clip drives the track it sits on \u{b7} open this curve on \
+        ui.interact(r, ui.id().with(("stripoff", id)), egui::Sense::hover())
+            .on_hover_text(
+                "an automation clip drives the track it sits on \u{b7} open this curve on \
              that lane to automate its controls",
-        );
+            );
     }
 }
 
@@ -12391,7 +12516,10 @@ fn bind_lamp_cell(
 ) {
     let (r, _) = ui.allocate_at_least(egui::vec2(54.0, 18.0), egui::Sense::hover());
     let p = ui.painter();
-    let sq = egui::Rect::from_min_size(egui::pos2(r.min.x + 1.0, r.center().y - 6.0), egui::vec2(12.0, 12.0));
+    let sq = egui::Rect::from_min_size(
+        egui::pos2(r.min.x + 1.0, r.center().y - 6.0),
+        egui::vec2(12.0, 12.0),
+    );
     if lit {
         p.rect_filled(sq, 2.0, Color32::from_rgb(230, 70, 70));
     } else {
@@ -12470,8 +12598,14 @@ fn bind_param_cell(
     );
     p.line_segment(
         [
-            egui::pos2(bar.min.x + bar.width() * frac.clamp(0.0, 1.0), bar.min.y - 1.0),
-            egui::pos2(bar.min.x + bar.width() * frac.clamp(0.0, 1.0), bar.max.y + 1.0),
+            egui::pos2(
+                bar.min.x + bar.width() * frac.clamp(0.0, 1.0),
+                bar.min.y - 1.0,
+            ),
+            egui::pos2(
+                bar.min.x + bar.width() * frac.clamp(0.0, 1.0),
+                bar.max.y + 1.0,
+            ),
         ],
         egui::Stroke::new(1.0, Color32::from_gray(215)),
     );
@@ -12696,9 +12830,7 @@ impl DynKind {
 /// right beside the MIXER dock, whose default is right/0) so the new
 /// master section starts literally next to the master strip. Once the
 /// user's config holds their own entry for "master", it wins.
-fn dyn_seed_for(
-    docks: &[crate::config::DynDock],
-) -> Vec<(DynKind, [i16; 3], [f32; 4])> {
+fn dyn_seed_for(docks: &[crate::config::DynDock]) -> Vec<(DynKind, [i16; 3], [f32; 4])> {
     let mut seed: Vec<(DynKind, [i16; 3], [f32; 4])> = docks
         .iter()
         .filter_map(|d| DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect)))
@@ -12981,10 +13113,8 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             if r[2] < 8.0 {
                 continue;
             }
-            let mut head = egui::Rect::from_min_size(
-                egui::pos2(r[0], r[1]),
-                egui::vec2(r[2], WIN_HEAD_H),
-            );
+            let mut head =
+                egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
             head.max.x -= WIN_BTN_STRIP; // never steal collapse/close
             if head.contains(press_pos) {
                 app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
@@ -13080,7 +13210,11 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // 1537-px max-rect). Only a real divider drag moves it, and those
         // clear this threshold immediately.
         let cross = edge == 2 || edge == 3;
-        let (cur, size) = if cross { (wr[3], r.height()) } else { (wr[2], r.width()) };
+        let (cur, size) = if cross {
+            (wr[3], r.height())
+        } else {
+            (wr[2], r.width())
+        };
         if size > 16.0 && (cur - size).abs() > 24.0 {
             if cross {
                 wr[3] = size;
@@ -13137,7 +13271,11 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
             let c = app.dock_collapsed[idx];
             if ui
                 .small_button(if c { "+" } else { "\u{2013}" })
-                .on_hover_text(if c { "Expand this window" } else { "Collapse this window" })
+                .on_hover_text(if c {
+                    "Expand this window"
+                } else {
+                    "Collapse this window"
+                })
                 .clicked()
             {
                 app.dock_collapsed[idx] = !c;
@@ -13242,11 +13380,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             // resizable panel's size by Id, so when the
                             // stack changes the fair-share default must
                             // apply afresh (else old solo sizes persist).
-                            egui::Panel::left(egui::Id::new((
-                                "dockw",
-                                *i,
-                                ids.len(),
-                            )))
+                            egui::Panel::left(egui::Id::new(("dockw", *i, ids.len())))
                                 .resizable(true)
                                 .default_size(want.min(cap).max(48.0))
                                 .min_size(20.0)
@@ -13269,40 +13403,40 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
             // v35 R6: thinner floors — docked stacks squeeze to a border.
             wpanel = wpanel.resizable(true).default_size(w).min_size(56.0);
             wpanel.show(ui, |ui| {
-                    // v35 R6: fair-share defaults (see bottom-edge note).
-                    let strip = ui.max_rect().height();
-                    let mut alloc = 0.0f32;
-                    for (n, i) in ids.iter().enumerate() {
-                        let b = ui.max_rect();
-                        if n + 1 == ids.len() {
-                            egui::Panel::left(egui::Id::new(("dockfill", *i)))
-                                .resizable(false)
-                                .exact_size(b.width())
-                                .show(ui, |ui| docked_window(ui, app, *i));
-                        } else {
-                            let rec = win_rect(app, *i)[3].max(0.0);
-                            let want = if rec > 8.0 { rec } else { def_h(*i) };
-                            let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
-                            alloc += want.min(cap);
-                            // egui sizes top panels to CONTENT desired
-                            // height, which would let one stacked window
-                            // devour the strip; cap the content to the
-                            // window's share in a scroll viewport.
-                            let sz = want.min(cap).max(48.0);
-                            egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
-                                .resizable(true)
-                                .default_size(sz)
-                                .min_size(20.0)
-                                .show(ui, |ui| {
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(("dockstack", *i))
-                                        .auto_shrink([false, false])
-                                        .max_height(sz)
-                                        .show(ui, |ui| docked_window(ui, app, *i));
-                                });
-                        }
+                // v35 R6: fair-share defaults (see bottom-edge note).
+                let strip = ui.max_rect().height();
+                let mut alloc = 0.0f32;
+                for (n, i) in ids.iter().enumerate() {
+                    let b = ui.max_rect();
+                    if n + 1 == ids.len() {
+                        egui::Panel::left(egui::Id::new(("dockfill", *i)))
+                            .resizable(false)
+                            .exact_size(b.width())
+                            .show(ui, |ui| docked_window(ui, app, *i));
+                    } else {
+                        let rec = win_rect(app, *i)[3].max(0.0);
+                        let want = if rec > 8.0 { rec } else { def_h(*i) };
+                        let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
+                        alloc += want.min(cap);
+                        // egui sizes top panels to CONTENT desired
+                        // height, which would let one stacked window
+                        // devour the strip; cap the content to the
+                        // window's share in a scroll viewport.
+                        let sz = want.min(cap).max(48.0);
+                        egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
+                            .resizable(true)
+                            .default_size(sz)
+                            .min_size(20.0)
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("dockstack", *i))
+                                    .auto_shrink([false, false])
+                                    .max_height(sz)
+                                    .show(ui, |ui| docked_window(ui, app, *i));
+                            });
                     }
-                });
+                }
+            });
         }
     }
 }
@@ -13427,14 +13561,12 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
         if let Some(pt) = pt {
             if let Some(edge) = snap_zone(vp, pt) {
                 let z = match edge {
-                    0 => egui::Rect::from_min_max(
-                        vp.min,
-                        egui::pos2(vp.min.x + SNAP_EDGE, vp.max.y),
-                    ),
-                    1 => egui::Rect::from_min_max(
-                        egui::pos2(vp.max.x - SNAP_EDGE, vp.min.y),
-                        vp.max,
-                    ),
+                    0 => {
+                        egui::Rect::from_min_max(vp.min, egui::pos2(vp.min.x + SNAP_EDGE, vp.max.y))
+                    }
+                    1 => {
+                        egui::Rect::from_min_max(egui::pos2(vp.max.x - SNAP_EDGE, vp.min.y), vp.max)
+                    }
                     3 => egui::Rect::from_min_max(
                         vp.min,
                         egui::pos2(vp.max.x, vp.min.y + SNAP_BOTTOM),
@@ -13444,12 +13576,14 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                         vp.max,
                     ),
                 };
-                let lid = egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("dock-zone-hl"),
-                );
+                let lid =
+                    egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-zone-hl"));
                 let p = ui.ctx().layer_painter(lid);
-                p.rect_filled(z, 0.0, Color32::from_rgb(120, 190, 255).linear_multiply(0.12));
+                p.rect_filled(
+                    z,
+                    0.0,
+                    Color32::from_rgb(120, 190, 255).linear_multiply(0.12),
+                );
                 p.rect_stroke(
                     z,
                     0.0,
@@ -13467,44 +13601,43 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
 /// the right widget for the value's nature: knobs run the three-step
 /// axis wizard, booleans capture one message as a switch.
 fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
-
-            ui.label(
-                RichText::new("project value bindings \u{b7} always linked to the main GUI")
-                    .weak()
-                    .small(),
-            );
-            ui.separator();
-            let track = app.selected.min(app.n_tracks.saturating_sub(1)) as u32;
-            let mut target = app
-                .vb_target
-                .clone()
-                .or_else(|| app.auto_edit.as_ref().map(|ed| ed.target.clone()))
-                .unwrap_or_else(|| crate::automation::TARGET_TRACK_VOL.to_string());
-            let targets = auto_targets(app, track as usize);
-            let q = target_search_box(ui, "filter binding target");
-            let shown = filtered_targets(&targets, &q);
-            let cur = targets
-                .iter()
-                .find(|(id, _)| id == &target)
-                .map(|(_, l)| l.clone())
-                .unwrap_or_else(|| target.clone());
-            egui::ComboBox::from_id_salt("vb_target")
-                // Prefixed so the rack's combo never impersonates the
-                // manager's own target readout (galley-matching pins).
-                .selected_text(format!("bind to \u{2192} {cur}"))
-                .width(210.0)
-                .show_ui(ui, |ui| {
-                    for (id, label) in shown.iter() {
-                        if ui
-                            .selectable_value(&mut target, id.clone(), label)
-                            .changed()
-                        {
-                            app.vb_target = Some(target.clone());
-                        }
-                    }
-                });
-            let is_bool = target == crate::automation::TARGET_TRACK_MUTE;
-            ui.horizontal(|ui| {
+    ui.label(
+        RichText::new("project value bindings \u{b7} always linked to the main GUI")
+            .weak()
+            .small(),
+    );
+    ui.separator();
+    let track = app.selected.min(app.n_tracks.saturating_sub(1)) as u32;
+    let mut target = app
+        .vb_target
+        .clone()
+        .or_else(|| app.auto_edit.as_ref().map(|ed| ed.target.clone()))
+        .unwrap_or_else(|| crate::automation::TARGET_TRACK_VOL.to_string());
+    let targets = auto_targets(app, track as usize);
+    let q = target_search_box(ui, "filter binding target");
+    let shown = filtered_targets(&targets, &q);
+    let cur = targets
+        .iter()
+        .find(|(id, _)| id == &target)
+        .map(|(_, l)| l.clone())
+        .unwrap_or_else(|| target.clone());
+    egui::ComboBox::from_id_salt("vb_target")
+        // Prefixed so the rack's combo never impersonates the
+        // manager's own target readout (galley-matching pins).
+        .selected_text(format!("bind to \u{2192} {cur}"))
+        .width(210.0)
+        .show_ui(ui, |ui| {
+            for (id, label) in shown.iter() {
+                if ui
+                    .selectable_value(&mut target, id.clone(), label)
+                    .changed()
+                {
+                    app.vb_target = Some(target.clone());
+                }
+            }
+        });
+    let is_bool = target == crate::automation::TARGET_TRACK_MUTE;
+    ui.horizontal(|ui| {
                 let label = if is_bool { "bind switch" } else { "bind knob\u{2026}" };
                 let hover = if is_bool {
                     "click, then MOVE/PRESS the control \u{b7} every message toggles this value"
@@ -13527,58 +13660,60 @@ fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
                     }
                 }
             });
-            ui.separator();
-            ui.label(RichText::new("bound controls").weak().small());
-            let mut unbind: Option<usize> = None;
-            let mut learn: Option<usize> = None;
-            for (i, vb) in app.value_binds.clone().iter().enumerate() {
-                let lbl = targets
-                    .iter()
-                    .find(|(id, _)| *id == vb.target)
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_else(|| {
-                        crate::automation::describe_target(&vb.target)
-                    });
-                ui.horizontal(|ui| {
-                    let tail = if vb.kind == 0 {
-                        format!("knob {}..{}", vb.lo, vb.hi)
-                    } else {
-                        "switch".to_string()
-                    };
-                    ui.label(format!(
-                        "{} \u{2192} T{} {} ({})",
-                        vb.bind.label(),
-                        vb.track + 1,
-                        lbl,
-                        tail
-                    ))
-                    .on_hover_text("bound in this project; travels with the project file");
-                    if ui.small_button("relearn").clicked() {
-                        learn = Some(i);
-                    }
-                    if ui.small_button("\u{2715}").on_hover_text("unbind").clicked() {
-                        unbind = Some(i);
-                    }
-                });
+    ui.separator();
+    ui.label(RichText::new("bound controls").weak().small());
+    let mut unbind: Option<usize> = None;
+    let mut learn: Option<usize> = None;
+    for (i, vb) in app.value_binds.clone().iter().enumerate() {
+        let lbl = targets
+            .iter()
+            .find(|(id, _)| *id == vb.target)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| crate::automation::describe_target(&vb.target));
+        ui.horizontal(|ui| {
+            let tail = if vb.kind == 0 {
+                format!("knob {}..{}", vb.lo, vb.hi)
+            } else {
+                "switch".to_string()
+            };
+            ui.label(format!(
+                "{} \u{2192} T{} {} ({})",
+                vb.bind.label(),
+                vb.track + 1,
+                lbl,
+                tail
+            ))
+            .on_hover_text("bound in this project; travels with the project file");
+            if ui.small_button("relearn").clicked() {
+                learn = Some(i);
             }
-            if let Some(i) = learn {
-                if let Some(vb) = app.value_binds.get(i) {
-                    let (t, trk, kind) = (vb.target.clone(), vb.track, vb.kind);
-                    if kind == 1 {
-                        app.value_learning = Some((i, t.clone(), trk));
-                        app.status = "switch binding \u{2014} move or press a control".into();
-                    } else {
-                        app.arm_value_knob_learn(&t, trk, i);
-                    }
-                }
+            if ui
+                .small_button("\u{2715}")
+                .on_hover_text("unbind")
+                .clicked()
+            {
+                unbind = Some(i);
             }
-            if let Some(i) = unbind {
-                if i < app.value_binds.len() {
-                    let vb = app.value_binds.remove(i);
-                    app.save_config();
-                    app.status = format!("unbound: {}", describe_binding_target(&vb));
-                }
+        });
+    }
+    if let Some(i) = learn {
+        if let Some(vb) = app.value_binds.get(i) {
+            let (t, trk, kind) = (vb.target.clone(), vb.track, vb.kind);
+            if kind == 1 {
+                app.value_learning = Some((i, t.clone(), trk));
+                app.status = "switch binding \u{2014} move or press a control".into();
+            } else {
+                app.arm_value_knob_learn(&t, trk, i);
             }
+        }
+    }
+    if let Some(i) = unbind {
+        if i < app.value_binds.len() {
+            let vb = app.value_binds.remove(i);
+            app.save_config();
+            app.status = format!("unbound: {}", describe_binding_target(&vb));
+        }
+    }
 }
 
 fn describe_binding_target(vb: &crate::config::ValueBind) -> String {
@@ -13780,7 +13915,7 @@ fn rack_file_row(
             app.preview_asset(k);
         }
     }
-    if dr.drag_started() {
+    if dr.drag_started_by(egui::PointerButton::Primary) {
         if let Some(k) = app.ensure_asset(fp) {
             app.sel_asset = Some(k);
             // egui-native drag: the payload travels with the gesture and
@@ -13825,9 +13960,7 @@ fn rack_file_row(
         }
         if ui
             .button(RichText::new("delete file").color(Color32::from_rgb(255, 120, 120)))
-            .on_hover_text(
-                "Removes every clip using this asset AND deletes the file on disk",
-            )
+            .on_hover_text("Removes every clip using this asset AND deletes the file on disk")
             .clicked()
         {
             app.rack_confirm_del = Some(fp_disp.clone());
@@ -13875,30 +14008,29 @@ fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
 /// draggable row per audio file, project-only assets below, and the
 /// selected-asset toolbar (quantize / trim / remove).
 fn rack_body(ui: &mut egui::Ui, app: &mut App) {
-
-            ui.horizontal(|ui| {
-                if ui
-                    .button("+ folder")
-                    .on_hover_text("Add an audio folder to the rack")
-                    .clicked()
-                {
-                    let mut dlg = rfd::FileDialog::new().set_title("Add rack folder");
-                    if let Some(d) = app.pick_dir("rack") {
-                        dlg = dlg.set_directory(d);
-                    }
-                    if let Some(p) = dlg.pick_folder() {
-                        app.note_dir("rack", &p);
-                        let mut f = RackFolder::new(p.to_string_lossy().into_owned());
-                        f.rescan();
-                        app.rack.push(f);
-                        app.save_config();
-                    }
-                }
-            });
-            // v29: whole-rack view controls — collapse/expand every
-            // sub-folder group, and flip the grouping mode (by asset type,
-            // the historical default, vs by sub-folder). All persisted.
-            ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
+        if ui
+            .button("+ folder")
+            .on_hover_text("Add an audio folder to the rack")
+            .clicked()
+        {
+            let mut dlg = rfd::FileDialog::new().set_title("Add rack folder");
+            if let Some(d) = app.pick_dir("rack") {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(p) = dlg.pick_folder() {
+                app.note_dir("rack", &p);
+                let mut f = RackFolder::new(p.to_string_lossy().into_owned());
+                f.rescan();
+                app.rack.push(f);
+                app.save_config();
+            }
+        }
+    });
+    // v29: whole-rack view controls — collapse/expand every
+    // sub-folder group, and flip the grouping mode (by asset type,
+    // the historical default, vs by sub-folder). All persisted.
+    ui.horizontal_wrapped(|ui| {
                 if ui
                     .small_button("collapse all")
                     .on_hover_text("Collapse every sub-folder group")
@@ -13950,18 +14082,18 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                     app.save_config();
                 }
             });
-            if app.rack.is_empty() {
-                ui.label(
-                    RichText::new(
-                        "Add a folder: its audio files become clips you can \
+    if app.rack.is_empty() {
+        ui.label(
+            RichText::new(
+                "Add a folder: its audio files become clips you can \
                          drag onto tracks. The FIRST folder also receives \
                          every recording as a WAV.",
-                    )
-                    .weak()
-                    .small(),
-                );
-            }
-            egui::ScrollArea::vertical()
+            )
+            .weak()
+            .small(),
+        );
+    }
+    egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // Snapshot so rows can call &mut App methods (ensure_asset).
@@ -14472,7 +14604,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 app.sel_asset = Some(k);
                                 app.preview_asset(k);
                             }
-                            if dr.drag_started() {
+                            if dr.drag_started_by(egui::PointerButton::Primary) {
                                 dr.dnd_set_drag_payload(k);
                             }
                             // v29: same management menu as rack rows (the
@@ -14599,7 +14731,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
 /// button; primary drags and keyboard edits pass through untouched.
 /// Take `before` before adding the widget; call INSTEAD of `resp.changed()`.
 #[must_use]
-fn p_changed<T: Copy>(resp: &egui::Response, before: T, value: &mut T) -> bool {
+pub(crate) fn p_changed<T: Copy>(resp: &egui::Response, before: T, value: &mut T) -> bool {
     if resp.changed() && resp.dragged() && !resp.dragged_by(egui::PointerButton::Primary) {
         *value = before;
         return false;
@@ -14671,8 +14803,20 @@ fn master_volume_controls(ui: &mut egui::Ui, app: &mut App) {
     // v20 R3: master volume binds directly too (global target: no
     // owner track — selection's first track or the longest hosts it).
     let mvv = vol_amp(app.master_midi);
-    bind_value_controls(&mut msl, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
-    bind_value_controls(&mut mvr, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
+    bind_value_controls(
+        &mut msl,
+        app,
+        None,
+        crate::automation::TARGET_MASTER_VOL,
+        mvv,
+    );
+    bind_value_controls(
+        &mut mvr,
+        app,
+        None,
+        crate::automation::TARGET_MASTER_VOL,
+        mvv,
+    );
     if ui
         .small_button(RichText::new("0").monospace())
         .on_hover_text("Reset master volume to 0 dB")
@@ -14715,16 +14859,22 @@ fn paint_stereo_meters(
     let label_x = rect.min.x + 2.0 * bar_w + 6.0;
     for (i, (amp, hold)) in [(l, lh), (r, rh)].iter().enumerate() {
         let x = rect.min.x + 2.0 + i as f32 * (bar_w + 2.0);
-        let b = egui::Rect::from_min_size(egui::pos2(x, rect.min.y + 1.0), egui::vec2(bar_w, rect.height() - 2.0));
+        let b = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y + 1.0),
+            egui::vec2(bar_w, rect.height() - 2.0),
+        );
         let db = db_of(*amp);
         if db > BOT_DB {
-            let mut seg = |lo: f32, hi: f32, col: Color32| {
+            let seg = |lo: f32, hi: f32, col: Color32| {
                 if db > lo {
                     let y0 = y_of(db.min(hi)).max(b.min.y);
                     let y1 = y_of(lo).min(b.max.y);
                     if y1 > y0 {
                         p.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(b.min.x, y0), egui::pos2(b.max.x, y1)),
+                            egui::Rect::from_min_max(
+                                egui::pos2(b.min.x, y0),
+                                egui::pos2(b.max.x, y1),
+                            ),
                             0.0,
                             col,
                         );
@@ -14750,7 +14900,11 @@ fn paint_stereo_meters(
     let gray = Color32::from_rgb(130, 130, 138);
     for db in [0.0f32, -6.0, -12.0, -24.0, -40.0, -60.0] {
         let y = y_of(db).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
-        p.hline(label_x - 4.0..=label_x - 1.0, y, egui::Stroke::new(1.0, gray));
+        p.hline(
+            label_x - 4.0..=label_x - 1.0,
+            y,
+            egui::Stroke::new(1.0, gray),
+        );
         p.text(
             egui::pos2(label_x, y),
             egui::Align2::LEFT_CENTER,
@@ -14769,9 +14923,7 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
     let x_of = |f: f32| -> f32 {
         rect.min.x + (f.ln() - 30.0f32.ln()) / (20000.0f32 / 30.0).ln() * rect.width()
     };
-    let y_of = |db: f32| -> f32 {
-        rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height()
-    };
+    let y_of = |db: f32| -> f32 { rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height() };
     let grid = Color32::from_rgb(58, 58, 66);
     let txt = Color32::from_rgb(120, 120, 128);
     for (f, lab) in [(100.0f32, "100"), (1000.0, "1k"), (10000.0, "10k")] {
@@ -14841,10 +14993,7 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
                 let yc = y_of(sp.peak_db[bin]);
                 if yc < y - 1.5 {
                     mesh.add_colored_rect(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x, yc - 1.2),
-                            egui::pos2(x + 1.6, yc),
-                        ),
+                        egui::Rect::from_min_max(egui::pos2(x, yc - 1.2), egui::pos2(x + 1.6, yc)),
                         Color32::from_rgb(220, 220, 220),
                     );
                 }
@@ -14919,113 +15068,113 @@ fn master_strip(ui: &mut egui::Ui, app: &mut App) {
 }
 
 fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
-            // v30-batch-2: the dock/window header carries the title, so
-            // the old in-panel MIXER heading is gone (it double-stacked).
-            // v34 R6: `max_rect()` not `available_rect_before_wrap()`:
-            // the docked content pass can run twice in one frame, and a
-            // flow-derived rect drifts between the passes — strips then
-            // land ~1700 px below the panel.
-            let base = ui.max_rect();
-            // v34 R6: the mixer shares the grid's vertical rhythm ONLY
-            // while docked LEFT or RIGHT, where every strip must sit level
-            // with its track row. Bottom-docked or floating it is an
-            // independent view: strips start at the panel top, and the
-            // wheel over the mixer scrolls the MIXER — never the grid
-            // (the old always-tied math pinned the strips to `grid_anchor`
-            // even when that anchor lived in a completely different part
-            // of the window, so the bottom/floating mixer seemed welded to
-            // the main GUI's scroll and layout).
-            let tied = !mixer_independent(app);
-            let mut free_scroll = 0.0;
-            if !tied {
-                let over = ui.rect_contains_pointer(base);
-                let d = if over { ui.input(|i| i.smooth_scroll_delta).y } else { 0.0 };
-                if d != 0.0 {
-                    app.mixer_scroll = (app.mixer_scroll - d).max(0.0);
-                }
-                free_scroll = app.mixer_scroll;
-            }
-            // Clip to the visible column, then lay strips out on absolute
-            // rects shifted by the grid's vertical scroll (shared offset —
-            // the alignment is the whole point of this panel). The column
-            // starts at the timeline track stack's top edge (measured last
-            // frame by `central_panels`), so strips sit level with tracks
-            // even though the two panels' headers differ in height; any
-            // leftover room between panels is intentionally left empty.
-            ui.shrink_clip_rect(base);
-            let top = if tied {
-                if app.grid_anchor > 0.0 {
-                    app.grid_anchor.min(base.max.y)
-                } else {
-                    base.min.y
-                }
-            } else {
-                // Independent mode: right below the master band.
-                base.min.y + 44.0
-            };
-            let scroll_y = if tied { app.vscroll } else { free_scroll };
-            let mut y = top - scroll_y;
-            // Master strip in the header band: from the panel header down
-            // to where the track stack begins — the band level with the
-            // timeline grid header, directly above the Track 1 strip.
-            // The band gets an OPAQUE backdrop that belongs to it: without
-            // one, scrolled track-strip widgets show through the transparent
-            // header and overlay the master controls (user report).
-            let band_bottom = top.max(base.min.y);
-            if band_bottom - base.min.y > 24.0 {
-                let band = egui::Rect::from_min_max(
-                    egui::pos2(base.min.x, base.min.y),
-                    egui::pos2(base.max.x, band_bottom),
-                );
-                let pfill = ui.visuals().panel_fill;
-                ui.painter().rect_filled(band, 0.0, pfill);
-                ui.painter().hline(
-                    band.x_range(),
-                    band.bottom() - 0.5,
-                    egui::Stroke::new(1.0, Color32::from_gray(64)),
-                );
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .id_salt("masterstrip")
-                        .max_rect(band)
-                        .layout(
-                            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(false),
-                        ),
-                    |ui| master_strip(ui, app),
-                );
-            }
-            // Track strips may only paint BELOW the band — their absolute
-            // rects shift with the shared vertical scroll, so without this
-            // they'd draw over the master header when scrolled up.
-            ui.shrink_clip_rect(egui::Rect::from_min_max(
-                egui::pos2(base.min.x, band_bottom.max(base.min.y)),
-                base.max,
-            ));
-            for t in 0..app.n_tracks {
-                let th = app.track_h(t);
-                if y + th >= base.min.y && y <= base.max.y {
-                    let r = egui::Rect::from_min_size(
-                        egui::pos2(base.min.x, y),
-                        egui::vec2(base.width(), th),
-                    );
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .id_salt(("mixstrip", t))
-                            .max_rect(r)
-                            .layout(egui::Layout::top_down(egui::Align::Min)),
-                        |ui| mixer_strip(ui, app, t),
-                    );
-                    // v0.15: hairline under each strip — consecutive
-                    // strips used to melt into one wall of controls.
-                    ui.painter().hline(
-                        r.x_range(),
-                        r.max.y + TRACK_SEP_HIT * 0.5,
-                        egui::Stroke::new(1.0, Color32::from_gray(48)),
-                    );
-                }
-                y += th + TRACK_SEP_HIT;
-            }
-            let _ = ui.allocate_exact_size(base.size(), Sense::hover());
+    // v30-batch-2: the dock/window header carries the title, so
+    // the old in-panel MIXER heading is gone (it double-stacked).
+    // v34 R6: `max_rect()` not `available_rect_before_wrap()`:
+    // the docked content pass can run twice in one frame, and a
+    // flow-derived rect drifts between the passes — strips then
+    // land ~1700 px below the panel.
+    let base = ui.max_rect();
+    // v34 R6: the mixer shares the grid's vertical rhythm ONLY
+    // while docked LEFT or RIGHT, where every strip must sit level
+    // with its track row. Bottom-docked or floating it is an
+    // independent view: strips start at the panel top, and the
+    // wheel over the mixer scrolls the MIXER — never the grid
+    // (the old always-tied math pinned the strips to `grid_anchor`
+    // even when that anchor lived in a completely different part
+    // of the window, so the bottom/floating mixer seemed welded to
+    // the main GUI's scroll and layout).
+    let tied = !mixer_independent(app);
+    let mut free_scroll = 0.0;
+    if !tied {
+        let over = ui.rect_contains_pointer(base);
+        let d = if over {
+            ui.input(|i| i.smooth_scroll_delta).y
+        } else {
+            0.0
+        };
+        if d != 0.0 {
+            app.mixer_scroll = (app.mixer_scroll - d).max(0.0);
+        }
+        free_scroll = app.mixer_scroll;
+    }
+    // Clip to the visible column, then lay strips out on absolute
+    // rects shifted by the grid's vertical scroll (shared offset —
+    // the alignment is the whole point of this panel). The column
+    // starts at the timeline track stack's top edge (measured last
+    // frame by `central_panels`), so strips sit level with tracks
+    // even though the two panels' headers differ in height; any
+    // leftover room between panels is intentionally left empty.
+    ui.shrink_clip_rect(base);
+    let top = if tied {
+        if app.grid_anchor > 0.0 {
+            app.grid_anchor.min(base.max.y)
+        } else {
+            base.min.y
+        }
+    } else {
+        // Independent mode: right below the master band.
+        base.min.y + 44.0
+    };
+    let scroll_y = if tied { app.vscroll } else { free_scroll };
+    let mut y = top - scroll_y;
+    // Master strip in the header band: from the panel header down
+    // to where the track stack begins — the band level with the
+    // timeline grid header, directly above the Track 1 strip.
+    // The band gets an OPAQUE backdrop that belongs to it: without
+    // one, scrolled track-strip widgets show through the transparent
+    // header and overlay the master controls (user report).
+    let band_bottom = top.max(base.min.y);
+    if band_bottom - base.min.y > 24.0 {
+        let band = egui::Rect::from_min_max(
+            egui::pos2(base.min.x, base.min.y),
+            egui::pos2(base.max.x, band_bottom),
+        );
+        let pfill = ui.visuals().panel_fill;
+        ui.painter().rect_filled(band, 0.0, pfill);
+        ui.painter().hline(
+            band.x_range(),
+            band.bottom() - 0.5,
+            egui::Stroke::new(1.0, Color32::from_gray(64)),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .id_salt("masterstrip")
+                .max_rect(band)
+                .layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(false)),
+            |ui| master_strip(ui, app),
+        );
+    }
+    // Track strips may only paint BELOW the band — their absolute
+    // rects shift with the shared vertical scroll, so without this
+    // they'd draw over the master header when scrolled up.
+    ui.shrink_clip_rect(egui::Rect::from_min_max(
+        egui::pos2(base.min.x, band_bottom.max(base.min.y)),
+        base.max,
+    ));
+    for t in 0..app.n_tracks {
+        let th = app.track_h(t);
+        if y + th >= base.min.y && y <= base.max.y {
+            let r =
+                egui::Rect::from_min_size(egui::pos2(base.min.x, y), egui::vec2(base.width(), th));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt(("mixstrip", t))
+                    .max_rect(r)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| mixer_strip(ui, app, t),
+            );
+            // v0.15: hairline under each strip — consecutive
+            // strips used to melt into one wall of controls.
+            ui.painter().hline(
+                r.x_range(),
+                r.max.y + TRACK_SEP_HIT * 0.5,
+                egui::Stroke::new(1.0, Color32::from_gray(48)),
+            );
+        }
+        y += th + TRACK_SEP_HIT;
+    }
+    let _ = ui.allocate_exact_size(base.size(), Sense::hover());
 }
 
 fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
@@ -15282,14 +15431,18 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
     }
     let dragging = app.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
     let mut open = true;
-    let mut w = egui::Window::new(RichText::new(format!("SYNTHS \u{2014} track {}", t + 1)).strong())
-        .id(egui::Id::new(("dynwin-synthpick", t)))
-        .open(&mut open)
-        .min_width(240.0)
-        .min_height(120.0)
-        .default_height(460.0);
+    let mut w =
+        egui::Window::new(RichText::new(format!("SYNTHS \u{2014} track {}", t + 1)).strong())
+            .id(egui::Id::new(("dynwin-synthpick", t)))
+            .open(&mut open)
+            .min_width(240.0)
+            .min_height(120.0)
+            .default_height(460.0);
     if let Some(r) = app.dyn_rect(idx) {
-        w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        w = w
+            .default_pos([r[0], r[1]])
+            .default_width(r[2])
+            .default_height(r[3]);
     }
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
@@ -15310,157 +15463,147 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
         app.vst_rescan();
     }
     let cur = app.track_synth[t].clone().unwrap_or_default();
-            ui.label(RichText::new("Synthesizers (click binds to this track):").strong());
-            // (tag, label, stem-to-bind) for every choice: the default,
-            // every script synth, every scanned plugin instrument.
-            let mut rows: Vec<(&'static str, String, String)> =
-                vec![("rust", "piano \u{2014} default".to_string(), String::new())];
-            for stem in app.synth_registry.stems() {
-                if stem != "piano" {
-                    rows.push(("rust", stem.clone(), stem));
-                }
-            }
-            for e in app.vst_scan.iter() {
-                if !e.instrument || e.error.is_some() {
-                    continue;
-                }
-                let tag: &'static str = match e.kind {
-                    crate::vsthost::VstKind::V2 => "vst2",
-                    crate::vsthost::VstKind::V3 => "vst3",
-                    crate::vsthost::VstKind::Clap => "clap",
+    ui.label(RichText::new("Synthesizers (click binds to this track):").strong());
+    // (tag, label, stem-to-bind) for every choice: the default,
+    // every script synth, every scanned plugin instrument.
+    let mut rows: Vec<(&'static str, String, String)> =
+        vec![("rust", "piano \u{2014} default".to_string(), String::new())];
+    for stem in app.synth_registry.stems() {
+        if stem != "piano" {
+            rows.push(("rust", stem.clone(), stem));
+        }
+    }
+    for e in app.vst_scan.iter() {
+        if !e.instrument || e.error.is_some() {
+            continue;
+        }
+        let tag: &'static str = match e.kind {
+            crate::vsthost::VstKind::V2 => "vst2",
+            crate::vsthost::VstKind::V3 => "vst3",
+            crate::vsthost::VstKind::Clap => "clap",
+        };
+        rows.push((
+            tag,
+            format!("{} \u{2014} plugin instrument", e.name),
+            vst_synth_encode(e.kind, &e.path.to_string_lossy(), e.plugin_id.as_deref()),
+        ));
+    }
+    let scanning = !app.vst_scanned || app.vst_scan_rx.is_some();
+    egui::ScrollArea::vertical()
+        .id_salt(("synthpicklist", t))
+        .max_height(190.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let full_w = ui.available_width();
+            let n_rows = rows.len();
+            let mut pick: Option<String> = None;
+            for (tag, label, stem) in rows {
+                let active = stem == cur;
+                let txt = if active {
+                    RichText::new(format!("[{tag}]  {label}")).strong()
+                } else {
+                    RichText::new(format!("[{tag}]  {label}"))
                 };
-                rows.push((
-                    tag,
-                    format!("{} \u{2014} plugin instrument", e.name),
-                    vst_synth_encode(e.kind, &e.path.to_string_lossy(), e.plugin_id.as_deref()),
-                ));
+                let resp = ui.add_sized([full_w, 24.0], egui::Button::new(txt).frame(false));
+                if resp.clicked() && !active {
+                    pick = Some(stem);
+                }
+                if active {
+                    // THE marker: a border around the selected synth.
+                    let rect = resp.rect.expand(2.0);
+                    ui.painter().rect(
+                        rect,
+                        4.0,
+                        Color32::TRANSPARENT,
+                        egui::Stroke::new(1.6, Color32::from_rgb(120, 190, 255)),
+                        egui::StrokeKind::Middle,
+                    );
+                }
             }
-            let scanning = !app.vst_scanned || app.vst_scan_rx.is_some();
-            egui::ScrollArea::vertical()
-                .id_salt(("synthpicklist", t))
-                .max_height(190.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let full_w = ui.available_width();
-                    let n_rows = rows.len();
-                    let mut pick: Option<String> = None;
-                    for (tag, label, stem) in rows {
-                        let active = stem == cur;
-                        let txt = if active {
-                            RichText::new(format!("[{tag}]  {label}")).strong()
-                        } else {
-                            RichText::new(format!("[{tag}]  {label}"))
-                        };
-                        let resp = ui.add_sized(
-                            [full_w, 24.0],
-                            egui::Button::new(txt).frame(false),
-                        );
-                        if resp.clicked() && !active {
-                            pick = Some(stem);
-                        }
-                        if active {
-                            // THE marker: a border around the selected synth.
-                            let rect = resp.rect.expand(2.0);
-                            ui.painter().rect(
-                                rect,
-                                4.0,
-                                Color32::TRANSPARENT,
-                                egui::Stroke::new(1.6, Color32::from_rgb(120, 190, 255)),
-                                egui::StrokeKind::Middle,
-                            );
-                        }
-                    }
-                    if n_rows <= 2 {
-                        ui.label(
-                            RichText::new(if scanning {
-                                "scanning plugin folders\u{2026}"
-                            } else {
-                                "(only script synths found \u{2014} drop a VST instrument into \
+            if n_rows <= 2 {
+                ui.label(
+                    RichText::new(if scanning {
+                        "scanning plugin folders\u{2026}"
+                    } else {
+                        "(only script synths found \u{2014} drop a VST instrument into \
                                  one of the folders below and press Rescan Plugins)"
-                            })
-                            .weak()
-                            .small(),
-                        );
-                    }
-                    if let Some(stem) = pick {
-                        // set_track_synth_stem auto-opens the plugin's GUI
-                        // (v0.10 standard) and persists the binding.
-                        app.set_track_synth_stem(t, &stem);
-                    }
-                });
-            ui.label(
-                RichText::new(
-                    "[rust] native synth script (compiled Rust, in the script folder) \u{2014} \
-                     [vst2] / [vst3] plugin instrument (a `.so` in a plugin folder). A border \
-                     marks the synth this track is playing.",
-                )
-                .weak()
-                .small(),
-            );
-            ui.separator();
-
-            // --- where synthesizers live ----------------------------------
-            ui.label(RichText::new("Synth script folder (native Rust):").strong());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(app.synth_registry.dir().display().to_string())
-                        .monospace()
-                        .small(),
-                );
-                if ui
-                    .small_button("Rescan scripts")
-                    .on_hover_text("Re-scan and re-compile the synth script folder")
-                    .clicked()
-                {
-                    app.synth_registry.rescan();
-                    app.status = "synths re-scanned".into();
-                }
-            });
-            if !fx::rustc_available() {
-                ui.label(
-                    RichText::new(
-                        "rustc is not on PATH \u{2014} synth scripts cannot compile. Install \
-                         Rust (rustup).",
-                    )
-                    .color(Color32::YELLOW),
-                );
-            }
-            ui.label(RichText::new("Plugin folders:").strong());
-            for d in crate::vsthost::default_vst_dirs() {
-                ui.label(
-                    RichText::new(d.display().to_string())
-                        .monospace()
-                        .small()
-                        .weak(),
-                );
-            }
-            for d in &app.vst_dirs {
-                ui.label(
-                    RichText::new(d.as_str())
-                        .monospace()
-                        .small()
-                        .weak(),
-                );
-            }
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Rescan Plugins")
-                    .on_hover_text("Scan the folders above for new plugins")
-                    .clicked()
-                {
-                    app.vst_rescan();
-                }
-                ui.label(
-                    RichText::new(
-                        "add your own folders to the list in the MIXER CHAIN window",
-                    )
+                    })
                     .weak()
                     .small(),
                 );
-            });
-            if !app.vst_note.is_empty() {
-                ui.label(RichText::new(&app.vst_note).weak().small());
             }
+            if let Some(stem) = pick {
+                // set_track_synth_stem auto-opens the plugin's GUI
+                // (v0.10 standard) and persists the binding.
+                app.set_track_synth_stem(t, &stem);
+            }
+        });
+    ui.label(
+        RichText::new(
+            "[rust] native synth script (compiled Rust, in the script folder) \u{2014} \
+                     [vst2] / [vst3] plugin instrument (a `.so` in a plugin folder). A border \
+                     marks the synth this track is playing.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.separator();
+
+    // --- where synthesizers live ----------------------------------
+    ui.label(RichText::new("Synth script folder (native Rust):").strong());
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(app.synth_registry.dir().display().to_string())
+                .monospace()
+                .small(),
+        );
+        if ui
+            .small_button("Rescan scripts")
+            .on_hover_text("Re-scan and re-compile the synth script folder")
+            .clicked()
+        {
+            app.synth_registry.rescan();
+            app.status = "synths re-scanned".into();
+        }
+    });
+    if !fx::rustc_available() {
+        ui.label(
+            RichText::new(
+                "rustc is not on PATH \u{2014} synth scripts cannot compile. Install \
+                         Rust (rustup).",
+            )
+            .color(Color32::YELLOW),
+        );
+    }
+    ui.label(RichText::new("Plugin folders:").strong());
+    for d in crate::vsthost::default_vst_dirs() {
+        ui.label(
+            RichText::new(d.display().to_string())
+                .monospace()
+                .small()
+                .weak(),
+        );
+    }
+    for d in &app.vst_dirs {
+        ui.label(RichText::new(d.as_str()).monospace().small().weak());
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .button("Rescan Plugins")
+            .on_hover_text("Scan the folders above for new plugins")
+            .clicked()
+        {
+            app.vst_rescan();
+        }
+        ui.label(
+            RichText::new("add your own folders to the list in the MIXER CHAIN window")
+                .weak()
+                .small(),
+        );
+    });
+    if !app.vst_note.is_empty() {
+        ui.label(RichText::new(&app.vst_note).weak().small());
+    }
 }
 
 /// The toolbar row above the timeline: quantize / snap controls, asset
@@ -15670,14 +15813,14 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
         ui.label("zoom");
         // Logarithmic so the default (160 px/s) sits near the centre of the
         // 3..2400 range: max-out shows ~100 bars, max-in edits samples.
-        if ui
+        let before_z = app.px_per_sec;
+        let rz = ui
             .add(
                 Slider::new(&mut app.px_per_sec, ZOOM_MIN..=ZOOM_MAX)
                     .logarithmic(true)
                     .show_value(false),
-            )
-            .changed()
-        {}
+            );
+        let _ = p_changed(&rz, before_z, &mut app.px_per_sec);
     });
 }
 
@@ -15795,6 +15938,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
         // with TextWrapMode::Extend, so an unbounded slider reports an
         // enormous desired width; in the now-narrow WRAPPED strip row (side
         // windows dock by default) the tail widgets vanished entirely.
+        let before_g = db;
         let r = ui.add_sized(
             [135.0, 16.0],
             Slider::new(&mut db, -60.0..=12.0)
@@ -15802,7 +15946,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 .step_by(0.5)
                 .trailing_fill(true),
         );
-        if r.changed() {
+        if p_changed(&r, before_g, &mut db) {
             if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                 cl.gain = 10f32.powf(db / 20.0);
             }
@@ -15815,6 +15959,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
             ("fade out", cl.fade_out, false),
         ] {
             let mut ms = cur as f64 * 1000.0 / sr;
+            let before_f = ms;
             let r = ui.add_sized(
                 [130.0, 16.0],
                 Slider::new(&mut ms, 0.0..=5000.0)
@@ -15822,7 +15967,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                     .step_by(5.0)
                     .trailing_fill(true),
             );
-            if r.changed() {
+            if p_changed(&r, before_f, &mut ms) {
                 if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                     let samples = (ms * sr / 1000.0) as u64;
                     if is_in {
@@ -15888,7 +16033,11 @@ fn auto_map_y(app: &App, c: &Clip, v: f32, rect: egui::Rect) -> f32 {
     let (mn, mx) = app
         .assets
         .get(c.asset as usize)
-        .and_then(|a| a.automation.as_ref().map(|a| crate::automation::target_range(&a.target)))
+        .and_then(|a| {
+            a.automation
+                .as_ref()
+                .map(|a| crate::automation::target_range(&a.target))
+        })
         .unwrap_or((0.0, 1.0));
     let f = ((v - mn) / (mx - mn).max(1e-9)).clamp(0.0, 1.0);
     rect.max.y - 3.0 - f * (rect.height() - 6.0).max(1.0)
@@ -15921,7 +16070,11 @@ fn auto_val_at_y(app: &App, c: &Clip, y: f32, rect: egui::Rect) -> f32 {
     let (mn, mx) = app
         .assets
         .get(c.asset as usize)
-        .and_then(|a| a.automation.as_ref().map(|a| crate::automation::target_range(&a.target)))
+        .and_then(|a| {
+            a.automation
+                .as_ref()
+                .map(|a| crate::automation::target_range(&a.target))
+        })
         .unwrap_or((0.0, 1.0));
     let f = ((rect.max.y - 3.0 - y) / (rect.height() - 6.0).max(1.0)).clamp(0.0, 1.0);
     mn + f * (mx - mn)
@@ -16060,9 +16213,17 @@ fn skip_button(ui: &mut egui::Ui, to_start: bool) -> egui::Response {
         0.5,
         fg,
     );
-    let tx = if to_start { r.min.x + 8.0 } else { r.max.x - 8.0 };
+    let tx = if to_start {
+        r.min.x + 8.0
+    } else {
+        r.max.x - 8.0
+    };
     p.add(egui::Shape::convex_polygon(
-        vec![egui::pos2(tx, c - 5.0), egui::pos2(tx, c + 5.0), egui::pos2(tip, c)],
+        vec![
+            egui::pos2(tx, c - 5.0),
+            egui::pos2(tx, c + 5.0),
+            egui::pos2(tip, c),
+        ],
         fg,
         egui::Stroke::NONE,
     ));
@@ -16165,7 +16326,7 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                 app.drag_loop_handle = None;
                 app.save_config();
             }
-        } else if (resp.dragged() || resp.clicked()) && in_rect {
+        } else if (resp.dragged_by(egui::PointerButton::Primary) || resp.clicked()) && in_rect {
             let pos = s_at(x0, pt.x, sr, px);
             app.backend.cmd(Cmd::Seek { pos });
         }
@@ -16174,7 +16335,10 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
     // where dragging an endpoint is what will happen; a pointing hand over
     // the clickable ruler body.
     if resp.hovered() {
-        let cur = ui.ctx().input(|i| i.pointer.hover_pos()).unwrap_or_default();
+        let cur = ui
+            .ctx()
+            .input(|i| i.pointer.hover_pos())
+            .unwrap_or_default();
         ui.ctx().set_cursor_icon(if handle_zone(cur.x).is_some() {
             egui::CursorIcon::ResizeHorizontal
         } else {
@@ -16420,8 +16584,7 @@ fn lane_row(
         // hatch in front, the waveform anchored where the AUDIO starts
         // (never stretched to fill the padded rect).
         let ax0 = x_of(x0, c.data_start(), sr, px).max(cres.min.x);
-        let cres_audio =
-            egui::Rect::from_min_max(egui::pos2(ax0, cres.min.y), cres.max);
+        let cres_audio = egui::Rect::from_min_max(egui::pos2(ax0, cres.min.y), cres.max);
         if ax0 > cres.min.x + 0.5 {
             ui.painter().rect_filled(
                 egui::Rect::from_min_max(cres.min, egui::pos2(ax0, cres.max.y)),
@@ -16488,7 +16651,10 @@ fn lane_row(
         if sel && (trimmed_left || trimmed_right || extended) {
             for bx in [
                 (dend, true),
-                (x_of(x0, c.data_start().saturating_sub(c.cut), sr, px), false),
+                (
+                    x_of(x0, c.data_start().saturating_sub(c.cut), sr, px),
+                    false,
+                ),
             ] {
                 let (x, right_of_clip) = bx;
                 if x < rect.min.x - 30.0 || x > rect.max.x + 30.0 {
@@ -16624,8 +16790,8 @@ fn lane_row(
     // Drop-target outline: while an asset rides an in-app drag or an OS
     // file drop is in flight, the strip under the pointer lights up so
     // the release target is unmistakable.
-    let drop_in_flight = !app.os_drops.is_empty()
-        || egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
+    let drop_in_flight =
+        !app.os_drops.is_empty() || egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
     if drop_in_flight && hover_pt.is_some_and(|p| rect.contains(p)) {
         ui.painter().rect_stroke(
             rect.shrink(1.0),
@@ -16691,12 +16857,7 @@ fn lane_row(
                         .map(|l| l.clips.len().saturating_sub(1))
                         .unwrap_or(0);
                     placed.push((t, lane, li));
-                    names.push(
-                        app.assets
-                            .get(ai)
-                            .map(|a| a.name.clone())
-                            .unwrap_or(shown),
-                    );
+                    names.push(app.assets.get(ai).map(|a| a.name.clone()).unwrap_or(shown));
                 }
                 if !placed.is_empty() {
                     app.sel_clips = placed;
@@ -16807,7 +16968,9 @@ fn lane_row(
                     .iter()
                     .enumerate()
                     .filter(|(_, (c, _))| {
-                        app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto())
+                        app.assets
+                            .get(c.asset as usize)
+                            .is_some_and(|a| a.is_auto())
                     })
                     .find_map(|(ci, (c, _))| {
                         let alen0 = app.asset_len(c.asset);
@@ -16855,47 +17018,47 @@ fn lane_row(
                         Some(ci) => {
                             let id = (t, k, ci);
                             {
-                            if mods.command {
-                                app.select_toggle(id);
-                            } else if mods.shift && app.sel_anchor.is_some() {
-                                // Shift+press: the run from the anchor clip
-                                // to this one, inclusive — v34 R18: across
-                                // the track's child lanes too, not just the
-                                // clicked lane.
-                                let ids = app.lane_run_ids(t, id);
-                                app.select_range(ids);
-                            } else if !app.is_sel(id) {
-                                app.select_one(id);
-                            }
-                            // Group drag: remember every selected clip and
-                            // its position; the group moves by the snapped
-                            // delta of this strip's pointer.
-                            let mut ids = app.sel_clips.clone();
-                            ids.sort();
-                            let items: Vec<(usize, usize, usize, u64)> = ids
-                                .iter()
-                                .filter_map(|(tt, kk, cc)| {
-                                    let p = app.arr.tracks[*tt].lanes[*kk]
-                                        .clips
-                                        .get(*cc)
-                                        .map(|c| c.pos)?;
-                                    Some((*tt, *kk, *cc, p))
-                                })
-                                .collect();
-                            if !items.is_empty() {
-                                let base0 = items.iter().map(|x| x.3).min().unwrap_or(0);
-                                let lane0 = if items.len() == 1 {
-                                    Some(items[0].1)
-                                } else {
-                                    None
-                                };
-                                app.drag_clip = Some(ClipDrag {
-                                    items,
-                                    base0,
-                                    grab: base0.saturating_sub(pos),
-                                    lane0,
-                                });
-                            }
+                                if mods.command {
+                                    app.select_toggle(id);
+                                } else if mods.shift && app.sel_anchor.is_some() {
+                                    // Shift+press: the run from the anchor clip
+                                    // to this one, inclusive — v34 R18: across
+                                    // the track's child lanes too, not just the
+                                    // clicked lane.
+                                    let ids = app.lane_run_ids(t, id);
+                                    app.select_range(ids);
+                                } else if !app.is_sel(id) {
+                                    app.select_one(id);
+                                }
+                                // Group drag: remember every selected clip and
+                                // its position; the group moves by the snapped
+                                // delta of this strip's pointer.
+                                let mut ids = app.sel_clips.clone();
+                                ids.sort();
+                                let items: Vec<(usize, usize, usize, u64)> = ids
+                                    .iter()
+                                    .filter_map(|(tt, kk, cc)| {
+                                        let p = app.arr.tracks[*tt].lanes[*kk]
+                                            .clips
+                                            .get(*cc)
+                                            .map(|c| c.pos)?;
+                                        Some((*tt, *kk, *cc, p))
+                                    })
+                                    .collect();
+                                if !items.is_empty() {
+                                    let base0 = items.iter().map(|x| x.3).min().unwrap_or(0);
+                                    let lane0 = if items.len() == 1 {
+                                        Some(items[0].1)
+                                    } else {
+                                        None
+                                    };
+                                    app.drag_clip = Some(ClipDrag {
+                                        items,
+                                        base0,
+                                        grab: base0.saturating_sub(pos),
+                                        lane0,
+                                    });
+                                }
                             }
                         }
                         None => {
@@ -16999,7 +17162,8 @@ fn lane_row(
                         } else {
                             audio0.saturating_sub(r.cut0)
                         };
-                        if (cand as i64 - (audio0 - r.cut0) as i64).abs() <= (unit / 2).max(1) as i64
+                        if (cand as i64 - (audio0 - r.cut0) as i64).abs()
+                            <= (unit / 2).max(1) as i64
                         {
                             cand = audio0.saturating_sub(r.cut0);
                         }
@@ -17108,10 +17272,7 @@ fn lane_row(
                     let lh = rect.height();
                     let track_rect = egui::Rect::from_min_max(
                         egui::pos2(rect.min.x, rect.min.y - (k as f32) * lh),
-                        egui::pos2(
-                            rect.max.x,
-                            rect.max.y + ((lanes - 1 - k) as f32) * lh,
-                        ),
+                        egui::pos2(rect.max.x, rect.max.y + ((lanes - 1 - k) as f32) * lh),
                     );
                     let target_t = app.track_at_y(t, &track_rect, pt.y);
                     if target_t != tt {
@@ -17193,7 +17354,11 @@ fn lane_row(
             for (ci, (c, _)) in clips.iter().enumerate() {
                 let _ = ci;
                 let alen = app.asset_len(c.asset);
-                if !app.assets.get(c.asset as usize).is_some_and(|a| a.is_auto()) {
+                if !app
+                    .assets
+                    .get(c.asset as usize)
+                    .is_some_and(|a| a.is_auto())
+                {
                     continue;
                 }
                 let cres = egui::Rect::from_min_max(
@@ -17275,23 +17440,26 @@ fn lane_row(
     if resp.secondary_clicked() {
         // The PRESS point (not where the pointer sits at release): this is
         // the spot the menu content must stay anchored to.
-        let press = ui.ctx().input(|i| {
-            i.events.iter().rev().find_map(|e| match e {
-                egui::Event::PointerButton {
-                    button: egui::PointerButton::Secondary,
-                    pressed: true,
-                    pos,
-                    ..
-                } => Some(*pos),
-                _ => None,
+        let press = ui
+            .ctx()
+            .input(|i| {
+                i.events.iter().rev().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        pos,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
             })
-        })
-        .or_else(|| resp.interact_pointer_pos());
+            .or_else(|| resp.interact_pointer_pos());
         if let Some(pp) = press {
             app.grid_menu_anchor = Some(((t, k), pp));
         }
     } else if !resp.context_menu_opened()
-        && app.grid_menu_anchor
+        && app
+            .grid_menu_anchor
             .as_ref()
             .is_some_and(|((tt, kk), _)| *tt == t && *kk == k)
     {
@@ -17385,8 +17553,7 @@ fn grid_context_menu(
                             } else {
                                 format!("child {}", lane)
                             };
-                            if ui.button(format!("lane {} ({})", lane + 1, name)).clicked()
-                            {
+                            if ui.button(format!("lane {} ({})", lane + 1, name)).clicked() {
                                 dest = Some((tt, Some(lane)));
                                 ui.close();
                             }
@@ -17758,6 +17925,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         // (the "mixer sliders fixed in place" report). The RMB and
         // double-click gestures ride `slider_click_gestures` inside
         // `bind_value_controls` instead.
+        let before = v;
         let mut r = ui
             .add_sized(
                 egui::vec2(sw, 18.0),
@@ -17794,7 +17962,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
             )
             .selectable(false),
         );
-        if r.changed() {
+        if p_changed(&r, before, &mut v) {
             // v35 R1: dragging THIS fader owns the control this frame —
             // the engine-mirror must not fight the pointer.
             app.fader_live = Some((i, kind));
@@ -17830,20 +17998,8 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                 // creates the asset directly, exactly like vol/pan (the
                 // Set-value-only menu stayed because the engine could not
                 // evaluate the target; double-click still opens Set value).
-                bind_value_controls(
-                    &mut r,
-                    app,
-                    Some(i),
-                    TARGET_PSEUDO_GAIN,
-                    gain_amp(midi),
-                );
-                bind_value_controls(
-                    &mut vr,
-                    app,
-                    Some(i),
-                    TARGET_PSEUDO_GAIN,
-                    gain_amp(midi),
-                );
+                bind_value_controls(&mut r, app, Some(i), TARGET_PSEUDO_GAIN, gain_amp(midi));
+                bind_value_controls(&mut vr, app, Some(i), TARGET_PSEUDO_GAIN, gain_amp(midi));
             }
             _ => {
                 bind_value_controls(
@@ -18379,14 +18535,18 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     }
     let dragging = app.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
     let mut open = true;
-    let mut w = egui::Window::new(RichText::new(format!("MIXER CHAIN — track {}", loop_i + 1)).strong())
-        .id(egui::Id::new(("dynwin-chain", loop_i)))
-        .open(&mut open)
-        .min_width(240.0)
-        .min_height(120.0)
-        .default_height(480.0);
+    let mut w =
+        egui::Window::new(RichText::new(format!("MIXER CHAIN — track {}", loop_i + 1)).strong())
+            .id(egui::Id::new(("dynwin-chain", loop_i)))
+            .open(&mut open)
+            .min_width(240.0)
+            .min_height(120.0)
+            .default_height(480.0);
     if let Some(r) = app.dyn_rect(idx) {
-        w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        w = w
+            .default_pos([r[0], r[1]])
+            .default_width(r[2])
+            .default_height(r[3]);
     }
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
@@ -18403,337 +18563,357 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
 /// v35 R5: MIXER CHAIN body — ONE body shared by the floating window and
 /// the docked panel, so the two can never drift apart.
 fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
-            // --- chain (audio order, top first) ---------------------------
-            ui.label(RichText::new("Chain (top = first):").strong());
-            let mut act: Option<(u8, usize)> = None; // 0 open, 1 up, 2 down, 3 remove
-            let rows = app.fx_rows[loop_i].clone();
-            egui::ScrollArea::vertical()
-                .max_height(210.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for (k, row) in rows.iter().enumerate() {
-                        let (tag, label, ok) = match row {
-                            ChainRow::Script { stem, .. } => {
-                                let d = app.fx_registry.desc(stem);
-                                (
-                                    if d.map(|d| d.sidechain).unwrap_or(false) { "fx:sc" } else { "fx" },
-                                    d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
-                                    d.is_some(),
-                                )
-                            }
-                            ChainRow::Vst { kind, name, entry, .. } => {
-                                (kind.tag(), name.clone(), entry.is_some())
-                            }
-                        };
-                        ui.horizontal(|ui| {
-                            ui.monospace(format!("[{tag}]"));
-                            let txt = if ok {
-                                RichText::new(&label).strong()
+    // --- chain (audio order, top first) ---------------------------
+    ui.label(RichText::new("Chain (top = first):").strong());
+    let mut act: Option<(u8, usize)> = None; // 0 open, 1 up, 2 down, 3 remove
+    let rows = app.fx_rows[loop_i].clone();
+    egui::ScrollArea::vertical()
+        .max_height(210.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (k, row) in rows.iter().enumerate() {
+                let (tag, label, ok) = match row {
+                    ChainRow::Script { stem, .. } => {
+                        let d = app.fx_registry.desc(stem);
+                        (
+                            if d.map(|d| d.sidechain).unwrap_or(false) {
+                                "fx:sc"
                             } else {
-                                RichText::new(&label).weak()
-                            };
-                            // v25: a row whose script/plugin never loaded is
-                            // NOT clickable — its click used to do nothing
-                            // while the button still looked live. It now
-                            // paints dimmed and explains itself on hover.
-                            let resp = ui.add_enabled(
-                                ok,
-                                egui::Button::new(txt).frame(false),
-                            );
-                            let resp = resp.on_hover_text(if ok {
-                                "click to open controls"
-                            } else {
-                                "not loaded — fix the folder or rescan below"
-                            });
-                            if resp.clicked() {
-                                act = Some((0, k));
-                            }
-                            if matches!(row, ChainRow::Vst { entry: None, open_rx: Some(_), .. }) {
-                                // v16: loading on the plugin thread — the
-                                // UI stayed live; the entry lands via
-                                // `poll_vst_opens` and repaints.
-                                ui.label(
-                                    RichText::new("loading…").weak().small(),
-                                );
-                            } else if matches!(row, ChainRow::Vst { entry: None, .. }) {
-                                ui.label(
-                                    RichText::new("× not loaded (Rescan Plugins below)")
-                                        .color(Color32::from_rgb(220, 120, 120))
-                                        .small(),
-                                );
-                            } else if !ok {
-                                ui.label(
-                                    RichText::new("× script missing (Rescan effects below)")
-                                        .color(Color32::from_rgb(220, 120, 120))
-                                        .small(),
-                                );
-                            } else {
-                                ui.label(
-                                    RichText::new("click to open controls")
-                                        .weak()
-                                        .small(),
-                                );
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("×").on_hover_text("Remove from chain").clicked()
-                                {
-                                    act = Some((3, k));
-                                }
-                                if arrow_button(ui, false).clicked() {
-                                    act = Some((2, k));
-                                }
-                                if arrow_button(ui, true).clicked() {
-                                    act = Some((1, k));
-                                }
-                            });
-                        });
+                                "fx"
+                            },
+                            d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
+                            d.is_some(),
+                        )
                     }
-                    if rows.is_empty() {
+                    ChainRow::Vst {
+                        kind, name, entry, ..
+                    } => (kind.tag(), name.clone(), entry.is_some()),
+                };
+                ui.horizontal(|ui| {
+                    ui.monospace(format!("[{tag}]"));
+                    let txt = if ok {
+                        RichText::new(&label).strong()
+                    } else {
+                        RichText::new(&label).weak()
+                    };
+                    // v25: a row whose script/plugin never loaded is
+                    // NOT clickable — its click used to do nothing
+                    // while the button still looked live. It now
+                    // paints dimmed and explains itself on hover.
+                    let resp = ui.add_enabled(ok, egui::Button::new(txt).frame(false));
+                    let resp = resp.on_hover_text(if ok {
+                        "click to open controls"
+                    } else {
+                        "not loaded — fix the folder or rescan below"
+                    });
+                    if resp.clicked() {
+                        act = Some((0, k));
+                    }
+                    if matches!(
+                        row,
+                        ChainRow::Vst {
+                            entry: None,
+                            open_rx: Some(_),
+                            ..
+                        }
+                    ) {
+                        // v16: loading on the plugin thread — the
+                        // UI stayed live; the entry lands via
+                        // `poll_vst_opens` and repaints.
+                        ui.label(RichText::new("loading…").weak().small());
+                    } else if matches!(row, ChainRow::Vst { entry: None, .. }) {
                         ui.label(
-                            RichText::new("(chain empty — add an effect or a plugin below)")
-                                .weak()
+                            RichText::new("× not loaded (Rescan Plugins below)")
+                                .color(Color32::from_rgb(220, 120, 120))
                                 .small(),
                         );
-                    }
-                });
-            match act {
-                Some((0, k)) => match &app.fx_rows[loop_i][k] {
-                    ChainRow::Script { .. } => app.open_fx_editor(loop_i, k),
-                    ChainRow::Vst { entry: Some(_), .. } => {
-                        // v0.10: open the plugin's own window; sliders only
-                        // as the no-editor fallback (inside vst_row_gui).
-                        app.vst_row_gui(loop_i, k);
-                    }
-                    ChainRow::Vst { .. } => {}
-                },
-                Some((1, k)) => app.move_fx_row(loop_i, k, -1),
-                Some((2, k)) => app.move_fx_row(loop_i, k, 1),
-                Some((3, k)) => app.remove_fx_row(loop_i, k),
-                _ => {}
-            }
-            ui.separator();
-
-            // --- sidechain in (v32 R5) ------------------------------------
-            // Which tracks key THIS track's scripted effects. The engine
-            // consumes the mask from the next audio block; saving follows
-            // the same idle-flush as chain edits.
-            ui.label(
-                RichText::new("Sidechain in — tracks whose audio keys this chain:")
-                    .strong()
-                    .small(),
-            );
-            ui.horizontal_wrapped(|ui| {
-                let m = app.sc_send[loop_i];
-                for s in 0..MAX_LOOPS {
-                    let bit = 1u128 << s;
-                    let self_bit = s == loop_i;
-                    let on = m & bit != 0;
-                    let lbl = format!("{}", s + 1);
-                    let resp = if on {
-                        ui.button(format!("[{lbl}]")).on_hover_text(if self_bit {
-                            "a track cannot key itself"
-                        } else {
-                            "sidechain source — click to remove"
-                        })
+                    } else if !ok {
+                        ui.label(
+                            RichText::new("× script missing (Rescan effects below)")
+                                .color(Color32::from_rgb(220, 120, 120))
+                                .small(),
+                        );
                     } else {
-                        ui.button(&lbl).on_hover_text(if self_bit {
-                            "a track cannot key itself"
-                        } else {
-                            "click to route this track as a sidechain source"
-                        })
-                    };
-                    if resp.clicked() && !self_bit {
-                        let v = (app.sc_send[loop_i] ^ bit) & !(1u128 << loop_i);
-                        app.sc_send[loop_i] = v;
-                        app.backend.engine.set_sc_send(loop_i, v);
-                        app.fx_save_pending = true;
+                        ui.label(RichText::new("click to open controls").weak().small());
                     }
-                }
-                if m != 0 && ui.small_button("none").clicked() {
-                    app.sc_send[loop_i] = 0;
-                    app.backend.engine.set_sc_send(loop_i, 0);
-                    app.fx_save_pending = true;
-                }
-                if m != 0 {
-                    let names: Vec<usize> = (0..MAX_LOOPS)
-                        .filter(|s| m & (1u128 << s) != 0)
-                        .map(|s| s + 1)
-                        .collect();
-                    ui.label(RichText::new(format!("keyed by {names:?}")).weak().small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Remove from chain")
+                            .clicked()
+                        {
+                            act = Some((3, k));
+                        }
+                        if arrow_button(ui, false).clicked() {
+                            act = Some((2, k));
+                        }
+                        if arrow_button(ui, true).clicked() {
+                            act = Some((1, k));
+                        }
+                    });
+                });
+            }
+            if rows.is_empty() {
+                ui.label(
+                    RichText::new("(chain empty — add an effect or a plugin below)")
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+    match act {
+        Some((0, k)) => match &app.fx_rows[loop_i][k] {
+            ChainRow::Script { .. } => app.open_fx_editor(loop_i, k),
+            ChainRow::Vst { entry: Some(_), .. } => {
+                // v0.10: open the plugin's own window; sliders only
+                // as the no-editor fallback (inside vst_row_gui).
+                app.vst_row_gui(loop_i, k);
+            }
+            ChainRow::Vst { .. } => {}
+        },
+        Some((1, k)) => app.move_fx_row(loop_i, k, -1),
+        Some((2, k)) => app.move_fx_row(loop_i, k, 1),
+        Some((3, k)) => app.remove_fx_row(loop_i, k),
+        _ => {}
+    }
+    ui.separator();
+
+    // --- sidechain in (v32 R5) ------------------------------------
+    // Which tracks key THIS track's scripted effects. The engine
+    // consumes the mask from the next audio block; saving follows
+    // the same idle-flush as chain edits.
+    ui.label(
+        RichText::new("Sidechain in — tracks whose audio keys this chain:")
+            .strong()
+            .small(),
+    );
+    ui.horizontal_wrapped(|ui| {
+        let m = app.sc_send[loop_i];
+        for s in 0..MAX_LOOPS {
+            let bit = 1u128 << s;
+            let self_bit = s == loop_i;
+            let on = m & bit != 0;
+            let lbl = format!("{}", s + 1);
+            let resp = if on {
+                ui.button(format!("[{lbl}]")).on_hover_text(if self_bit {
+                    "a track cannot key itself"
+                } else {
+                    "sidechain source — click to remove"
+                })
+            } else {
+                ui.button(&lbl).on_hover_text(if self_bit {
+                    "a track cannot key itself"
+                } else {
+                    "click to route this track as a sidechain source"
+                })
+            };
+            if resp.clicked() && !self_bit {
+                let v = (app.sc_send[loop_i] ^ bit) & !(1u128 << loop_i);
+                app.sc_send[loop_i] = v;
+                app.backend.engine.set_sc_send(loop_i, v);
+                app.fx_save_pending = true;
+            }
+        }
+        if m != 0 && ui.small_button("none").clicked() {
+            app.sc_send[loop_i] = 0;
+            app.backend.engine.set_sc_send(loop_i, 0);
+            app.fx_save_pending = true;
+        }
+        if m != 0 {
+            let names: Vec<usize> = (0..MAX_LOOPS)
+                .filter(|s| m & (1u128 << s) != 0)
+                .map(|s| s + 1)
+                .collect();
+            ui.label(RichText::new(format!("keyed by {names:?}")).weak().small());
+        }
+    });
+    ui.separator();
+
+    // --- add ------------------------------------------------------
+    ui.horizontal(|ui| {
+        let stems = app.fx_registry.stems();
+        egui::ComboBox::from_id_salt(("addfx", loop_i))
+            .selected_text("+ effect")
+            .show_ui(ui, |ui| {
+                for s in &stems {
+                    let name = app
+                        .fx_registry
+                        .desc(s)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| s.clone());
+                    if ui
+                        .selectable_label(false, format!("{name}  ({s})"))
+                        .clicked()
+                    {
+                        app.add_fx_script(loop_i, s);
+                    }
                 }
             });
-            ui.separator();
-
-            // --- add ------------------------------------------------------
-            ui.horizontal(|ui| {
-                let stems = app.fx_registry.stems();
-                egui::ComboBox::from_id_salt(("addfx", loop_i))
-                    .selected_text("+ effect")
-                    .show_ui(ui, |ui| {
-                        for s in &stems {
-                            let name = app
-                                .fx_registry
-                                .desc(s)
-                                .map(|d| d.name.clone())
-                                .unwrap_or_else(|| s.clone());
-                            if ui.selectable_label(false, format!("{name}  ({s})")).clicked() {
-                                app.add_fx_script(loop_i, s);
+        egui::ComboBox::from_id_salt(("addvst", loop_i))
+            .selected_text("+ VST plugin")
+            .width(320.0)
+            .show_ui(ui, |ui| {
+                if app.vst_scan.is_empty() {
+                    ui.label(
+                        RichText::new(if app.vst_scan_rx.is_some() {
+                            "scanning plugin folders\u{2026}"
+                        } else {
+                            "no plugins found \u{2014} add the folder your plugins live \
+                                     in (drag-and-drop installs included) and press \
+                                     Rescan Plugins below"
+                        })
+                        .weak()
+                        .small(),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for e in app.vst_scan.clone() {
+                            if e.error.is_some() {
+                                continue;
+                            }
+                            // v0.19: an instrument is NOT an effect.
+                            // Synths never belong in the mixer
+                            // chain — they are bound through the
+                            // track header's synth (♪) picker.
+                            if e.instrument {
+                                continue;
+                            }
+                            let label =
+                                format!("[{}] {} \u{2014} {}", e.kind.tag(), e.name, e.vendor);
+                            if ui
+                                .selectable_label(false, &label)
+                                .on_hover_text("Effect plugin for this track's chain")
+                                .clicked()
+                            {
+                                app.add_fx_plugin(loop_i, &e);
                             }
                         }
                     });
-                egui::ComboBox::from_id_salt(("addvst", loop_i))
-                    .selected_text("+ VST plugin")
-                    .width(320.0)
-                    .show_ui(ui, |ui| {
-                        if app.vst_scan.is_empty() {
-                            ui.label(
-                                RichText::new(if app.vst_scan_rx.is_some() {
-                                    "scanning plugin folders\u{2026}"
-                                } else {
-                                    "no plugins found \u{2014} add the folder your plugins live \
-                                     in (drag-and-drop installs included) and press \
-                                     Rescan Plugins below"
-                                })
-                                .weak()
-                                .small(),
-                            );
-                        }
-                        egui::ScrollArea::vertical()
-                            .max_height(240.0)
-                            .show(ui, |ui| {
-                                for e in app.vst_scan.clone() {
-                                    if e.error.is_some() {
-                                        continue;
-                                    }
-                                    // v0.19: an instrument is NOT an effect.
-                                    // Synths never belong in the mixer
-                                    // chain — they are bound through the
-                                    // track header's synth (♪) picker.
-                                    if e.instrument {
-                                        continue;
-                                    }
-                                    let label =
-                                        format!("[{}] {} \u{2014} {}", e.kind.tag(), e.name, e.vendor);
-                                    if ui
-                                        .selectable_label(false, &label)
-                                        .on_hover_text("Effect plugin for this track's chain")
-                                        .clicked()
-                                    {
-                                        app.add_fx_plugin(loop_i, &e);
-                                    }
-                                }
-                            });
-                    });
             });
-            ui.separator();
+    });
+    ui.separator();
 
-            // --- effects script folder ------------------------------------
-            ui.label("Effects folder (Rust scripts):");
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
-                if ui.button("Browse…").clicked() {
-                    let mut dlg = rfd::FileDialog::new().set_title("Effects folder");
-                    if let Some(d) = app.pick_dir("effects") {
-                        dlg = dlg.set_directory(d);
-                    }
-                    if let Some(p) = dlg.pick_folder() {
-                        app.note_dir("effects", &p);
-                        app.fx_dir_edit = p.to_string_lossy().into_owned();
-                        app.apply_fx_dir();
-                    }
-                }
-                if ui.button("Apply").clicked() {
-                    app.apply_fx_dir();
-                }
-                if ui.button("Rescan").clicked() {
-                    app.rescan_fx();
-                }
-                if ui.button("Add template").clicked() {
-                    match app.fx_registry.add_template() {
-                        Ok(stem) => {
-                            app.add_fx_script(loop_i, &stem);
-                            app.fx_note =
-                                format!("created {stem}.rs — added to this track's chain");
-                        }
-                        Err(e) => app.fx_note = e,
-                    }
-                }
-            });
-            if !fx::rustc_available() {
-                ui.label(
-                    RichText::new(
-                        "rustc is not on PATH — effect scripts cannot compile. Install Rust (rustup).",
-                    )
-                    .color(Color32::YELLOW),
-                );
+    // --- effects script folder ------------------------------------
+    ui.label("Effects folder (Rust scripts):");
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
+        if ui.button("Browse…").clicked() {
+            let mut dlg = rfd::FileDialog::new().set_title("Effects folder");
+            if let Some(d) = app.pick_dir("effects") {
+                dlg = dlg.set_directory(d);
             }
-            // Scripts that failed to compile or load: dimmed rows with the
-            // rejection reason, so an effect author can fix the script in
-            // place and Rescan.
-            for it in app.fx_registry.items().iter().filter(|it| it.desc.is_none()) {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&it.stem).weak().monospace());
-                    let t = it.error.clone().unwrap_or_else(|| "invalid".into());
-                    let short: String = t.chars().take(140).collect();
-                    ui.label(
-                        RichText::new(format!("× {}", short.replace('\n', " · ")))
-                            .color(Color32::from_rgb(220, 120, 120))
-                            .small(),
-                    )
-                    .on_hover_text(t);
-                });
+            if let Some(p) = dlg.pick_folder() {
+                app.note_dir("effects", &p);
+                app.fx_dir_edit = p.to_string_lossy().into_owned();
+                app.apply_fx_dir();
             }
-            if !app.fx_note.is_empty() {
-                ui.label(RichText::new(&app.fx_note).weak().small());
-            }
-            ui.separator();
-
-            // --- plugin scan folders ---------------------------------------
-            ui.label("Plugin folders:");
-            if app.vst_dirs.is_empty() {
-                ui.label(RichText::new("(standard system folders only)").weak().small());
-            }
-            for (i, d) in app.vst_dirs.clone().iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(d).monospace().small());
-                    if ui.small_button("×").on_hover_text("Remove this folder").clicked() {
-                        app.vst_dirs.remove(i);
-                        app.vst_scanned = false;
-                    }
-                });
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Add folder…").clicked() {
-                    let mut dlg = rfd::FileDialog::new().set_title("VST folder");
-                    if let Some(d) = app.pick_dir("vst") {
-                        dlg = dlg.set_directory(d);
-                    }
-                    if let Some(p) = dlg.pick_folder() {
-                        app.note_dir("vst", &p);
-                        let d = p.to_string_lossy().into_owned();
-                        if !app.vst_dirs.contains(&d) {
-                            app.vst_dirs.push(d);
-                            app.vst_scanned = false;
-                        }
-                    }
+        }
+        if ui.button("Apply").clicked() {
+            app.apply_fx_dir();
+        }
+        if ui.button("Rescan").clicked() {
+            app.rescan_fx();
+        }
+        if ui.button("Add template").clicked() {
+            match app.fx_registry.add_template() {
+                Ok(stem) => {
+                    app.add_fx_script(loop_i, &stem);
+                    app.fx_note = format!("created {stem}.rs — added to this track's chain");
                 }
-                if ui.button("Rescan Plugins").clicked() {
-                    app.vst_rescan();
-                }
-            });
-            if !app.vst_note.is_empty() {
-                ui.label(RichText::new(&app.vst_note).weak().small());
+                Err(e) => app.fx_note = e,
             }
-            ui.separator();
+        }
+    });
+    if !fx::rustc_available() {
+        ui.label(
+            RichText::new(
+                "rustc is not on PATH — effect scripts cannot compile. Install Rust (rustup).",
+            )
+            .color(Color32::YELLOW),
+        );
+    }
+    // Scripts that failed to compile or load: dimmed rows with the
+    // rejection reason, so an effect author can fix the script in
+    // place and Rescan.
+    for it in app
+        .fx_registry
+        .items()
+        .iter()
+        .filter(|it| it.desc.is_none())
+    {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&it.stem).weak().monospace());
+            let t = it.error.clone().unwrap_or_else(|| "invalid".into());
+            let short: String = t.chars().take(140).collect();
             ui.label(
-                RichText::new(
-                    "Chain slots run top-down on this track's signal, after gain and volume, \
-                     before pan. Effects scripts and VST2 (`.so`) / VST3 (`.vst3`) plugins mix \
-                     freely in any order; click a slot to open its controls.",
-                )
+                RichText::new(format!("× {}", short.replace('\n', " · ")))
+                    .color(Color32::from_rgb(220, 120, 120))
+                    .small(),
+            )
+            .on_hover_text(t);
+        });
+    }
+    if !app.fx_note.is_empty() {
+        ui.label(RichText::new(&app.fx_note).weak().small());
+    }
+    ui.separator();
+
+    // --- plugin scan folders ---------------------------------------
+    ui.label("Plugin folders:");
+    if app.vst_dirs.is_empty() {
+        ui.label(
+            RichText::new("(standard system folders only)")
                 .weak()
                 .small(),
-            );
+        );
+    }
+    for (i, d) in app.vst_dirs.clone().iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(d).monospace().small());
+            if ui
+                .small_button("×")
+                .on_hover_text("Remove this folder")
+                .clicked()
+            {
+                app.vst_dirs.remove(i);
+                app.vst_scanned = false;
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Add folder…").clicked() {
+            let mut dlg = rfd::FileDialog::new().set_title("VST folder");
+            if let Some(d) = app.pick_dir("vst") {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(p) = dlg.pick_folder() {
+                app.note_dir("vst", &p);
+                let d = p.to_string_lossy().into_owned();
+                if !app.vst_dirs.contains(&d) {
+                    app.vst_dirs.push(d);
+                    app.vst_scanned = false;
+                }
+            }
+        }
+        if ui.button("Rescan Plugins").clicked() {
+            app.vst_rescan();
+        }
+    });
+    if !app.vst_note.is_empty() {
+        ui.label(RichText::new(&app.vst_note).weak().small());
+    }
+    ui.separator();
+    ui.label(
+        RichText::new(
+            "Chain slots run top-down on this track's signal, after gain and volume, \
+                     before pan. Effects scripts and VST2 (`.so`) / VST3 (`.vst3`) plugins mix \
+                     freely in any order; click a slot to open its controls.",
+        )
+        .weak()
+        .small(),
+    );
 }
 
 /// Small ↑/↓ reorder button with a DRAWN arrow. egui's default font stack
@@ -18856,121 +19036,119 @@ fn port_list_lr(
 }
 
 fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
-
-            // v25: ONE honest state line instead of a static paragraph.
-            // It says what the monitor sees RIGHT NOW; the pw-link
-            // instructions moved to its tooltip so the dock stops reading
-            // like a wall of documentation.
-            ui.horizontal(|ui| {
-                let _ = ();
-                let (state, warn) = match (&app.last_midi, app.midi_sources.is_empty()) {
-                    (Some(_), false) => (
-                        format!(
-                            "live — {} message(s) logged from {} source(s)",
-                            app.midi_log.len(),
-                            app.midi_sources.len()
-                        ),
-                        false,
-                    ),
-                    // A genuine wait: something IS linked, nothing has
-                    // arrived yet. Only now may the panel say "waiting".
-                    (None, false) => (
-                        format!(
-                            "waiting — {} source(s) linked, no message yet",
-                            app.midi_sources.len()
-                        ),
-                        false,
-                    ),
-                    // Nothing to wait for: say so plainly instead of
-                    // promising a listen.
-                    (_, true) => (
-                        "no MIDI source linked — nothing is being received".to_string(),
-                        true,
-                    ),
-                };
-                let r = ui.label(
-                    RichText::new(state)
-                        .weak()
-                        .small()
-                        .color(if warn {
-                            Color32::from_rgb(220, 180, 120)
-                        } else {
-                            Color32::from_gray(160)
-                        }),
-                );
-                r.on_hover_text(
-                    "the audio thread reads the JACK port slooper:midi_in and listens on \
+    // v25: ONE honest state line instead of a static paragraph.
+    // It says what the monitor sees RIGHT NOW; the pw-link
+    // instructions moved to its tooltip so the dock stops reading
+    // like a wall of documentation.
+    ui.horizontal(|ui| {
+        let _ = ();
+        let (state, warn) = match (&app.last_midi, app.midi_sources.is_empty()) {
+            (Some(_), false) => (
+                format!(
+                    "live — {} message(s) logged from {} source(s)",
+                    app.midi_log.len(),
+                    app.midi_sources.len()
+                ),
+                false,
+            ),
+            // A genuine wait: something IS linked, nothing has
+            // arrived yet. Only now may the panel say "waiting".
+            (None, false) => (
+                format!(
+                    "waiting — {} source(s) linked, no message yet",
+                    app.midi_sources.len()
+                ),
+                false,
+            ),
+            // Nothing to wait for: say so plainly instead of
+            // promising a listen.
+            (_, true) => (
+                "no MIDI source linked — nothing is being received".to_string(),
+                true,
+            ),
+        };
+        let r = ui.label(RichText::new(state).weak().small().color(if warn {
+            Color32::from_rgb(220, 180, 120)
+        } else {
+            Color32::from_gray(160)
+        }));
+        r.on_hover_text(
+            "the audio thread reads the JACK port slooper:midi_in and listens on \
                      every channel; every remote MIDI port that appears is linked to it \
                      automatically (manually: pw-link 'your-midi-port' 'slooper:midi_in'). \
                      Detected input is also printed to stdout.",
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("Clear")
-                        .on_hover_text("empty the monitor log")
-                        .clicked()
-                    {
-                        app.midi_log.clear();
-                        app.last_midi = None;
-                    }
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Clear")
+                .on_hover_text("empty the monitor log")
+                .clicked()
+            {
+                app.midi_log.clear();
+                app.last_midi = None;
+            }
+        });
+    });
+
+    if let Some(last) = &app.last_midi {
+        ui.add_space(4.0);
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(35, 40, 50))
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("[{}]  last:", last.ts))
+                            .weak()
+                            .monospace(),
+                    );
+                    ui.label(RichText::new(last.type_name).strong().monospace());
+                    ui.label(RichText::new(&last.describe).monospace());
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("| {}", last.raw_hex))
+                            .weak()
+                            .monospace(),
+                    );
                 });
             });
+    }
 
-            if let Some(last) = &app.last_midi {
-                ui.add_space(4.0);
-                egui::Frame::group(ui.style())
-                    .fill(Color32::from_rgb(35, 40, 50))
-                    .inner_margin(6.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("[{}]  last:", last.ts)).weak().monospace());
-                            ui.label(RichText::new(last.type_name).strong().monospace());
-                            ui.label(RichText::new(&last.describe).monospace());
-                            ui.separator();
-                            ui.label(
-                                RichText::new(format!("| {}", last.raw_hex))
-                                    .weak()
-                                    .monospace(),
-                            );
-                        });
-                    });
-            }
+    if !app.midi_sources.is_empty() {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("sources auto-linked to slooper:midi_in")
+                .weak()
+                .small(),
+        );
+        for s in &app.midi_sources {
+            ui.label(RichText::new(format!("  {s}")).weak().small().monospace());
+        }
+    }
 
-            if !app.midi_sources.is_empty() {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("sources auto-linked to slooper:midi_in")
-                        .weak()
-                        .small(),
-                );
-                for s in &app.midi_sources {
-                    ui.label(RichText::new(format!("  {s}")).weak().small().monospace());
-                }
-            }
-
-            egui::ScrollArea::vertical()
-                // v22: `.min_scrolled_height(f32::INFINITY)` (its original
-                // 0.1 idiom) makes egui 0.36.2's scrollbar math debug-assert
-                // ("from.start()/end() should not be equal" — an infinite
-                // remap range), which killed 15 UI harness tests. It was
-                // always redundant: `auto_shrink([false; 2])` below already
-                // pins the area to the full available height.
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    // Newest first (log is push_front).
-                    for line in app.midi_log.iter() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("[{}]", line.ts)).weak().monospace());
-                            ui.label(RichText::new(line.type_name).monospace());
-                            ui.label(RichText::new(&line.describe).weak().monospace());
-                            ui.label(
-                                RichText::new(format!("| {}", line.raw_hex))
-                                    .weak()
-                                    .monospace(),
-                            );
-                        });
-                    }
+    egui::ScrollArea::vertical()
+        // v22: `.min_scrolled_height(f32::INFINITY)` (its original
+        // 0.1 idiom) makes egui 0.36.2's scrollbar math debug-assert
+        // ("from.start()/end() should not be equal" — an infinite
+        // remap range), which killed 15 UI harness tests. It was
+        // always redundant: `auto_shrink([false; 2])` below already
+        // pins the area to the full available height.
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            // Newest first (log is push_front).
+            for line in app.midi_log.iter() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("[{}]", line.ts)).weak().monospace());
+                    ui.label(RichText::new(line.type_name).monospace());
+                    ui.label(RichText::new(&line.describe).weak().monospace());
+                    ui.label(
+                        RichText::new(format!("| {}", line.raw_hex))
+                            .weak()
+                            .monospace(),
+                    );
                 });
+            }
+        });
 }
 
 fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
@@ -18982,8 +19160,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             ui.separator();
             ui.label(RichText::new("GUI").strong());
             ui.horizontal(|ui| {
+                let before = app.gui_scale;
                 let r = ui.add(egui::Slider::new(&mut app.gui_scale, 0.7..=1.6).suffix("×"));
-                if r.changed() {
+                if p_changed(&r, before, &mut app.gui_scale) {
                     app.save_config();
                 }
             });
@@ -18991,12 +19170,13 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             ui.horizontal(|ui| {
                 ui.label("tracks:");
                 let mut n = app.n_tracks as i64;
+                let before = n;
                 let r = ui.add(
                     egui::DragValue::new(&mut n)
                         .range(1..=MAX_LOOPS as i64)
                         .speed(1),
                 );
-                if r.changed() {
+                if p_changed(&r, before, &mut n) {
                     app.n_tracks = n as usize;
                     app.selected = app.selected.min(app.n_tracks - 1);
                     app.bind_loop_sel = app.bind_loop_sel.min(app.n_tracks - 1);
@@ -19613,8 +19793,7 @@ mod tests {
     /// egui's double-click accounting misbehaves after an unrelated click
     /// (all presses claim the same instant), which used to mask/cause flaky
     /// gesture pins.
-    static TEST_CLOCK_TICKS: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(1);
+    static TEST_CLOCK_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     fn test_time() -> f64 {
         // v22: egui 0.36.2 coarsens fed times to f32 precision internally;
@@ -19708,7 +19887,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -19817,7 +19996,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -19997,13 +20176,25 @@ mod tests {
             &ctx,
             vec![moved(cp), btn(cp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(cp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         let del = galley_at(&mut app, &ctx, "Delete")
             .expect("clip menu opened on the clip body")
             .center();
-        frame(&mut app, &ctx, vec![moved(del), btn(del, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(del, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(del), btn(del, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(del, egui::PointerButton::Primary, false)],
+        );
         assert_eq!(total(&app), 0, "menu Delete removed the clip");
     }
 
@@ -20355,8 +20546,8 @@ mod tests {
 
         frame_keys(&mut app, &ctx, vec![]); // layout pass
                                             // 1. Rack DnD drop onto a lane (same recipe as the DnD pin test).
-        // v30 R6: the rack floats, so anchor on the painted row galley —
-        // a fixed x=40 probe strip walks into the window's header buttons.
+                                            // v30 R6: the rack floats, so anchor on the painted row galley —
+                                            // a fixed x=40 probe strip walks into the window's header buttons.
         let kick = galley_centers(&mut app, &ctx, "kick", true);
         assert!(!kick.is_empty(), "rack row visible");
         let start = kick[0];
@@ -20576,7 +20767,10 @@ mod tests {
         assert!(!kick.is_empty(), "rack row visible");
         let y_row = kick[0].y;
         click(&mut app, &ctx, y_row);
-        assert!(app.preview_playing.is_some(), "clicking the row previews it");
+        assert!(
+            app.preview_playing.is_some(),
+            "clicking the row previews it"
+        );
         assert!(app
             .preview_playing
             .as_deref()
@@ -20643,7 +20837,11 @@ mod tests {
                 &ctx,
                 vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
             );
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
         }
         assert!(
             app.value_dialog.is_some(),
@@ -20869,7 +21067,7 @@ mod tests {
     /// curve's min/max to the new output's limits.
     #[test]
     fn v15_auto_pick_binds_and_rescales() {
-        use crate::automation::{Node};
+        use crate::automation::Node;
         let mut app = headless_app("v15autopick");
         let ctx = egui::Context::default();
         app.open_auto_editor(None);
@@ -21152,7 +21350,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -21407,7 +21605,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -21472,7 +21670,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -21554,7 +21752,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -21892,9 +22090,10 @@ mod tests {
         let inst = reg
             .create_instance("piano", 48000.0, &[])
             .expect("bundled piano must load");
-        app.backend
-            .engine
-            .set_track_synth(0, Some(std::sync::Arc::new(crate::audio::SynthHandle::Script(inst))));
+        app.backend.engine.set_track_synth(
+            0,
+            Some(std::sync::Arc::new(crate::audio::SynthHandle::Script(inst))),
+        );
         assert!(app.track_synth.first().map(|s| s.is_none()).unwrap_or(true));
         // Open the route combobox and read its rows.
         frame(&mut app, &ctx, vec![]);
@@ -21950,8 +22149,7 @@ mod tests {
         clear_canvas(&mut app);
         let canvas = open_roll_headless(&mut app, &ctx);
         // Empty pattern + preview click: says WHY nothing happens.
-        let p = exact_galley(&mut app, &ctx, "preview")
-            .expect("preview button (exact)");
+        let p = exact_galley(&mut app, &ctx, "preview").expect("preview button (exact)");
         frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
         frame(&mut app, &ctx, vec![btn_btn(p, false)]);
         assert!(
@@ -22071,7 +22269,7 @@ mod tests {
     #[test]
     fn v15_mgr_record_never_grows_past_span() {
         use crate::audio::{Evt, RawMidiMsg};
-        use crate::automation::{Node};
+        use crate::automation::Node;
         use crate::midi::{MidiAction, MidiBind};
         let mut app = headless_app("reclim");
         app.sample_rate = 48_000;
@@ -22270,8 +22468,12 @@ mod tests {
             std::sync::Arc::new(app.arr.clone()),
             app.total_len(),
         );
-        app.backend.engine.set_midi_assets(std::sync::Arc::new(Vec::new()));
-        app.backend.engine.set_auto_assets(std::sync::Arc::new(Vec::new()));
+        app.backend
+            .engine
+            .set_midi_assets(std::sync::Arc::new(Vec::new()));
+        app.backend
+            .engine
+            .set_auto_assets(std::sync::Arc::new(Vec::new()));
         let out = app.backend.engine.render_project().expect("render");
         assert!(
             out[5_000..7_400].iter().all(|s| *s == 0.0),
@@ -22343,8 +22545,7 @@ mod tests {
         let apath = app.record_dir().join("take-ovr.wav");
         std::fs::write(&apath, "not-a-curve").unwrap();
         let apath_for_push = apath.clone();
-        app.assets
-            .push(crate::ui::Asset::audio(
+        app.assets.push(crate::ui::Asset::audio(
             audio_id,
             "take".to_string(),
             apath_for_push,
@@ -22491,7 +22692,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -22751,7 +22952,7 @@ mod tests {
                         egui::Pos2::ZERO,
                         egui::vec2(1440.0, 853.0),
                     )),
-            time: Some(test_time()),
+                    time: Some(test_time()),
                     ..Default::default()
                 };
                 let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -22845,7 +23046,7 @@ mod tests {
         // landing tick (environment-timing flake: slow X/wine states
         // stretched the probe and this raced).
         let editor = loop_pump(&mut app, &ctx, |a| a.fx_vst_editors.remove(&(0, 0)))
-        .expect("adding an editor-capable plugin opens its own window");
+            .expect("adding an editor-capable plugin opens its own window");
         let t0 = std::time::Instant::now();
         loop {
             if editor.painted() || editor.open_failed() || editor.is_closed() {
@@ -22925,8 +23126,14 @@ mod tests {
         let entries = crate::vsthost::scan(std::slice::from_ref(&dir));
         let ok: Vec<_> = entries.iter().filter(|e| e.error.is_none()).collect();
         assert_eq!(ok.len(), 2, "both plugins must scan: {entries:?}");
-        let ins = ok.iter().find(|e| e.instrument).expect("scan sees the instrument");
-        let fx = ok.iter().find(|e| !e.instrument).expect("scan sees the effect");
+        let ins = ok
+            .iter()
+            .find(|e| e.instrument)
+            .expect("scan sees the instrument");
+        let fx = ok
+            .iter()
+            .find(|e| !e.instrument)
+            .expect("scan sees the effect");
 
         let mut app = headless_app("fxmenupin");
         std::env::set_var("HOME", &dir);
@@ -22936,12 +23143,28 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let m = label_center(&mut app, &ctx, "\u{2026} more").expect("more button on the strip");
         frame(&mut app, &ctx, vec![moved(m)]);
-        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(m, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(m, egui::PointerButton::Primary, false)],
+        );
         let p = label_center(&mut app, &ctx, "FX").expect("FX chip in the more popup");
         frame(&mut app, &ctx, vec![moved(p)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
         assert_eq!(app.fx_window, Some(0), "chip opens the chain window");
 
         let mut scanned = false;
@@ -22962,8 +23185,16 @@ mod tests {
         // painted text — including status notes.)
         let q = label_center(&mut app, &ctx, "+ VST plugin").expect("plugin picker");
         frame(&mut app, &ctx, vec![moved(q)]);
-        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(q, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(q, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]); // the popup paints on the next frame
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -23000,8 +23231,16 @@ mod tests {
         // Belt-and-braces guard: even a direct add refuses an instrument.
         let n_before = app.fx_rows[0].len();
         app.add_fx_plugin(0, ins);
-        assert_eq!(app.fx_rows[0].len(), n_before, "instrument never enters a chain");
-        assert!(app.vst_note.contains("instrument"), "refusal is explained: {}", app.vst_note);
+        assert_eq!(
+            app.fx_rows[0].len(),
+            n_before,
+            "instrument never enters a chain"
+        );
+        assert!(
+            app.vst_note.contains("instrument"),
+            "refusal is explained: {}",
+            app.vst_note
+        );
 
         std::env::set_var("HOME", &home);
         let _ = std::fs::remove_dir_all(&dir);
@@ -23952,7 +24191,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -24234,7 +24473,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -24276,8 +24515,14 @@ mod tests {
             has_text(&mut app, &ctx, "sine \u{b7}"),
             "strip names the clip"
         );
-        assert!(!v25_hits(&mut app, &ctx, "fade in").is_empty(), "fade-in slider present");
-        assert!(!v25_hits(&mut app, &ctx, "fade out").is_empty(), "fade-out slider present");
+        assert!(
+            !v25_hits(&mut app, &ctx, "fade in").is_empty(),
+            "fade-in slider present"
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "fade out").is_empty(),
+            "fade-out slider present"
+        );
 
         // S splits at the playhead.
         frame_keys(
@@ -24583,7 +24828,7 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1440.0, 853.0),
                 )),
-            time: Some(test_time()),
+                time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
@@ -24741,9 +24986,7 @@ mod tests {
                         texts.push((s, egui::Rect::from_min_size(t.pos, t.galley.rect.size())));
                     }
                 }
-                egui::epaint::Shape::Rect(r)
-                    if (r.stroke.width - 1.6).abs() < 0.01 =>
-                {
+                egui::epaint::Shape::Rect(r) if (r.stroke.width - 1.6).abs() < 0.01 => {
                     // The ACTIVE border color, possibly dimmed by the
                     // window's fade-in animation (shapes are painted at
                     // the layer's animated alpha) — compare un-premultiplied.
@@ -24787,7 +25030,10 @@ mod tests {
             "/home/u/.clap/Camshaft.clap",
             Some("com.azuriteid.camshaft.comppressor"),
         );
-        assert_eq!(stem, "clap:/home/u/.clap/Camshaft.clap#com.azuriteid.camshaft.comppressor");
+        assert_eq!(
+            stem,
+            "clap:/home/u/.clap/Camshaft.clap#com.azuriteid.camshaft.comppressor"
+        );
         let (kind, path, pid) = vst_synth_decode(&stem).unwrap();
         assert_eq!(kind, crate::vsthost::VstKind::Clap);
         assert_eq!(path, "/home/u/.clap/Camshaft.clap");
@@ -24835,11 +25081,7 @@ mod tests {
             &ctx,
             vec![btn(c, egui::PointerButton::Primary, false)],
         );
-        assert_eq!(
-            app.synth_pick,
-            Some(0),
-            "the chip opens the SYNTHS window"
-        );
+        assert_eq!(app.synth_pick, Some(0), "the chip opens the SYNTHS window");
     }
 
     /// v17: the window lists script synths as `[rust]` and scanned plugin
@@ -25238,9 +25480,8 @@ mod tests {
 
     /// Left-click the painted galley whose text equals `needle`.
     fn click_label(app: &mut App, ctx: &egui::Context, needle: &str) {
-        let r = galley_at(app, ctx, needle).unwrap_or_else(|| {
-            panic!("galley {needle:?} not painted (status {:?})", app.status)
-        });
+        let r = galley_at(app, ctx, needle)
+            .unwrap_or_else(|| panic!("galley {needle:?} not painted (status {:?})", app.status));
         let p = r.center();
         frame(app, ctx, vec![moved(p)]);
         frame(
@@ -25299,11 +25540,24 @@ mod tests {
         let p = egui::pos2(500.0, 240.0); // lane strip of track 2 (DnD-pin geometry)
         frame_files(&mut app, &ctx, vec![moved(p)], vec![wav]);
         frame(&mut app, &ctx, vec![moved(p)]);
-        assert_eq!(app.assets.len(), n0 + 1, "dropped wav imported: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0 + 1,
+            "dropped wav imported: {}",
+            app.status
+        );
         assert_eq!(n_clips(&app), 1, "drop placed a clip: {}", app.status);
-        assert!(app.status.contains("track 2"), "status names the track: {}", app.status);
+        assert!(
+            app.status.contains("track 2"),
+            "status names the track: {}",
+            app.status
+        );
         assert!(!app.sel_clips.is_empty(), "placed clip is selected");
-        assert_eq!(app.sel_asset, Some(app.assets.len() - 1), "and rack-selected");
+        assert_eq!(
+            app.sel_asset,
+            Some(app.assets.len() - 1),
+            "and rack-selected"
+        );
     }
 
     /// R1b: a drop anywhere else (here: the rack panel) imports the asset —
@@ -25325,11 +25579,25 @@ mod tests {
             0.1,
         );
         let n0 = app.assets.len();
-        frame_files(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))], vec![wav]);
+        frame_files(
+            &mut app,
+            &ctx,
+            vec![moved(egui::pos2(120.0, 400.0))],
+            vec![wav],
+        );
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "rack drop imported: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0 + 1,
+            "rack drop imported: {}",
+            app.status
+        );
         assert_eq!(n_clips(&app), 0, "rack drop places no clip");
-        assert_eq!(app.sel_asset, Some(app.assets.len() - 1), "imported asset selected");
+        assert_eq!(
+            app.sel_asset,
+            Some(app.assets.len() - 1),
+            "imported asset selected"
+        );
     }
 
     /// R1c: a .mid dropped on a lane places a MIDI clip.
@@ -25354,7 +25622,12 @@ mod tests {
             len: 240,
         });
         pat.save_mid(&mid).unwrap();
-        frame_files(&mut app, &ctx, vec![moved(egui::pos2(500.0, 240.0))], vec![mid]);
+        frame_files(
+            &mut app,
+            &ctx,
+            vec![moved(egui::pos2(500.0, 240.0))],
+            vec![mid],
+        );
         frame(&mut app, &ctx, vec![]);
         let ids = clip_ids(&app);
         assert_eq!(ids.len(), 1, "midi drop placed one clip: {}", app.status);
@@ -25375,7 +25648,12 @@ mod tests {
         let txt = dir.join("notes.txt");
         std::fs::write(&txt, "not audio").unwrap();
         let n0 = app.assets.len();
-        frame_files(&mut app, &ctx, vec![moved(egui::pos2(500.0, 240.0))], vec![txt]);
+        frame_files(
+            &mut app,
+            &ctx,
+            vec![moved(egui::pos2(500.0, 240.0))],
+            vec![txt],
+        );
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.assets.len(), n0, "nothing imported");
         assert_eq!(n_clips(&app), 0, "no clip");
@@ -25394,12 +25672,24 @@ mod tests {
         let mut app = headless_app("v18dropdir");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        let dir = std::env::temp_dir().join("sp-uity-v18dropdir").join("newpack");
+        let dir = std::env::temp_dir()
+            .join("sp-uity-v18dropdir")
+            .join("newpack");
         write_test_wav(&dir, "hat.wav", 6_000, 0.4);
         let n0 = app.rack.len();
-        frame_files(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))], vec![dir]);
+        frame_files(
+            &mut app,
+            &ctx,
+            vec![moved(egui::pos2(120.0, 400.0))],
+            vec![dir],
+        );
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.rack.len(), n0 + 1, "folder added to the rack: {}", app.status);
+        assert_eq!(
+            app.rack.len(),
+            n0 + 1,
+            "folder added to the rack: {}",
+            app.status
+        );
         let last = app.rack.last().unwrap();
         assert_eq!(last.files.len(), 1, "its files scanned");
     }
@@ -25424,10 +25714,23 @@ mod tests {
         click_label(&mut app, &ctx, "Save as new asset + clip");
         frame(&mut app, &ctx, vec![]);
         let before = n_clips(&app);
-        assert_eq!(before, 3, "2 audio clips + 1 automation clip: {}", app.status);
+        assert_eq!(
+            before, 3,
+            "2 audio clips + 1 automation clip: {}",
+            app.status
+        );
         app.select_one((0, 0, 1));
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
-        assert_eq!(n_clips(&app), before - 1, "Delete key removed the clip: {}", app.status);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Delete, Default::default())],
+        );
+        assert_eq!(
+            n_clips(&app),
+            before - 1,
+            "Delete key removed the clip: {}",
+            app.status
+        );
         assert_eq!(
             clip_ids(&app).iter().filter(|(t, _, _, _)| *t == 0).count(),
             1,
@@ -25436,22 +25739,44 @@ mod tests {
         let (at, ak, ac, _c) = clip_ids(&app)
             .into_iter()
             .find(|(_, _, _, c)| {
-                app.assets.get(c.asset as usize).is_some_and(|x| x.is_auto())
+                app.assets
+                    .get(c.asset as usize)
+                    .is_some_and(|x| x.is_auto())
             })
             .expect("automation clip placed");
         let n_assets = app.assets.len();
         app.select_one((at, ak, ac));
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Backspace, Default::default())]);
-        assert_eq!(n_clips(&app), before - 2, "Backspace deleted the automation clip");
-        assert_eq!(app.assets.len(), n_assets, "automation ASSET stays in the rack");
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Backspace, Default::default())],
+        );
+        assert_eq!(
+            n_clips(&app),
+            before - 2,
+            "Backspace deleted the automation clip"
+        );
+        assert_eq!(
+            app.assets.len(),
+            n_assets,
+            "automation ASSET stays in the rack"
+        );
         // A stray key with no selection must no-op, not delete "whatever".
         assert!(app.sel_clips.is_empty());
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Delete, Default::default())],
+        );
         assert_eq!(n_clips(&app), before - 2);
         // remove_asset_at cleared the selection — later Delete is a no-op.
         app.select_one((0, 0, 0));
         app.remove_asset_at(a as usize);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Delete, Default::default())],
+        );
         assert!(app.sel_clips.is_empty());
     }
 
@@ -25527,6 +25852,10 @@ mod tests {
     fn v35_chain_window_docks_and_stacks() {
         let mut app = headless_app("v35dock");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         app.fx_window = Some(0);
         frame(&mut app, &ctx, vec![]);
         let idx = 4; // first dynamic slot
@@ -25632,14 +25961,14 @@ mod tests {
         let mut app = headless_app("v35dockall");
         let ctx = egui::Context::default();
 
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         // ---- DRUM MACHINE (slot 4) ----
         app.show_drums = true;
         frame(&mut app, &ctx, vec![]);
         assert_eq!(win_count(&app), 5, "drums slot registered");
-        assert!(
-            !is_docked(&app, 4),
-            "starts floating like the chain window"
-        );
+        assert!(!is_docked(&app, 4), "starts floating like the chain window");
         assert_eq!(
             painted(&ctx, &mut app, "sixteenth note (4/beat)"),
             1,
@@ -25876,7 +26205,11 @@ mod tests {
         // (1) Clip delete by Delete key with a stale extra id in the
         // selection (as if another clip had already been removed).
         app.sel_clips = vec![(1, 0, 0), (1, 0, 1), (1, 0, 9)];
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, Default::default())]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Delete, Default::default())],
+        );
         frame(&mut app, &ctx, vec![]);
         invariant(&app, "after Delete key with stale id");
 
@@ -25887,7 +26220,8 @@ mod tests {
         click_label(&mut app, &ctx, "Save as new asset + clip");
         frame(&mut app, &ctx, vec![]);
         let auto_id = app.assets.len() - 1;
-        app.arr.insert(1, 0, crate::arrange::Clip::new(auto_id as u32, 0));
+        app.arr
+            .insert(1, 0, crate::arrange::Clip::new(auto_id as u32, 0));
         frame(&mut app, &ctx, vec![]);
         app.open_bound_auto(Some(1), crate::automation::TARGET_MASTER_TEMPO, 120.0);
         frame(&mut app, &ctx, vec![]);
@@ -26045,7 +26379,12 @@ mod tests {
         );
         click_label(&mut app, &ctx, "Save as new asset + clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "AUTO asset on save: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0 + 1,
+            "AUTO asset on save: {}",
+            app.status
+        );
         assert!(app.assets[n0].is_auto(), "kind = automation");
         let ids = clip_ids(&app);
         assert_eq!(ids.len(), 1, "automation clip placed: {}", app.status);
@@ -26062,7 +26401,8 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.assets.len(), n0 + 2, "second asset: {}", app.status);
         assert_eq!(
-            app.assets[n0 + 1].name, "automation-2",
+            app.assets[n0 + 1].name,
+            "automation-2",
             "automation-2 next to automation"
         );
     }
@@ -26085,7 +26425,12 @@ mod tests {
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0, "right-click opens a MENU now: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0,
+            "right-click opens a MENU now: {}",
+            app.status
+        );
         assert!(app.value_menu.is_some(), "value menu open");
         click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
@@ -26093,11 +26438,18 @@ mod tests {
         let ed = app.auto_edit.as_ref().expect("manager opened bound");
         assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
         assert_eq!(ed.asset, None, "unsaved curve");
-        assert_eq!(ed.host, Some(1), "bound to the track it rides (strips are master + tracks 1..n)");
+        assert_eq!(
+            ed.host,
+            Some(1),
+            "bound to the track it rides (strips are master + tracks 1..n)"
+        );
         click_label(&mut app, &ctx, "Save as new asset + clip");
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.assets.len(), n0 + 1, "save creates: {}", app.status);
-        let auto = app.assets[n0].automation.as_ref().expect("automation attached");
+        let auto = app.assets[n0]
+            .automation
+            .as_ref()
+            .expect("automation attached");
         assert_eq!(auto.target, crate::automation::TARGET_TRACK_VOL);
     }
 
@@ -26139,13 +26491,17 @@ mod tests {
 
     fn v20_placed(app: &App, asset: u32) -> Option<(usize, usize, crate::arrange::Clip)> {
         (0..MAX_LOOPS).find_map(|t| {
-            app.arr.tracks[t].lanes.iter().enumerate().find_map(|(l, ln)| {
-                ln.clips
-                    .iter()
-                    .find(|c| c.asset == asset)
-                    .cloned()
-                    .map(|c| (t, l, c))
-            })
+            app.arr.tracks[t]
+                .lanes
+                .iter()
+                .enumerate()
+                .find_map(|(l, ln)| {
+                    ln.clips
+                        .iter()
+                        .find(|c| c.asset == asset)
+                        .cloned()
+                        .map(|c| (t, l, c))
+                })
         })
     }
 
@@ -26164,7 +26520,12 @@ mod tests {
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0, "RMB alone creates nothing: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0,
+            "RMB alone creates nothing: {}",
+            app.status
+        );
         assert!(app.value_menu.is_some(), "mini menu at the pointer");
         click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
@@ -26184,7 +26545,12 @@ mod tests {
         park_window(&mut app, &ctx, "Automation", egui::vec2(0.0, -220.0));
         click_label(&mut app, &ctx, "Save as new asset + clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0 + 1, "save creates the asset: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0 + 1,
+            "save creates the asset: {}",
+            app.status
+        );
         let (t, _lane, cl) = v20_placed(&app, n0 as u32).expect("automation clip placed");
         assert_eq!(t, 0, "clip on the OWNER track");
         assert_eq!(cl.pos, 0, "no selection → snapped playhead");
@@ -26456,7 +26822,11 @@ mod tests {
         assert_eq!(app.goto_pos, Some(3 * 48_000), "start of selection");
         assert_eq!(app.goto_what, "selection");
         app.goto_edge(false);
-        assert_eq!(app.goto_pos, Some(9 * 48_000 + 12_000 + alen), "end of selection");
+        assert_eq!(
+            app.goto_pos,
+            Some(9 * 48_000 + 12_000 + alen),
+            "end of selection"
+        );
         // (2) No selection + loop on: the loop region.
         app.sel_clips.clear();
         app.loop_tl = true;
@@ -26479,9 +26849,17 @@ mod tests {
         // (4) The default Home/End keys dispatch (binding table path).
         let t2 = app.total_len();
         frame(&mut app, &ctx, vec![]);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::End, Default::default())]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::End, Default::default())],
+        );
         assert_eq!(app.goto_pos, Some(t2), "End key fired: {}", app.status);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Home, Default::default())]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Home, Default::default())],
+        );
         assert_eq!(app.goto_pos, Some(0), "Home key fired: {}", app.status);
     }
 
@@ -26521,10 +26899,21 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let p = v20_track1_vol_point(&mut app, &ctx);
         for _ in 0..2 {
-            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
-            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
         }
-        let dlg = app.value_dialog.clone().expect("double-click opens Set value");
+        let dlg = app
+            .value_dialog
+            .clone()
+            .expect("double-click opens Set value");
         assert_eq!(dlg.1, crate::automation::TARGET_TRACK_VOL);
     }
 
@@ -26561,7 +26950,11 @@ mod tests {
         let status = app.status.clone();
         // Hover EMPTY grid (the old live hit-test flipped to the grid
         // variant and re-selected the lane under the pointer).
-        frame(&mut app, &ctx, vec![moved(press + egui::vec2(240.0, 240.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(press + egui::vec2(240.0, 240.0))],
+        );
         assert!(
             galley_at(&mut app, &ctx, "Copy  (Ctrl+C)").is_some(),
             "menu content stays the clip variant while hovering empty grid (status {:?})",
@@ -26593,7 +26986,11 @@ mod tests {
             egui::vec2(400.0, 300.0),
         ));
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.bpm_rect, Some(real), "the stale rect never survives a frame");
+        assert_eq!(
+            app.bpm_rect,
+            Some(real),
+            "the stale rect never survives a frame"
+        );
         let mut menu = None;
         for y in (150..640).step_by(50) {
             let p = egui::pos2(700.0, y as f32);
@@ -26608,7 +27005,10 @@ mod tests {
             menu.is_some(),
             "a grid right-click in the poisoned zone still opens the menu"
         );
-        assert!(app.value_menu.is_none(), "the press was not swallowed by bpm");
+        assert!(
+            app.value_menu.is_none(),
+            "the press was not swallowed by bpm"
+        );
     }
 
     /// The value mini-menu family: opening, dismissing, and REOPENING must
@@ -26648,11 +27048,7 @@ mod tests {
             // The stock seed put chorus.rs in the effects folder at App::new;
             // a headless run without it: seed manually and rescan.
             let dir = app.fx_registry.dir().to_path_buf();
-            std::fs::write(
-                dir.join("chorus.rs"),
-                include_str!("../effects/chorus.rs"),
-            )
-            .unwrap();
+            std::fs::write(dir.join("chorus.rs"), include_str!("../effects/chorus.rs")).unwrap();
             app.rescan_fx();
         }
         app.add_fx_script(0, "chorus");
@@ -26665,7 +27061,12 @@ mod tests {
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), n0, "fx slider RMB creates nothing: {}", app.status);
+        assert_eq!(
+            app.assets.len(),
+            n0,
+            "fx slider RMB creates nothing: {}",
+            app.status
+        );
         assert!(app.value_menu.is_some(), "value menu opens");
         click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
@@ -26721,7 +27122,11 @@ mod tests {
                 break;
             }
         }
-        assert!(armed, "bridge knob RMB opens the bound menu: {}", app.status);
+        assert!(
+            armed,
+            "bridge knob RMB opens the bound menu: {}",
+            app.status
+        );
         assert_eq!(app.assets.len(), n0, "no eager asset");
         click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
@@ -26830,7 +27235,11 @@ mod tests {
             ],
         );
         assert_eq!(n_clips(&app), 0, "Ctrl+X deleted the clip");
-        assert_eq!(app.clipboard.as_ref().map(|c| c.items.len()), Some(1), "and copied it");
+        assert_eq!(
+            app.clipboard.as_ref().map(|c| c.items.len()),
+            Some(1),
+            "and copied it"
+        );
         frame_keys(
             &mut app,
             &ctx,
@@ -26879,6 +27288,10 @@ mod tests {
     fn v18_paste_lands_on_last_clicked_track() {
         let mut app = headless_app("v18pastetgt");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         frame_keys(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
@@ -26899,9 +27312,21 @@ mod tests {
         let top3 = app.grid_anchor - app.vscroll + 2.0 * (app.track_h(2) + TRACK_SEP_HIT);
         let p = egui::pos2(1100.0, top3 + app.track_h(2) * 0.5);
         frame(&mut app, &ctx, vec![moved(p)]);
-        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
-        assert_eq!(app.last_click_track, Some(2), "grid click remembered track 3");
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.last_click_track,
+            Some(2),
+            "grid click remembered track 3"
+        );
         frame_keys(
             &mut app,
             &ctx,
@@ -26912,7 +27337,10 @@ mod tests {
         );
         let ids = clip_ids(&app);
         assert_eq!(ids.len(), 2);
-        assert!(ids.iter().any(|(t, _, _, _)| *t == 2), "paste landed on track 3: {ids:?}");
+        assert!(
+            ids.iter().any(|(t, _, _, _)| *t == 2),
+            "paste landed on track 3: {ids:?}"
+        );
     }
 
     /// v21 AC2: Ctrl+V in a fresh session (empty clipboard) must SAY so —
@@ -27012,23 +27440,51 @@ mod tests {
         let grab = egui::pos2(250.0, top1 + lane_h * 0.5);
         let drop = egui::pos2(250.0, top1 + lane_h * 1.5);
         frame(&mut app, &ctx, vec![moved(grab)]);
-        frame(&mut app, &ctx, vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)],
+        );
         let mid = egui::pos2(250.0, (grab.y + drop.y) * 0.5);
         frame(&mut app, &ctx, vec![moved(mid)]);
         frame(&mut app, &ctx, vec![moved(drop)]);
-        frame(&mut app, &ctx, vec![moved(drop), btn(drop, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(drop), btn(drop, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         let ids = clip_ids(&app);
-        assert_eq!(ids.iter().filter(|(t, k, _, _)| *t == 1 && *k == 1).count(), 2, "both clips now share the child lane: {ids:?}");
-        assert!(app.sel_clips.iter().all(|(t, k, _)| *t == 1 && *k == 1), "selection followed the lane");
+        assert_eq!(
+            ids.iter().filter(|(t, k, _, _)| *t == 1 && *k == 1).count(),
+            2,
+            "both clips now share the child lane: {ids:?}"
+        );
+        assert!(
+            app.sel_clips.iter().all(|(t, k, _)| *t == 1 && *k == 1),
+            "selection followed the lane"
+        );
         // Plain click afterwards still selects (the reaper must be
         // clean) — click the CHILD LANE the clips now live in; lane 0 is
         // empty after the drag, and clicking empty grid correctly clears.
         let click = egui::pos2(250.0, top1 + lane_h * 1.5);
         frame(&mut app, &ctx, vec![moved(click)]);
-        frame(&mut app, &ctx, vec![moved(click), btn(click, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(click, egui::PointerButton::Primary, false)]);
-        assert_eq!(app.sel_clips.len(), 1, "click after drag selects again: {:?}", app.sel_clips);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(click), btn(click, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(click, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.sel_clips.len(),
+            1,
+            "click after drag selects again: {:?}",
+            app.sel_clips
+        );
     }
 
     /// R5b: cutting the selected clip WHILE an edge-resize drag is armed
@@ -27050,7 +27506,11 @@ mod tests {
         let edge_x = 8.0 + 3.0 * app.px_per_sec;
         let grab = egui::pos2(edge_x - 2.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(grab)]);
-        frame(&mut app, &ctx, vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)],
+        );
         let moved_to = egui::pos2(edge_x + 14.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(moved_to)]);
         assert!(app.clip_resize.is_some(), "edge resize armed");
@@ -27066,8 +27526,20 @@ mod tests {
         );
         assert_eq!(n_clips(&app), 0, "cut happened");
         // Keep moving, then release: the dead gesture must not be touched.
-        frame_keys(&mut app, &ctx, vec![moved(egui::pos2(edge_x + 40.0, moved_to.y))]);
-        frame(&mut app, &ctx, vec![btn(egui::pos2(edge_x + 40.0, moved_to.y), egui::PointerButton::Primary, false)]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![moved(egui::pos2(edge_x + 40.0, moved_to.y))],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(
+                egui::pos2(edge_x + 40.0, moved_to.y),
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
         frame(&mut app, &ctx, vec![]);
     }
 
@@ -27084,15 +27556,31 @@ mod tests {
         let top0 = app.grid_anchor - app.vscroll;
         let p0 = egui::pos2(900.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(p0)]);
-        frame(&mut app, &ctx, vec![moved(p0), btn(p0, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p0), btn(p0, egui::PointerButton::Primary, true)],
+        );
         let p1 = egui::pos2(980.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(p1)]);
         // Secondary press + release while the primary is still held.
-        frame(&mut app, &ctx, vec![btn(p1, egui::PointerButton::Secondary, true)]);
-        frame(&mut app, &ctx, vec![btn(p1, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p1, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p1, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![moved(p1)]);
         // Release primary somewhere else; idle frames settle everything.
-        frame(&mut app, &ctx, vec![btn(p0, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p0, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..4 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -27192,7 +27680,11 @@ mod tests {
         assert!(app.auto_edit.is_none(), "menu first, manager on request");
         click_label(&mut app, &ctx, "Create automation clip");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.assets.len(), before, "manager opens, still nothing created");
+        assert_eq!(
+            app.assets.len(),
+            before,
+            "manager opens, still nothing created"
+        );
         let ed = app.auto_edit.as_ref().expect("manager opened bound");
         assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
         assert_eq!(ed.asset, None, "unsaved curve");
@@ -27204,7 +27696,8 @@ mod tests {
             "saving creates the automation asset: {}",
             app.status
         );
-        let au = app.assets
+        let au = app
+            .assets
             .last()
             .unwrap()
             .automation
@@ -27279,6 +27772,10 @@ mod tests {
             return;
         }
         let mut app = headless_app("v23ban");
+
+        // v39: MASTER OUT registers as a dynamic window while open; close
+        // it from the FIRST frame so the dock-slot indices stay pre-v39.
+        app.show_master = false;
         let load = crate::vsthost::open(p, crate::vsthost::VstKind::V3, 48_000, None)
             .expect("wolf-shaper opens");
         let entry = load.entry;
@@ -27463,8 +27960,7 @@ mod tests {
         // Press the title bar: arms the carry like every other dynamic
         // window. The window title is an exact galley; the body may show
         // fragments of the same words, so match the full title string.
-        let title_text =
-            format!("{} \u{2014} track 1", app.fx_editor.as_ref().unwrap().name);
+        let title_text = format!("{} \u{2014} track 1", app.fx_editor.as_ref().unwrap().name);
         let title = galleys_all(&mut app, &ctx, &title_text)
             .into_iter()
             .min_by(|a, b| a.y.total_cmp(&b.y))
@@ -27518,8 +28014,16 @@ mod tests {
             })
             .expect("dock header close button");
         frame(&mut app, &ctx, vec![moved(close)]);
-        frame(&mut app, &ctx, vec![btn(close, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(close, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(close, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(close, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(app.fx_editor.is_none(), "dock close cleared the editor");
 
@@ -27587,10 +28091,18 @@ mod tests {
         let corner = egui::pos2(r0[0] + r0[2] - 3.0, r0[1] + r0[3] - 3.0);
         let far = corner + egui::vec2(170.0, 130.0);
         frame(&mut app, &ctx, vec![moved(corner)]);
-        frame(&mut app, &ctx, vec![btn(corner, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(corner, egui::PointerButton::Primary, true)],
+        );
         frame(&mut app, &ctx, vec![moved(corner + egui::vec2(40.0, 30.0))]);
         frame(&mut app, &ctx, vec![moved(far)]);
-        frame(&mut app, &ctx, vec![btn(far, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(far, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         let r1 = app.dyn_wins[p].rect;
         assert!(
@@ -27619,8 +28131,9 @@ mod tests {
             eprintln!("skip: no C compiler for the CLAP fixture");
             return;
         };
-        let entry = crate::claphost::open(&path, Some("com.slooper.fixture-sine"), 48_000, None, None)
-            .expect("fixture instrument opens");
+        let entry =
+            crate::claphost::open(&path, Some("com.slooper.fixture-sine"), 48_000, None, None)
+                .expect("fixture instrument opens");
         use crate::vsthost::StageEntry as _;
         assert!(!entry.has_editor(), "CLAP has no window of its own (v34)");
         let mut app = headless_app("v36clapgui");
@@ -27662,8 +28175,9 @@ mod tests {
             eprintln!("skip: no C compiler for the CLAP fixture");
             return;
         };
-        let entry = crate::claphost::open(&path, Some("com.slooper.fixture-gain"), 48_000, None, None)
-            .expect("fixture effect opens");
+        let entry =
+            crate::claphost::open(&path, Some("com.slooper.fixture-gain"), 48_000, None, None)
+                .expect("fixture effect opens");
         let entry = entry as std::sync::Arc<dyn crate::vsthost::StageEntry>;
         let mut app = headless_app("v36claprow");
         let ctx = egui::Context::default();
@@ -27869,7 +28383,10 @@ mod tests {
             })
             .collect();
         let all = filtered_targets(&targets, "");
-        assert!(!all.is_empty() && all.len() <= 400, "cap must bound the list");
+        assert!(
+            !all.is_empty() && all.len() <= 400,
+            "cap must bound the list"
+        );
         let hit = filtered_targets(&targets, "resonance");
         assert!(hit.len() >= 30 && hit.iter().all(|(_, l)| l.contains("Resonance")));
         assert!(filtered_targets(&targets, "zzz-nothing").is_empty());
@@ -27905,7 +28422,10 @@ mod tests {
             );
             w.textures_delta.clear();
         }
-        let raw = egui::RawInput { time: Some(test_time()), ..raw };
+        let raw = egui::RawInput {
+            time: Some(test_time()),
+            ..raw
+        };
         let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
         let hits: Vec<String> = out
             .shapes
@@ -28093,7 +28613,11 @@ mod tests {
         let mut app = headless_app("v30lay");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "all docked by default");
+        assert_eq!(
+            app.side_wins.dock,
+            crate::config::default_dock(),
+            "all docked by default"
+        );
         app.show_settings = true;
         frame(&mut app, &ctx, vec![]);
         let p = label_center(&mut app, &ctx, "float all windows").expect("float-all button");
@@ -28108,7 +28632,11 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "snapped back to slots");
+        assert_eq!(
+            app.side_wins.dock,
+            crate::config::default_dock(),
+            "snapped back to slots"
+        );
         // And the dock header title carries the re-slot menu.
         let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack dock header");
         let tp = t.center();
@@ -28118,9 +28646,14 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        let f = galley_at(&mut app, &ctx, "float out (free window)").expect("dock menu on the title");
+        let f =
+            galley_at(&mut app, &ctx, "float out (free window)").expect("dock menu on the title");
         click_pt(&mut app, &ctx, f.center());
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
@@ -28135,12 +28668,19 @@ mod tests {
     fn v30_mixer_strips_align_with_tracks() {
         let mut app = headless_app("v30align");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
         let g = galley_centers(&mut app, &ctx, "T1 track", false);
         let m = galley_centers(&mut app, &ctx, "Track 1", false);
-        assert!(!g.is_empty() && !m.is_empty(), "grid labels and mixer headers paint");
+        assert!(
+            !g.is_empty() && !m.is_empty(),
+            "grid labels and mixer headers paint"
+        );
         let gy0 = g[0].y;
         let my0 = m[0].y;
         for t in 0..app.n_tracks.min(6) {
@@ -28151,8 +28691,16 @@ mod tests {
             }
             // Pick the occurrences on the grid side (x < 400) and the mixer
             // side (x > 1000) so rack/other galleys never match.
-            let gyy = gy.iter().filter(|c| c.x < 400.0).copied().collect::<Vec<_>>()[0];
-            let myy = my.iter().filter(|c| c.x > 1000.0).copied().collect::<Vec<_>>()[0];
+            let gyy = gy
+                .iter()
+                .filter(|c| c.x < 400.0)
+                .copied()
+                .collect::<Vec<_>>()[0];
+            let myy = my
+                .iter()
+                .filter(|c| c.x > 1000.0)
+                .copied()
+                .collect::<Vec<_>>()[0];
             assert!(
                 (gyy.y - myy.y).abs() < 6.0,
                 "track {} must sit level: grid y={:.0} mixer y={:.0} (base {gy0:.0}/{my0:.0})",
@@ -28171,8 +28719,14 @@ mod tests {
         // every header paints and SETTINGS (a left panel added first)
         // stacks left of the rack dock with its checkboxes clickable.
         frame(&mut app, &ctx, vec![]);
-        assert!(!v25_hits(&mut app, &ctx, "ASSET RACK").is_empty(), "rack default on");
-        assert!(!v25_hits(&mut app, &ctx, "MIXER").is_empty(), "mixer default on");
+        assert!(
+            !v25_hits(&mut app, &ctx, "ASSET RACK").is_empty(),
+            "rack default on"
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "MIXER").is_empty(),
+            "mixer default on"
+        );
         app.show_settings = true;
         let p = label_center(&mut app, &ctx, "asset rack").expect("rack checkbox");
         click_pt(&mut app, &ctx, p);
@@ -28227,7 +28781,10 @@ mod tests {
         zoom_key(&mut app, &ctx, egui::Key::Num0);
         assert!((app.gui_scale - 1.0).abs() < 1e-6, "Ctrl+0 resets to 100%");
         let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
-        assert!(cfg_txt.contains("\"gui_scale\": 1.0"), "zoom persists: {cfg_txt}");
+        assert!(
+            cfg_txt.contains("\"gui_scale\": 1.0"),
+            "zoom persists: {cfg_txt}"
+        );
     }
 
     /// The bindings reset must actually reset everything it claims — the
@@ -28238,7 +28795,11 @@ mod tests {
         let mut app = headless_app("v25resetaxis");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        app.knob_cal[3] = Some(crate::config::MidiAxisCal { slot: 3, lo: 9, hi: 118 });
+        app.knob_cal[3] = Some(crate::config::MidiAxisCal {
+            slot: 3,
+            lo: 9,
+            hi: 118,
+        });
         frame(&mut app, &ctx, vec![]);
         app.show_settings = true;
         let p = label_center(&mut app, &ctx, "Reset to Defaults").expect("reset button");
@@ -28277,16 +28838,17 @@ mod tests {
             time: Some(test_time()),
             ..Default::default()
         };
-        let big_frame = |app: &mut App, events: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
-            let mut raw = big.clone();
-            raw.events = events;
-            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
-            let shapes = std::mem::take(&mut out.shapes);
-            let prims = ctx.tessellate(shapes.clone(), out.pixels_per_point);
-            drop(prims);
-            out.textures_delta.clear();
-            shapes
-        };
+        let big_frame =
+            |app: &mut App, events: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
+                let mut raw = big.clone();
+                raw.events = events;
+                let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+                let shapes = std::mem::take(&mut out.shapes);
+                let prims = ctx.tessellate(shapes.clone(), out.pixels_per_point);
+                drop(prims);
+                out.textures_delta.clear();
+                shapes
+            };
         big_frame(&mut app, vec![]);
         let out = big_frame(&mut app, vec![]);
         let find_stop = |out: &[egui::epaint::ClippedShape]| -> Option<egui::Pos2> {
@@ -28317,7 +28879,10 @@ mod tests {
                 .collect();
             panic!("no Stop; last galleys by y: {tail:?}");
         });
-        big_frame(&mut app, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        big_frame(
+            &mut app,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
         big_frame(&mut app, vec![btn(p, egui::PointerButton::Primary, false)]);
         assert!(app.applied.is_none(), "readout state clears");
         assert!(
@@ -28391,8 +28956,8 @@ mod tests {
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
         v26_settle(&mut app, &ctx);
-        let curve = galley_at(&mut app, &ctx, "curve").expect("curvature slider label");        // Grab the handle: it is the gray capsule at the CENTER of the
-        // slider track (the value text and label live OUTSIDE the track).
+        let curve = galley_at(&mut app, &ctx, "curve").expect("curvature slider label"); // Grab the handle: it is the gray capsule at the CENTER of the
+                                                                                         // slider track (the value text and label live OUTSIDE the track).
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -28512,7 +29077,10 @@ mod tests {
         let cell = galley_at(&mut app, &ctx, "tone").expect("param cell mirrors 'tone'");
         click_pt(&mut app, &ctx, cell.center());
         let ed = app.auto_edit.as_ref().unwrap();
-        assert_eq!(ed.target, "fx:0:2", "panel click bound the plugin parameter");
+        assert_eq!(
+            ed.target, "fx:0:2",
+            "panel click bound the plugin parameter"
+        );
     }
 
     /// egui 0.36 paints a freshly opened window through a fade-IN animation
@@ -28536,18 +29104,38 @@ mod tests {
     #[test]
     #[ignore = "manual visual smoke: set SLOOPER_V26_DUMP=/path/out.svg"]
     fn v26_dump_manager_svg() {
-        use crate::automation::{Node};
+        use crate::automation::Node;
         let out_path = std::env::var("SLOOPER_V26_DUMP").expect("set SLOOPER_V26_DUMP=/path.svg");
         let mut app = headless_app("v26dump");
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
         let len = app.auto_edit.as_ref().unwrap().len_samples;
         app.auto_edit.as_mut().unwrap().nodes = vec![
-            Node { t: 0, v: 1.0, c: 0.0 },
-            Node { t: len / 4, v: 1.9, c: 0.0 },
-            Node { t: len / 2, v: 0.2, c: 0.5 },
-            Node { t: (len * 3) / 4, v: 1.5, c: 0.0 },
-            Node { t: len, v: 1.0, c: 0.0 },
+            Node {
+                t: 0,
+                v: 1.0,
+                c: 0.0,
+            },
+            Node {
+                t: len / 4,
+                v: 1.9,
+                c: 0.0,
+            },
+            Node {
+                t: len / 2,
+                v: 0.2,
+                c: 0.5,
+            },
+            Node {
+                t: (len * 3) / 4,
+                v: 1.5,
+                c: 0.0,
+            },
+            Node {
+                t: len,
+                v: 1.0,
+                c: 0.0,
+            },
         ];
         app.auto_edit.as_mut().unwrap().len_bars = true;
         app.auto_edit.as_mut().unwrap().sel = 1;
@@ -28568,7 +29156,14 @@ mod tests {
         );
         let col = |c: Color32| -> String {
             let p = c.to_array();
-            let f = |v: u8| (if p[3] == 255 { v as u32 } else { v as u32 * 255 / p[3].max(1) as u32 }).min(255) as u8;
+            let f = |v: u8| {
+                (if p[3] == 255 {
+                    v as u32
+                } else {
+                    v as u32 * 255 / p[3].max(1) as u32
+                })
+                .min(255) as u8
+            };
             format!(
                 "rgba({},{},{},{:.2})",
                 f(p[0]),
@@ -28583,10 +29178,7 @@ mod tests {
                     if r.fill == Color32::from_rgb(16, 18, 24) && r.rect.width() > 400.0 {
                         eprintln!(
                             "CANVAS {:.1} {:.1} {:.1} {:.1}",
-                            r.rect.min.x,
-                            r.rect.min.y,
-                            r.rect.max.x,
-                            r.rect.max.y
+                            r.rect.min.x, r.rect.min.y, r.rect.max.x, r.rect.max.y
                         );
                     }
                     if r.fill != Color32::TRANSPARENT {
@@ -28712,14 +29304,26 @@ mod tests {
         click_pt(&mut app, &ctx, row);
         frame(&mut app, &ctx, vec![]);
         let p = label_center(&mut app, &ctx, "1.00 bars").expect("bars DragValue paints its value");
-        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
         for dx in [8, 20, 44, 80] {
-            frame(&mut app, &ctx, vec![moved(egui::pos2(p.x + dx as f32, p.y))]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(egui::pos2(p.x + dx as f32, p.y))],
+            );
         }
         frame(
             &mut app,
             &ctx,
-            vec![btn(egui::pos2(p.x + 80.0, p.y), egui::PointerButton::Primary, false)],
+            vec![btn(
+                egui::pos2(p.x + 80.0, p.y),
+                egui::PointerButton::Primary,
+                false,
+            )],
         );
         let ed = app.auto_edit.as_ref().unwrap();
         assert!(ed.len_bars, "the drag never leaves bars mode");
@@ -28785,7 +29389,11 @@ mod tests {
         for cs in &out.shapes {
             match &cs.shape {
                 egui::epaint::Shape::Mesh(m) => {
-                    if m.vertices.first().map(|v| v.color == fill_col).unwrap_or(false) {
+                    if m.vertices
+                        .first()
+                        .map(|v| v.color == fill_col)
+                        .unwrap_or(false)
+                    {
                         for tri in m.triangles() {
                             tris.push((
                                 m.vertices[tri[0] as usize].pos,
@@ -28816,10 +29424,8 @@ mod tests {
         );
         let (rmin, rmax) = crate::automation::target_range("track.vol");
         let x_of = |t: i64| rect.min.x + (t as f64 / len as f64) as f32 * rect.width();
-        let y_of = |v: f32| {
-            rect.max.y
-                - ((v - rmin) / (rmax - rmin)).clamp(0.0, 1.0) * rect.height()
-        };
+        let y_of =
+            |v: f32| rect.max.y - ((v - rmin) / (rmax - rmin)).clamp(0.0, 1.0) * rect.height();
         let side = |a: egui::Pos2, b: egui::Pos2, p: egui::Pos2| {
             (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y)
         };
@@ -28861,6 +29467,10 @@ mod tests {
     fn v26_auto_preset_buttons_replace_nodes() {
         let mut app = headless_app("v26preset");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         v26_manager_open(&mut app, &ctx);
         let p = label_center(&mut app, &ctx, "peak").expect("peak preset button");
         click_pt(&mut app, &ctx, p);
@@ -28896,7 +29506,7 @@ mod tests {
     /// leading into it (the hint text promises it; the node combo shows it).
     #[test]
     fn v26_auto_dbl_click_cycles_shape() {
-        use crate::automation::{Node};
+        use crate::automation::Node;
         let mut app = headless_app("v26dbl");
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
@@ -28924,26 +29534,64 @@ mod tests {
         let c = rect.center();
         // Double click = press+release, press+release, at ONE point (the
         // v20 trap: split across points, headless double_clicked is dead).
-        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
-        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        );
         let ed = app.auto_edit.as_ref().unwrap();
         assert_eq!(ed.nodes.len(), 3, "a double-click cycles, never adds");
         assert_eq!(ed.sel, 1);
         // v27: the cycle walks the CONTINUOUS curvature 0 \u{b7} +0.75 \u{b7} -0.75.
-        assert!((ed.nodes[1].c - 0.75).abs() < 1e-6, "dbl-click sets curvature");
+        assert!(
+            (ed.nodes[1].c - 0.75).abs() < 1e-6,
+            "dbl-click sets curvature"
+        );
         // Let egui's double-click window expire, else the click counter
         // climbs to 3 and double_clicked() never fires again.
         for _ in 0..48 {
             frame(&mut app, &ctx, vec![]);
         }
-        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
-        frame(&mut app, &ctx, vec![moved(c), btn(c, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(c, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        );
         let ed = app.auto_edit.as_ref().unwrap();
-        assert!((ed.nodes[1].c + 0.75).abs() < 1e-6, "cycle reaches negative");
+        assert!(
+            (ed.nodes[1].c + 0.75).abs() < 1e-6,
+            "cycle reaches negative"
+        );
         assert_eq!(ed.nodes.len(), 3);
     }
 
@@ -28987,7 +29635,12 @@ mod tests {
     /// Centers of every painted text galley matching `want` (exact or
     /// contains) in paint (= layout) order, in a TALL viewport (v25 cull
     /// trap) with the pointer parked off all rows (hover-text trap).
-    fn galley_centers(app: &mut App, ctx: &egui::Context, want: &str, exact: bool) -> Vec<egui::Pos2> {
+    fn galley_centers(
+        app: &mut App,
+        ctx: &egui::Context,
+        want: &str,
+        exact: bool,
+    ) -> Vec<egui::Pos2> {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -29004,7 +29657,11 @@ mod tests {
             .filter_map(|cs| {
                 if let egui::epaint::Shape::Text(t) = &cs.shape {
                     let txt = t.galley.text();
-                    let hit = if exact { txt == want } else { txt.contains(want) };
+                    let hit = if exact {
+                        txt == want
+                    } else {
+                        txt.contains(want)
+                    };
                     if hit {
                         let local = t.galley.rect;
                         return Some(t.pos + (local.center() - local.min));
@@ -29025,13 +29682,7 @@ mod tests {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         let data: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.1).sin() * 0.4).collect();
-        crate::audio_io::export(
-            &p,
-            48000,
-            &data,
-            crate::audio_io::ExportFormat::Wav,
-        )
-        .unwrap();
+        crate::audio_io::export(&p, 48000, &data, crate::audio_io::ExportFormat::Wav).unwrap();
     }
 
     /// v28 R2/A2: sub-folders become labeled group headers with entry
@@ -29047,8 +29698,14 @@ mod tests {
         v28_wav(&samples, "kit-b/kick.wav");
         app.rack[0].rescan();
         let ctx = egui::Context::default();
-        assert!(!v25_hits(&mut app, &ctx, "kit-a (1)").is_empty(), "kit-a header");
-        assert!(!v25_hits(&mut app, &ctx, "kit-b (3)").is_empty(), "kit-b header");
+        assert!(
+            !v25_hits(&mut app, &ctx, "kit-a (1)").is_empty(),
+            "kit-a header"
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "kit-b (3)").is_empty(),
+            "kit-b header"
+        );
         assert!(
             !v25_hits(&mut app, &ctx, "- kit-a (1)").is_empty(),
             "expanded default shows the '-' collapse marker"
@@ -29073,16 +29730,30 @@ mod tests {
         let h = galley_centers(&mut app, &ctx, "kit-b (2)", false)[0];
         click_pt(&mut app, &ctx, h);
         assert!(!app.rack_collapsed.is_empty(), "header click collapses");
-        assert!(galley_centers(&mut app, &ctx, "snare", true).is_empty(), "collapsed hides rows");
-        assert!(!v25_hits(&mut app, &ctx, "+ kit-b (2)").is_empty(), "collapsed marker");
+        assert!(
+            galley_centers(&mut app, &ctx, "snare", true).is_empty(),
+            "collapsed hides rows"
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "+ kit-b (2)").is_empty(),
+            "collapsed marker"
+        );
         let h2 = galley_centers(&mut app, &ctx, "kit-b (2)", false)[0];
         click_pt(&mut app, &ctx, h2);
         assert!(app.rack_collapsed.is_empty(), "second click expands again");
-        assert_eq!(galley_centers(&mut app, &ctx, "snare", true).len(), 1, "rows return");
+        assert_eq!(
+            galley_centers(&mut app, &ctx, "snare", true).len(),
+            1,
+            "rows return"
+        );
         // A rescan (files on disk unchanged) must not silently re-expand.
-        app.rack_collapsed.insert(format!("{}\u{1}kit-b", app.rack[0].path));
+        app.rack_collapsed
+            .insert(format!("{}\u{1}kit-b", app.rack[0].path));
         app.rack[0].rescan();
-        assert!(galley_centers(&mut app, &ctx, "snare", true).is_empty(), "rescan keeps it collapsed");
+        assert!(
+            galley_centers(&mut app, &ctx, "snare", true).is_empty(),
+            "rescan keeps it collapsed"
+        );
     }
 
     /// v28 A4: a row inside a sub-folder behaves exactly like a root row —
@@ -29097,9 +29768,14 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let p = galley_centers(&mut app, &ctx, "snare", true)[0];
         click_pt(&mut app, &ctx, p);
-        let k = app.sel_asset.expect("sub-folder row click selects an asset");
+        let k = app
+            .sel_asset
+            .expect("sub-folder row click selects an asset");
         assert!(
-            app.assets[k].path.to_string_lossy().contains("kit-b/snare.wav"),
+            app.assets[k]
+                .path
+                .to_string_lossy()
+                .contains("kit-b/snare.wav"),
             "{}",
             app.assets[k].path.display()
         );
@@ -29127,7 +29803,8 @@ mod tests {
         let pa = app.assets[a].path.clone();
         let pb = app.assets[b].path.clone();
         assert!(
-            pa.to_string_lossy().contains("kit-a/kick") && pb.to_string_lossy().contains("kit-b/kick"),
+            pa.to_string_lossy().contains("kit-a/kick")
+                && pb.to_string_lossy().contains("kit-b/kick"),
             "{pa:?} vs {pb:?}"
         );
     }
@@ -29153,13 +29830,15 @@ mod tests {
             "fresh default = samples root, not the 808 pack dir"
         );
         assert!(app.rack[0].err.is_none(), "{:?}", app.rack[0].err);
-        assert!(app
-            .rack[0]
+        assert!(app.rack[0]
             .files
             .iter()
             .any(|f| f.dir == "808" && f.name == "808-kick"));
         let ctx = egui::Context::default();
-        assert!(!v25_hits(&mut app, &ctx, "808 (").is_empty(), "808 group painted");
+        assert!(
+            !v25_hits(&mut app, &ctx, "808 (").is_empty(),
+            "808 group painted"
+        );
     }
 
     // ====================================================== v29 pins
@@ -29184,8 +29863,14 @@ mod tests {
         let p = galley_centers(&mut app, &ctx, "collapse all", true)[0];
         click_pt(&mut app, &ctx, p);
         assert_eq!(app.rack_collapsed.len(), 2, "both groups collapsed");
-        assert!(!v25_hits(&mut app, &ctx, "+ kit-a (1)").is_empty(), "kit-a collapsed");
-        assert!(!v25_hits(&mut app, &ctx, "+ kit-b (1)").is_empty(), "kit-b collapsed");
+        assert!(
+            !v25_hits(&mut app, &ctx, "+ kit-a (1)").is_empty(),
+            "kit-a collapsed"
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "+ kit-b (1)").is_empty(),
+            "kit-b collapsed"
+        );
         let p = galley_centers(&mut app, &ctx, "expand all", true)[0];
         click_pt(&mut app, &ctx, p);
         assert!(app.rack_collapsed.is_empty(), "expand all clears");
@@ -29195,7 +29880,10 @@ mod tests {
         drop(ctx);
         app.save_config();
         let b = App::new(Backend::start());
-        assert_eq!(b.rack_collapsed, app.rack_collapsed, "collapse set restored from config");
+        assert_eq!(
+            b.rack_collapsed, app.rack_collapsed,
+            "collapse set restored from config"
+        );
     }
 
     /// v29: the grouping toggle flips AUDIO/MIDI sections for one
@@ -29213,25 +29901,40 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
         // Default: separated BY TYPE — the section labels exist.
-        assert!(!v25_hits(&mut app, &ctx, "AUDIO").is_empty(), "type view first");
+        assert!(
+            !v25_hits(&mut app, &ctx, "AUDIO").is_empty(),
+            "type view first"
+        );
         let g = galley_centers(&mut app, &ctx, "group: type", true)[0];
         click_pt(&mut app, &ctx, g);
         assert!(app.rack_group_by_dir, "toggle flips the mode");
         // The section label is lowercase "audio"; the per-row badge is
         // uppercase "AUDIO" — only the exact label may disappear.
-        assert!(galley_centers(&mut app, &ctx, "audio", true).is_empty(), "no type sections now");
+        assert!(
+            galley_centers(&mut app, &ctx, "audio", true).is_empty(),
+            "no type sections now"
+        );
         // ONE group header for kit-a holding BOTH kinds.
         let hdrs = v25_hits(&mut app, &ctx, "- kit-a (2)");
         assert_eq!(hdrs.len(), 1, "one mixed-kind group, got {hdrs:?}");
-        assert!(!v25_hits(&mut app, &ctx, "snare").is_empty(), "audio row shown");
-        assert!(!v25_hits(&mut app, &ctx, "loop").is_empty(), "midi row shown");
+        assert!(
+            !v25_hits(&mut app, &ctx, "snare").is_empty(),
+            "audio row shown"
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "loop").is_empty(),
+            "midi row shown"
+        );
         app.save_config();
         let cfgsrc = std::fs::read_to_string(format!(
             "{}/slooper/config.json",
             std::env::var("XDG_CONFIG_HOME").unwrap()
         ))
         .unwrap();
-        assert!(cfgsrc.contains("rack_group_by_dir"), "mode persisted to config");
+        assert!(
+            cfgsrc.contains("rack_group_by_dir"),
+            "mode persisted to config"
+        );
     }
 
     /// v29: right-click a group header, "down" re-orders sub-folders; the
@@ -29252,14 +29955,22 @@ mod tests {
         let h = galley_centers(&mut app, &ctx, "kit-a (1)", false)[0];
         rmb(&mut app, &ctx, h);
         let dn = galley_centers(&mut app, &ctx, "down", true);
-        assert_eq!(dn.len(), 1, "context menu offers exactly one \u{201c}down\u{201d}");
+        assert_eq!(
+            dn.len(),
+            1,
+            "context menu offers exactly one \u{201c}down\u{201d}"
+        );
         click_pt(&mut app, &ctx, dn[0]);
         assert_eq!(
             app.rack_dir_order.first().map(|o| o.dirs.clone()),
             Some(vec!["kit-b".to_string(), "kit-a".to_string()]),
             "kit-a moved down behind kit-b"
         );
-        assert_eq!(app.record_dir(), samples.join("kit-b"), "top folder = recordings");
+        assert_eq!(
+            app.record_dir(),
+            samples.join("kit-b"),
+            "top folder = recordings"
+        );
     }
 
     /// v29: rename from the rack menu renames the FILE on disk, follows
@@ -29343,7 +30054,10 @@ mod tests {
         let d = galley_centers(&mut app, &ctx, "delete file", true)[0];
         click_pt(&mut app, &ctx, d);
         assert!(app.rack_confirm_del.is_some(), "confirm dialog opened");
-        assert!(samples.join("kick.wav").exists(), "nothing deleted before confirm");
+        assert!(
+            samples.join("kick.wav").exists(),
+            "nothing deleted before confirm"
+        );
         let yes = galley_centers(&mut app, &ctx, "Delete", true)[0];
         click_pt(&mut app, &ctx, yes);
         assert!(!samples.join("kick.wav").exists(), "file deleted");
@@ -29368,6 +30082,10 @@ mod tests {
     fn v29_record_button_arms_ticked_sources() {
         let mut app = headless_app("v29recall");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         app.rec_src[0] = RecSrc {
@@ -29390,7 +30108,10 @@ mod tests {
         let p0 = galley_centers(&mut app, &ctx, "STOP", true)
             .into_iter()
             .min_by(|a, b| {
-                (*a - p0).length_sq().partial_cmp(&(*b - p0).length_sq()).unwrap()
+                (*a - p0)
+                    .length_sq()
+                    .partial_cmp(&(*b - p0).length_sq())
+                    .unwrap()
             })
             .expect("the REC button became STOP");
         click_pt(&mut app, &ctx, p0);
@@ -29412,7 +30133,10 @@ mod tests {
         app.save_config();
         let b = App::new(Backend::start());
         assert!(!b.rec_src[2].audio, "source mix restored from config");
-        assert!(b.rec_src[0].audio && b.rec_src[0].midi && b.rec_src[0].auto, "full mix restored");
+        assert!(
+            b.rec_src[0].audio && b.rec_src[0].midi && b.rec_src[0].auto,
+            "full mix restored"
+        );
     }
 
     /// v29: one write-automation take can capture SEVERAL controls — each
@@ -29435,10 +30159,24 @@ mod tests {
         let vol = &app.assets[nb];
         let pan = &app.assets[nb + 1];
         assert!(vol.is_auto() && pan.is_auto());
-        assert_eq!(vol.automation.as_ref().unwrap().target, crate::automation::TARGET_TRACK_VOL);
-        assert_eq!(pan.automation.as_ref().unwrap().target, crate::automation::TARGET_TRACK_PAN);
-        assert!(vol.name.contains("vol"), "clip named after the control: {}", vol.name);
-        assert!(pan.name.contains("pan"), "clip named after the control: {}", pan.name);
+        assert_eq!(
+            vol.automation.as_ref().unwrap().target,
+            crate::automation::TARGET_TRACK_VOL
+        );
+        assert_eq!(
+            pan.automation.as_ref().unwrap().target,
+            crate::automation::TARGET_TRACK_PAN
+        );
+        assert!(
+            vol.name.contains("vol"),
+            "clip named after the control: {}",
+            vol.name
+        );
+        assert!(
+            pan.name.contains("pan"),
+            "clip named after the control: {}",
+            pan.name
+        );
         let placed: Vec<u32> = app.arr.tracks[0]
             .lanes
             .iter()
@@ -29448,7 +30186,10 @@ mod tests {
             .collect();
         assert_eq!(placed.len(), 2, "both clips on track 1: {placed:?}");
         // The files are distinct and each parses back to its own target.
-        for (a, tgt) in [(vol, crate::automation::TARGET_TRACK_VOL), (pan, crate::automation::TARGET_TRACK_PAN)] {
+        for (a, tgt) in [
+            (vol, crate::automation::TARGET_TRACK_VOL),
+            (pan, crate::automation::TARGET_TRACK_PAN),
+        ] {
             let txt = std::fs::read_to_string(&a.path).unwrap();
             let back = crate::automation::Automation::from_json(&txt).unwrap();
             assert_eq!(back.target, tgt);
@@ -29468,7 +30209,11 @@ mod tests {
         app.toggle_record_all(0);
         assert_ne!(app.backend.engine.rec_state_of(0), TR_REC);
         assert!(!app.midi_rec[0].armed && !app.auto_rec[0].armed);
-        assert!(app.status.contains("tick a source"), "hint shown: {}", app.status);
+        assert!(
+            app.status.contains("tick a source"),
+            "hint shown: {}",
+            app.status
+        );
     }
 
     /// v29: the record bindings drive the UNIFIED button now — RecSelected
@@ -29487,7 +30232,11 @@ mod tests {
         app.fire_midi_action(MidiAction::RecSelected);
         assert!(app.midi_rec[1].armed, "MIDI armed via binding");
         assert!(!app.auto_rec[1].armed, "unticked stays off");
-        assert_ne!(app.backend.engine.rec_state_of(1), TR_REC, "audio untouched");
+        assert_ne!(
+            app.backend.engine.rec_state_of(1),
+            TR_REC,
+            "audio untouched"
+        );
         // Stop via the same binding.
         app.fire_midi_action(MidiAction::RecSelected);
         assert!(!app.midi_rec[1].armed, "binding toggles off too");
@@ -29504,7 +30253,11 @@ mod tests {
         app.value_binds.push(crate::config::ValueBind {
             target: crate::automation::TARGET_TRACK_VOL.to_string(),
             track: 0,
-            bind: crate::midi::MidiBind { ty: 1, ch: 0, d1: 20 },
+            bind: crate::midi::MidiBind {
+                ty: 1,
+                ch: 0,
+                d1: 20,
+            },
             kind: 0,
             lo: 0,
             hi: 127,
@@ -29524,7 +30277,10 @@ mod tests {
         // it must sit strictly between the ends.
         assert!(mid > 0 && mid < 127, "mid travel drives mid fader: {mid}");
         let msg = crate::midi::MidiMsg::parse(&[0xB0, 20, 64]).unwrap();
-        assert!(app.midi_msg_is_bound(&msg), "bound CC stays out of MIDI takes");
+        assert!(
+            app.midi_msg_is_bound(&msg),
+            "bound CC stays out of MIDI takes"
+        );
         // Knobs OWN their axis (type + channel) — same-channel CCs on
         // other numbers count too (that is the drift-tolerance design).
         let other = crate::midi::MidiMsg::parse(&[0xB1, 20, 64]).unwrap();
@@ -29543,7 +30299,11 @@ mod tests {
         app.value_binds.push(crate::config::ValueBind {
             target: crate::automation::TARGET_TRACK_PAN.to_string(),
             track: 1,
-            bind: crate::midi::MidiBind { ty: 1, ch: 0, d1: 33 },
+            bind: crate::midi::MidiBind {
+                ty: 1,
+                ch: 0,
+                d1: 33,
+            },
             kind: 1,
             lo: 0,
             hi: 127,
@@ -29556,9 +30316,11 @@ mod tests {
         app.handle_evt(cc(9));
         assert_eq!(app.trk_pan[1], 127, "switch hit applies the maximum");
         let msg = crate::midi::MidiMsg::parse(&[0xB0, 33, 9]).unwrap();
-        assert!(app.midi_msg_is_bound(&msg), "switch claims its exact message");
+        assert!(
+            app.midi_msg_is_bound(&msg),
+            "switch claims its exact message"
+        );
     }
-
 
     /// v29 R5: the drum machine commits its velocity grid to the
     /// arrangement: one lane per pad, one-shot per hit, clip gain =
@@ -29622,7 +30384,10 @@ mod tests {
         // column is the only "x" stack near x=127 (v30: the sound combo
         // and vel slider moved into the kit editor, shifting the column
         // left of the v29 x=393; mixer/rack delete glyphs live far right).
-        let x = x.into_iter().filter(|p| (p.x - 127.0).abs() < 25.0).collect::<Vec<_>>();
+        let x = x
+            .into_iter()
+            .filter(|p| (p.x - 127.0).abs() < 25.0)
+            .collect::<Vec<_>>();
         assert!(x.len() >= 8, "pad rows carry clear buttons, got {x:?}");
         app.drum.grid[0][3] = 55;
         frame(&mut app, &ctx, vec![moved(x[0])]);
@@ -29683,7 +30448,10 @@ mod tests {
         );
         // Kits never bleed into each other.
         assert!(app.kit(0)[2].asset_path.is_empty());
-        assert!(app.kit(2)[0].asset_path.is_empty(), "stock kits stay silent");
+        assert!(
+            app.kit(2)[0].asset_path.is_empty(),
+            "stock kits stay silent"
+        );
         // A5: kits travel through config AND project.
         app.save_config();
         let cfg = crate::config::Config::load();
@@ -29694,7 +30462,11 @@ mod tests {
         assert_eq!(pj.drum_kits[0][0].asset, kick.to_string_lossy());
         app.kit_mut(1).clear();
         app.load_kits(&pj.drum_kits, pj.drum.as_ref());
-        assert_eq!(app.kit(1)[0].asset_path, hat.to_string_lossy(), "project load restores");
+        assert_eq!(
+            app.kit(1)[0].asset_path,
+            hat.to_string_lossy(),
+            "project load restores"
+        );
     }
 
     /// One frame, returning the FILLED NODE DOTS painted for automation
@@ -29739,8 +30511,16 @@ mod tests {
             target: TARGET_TRACK_VOL.to_string(),
             len_samples: 48_000,
             nodes: vec![
-                Node { t: 0, v: 0.0, c: 0.0 },
-                Node { t: 48_000, v: 1.0, c: 0.0 },
+                Node {
+                    t: 0,
+                    v: 0.0,
+                    c: 0.0,
+                },
+                Node {
+                    t: 48_000,
+                    v: 1.0,
+                    c: 0.0,
+                },
             ],
         };
         auto.normalize(0, f32::INFINITY);
@@ -29754,7 +30534,8 @@ mod tests {
             pattern: None,
             automation: Some(std::sync::Arc::new(auto)),
         });
-        app.arr.insert(0, 0, crate::arrange::Clip::new(idx as u32, 0));
+        app.arr
+            .insert(0, 0, crate::arrange::Clip::new(idx as u32, 0));
         frame(&mut app, &ctx, vec![]);
         // The clip paints its name — hover THAT to wake the node dots.
         let clipc = galley_at(&mut app, &ctx, "volride")
@@ -29762,7 +30543,10 @@ mod tests {
             .center();
 
         let dots = node_dots(&mut app, &ctx, vec![moved(clipc)]);
-        assert!(dots.len() >= 2, "hover paints one dot per node, got {dots:?}");
+        assert!(
+            dots.len() >= 2,
+            "hover paints one dot per node, got {dots:?}"
+        );
         let mut dots = dots;
         dots.sort_by(|a, b| a.x.total_cmp(&b.x));
         let right = dots[dots.len() - 1];
@@ -29770,17 +30554,21 @@ mod tests {
         // --- drag the right node left/down ---
         frame(&mut app, &ctx, vec![moved(right)]);
         frame(&mut app, &ctx, vec![moved(right + egui::vec2(2.0, 0.0))]);
-        frame(&mut app, &ctx, vec![btn(right, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![moved(right - egui::vec2(60.0, 0.0))]);
         frame(
             &mut app,
             &ctx,
-            vec![moved(right - egui::vec2(60.0, 25.0))],
+            vec![btn(right, egui::PointerButton::Primary, true)],
         );
+        frame(&mut app, &ctx, vec![moved(right - egui::vec2(60.0, 0.0))]);
+        frame(&mut app, &ctx, vec![moved(right - egui::vec2(60.0, 25.0))]);
         frame(
             &mut app,
             &ctx,
-            vec![btn(right - egui::vec2(60.0, 25.0), egui::PointerButton::Primary, false)],
+            vec![btn(
+                right - egui::vec2(60.0, 25.0),
+                egui::PointerButton::Primary,
+                false,
+            )],
         );
         frame(&mut app, &ctx, vec![]);
         let nd = &app.assets[idx].automation.as_ref().unwrap().nodes;
@@ -29839,8 +30627,16 @@ mod tests {
         let dots3 = node_dots(&mut app, &ctx, vec![moved(strip_mid)]);
         let left = dots3[0];
         frame(&mut app, &ctx, vec![moved(left)]);
-        frame(&mut app, &ctx, vec![btn(left, egui::PointerButton::Secondary, true)]);
-        frame(&mut app, &ctx, vec![btn(left, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(left, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(left, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         let final_n = app.assets[idx].automation.as_ref().unwrap().nodes.len();
         assert_eq!(final_n, after - 1, "RMB over a node deletes it");
@@ -29931,9 +30727,7 @@ mod tests {
         // The sandbox fixture asset arrives via the rack folder scan;
         // make sure one audio asset exists to drag.
         if app.assets.is_empty() {
-            let k = app
-                .ensure_asset(&kick)
-                .expect("sandbox kick.wav imports");
+            let k = app.ensure_asset(&kick).expect("sandbox kick.wav imports");
             assert!(k < app.assets.len());
         }
         let a_idx = app
@@ -29970,7 +30764,11 @@ mod tests {
             .find(|(_, p, _)| *p == 1)
             .map(|(_, _, r)| *r)
             .expect("pad 1 row registered");
-        frame(&mut app, &ctx, vec![moved(pad1.center() + egui::vec2(0.0, 2.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(pad1.center() + egui::vec2(0.0, 2.0))],
+        );
         // Arm the payload the way egui's dnd does under a real drag:
         frame(
             &mut app,
@@ -30057,11 +30855,7 @@ mod tests {
         app.drum.track = 0;
         app.drum_commit();
         assert_eq!(app.arr.tracks[0].lanes[0].clips[0].asset, ik);
-        let total: usize = app.arr.tracks[0]
-            .lanes
-            .iter()
-            .map(|l| l.clips.len())
-            .sum();
+        let total: usize = app.arr.tracks[0].lanes.iter().map(|l| l.clips.len()).sum();
         assert_eq!(total, 1, "only pad 1 (the survivor) commits");
     }
 
@@ -30144,9 +30938,15 @@ mod tests {
         }
         // The parent's own file renders under the parent, and so do the
         // leaf folder + root file.
-        assert!(!galley_centers(&mut app, &ctx, "own", true).is_empty(), "parent own-file row");
+        assert!(
+            !galley_centers(&mut app, &ctx, "own", true).is_empty(),
+            "parent own-file row"
+        );
         assert!(!galley_centers(&mut app, &ctx, "- leaf (1)", false).is_empty());
-        assert!(!galley_centers(&mut app, &ctx, "top", true).is_empty(), "root file row");
+        assert!(
+            !galley_centers(&mut app, &ctx, "top", true).is_empty(),
+            "root file row"
+        );
         // Clicking the parent collapses the WHOLE subtree.
         frame(&mut app, &ctx, vec![moved(parents[0])]);
         click_pt(&mut app, &ctx, parents[0]);
@@ -30160,7 +30960,10 @@ mod tests {
                 "children hide with the parent: {sub}"
             );
         }
-        assert!(galley_centers(&mut app, &ctx, "own", true).is_empty(), "own-file hides with parent");
+        assert!(
+            galley_centers(&mut app, &ctx, "own", true).is_empty(),
+            "own-file hides with parent"
+        );
         // Re-open, then collapse a single child.
         let p2 = galley_centers(&mut app, &ctx, "+ kringel (5)", false)[0];
         frame(&mut app, &ctx, vec![moved(p2)]);
@@ -30169,10 +30972,14 @@ mod tests {
         assert_eq!(wet.len(), 1);
         frame(&mut app, &ctx, vec![moved(wet[0])]);
         click_pt(&mut app, &ctx, wet[0]);
-        assert!(galley_centers(&mut app, &ctx, "- kringel/dry (", false).len() == 1,
-            "sibling child stays open");
-        assert!(galley_centers(&mut app, &ctx, "b", true).is_empty(),
-            "collapsed child's rows are gone");
+        assert!(
+            galley_centers(&mut app, &ctx, "- kringel/dry (", false).len() == 1,
+            "sibling child stays open"
+        );
+        assert!(
+            galley_centers(&mut app, &ctx, "b", true).is_empty(),
+            "collapsed child's rows are gone"
+        );
         // BY-TYPE view carries the same tree (v30: not a flat list).
         app.rack_group_by_dir = false;
         let p3 = {
@@ -30187,8 +30994,14 @@ mod tests {
         click_pt(&mut app, &ctx, p3);
         // Collapse state is shared across the sections and both grouping
         // modes — one key, so every copy of the header flips together.
-        assert_eq!(galley_centers(&mut app, &ctx, "+ kringel (5)", false).len(), 2);
-        assert_eq!(galley_centers(&mut app, &ctx, "- kringel (5)", false).len(), 0);
+        assert_eq!(
+            galley_centers(&mut app, &ctx, "+ kringel (5)", false).len(),
+            2
+        );
+        assert_eq!(
+            galley_centers(&mut app, &ctx, "- kringel (5)", false).len(),
+            0
+        );
     }
 
     /// v30 R3: automation presets are FILES (effect-preset system, same
@@ -30206,9 +31019,16 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         // Factory seed: opening the manager once materialises all nine.
         assert!(dir.exists(), "presets folder seeded");
-        assert_eq!(crate::automation::list_presets().len(), 9, "nine factory files");
+        assert_eq!(
+            crate::automation::list_presets().len(),
+            9,
+            "nine factory files"
+        );
         let lin = crate::automation::Preset::ALL[0].label().to_string();
-        assert!(!galley_centers(&mut app, &ctx, &lin, false).is_empty(), "factory preset painted");
+        assert!(
+            !galley_centers(&mut app, &ctx, &lin, false).is_empty(),
+            "factory preset painted"
+        );
         // The old recorder button is gone (v30 R3).
         assert!(
             galley_centers(&mut app, &ctx, "\u{25cf} record", false).is_empty()
@@ -30230,7 +31050,10 @@ mod tests {
         let sv = galley_centers(&mut app, &ctx, "save curve", false);
         assert!(!sv.is_empty(), "save button painted");
         click_pt(&mut app, &ctx, sv[0]);
-        assert!(crate::automation::list_presets().contains(&"my curve".to_string()), "file saved");
+        assert!(
+            crate::automation::list_presets().contains(&"my curve".to_string()),
+            "file saved"
+        );
         // LOAD: wreck the nodes, click the file, the shape comes back.
         // Round-trip identity: save and load run through the SAME editor
         // range, so the loaded nodes equal the ones that were saved.
@@ -30266,7 +31089,10 @@ mod tests {
         let del = galley_centers(&mut app, &ctx, "delete preset", false);
         assert!(!del.is_empty(), "context menu offers delete");
         click_pt(&mut app, &ctx, del[0]);
-        assert!(!crate::automation::list_presets().contains(&"my curve".to_string()), "file deleted");
+        assert!(
+            !crate::automation::list_presets().contains(&"my curve".to_string()),
+            "file deleted"
+        );
     }
 
     /// v30 R6: the three side windows are free — drag any title bar and
@@ -30300,7 +31126,11 @@ mod tests {
         let cfg_txt = std::fs::read_to_string(crate::config::Config::path()).unwrap_or_default();
         assert!(cfg_txt.contains("\"side_wins\""), "geometry persists");
         let app2 = App::new(Backend::start());
-        assert_eq!(app2.side_wins.dock[0], [1, 0, 0], "dock state survives restart");
+        assert_eq!(
+            app2.side_wins.dock[0],
+            [1, 0, 0],
+            "dock state survives restart"
+        );
     }
 
     #[test]
@@ -30349,7 +31179,10 @@ mod tests {
         }));
         assert!(app.value_learning.is_none(), "listener consumed");
         assert_eq!(app.value_binds.len(), 1, "switch stored");
-        assert_eq!(app.value_binds[0].target, crate::automation::TARGET_TRACK_MUTE);
+        assert_eq!(
+            app.value_binds[0].target,
+            crate::automation::TARGET_TRACK_MUTE
+        );
         assert_eq!(app.value_binds[0].bind.d1, 44);
         app.save_config();
         let b2 = App::new(Backend::start());
@@ -30366,7 +31199,11 @@ mod tests {
         app.value_binds.push(crate::config::ValueBind {
             target: "fx:0:1".into(),
             track: 2,
-            bind: crate::midi::MidiBind { ty: 0, ch: 1, d1: 60 },
+            bind: crate::midi::MidiBind {
+                ty: 0,
+                ch: 1,
+                d1: 60,
+            },
             kind: 0,
             lo: 4,
             hi: 100,
@@ -30397,16 +31234,41 @@ mod tests {
         let top0 = app.grid_anchor - app.vscroll;
         let mid0 = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
         frame(&mut app, &ctx, vec![moved(mid0)]);
-        frame(&mut app, &ctx, vec![moved(mid0), btn(mid0, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(mid0), btn(mid0, egui::PointerButton::Primary, true)],
+        );
         // Drag down past track 0 into track 1's rows.
-        let in_t1 = egui::pos2(250.0, top0 + app.track_h(0) + TRACK_SEP_HIT + app.track_h(1) * 0.5);
+        let in_t1 = egui::pos2(
+            250.0,
+            top0 + app.track_h(0) + TRACK_SEP_HIT + app.track_h(1) * 0.5,
+        );
         frame(&mut app, &ctx, vec![moved(in_t1)]);
-        frame(&mut app, &ctx, vec![moved(in_t1), btn(in_t1, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(in_t1),
+                btn(in_t1, egui::PointerButton::Primary, false),
+            ],
+        );
         frame(&mut app, &ctx, vec![]);
         let ids = clip_ids(&app);
-        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 1).count(), 1, "clip moved to track 1: {ids:?}");
-        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 0).count(), 0, "left track 0");
-        assert!(app.sel_clips.iter().all(|(t, _, _)| *t == 1), "selection followed the track");
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 1).count(),
+            1,
+            "clip moved to track 1: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 0).count(),
+            0,
+            "left track 0"
+        );
+        assert!(
+            app.sel_clips.iter().all(|(t, _, _)| *t == 1),
+            "selection followed the track"
+        );
     }
 
     /// v29: the clip context menu "Move to track" relocates the selection
@@ -30464,10 +31326,18 @@ mod tests {
         click_pt(&mut app, &ctx, lane);
         frame(&mut app, &ctx, vec![]);
         let ids = clip_ids(&app);
-        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 2).count(), 1, "clip now on track 2 (Track 3): {ids:?}");
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 2).count(),
+            1,
+            "clip now on track 2 (Track 3): {ids:?}"
+        );
         assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 0).count(), 0);
         // The live selection follows the moved clip.
-        assert!(app.sel_clips.iter().all(|(t, _, _)| *t == 2), "selection follows: {:?}", app.sel_clips);
+        assert!(
+            app.sel_clips.iter().all(|(t, _, _)| *t == 2),
+            "selection follows: {:?}",
+            app.sel_clips
+        );
     }
 
     /// BUG 3 repro: dragging the mixer volume slider must move the value.
@@ -30483,18 +31353,25 @@ mod tests {
         // galley_at("vol ") first-hit can be the master row).
         let readout = format!("{:>5}", db_num(vol_amp(32u8)));
         let ro = galleys_all(&mut app, &ctx, &readout);
-        assert_eq!(ro.len(), 1, "track-1 readout {readout:?} painted once: {ro:?}");
+        assert_eq!(
+            ro.len(),
+            1,
+            "track-1 readout {readout:?} painted once: {ro:?}"
+        );
         let y = ro[0].y;
         // The slider track is the gray(60) rect in that row's y band.
         let track = {
-            let mut out = ctx.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_max(
-                    egui::Pos2::ZERO,
-                    egui::pos2(1600.0, 1200.0),
-                )),
-                time: Some(test_time()),
-                ..Default::default()
-            }, |ui| app.ui_root(ui));
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::Pos2::ZERO,
+                        egui::pos2(1600.0, 1200.0),
+                    )),
+                    time: Some(test_time()),
+                    ..Default::default()
+                },
+                |ui| app.ui_root(ui),
+            );
             let shapes = out.shapes;
             let mut hits: Vec<egui::Rect> = shapes
                 .iter()
@@ -30520,7 +31397,12 @@ mod tests {
         };
         let p = egui::pos2(track.center().x, track.center().y);
         let master0 = app.master_midi;
-        drag_pt(&mut app, &ctx, p, egui::pos2(track.max.x - 4.0, track.center().y));
+        drag_pt(
+            &mut app,
+            &ctx,
+            p,
+            egui::pos2(track.max.x - 4.0, track.center().y),
+        );
         eprintln!(
             "track rect {track:?} vol {} master {master0} -> {}",
             app.trk_vol[0], app.master_midi
@@ -30529,6 +31411,255 @@ mod tests {
             app.trk_vol[0] > 32,
             "dragging the vol slider right must raise track volume (got {})",
             app.trk_vol[0]
+        );
+    }
+
+    /// v39: the right-button guard on value widgets. Reported bug:
+    /// right-clicking a volume slider opened the value menu AND moved
+    /// the value (egui sliders map ANY button drag to the value). The
+    /// guard reverts changes caused by a non-primary drag — while a
+    /// plain left drag must still work.
+    #[test]
+    fn v39_right_drag_leaves_slider_value() {
+        let mut app = headless_app("v39rmbguard");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.set_trk_vol(0, 32);
+        frame(&mut app, &ctx, vec![]);
+        let readout = format!("{:>5}", db_num(vol_amp(32u8)));
+        let ro = galleys_all(&mut app, &ctx, &readout);
+        assert_eq!(ro.len(), 1, "track-1 readout painted once: {ro:?}");
+        let y = ro[0].y;
+        let track = {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::Pos2::ZERO,
+                        egui::pos2(1600.0, 1200.0),
+                    )),
+                    time: Some(test_time()),
+                    ..Default::default()
+                },
+                |ui| app.ui_root(ui),
+            );
+            let shapes = out.shapes;
+            let mut hits: Vec<egui::Rect> = shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) => {
+                        let c = r.fill;
+                        if c == egui::Color32::from_gray(60)
+                            && r.rect.left() > 900.0
+                            && (r.rect.center().y - y).abs() < 4.0
+                            && r.rect.width() > 30.0
+                        {
+                            Some(r.rect)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+            assert_eq!(hits.len(), 1, "one slider track in the vol row");
+            hits.pop().unwrap()
+        };
+        let p = egui::pos2(track.center().x, track.center().y);
+        // Control FIRST: a primary drag must still move the value.
+        drag_pt(&mut app, &ctx, p, egui::pos2(track.max.x - 4.0, p.y));
+        assert!(
+            app.trk_vol[0] > 32,
+            "primary drag still changes the value (got {})",
+            app.trk_vol[0]
+        );
+        // The reported gesture: right button pressed on the slider,
+        // dragged right, released. The value must not move.
+        let v1 = app.trk_vol[0];
+        let end = egui::pos2(track.max.x - 4.0, p.y);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(p + egui::vec2(1.0, 0.0))]);
+        frame(&mut app, &ctx, vec![moved(end)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(end, egui::PointerButton::Secondary, false)],
+        );
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(
+            app.trk_vol[0], v1,
+            "right-button drag ACROSS the vol slider must not change it (was {v1})"
+        );
+    }
+
+    /// v39: reported conflict — a context menu opens on the slider, then
+    /// the wheel closes/escapes it because the panel underneath scrolls
+    /// while the menu is open. `ui_root` now freezes scroll deltas for
+    /// any frame where a popup is open and the pointer is not over it.
+    #[test]
+    fn v39_wheel_frozen_under_open_menu() {
+        let mut app = headless_app("v39wheel");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let wheel = |dx: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(dx, 0.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let grid = egui::pos2(300.0, 400.0);
+        // Baseline: plain wheel over the grid pans the timeline.
+        let h0 = app.hscroll;
+        frame(&mut app, &ctx, vec![moved(grid)]);
+        frame(&mut app, &ctx, vec![wheel(-10.0)]);
+        // egui smooths wheel deltas over several frames — let the
+        // baseline pan finish before sampling.
+        for _ in 0..10 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            app.hscroll > h0,
+            "baseline: plain wheel pans the grid (hscroll {} -> {})",
+            h0,
+            app.hscroll
+        );
+        // Open the value menu with a right-click on the track-1 volume
+        // slider: anchor on the painted readout, aim at the gray(60)
+        // slider track in that row (same probe as the guard pin).
+        app.set_trk_vol(0, 64);
+        frame(&mut app, &ctx, vec![]);
+        let readout = format!("{:>5}", db_num(vol_amp(64u8)));
+        let ro = galleys_all(&mut app, &ctx, &readout);
+        let y = ro[0].y;
+        let sp = {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_max(
+                        egui::Pos2::ZERO,
+                        egui::pos2(1600.0, 1200.0),
+                    )),
+                    time: Some(test_time()),
+                    ..Default::default()
+                },
+                |ui| app.ui_root(ui),
+            );
+            let shapes = out.shapes;
+            let hits: Vec<egui::Rect> = shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) => {
+                        let c = r.fill;
+                        if c == egui::Color32::from_gray(60)
+                            && r.rect.left() > 900.0
+                            && (r.rect.center().y - y).abs() < 4.0
+                            && r.rect.width() > 30.0
+                        {
+                            Some(r.rect)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+            assert_eq!(hits.len(), 1, "one slider track in the vol row");
+            hits[0].center()
+        };
+        rmb(&mut app, &ctx, sp);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            ctx.any_popup_open() || galley_at(&mut app, &ctx, "Set value").is_some(),
+            "right-click on the slider opened the value menu (status: {})",
+            app.status
+        );
+        let h1 = app.hscroll;
+        // Wheel over the GRID (pointer NOT over the popup) with the menu
+        // open: the panel must not scroll.
+        frame(&mut app, &ctx, vec![moved(grid)]);
+        frame(&mut app, &ctx, vec![wheel(-15.0)]);
+        assert_eq!(
+            app.hscroll, h1,
+            "wheel under an open menu must not scroll the grid"
+        );
+        assert!(
+            ctx.any_popup_open() || galley_at(&mut app, &ctx, "Set value").is_some(),
+            "and the menu stays open"
+        );
+    }
+
+    /// v39: the MASTER OUT section (the full master-metering redo) is
+    /// open by default next to the mixer: title paints and the live
+    /// LUFS/LRA readout rows paint even before any audio ran.
+    #[test]
+    fn v39_master_out_panel_paints_by_default() {
+        let mut app = headless_app("v39master");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        assert!(app.show_master, "MASTER OUT open by default");
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            galley_at(&mut app, &ctx, "MASTER OUT").is_some(),
+            "MASTER OUT title paints"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "LRA").is_some(),
+            "the loudness-range readout row paints"
+        );
+        // The panel is a first-class DYNAMIC dock window: four static
+        // docks + MASTER OUT — and it arrives DOCKED (right edge, order
+        // 1, beside the mixer's order 0), not floating over the grid.
+        assert_eq!(win_count(&app), 5, "MASTER OUT registered as dynamic dock");
+        assert!(is_docked(&app, 4), "MASTER OUT docks out of the box");
+        assert_eq!(app.dyn_wins[0].dock, [1, 1, 1], "right edge, order 1");
+    }
+
+    /// v39: the LIVE metering path end to end: RT-side tap ring →
+    /// `App::update` drain → LUFS numbers painted in the MASTER OUT
+    /// panel. A 1 kHz sine at -20 dBFS must show "-20.0".
+    #[test]
+    fn v39_live_ring_drain_paints_lufs() {
+        use eframe::App as _;
+        let mut app = headless_app("v39live");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.sample_rate = 48_000;
+        let mut f = eframe::Frame::_new_kittest();
+        // Two 1-second blocks of -20 dBFS 1 kHz stereo, drained between
+        // (the ring holds 1.36 s; integrated needs ~1.6 s total).
+        let mut blk = Vec::with_capacity(2 * 48_000);
+        for i in 0..48_000 {
+            let s = 0.1f32 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0).sin();
+            blk.push(s);
+            blk.push(s);
+        }
+        for _ in 0..2 {
+            assert!(app.backend.meter.write(&blk) > 0);
+            for _ in 0..12 {
+                app.logic(&ctx, &mut f);
+            }
+        }
+        // The integrated/LRA snapshot runs behind a 250 ms throttle.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        app.logic(&ctx, &mut f);
+        let i = app.meter_i.expect("integrated loudness computed from tone");
+        assert!(
+            (i - (-20.0)).abs() < 0.5,
+            "live path integrated reads {i} for -20 dBFS"
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "-20.0").is_some(),
+            "the LUFS readout row paints the live number"
         );
     }
 
@@ -30541,7 +31672,10 @@ mod tests {
         // run frames so grid_anchor settles
         for _ in 0..3 {
             let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 853.0))),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
                 time: Some(test_time()),
                 ..Default::default()
             };
@@ -30552,7 +31686,10 @@ mod tests {
         }
         // one more frame, collecting shapes this time
         let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 853.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
             time: Some(test_time()),
             ..Default::default()
         };
@@ -30572,14 +31709,21 @@ mod tests {
         // hlines are painted via add(stroke) -> Line segment shape
         for c in &out.shapes {
             if let egui::Shape::LineSegment { points, stroke } = &c.shape {
-                if stroke.color == Color32::from_gray(48) && (points[0].y - points[1].y).abs() < 0.01 {
+                if stroke.color == Color32::from_gray(48)
+                    && (points[0].y - points[1].y).abs() < 0.01
+                {
                     hair.push(points[0].y);
                 }
             }
         }
         lanes.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
         hair.sort_by(|a, b| a.total_cmp(b));
-        eprintln!("grid_anchor={} vscroll={} track_h0={}", app.grid_anchor, app.vscroll, app.track_h(0));
+        eprintln!(
+            "grid_anchor={} vscroll={} track_h0={}",
+            app.grid_anchor,
+            app.vscroll,
+            app.track_h(0)
+        );
         eprintln!("lane rects: {:?}", lanes);
         eprintln!("mixer hairlines: {:?}", hair);
         // predicted
@@ -30705,7 +31849,11 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
         let slot = MidiAction::idx(MidiAction::VolMaster);
-        app.midi_binds[slot] = Some(MidiBind { ty: 1, ch: 0, d1: 41 });
+        app.midi_binds[slot] = Some(MidiBind {
+            ty: 1,
+            ch: 0,
+            d1: 41,
+        });
         // Exact CC 41.
         app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
             bytes: vec![0xB0, 41, 66],
@@ -30744,6 +31892,10 @@ mod tests {
     fn v32_mixer_state_swaps_do_not_reflow() {
         let mut app = headless_app("v32reflow");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -30811,7 +31963,12 @@ mod tests {
             let name = ["ASSET RACK", "MIDI BINDINGS", "MIDI MONITOR", "MIXER"][idx];
             let t = galley_at(&mut app, &ctx, name).expect("dock header");
             let vp = ctx.viewport_rect();
-            drag_pt(&mut app, &ctx, t.center(), egui::pos2(700.0, vp.max.y - 20.0));
+            drag_pt(
+                &mut app,
+                &ctx,
+                t.center(),
+                egui::pos2(700.0, vp.max.y - 20.0),
+            );
             for _ in 0..3 {
                 frame(&mut app, &ctx, vec![]);
             }
@@ -30828,7 +31985,12 @@ mod tests {
         // Grab the strip's top divider (a hair BELOW the strip top so the
         // panel resize handle, not the canvas, owns the press) and pull up.
         let x = ctx.viewport_rect().center().x;
-        drag_pt(&mut app, &ctx, egui::pos2(x, strip_top + 1.0), egui::pos2(x, strip_top - 260.0));
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(x, strip_top + 1.0),
+            egui::pos2(x, strip_top - 260.0),
+        );
         for _ in 0..5 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -30920,7 +32082,10 @@ mod tests {
         let mut rects = painted_rects(&mut app, &ctx, body);
         rects.retain(|r| r.width() > 40.0);
         rects.sort_by(|a, b| {
-            a.min.y.total_cmp(&b.min.y).then(a.min.x.total_cmp(&b.min.x))
+            a.min
+                .y
+                .total_cmp(&b.min.y)
+                .then(a.min.x.total_cmp(&b.min.x))
         });
         assert!(rects.len() >= 4, "clips painted across lanes: {rects:?}");
         // lane 0's first clip (leftmost of the lowest y band) + the only
@@ -30937,7 +32102,9 @@ mod tests {
         // Shift+click the child-lane clip sitting at 120 k.
         click_mod(&mut app, &ctx, hit.center(), egui::Modifiers::SHIFT);
         let want: std::collections::BTreeSet<(usize, usize, usize)> =
-            [(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 1, 0)].into_iter().collect();
+            [(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 1, 0)]
+                .into_iter()
+                .collect();
         let got: std::collections::BTreeSet<(usize, usize, usize)> =
             app.sel_clips.iter().copied().collect();
         assert_eq!(got, want, "run spans lanes: {:?}", app.sel_clips);
@@ -30958,7 +32125,14 @@ mod tests {
             ..Clip::new(a, 0)
         };
         app.arr.insert(0, 0, short);
-        app.arr.insert(3, 0, Clip { pos: 90_000, ..short });
+        app.arr.insert(
+            3,
+            0,
+            Clip {
+                pos: 90_000,
+                ..short
+            },
+        );
         frame(&mut app, &ctx, vec![]);
         let body = {
             let c = COL_CLIP.linear_multiply(0.45);
@@ -31002,7 +32176,10 @@ mod tests {
         let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
         click_pt(&mut app, &ctx, p);
         rmb(&mut app, &ctx, p);
-        assert!(!v25_hits(&mut app, &ctx, "Cut").is_empty(), "clip menu open");
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu open"
+        );
         let mv = galley_centers(&mut app, &ctx, "Move to track", false);
         click_pt(&mut app, &ctx, mv[0]);
         let t3 = galley_centers(&mut app, &ctx, "Track 3", true);
@@ -31062,10 +32239,7 @@ mod tests {
         drag_pt(&mut app, &ctx, from, to);
         let ids = clip_ids(&app);
         let on_child = ids.iter().any(|(t, k, _, _)| *t == 2 && *k == 1);
-        assert!(
-            on_child,
-            "clip dropped onto track 3's CHILD lane: {ids:?}",
-        );
+        assert!(on_child, "clip dropped onto track 3's CHILD lane: {ids:?}",);
     }
 
     /// v34 R6: the mixer follows the grid's vertical rhythm ONLY while
@@ -31151,7 +32325,11 @@ mod tests {
         app.status_at = std::time::Instant::now();
         app.applied = Some((1, 2));
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(v25_hits(&mut app, &ctx, "saved project").len(), 1, "fresh notice shows");
+        assert_eq!(
+            v25_hits(&mut app, &ctx, "saved project").len(),
+            1,
+            "fresh notice shows"
+        );
         // Mid-fade (9 s): still readable — fading, not gone.
         app.status_at -= std::time::Duration::from_secs(9);
         assert_eq!(
@@ -31219,10 +32397,18 @@ mod tests {
             std::sync::Arc::new(app.arr.clone()),
             app.total_len(),
         );
-        app.backend.engine.set_midi_assets(std::sync::Arc::new(Vec::new()));
-        app.backend.engine.set_auto_assets(std::sync::Arc::new(Vec::new()));
+        app.backend
+            .engine
+            .set_midi_assets(std::sync::Arc::new(Vec::new()));
+        app.backend
+            .engine
+            .set_auto_assets(std::sync::Arc::new(Vec::new()));
         let out = app.backend.engine.render_project().expect("render a");
-        assert_eq!(hits(&out), vec![9600, 12000, 14399], "clip placement must be exact");
+        assert_eq!(
+            hits(&out),
+            vec![9600, 12000, 14399],
+            "clip placement must be exact"
+        );
 
         // (b) transport moved: the EXPORT must still render from the
         // PROJECT start — and via the off-thread worker on the CURRENT
@@ -31245,7 +32431,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(app.status.contains("exported"), "status was: {}", app.status);
+        assert!(
+            app.status.contains("exported"),
+            "status was: {}",
+            app.status
+        );
         // Parse the PCM16 WAV directly (44-byte canonical header).
         let bytes = std::fs::read(&wav).expect("wav bytes");
         let mut got = Vec::with_capacity((bytes.len() - 44) / 2);
@@ -31257,7 +32447,6 @@ mod tests {
             [9600, 12000, 14399],
             "the WAV must start at the PROJECT start, not the transport"
         );
-
     }
 
     // ---- v37 R5: recording rework ------------------------------------
@@ -31291,13 +32480,7 @@ mod tests {
         // 2.5 s after arming, not a whole bar of anything:
         app.backend.engine.force_pos(5 * sr / 2);
         app.toggle_midi_rec(sel);
-        let pat = app
-            .assets
-            .last()
-            .unwrap()
-            .pattern
-            .clone()
-            .expect("pattern");
+        let pat = app.assets.last().unwrap().pattern.clone().expect("pattern");
         assert_eq!(
             pat.len_samples(rate),
             5 * sr / 2,
@@ -31433,6 +32616,10 @@ mod tests {
     fn v37_dock_reorder_lands_in_the_middle_slot() {
         let mut app = headless_app("v37dockord");
         let ctx = egui::Context::default();
+
+        // v39: MASTER OUT docks on the right by default and is a
+        // layout change these older geometry pins predate; close it.
+        app.show_master = false;
         app.side_wins.dock[1] = [1, 2, 0]; // BINDINGS, bottom, left
         app.side_wins.dock[2] = [1, 2, 1]; // MONITOR, bottom, middle
         app.side_wins.dock[3] = [1, 2, 2]; // MIXER, bottom, right
@@ -31440,11 +32627,7 @@ mod tests {
         app.show_midi = true;
         app.show_mixer = true;
         frame(&mut app, &ctx, vec![]);
-        let (r1, r2, r3) = (
-            app.dock_rects[1],
-            app.dock_rects[2],
-            app.dock_rects[3],
-        );
+        let (r1, r2, r3) = (app.dock_rects[1], app.dock_rects[2], app.dock_rects[3]);
         assert!(
             r1[2] > 8.0 && r2[2] > 8.0 && r3[2] > 8.0,
             "all three docked panels painted"
@@ -31471,7 +32654,10 @@ mod tests {
             &ctx,
             vec![moved(dst), btn(dst, egui::PointerButton::Primary, false)],
         );
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 2, "stays in the bottom dock");
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 2,
+            "stays in the bottom dock"
+        );
         assert_eq!(dock_order(&app, 1), 0, "bindings stays leftmost");
         assert_eq!(dock_order(&app, 3), 1, "mixer landed in the MIDDLE slot");
         assert_eq!(dock_order(&app, 2), 2, "monitor pushed right");

@@ -422,6 +422,7 @@ extern "C" fn tr_slider(
     let br = unsafe { &mut *(ctx as *mut Bridge) };
     let rect = br.rect(x, y, w, if h < 14.0 { 18.0 } else { h });
     let mut v = unsafe { *value };
+    let before = v;
     let mut sl = Slider::new(&mut v, min..=max).show_value(false);
     if curve <= 0.0 && min > 0.0 {
         sl = sl.logarithmic(true);
@@ -440,7 +441,8 @@ extern "C" fn tr_slider(
         br.ui.input(|i| {
             (
                 i.pointer.button_clicked(egui::PointerButton::Secondary),
-                i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary),
             )
         })
     } else {
@@ -457,7 +459,7 @@ extern "C" fn tr_slider(
     if r.double_clicked() || dbl {
         br.note_dbl(&label, v);
     }
-    if r.changed() {
+    if crate::ui::p_changed(&r, before, &mut v) {
         unsafe { *value = v.clamp(min, max) };
         1
     } else {
@@ -1004,6 +1006,7 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
         .show(ui, |ui| {
             for (k, p) in ed.desc.params.iter().enumerate() {
                 let mut v = ed.inst.param(k);
+                let before = v;
                 let mut sl = Slider::new(&mut v, p.min..=p.max);
                 if p.min > 0.0 && p.max / p.min > 50.0 {
                     sl = sl.logarithmic(true);
@@ -1017,7 +1020,8 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                     ui.input(|i| {
                         (
                             i.pointer.button_clicked(egui::PointerButton::Secondary),
-                            i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                            i.pointer
+                                .button_double_clicked(egui::PointerButton::Primary),
                         )
                     })
                 } else {
@@ -1035,7 +1039,7 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 }
                 ui.label(&p.label);
                 ui.label(RichText::new(format!("{v:.2}")).monospace().small());
-                if r.changed() {
+                if crate::ui::p_changed(&r, before, &mut v) {
                     ed.inst.set_param(k, v);
                     ed.pending.push((k, v));
                 }

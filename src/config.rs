@@ -90,17 +90,15 @@ fn default_drum_sub() -> u32 {
 /// v30 R1: the stock drum kit (pattern builder default): 8 silent pads
 /// with FL-flavoured names. An empty saved kit entry always means THIS.
 pub fn default_drum_kit() -> Vec<DrumPadSave> {
-    [
-        "Kick", "Snare", "Hat", "Open", "Clap", "Tom", "Cow", "Perc",
-    ]
-    .iter()
-    .map(|n| DrumPadSave {
-        name: n.to_string(),
-        asset: String::new(),
-        vel: 100,
-        muted: false,
-    })
-    .collect()
+    ["Kick", "Snare", "Hat", "Open", "Clap", "Tom", "Cow", "Perc"]
+        .iter()
+        .map(|n| DrumPadSave {
+            name: n.to_string(),
+            asset: String::new(),
+            vel: 100,
+            muted: false,
+        })
+        .collect()
 }
 
 /// Axis calibration for one continuous (knob/slider) binding slot: the raw
@@ -182,8 +180,16 @@ pub fn b64_encode(v: &[u8]) -> String {
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         s.push(B64_T[(n >> 18 & 63) as usize] as char);
         s.push(B64_T[(n >> 12 & 63) as usize] as char);
-        s.push(if c.len() > 1 { B64_T[(n >> 6 & 63) as usize] as char } else { '=' });
-        s.push(if c.len() > 2 { B64_T[(n & 63) as usize] as char } else { '=' });
+        s.push(if c.len() > 1 {
+            B64_T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        s.push(if c.len() > 2 {
+            B64_T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     s
 }
@@ -253,7 +259,11 @@ pub struct DynDock {
 
 impl Default for DynDock {
     fn default() -> Self {
-        DynDock { kind: String::new(), dock: [0, 1, 0], rect: [0.0; 4] }
+        DynDock {
+            kind: String::new(),
+            dock: [0, 1, 0],
+            rect: [0.0; 4],
+        }
     }
 }
 
@@ -463,7 +473,7 @@ pub struct Config {
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
     pub fx_dir: String,
-        /// Per-track effect chains (legacy format, pre-VST-in-chain).
+    /// Per-track effect chains (legacy format, pre-VST-in-chain).
     /// only when `track_chain` is absent; saves write `track_chain` only.
     #[serde(default)]
     pub track_fx: Vec<Vec<TrackFxSave>>,
@@ -935,7 +945,10 @@ mod tests {
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back.shortcuts, cfg.shortcuts);
         assert_eq!(back.midi, cfg.midi);
-        assert_eq!(back.dyn_docks, cfg.dyn_docks, "v35 dynamic dock state round-trips");
+        assert_eq!(
+            back.dyn_docks, cfg.dyn_docks,
+            "v35 dynamic dock state round-trips"
+        );
         assert!((back.gui_scale - 1.25).abs() < f32::EPSILON);
         assert!((back.latency_ms - 12.5).abs() < f32::EPSILON);
         assert_eq!(back.metro_bpm, 96);
@@ -1056,7 +1069,10 @@ mod tests {
         assert_eq!(b64_decode(&enc).unwrap(), raw);
         assert_eq!(b64_encode(&[]), "");
         assert_eq!(b64_decode("").unwrap(), Vec::<u8>::new());
-        assert!(b64_decode("!!!").is_none(), "garbage is rejected, not trusted");
+        assert!(
+            b64_decode("!!!").is_none(),
+            "garbage is rejected, not trusted"
+        );
     }
 
     /// v23 pin: the editor crash-guard cache (path → (mtime, safe))
@@ -1097,13 +1113,21 @@ mod tests {
         assert!(j.contains("\"CLAP\""), "{j}");
         let back: ChainSave = serde_json::from_str(&j).unwrap();
         match back {
-            ChainSave::Vst { kind, plugin_id, state, .. } => {
+            ChainSave::Vst {
+                kind,
+                plugin_id,
+                state,
+                ..
+            } => {
                 assert_eq!(kind, "CLAP");
                 assert_eq!(
                     plugin_id.as_deref(),
                     Some("com.azuriteid.camshaft.comppressor")
                 );
-                assert_eq!(state.as_deref().and_then(b64_decode), Some(b"F1 0.25".to_vec()));
+                assert_eq!(
+                    state.as_deref().and_then(b64_decode),
+                    Some(b"F1 0.25".to_vec())
+                );
             }
             _ => panic!("variant lost"),
         }

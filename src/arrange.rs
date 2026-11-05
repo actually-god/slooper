@@ -432,8 +432,14 @@ mod tests {
         assert_eq!((r.pos, r.pre_pad, r.cut, r.end(alen)), (1300, 500, 0, 6800));
         // Split in the AUDIO: pad stays left, right continues the source.
         let (l, r) = c.split_at(3000, alen).unwrap();
-        assert_eq!((l.pre_pad, l.play_len, l.end(alen)), (800, Some(1200), 3000));
-        assert_eq!((r.pos, r.pre_pad, r.cut, r.end(alen)), (3000, 0, 1200, 6800));
+        assert_eq!(
+            (l.pre_pad, l.play_len, l.end(alen)),
+            (800, Some(1200), 3000)
+        );
+        assert_eq!(
+            (r.pos, r.pre_pad, r.cut, r.end(alen)),
+            (3000, 0, 1200, 6800)
+        );
         // Re-joined, the right half still ends where the source ends.
         assert_eq!(r.end(alen), 1800 + 5000 - 1200 + 1200);
     }
