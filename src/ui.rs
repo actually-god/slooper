@@ -15491,7 +15491,10 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
     let scanning = !app.vst_scanned || app.vst_scan_rx.is_some();
     egui::ScrollArea::vertical()
         .id_salt(("synthpicklist", t))
-        .max_height(190.0)
+        // Tier 2 grew the stock synth list (8 scripts + plugins); 190 px
+        // hid the plugin rows below the fold. The window itself is still
+        // resizable and the area keeps scrolling past ~14 rows.
+        .max_height(340.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let full_w = ui.available_width();
