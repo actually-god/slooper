@@ -39,7 +39,7 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Frequency Shifter | SSB shift (metallic/vibrato) | `shifter.rs` | done |
 | Transient Processor, Transmitter (split lite) | transient/sustain shaping | `transient.rs` | done |
 | Fruity Vocoder, Vocodex | vocoder (SC carrier feed) | `vocoder.rs` | done |
-| Convolver | impulse reverb | `convolver.rs` | later (IR-folder capability: scan `~/.local/share/slooper/impulses`, param picks index) |
+| Convolver | impulse reverb | `convolver.rs` | done (partitioned overlap-save FFT, **folder IR capability** — `~/.local/share/slooper/impulses`, env override, index 0 = built-in hall) |
 | Multiband Delay | split echo | `echo3` + `multiband` chain | later (chainable today) |
 | Spreader, Stereo Enhancer, Stereo Shaper, PanOMatic pan, Flangus stereo, ping-pong delays | stereo width/image | — | later (**stereo-buffers capability**, see below) |
 | Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | — | later (pitch-detect capability) |
@@ -59,12 +59,12 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Drumpad, FPC, Fruity Kick, BassDrum, DrumSynth Live | drums | `drums.rs` | done |
 | (pad bank), Harmless pads role | pads | `pad.rs` | done |
 | DirectWave (player), Channel Sampler, SoundFont Player, FLEX (playback role), Slicex (playback) | sampling | `sampler.rs` (+ sfizz/VST hosting for SF2) | done |
-| 3x OSC, SimSynth, PoiZone, BooBass, MiniSynth | subtractive workhorse synth | `tri_osc.rs` (synth API) | later (next tier) |
-| Sytrus, Fruity DX10, part of Toxic Biohazard | FM | `fm.rs` | later |
-| Harmor, Morphine, Ogun | additive | `additive.rs` | later |
-| Plucked!, Sakura | plucked string model (Karplus–Strong) | `pluck.rs` | later |
-| Transistor Bass | 303-style bass | `tri_osc.rs` presets | later |
-| Fruity Granulizer | granular | `granular.rs` | later |
+| 3x OSC, SimSynth, PoiZone, BooBass, MiniSynth, Sawer, Kepler Exo, GMS | subtractive workhorse synth | `tri_osc.rs` | done (waveforms + detune + sub + 24 dB env filter + glide; Transistor Bass role via presets) |
+| Transistor Bass | 303-style bass | `tri_osc.rs` presets | done (saw + high fenv + resonance + glide) |
+| Sytrus, Fruity DX10, part of Toxic Biohazard | FM | `fm.rs` | done (2-op + feedback + dual envs + sub) |
+| Harmor, Morphine, Ogun, Harmless | additive | `additive.rs` | later (next tier; engine design done: partial bank + morph tables) |
+| Plucked!, Sakura | plucked string model (Karplus–Strong) | `pluck.rs` | done (fractional-delay KS, pick comb, body, stiffness) |
+| Fruity Granulizer, BeepMap (texture role) | granular | `granular.rs` | done (rack-asset grain clouds, notes = playheads) |
 | FLEX, GMS, Kepler, Drumaxx, Harmor et al. (content depth) | preset factories | script presets + hosted Vitalium/Dexed/Geonkick/sfizz set | host |
 
 ## Capability log (ABI / engine)
@@ -83,20 +83,41 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
 4. **Control-rate OUT** (an effect publishing a CV lane the automation
    system can bind) — Peak/Envelope/Formula-controller duties.
 5. **Block (vector) process** — CPU headroom for vocoder/multiband tiers.
-6. **File pickers** (or fixed-folder scan) — Convolver IR selection.
+6. **File pickers** (or fixed-folder scan) — **SHIPPED tier 2 by the
+   convolver**: scripts may scan a fixed data folder in `create()`
+   (never `process`) and read env overrides — the convention is
+   `$SLOOPER_IMPULSES_DIR` > `$XDG_DATA_HOME/slooper/impulses` >
+   `~/.local/share/slooper/impulses`, folder + README auto-created on
+   first use, everything parsed/precomputed at create so `process`
+   stays allocation-free. Same recipe works for future wavetable/preset
+   folders.
+7. **Additive partial bank** (tier 3 design, no ABI change needed):
+   per-voice table of N harmonic oscillators + two morph level tables +
+   per-partial decay tilt covers Harmor/Morphine/Ogun/Harmless.
 
 ## Development cycle notes
 - Bundle path: add `effects/<name>.rs` → register in `fx::EXAMPLES`
   (`src/fx.rs`) → the two `stems()` test lists now DERIVE from `EXAMPLES`
   (was a hard-coded-list trap pre-2026-11-05). `seed_api` adds missing
   stock scripts to existing installs, backs up stale ones to `.bak`.
+  Synths: add `synths/<name>.rs` (stamp `// slooper-synth-version: N`
+  line 2) → register in `synth::BUNDLED`; the
+  `all_bundled_synths_render_sound` gate DERIVES from `BUNDLED`
+  (tier-2 rule: bundling = covered, mirrors the effect side).
 - Verification per plugin: standalone `rustc --edition 2021 --crate-type
-  cdylib` clean, then `cargo test fx::` — the real loader compiles/loads
+  cdylib -C opt-level=2` clean (that IS the app's command for scripts),
+  then `cargo test fx::` — the real loader compiles/loads
   every bundle; `bundled_effects_produce_sound` renders a fixed fixture
   (tone + percussive bursts) through every bundled effect and asserts
   finite / in-range / non-silent output (plus a live-key pass over the
   v2 sidechain path). Special surfaces pin in
   `bundled_examples_load_with_custom_guis` (waveshaper curve GUI,
   vocoder = second stock ABI-v2, v1 effects stay GUI/sidechain-free).
+- Tier-2 patterns (2026-11-05): FFT scripts work (radix-2 + precomputed
+  tables, ~600 flops/sample under opt-level=2) — but NORMALIZE
+  convolution IRs by ENERGY not peak (a peak-normalized 1.2 s noise IR
+  is ~20× too hot; the produce_sound gate caught peak 12.7). Trap:
+  `usize::to_le_bytes()` is EIGHT bytes — binary-format writers must
+  cast to u32 first.
 - Live test: boot the freshly built binary on the X display and capture
   the Effects window (all rows valid), plus one loaded-chain screenshot.
