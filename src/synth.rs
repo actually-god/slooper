@@ -35,6 +35,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("tri_osc.rs", include_str!("../synths/tri_osc.rs")),
     ("fm.rs", include_str!("../synths/fm.rs")),
     ("pluck.rs", include_str!("../synths/pluck.rs")),
+    ("granular.rs", include_str!("../synths/granular.rs")),
     ("sampler.rs", include_str!("../synths/sampler.rs")),
     // Attribution for the piano samples (TimGM6mb, GPL-2); the registry
     // only compiles *.rs, so this rides along as documentation.
@@ -840,7 +841,7 @@ mod tests {
             assert!(tail < 1e-3, "{stem} all_off must stop new sound (tail {tail})");
             tested += 1;
         }
-        assert!(tested >= 7, "expected 7 bundled synths, tested {tested}");
+        assert!(tested >= 8, "expected 8 bundled synths, tested {tested}");
     }
 
     /// v0.8 item 2: "the sampler doesn't currently work" — beyond making
