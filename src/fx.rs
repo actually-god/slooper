@@ -72,6 +72,21 @@ pub const EXAMPLES: &[(&str, &str)] = &[
         "sidechain_comp.rs",
         include_str!("../effects/sidechain_comp.rs"),
     ),
+    // FL Studio suite tier 1 (docs/FL-SUITE.md), added 2026-11-05.
+    ("overdrive.rs", include_str!("../effects/overdrive.rs")),
+    ("waveshaper.rs", include_str!("../effects/waveshaper.rs")),
+    ("crush.rs", include_str!("../effects/crush.rs")),
+    ("goodizer.rs", include_str!("../effects/goodizer.rs")),
+    ("limiter.rs", include_str!("../effects/limiter.rs")),
+    ("multiband.rs", include_str!("../effects/multiband.rs")),
+    ("vfilter.rs", include_str!("../effects/vfilter.rs")),
+    ("phaser.rs", include_str!("../effects/phaser.rs")),
+    ("flanger.rs", include_str!("../effects/flanger.rs")),
+    ("gater.rs", include_str!("../effects/gater.rs")),
+    ("echo3.rs", include_str!("../effects/echo3.rs")),
+    ("shifter.rs", include_str!("../effects/shifter.rs")),
+    ("transient.rs", include_str!("../effects/transient.rs")),
+    ("vocoder.rs", include_str!("../effects/vocoder.rs")),
 ];
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
@@ -1702,6 +1717,21 @@ mod tests {
             reg.gui("template").is_none(),
             "template keeps the auto slider window"
         );
+        // FL-suite tier: the waveshaper carries the draggable-curve GUI,
+        // and the vocoder is the second stock ABI-v2 (sidechain) effect.
+        assert!(
+            reg.gui("waveshaper").is_some(),
+            "waveshaper must expose its curve editor GUI"
+        );
+        assert!(
+            reg.desc("vocoder").unwrap().sidechain,
+            "vocoder must load through the v2 entry"
+        );
+        assert!(!reg.desc("overdrive").unwrap().sidechain, "overdrive is v1");
+        assert!(
+            reg.gui("overdrive").is_none(),
+            "auto slider window covers overdrive"
+        );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2405,16 +2435,17 @@ mod tests {
         std::fs::write(dir.join(TEMPLATE_FILE), TEMPLATE_SRC).unwrap();
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
+        // Expected rows DERIVE from the bundle — a hard-coded list once
+        // silently demanded an edit for every new stock effect.
+        let mut want: Vec<String> = EXAMPLES
+            .iter()
+            .map(|(n, _)| n.trim_end_matches(".rs").to_string())
+            .collect();
+        want.push("template".to_string());
+        want.sort();
         assert_eq!(
             reg.stems(),
-            vec![
-                "chorus".to_string(),
-                "compressor".to_string(),
-                "parametric_eq".to_string(),
-                "sidechain_comp".to_string(),
-                "space_echo".to_string(),
-                "template".to_string(),
-            ],
+            want,
             "errors: {:?}",
             reg.items().iter().map(|i| &i.error).collect::<Vec<_>>()
         );
@@ -2577,17 +2608,13 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             std::fs::remove_dir_all(&dir).ok();
             return;
         }
-        assert_eq!(
-            reg.stems(),
-            vec![
-                "chorus".to_string(),
-                "compressor".to_string(),
-                "ok".to_string(),
-                "parametric_eq".to_string(),
-                "sidechain_comp".to_string(),
-                "space_echo".to_string(),
-            ]
-        );
+        let mut want: Vec<String> = EXAMPLES
+            .iter()
+            .map(|(n, _)| n.trim_end_matches(".rs").to_string())
+            .collect();
+        want.push("ok".to_string());
+        want.sort();
+        assert_eq!(reg.stems(), want);
         let errs: HashMap<_, _> = reg
             .items()
             .iter()
@@ -3074,5 +3101,69 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn bundled_effects_produce_sound() {
+        // Headless "did it actually change audio" gate for the FL-suite
+        // tier (docs/FL-SUITE.md): every bundled effect runs a fixed
+        // fixture (tone + percussive bursts) through the REAL loader as a
+        // private instance at default params. Output must stay finite and
+        // in range, and must not be silent — the compile+load tests prove
+        // validity; this proves audible intent.
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("render");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let sr = 44100.0f64;
+        let n = 22050usize;
+        let fixture: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let env = if i < n / 4 { 0.9 } else { 0.3 };
+                env * (core::f32::consts::TAU * 220.0 * t).sin()
+                    + if i % 7350 < 300 {
+                        0.5 * (core::f32::consts::TAU * 4400.0 * t).sin()
+                    } else {
+                        0.0
+                    }
+            })
+            .collect();
+        for (name, _) in EXAMPLES {
+            let stem = name.trim_end_matches(".rs");
+            let inst = reg
+                .create_instance(stem, sr, &[])
+                .unwrap_or_else(|| panic!("{stem}: no instance"));
+            let mut peak = 0.0f32;
+            let mut energy = 0.0f64;
+            for &x in &fixture {
+                let y = inst.process_private(x);
+                assert!(y.is_finite(), "{stem}: produced {y}");
+                peak = peak.max(y.abs());
+                energy += (y as f64) * (y as f64);
+            }
+            let rms = (energy / n as f64).sqrt();
+            assert!(peak <= 4.0, "{stem}: peak {peak} out of range");
+            assert!(
+                rms > 1e-5,
+                "{stem}: silent output at default params (rms {rms})"
+            );
+            drop(inst);
+        }
+        // Sidechain path: the v2 entry must run with a live key signal.
+        for stem in ["sidechain_comp", "vocoder"] {
+            let inst = reg
+                .create_instance(stem, sr, &[])
+                .unwrap_or_else(|| panic!("{stem}: no instance"));
+            for (i, &x) in fixture.iter().take(4410).enumerate() {
+                let sc = if i < 2200 { x } else { 0.0 };
+                let y = unsafe { inst.call_sample_sc(x, &[0.0; MAX_PARAMS], sc) };
+                assert!(y.is_finite(), "{stem}: sc path produced {y}");
+            }
+            drop(inst);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

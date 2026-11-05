@@ -105,7 +105,8 @@ src/            application source (Rust 2021 edition)
 synths/         bundled synth scripts (piano.rs, sampler.rs) + synth_api.rs
                 + THIRD-PARTY-NOTICES.md (piano model credits)
 effects/        effect-script authoring kit: template.rs (start here),
-                effect_api.rs (ABI), parametric_eq.rs, space_echo.rs examples
+                effect_api.rs (ABI) + the bundled FL Studio suite
+                (docs/FL-SUITE.md is the roster: 19 shipping effects)
 vendor/vst2/    in-tree patched VST2 crate (see VENDOR-NOTES.md; keep the
                 entry-name + chunk patches when vendoring anything newer)
 examples/       small dev utilities run via `cargo run --example <name>`
@@ -244,8 +245,9 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   modes in the grid toolbar (`src/ui.rs`, `LoopMode`)
 - Project format + migration: `src/project.rs`, `midi::migrate_shortcuts`
 - All bindable actions + key defaults: `MidiAction::ALL`, `SHORTCUT_DEFAULTS` (`src/ui.rs`)
-- Effect ABI (audio v1 + GUI v1): `src/effect_api.rs`; synth ABI:
-  `synths/synth_api.rs`
+- Effect ABI (audio v1, v2 sidechain + GUI v1): `src/effect_api.rs`;
+  synth ABI: `synths/synth_api.rs`; suite roster + coverage map:
+  [FL-SUITE.md](FL-SUITE.md)
 - Import formats: `IMPORT_EXTENSIONS` (`src/audio_io.rs`)
 - Export formats: `ExportFormat` (`src/audio_io.rs`)
 
@@ -255,6 +257,6 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 | --- | --- |
 | end user | [USAGE.md](USAGE.md) |
 | sysadmin / packager | [INSTALL.md](INSTALL.md) |
-| effect-script author | `effects/template.rs` (self-documenting) + *Track effects & plugins* in USAGE.md |
+| effect-script author | `effects/template.rs` (self-documenting) + *Track effects & plugins* in USAGE.md + bundled suite examples (`effects/`, roster in [FL-SUITE.md](FL-SUITE.md)) |
 | synth-script / VST author | [PLUGINS.md](PLUGINS.md) + `synths/synth_api.rs` |
 | CI/automation agents | this file |
