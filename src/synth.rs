@@ -32,6 +32,9 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("piano.rs", include_str!("../synths/piano.rs")),
     ("drums.rs", include_str!("../synths/drums.rs")),
     ("pad.rs", include_str!("../synths/pad.rs")),
+    ("tri_osc.rs", include_str!("../synths/tri_osc.rs")),
+    ("fm.rs", include_str!("../synths/fm.rs")),
+    ("pluck.rs", include_str!("../synths/pluck.rs")),
     ("sampler.rs", include_str!("../synths/sampler.rs")),
     // Attribution for the piano samples (TimGM6mb, GPL-2); the registry
     // only compiles *.rs, so this rides along as documentation.
@@ -790,6 +793,54 @@ mod tests {
             let tail = out2.iter().fold(0.0f32, |m, x| m.max(x.abs()));
             assert!(tail < peak.max(1e-9), "{stem} all_off must stop new sound");
         }
+    }
+
+    /// FL Suite tier 2: EVERY bundled synth must compile, load, render
+    /// audible sound at its own default params, and fall silent on
+    /// all_off. The list DERIVES from `BUNDLED` (same rule as the effect
+    /// bundle): a new script joins the gate by being bundled.
+    #[test]
+    fn all_bundled_synths_render_sound() {
+        let reg = test_registry("allbundled");
+        let sine: Arc<[f32]> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let mut tested = 0;
+        for (name, _src) in BUNDLED {
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let stem = name.trim_end_matches(".rs");
+            let inst = reg
+                .create_instance(stem, 48_000.0, &[])
+                .unwrap_or_else(|| panic!("{stem} instance"));
+            let desc = reg.desc(stem).unwrap();
+            let mut p = [0.0f32; MAX_PARAMS];
+            for (k, pd) in desc.params.iter().enumerate() {
+                p[k] = pd.default;
+            }
+            // One sync block (samplers pick up their asset), then notes.
+            let mut out = vec![0.0f32; 2048];
+            unsafe { inst.process_into(&mut out, &p) };
+            inst.note_on(0, 60, 110);
+            inst.note_on(0, 64, 100);
+            inst.note_on(0, 67, 92);
+            // Half a second covers the slowest default attack.
+            let mut out = vec![0.0f32; 24000];
+            unsafe { inst.process_into(&mut out, &p) };
+            let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(peak > 1e-4, "{stem} must make sound (peak {peak})");
+            assert!(
+                out.iter().all(|x| x.is_finite()),
+                "{stem} produced non-finite output"
+            );
+            inst.all_off();
+            let mut out2 = vec![0.0f32; 4096];
+            unsafe { inst.process_into(&mut out2, &p) };
+            let tail = out2.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(tail < 1e-3, "{stem} all_off must stop new sound (tail {tail})");
+            tested += 1;
+        }
+        assert!(tested >= 7, "expected 7 bundled synths, tested {tested}");
     }
 
     /// v0.8 item 2: "the sampler doesn't currently work" — beyond making
