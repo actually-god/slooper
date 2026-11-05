@@ -26,7 +26,7 @@ use jack::{
 };
 
 use slooper::arrange::{Arrangement, Clip};
-use slooper::audio::{Backend, Cmd, Evt, FxSlot, TrackFx};
+use slooper::audio::{Backend, Cmd, Evt, FxSlot, MidiEv, TrackFx};
 use slooper::midi::MidiMsg;
 
 /// Serialize the e2e tests. Each drives the live audio server in real time
@@ -2961,6 +2961,194 @@ fn e2e_v37_recording_suppresses_park_and_autostop() {
         || !b.engine.transport_on(),
         Duration::from_secs(4),
         "auto-stop fires once nothing records",
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
+}
+
+
+// =============== v38 R1: roll audition voices (live path) =================
+
+/// Transport STOPPED, track play flag OFF: a staged audition voice must
+/// sound through the track's OWN instrument (bound, not the default) and
+/// its chain — the "place a note, hear the instrument NOW" promise —
+/// and the playing flag must drain itself when the voice retires.
+#[test]
+fn e2e_roll_audition_note_sounds_with_transport_stopped() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("audlive", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // Script instrument bound to TRACK 0 specifically (not the project
+    // default) — the audition must route through the track's binding.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.engine
+        .set_track_synth(0, Some(Arc::new(slooper::audio::SynthHandle::Script(inst))));
+    // Track play flag OFF: an audition ignores it by design (A1).
+    b.cmd(Cmd::SetTrackOn { i: 0, on: false });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!b.engine.transport_on(), "transport stays stopped");
+
+    let ev: Arc<[MidiEv]> = vec![
+        (0u64, 3u8, 0u8, 57u8, 110u8),
+        (sr as u64, 0, 0, 57, 0), // one second of note
+    ]
+    .into();
+    b.engine.play_audition(0, ev);
+    assert!(b.engine.audition_active(), "voice armed");
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "audition note audible with the transport STOPPED",
+    );
+    let body = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+        .expect("body window");
+    let body_rms = rms(&body);
+    assert!(body_rms > 2e-3, "audition body must carry audio: {body_rms}");
+
+    // After the note-off lands and the pool retires, the flag drains —
+    // the roll's STOP button flips back on its own (A2).
+    wait_until(
+        || !b.engine.audition_active(),
+        Duration::from_secs(6),
+        "audition flag drains when voices retire",
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let tail = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+        .expect("tail window");
+    let tail_rms = rms(&tail);
+    assert!(
+        tail_rms < 0.25 * body_rms.max(1e-9),
+        "retired audition must decay: tail {tail_rms} vs body {body_rms}"
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
+}
+
+/// A held audition note that is STOPPED mid-voice (STOP button / SPACE /
+/// roll close) must not keep ringing: the purge all-notes-offs the track
+/// within a few blocks and never resurrects.
+#[test]
+fn e2e_roll_audition_stop_silences_held_note() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("audstop", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.engine
+        .set_track_synth(0, Some(Arc::new(slooper::audio::SynthHandle::Script(inst))));
+    std::thread::sleep(Duration::from_millis(150));
+
+    // A 3-second note; STOP it ~0.6 s in, while it is held.
+    let ev: Arc<[MidiEv]> = vec![
+        (0u64, 3u8, 0u8, 50u8, 120u8),
+        (3 * sr as u64, 0, 0, 50, 0),
+    ]
+    .into();
+    b.engine.play_audition(0, ev);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "audition sounding before STOP",
+    );
+    let body = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+        .expect("body window");
+    let body_rms = rms(&body);
+    assert!(body_rms > 2e-3, "held note audible: {body_rms}");
+
+    b.engine.stop_audition();
+    // a few blocks + damper decay
+    std::thread::sleep(Duration::from_millis(600));
+    let after = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+        .expect("post-stop window");
+    let after_rms = rms(&after);
+    assert!(
+        after_rms < 0.15 * body_rms.max(1e-9),
+        "STOP must kill the held note: {after_rms} vs {body_rms}"
+    );
+    // …and it must stay dead (no resurrect from staged-but-purged offs).
+    std::thread::sleep(Duration::from_millis(500));
+    let after2 = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+        .expect("late window");
+    let after2_rms = rms(&after2);
+    assert!(
+        after2_rms < 0.15 * body_rms.max(1e-9),
+        "purged voice must stay silent: {after2_rms} vs {body_rms}"
     );
     drop(active);
     b.cmd(Cmd::StopAll);
