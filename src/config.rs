@@ -455,6 +455,10 @@ pub struct Config {
     /// v29 R5: was the drum-machine window open?
     #[serde(default)]
     pub show_drums: bool,
+    /// v39: was the MASTER OUT meter panel open? Defaults OPEN (the new
+    /// master section is the front door for loudness metering).
+    #[serde(default = "default_true")]
+    pub show_master: bool,
     /// Effects folder ("" = default: `effects/` next to the installed
     /// package). The folder is created and seeded on first use.
     #[serde(default)]
@@ -581,6 +585,7 @@ impl Default for Config {
             drum: None,
             drum_kits: Vec::new(),
             show_drums: false,
+            show_master: true,
             fx_dir: String::new(),
             track_fx: Vec::new(),
             track_chain: Vec::new(),
@@ -883,6 +888,7 @@ mod tests {
                 muted: false,
             }]],
             show_drums: true,
+            show_master: false, // exercise the non-default round-trip
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             sc_send: Vec::new(),
