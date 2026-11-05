@@ -86,6 +86,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("echo3.rs", include_str!("../effects/echo3.rs")),
     ("shifter.rs", include_str!("../effects/shifter.rs")),
     ("transient.rs", include_str!("../effects/transient.rs")),
+    ("pitchshft.rs", include_str!("../effects/pitchshft.rs")),
     ("vocoder.rs", include_str!("../effects/vocoder.rs")),
     ("convolver.rs", include_str!("../effects/convolver.rs")),
 ];
