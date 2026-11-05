@@ -36,6 +36,7 @@ const GRAINS: usize = 32;
 
 struct Grain {
     on: bool,
+    pre: f64,    // samples of delayed start (sub-block spawn timing)
     pos: f64,    // read position (fractional samples)
     rate: f64,   // playback rate (pitch)
     age: f64,    // seconds
@@ -80,7 +81,7 @@ extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_voi
         buf_sr: 48000.0,
         voices: [Voice { held: false, note: 0, pos: 0.0, timer: 0.0 }; VOICES],
         grains: (0..GRAINS)
-            .map(|_| Grain { on: false, pos: 0.0, rate: 1.0, age: 0.0, len: 0.0, amp: 0.0 })
+            .map(|_| Grain { on: false, pre: 0.0, pos: 0.0, rate: 1.0, age: 0.0, len: 0.0, amp: 0.0 })
             .collect(),
         rng: 0x5bd1_e995,
     });
@@ -231,6 +232,11 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 let spr = (lcg(&mut p.rng) * 2.0 - 1.0) * spray * sr;
                 let sc = (lcg(&mut p.rng) * 2.0 - 1.0) * scatter;
                 g.on = true;
+                // Sub-block spawn offset: host blocks are NOT 1 ms — with
+                // block-rate timing a 1.5 s preview bounce collapsed every
+                // grain into one burst at the block head (body of the note
+                // rendered silence). `pre` delays start to the exact time.
+                g.pre = (v.timer - spawn_every).max(0.0) * sr;
                 g.pos = (v.pos + spr).rem_euclid(blen.max(1.0));
                 g.rate = base_rate * 2.0f64.powf(sc / 12.0);
                 g.age = 0.0;
@@ -252,6 +258,10 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
         let buf = &p.buf;
         for g in grains.iter_mut() {
             if !g.on {
+                continue;
+            }
+            if g.pre > 0.0 {
+                g.pre -= 1.0;
                 continue;
             }
             let t = g.age / g.len;
