@@ -3192,3 +3192,167 @@ fn e2e_roll_audition_stop_silences_held_note() {
     drop(active);
     b.cmd(Cmd::StopAll);
 }
+
+// ---------------------------------------------------- FL-suite tier 2 live --
+
+/// FL-Suite tier 2: the four new bundled synths (tri_osc, pluck, fm,
+/// granular) and the new Convolver must work through the exact public
+/// command queue the UI uses. Synths come from the SEEDED user folder
+/// (same registry path every other e2e uses); the convolver from the
+/// repo's `effects/` — the identical source that gets embedded and
+/// seeded. Proof has two halves: (a) each synth carries a sustained note
+/// through the production preview bounce, (b) tri_osc + Convolver on the
+/// live RT thread produce audio at the master out while the transport
+/// runs — real dlopen of the scripted cdylib, real process() per block.
+#[test]
+fn e2e_tier2_new_bundled_plugins_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("tier2_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // A real CONSTANT-ENERGY asset. Granular maps note number to a
+    // playhead position (and scan drifts it), so the buffer must carry
+    // energy EVERYWHERE: a sine leaves zero-crossing neighborhoods where
+    // 40 ms grains genuinely render silence (measured body = 0). Noise
+    // with a tonal carrier is what a granular source really is.
+    let n = (sr as usize) * 2;
+    let sample: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let tone = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+                // deterministic "noise" (integer-multiply LCG, no rand dep)
+                let h = (i as u32).wrapping_mul(2654435761);
+                let noise = (h as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                (tone * 0.5 + noise * 0.5) * 0.5
+            })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![sample.clone()]),
+        arr: arr.into(),
+        len: (sr as u64) * 4,
+    });
+
+    // (a) every tier-2 synth carries a held note through the UI preview path.
+    let sreg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    for name in ["tri_osc", "pluck", "fm", "granular"] {
+        let inst = sreg
+            .create_instance(name, sr as f64, &[])
+            .unwrap_or_else(|| panic!("{name}: bundled synth must compile and load"));
+        b.cmd(Cmd::SetTrackSynth {
+            i: 0,
+            synth: Some(Arc::new(slooper::audio::SynthHandle::Script(inst))),
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        let mut ev = vec![
+            (0u64, 3u8, 0u8, 57u8, 110u8),
+            ((sr as u64) * 3 / 2, 0, 0, 57, 0),
+        ];
+        let buf = b
+            .engine
+            .bounce_track_preview(0, &mut ev, (sr as usize) * 3)
+            .unwrap_or_else(|| panic!("{name}: preview bounce"));
+        assert!(buf.iter().all(|v| v.is_finite()), "{name}: non-finite");
+        let body = rms(&buf[(sr as usize) / 2..(sr as usize) / 2 + sr as usize / 4]);
+        assert!(
+            body > 1e-3,
+            "{name}: held note must carry audio at 0.5 s (rms {body})"
+        );
+    }
+
+    // (b) convolver on the live RT thread: tri_osc through the scripted
+    // insert, notes firing, master out non-silent while PLAYING.
+    let mut freg =
+        slooper::fx::Registry::open(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("effects"));
+    freg.rescan(); // compiles scripts (content-hashed cache: instant after first run)
+    let conv = freg
+        .create_instance("convolver", sr as f64, &[100.0, 50.0, 40.0, 100.0])
+        .expect("bundled convolver must compile and load (repo effects/)");
+    let desc = freg.desc("convolver").expect("convolver desc").clone();
+    let inst = sreg
+        .create_instance("tri_osc", sr as f64, &[])
+        .expect("tri_osc instance");
+    b.cmd(Cmd::SetTrackSynth {
+        i: 0,
+        synth: Some(Arc::new(slooper::audio::SynthHandle::Script(inst))),
+    });
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(conv.clone(), desc)]),
+        },
+    });
+    let mut pat = slooper::midipat::Pattern::new(120);
+    let step = (0.25 * 2.0 * slooper::midipat::PPQ as f64) as u32;
+    for i in 0..12u32 {
+        pat.notes.push(slooper::midipat::Note {
+            ch: 0,
+            note: 57,
+            vel: 110,
+            press: 0,
+            start: i * step,
+            len: step,
+        });
+    }
+    pat.len_ticks = 12 * step;
+    pat.sort();
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+    b.cmd(Cmd::Seek { pos: 0 });
+    b.cmd(Cmd::PlayAll);
+    let mut peak = 0.0f32;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(30));
+        peak = peak.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+    }
+    b.cmd(Cmd::StopAll);
+    assert!(
+        peak > 0.02,
+        "tri_osc + convolver chain must sound on the live RT thread (peak {peak})"
+    );
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx::default(),
+    });
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arrangement::new().into(),
+        len: 4_800,
+    });
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![])));
+    let _ = b.cmd(Cmd::StopAll);
+}
