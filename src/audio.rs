@@ -293,6 +293,10 @@ pub type OutSel = (String, u8);
 /// as one Arc whenever the rack changes. Clip lengths are the asset lengths.
 pub type AssetTable = Vec<Arc<[f32]>>;
 
+/// One MIDI-ish event as the RT queues and audition voices carry it:
+/// `(sample_offset, status_hi, channel, note, velocity)`.
+pub type MidiEv = (u64, u8, u8, u8, u8);
+
 /// Commands from the GUI to the audio manager thread.
 /// Scratchpad for one control-rate automation pass (v0.11 R5). `None`
 /// means "no clip sounds on this track for this target" — the manual
@@ -790,7 +794,7 @@ pub struct Engine {
 pub struct AudVoiceReq {
     pub vid: u64,
     pub track: usize,
-    pub ev: std::sync::Arc<[(u64, u8, u8, u8, u8)]>,
+    pub ev: std::sync::Arc<[MidiEv]>,
 }
 
 /// Held (staged-but-not-yet-off) note count of a voice at cursor `cur`.
@@ -1452,7 +1456,7 @@ impl Engine {
     /// NOTHING is instantiated here, the sound comes out of the instance
     /// the audio thread already owns. The pool is bounded (oldest voice
     /// dropped), mirroring the asset-preview voices.
-    pub fn play_audition(&self, track: usize, ev: Arc<[(u64, u8, u8, u8, u8)]>) {
+    pub fn play_audition(&self, track: usize, ev: Arc<[MidiEv]>) {
         const MAX_AUD_VOICES: usize = 12;
         if ev.is_empty() {
             return;
@@ -3372,6 +3376,12 @@ impl Proc {
     }
 }
 
+/// One staged audition row while a block renders:
+/// `(sample offset in block, status kind, channel, data1, data2)` — the
+/// exact shape `render_midi_block` consumes from `aud_block` (usize
+/// offset, not the u64 voice-queue offset of `MidiEv`).
+type AudRow = (usize, u8, u8, u8, u8);
+
 /// Realtime process handler. No allocation, no locks, no I/O: the slot pool
 /// is fixed at startup and its raw port pointers are cached here; per-cycle
 /// work is a handful of atomic loads plus one pass over the arrangement's
@@ -3534,7 +3544,7 @@ struct Proc {
     aud_mask: u128,
     /// Per-track staging rows for `aud_mask` (capacity lives after the
     /// first touch; cleared per block for the rows used).
-    aud_block: Vec<Vec<(usize, u8, u8, u8, u8)>>,
+    aud_block: Vec<Vec<AudRow>>,
     /// Tracks whose held audition notes were purged (pool replaced) —
     /// `render_midi_block` all-offs them once.
     aud_purge: u128,
@@ -5793,5 +5803,40 @@ mod tests {
         set(&e);
         assert_eq!(e.pos(), 5000, "recording: playhead runs past the old end");
         e.set_recording(false);
+    }
+
+    #[test]
+    fn v38_audition_voice_lifecycle() {
+        let e = Engine::new();
+        assert!(!e.audition_active(), "nothing armed by default");
+        let ev: Arc<[MidiEv]> =
+            vec![(0u64, 3u8, 0u8, 60u8, 100u8), (16000, 0, 0, 60, 0)].into();
+        e.play_audition(3, ev.clone());
+        assert!(e.audition_active(), "armed by a voice");
+        assert_eq!(e.audition_snapshot().len(), 1, "one voice in the pool");
+        e.play_audition(3, ev); // additive taps stack (v0.10 key semantics)
+        assert_eq!(e.audition_snapshot().len(), 2);
+        e.stop_audition();
+        assert!(!e.audition_active(), "stopped");
+        assert!(e.audition_snapshot().is_empty(), "pool purged");
+        // An empty event list never arms the flag (an empty-pattern
+        // preview must not stick the roll in STOP state).
+        let empty: Arc<[MidiEv]> = vec![].into();
+        e.play_audition(0, empty);
+        assert!(!e.audition_active(), "empty voice is no voice");
+    }
+
+    #[test]
+    fn v38_audition_pending_counts_staged_notes() {
+        // Sorted pattern encoding: 3 = note-on, 0 = note-off.
+        let ev = [
+            (0u64, 3u8, 0u8, 60u8, 100u8),
+            (100, 0, 0, 60, 0),
+            (200, 3, 0, 61, 90),
+        ];
+        assert_eq!(aud_pending(&ev, 0), 0, "nothing staged yet");
+        assert_eq!(aud_pending(&ev, 50), 1, "first note ringing");
+        assert_eq!(aud_pending(&ev, 150), 0, "its off arrived");
+        assert_eq!(aud_pending(&ev, 250), 1, "second note held");
     }
 }

@@ -7020,8 +7020,11 @@ impl App {
         match self.preview_track {
             Some(t) => {
                 self.backend.engine.play_audition(t, ev.into());
-                self.status =
-                    format!("\u{266a} {nm} \u{b7} through track {}", t + 1, nm = note_name(note));
+                self.status = format!(
+                    "\u{266a} {nm} \u{b7} {route}",
+                    nm = note_name(note),
+                    route = self.roll_track_label(t)
+                );
             }
             None => match self.audition_render(&ev, 0.6) {
                 Some(buf) => {
@@ -7036,7 +7039,6 @@ impl App {
                 }
                 None => {
                     self.status = "audition: no synth available".into();
-                    return;
                 }
             },
         }
@@ -7186,7 +7188,7 @@ impl App {
                     samples: buf,
                 });
                 self.preview_playing = Some(name);
-                self.status = format!("preview playing \u{b7} default (piano)");
+                self.status = "preview playing \u{b7} default (piano)".into();
             }
             None => self.status = "preview: no synth available".into(),
         }
@@ -7567,6 +7569,11 @@ impl App {
         }
         if let Some(n) = placed {
             self.audition_note(n);
+            // v38 R6: keep BOTH facts in one echo — what happened AND
+            // what the user is hearing (the audition line used to
+            // silently overwrite the placement echo, so a placed note
+            // looked like an unconfirmed click — the "2/3 dead" feel).
+            self.status = format!("placed \u{b7} {}", self.status);
         }
         // ---- toolbar actions deferred (need &mut self) ----
         if clear {
@@ -7597,6 +7604,12 @@ impl App {
         }
         if preview {
             let pat = roll.pat.clone();
+            // v38 R6: an empty pattern previews to silence — say so
+            // instead of pretending a transport started.
+            if pat.notes.is_empty() && pat.ccs.is_empty() && pat.press.is_empty() {
+                self.status =
+                    "preview: nothing to play \u{b7} place a note first".into();
+            } else {
             match self.preview_track {
                 // v38 R1: the pattern goes through the LIVE track
                 // instrument as an RT audition voice — instant, no
@@ -7636,6 +7649,7 @@ impl App {
                     }
                     None => self.status = "preview: no synth available".into(),
                 },
+            }
             }
         }
         // v38 R4: STOP is a first-class state now — the button, SPACE and
@@ -8129,7 +8143,7 @@ impl App {
                 });
                 if let Some(pt) = resp
                     .interact_pointer_pos()
-                    .or_else(|| if coalesced_press { hover } else { None })
+                    .or(if coalesced_press { hover } else { None })
                 {
                     let mods = ui.input(|i| i.modifiers);
                     // Right-click deletes the note under the cursor.
@@ -20937,6 +20951,33 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         // 1) Open via the real toolbar button.
         let btn = find_galley(&mut app, &ctx, "Piano roll").expect("toolbar button painted");
+
+        // v38: the preview button's label is now the state-dependent
+        // word "preview"/"STOP" — plain substring search collides with
+        // status lines and the "preview:" route label, so exact galleys.
+        fn find_exact(app: &mut App, ctx: &egui::Context, want: &str) -> Option<egui::Rect> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == want {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.map(|p| egui::Rect::from_min_size(p, egui::vec2(4.0, 12.0)))
+        }
         let p = btn.center();
         frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
         frame(&mut app, &ctx, vec![btn_btn(p, false)]);
@@ -21016,7 +21057,7 @@ mod tests {
             );
         }
         app.drain_events();
-        let pv = find_galley(&mut app, &ctx, "\u{25b6} preview")
+        let pv = find_exact(&mut app, &ctx, "preview")
             .expect("preview button")
             .center();
         frame(&mut app, &ctx, vec![moved(pv), btn_btn(pv, true)]);
@@ -21065,28 +21106,418 @@ mod tests {
         frame(&mut app, &ctx, vec![btn_btn(tr, false)]);
         assert_eq!(app.preview_track, Some(0), "preview routes to track 1");
         // Track 1 has no explicit synth binding → the fallback keeps the
-        // preview alive (synth + empty chain still renders).
-        let pv2 = find_galley(&mut app, &ctx, "\u{25b6} preview")
+        // preview alive (default instrument through the live path).
+        let pv2 = find_exact(&mut app, &ctx, "preview")
             .expect("preview button")
             .center();
         frame(&mut app, &ctx, vec![moved(pv2), btn_btn(pv2, true)]);
         frame(&mut app, &ctx, vec![btn_btn(pv2, false)]);
         assert!(!app.status.contains("no synth"), "{}", app.status);
+        // v38: a routed preview is an ENGINE audition voice — the live
+        // flag is the observable, not the old UI-side buffer path.
+        assert!(
+            app.backend.engine.audition_active(),
+            "routed preview arms the engine audition"
+        );
 
-        // 6) Clicking a piano key auditions that single note.
+        // 6) Clicking a piano key auditions that single note through the
+        // picked track's LIVE instrument — while the audition from step 5
+        // is live the toolbar reads STOP (state feedback), and the key
+        // press re-arms a fresh audition voice whose status names the
+        // track AND the instrument behind it.
+        assert!(
+            find_exact(&mut app, &ctx, "STOP").is_some(),
+            "button shows STOP while an audition is live: {}",
+            app.status
+        );
         let kc = egui::pos2(canvas.min.x + 25.0, canvas.center().y);
         frame(&mut app, &ctx, vec![moved(kc), btn_btn(kc, true)]);
         frame(&mut app, &ctx, vec![btn_btn(kc, false)]);
         assert!(
-            app.preview_playing
-                .as_deref()
-                .is_some_and(|p| p.starts_with("key ")),
-            "key click auditions: {:?}",
-            app.preview_playing
+            app.status.contains('\u{266a}') && app.backend.engine.audition_active(),
+            "key click auditions through the track: {}",
+            app.status
         );
 
         std::env::remove_var("SLOOPER_SYNTHS_DIR");
         let _ = std::fs::remove_dir_all(&sdir);
+    }
+
+    /// Read the cursor icon a hover produces (the frame's FullOutput —
+    /// `set_cursor_icon` is what a real window manager would apply).
+    fn cursor_after_hover(app: &mut App, ctx: &egui::Context, p: egui::Pos2) -> egui::CursorIcon {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            events: vec![egui::Event::PointerMoved(p)],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let ic = out.platform_output.cursor_icon;
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        ic
+    }
+
+    /// Center of the ONE galley whose text is exactly `want` (the
+    /// v38 preview/STOP button texts collide as substrings with status
+    /// lines and the "preview:" label — exact matching is the fix).
+    fn exact_galley(app: &mut App, ctx: &egui::Context, want: &str) -> Option<egui::Pos2> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text() == want {
+                    return Some(t.pos);
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit.map(|p| egui::Rect::from_min_size(p, egui::vec2(4.0, 12.0)).center())
+    }
+
+    /// v38 R5: the cursor says what a press WILL do before it happens —
+    /// crosshair on empty grid (place), pointing hand over a note body
+    /// (select/move; wheel trims velocity), side-arrows on an end cap
+    /// (extend that end), pointing hand on the piano strip (audition).
+    #[test]
+    fn v38_roll_mode_cursors() {
+        let mut app = headless_app("rollcursors");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let canvas = open_roll_headless(&mut app, &ctx);
+        // Deterministic geometry: 160 px per beat, view at 0.
+        let (row_h, note_row) = {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.px_per_beat = 160.0;
+            r.scroll_sec = 0.0;
+            // The roll opens vertically centred (vscroll_px ≠ 0) — pin the
+            // geometry or row_at() won't match the test's own inverse.
+            r.vscroll_px = 0.0;
+            r.pat.notes.clear();
+            // Row under the canvas middle, per the roll's own mapping.
+            let rh = r.row_h;
+            let row = (((canvas.max.y - 10.0) - canvas.center().y - rh) / rh).ceil() as i32;
+            let row = row.clamp(0, 127);
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: row as u8,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480, // one beat at PPQ=480 → 160 px wide
+            });
+            (r.row_h, row)
+        };
+        frame(&mut app, &ctx, vec![]);
+        let grid_x0 = canvas.min.x + 58.0;
+        // y of the note's row, inverting the roll's own mapping
+        // row = ceil((bot - y - row_h)/row_h)  →  z at row - 0.5.
+        // Row n spans [B-(n+1)·r, B-n·r) → its CENTER sits at B-(n+0.5)·r.
+        let y = (canvas.max.y - 10.0) - row_h * (note_row as f32 + 0.5);
+        // Empty grid → crosshair (place-a-note mode).
+        let ic = cursor_after_hover(&mut app, &ctx, egui::pos2(grid_x0 + 400.0, y));
+        assert_eq!(ic, egui::CursorIcon::Crosshair, "empty grid = place mode");
+        // Note body → pointing hand (select / drag).
+        let ic = cursor_after_hover(&mut app, &ctx, egui::pos2(grid_x0 + 80.0, y));
+        assert_eq!(ic, egui::CursorIcon::PointingHand, "note body = select");
+        // Left cap (within 6 px) → horizontal resize.
+        let ic = cursor_after_hover(&mut app, &ctx, egui::pos2(grid_x0 + 3.0, y));
+        assert_eq!(ic, egui::CursorIcon::ResizeHorizontal, "note head = extend");
+        // Right cap → same on the tail.
+        let ic = cursor_after_hover(&mut app, &ctx, egui::pos2(grid_x0 + 157.0, y));
+        assert_eq!(ic, egui::CursorIcon::ResizeHorizontal, "note tail = extend");
+        // Piano strip → pointing hand (audition).
+        let ic = cursor_after_hover(
+            &mut app,
+            &ctx,
+            egui::pos2(canvas.min.x + 25.0, canvas.center().y),
+        );
+        assert_eq!(ic, egui::CursorIcon::PointingHand, "piano key = audition");
+    }
+
+    /// v38 R2: "left click does nothing 2/3 of the time" was a press and
+    /// its release coalescing into ONE frame — the old `is_pointer_button_
+    /// down_on()` gate read the button as already up and skipped the press.
+    /// The press-edge gate must place the note even for that coalesced
+    /// frame, and the placement must announce itself.
+    #[test]
+    fn v38_roll_coalesced_click_still_places_a_note() {
+        let mut app = headless_app("rollcoal");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let canvas = open_roll_headless(&mut app, &ctx);
+        let p = egui::pos2(canvas.min.x + 58.0 + 120.0, canvas.center().y);
+        // ONE frame carrying move + press + release: the stress case.
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn_btn(p, true), btn_btn(p, false)],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(4.0, 4.0))]);
+        frame(&mut app, &ctx, vec![]);
+        let n = app.piano_roll.as_ref().unwrap().pat.notes.len();
+        assert_eq!(n, 1, "coalesced press+release places exactly one note");
+        assert!(
+            app.status.contains("placed"),
+            "placement echoes: {}",
+            app.status
+        );
+    }
+
+    /// v38 R4: the toolbar button IS the play-state readout — while an
+    /// audition voice lives on the engine it reads STOP in red, and one
+    /// click stops, clears the flag, and reverts the button.
+    #[test]
+    fn v38_roll_stop_button_shows_and_kills_audition() {
+        let mut app = headless_app("rollstopbtn");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        open_roll_headless(&mut app, &ctx);
+        // Nothing playing → the button invites, it does not threaten.
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            exact_galley(&mut app, &ctx, "preview").is_some(),
+            "idle button reads preview"
+        );
+        // Arm an audition voice directly (null audio: no RT drain, the
+        // flag stays up) — the next frame MUST show STOP, not preview.
+        let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
+        app.backend.engine.play_audition(0, ev.into());
+        assert!(app.backend.engine.audition_active());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            exact_galley(&mut app, &ctx, "preview").is_none(),
+            "preview label must vanish while playing"
+        );
+        let p = exact_galley(&mut app, &ctx, "STOP").expect("button flips to STOP while live");
+        frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(p, false)]);
+        assert!(
+            !app.backend.engine.audition_active(),
+            "STOP killed the engine audition"
+        );
+        assert!(app.status.contains("preview stopped"), "{}", app.status);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            exact_galley(&mut app, &ctx, "preview").is_some(),
+            "button reverts to preview after STOP"
+        );
+    }
+
+    /// v38 R5: wheel over a note trims its velocity (FL-style, no
+    /// modifier), the selected group together, and the status confirms.
+    #[test]
+    fn v38_roll_wheel_over_note_trims_velocity() {
+        let mut app = headless_app("rollwheelvel");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let canvas = open_roll_headless(&mut app, &ctx);
+        let (row_h, note_row) = {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.px_per_beat = 160.0;
+            r.scroll_sec = 0.0;
+            // The roll opens vertically centred (vscroll_px ≠ 0) — pin the
+            // geometry or row_at() won't match the test's own inverse.
+            r.vscroll_px = 0.0;
+            r.pat.notes.clear();
+            let rh = r.row_h;
+            let row = (((canvas.max.y - 10.0) - canvas.center().y - rh) / rh).ceil() as i32;
+            let row = row.clamp(0, 127);
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: row as u8,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+            (r.row_h, row)
+        };
+        frame(&mut app, &ctx, vec![]);
+        let grid_x0 = canvas.min.x + 58.0;
+        // Row n spans [B-(n+1)·r, B-n·r) → its CENTER sits at B-(n+0.5)·r.
+        let y = (canvas.max.y - 10.0) - row_h * (note_row as f32 + 0.5);
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Hover the note body, then wheel UP one notch: +5 velocity.
+        let p = egui::pos2(grid_x0 + 80.0, y);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), wheel]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes[0].vel, 105, "one notch = +5 velocity");
+        }
+        assert!(
+            app.status.contains("velocity"),
+            "trim echoes: {}",
+            app.status
+        );
+        // Wheel over EMPTY grid must NOT trim — it scrolls instead.
+        let before = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        frame(&mut app, &ctx, vec![moved(egui::pos2(grid_x0 + 500.0, y))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(grid_x0 + 500.0, y)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().pat.notes[0].vel,
+            before,
+            "wheel off a note scrolls, it does not trim"
+        );
+    }
+
+    /// v38 R3: the route picker's track rows read the instrument FROM
+    /// THE ENGINE TABLE — the instance the audio thread actually holds.
+    /// A track whose UI name mirror is EMPTY but whose engine slot is
+    /// bound must show the engine's state, never "default (piano)".
+    #[test]
+    fn v38_roll_picker_labels_come_from_engine_table() {
+        let sdir = std::env::temp_dir().join("sp-rollpicklbl");
+        let _ = std::fs::remove_dir_all(&sdir);
+        std::env::set_var("SLOOPER_SYNTHS_DIR", &sdir);
+        let mut app = headless_app("rollpicklbl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        open_roll_headless(&mut app, &ctx);
+        // Bind a script synth on the ENGINE for track 1 while the UI
+        // mirror stays empty — exactly the drift the old labels shipped.
+        let reg = crate::synth::Registry::open(crate::synth::default_dir());
+        let inst = reg
+            .create_instance("piano", 48000.0, &[])
+            .expect("bundled piano must load");
+        app.backend
+            .engine
+            .set_track_synth(0, Some(std::sync::Arc::new(crate::audio::SynthHandle::Script(inst))));
+        assert!(app.track_synth.first().map(|s| s.is_none()).unwrap_or(true));
+        // Open the route combobox and read its rows.
+        frame(&mut app, &ctx, vec![]);
+        let combo = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == "preview:" {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.expect("route picker painted")
+        };
+        let cb = egui::pos2(combo.x + 120.0, combo.y + 6.0);
+        frame(&mut app, &ctx, vec![moved(cb), btn_btn(cb, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(cb, false)]);
+        frame(&mut app, &ctx, vec![]); // popup open
+        let row = galley_at(&mut app, &ctx, "track 1 \u{b7} script synth")
+            .expect("engine-bound track shows the ENGINE's state, not the stale mirror");
+        let p = row.center();
+        frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(p, false)]);
+        assert_eq!(app.preview_track, Some(0));
+        assert!(
+            app.status.contains("live instrument"),
+            "the pick confirms the live route: {}",
+            app.status
+        );
+        std::env::remove_var("SLOOPER_SYNTHS_DIR");
+        let _ = std::fs::remove_dir_all(&sdir);
+    }
+
+    /// v38 R6: feedback sweep — every obvious roll interaction answers
+    /// in the status line the frame it happens (metro, quantize, clear,
+    /// empty-pattern preview), and SPACE is the roll-local transport.
+    #[test]
+    fn v38_roll_interactions_all_answer() {
+        let mut app = headless_app("rollsweep");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let canvas = open_roll_headless(&mut app, &ctx);
+        // Empty pattern + preview click: says WHY nothing happens.
+        let p = exact_galley(&mut app, &ctx, "preview")
+            .expect("preview button (exact)");
+        frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(p, false)]);
+        assert!(
+            app.status.contains("nothing to play"),
+            "empty preview explains itself: {}",
+            app.status
+        );
+        // Metro toggle answers both ways.
+        let m = galley_at(&mut app, &ctx, "\u{266b} metro")
+            .expect("metro checkbox")
+            .center();
+        frame(&mut app, &ctx, vec![moved(m), btn_btn(m, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(m, false)]);
+        assert!(app.status.contains("metronome ON"), "{}", app.status);
+        frame(&mut app, &ctx, vec![moved(m), btn_btn(m, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(m, false)]);
+        assert!(app.status.contains("metronome OFF"), "{}", app.status);
+        // Place a note (real click), then quantize + clear answer too.
+        let g = egui::pos2(canvas.min.x + 58.0 + 150.0, canvas.center().y);
+        frame(&mut app, &ctx, vec![moved(g), btn_btn(g, true)]);
+        frame(&mut app, &ctx, vec![moved(g), btn_btn(g, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes.len(), 1);
+        // galley_at_LAST: the MAIN header paints a "quantize" label too
+        // (it draws first), and the near-fullscreen roll window covers it
+        // — a first-match lookup would click into the void.
+        let q = galley_at_last(&mut app, &ctx, "quantize")
+            .expect("quantize button")
+            .center();
+        frame(&mut app, &ctx, vec![moved(q), btn_btn(q, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(q, false)]);
+        assert!(app.status.contains("quantized"), "{}", app.status);
+        let c = galley_at_last(&mut app, &ctx, "clear")
+            .expect("clear button")
+            .center();
+        frame(&mut app, &ctx, vec![moved(c), btn_btn(c, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(c, false)]);
+        assert!(
+            app.status.contains("pattern cleared"),
+            "destructive clear confirms: {}",
+            app.status
+        );
+        assert!(app.piano_roll.as_ref().unwrap().pat.notes.is_empty());
     }
 
     fn btn_btn(p: egui::Pos2, down: bool) -> egui::Event {
@@ -22950,6 +23381,17 @@ mod tests {
                 egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
                 key_ev(egui::Key::A, egui::Modifiers::COMMAND),
             ],
+        );
+        // v38: RELEASE ⌘ before the group drag. egui keeps modifiers set
+        // by events until told otherwise, and the v38 press-edge gate
+        // (correctly) treats a HELD ⌘ on press as the FL deselect
+        // toggle — once per press, not once per frame like the old
+        // level-gated one. A real user lifts the key between Ctrl+A and
+        // the drag; the harness must too.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
         );
         let before: Vec<u32> = app
             .piano_roll
