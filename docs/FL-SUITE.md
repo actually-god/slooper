@@ -119,5 +119,15 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
   is ~20× too hot; the produce_sound gate caught peak 12.7). Trap:
   `usize::to_le_bytes()` is EIGHT bytes — binary-format writers must
   cast to u32 first.
+- Live-RT proof per tier-2 plugin: `e2e_tier2_new_bundled_plugins_live`
+  (tests/e2e.rs) drives the public command queue against the running
+  audio server — every new synth through the UI preview bounce and
+  tri_osc→Convolver on the RT thread. This gate caught a REAL bug:
+  granular spawned grains at block rate, collapsing into one burst on
+  the 1.5 s preview block — grain starts are now sample-exact
+  (`Grain.pre`). Rule: any time-based scheduling in a script must be
+  SAMPLE-exact; host blocks range from ~1 ms (RT) to seconds (preview).
+  Granular test assets must be constant-energy (note→playhead mapping
+  can park a grain on a sine's zero crossing → legitimate silence).
 - Live test: boot the freshly built binary on the X display and capture
   the Effects window (all rows valid), plus one loaded-chain screenshot.
