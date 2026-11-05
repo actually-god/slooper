@@ -87,6 +87,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("shifter.rs", include_str!("../effects/shifter.rs")),
     ("transient.rs", include_str!("../effects/transient.rs")),
     ("vocoder.rs", include_str!("../effects/vocoder.rs")),
+    ("convolver.rs", include_str!("../effects/convolver.rs")),
 ];
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
@@ -3115,6 +3116,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             return;
         }
         let dir = temp_dir("render");
+        // The convolver scans a folder at create — keep it in the sandbox.
+        std::env::set_var("SLOOPER_IMPULSES_DIR", dir.join("impulses"));
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         let sr = 44100.0f64;
@@ -3164,6 +3167,88 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             }
             drop(inst);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FL Suite tier 2 CAPABILITY PIN (docs/FL-SUITE.md: folder file
+    /// scan): the convolver must load `.wav` impulses from the impulses
+    /// folder and the `ir` slider must select them. A delta IR has to
+    /// reproduce its input as a one-hop-delayed single blip with NO tail
+    /// — that only happens if WAV parse, normalization, FFT tables and
+    /// partitioned convolution are all real. Index 0 (built-in hall)
+    /// must instead produce a long decaying tail.
+    #[test]
+    fn convolver_folder_ir_delta() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("convir");
+        let imp = dir.join("impulses");
+        std::fs::create_dir_all(&imp).unwrap();
+        std::env::set_var("SLOOPER_IMPULSES_DIR", &imp);
+        // Minimal float32 mono WAV writer: one 1.0 delta.
+        fn wav_f32(path: &std::path::Path, sr: u32, x: &[f32]) {
+            let data: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut b: Vec<u8> = Vec::new();
+            b.extend_from_slice(b"RIFF");
+            // NB: keep this an u32 — `36 + data.len()` is usize and its
+            // to_le_bytes() is EIGHT bytes (silent 4-byte header shift).
+            b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+            b.extend_from_slice(b"WAVEfmt ");
+            b.extend_from_slice(&16u32.to_le_bytes());
+            b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+            b.extend_from_slice(&1u16.to_le_bytes()); // mono
+            b.extend_from_slice(&sr.to_le_bytes());
+            b.extend_from_slice(&(sr * 4).to_le_bytes());
+            b.extend_from_slice(&4u16.to_le_bytes());
+            b.extend_from_slice(&32u16.to_le_bytes());
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(&data);
+            std::fs::write(path, b).unwrap();
+        }
+        wav_f32(&imp.join("a-delta.wav"), 48_000, &[1.0]);
+
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let d = reg.desc("convolver").expect("convolver desc");
+        assert_eq!(d.params.len(), 4);
+        let inst = reg
+            .create_instance("convolver", 48_000.0, &[])
+            .expect("convolver instance");
+
+        let run = |ir: f32| -> Vec<f32> {
+            let mut p = [0.0f32; MAX_PARAMS];
+            p[0] = ir;
+            p[1] = 1.0; // full wet
+            p[2] = 1.0;
+            p[3] = 20_000.0; // damping open
+            (0..24_000)
+                .map(|i| {
+                    let x = if i == 8000 { 1.0 } else { 0.0 };
+                    unsafe { inst.call_sample(x, &p) }
+                })
+                .collect()
+        };
+
+        let y = run(1.0); // folder delta IR
+        let pre = y[..8_000].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(pre < 1e-6, "convolver leaked before input (pre {pre})");
+        let win: &[f32] = &y[8_000 + 1_000..8_000 + 2_100];
+        let (pi, pv) = win
+            .iter()
+            .enumerate()
+            .fold((0, 0.0f32), |a, (i, v)| if v.abs() > a.1 { (i, *v) } else { a });
+        assert!(pv > 0.3, "delta IR produced no blip (peak {pv})");
+        let after = y[8_000 + 1_000 + pi + 40..]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(after < 1e-4, "delta IR must have no tail (tail {after})");
+
+        let y = run(0.0); // built-in hall: long tail required
+        let tail_e: f64 = y[8_000 + 4_000..].iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        assert!(tail_e > 1e-4, "built-in hall has no reverb tail (energy {tail_e})");
+        drop(inst);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
