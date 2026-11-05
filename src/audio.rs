@@ -527,6 +527,9 @@ pub struct Backend {
     pub gain: Arc<AtomicU32>,
     /// Peak of the mixed output during the last cycle (f32 bits).
     pub peak: Arc<AtomicU32>,
+    /// v39: post-master-gain stereo samples for the MASTER OUT meter panel
+    /// (lock-free SPSC ring; RT writes, the GUI drains once per frame).
+    pub meter: Arc<crate::meter::MeterRing>,
     /// Total xruns since start.
     pub xruns: Arc<AtomicU64>,
     /// MIDI events dropped because the GUI event queue was full.
@@ -544,12 +547,14 @@ impl Backend {
         let (evt_tx, evt_rx) = mpsc::sync_channel::<Evt>(256);
         let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let peak = Arc::new(AtomicU32::new(0));
+        let meter = Arc::new(crate::meter::MeterRing::new());
         let xruns = Arc::new(AtomicU64::new(0));
         let midi_drops = Arc::new(AtomicU64::new(0));
         let engine = Engine::new();
-        let (t_gain, t_peak, t_xruns, t_midi_drops, t_engine) = (
+        let (t_gain, t_peak, t_meter, t_xruns, t_midi_drops, t_engine) = (
             gain.clone(),
             peak.clone(),
+            meter.clone(),
             xruns.clone(),
             midi_drops.clone(),
             engine.clone(),
@@ -563,6 +568,7 @@ impl Backend {
                     evt_tx,
                     t_gain,
                     t_peak,
+                    t_meter,
                     t_xruns,
                     t_midi_drops,
                     t_engine,
@@ -575,6 +581,7 @@ impl Backend {
             evt_rx,
             gain,
             peak,
+            meter,
             xruns,
             midi_drops,
             engine,
@@ -1867,6 +1874,7 @@ fn run(
     evt_tx: SyncSender<Evt>,
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
+    meter: Arc<crate::meter::MeterRing>,
     xruns: Arc<AtomicU64>,
     midi_drops: Arc<AtomicU64>,
     engine: Arc<Engine>,
@@ -1961,6 +1969,8 @@ fn run(
         midi_drops,
         gain: gain.clone(),
         peak: peak.clone(),
+        meter,
+        tap_buf: Vec::new(),
         engine: engine.clone(),
         prev_rec: [TR_IDLE; MAX_LOOPS],
         rec_full: 0,
@@ -3398,6 +3408,10 @@ struct Proc {
     midi_drops: Arc<AtomicU64>,
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
+    /// v39: master-out tap ring (post-master-gain stereo → GUI meter).
+    meter: Arc<crate::meter::MeterRing>,
+    /// v39: scratch buffer holding one block's interleaved tap pairs.
+    tap_buf: Vec<f32>,
     engine: Arc<Engine>,
     // RT-local take-capture state (audio thread only).
     prev_rec: [u8; MAX_LOOPS],
@@ -4800,11 +4814,17 @@ impl ProcessHandler for Proc {
 
         // Master gain + port writes (moved out of the sample loop so VST
         // inserts can run before the mix leaves the callback).
+        // v39: the master tap doubles the block for the GUI meter ring —
+        // SPSC, never blocks; a stalled UI only drops meter resolution.
+        let mut tap = std::mem::take(&mut self.tap_buf);
+        tap.resize(n * 2, 0.0);
         for i in 0..n {
             // v32 R7: ramped master (g_a → g across the block).
             let gm = g_a + g_s * i as f32;
             let v_l = mix_l[i] * gm;
             let v_r = mix_r[i] * gm;
+            tap[2 * i] = v_l;
+            tap[2 * i + 1] = v_r;
             let av = v_l.abs().max(v_r.abs());
             if av.to_bits() > peak_val {
                 peak_val = av.to_bits();
@@ -4822,6 +4842,8 @@ impl ProcessHandler for Proc {
                 unsafe { *b.add(i) = v_r };
             }
         }
+        self.meter.write(&tap[..n * 2]);
+        self.tap_buf = tap;
 
         // Give the per-block buffers back for the next block.
         self.mix_l = mix_l;

@@ -1199,6 +1199,17 @@ pub struct App {
     /// module owns its kit, so each synth carries a different patch.
     drum_kits: Vec<Vec<DrumPad>>,
     show_drums: bool,
+    /// v39: MASTER OUT panel open (dockable, docks next to the MIXER).
+    show_master: bool,
+    /// v39: master metering state; built lazily once the sample rate is
+    /// known (Evt::Ready), lives next to `peak_disp`.
+    meter_state: Option<crate::meter::MasterMeter>,
+    /// v39: reuse buffer for the meter-ring drain.
+    meter_drain: Vec<f32>,
+    /// v39: integrated/LRA are O(history) — recompute at most 4×/s.
+    meter_calc_at: std::time::Instant,
+    meter_i: Option<f64>,
+    meter_lra: Option<f64>,
     auto_edit: Option<Box<AutoEdit>>,
     /// v0.15: bindings picked as automation-manager record sources
     /// (action slot + bind). While the manager is open these are MUTED in
@@ -1504,13 +1515,7 @@ impl App {
             auto_preset_name: String::new(),
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
-            dyn_seed: cfg
-                .dyn_docks
-                .iter()
-                .filter_map(|d| {
-                    DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect))
-                })
-                .collect(),
+            dyn_seed: dyn_seed_for(&cfg.dyn_docks),
             side_dirty: false,
             free_drag: None,
             drag_pos: [0.0, 0.0],
@@ -1636,6 +1641,12 @@ impl App {
                 .unwrap_or_else(DrumMachine::defaults),
             drum_kits: init_drum_kits(&cfg.drum_kits, cfg.drum.as_ref()),
             show_drums: cfg.show_drums,
+            show_master: cfg.show_master,
+            meter_state: None,
+            meter_drain: Vec::new(),
+            meter_calc_at: std::time::Instant::now(),
+            meter_i: None,
+            meter_lra: None,
             auto_edit: None,
             auto_mgr_rec: Vec::new(),
             auto_pick_open: false,
@@ -4050,6 +4061,7 @@ impl App {
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
             show_drums: self.show_drums,
+            show_master: self.show_master,
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             sc_send: self.sc_send.to_vec(),
@@ -5569,6 +5581,156 @@ impl App {
         self.show_drums = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
+        }
+    }
+
+    /// v39: MASTER OUT — the pro master section, mirroring the meter
+    /// strips of FL Studio / Ableton Live's master chain: master volume
+    /// control, vertical L/R meters with peak hold + clip LED, live
+    /// BS.1770-4 loudness numbers (M/S/I/LRA), and a spectrum viewer.
+    /// A dynamic (dockable) window; default docks right next to the MIXER.
+    fn master_out_window(&mut self, ui: &mut egui::Ui) {
+        let idx = self.dyn_reg(DynKind::Master, "MASTER OUT".into());
+        if self.dyn_dock_skip(idx) {
+            return;
+        }
+        let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+        let mut open = self.show_master;
+        let ctx = ui.ctx().clone();
+        let mut w = egui::Window::new("master out")
+            .id(egui::Id::new("master_out_window"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(190.0)
+            .min_width(80.0)
+            .min_height(70.0);
+        if let Some(r) = self.dyn_rect(idx) {
+            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        }
+        if dragging {
+            w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+        }
+        let resp = w.show(&ctx, |ui| self.master_out_body(ui));
+        self.show_master = open;
+        if let Some(out) = resp.map(|r| r.response.rect) {
+            self.dyn_remember(idx, out);
+        }
+    }
+
+    /// v39: MASTER OUT body — ONE body shared by the floating window and
+    /// the docked panel. Layout (wide): [volume] [L/R meters] [LUFS
+    /// numbers] [spectrum]; when narrow the spectrum drops to a second
+    /// full-width row. Every readout is the LIVE master output.
+    fn master_out_body(&mut self, ui: &mut egui::Ui) {
+        let wide = ui.available_width() >= 470.0;
+        let meter_h = (ui.available_height() - 26.0).clamp(56.0, 130.0);
+        let mut spec_rect = egui::Rect::NOTHING;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                master_volume_controls(ui, self);
+                ui.add_space(4.0);
+                if ui
+                    .small_button("reset I")
+                    .on_hover_text(
+                        "Reset integrated loudness + LRA (like Youlean/Ozone \
+                         reset) — start a fresh measurement pass.",
+                    )
+                    .clicked()
+                {
+                    if let Some(ms) = self.meter_state.as_mut() {
+                        ms.lufs.reset_integrated();
+                    }
+                    self.meter_i = None;
+                    self.meter_lra = None;
+                }
+                let (peak_l, peak_r, clip) = match self.meter_state.as_ref() {
+                    Some(ms) => (db_of(ms.l_hold), db_of(ms.r_hold), ms.clip),
+                    None => (-120.0, -120.0, false),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("peak").small().weak());
+                    ui.label(
+                        RichText::new(format!(
+                            "{peak_l:>6.1} {peak_r:>6.1} dBFS",
+                            peak_l = peak_l,
+                            peak_r = peak_r
+                        ))
+                        .monospace()
+                        .small(),
+                    )
+                    .on_hover_text(
+                        "Sample peak hold per channel, post master gain \
+                         (dBFS). Red clip LED lights on any full-scale sample.",
+                    );
+                    if clip {
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2(10.0, 10.0),
+                            Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(r.shrink(1.5), 1.0, Color32::from_rgb(235, 60, 50));
+                    }
+                });
+            });
+            ui.separator();
+            // ---- vertical stereo meters (FL/Ableton master-strip look) ----
+            let (mrect, _) =
+                ui.allocate_exact_size(egui::vec2(58.0, meter_h), Sense::hover());
+            let (l_amp, r_amp) = match self.meter_state.as_ref() {
+                Some(ms) => (ms.l_peak, ms.r_peak),
+                None => (0.0, 0.0),
+            };
+            paint_stereo_meters(
+                ui,
+                mrect,
+                l_amp,
+                r_amp,
+                self.meter_state.as_ref().map(|m| m.l_hold).unwrap_or(-120.0),
+                self.meter_state.as_ref().map(|m| m.r_hold).unwrap_or(-120.0),
+                self.meter_state.as_ref().is_some_and(|m| m.clip),
+            );
+            ui.separator();
+            // ---- live LUFS numbers (the panel's headline readouts) ----
+            ui.vertical(|ui| {
+                let (m, s) = match self.meter_state.as_ref() {
+                    Some(ms) => (ms.lufs.momentary(), ms.lufs.short_term()),
+                    None => (None, None),
+                };
+                lufs_row(ui, "M", m, "Momentary loudness (BS.1770 400 ms window) — the live reading.");
+                lufs_row(ui, "S", s, "Short-term loudness (3 s window).");
+                lufs_row(
+                    ui,
+                    "I",
+                    self.meter_i,
+                    "Integrated loudness since reset/start: gated mean (−70 LUFS absolute, \
+                     −10 LU relative). Silence is excluded — EBU R 128 / Tech 3341.",
+                );
+                lufs_row(
+                    ui,
+                    "LRA",
+                    self.meter_lra,
+                    "Loudness range: P95−P10 of the gated short-term series (EBU Tech 3342).",
+                );
+            });
+            if wide {
+                ui.separator();
+                let (r2, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width().max(150.0), meter_h),
+                    Sense::hover(),
+                );
+                paint_spectrum(ui, self.meter_state.as_ref(), r2);
+                spec_rect = r2;
+            }
+        });
+        if !wide {
+            let h = (ui.available_height() - 8.0).max(46.0);
+            let (r2, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(150.0), h),
+                Sense::hover(),
+            );
+            paint_spectrum(ui, self.meter_state.as_ref(), r2);
+            let _ = spec_rect;
         }
     }
 
@@ -10864,6 +11026,29 @@ impl eframe::App for App {
         let p = f32::from_bits(self.backend.peak.load(Ordering::Relaxed));
         self.peak_disp = p.max(self.peak_disp * 0.9);
 
+        // v39: drain the master-output tap into the meter state. Only when
+        // a live backend exists (null-audio tests never fill the ring).
+        // The RT callback writes post-master-gain stereo; overflow drops
+        // the NEWEST samples, so the audio thread never blocks.
+        if self.sample_rate > 0 {
+            if self.meter_state.is_none() {
+                self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
+            }
+            if let Some(ms) = self.meter_state.as_mut() {
+                let n = self.backend.meter.drain(&mut self.meter_drain, 4_800);
+                if n > 0 {
+                    ms.feed(&self.meter_drain);
+                }
+                ms.spectrum.refresh(2.5);
+                ms.tick();
+                if self.meter_calc_at.elapsed().as_millis() >= 250 {
+                    self.meter_calc_at = std::time::Instant::now();
+                    self.meter_i = ms.lufs.integrated();
+                    self.meter_lra = ms.lufs.lra();
+                }
+            }
+        }
+
         if changed {
             ctx.request_repaint();
         }
@@ -11302,6 +11487,9 @@ impl App {
         }
         if self.show_drums {
             self.drum_window(ui);
+        }
+        if self.show_master {
+            self.master_out_window(ui);
         }
         let sw = self.synth_win;
         if let Some(t) = sw {
@@ -11826,6 +12014,17 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Export").clicked() {
                     app.show_export = true;
+                }
+                if ui
+                    .button("Meter")
+                    .on_hover_text(
+                        "MASTER OUT panel: stereo meters + live LUFS \
+                         (momentary/short-term/integrated + LRA) + spectrum \
+                         viewer for the master output. Docks next to the mixer.",
+                    )
+                    .clicked()
+                {
+                    app.show_master = !app.show_master;
                 }
                 if ui
                     .button("Drums")
@@ -12437,6 +12636,8 @@ pub(crate) enum DynKind {
     /// keyed by (track, chain row).
     Fx(usize, usize),
     Drums,
+    /// v39: MASTER OUT — master volume + stereo meters + LUFS + spectrum.
+    Master,
     Roll,
     Auto,
     Synths(usize),
@@ -12460,6 +12661,7 @@ impl DynKind {
             DynKind::Synth(t) => format!("synth:{t}"),
             DynKind::Fx(t, r) => format!("fx:{t}:{r}"),
             DynKind::Drums => "drums".into(),
+            DynKind::Master => "master".into(),
             DynKind::Roll => "roll".into(),
             DynKind::Auto => "auto".into(),
             DynKind::Synths(t) => format!("synths:{t}"),
@@ -12478,6 +12680,7 @@ impl DynKind {
         Some(match (head, arg) {
             ("params", _) => DynKind::Params,
             ("drums", _) => DynKind::Drums,
+            ("master", _) => DynKind::Master,
             ("roll", _) => DynKind::Roll,
             ("auto", _) => DynKind::Auto,
             ("chain", Some(t)) => DynKind::Chain(t),
@@ -12486,6 +12689,24 @@ impl DynKind {
             _ => return None,
         })
     }
+}
+
+/// v39: dock seed — the user's saved dynamic-window dock states, plus a
+/// built-in default for MASTER OUT: docked on the RIGHT edge (rank 1,
+/// right beside the MIXER dock, whose default is right/0) so the new
+/// master section starts literally next to the master strip. Once the
+/// user's config holds their own entry for "master", it wins.
+fn dyn_seed_for(
+    docks: &[crate::config::DynDock],
+) -> Vec<(DynKind, [i16; 3], [f32; 4])> {
+    let mut seed: Vec<(DynKind, [i16; 3], [f32; 4])> = docks
+        .iter()
+        .filter_map(|d| DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect)))
+        .collect();
+    if !seed.iter().any(|(k, _, _)| *k == DynKind::Master) {
+        seed.push((DynKind::Master, [1, 1, 1], [520.0, 46.0, 560.0, 190.0]));
+    }
+    seed
 }
 
 /// Visibility of a dynamic window is owned by the very flag that opens it
@@ -12501,6 +12722,7 @@ fn dyn_open(app: &App, k: DynKind) -> bool {
             .as_ref()
             .is_some_and(|e| e.loop_i == t && e.slot == r),
         DynKind::Drums => app.show_drums,
+        DynKind::Master => app.show_master,
         DynKind::Roll => app.piano_roll.is_some(),
         DynKind::Auto => app.auto_edit.is_some(),
         DynKind::Synths(t) => app.synth_pick == Some(t),
@@ -12519,6 +12741,7 @@ fn dyn_set(app: &mut App, k: DynKind, v: bool) {
             }
         }
         DynKind::Drums => app.show_drums = v,
+        DynKind::Master => app.show_master = v,
         DynKind::Roll => app.piano_roll = if v { app.piano_roll.take() } else { None },
         DynKind::Auto => app.auto_edit = if v { app.auto_edit.take() } else { None },
         DynKind::Synths(_) => app.synth_pick = if v { app.synth_pick } else { None },
@@ -12815,6 +13038,7 @@ fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         DynKind::Roll => app.roll_pass(ui, idx, true),
         DynKind::Auto => app.auto_pass(ui, idx, true),
         DynKind::Drums => app.drum_win_body(ui),
+        DynKind::Master => app.master_out_body(ui),
         DynKind::Synth(t) => app.synth_sliders_body(ui, t),
         DynKind::Fx(t, r) => app.fx_editor_body(ui, t, r),
         DynKind::Params => {
@@ -14366,74 +14590,327 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                 });
 }
 
+/// v39 input guard: the RIGHT button must never change a value.
+/// egui 0.36 sliders/drag-values sense a bare `Sense::drag()`, and a drag
+/// is ANY button — so a right press on a slider marks it dragged at once
+/// and `interact_pointer_pos()` jumps the value to the pointer (that is
+/// why right-clicking the volume slider used to change the value while
+/// ALSO opening the value menu). Revert a change caused by a non-primary
+/// button; primary drags and keyboard edits pass through untouched.
+/// Take `before` before adding the widget; call INSTEAD of `resp.changed()`.
+#[must_use]
+fn p_changed<T: Copy>(resp: &egui::Response, before: T, value: &mut T) -> bool {
+    if resp.changed() && resp.dragged() && !resp.dragged_by(egui::PointerButton::Primary) {
+        *value = before;
+        return false;
+    }
+    resp.changed()
+}
+
+/// v39: amplitude → dBFS, floored for display math.
+fn db_of(amp: f32) -> f32 {
+    if amp <= 1e-9 {
+        -120.0
+    } else {
+        (20.0f32 * amp.log10()).clamp(-120.0, 12.0)
+    }
+}
+
+/// v39: one caption+value row of the MASTER OUT LUFS column.
+fn lufs_row(ui: &mut egui::Ui, cap: &str, val: Option<f64>, tip: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("{cap:>3}"))
+                .small()
+                .color(Color32::from_rgb(150, 150, 158)),
+        );
+        let txt = match val {
+            Some(v) if v > -99.0 => format!("{v:6.1}"),
+            _ => "   —".into(),
+        };
+        ui.label(RichText::new(txt).monospace()).on_hover_text(tip);
+    });
+}
+
+/// v39: the master volume controls — ONE implementation shared by the
+/// mixer's master strip and the MASTER OUT panel, so both carry the same
+/// gestures, the same automation binding and the right-button guard.
+fn master_volume_controls(ui: &mut egui::Ui, app: &mut App) {
+    // v0.15: no text box — right-click opens Set value / Create
+    // automation asset, matching every other automatable value.
+    let before = app.master_midi as i16;
+    let mut mv = app.master_midi as i16;
+    let mut msl = ui
+        .add_sized(
+            egui::vec2(44.0, 18.0),
+            Slider::new(&mut mv, 0..=127).show_value(false),
+        )
+        .on_hover_text(
+            "Master volume: -inf .. +6 dB. Right-click for exact entry and \
+             automation (right-drag never changes the value).",
+        );
+    let mut mvr = ui
+        .add_sized(
+            egui::vec2(50.0, 18.0),
+            egui::Label::new(
+                RichText::new(format!("{:>5}", db_num(vol_amp(app.master_midi))))
+                    .monospace()
+                    .small(),
+            )
+            .selectable(false)
+            .sense(egui::Sense::click()),
+        )
+        .on_hover_text("dB");
+    if p_changed(&msl, before, &mut mv) {
+        app.master_dirty = true; // v35 R1
+        app.master_midi = mv.clamp(0, 127) as u8;
+        let amp = vol_amp(app.master_midi);
+        app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
+        app.levels_dirty = true;
+    }
+    // v20 R3: master volume binds directly too (global target: no
+    // owner track — selection's first track or the longest hosts it).
+    let mvv = vol_amp(app.master_midi);
+    bind_value_controls(&mut msl, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
+    bind_value_controls(&mut mvr, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
+    if ui
+        .small_button(RichText::new("0").monospace())
+        .on_hover_text("Reset master volume to 0 dB")
+        .clicked()
+    {
+        app.master_dirty = true; // v35 R1
+        app.master_midi = VOL_UNITY_MIDI;
+        app.levels_dirty = true;
+    }
+}
+
+/// v39: vertical L/R master meters in the FL/Ableton idiom — dB scale
+/// −60…+6, green/yellow/red bands, white peak-hold lines, red clip LED.
+fn paint_stereo_meters(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    l: f32,
+    r: f32,
+    lh: f32,
+    rh: f32,
+    clip: bool,
+) {
+    const TOP_DB: f32 = 6.0;
+    const BOT_DB: f32 = -60.0;
+    let p = ui.painter();
+    p.rect_filled(rect, 1.0, Color32::from_rgb(30, 30, 34));
+    let y_of = |db: f32| -> f32 {
+        let f = ((db - BOT_DB) / (TOP_DB - BOT_DB)).clamp(0.0, 1.0);
+        rect.max.y - f * rect.height()
+    };
+    if clip {
+        let led_h = (rect.height() * 0.045).clamp(4.0, 8.0);
+        p.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), led_h)),
+            0.0,
+            Color32::from_rgb(235, 60, 50),
+        );
+    }
+    let bar_w = (rect.width() * 0.34).min(16.0);
+    let label_x = rect.min.x + 2.0 * bar_w + 6.0;
+    for (i, (amp, hold)) in [(l, lh), (r, rh)].iter().enumerate() {
+        let x = rect.min.x + 2.0 + i as f32 * (bar_w + 2.0);
+        let b = egui::Rect::from_min_size(egui::pos2(x, rect.min.y + 1.0), egui::vec2(bar_w, rect.height() - 2.0));
+        let db = db_of(*amp);
+        if db > BOT_DB {
+            let mut seg = |lo: f32, hi: f32, col: Color32| {
+                if db > lo {
+                    let y0 = y_of(db.min(hi)).max(b.min.y);
+                    let y1 = y_of(lo).min(b.max.y);
+                    if y1 > y0 {
+                        p.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(b.min.x, y0), egui::pos2(b.max.x, y1)),
+                            0.0,
+                            col,
+                        );
+                    }
+                }
+            };
+            seg(BOT_DB, -12.0, Color32::from_rgb(60, 200, 90));
+            seg(-12.0, -3.0, Color32::from_rgb(224, 204, 70));
+            seg(-3.0, TOP_DB, Color32::from_rgb(232, 84, 60));
+        }
+        if *hold > BOT_DB + 0.5 {
+            let y = y_of(*hold);
+            p.hline(b.x_range(), y, egui::Stroke::new(1.5, Color32::WHITE));
+        }
+        p.text(
+            egui::pos2(x + bar_w * 0.5, b.max.y - 7.0),
+            egui::Align2::CENTER_BOTTOM,
+            if i == 0 { "L" } else { "R" },
+            egui::FontId::proportional(9.0),
+            Color32::from_rgb(20, 20, 24),
+        );
+    }
+    let gray = Color32::from_rgb(130, 130, 138);
+    for db in [0.0f32, -6.0, -12.0, -24.0, -40.0, -60.0] {
+        let y = y_of(db).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
+        p.hline(label_x - 4.0..=label_x - 1.0, y, egui::Stroke::new(1.0, gray));
+        p.text(
+            egui::pos2(label_x, y),
+            egui::Align2::LEFT_CENTER,
+            format!("{db:.0}"),
+            egui::FontId::proportional(9.0),
+            gray,
+        );
+    }
+}
+
+/// v39: real-time spectrum viewer (Ableton-Spectrum style): log
+/// frequency 30 Hz…20 kHz, −120…0 dBFS, per-bin bars with peak caps.
+fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rect: egui::Rect) {
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, Color32::from_rgb(24, 24, 29));
+    let x_of = |f: f32| -> f32 {
+        rect.min.x + (f.ln() - 30.0f32.ln()) / (20000.0f32 / 30.0).ln() * rect.width()
+    };
+    let y_of = |db: f32| -> f32 {
+        rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height()
+    };
+    let grid = Color32::from_rgb(58, 58, 66);
+    let txt = Color32::from_rgb(120, 120, 128);
+    for (f, lab) in [(100.0f32, "100"), (1000.0, "1k"), (10000.0, "10k")] {
+        let x = x_of(f);
+        p.vline(x, rect.y_range(), egui::Stroke::new(1.0, grid));
+        p.text(
+            egui::pos2(x + 2.0, rect.min.y + 1.0),
+            egui::Align2::LEFT_TOP,
+            lab,
+            egui::FontId::proportional(9.0),
+            txt,
+        );
+    }
+    for db in [-60.0f32, -90.0] {
+        let y = y_of(db);
+        p.hline(rect.x_range(), y, egui::Stroke::new(1.0, grid));
+        p.text(
+            egui::pos2(rect.min.x + 2.0, y + 1.0),
+            egui::Align2::LEFT_TOP,
+            format!("{db:.0} dB"),
+            egui::FontId::proportional(9.0),
+            txt,
+        );
+    }
+    match ms {
+        None => {
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "no audio",
+                egui::FontId::proportional(11.0),
+                txt,
+            );
+        }
+        Some(m) => {
+            let sp = &m.spectrum;
+            let mut mesh = egui::epaint::Mesh::default();
+            for bin in 1..sp.n_bins() {
+                let f = sp.bin_hz(bin);
+                if f < 30.0 || f > 20000.0 {
+                    continue;
+                }
+                let db = sp.db[bin].max(-120.0);
+                if db < -118.0 {
+                    continue;
+                }
+                let x = x_of(f);
+                if x < rect.min.x || x > rect.max.x {
+                    continue;
+                }
+                let t = ((db + 120.0) / 120.0).clamp(0.0, 1.0);
+                let (a, b, tc) = if t < 0.5 {
+                    ((46.0, 130.0, 120.0), (70.0, 220.0, 200.0), t * 2.0)
+                } else {
+                    ((70.0, 220.0, 200.0), (240.0, 235.0, 170.0), (t - 0.5) * 2.0)
+                };
+                let col = Color32::from_rgb(
+                    (a.0 + (b.0 - a.0) * tc) as u8,
+                    (a.1 + (b.1 - a.1) * tc) as u8,
+                    (a.2 + (b.2 - a.2) * tc) as u8,
+                );
+                let y = y_of(db);
+                mesh.add_colored_rect(
+                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + 1.6, rect.max.y)),
+                    col,
+                );
+                let yc = y_of(sp.peak_db[bin]);
+                if yc < y - 1.5 {
+                    mesh.add_colored_rect(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x, yc - 1.2),
+                            egui::pos2(x + 1.6, yc),
+                        ),
+                        Color32::from_rgb(220, 220, 220),
+                    );
+                }
+            }
+            p.add(egui::Shape::mesh(mesh));
+            p.text(
+                egui::pos2(rect.max.x - 2.0, rect.min.y + 1.0),
+                egui::Align2::RIGHT_TOP,
+                "spectrum",
+                egui::FontId::proportional(9.0),
+                txt,
+            );
+        }
+    }
+}
+
+/// v39: the mixer's master header — controls via the shared
+/// `master_volume_controls`, then a compact STEREO peak meter (was a
+/// single mono bar) and a live integrated-LUFS number next to it. The
+/// full pro section (vertical meters, M/S/I/LRA, spectrum) lives in the
+/// MASTER OUT panel.
 fn master_strip(ui: &mut egui::Ui, app: &mut App) {
     ui.spacing_mut().item_spacing.x = 5.0;
-    ui.label(RichText::new("master").strong().small());
-    {
-        // v0.15: no text box — right-click opens Set value / Create
-        // automation asset, matching every other automatable value.
-        let mut mv = app.master_midi as i16;
-        let mut msl = ui
-            .add_sized(
-                egui::vec2(44.0, 18.0),
-                Slider::new(&mut mv, 0..=127).show_value(false),
-            )
-            .on_hover_text(
-                "Master volume: -inf .. +6 dB. Right-click for exact entry and automation.",
-            )
-            // v29: gestures surface via slider_click_gestures (see level_row).
-            ;
-        let mut mvr = ui
-            .add_sized(
-                egui::vec2(50.0, 18.0),
-                egui::Label::new(
-                    RichText::new(format!("{:>5}", db_num(vol_amp(app.master_midi))))
-                        .monospace()
-                        .small(),
-                )
-                .selectable(false)
-                .sense(egui::Sense::click()),
-            )
-            .on_hover_text("dB");
-        if msl.changed() {
-            app.master_dirty = true; // v35 R1
-            app.master_midi = mv.clamp(0, 127) as u8;
-            let amp = vol_amp(app.master_midi);
-            app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
-            app.levels_dirty = true;
-        }
-        // v20 R3: master volume binds directly too (global target: no
-        // owner track — selection's first track or the longest hosts it).
-        let mvv = vol_amp(app.master_midi);
-        bind_value_controls(&mut msl, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
-        bind_value_controls(&mut mvr, app, None, crate::automation::TARGET_MASTER_VOL, mvv);
-        if ui
-            .small_button(RichText::new("0").monospace())
-            .on_hover_text("Reset master volume to 0 dB")
-            .clicked()
-        {
-            app.master_dirty = true; // v35 R1
-            app.master_midi = VOL_UNITY_MIDI;
-            app.levels_dirty = true;
-        }
-        // Peak meter last: it absorbs whatever width is left, so the fixed
-        // widgets (box, slider, zeroize) can never be clipped off the edge
-        // when the mixer dock is narrow.
-        let meter_w = (ui.available_width() - ui.spacing().item_spacing.x).max(12.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(meter_w, 8.0), Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 1.0, Color32::from_rgb(40, 40, 45));
-        let frac = (app.peak_disp * 0.9).clamp(0.0, 1.0);
-        let color = if app.peak_disp > 0.99 {
+    master_volume_controls(ui, app);
+    // Live integrated loudness, next to the meter it belongs to.
+    let i_txt = match app.meter_i {
+        Some(v) if v > -99.0 => format!("I {:5.1}", v),
+        _ => "I    —".into(),
+    };
+    ui.label(
+        RichText::new(i_txt)
+            .monospace()
+            .small()
+            .color(Color32::from_rgb(150, 150, 158)),
+    )
+    .on_hover_text(
+        "Integrated loudness (EBU R 128 / BS.1770 gating) of the master \
+         output. Momentary/short-term readings + LRA + spectrum: MASTER OUT panel.",
+    );
+    // Peak meter last: it absorbs whatever width is left, so the fixed
+    // widgets (slider, dB readout, zeroize) can never be clipped off the
+    // edge when the mixer dock is narrow.
+    let meter_w = (ui.available_width() - ui.spacing().item_spacing.x).max(12.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(meter_w, 8.0), Sense::hover());
+    let painter = ui.painter();
+    let (lp, rp) = match app.meter_state.as_ref() {
+        Some(ms) => (ms.l_peak, ms.r_peak),
+        None => (app.peak_disp, app.peak_disp),
+    };
+    for (i, amp) in [(0usize, lp), (1, rp)] {
+        let row = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, rect.min.y + i as f32 * 4.0),
+            egui::vec2(rect.width(), 3.5),
+        );
+        painter.rect_filled(row, 1.0, Color32::from_rgb(40, 40, 45));
+        let frac = (amp * 0.9).clamp(0.0, 1.0);
+        let color = if amp > 0.99 {
             Color32::RED
-        } else if app.peak_disp > 0.7 {
+        } else if amp > 0.7 {
             Color32::YELLOW
         } else {
             Color32::LIGHT_GREEN
         };
         if frac > 0.01 {
             painter.rect_filled(
-                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height())),
+                egui::Rect::from_min_size(row.min, egui::vec2(row.width() * frac, row.height())),
                 1.0,
                 color,
             );

@@ -26,6 +26,7 @@ pub mod fx;
 pub mod fxgui;
 pub mod midi;
 pub mod midipat;
+pub mod meter;
 pub mod ports;
 pub mod project;
 pub mod quantize;
