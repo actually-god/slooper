@@ -36,6 +36,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("fm.rs", include_str!("../synths/fm.rs")),
     ("pluck.rs", include_str!("../synths/pluck.rs")),
     ("granular.rs", include_str!("../synths/granular.rs")),
+    ("additive.rs", include_str!("../synths/additive.rs")),
     ("sampler.rs", include_str!("../synths/sampler.rs")),
     // Attribution for the piano samples (TimGM6mb, GPL-2); the registry
     // only compiles *.rs, so this rides along as documentation.
