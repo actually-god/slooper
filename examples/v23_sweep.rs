@@ -47,7 +47,10 @@ fn main() {
         .downcast_ref::<slooper::vsthost::RtStageEntry>()
         .unwrap();
     let ndesc = entry.descs().len();
-    println!("OPEN ok {name} params_host={ndesc} editor={}", entry.has_editor());
+    println!(
+        "OPEN ok {name} params_host={ndesc} editor={}",
+        entry.has_editor()
+    );
 
     // Deterministic noise, measure the plugin doing something.
     let mut st = 0x2545_F491_u32;

@@ -20,7 +20,16 @@ fn main() {
         match open(&p, kind, 48_000, None) {
             Ok(_keep) => {
                 let ms = t0.elapsed().as_millis();
-                println!("T {} {:>6} {}", if matches!(kind, VstKind::V3) { "V3" } else { "V2" }, ms, a);
+                println!(
+                    "T {} {:>6} {}",
+                    if matches!(kind, VstKind::V3) {
+                        "V3"
+                    } else {
+                        "V2"
+                    },
+                    ms,
+                    a
+                );
                 // Never drop plugin instances in probes (skill rule).
                 std::mem::forget(_keep);
             }

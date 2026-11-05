@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::vsthost::{
-    vst_loader_lock, StageEntry, VstKind, VstParamDesc, VstParams, FxRing, MIDI_QUEUE_CAP,
+    vst_loader_lock, FxRing, StageEntry, VstKind, VstParamDesc, VstParams, MIDI_QUEUE_CAP,
     VST_BLOCK,
 };
 
@@ -104,7 +104,8 @@ mod ffi {
         pub vendor: *const c_char,
         pub url: *const c_char,
         pub version: *const c_char,
-        pub get_extension: unsafe extern "C" fn(host: *const ClapHost, id: *const c_char) -> *const c_void,
+        pub get_extension:
+            unsafe extern "C" fn(host: *const ClapHost, id: *const c_char) -> *const c_void,
         pub request_restart: unsafe extern "C" fn(host: *const ClapHost),
         pub request_process: unsafe extern "C" fn(host: *const ClapHost),
         pub request_callback: unsafe extern "C" fn(host: *const ClapHost),
@@ -119,8 +120,10 @@ mod ffi {
     #[repr(C)]
     pub struct ClapPluginFactory {
         pub get_plugin_count: unsafe extern "C" fn(f: *const ClapPluginFactory) -> u32,
-        pub get_plugin_descriptor:
-            unsafe extern "C" fn(f: *const ClapPluginFactory, index: u32) -> *const ClapPluginDescriptor,
+        pub get_plugin_descriptor: unsafe extern "C" fn(
+            f: *const ClapPluginFactory,
+            index: u32,
+        ) -> *const ClapPluginDescriptor,
         pub create_plugin: unsafe extern "C" fn(
             f: *const ClapPluginFactory,
             host: *const ClapHost,
@@ -134,14 +137,19 @@ mod ffi {
         pub plugin_data: *mut c_void,
         pub init: unsafe extern "C" fn(p: *const ClapPlugin) -> bool,
         pub destroy: unsafe extern "C" fn(p: *const ClapPlugin),
-        pub activate:
-            unsafe extern "C" fn(p: *const ClapPlugin, sr: f64, min_frames: u32, max_frames: u32) -> bool,
+        pub activate: unsafe extern "C" fn(
+            p: *const ClapPlugin,
+            sr: f64,
+            min_frames: u32,
+            max_frames: u32,
+        ) -> bool,
         pub deactivate: unsafe extern "C" fn(p: *const ClapPlugin),
         pub start_processing: unsafe extern "C" fn(p: *const ClapPlugin) -> bool,
         pub stop_processing: unsafe extern "C" fn(p: *const ClapPlugin),
         pub reset: unsafe extern "C" fn(p: *const ClapPlugin),
         pub process: unsafe extern "C" fn(p: *const ClapPlugin, proc: *const ClapProcess) -> i32,
-        pub get_extension: unsafe extern "C" fn(p: *const ClapPlugin, id: *const c_char) -> *const c_void,
+        pub get_extension:
+            unsafe extern "C" fn(p: *const ClapPlugin, id: *const c_char) -> *const c_void,
         pub on_main_thread: unsafe extern "C" fn(p: *const ClapPlugin),
     }
 
@@ -197,15 +205,20 @@ mod ffi {
     pub struct ClapInputEvents {
         pub ctx: *mut c_void,
         pub size: unsafe extern "C" fn(list: *const ClapInputEvents) -> u32,
-        pub get: unsafe extern "C" fn(list: *const ClapInputEvents, index: u32) -> *const ClapEventHeader,
+        pub get: unsafe extern "C" fn(
+            list: *const ClapInputEvents,
+            index: u32,
+        ) -> *const ClapEventHeader,
     }
 
     /// Plugin -> host event list (the host implements try_push).
     #[repr(C)]
     pub struct ClapOutputEvents {
         pub ctx: *mut c_void,
-        pub try_push:
-            unsafe extern "C" fn(list: *const ClapOutputEvents, event: *const ClapEventHeader) -> bool,
+        pub try_push: unsafe extern "C" fn(
+            list: *const ClapOutputEvents,
+            event: *const ClapEventHeader,
+        ) -> bool,
     }
 
     #[repr(C)]
@@ -283,13 +296,15 @@ mod ffi {
     #[repr(C)]
     pub struct ClapIStream {
         pub ctx: *mut c_void,
-        pub read: unsafe extern "C" fn(s: *const ClapIStream, buffer: *mut c_void, size: u64) -> i64,
+        pub read:
+            unsafe extern "C" fn(s: *const ClapIStream, buffer: *mut c_void, size: u64) -> i64,
     }
 
     #[repr(C)]
     pub struct ClapOStream {
         pub ctx: *mut c_void,
-        pub write: unsafe extern "C" fn(s: *const ClapOStream, buffer: *const c_void, size: u64) -> i64,
+        pub write:
+            unsafe extern "C" fn(s: *const ClapOStream, buffer: *const c_void, size: u64) -> i64,
     }
 
     #[repr(C)]
@@ -342,7 +357,11 @@ static HOST: LazyLock<HostGlobals> = LazyLock::new(|| {
     let version = CString::new(env!("CARGO_PKG_VERSION")).unwrap();
     let log = ffi::ClapHostLog { log: host_log_cb };
     let host = ffi::ClapHost {
-        clap_version: ffi::ClapVersion { major: 1, minor: 2, revision: 0 },
+        clap_version: ffi::ClapVersion {
+            major: 1,
+            minor: 2,
+            revision: 0,
+        },
         host_data: std::ptr::null_mut(),
         name: name.as_ptr(),
         vendor: vendor.as_ptr(),
@@ -353,7 +372,14 @@ static HOST: LazyLock<HostGlobals> = LazyLock::new(|| {
         request_process: host_noop,
         request_callback: host_noop,
     };
-    HostGlobals { log, host, name, vendor, url, version }
+    HostGlobals {
+        log,
+        host,
+        name,
+        vendor,
+        url,
+        version,
+    }
 });
 
 unsafe extern "C" fn host_get_extension(
@@ -397,7 +423,8 @@ struct CachedLib {
 
 unsafe impl Send for CachedLib {}
 
-static LIBS: LazyLock<Mutex<HashMap<PathBuf, CachedLib>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static LIBS: LazyLock<Mutex<HashMap<PathBuf, CachedLib>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Fetch (and lazily dlopen+init) the CLAP entry of `path`. Caller holds
 /// `vst_loader_lock()` — dlopen + entry init touch process-global state.
@@ -409,7 +436,12 @@ fn entry_for(path: &Path) -> Result<&'static ffi::ClapEntry, String> {
         let lib = unsafe { libloading::Library::new(path) }
             .map_err(|e| format!("cannot open '{}' as CLAP: {e}", path.display()))?;
         let entry: libloading::Symbol<*const ffi::ClapEntry> = unsafe { lib.get(b"clap_entry\0") }
-            .map_err(|_| format!("'{}' exports no clap_entry (not a CLAP plugin?)", path.display()))?;
+            .map_err(|_| {
+                format!(
+                    "'{}' exports no clap_entry (not a CLAP plugin?)",
+                    path.display()
+                )
+            })?;
         let entry = *entry;
         libs.insert(
             key.clone(),
@@ -477,9 +509,17 @@ unsafe fn features_of(d: &ffi::ClapPluginDescriptor) -> Vec<String> {
 /// True when the descriptor's feature list marks a note-consuming plugin —
 /// the CLAP replacement for VST3's "Instrument" category (plugin-features.h).
 fn features_say_instrument(feats: &[String]) -> bool {
-    const INSTRUMENT_FEATURES: [&str; 6] =
-        ["instrument", "note-effect", "synthesizer", "sampler", "drum", "drum-machine"];
-    feats.iter().any(|f| INSTRUMENT_FEATURES.contains(&f.as_str()))
+    const INSTRUMENT_FEATURES: [&str; 6] = [
+        "instrument",
+        "note-effect",
+        "synthesizer",
+        "sampler",
+        "drum",
+        "drum-machine",
+    ];
+    feats
+        .iter()
+        .any(|f| INSTRUMENT_FEATURES.contains(&f.as_str()))
 }
 
 // ================================================================= scan ===
@@ -504,7 +544,8 @@ pub fn probe(path: &Path) -> Result<Vec<ScanProbe>, String> {
 /// re-take it; the parent holds it across the fork).
 pub(crate) fn probe_unlocked(path: &Path) -> Result<Vec<ScanProbe>, String> {
     let entry = entry_for(path)?;
-    let factory = unsafe { factory_of(entry) }.ok_or_else(|| "no clap.plugin-factory".to_string())?;
+    let factory =
+        unsafe { factory_of(entry) }.ok_or_else(|| "no clap.plugin-factory".to_string())?;
     let count = unsafe { (factory.get_plugin_count)(factory) };
     let mut out = Vec::new();
     for i in 0..count.min(64) {
@@ -770,7 +811,14 @@ impl ClapStageEntry {
             let status = q.m[0] & 0xF0;
             let ch = (q.m[0] & 0x0F) as i16;
             match status {
-                0x90 if q.m[2] > 0 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_ON, ch, q.m[1], q.m[2] as f64 / 127.0),
+                0x90 if q.m[2] > 0 => self.push_note(
+                    s,
+                    t,
+                    ffi::CLAP_EVENT_NOTE_ON,
+                    ch,
+                    q.m[1],
+                    q.m[2] as f64 / 127.0,
+                ),
                 // 0x90 with velocity 0 is note off by the classic convention.
                 0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, q.m[1], 0.0),
                 // CC / program / pressure travel as raw bytes: spec says
@@ -910,7 +958,11 @@ impl ClapStageEntry {
             steady_time: s.abs_processed,
             frames_count: frames,
             transport: std::ptr::null(),
-            audio_inputs: if self.in_ports > 0 { &s.in_buf } else { std::ptr::null() },
+            audio_inputs: if self.in_ports > 0 {
+                &s.in_buf
+            } else {
+                std::ptr::null()
+            },
             audio_outputs: &mut s.out_buf,
             audio_inputs_count: if self.in_ports > 0 { 1 } else { 0 },
             audio_outputs_count: 1,
@@ -1133,7 +1185,8 @@ pub(crate) fn open_unlocked(
     }
 
     let plugin = unsafe {
-        let id = CString::new(CStr::from_ptr((*desc).id).to_str().unwrap_or("")).unwrap_or_default();
+        let id =
+            CString::new(CStr::from_ptr((*desc).id).to_str().unwrap_or("")).unwrap_or_default();
         (factory.create_plugin)(factory, &HOST.host, id.as_ptr())
     };
     if plugin.is_null() {
@@ -1163,8 +1216,11 @@ pub(crate) fn open_unlocked(
             if !unsafe { ((*params_ext).get_info)(plugin, i, &mut info) } {
                 continue;
             }
-            let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy().into_owned();
-            let writable = info.flags & (ffi::CLAP_PARAM_IS_READONLY | ffi::CLAP_PARAM_IS_HIDDEN) == 0;
+            let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let writable =
+                info.flags & (ffi::CLAP_PARAM_IS_READONLY | ffi::CLAP_PARAM_IS_HIDDEN) == 0;
             let span = info.max_value - info.min_value;
             let default = if span.abs() > f64::EPSILON {
                 ((info.default_value - info.min_value) / span) as f32
@@ -1178,7 +1234,12 @@ pub(crate) fn open_unlocked(
                 ((*params_ext).get_value)(plugin, info.id, &mut cur);
             }
             ids.push(info.id);
-            descs.push(VstParamDesc { id: info.id, name, default, writable });
+            descs.push(VstParamDesc {
+                id: info.id,
+                name,
+                default,
+                writable,
+            });
             ranges.push((info.min_value, info.max_value));
             cur_vals.push(default_from_plain(cur, &info));
         }
@@ -1208,7 +1269,10 @@ pub(crate) fn open_unlocked(
     // active; the chunk already carries parameter values).
     if let Some(bytes) = state {
         if !state_ext.is_null() {
-            struct Cur { bytes: Vec<u8>, pos: usize }
+            struct Cur {
+                bytes: Vec<u8>,
+                pos: usize,
+            }
             unsafe extern "C" fn rd(
                 stream: *const ffi::ClapIStream,
                 buffer: *mut c_void,
@@ -1229,7 +1293,10 @@ pub(crate) fn open_unlocked(
                 c.pos += avail;
                 avail as i64
             }
-            let mut cur = Cur { bytes: bytes.to_vec(), pos: 0 };
+            let mut cur = Cur {
+                bytes: bytes.to_vec(),
+                pos: 0,
+            };
             let is = ffi::ClapIStream {
                 ctx: &mut cur as *mut Cur as *mut c_void,
                 read: rd,
@@ -1327,14 +1394,8 @@ pub(crate) fn open_unlocked(
         let s = &mut *std::sync::Arc::get_mut(&mut e).unwrap().state.get();
         // Mono pipeline: feed the plugin a stereo buffer (L=R) when it
         // declares an input port; take L back out.
-        s.in_chans = vec![
-            s.stage_l.as_mut_ptr(),
-            s.stage_r.as_mut_ptr(),
-        ];
-        s.out_chans = vec![
-            s.stage_ol.as_mut_ptr(),
-            s.stage_or.as_mut_ptr(),
-        ];
+        s.in_chans = vec![s.stage_l.as_mut_ptr(), s.stage_r.as_mut_ptr()];
+        s.out_chans = vec![s.stage_ol.as_mut_ptr(), s.stage_or.as_mut_ptr()];
         s.in_buf.data32 = s.in_chans.as_mut_ptr();
         s.in_buf.channel_count = 2;
         s.out_buf.data32 = s.out_chans.as_mut_ptr();
@@ -1405,7 +1466,11 @@ pub(crate) mod tests {
 
     fn fixture_entry(which: &str) -> std::sync::Arc<ClapStageEntry> {
         let p = fixture_clap().expect("fixture compiled");
-        let id = if which == "gain" { "com.slooper.fixture-gain" } else { "com.slooper.fixture-sine" };
+        let id = if which == "gain" {
+            "com.slooper.fixture-gain"
+        } else {
+            "com.slooper.fixture-sine"
+        };
         // (open/probe/chunk lock the loader internally — this mutex is
         //  NOT reentrant; taking it here too would self-deadlock.)
         open(&p, Some(id), 48_000, None, None).unwrap_or_else(|e| panic!("open {id}: {e}"))
@@ -1421,8 +1486,14 @@ pub(crate) mod tests {
         //  NOT reentrant; taking it here too would self-deadlock.)
         let probes = probe(&p).unwrap();
         assert_eq!(probes.len(), 2, "fixture exports two plugins");
-        let gain = probes.iter().find(|x| x.plugin_id == "com.slooper.fixture-gain").unwrap();
-        let sine = probes.iter().find(|x| x.plugin_id == "com.slooper.fixture-sine").unwrap();
+        let gain = probes
+            .iter()
+            .find(|x| x.plugin_id == "com.slooper.fixture-gain")
+            .unwrap();
+        let sine = probes
+            .iter()
+            .find(|x| x.plugin_id == "com.slooper.fixture-sine")
+            .unwrap();
         assert!(!gain.instrument, "audio-effect is an effect");
         assert!(sine.instrument, "note-effect is an instrument");
         assert_eq!(gain.name, "Fixture Gain");
@@ -1459,7 +1530,10 @@ pub(crate) mod tests {
             .find(|e| e.plugin_id.as_deref() == Some("com.slooper.fixture-sine"))
             .unwrap();
         assert!(sine.instrument, "note-effect scans as an instrument");
-        assert!(!entries[0].path.to_string_lossy().ends_with('#'), "path stays clean of the #id tail");
+        assert!(
+            !entries[0].path.to_string_lossy().ends_with('#'),
+            "path stays clean of the #id tail"
+        );
     }
 
     #[test]
@@ -1469,7 +1543,10 @@ pub(crate) mod tests {
         assert_eq!(e.descs()[0].name, "fixgain");
         // plain default 1.0 on [0,1] normalizes to 1.0
         assert!((e.descs()[0].default - 1.0).abs() < 1e-6);
-        assert!((e.params().get(0) - 1.0).abs() < 1e-6, "cells seed from plugin, not host");
+        assert!(
+            (e.params().get(0) - 1.0).abs() < 1e-6,
+            "cells seed from plugin, not host"
+        );
     }
 
     #[test]
@@ -1492,9 +1569,7 @@ pub(crate) mod tests {
         e.process(&input, &mut out);
         // After the param block lands (echo carries dry only until the
         // plugin produces), the tail sits at half amplitude.
-        let tail: f32 = out[1200..1536]
-            .iter()
-            .fold(0.0f32, |m, x| m.max(x.abs()));
+        let tail: f32 = out[1200..1536].iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!((tail - 0.5).abs() < 0.05, "half gain expected, got {tail}");
     }
 
@@ -1508,13 +1583,19 @@ pub(crate) mod tests {
         // sample; empty input would mean no blocks at all, VST included).
         e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
         let peak = out[1024..1536].iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        assert!(peak > 0.4 && peak <= 0.55, "A4 full velocity peaks ~0.5, got {peak}");
+        assert!(
+            peak > 0.4 && peak <= 0.55,
+            "A4 full velocity peaks ~0.5, got {peak}"
+        );
         let zc = out[1025..1536]
             .windows(2)
             .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
             .count();
         let expect = (440.0 * 2.0 * 511.0 / 48_000.0) as isize;
-        assert!((zc as isize - expect).abs() <= 2, "440 Hz expected: zc {zc} vs {expect}");
+        assert!(
+            (zc as isize - expect).abs() <= 2,
+            "440 Hz expected: zc {zc} vs {expect}"
+        );
     }
 
     #[test]
@@ -1534,14 +1615,22 @@ pub(crate) mod tests {
         let chunk = e.chunk().expect("state saved");
         assert!(chunk.starts_with(b"F1 0.25"));
         // Reopen from state: fresh entry must come up at gain 0.25.
-        let e2 =
-            open(&p, Some("com.slooper.fixture-gain"), 48_000, Some(&[0.25, 1.0]), Some(&chunk))
-                .unwrap();
+        let e2 = open(
+            &p,
+            Some("com.slooper.fixture-gain"),
+            48_000,
+            Some(&[0.25, 1.0]),
+            Some(&chunk),
+        )
+        .unwrap();
         assert!((e2.params().get(0) - 0.25).abs() < 1e-6);
         let mut out = vec![0.0f32; 1536];
         e2.process(&[1.0f32; 1536], &mut out);
         let tail = out[1200..1536].iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        assert!((tail - 0.25).abs() < 0.05, "recovered gain 0.25 expected, got {tail}");
+        assert!(
+            (tail - 0.25).abs() < 0.05,
+            "recovered gain 0.25 expected, got {tail}"
+        );
     }
 
     #[test]

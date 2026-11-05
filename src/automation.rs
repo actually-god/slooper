@@ -108,18 +108,7 @@ impl Automation {
         Automation {
             target: target.into(),
             len_samples: len,
-            nodes: vec![
-                Node {
-                    t: 0,
-                    v,
-                    c: 0.0,
-                },
-                Node {
-                    t: len,
-                    v,
-                    c: 0.0,
-                },
-            ],
+            nodes: vec![Node { t: 0, v, c: 0.0 }, Node { t: len, v, c: 0.0 }],
         }
     }
 
@@ -151,14 +140,7 @@ impl Automation {
         }
         if self.nodes[0].t != 0 {
             let v = self.nodes[0].v;
-            self.nodes.insert(
-                0,
-                Node {
-                    t: 0,
-                    v,
-                    c: 0.0,
-                },
-            );
+            self.nodes.insert(0, Node { t: 0, v, c: 0.0 });
         }
         let _ = (min_t, max_v);
     }
@@ -293,16 +275,8 @@ pub fn preset_nodes(p: Preset, len: i64, lo: f32, hi: f32) -> Vec<Node> {
         Preset::FadeIn => vec![n(0.0, 0.0, 0.0), n(1.0, 1.0, 0.0)],
         Preset::FadeOut => vec![n(0.0, 1.0, 0.0), n(1.0, 0.0, 0.0)],
         // Hill: rush up into the peak (soft arrival), ease away from it.
-        Preset::Peak => vec![
-            n(0.0, 0.0, 0.0),
-            n(0.5, 1.0, 0.85),
-            n(1.0, 0.0, -0.85),
-        ],
-        Preset::Valley => vec![
-            n(0.0, 1.0, 0.0),
-            n(0.5, 0.0, 0.85),
-            n(1.0, 1.0, -0.85),
-        ],
+        Preset::Peak => vec![n(0.0, 0.0, 0.0), n(0.5, 1.0, 0.85), n(1.0, 0.0, -0.85)],
+        Preset::Valley => vec![n(0.0, 1.0, 0.0), n(0.5, 0.0, 0.85), n(1.0, 1.0, -0.85)],
         // Positive curvature = settle softly into the destination value.
         Preset::EaseUp => vec![n(0.0, 0.0, 0.0), n(1.0, 1.0, 0.85)],
         Preset::EaseDown => vec![n(0.0, 1.0, 0.0), n(1.0, 0.0, 0.85)],
@@ -367,12 +341,7 @@ pub fn is_plugin_target(t: &str) -> bool {
 /// Inside the clip window the source wraps (the R4 clip-window repeat);
 /// past the window the LAST played source sample is held, so the target
 /// keeps the value the curve ended on instead of snapping back.
-pub fn clip_source_pos(
-    len_samples: i64,
-    cut: u64,
-    play_len: Option<u64>,
-    off: i64,
-) -> Option<i64> {
+pub fn clip_source_pos(len_samples: i64, cut: u64, play_len: Option<u64>, off: i64) -> Option<i64> {
     if off < 0 || len_samples <= 0 {
         return None;
     }
@@ -443,10 +412,7 @@ pub fn presets_dir() -> std::path::PathBuf {
 }
 
 pub fn preset_path(name: &str) -> std::path::PathBuf {
-    presets_dir().join(format!(
-        "{}.json",
-        crate::fx::sanitize_preset_name(name)
-    ))
+    presets_dir().join(format!("{}.json", crate::fx::sanitize_preset_name(name)))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -603,7 +569,10 @@ mod tests {
         }
         assert!((warp(0.0, 0.5) - 0.5).abs() < 1e-6, "0 is linear");
         assert!((warp(1.0, 0.5) - 0.875).abs() < 1e-5, "+1 = old Slow cubic");
-        assert!((warp(-1.0, 0.5) - 0.125).abs() < 1e-5, "-1 = old Fast cubic");
+        assert!(
+            (warp(-1.0, 0.5) - 0.125).abs() < 1e-5,
+            "-1 = old Fast cubic"
+        );
         assert!(warp(0.6, 0.5) > 0.5, "positive leads");
         assert!(warp(-0.6, 0.5) < 0.5, "negative lags");
     }

@@ -31,8 +31,7 @@ mod api {
 }
 pub use api::{
     EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectParamV1, GuiApiV1, GuiFrameV1,
-    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2,
-    SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
+    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
@@ -69,7 +68,10 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("space_echo.rs", include_str!("../effects/space_echo.rs")),
     ("compressor.rs", include_str!("../effects/compressor.rs")),
     ("chorus.rs", include_str!("../effects/chorus.rs")),
-    ("sidechain_comp.rs", include_str!("../effects/sidechain_comp.rs")),
+    (
+        "sidechain_comp.rs",
+        include_str!("../effects/sidechain_comp.rs"),
+    ),
 ];
 
 /// Symbol every effect library must export (NUL-terminated: libloading 0.8
@@ -723,7 +725,14 @@ struct EffectFns {
     destroy: extern "C" fn(state: *mut core::ffi::c_void),
     process: extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32,
     /// ABI v2 sidechain entry (None for v1 scripts — they never see `sc`).
-    process_sc: Option<extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32>,
+    process_sc: Option<
+        extern "C" fn(
+            state: *mut core::ffi::c_void,
+            input: f32,
+            params: *const f32,
+            sc: f32,
+        ) -> f32,
+    >,
 }
 
 /// Owning wrapper for a loaded library (raw handle inside ⇒ manual impls;
@@ -868,12 +877,7 @@ impl Instance {
     /// must come from a successfully opened effect whose owner lock is
     /// held by the caller, and `params` is the caller's frozen param set.
     #[inline]
-    pub unsafe fn call_sample_sc(
-        &self,
-        input: f32,
-        params: &[f32; MAX_PARAMS],
-        sc: f32,
-    ) -> f32 {
+    pub unsafe fn call_sample_sc(&self, input: f32, params: &[f32; MAX_PARAMS], sc: f32) -> f32 {
         match self.fns.process_sc {
             Some(f) => f(self.state, input, params.as_ptr(), sc),
             None => (self.fns.process)(self.state, input, params.as_ptr()),
@@ -1291,9 +1295,10 @@ unsafe fn validate(
                 .unwrap()
         }
         Err(_) => {
-            let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> = lib
-                .get(ENTRY)
-                .map_err(|_| "missing entry point slooper_effect_info — see template.rs".to_string())?;
+            let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> =
+                lib.get(ENTRY).map_err(|_| {
+                    "missing entry point slooper_effect_info — see template.rs".to_string()
+                })?;
             let info = sym();
             if info.is_null() {
                 return Err("slooper_effect_info returned null".into());
@@ -1677,7 +1682,9 @@ mod tests {
         // It must load (both entry symbols present) and be recognized as
         // sidechain-capable; every v1 stock effect must not be.
         {
-            let sc = reg.desc("sidechain_comp").unwrap_or_else(|| panic!("sidechain_comp missing/failed"));
+            let sc = reg
+                .desc("sidechain_comp")
+                .unwrap_or_else(|| panic!("sidechain_comp missing/failed"));
             assert!(sc.sidechain, "must load through the v2 entry");
             assert_eq!(sc.params.len(), 6);
             assert!(!reg.desc("compressor").unwrap().sidechain, "v1 stays v1");
@@ -2534,10 +2541,19 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         std::fs::write(dir.join("my_thing.rs"), "// user file\nfn main(){}\n").unwrap();
         seed_api(&dir);
         for name in ["compressor.rs", "chorus.rs", API_FILE] {
-            assert!(dir.join(name).exists(), "{name} must be seeded into a pre-existing folder");
+            assert!(
+                dir.join(name).exists(),
+                "{name} must be seeded into a pre-existing folder"
+            );
         }
-        assert!(dir.join("my_thing.rs").is_file(), "user files are untouched");
-        assert!(!dir.join("template.rs").exists(), "template stays fresh-folder-only");
+        assert!(
+            dir.join("my_thing.rs").is_file(),
+            "user files are untouched"
+        );
+        assert!(
+            !dir.join("template.rs").exists(),
+            "template stays fresh-folder-only"
+        );
         // Second seed is a no-op: no .bak churn when content already matches.
         seed_api(&dir);
         assert!(!dir.join("compressor.rs.bak").exists());

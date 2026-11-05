@@ -1252,10 +1252,17 @@ fn e2e_export_writes_file() {
         Duration::from_secs(5),
     );
     assert!(got_r.is_some(), "no Notice exporting while rolling");
-    let roll = slooper::audio_io::decode_to_mono(&dir.join("rolling.wav"), sr).expect("rolling wav");
+    let roll =
+        slooper::audio_io::decode_to_mono(&dir.join("rolling.wav"), sr).expect("rolling wav");
     let seg_r = |a: usize, c: usize| roll[a..c].iter().sum::<f32>() / (c - a) as f32;
-    assert!((seg_r(0, 4_000) - 0.5).abs() < 0.02, "rolling export segment 1");
-    assert!((seg_r(4_000, 8_000) - 0.75).abs() < 0.02, "rolling export segment 2");
+    assert!(
+        (seg_r(0, 4_000) - 0.5).abs() < 0.02,
+        "rolling export segment 1"
+    );
+    assert!(
+        (seg_r(4_000, 8_000) - 0.75).abs() < 0.02,
+        "rolling export segment 2"
+    );
     assert!(seg_r(8_000, 12_000).abs() < 1e-6, "rolling export tail");
     b.cmd(Cmd::StopAll);
 
@@ -2450,16 +2457,16 @@ impl ProcessHandler for LiveMidiCapProc {
     fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
         match self.stage.swap(0, Ordering::SeqCst) {
             1 => {
-                let _ = self
-                    .out
-                    .writer(ps)
-                    .write(&RawMidi { time: 0, bytes: &[0x90, 60, 100] });
+                let _ = self.out.writer(ps).write(&RawMidi {
+                    time: 0,
+                    bytes: &[0x90, 60, 100],
+                });
             }
             2 => {
-                let _ = self
-                    .out
-                    .writer(ps)
-                    .write(&RawMidi { time: 0, bytes: &[0x80, 60, 0] });
+                let _ = self.out.writer(ps).write(&RawMidi {
+                    time: 0,
+                    bytes: &[0x80, 60, 0],
+                });
             }
             _ => {}
         }
@@ -2558,7 +2565,11 @@ fn e2e_live_midi_input_plays_synths() {
     // Play. The attack is audible within a few blocks...
     stage.store(1, Ordering::SeqCst);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "live note-on plays the selected track's synth (transport STOPPED)",
     );
@@ -2576,8 +2587,7 @@ fn e2e_live_midi_input_plays_synths() {
     // Release: it decays.
     stage.store(2, Ordering::SeqCst);
     std::thread::sleep(Duration::from_millis(1400));
-    let tail = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
-        .expect("tail");
+    let tail = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("tail");
     assert!(
         rms(&tail) < 0.25 * mid_rms,
         "released key decays: {} vs {mid_rms}",
@@ -2620,7 +2630,11 @@ fn e2e_live_midi_input_plays_synths() {
     std::thread::sleep(Duration::from_millis(120));
     stage.store(1, Ordering::SeqCst);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "gate back on: the keyboard plays again",
     );
@@ -2650,7 +2664,14 @@ fn e2e_no_click_gain_steps() {
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
     let src_name = client.name().to_string();
     let active = client
-        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
         .unwrap();
     b.cmd(Cmd::Apply {
         ins: vec![],
@@ -2678,20 +2699,20 @@ fn e2e_no_click_gain_steps() {
     });
     b.cmd(Cmd::SetLoop(true));
 
-    let max_delta = |x: &[f32]| -> f32 {
-        x.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()))
-    };
+    let max_delta =
+        |x: &[f32]| -> f32 { x.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs())) };
     // Capture a SPANK that straddles a command: ring positions are exact,
     // so the transition itself (not just the aftermath) lands inside.
-    let read_span = |ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, w0: u64, back: u64, fwd: u64| -> Vec<f32> {
-        let n = ring.len() as u64;
-        while widx.load(Ordering::Relaxed).saturating_sub(w0) < fwd {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        ((w0 - back)..(w0 + fwd))
-            .map(|i| f32::from_bits(ring[(i % n) as usize].load(Ordering::Relaxed)))
-            .collect()
-    };
+    let read_span =
+        |ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, w0: u64, back: u64, fwd: u64| -> Vec<f32> {
+            let n = ring.len() as u64;
+            while widx.load(Ordering::Relaxed).saturating_sub(w0) < fwd {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ((w0 - back)..(w0 + fwd))
+                .map(|i| f32::from_bits(ring[(i % n) as usize].load(Ordering::Relaxed)))
+                .collect()
+        };
 
     // Play: steady DC, zero deltas (float-exact except the start ramp).
     b.cmd(Cmd::PlayAll);
@@ -2778,7 +2799,10 @@ fn e2e_sidechain_ducks_target_track() {
     reg.rescan();
     // threshold -30 dB, ratio 4, attack 2 ms, release 100 ms, knee 6, depth 1.
     let vals = [-30.0f32, 4.0, 2.0, 100.0, 6.0, 1.0];
-    let desc = reg.desc("sidechain_comp").expect("stock sidechain_comp present").clone();
+    let desc = reg
+        .desc("sidechain_comp")
+        .expect("stock sidechain_comp present")
+        .clone();
     let inst = reg
         .create_instance("sidechain_comp", sr as f64, &vals)
         .expect("sidechain_comp compiles and instantiates");
@@ -2791,7 +2815,14 @@ fn e2e_sidechain_ducks_target_track() {
     let sink = client.register_port("sink", AudioIn::default()).unwrap();
     let src_name = client.name().to_string();
     let _active = client
-        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
         .unwrap();
     // Probe the RIGHT bus only: the key track is panned hard left so its
     // own energy never touches the measured signal — the sink hears the
@@ -2833,7 +2864,9 @@ fn e2e_sidechain_ducks_target_track() {
     b.engine.set_loop_pan(1, 1.0); // tone hard right
     b.cmd(Cmd::SetTrackEffects {
         i: 1,
-        chain: TrackFx { slots: Arc::new(vec![FxSlot::scripted(inst, desc)]) },
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+        },
     });
     // Layout writes race the transport; land them before measuring.
     std::thread::sleep(Duration::from_millis(150));
@@ -2851,13 +2884,20 @@ fn e2e_sidechain_ducks_target_track() {
 
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 480).map(|m| m > 0.005).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 480)
+                .map(|m| m > 0.005)
+                .unwrap_or(false)
+        },
         Duration::from_secs(3),
         "target tone audible on the probe bus",
     );
     std::thread::sleep(Duration::from_millis(150));
     let open = rms(200);
-    assert!(open > 0.005, "tone must ride the probe bus unkeyed (got {open})");
+    assert!(
+        open > 0.005,
+        "tone must ride the probe bus unkeyed (got {open})"
+    );
 
     // Route the key: track 0 now keys track 1's chain (bit 0).
     b.engine.set_sc_send(1, 1 << 0);
@@ -2966,7 +3006,6 @@ fn e2e_v37_recording_suppresses_park_and_autostop() {
     b.cmd(Cmd::StopAll);
 }
 
-
 // =============== v38 R1: roll audition voices (live path) =================
 
 /// Transport STOPPED, track play flag OFF: a staged audition voice must
@@ -3039,10 +3078,13 @@ fn e2e_roll_audition_note_sounds_with_transport_stopped() {
         Duration::from_secs(5),
         "audition note audible with the transport STOPPED",
     );
-    let body = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
-        .expect("body window");
+    let body =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("body window");
     let body_rms = rms(&body);
-    assert!(body_rms > 2e-3, "audition body must carry audio: {body_rms}");
+    assert!(
+        body_rms > 2e-3,
+        "audition body must carry audio: {body_rms}"
+    );
 
     // After the note-off lands and the pool retires, the flag drains —
     // the roll's STOP button flips back on its own (A2).
@@ -3052,8 +3094,8 @@ fn e2e_roll_audition_note_sounds_with_transport_stopped() {
         "audition flag drains when voices retire",
     );
     std::thread::sleep(Duration::from_millis(400));
-    let tail = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
-        .expect("tail window");
+    let tail =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("tail window");
     let tail_rms = rms(&tail);
     assert!(
         tail_rms < 0.25 * body_rms.max(1e-9),
@@ -3111,11 +3153,8 @@ fn e2e_roll_audition_stop_silences_held_note() {
     std::thread::sleep(Duration::from_millis(150));
 
     // A 3-second note; STOP it ~0.6 s in, while it is held.
-    let ev: Arc<[MidiEv]> = vec![
-        (0u64, 3u8, 0u8, 50u8, 120u8),
-        (3 * sr as u64, 0, 0, 50, 0),
-    ]
-    .into();
+    let ev: Arc<[MidiEv]> =
+        vec![(0u64, 3u8, 0u8, 50u8, 120u8), (3 * sr as u64, 0, 0, 50, 0)].into();
     b.engine.play_audition(0, ev);
     wait_until(
         || {
@@ -3126,8 +3165,8 @@ fn e2e_roll_audition_stop_silences_held_note() {
         Duration::from_secs(5),
         "audition sounding before STOP",
     );
-    let body = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
-        .expect("body window");
+    let body =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("body window");
     let body_rms = rms(&body);
     assert!(body_rms > 2e-3, "held note audible: {body_rms}");
 
@@ -3143,8 +3182,8 @@ fn e2e_roll_audition_stop_silences_held_note() {
     );
     // …and it must stay dead (no resurrect from staged-but-purged offs).
     std::thread::sleep(Duration::from_millis(500));
-    let after2 = read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
-        .expect("late window");
+    let after2 =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("late window");
     let after2_rms = rms(&after2);
     assert!(
         after2_rms < 0.15 * body_rms.max(1e-9),

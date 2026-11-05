@@ -1565,7 +1565,9 @@ unsafe fn make_editor3(
     if let Some(bytes) = &state {
         if let Err(e) = plugin.load_state(bytes) {
             if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
-                eprintln!("[vstedit3] {title}: shadow load_state refused ({e}) — cell priming only");
+                eprintln!(
+                    "[vstedit3] {title}: shadow load_state refused ({e}) — cell priming only"
+                );
             }
         }
     }
@@ -1774,8 +1776,7 @@ impl Editor3 {
                                 // baseline without pushing — the baseline
                                 // IS the seeded state, pushing it would
                                 // stomp cells with the plugin's defaults.
-                                self.shadow_last =
-                                    model.iter().map(|x| x.value as f32).collect();
+                                self.shadow_last = model.iter().map(|x| x.value as f32).collect();
                             } else {
                                 for (k, pm) in model.iter().enumerate() {
                                     let v = pm.value as f32;
@@ -1906,86 +1907,86 @@ impl Editor3 {
         XFlush(self.d);
     }
 
-/// v20/v22: serialize a shadow's component state into `shared.state` —
-/// silent-block flush first (v20 PROBE FACT, kept verbatim in the body),
-/// then `save_state`. Free function on loose fields so both callers can
-/// run it while `self.plugin` is already re-borrowed inside the pump.
-/// Safe to call any number of times: teardown calls it once at close,
-/// and the Live phase calls it on a timer while the window is open (v22
-/// real-time persistence), so a crash or WM kill can never lose the
-/// visible patch more than a couple of seconds.
-fn harvest3(
-    p: &mut vst3_host::Plugin,
-    sr: u32,
-    dbg: bool,
-    title: &str,
-    shared: &Shared,
-    edited: &std::collections::HashSet<u32>,
-) {
-    // v20 PROBE FACT (v20_chunkdiff example): host-set parameter values
-    // are NOT part of a plugin's serializable state until the plugin
-    // has actually RUN audio with them — wolf-shaper and 3BandEQ wrote
-    // byte-identical chunks until one silent block ran (DPF's isLive
-    // deferral; the same pattern the VST3 SDK teaches). The shadow
-    // never processes during its life, so push a few silent blocks
-    // through NOW, otherwise the chunk would lag every knob the user
-    // moved and rebuilding from it could UNDO edits.
-    if let Err(e) = p.start_processing() {
-        if dbg {
-            eprintln!("[vstedit3] {title}: state-flush start failed: {e}");
-        }
-    } else {
-        let ch = p.output_channel_count().max(1);
-        let mut bufs = vst3_host::audio::AudioBuffers::new(
-            ch,
-            ch,
-            crate::vsthost::VST_BLOCK,
-            sr.max(1) as f64,
-        );
-        for _ in 0..4 {
-            if p.process_audio(&mut bufs).is_err() {
-                break;
-            }
-        }
-        let _ = p.stop_processing();
-    }
-    match p.save_state() {
-        Ok(bytes) => {
-            match p.get_parameters() {
-                Ok(all) => {
-                    // v24: ride-along parameter snapshot — but ONLY the
-                    // params this shadow actually saw move (the v23
-                    // whole-model snapshot replanted resting MIDI-CC /
-                    // bender values on reopen and silenced the synth).
-                    // With a chunk that carries no values, this edited
-                    // set is exactly the user's edits; with one that
-                    // does, it overrides just what was touched.
-                    let psnap: Vec<(u32, f32)> = all
-                        .into_iter()
-                        .filter(|x| edited.contains(&x.id))
-                        .map(|x| (x.id, x.value as f32))
-                        .collect();
-                    if let (Ok(mut cell), Ok(mut pcell)) =
-                        (shared.state.lock(), shared.params.lock())
-                    {
-                        *cell = Some(bytes);
-                        *pcell = Some(psnap);
-                    }
-                }
-                Err(_) => {
-                    if let Ok(mut cell) = shared.state.lock() {
-                        *cell = Some(bytes);
-                    }
-                }
-            }
-        }
-        Err(e) => {
+    /// v20/v22: serialize a shadow's component state into `shared.state` —
+    /// silent-block flush first (v20 PROBE FACT, kept verbatim in the body),
+    /// then `save_state`. Free function on loose fields so both callers can
+    /// run it while `self.plugin` is already re-borrowed inside the pump.
+    /// Safe to call any number of times: teardown calls it once at close,
+    /// and the Live phase calls it on a timer while the window is open (v22
+    /// real-time persistence), so a crash or WM kill can never lose the
+    /// visible patch more than a couple of seconds.
+    fn harvest3(
+        p: &mut vst3_host::Plugin,
+        sr: u32,
+        dbg: bool,
+        title: &str,
+        shared: &Shared,
+        edited: &std::collections::HashSet<u32>,
+    ) {
+        // v20 PROBE FACT (v20_chunkdiff example): host-set parameter values
+        // are NOT part of a plugin's serializable state until the plugin
+        // has actually RUN audio with them — wolf-shaper and 3BandEQ wrote
+        // byte-identical chunks until one silent block ran (DPF's isLive
+        // deferral; the same pattern the VST3 SDK teaches). The shadow
+        // never processes during its life, so push a few silent blocks
+        // through NOW, otherwise the chunk would lag every knob the user
+        // moved and rebuilding from it could UNDO edits.
+        if let Err(e) = p.start_processing() {
             if dbg {
-                eprintln!("[vstedit3] {title}: save_state failed: {e}");
+                eprintln!("[vstedit3] {title}: state-flush start failed: {e}");
+            }
+        } else {
+            let ch = p.output_channel_count().max(1);
+            let mut bufs = vst3_host::audio::AudioBuffers::new(
+                ch,
+                ch,
+                crate::vsthost::VST_BLOCK,
+                sr.max(1) as f64,
+            );
+            for _ in 0..4 {
+                if p.process_audio(&mut bufs).is_err() {
+                    break;
+                }
+            }
+            let _ = p.stop_processing();
+        }
+        match p.save_state() {
+            Ok(bytes) => {
+                match p.get_parameters() {
+                    Ok(all) => {
+                        // v24: ride-along parameter snapshot — but ONLY the
+                        // params this shadow actually saw move (the v23
+                        // whole-model snapshot replanted resting MIDI-CC /
+                        // bender values on reopen and silenced the synth).
+                        // With a chunk that carries no values, this edited
+                        // set is exactly the user's edits; with one that
+                        // does, it overrides just what was touched.
+                        let psnap: Vec<(u32, f32)> = all
+                            .into_iter()
+                            .filter(|x| edited.contains(&x.id))
+                            .map(|x| (x.id, x.value as f32))
+                            .collect();
+                        if let (Ok(mut cell), Ok(mut pcell)) =
+                            (shared.state.lock(), shared.params.lock())
+                        {
+                            *cell = Some(bytes);
+                            *pcell = Some(psnap);
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut cell) = shared.state.lock() {
+                            *cell = Some(bytes);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if dbg {
+                    eprintln!("[vstedit3] {title}: save_state failed: {e}");
+                }
             }
         }
     }
-}
 
     /// v20/v22: harvest the shadow's chunk (see [`harvest3`]).
     fn harvest(&mut self) {
@@ -1993,7 +1994,14 @@ fn harvest3(
             return;
         }
         if let Some(p) = self.plugin.as_mut() {
-            Self::harvest3(p, self.sr, self.dbg, &self.title, &self.shared, &self.edited);
+            Self::harvest3(
+                p,
+                self.sr,
+                self.dbg,
+                &self.title,
+                &self.shared,
+                &self.edited,
+            );
         }
     }
 
@@ -2249,7 +2257,13 @@ mod tests {
             path.display()
         );
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win = match open_editor(&h, &path.to_string_lossy(), "smoke", crate::vsthost::VstParams::new(&[]), 0) {
+        let mut win = match open_editor(
+            &h,
+            &path.to_string_lossy(),
+            "smoke",
+            crate::vsthost::VstParams::new(&[]),
+            0,
+        ) {
             Ok(w) => w,
             Err(e) => panic!("open_editor failed: {e}"),
         };
@@ -2317,7 +2331,14 @@ mod tests {
             .expect("plugin loads");
         let entry = &load.entry;
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-refuse", crate::vsthost::VstParams::new(&[]), 0).expect("open_editor");
+        let mut win = open_editor(
+            &h,
+            &path.to_string_lossy(),
+            "pin-refuse",
+            crate::vsthost::VstParams::new(&[]),
+            0,
+        )
+        .expect("open_editor");
         // Verification is 100 x 30 ms (shared pump); slack ok.
         let mut waited = 0u32;
         while !win.open_failed() && !win.painted() && waited < 8000 {
@@ -2359,7 +2380,14 @@ mod tests {
             .expect("plugin loads");
         let entry = &load.entry;
         let h = entry.vst2_handle().expect("vst2 handle");
-        let mut win = open_editor(&h, &path.to_string_lossy(), "pin-close", crate::vsthost::VstParams::new(&[]), 0).expect("open_editor");
+        let mut win = open_editor(
+            &h,
+            &path.to_string_lossy(),
+            "pin-close",
+            crate::vsthost::VstParams::new(&[]),
+            0,
+        )
+        .expect("open_editor");
         let mut waited = 0u32;
         while !win.painted() && !win.is_closed() && waited < 8000 {
             std::thread::sleep(Duration::from_millis(100));
@@ -2645,8 +2673,14 @@ mod tests {
                 continue;
             }
             let h = entry.vst2_handle().expect("vst2 handle");
-            let mut win =
-                open_editor(&h, &path.to_string_lossy(), "pin-paint", crate::vsthost::VstParams::new(&[]), 0).expect("open_editor");
+            let mut win = open_editor(
+                &h,
+                &path.to_string_lossy(),
+                "pin-paint",
+                crate::vsthost::VstParams::new(&[]),
+                0,
+            )
+            .expect("open_editor");
             let mut waited = 0u32;
             while !win.painted() && !win.is_closed() && waited < 10_000 {
                 std::thread::sleep(Duration::from_millis(100));
@@ -2832,8 +2866,14 @@ mod tests {
         }
         let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V2, 48_000, None).ok()?;
         let h = load.entry.vst2_handle()?;
-        let mut w = open_editor(&h, &path.to_string_lossy(), tag, crate::vsthost::VstParams::new(&[]), 0)
-            .ok()?;
+        let mut w = open_editor(
+            &h,
+            &path.to_string_lossy(),
+            tag,
+            crate::vsthost::VstParams::new(&[]),
+            0,
+        )
+        .ok()?;
         let t0 = std::time::Instant::now();
         while !w.painted()
             && !w.open_failed()
@@ -2951,7 +2991,11 @@ mod tests {
         let ok = XGetWMNormalHints(d, xid, &mut h, &mut supplied) != 0;
         XCloseDisplay(d);
         if ok {
-            Some((h.flags, (h.min_width, h.min_height), (h.max_width, h.max_height)))
+            Some((
+                h.flags,
+                (h.min_width, h.min_height),
+                (h.max_width, h.max_height),
+            ))
         } else {
             None
         }
@@ -2974,7 +3018,11 @@ mod tests {
             XSetErrorHandler(Some(x_error_noop));
             let win = XCreateSimpleWindow(d, root_window(d), 10, 10, 300, 200, 0, 0, 0);
             XFlush(d);
-            assert_eq!(wm_normal_hints(win).map(|h| h.0), None, "no hints before the pin");
+            assert_eq!(
+                wm_normal_hints(win).map(|h| h.0),
+                None,
+                "no hints before the pin"
+            );
             lock_wm_size(d, win, Some((317, 211)));
             let (flags, min, max) = wm_normal_hints(win).expect("hints written");
             assert_ne!(flags & PMIN_SIZE, 0, "PMinSize must be set");

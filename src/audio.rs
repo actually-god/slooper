@@ -242,12 +242,8 @@ impl BoundSet {
     /// generator when a binding changes while a key is held.
     pub fn claims(&self, kind: u8, ch: u8, d1: u8) -> bool {
         match kind {
-            3 => {
-                self.exact.contains(&bind_key(0, ch, d1)) || self.axes.contains(&axis_key(0, ch))
-            }
-            1 => {
-                self.exact.contains(&bind_key(1, ch, d1)) || self.axes.contains(&axis_key(1, ch))
-            }
+            3 => self.exact.contains(&bind_key(0, ch, d1)) || self.axes.contains(&axis_key(0, ch)),
+            1 => self.exact.contains(&bind_key(1, ch, d1)) || self.axes.contains(&axis_key(1, ch)),
             _ => false,
         }
     }
@@ -832,7 +828,9 @@ impl Engine {
         }
         Arc::new(Self {
             rec_bufs,
-            auto_disp: core::array::from_fn(|_| core::array::from_fn(|_| AtomicU32::new(f32::NAN.to_bits()))),
+            auto_disp: core::array::from_fn(|_| {
+                core::array::from_fn(|_| AtomicU32::new(f32::NAN.to_bits()))
+            }),
             rec_len: core::array::from_fn(|_| AtomicU32::new(0)),
             rec_state: core::array::from_fn(|_| AtomicU8::new(TR_IDLE)),
             rec_at: core::array::from_fn(|_| AtomicU64::new(0)),
@@ -1107,7 +1105,10 @@ impl Engine {
     /// still restarts from the top (PlayAll guard) and a non-looping run
     /// parks at the project end.
     pub fn seek_to(&self, p: u64) {
-        let cap = self.proj_len.load(Ordering::Relaxed).saturating_add(SEEK_SLACK);
+        let cap = self
+            .proj_len
+            .load(Ordering::Relaxed)
+            .saturating_add(SEEK_SLACK);
         let p = p.min(cap);
         self.pos.store(p, Ordering::Relaxed);
         self.seek.store(p, Ordering::Relaxed);
@@ -1149,7 +1150,6 @@ impl Engine {
         }
     }
 
-    
     /// v34 R11: last automation-driven vol/gain/pan for a track, in
     /// amplitude space (pan in -1..1). NAN = manual control — the mixer
     /// faders display these so they animate with automation.
@@ -1473,11 +1473,7 @@ impl Engine {
             v.remove(0);
         }
         let vid = self.aud_vid.fetch_add(1, Ordering::Relaxed) + 1;
-        v.push(AudVoiceReq {
-            vid,
-            track,
-            ev,
-        });
+        v.push(AudVoiceReq { vid, track, ev });
         *self.aud_voices.lock().unwrap() = Arc::new(v);
         self.aud_pos.store(0, Ordering::Relaxed);
         self.aud_gen.fetch_add(1, Ordering::SeqCst);
@@ -1869,6 +1865,9 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
     }
 }
 
+// one bundle per RT thread: command/event channels, master gain, transport
+// mirrors and the v39 meter taps — every handle `run` owns for its lifetime
+#[allow(clippy::too_many_arguments)]
 fn run(
     cmd_rx: Receiver<Cmd>,
     evt_tx: SyncSender<Evt>,
@@ -2888,8 +2887,12 @@ fn render_gate_blocked(block_n: usize, pattern_run: bool, live_any: bool, vst_op
 
 /// The synth slot a live track plays: its own binding if any, else the
 /// project default. TRUE when that resolves to a plugin instance.
-fn slot_is_vst(slot: Option<&std::sync::Arc<SynthHandle>>, dflt: Option<&std::sync::Arc<SynthHandle>>) -> bool {
-    slot.or(dflt).is_some_and(|a| matches!(&**a, SynthHandle::Vst(_)))
+fn slot_is_vst(
+    slot: Option<&std::sync::Arc<SynthHandle>>,
+    dflt: Option<&std::sync::Arc<SynthHandle>>,
+) -> bool {
+    slot.or(dflt)
+        .is_some_and(|a| matches!(&**a, SynthHandle::Vst(_)))
 }
 
 /// Stage ONE track's pattern clips — and, when `live`, the raw keyboard
@@ -3003,7 +3006,13 @@ impl Proc {
     /// live feed works with the transport STOPPED, which is exactly when
     /// auditioning a patch happens. Returns whether any track produced
     /// sound.
-    fn render_midi_block(&mut self, p0: u64, block_n: usize, live_mask: u128, live_on: bool) -> bool {
+    fn render_midi_block(
+        &mut self,
+        p0: u64,
+        block_n: usize,
+        live_mask: u128,
+        live_on: bool,
+    ) -> bool {
         // v38 R1: the audition pool was replaced/stopped — tracks holding
         // staged-but-never-off audition notes must die NOW, exactly like
         // the live-key cleanup below (never dropped silently: a ringing
@@ -3046,12 +3055,14 @@ impl Proc {
                     h.all_off();
                 }
             }
-            if self
-                .live_notes
-                .iter()
-                .enumerate()
-                .any(|(t, n)| *n != 0 && self.synths_cache.get(t).map(|s| s.is_none()).unwrap_or(true))
-            {
+            if self.live_notes.iter().enumerate().any(|(t, n)| {
+                *n != 0
+                    && self
+                        .synths_cache
+                        .get(t)
+                        .map(|s| s.is_none())
+                        .unwrap_or(true)
+            }) {
                 if let Some(d) = &self.dflt_synth {
                     d.all_off();
                 }
@@ -3061,8 +3072,7 @@ impl Proc {
             // either — whatever was staged belongs to the OFF gate.
             self.live_ev.clear();
         }
-        let pattern_run =
-            self.engine.transport_on() && !self.midi_cache.is_empty() && block_n != 0;
+        let pattern_run = self.engine.transport_on() && !self.midi_cache.is_empty() && block_n != 0;
         if !pattern_run {
             // Transport stopped (or the pattern table went away) while
             // pattern voices were sounding: silence them once so nothing
@@ -3086,7 +3096,11 @@ impl Proc {
                 if let Some(d) = &self.dflt_synth {
                     let held_on_default = self.live_notes.iter().enumerate().any(|(t, n)| {
                         (*n > 0 || self.aud_held[t] > 0)
-                            && self.synths_cache.get(t).map(|s| s.is_none()).unwrap_or(true)
+                            && self
+                                .synths_cache
+                                .get(t)
+                                .map(|s| s.is_none())
+                                .unwrap_or(true)
                     });
                     if !held_on_default {
                         d.all_off();
@@ -3099,8 +3113,8 @@ impl Proc {
                 self.midi_ring_to[t] = 0;
             }
         }
-        let live_any = live_on
-            && (!self.live_ev.is_empty() || self.live_notes.iter().any(|x| *x > 0));
+        let live_any =
+            live_on && (!self.live_ev.is_empty() || self.live_notes.iter().any(|x| *x > 0));
         // v38 R1: an audition voice in flight (or a held audition note)
         // opens the render path exactly like a physically held key.
         let aud_any =
@@ -3342,10 +3356,7 @@ impl Proc {
                 || has_ev
                 || midi_sustain[t]
                 || holding
-                || row[..block_n]
-                    .iter()
-                    .fold(0.0f32, |m, x| m.max(x.abs()))
-                    >= MIDI_SILENCE_FLOOR;
+                || row[..block_n].iter().fold(0.0f32, |m, x| m.max(x.abs())) >= MIDI_SILENCE_FLOOR;
             if sounding {
                 midi_live[t] = true;
                 any = true;
@@ -3647,9 +3658,7 @@ impl Proc {
                     }
                     // SAFETY: audio thread owns the live chain (as fx_mix).
                     for (j, x) in buf[..n].iter_mut().enumerate() {
-                        *x = unsafe {
-                            inst.call_sample_sc(*x, &rt.p, *sc.get(j).unwrap_or(&0.0))
-                        };
+                        *x = unsafe { inst.call_sample_sc(*x, &rt.p, *sc.get(j).unwrap_or(&0.0)) };
                     }
                 }
                 FxKind::Vst(e) => {
@@ -4669,7 +4678,11 @@ impl ProcessHandler for Proc {
                     } else {
                         // v32 R5: this track's scripted chain sees last
                         // block's sidechain sum (0.0 when no send routed).
-                        let scv = if self.sc_active[t] { sc_apply[t][i] } else { 0.0 };
+                        let scv = if self.sc_active[t] {
+                            sc_apply[t][i]
+                        } else {
+                            0.0
+                        };
                         let m = self.fx_mix(t, a * av, scv);
                         play_l += m * pgl[t];
                         play_r += m * pgr[t];
@@ -4794,8 +4807,11 @@ impl ProcessHandler for Proc {
                 let (buf, tmp) = (&mut trk_bufs[t], &mut vst_tmp);
                 // v32 R5: scripted slots inside a plugin-bearing chain get
                 // their sidechain row too; the plugin slots ignore it.
-                let scrow: &[f32] =
-                    if self.sc_active[t] { &sc_apply[t] } else { &sc_empty };
+                let scrow: &[f32] = if self.sc_active[t] {
+                    &sc_apply[t]
+                } else {
+                    &sc_empty
+                };
                 self.run_chain_block(t, buf, tmp, scrow);
                 for i in 0..n {
                     mix_l[i] += buf[i] * pgl[t];
@@ -4875,7 +4891,11 @@ impl ProcessHandler for Proc {
                 // v37 R5: a running take runs the playhead PAST the
                 // project end (the arrangement grows when the take
                 // bounces); only the parked/idle transport clamps.
-                self.pos = if rec_open { pos_now } else { pos_now.min(proj_len) };
+                self.pos = if rec_open {
+                    pos_now
+                } else {
+                    pos_now.min(proj_len)
+                };
             }
         }
         // Keep the free-running click clock glued to the playhead while the
@@ -5699,8 +5719,7 @@ mod tests {
         });
         let mut arr = Arrangement::new();
         arr.insert(0, 0, Clip::new(0, 0));
-        let cache: Vec<Option<std::sync::Arc<Pattern>>> =
-            vec![Some(std::sync::Arc::new(pat))];
+        let cache: Vec<Option<std::sync::Arc<Pattern>>> = vec![Some(std::sync::Arc::new(pat))];
         // The keyboard holds C4 — staged ONCE into live_ev by the port.
         let live_ev = vec![(5usize, 3u8, 0u8, 60u8, 100u8)];
 
@@ -5708,8 +5727,12 @@ mod tests {
         // (no clip, live) share this instance.
         let mut ev = Vec::new();
         let mut ring = 0u64;
-        stage_track_events(0, &arr, &cache, &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring);
-        stage_track_events(1, &arr, &cache, &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring);
+        stage_track_events(
+            0, &arr, &cache, &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring,
+        );
+        stage_track_events(
+            1, &arr, &cache, &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring,
+        );
         ev.sort_unstable();
         let doubled = ev.len();
         ev.dedup();
@@ -5725,7 +5748,9 @@ mod tests {
         // staged, and the ring keeps the engine advancing to its off.
         let held = vec![(9usize, 3u8, 2u8, 70u8, 90u8)];
         let mut ev = Vec::new();
-        stage_track_events(4, &arr, &cache, &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring);
+        stage_track_events(
+            4, &arr, &cache, &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring,
+        );
         assert_eq!(ev, vec![(9, 3, 2, 70, 90)]);
     }
 
@@ -5772,8 +5797,14 @@ mod tests {
         assert!(bs.claims(1, 2, 7), "bound CC");
         assert!(bs.claims(1, 5, 42), "a knob owns its whole axis");
         assert!(!bs.claims(1, 6, 42), "neighbour CC feeds");
-        assert!(!bs.claims(0, 0, 36), "note-off never claimed — no stuck notes");
-        assert!(!bs.claims(2, 3, 0), "channel pressure is unbindable → feeds");
+        assert!(
+            !bs.claims(0, 0, 36),
+            "note-off never claimed — no stuck notes"
+        );
+        assert!(
+            !bs.claims(2, 3, 0),
+            "channel pressure is unbindable → feeds"
+        );
         assert!(!bs.claims(3, 0, 60), "unbound keys play");
         assert!(BoundSet::default().axes.is_empty());
     }
@@ -5812,7 +5843,11 @@ mod tests {
         let e = Engine::new();
         let empty_assets: Arc<crate::audio::AssetTable> = Arc::new(Vec::new());
         let set = |e: &Engine| {
-            e.set_project(empty_assets.clone(), Arc::new(crate::arrange::Arrangement::new()), 2000)
+            e.set_project(
+                empty_assets.clone(),
+                Arc::new(crate::arrange::Arrangement::new()),
+                2000,
+            )
         };
         set(&e);
         assert!(!e.recording(), "not recording by default");
@@ -5831,8 +5866,7 @@ mod tests {
     fn v38_audition_voice_lifecycle() {
         let e = Engine::new();
         assert!(!e.audition_active(), "nothing armed by default");
-        let ev: Arc<[MidiEv]> =
-            vec![(0u64, 3u8, 0u8, 60u8, 100u8), (16000, 0, 0, 60, 0)].into();
+        let ev: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 60u8, 100u8), (16000, 0, 0, 60, 0)].into();
         e.play_audition(3, ev.clone());
         assert!(e.audition_active(), "armed by a voice");
         assert_eq!(e.audition_snapshot().len(), 1, "one voice in the pool");

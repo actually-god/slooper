@@ -52,11 +52,15 @@ fn main() {
     println!(
         "short note (120ms): sustain-window peak {short_mid:.5}, 0.9s-after-off peak {short_post:.5}"
     );
-    println!("long note (2s):   sustain-window peak {long_mid:.5}, 0.9s-after-off peak {long_post:.5}");
+    println!(
+        "long note (2s):   sustain-window peak {long_mid:.5}, 0.9s-after-off peak {long_post:.5}"
+    );
     if long_mid <= 1e-4 {
         println!("VERDICT: long note SILENT mid-hold — host is dropping/shortening holds");
     } else if long_mid <= short_mid * 1.05 && long_mid > 1e-4 {
-        println!("VERDICT: plugin sustains (loud at 1.2s into the hold) — HOST IS OK at this layer");
+        println!(
+            "VERDICT: plugin sustains (loud at 1.2s into the hold) — HOST IS OK at this layer"
+        );
     } else {
         println!("VERDICT: sustains (long-mid {long_mid:.4} vs short-mid {short_mid:.4})");
     }

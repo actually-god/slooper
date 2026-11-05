@@ -24,7 +24,7 @@ fn main() {
         entry.params().clone(),
         entry.descs().len(),
     )
-        .unwrap_or_else(|e| panic!("open_editor: {e}"));
+    .unwrap_or_else(|e| panic!("open_editor: {e}"));
     let mut outcome = String::from("painted");
     for _ in 0..80 {
         std::thread::sleep(std::time::Duration::from_millis(100));

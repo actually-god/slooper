@@ -18,15 +18,15 @@
 pub mod arrange;
 pub mod assets;
 pub mod audio;
-pub mod claphost;
 pub mod audio_io;
 pub mod automation;
+pub mod claphost;
 pub mod config;
 pub mod fx;
 pub mod fxgui;
+pub mod meter;
 pub mod midi;
 pub mod midipat;
-pub mod meter;
 pub mod ports;
 pub mod project;
 pub mod quantize;

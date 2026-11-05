@@ -6,7 +6,12 @@ fn main() {
     let pname = std::env::args().nth(2).unwrap();
     let pval: f64 = std::env::args().nth(3).unwrap().parse().unwrap();
     let mut p = vst3_host::simple::load_plugin_with_settings(&path, 48000.0, 512).unwrap();
-    let pre = p.get_parameters().unwrap().into_iter().find(|x| x.name == pname).unwrap();
+    let pre = p
+        .get_parameters()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.name == pname)
+        .unwrap();
     let a = p.save_state().unwrap();
     p.set_parameter(pre.id, pval).unwrap();
     let b = p.save_state().unwrap();
@@ -24,12 +29,24 @@ fn main() {
     let diff = |x: &[u8], y: &[u8]| x != y;
     println!(
         "chunk: default {}B, after-set {}B differ={}, after-proc {}B differ-vs-default={}",
-        a.len(), b.len(), diff(&a, &b), c.len(), diff(&a, &c)
+        a.len(),
+        b.len(),
+        diff(&a, &b),
+        c.len(),
+        diff(&a, &c)
     );
     drop(p);
     let mut q = vst3_host::simple::load_plugin_with_settings(&path, 48000.0, 512).unwrap();
-    match q.load_state(&c) { Ok(()) => {}, Err(e) => println!("load ERR {e}") }
-    let r = q.get_parameters().unwrap().into_iter().find(|x| x.id == pre.id).unwrap();
+    match q.load_state(&c) {
+        Ok(()) => {}
+        Err(e) => println!("load ERR {e}"),
+    }
+    let r = q
+        .get_parameters()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == pre.id)
+        .unwrap();
     println!("fresh restore readback: {} (asked {pval})", r.value);
     // and audio: peak through restored vs default
     let peak = |pl: &mut vst3_host::Plugin| -> f32 {
@@ -50,5 +67,9 @@ fn main() {
     q2.load_state(&c).ok();
     let mut d2 = vst3_host::simple::load_plugin_with_settings(&path, 48000.0, 512).unwrap();
     let _ = d2.load_state(&a);
-    println!("peak restored {:.4} vs default {:.4}", peak(&mut q2), peak(&mut d2));
+    println!(
+        "peak restored {:.4} vs default {:.4}",
+        peak(&mut q2),
+        peak(&mut d2)
+    );
 }

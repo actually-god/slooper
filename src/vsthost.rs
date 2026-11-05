@@ -416,7 +416,9 @@ fn scan_inner(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                 // yabridge wrappers dlopen straight into a Wine-host probe;
                 // when the Wine side cannot come up, yabridge's chainloader
                 // calls abort() INSIDE this process — unrecoverable.
-                if skip_bridged && (name.contains(".dll.") || dir.to_string_lossy().contains("/yabridge/")) {
+                if skip_bridged
+                    && (name.contains(".dll.") || dir.to_string_lossy().contains("/yabridge/"))
+                {
                     continue;
                 }
                 // v19.1: a real chainloader wrapper is guarded even in
@@ -605,9 +607,11 @@ fn bundle_inner_libs(dir: &Path) -> Vec<PathBuf> {
         let p = e.path();
         if p.is_dir() {
             if let Ok(rd2) = std::fs::read_dir(&p) {
-                out.extend(rd2.flatten().map(|e2| e2.path()).filter(|q| {
-                    q.extension().map(|x| x == "so").unwrap_or(false)
-                }));
+                out.extend(
+                    rd2.flatten()
+                        .map(|e2| e2.path())
+                        .filter(|q| q.extension().map(|x| x == "so").unwrap_or(false)),
+                );
             }
         } else if p.extension().map(|x| x == "so").unwrap_or(false) {
             out.push(p);
@@ -699,8 +703,7 @@ fn repair_looped_companion(wrapper: &Path, scan_dirs: &[PathBuf]) -> Option<Path
     // the DLL originally — the same information the loop corrupted).
     let mut cand_dirs: Vec<PathBuf> = scan_dirs.to_vec();
     if let Ok(home) = std::env::var("HOME") {
-        let cfgp = std::path::Path::new(&home)
-            .join(".config/yabridgectl/config.toml");
+        let cfgp = std::path::Path::new(&home).join(".config/yabridgectl/config.toml");
         if let Ok(txt) = std::fs::read_to_string(&cfgp) {
             // `plugin_dirs = [ 'a', 'b', ... ]` — single-quoted TOML strings.
             for seg in txt.split('\'') {
@@ -857,12 +860,10 @@ fn bridge_host_exe(need32: bool) -> Option<PathBuf> {
     }
     dirs.extend(["/usr/share/yabridge", "/usr/lib/yabridge"].map(PathBuf::from));
     dirs.iter().find_map(|d| {
-        names
-            .iter()
-            .find_map(|n| {
-                let p = d.join(n);
-                p.is_file().then_some(p)
-            })
+        names.iter().find_map(|n| {
+            let p = d.join(n);
+            p.is_file().then_some(p)
+        })
     })
 }
 
@@ -884,10 +885,16 @@ fn bridge_probe(loader: &Path, exe: &Path, need32: bool) -> Result<(), String> {
         .arg(exe)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(f))
-        .stderr(f2.map(std::process::Stdio::from).unwrap_or(std::process::Stdio::null()))
+        .stderr(
+            f2.map(std::process::Stdio::from)
+                .unwrap_or(std::process::Stdio::null()),
+        )
         .spawn()
         .map_err(|e| {
-            format!("Wine loader '{}' could not be started: {e}", loader.display())
+            format!(
+                "Wine loader '{}' could not be started: {e}",
+                loader.display()
+            )
         })?;
     let start = std::time::Instant::now();
     let mut alive_at_deadline = false;
@@ -984,7 +991,10 @@ fn bridge_probes() -> std::sync::MutexGuard<'static, Option<BridgeProbeResult>> 
 /// Windows plugins. `SLOOPER_BRIDGE_PROBE=0` trusts wrappers blindly
 /// (power-user escape hatch), `SLOOPER_SKIP_BRIDGED=1` never touches them.
 fn bridge_ok(need32: bool) -> Result<(), String> {
-    if std::env::var("SLOOPER_BRIDGE_PROBE").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("SLOOPER_BRIDGE_PROBE")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let key = [
@@ -1012,7 +1022,9 @@ fn bridge_ok(need32: bool) -> Result<(), String> {
     if needs_probe {
         let probe = |n32: bool| match (bridge_wine_loader(), bridge_host_exe(n32)) {
             (None, _) => Err("Wine not found (install Wine or set WINELOADER)".to_string()),
-            (_, None) => Err("yabridge host binaries not found (run `yabridgectl sync`)".to_string()),
+            (_, None) => {
+                Err("yabridge host binaries not found (run `yabridgectl sync`)".to_string())
+            }
             (Some(w), Some(h)) => bridge_probe(&w, &h, n32),
         };
         let ok32 = probe(true);
@@ -1395,7 +1407,13 @@ fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
             revents: 0,
         };
         // SAFETY: poll(2) over one fd; timeout in ms (>0, < i32::MAX).
-        let r = unsafe { libc::poll(&pfd as *const libc::pollfd as *mut libc::pollfd, 1, (slice.as_millis().max(1)) as i32) };
+        let r = unsafe {
+            libc::poll(
+                &pfd as *const libc::pollfd as *mut libc::pollfd,
+                1,
+                (slice.as_millis().max(1)) as i32,
+            )
+        };
         if r < 0 {
             break; // EINTR races are fine: the deadline rules.
         }
@@ -1403,9 +1421,7 @@ fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
             continue;
         }
         // SAFETY: read(2) into a stack buffer.
-        let n = unsafe {
-            libc::read(fds[0], chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
-        };
+        let n = unsafe { libc::read(fds[0], chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
         if n < 0 {
             break;
         }
@@ -1834,24 +1850,28 @@ fn lib_file_of(path: &Path) -> PathBuf {
 /// File identity: a replaced build must be probed again.
 fn file_sig(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let md = std::fs::metadata(lib_file_of(path)).ok()?;
-    Some((md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len()))
+    Some((
+        md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        md.len(),
+    ))
 }
 
 /// Record a SUCCESSFUL instantiation (both opens, both probes). Failed
 /// loads are NOT recorded: a broken file is probed again at the next Rescan.
 fn note_instantiated(path: &Path, kind: VstKind, name: String, vendor: String, instrument: bool) {
     INSTANTIATIONS.fetch_add(1, Ordering::Relaxed);
-    let Some((mtime, len)) = file_sig(path) else { return };
-    let entry =
-        VstEntry {
-            path: path.to_path_buf(),
-            kind,
-            name,
-            vendor,
-            instrument,
-            plugin_id: None,
-            error: None,
-        };
+    let Some((mtime, len)) = file_sig(path) else {
+        return;
+    };
+    let entry = VstEntry {
+        path: path.to_path_buf(),
+        kind,
+        name,
+        vendor,
+        instrument,
+        plugin_id: None,
+        error: None,
+    };
     if let Ok(mut c) = lib_cache().lock() {
         c.insert(path.to_path_buf(), CachedLib { mtime, len, entry });
     }
@@ -1865,7 +1885,6 @@ fn cached_entry(path: &Path) -> Option<VstEntry> {
     let hit = c.get(path).filter(|c| c.mtime == mtime && c.len == len)?;
     Some(hit.entry.clone())
 }
-
 
 // ---------------------------------------------------------------- GUI thread
 //
@@ -2100,7 +2119,14 @@ pub fn open_pid(
     let saved = saved.map(|s| s.to_vec());
     let patch = patch.cloned();
     on_gui_thread(move || {
-        open_inner(&path, kind, None, sample_rate, saved.as_deref(), patch.as_ref())
+        open_inner(
+            &path,
+            kind,
+            None,
+            sample_rate,
+            saved.as_deref(),
+            patch.as_ref(),
+        )
     })?
 }
 
@@ -2237,7 +2263,11 @@ pub fn probe_editor(path: &Path, kind: VstKind) -> EditorProbe {
     let child = std::process::Command::new(exe)
         .env(
             "SLOOPER_EDITOR_PROBE",
-            if matches!(kind, VstKind::V3) { "V3" } else { "V2" },
+            if matches!(kind, VstKind::V3) {
+                "V3"
+            } else {
+                "V2"
+            },
         )
         .env("SLOOPER_EDITOR_PROBE_PATH", path)
         .stdin(std::process::Stdio::null())
@@ -2275,10 +2305,7 @@ pub fn probe_editor(path: &Path, kind: VstKind) -> EditorProbe {
                 }
                 return probe_banned(
                     path,
-                    format!(
-                        "its plugin window failed the test (exit {:?})",
-                        st.code()
-                    ),
+                    format!("its plugin window failed the test (exit {:?})", st.code()),
                     true,
                 );
             }
@@ -2751,7 +2778,8 @@ impl RtStageEntry {
         if s.pending_midi.len() < MIDI_QUEUE_CAP {
             s.pending_midi.push(QueuedMidi { m: msg, pos });
         } else {
-            s.midi_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            s.midi_drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2920,7 +2948,13 @@ impl RtStageEntry {
         s.deliver.sort_by_key(|q| q.pos);
         // Destructure so the delivery loops below may touch `deliver`,
         // `ev_pool` and `backend` as disjoint fields at once.
-        let RtState { deliver, ev_pool, backend, midi_drops, .. } = s;
+        let RtState {
+            deliver,
+            ev_pool,
+            backend,
+            midi_drops,
+            ..
+        } = s;
         if matches!(backend, Backend::V3(_)) {
             // The UI holds this lock only for µs-long ring pushes; a brief
             // wait here is bounded well below any block period.
@@ -2933,11 +2967,19 @@ impl RtStageEntry {
                         let (d1, d2) = (q.m[1], q.m[2]);
                         let ok = match q.m[0] & 0xF0 {
                             0x90 if d2 > 0 => c.send_midi_at(
-                                MidiEvent::NoteOn { channel: ch, note: d1, velocity: d2 },
+                                MidiEvent::NoteOn {
+                                    channel: ch,
+                                    note: d1,
+                                    velocity: d2,
+                                },
                                 delta,
                             ),
                             0x80 | 0x90 => c.send_midi_at(
-                                MidiEvent::NoteOff { channel: ch, note: d1, velocity: d2 },
+                                MidiEvent::NoteOff {
+                                    channel: ch,
+                                    note: d1,
+                                    velocity: d2,
+                                },
                                 delta,
                             ),
                             0xB0 => c.send_midi_at(
@@ -2949,15 +2991,25 @@ impl RtStageEntry {
                                 delta,
                             ),
                             0xC0 => c.send_midi_at(
-                                MidiEvent::ProgramChange { channel: ch, program: d1 },
+                                MidiEvent::ProgramChange {
+                                    channel: ch,
+                                    program: d1,
+                                },
                                 delta,
                             ),
                             0xD0 => c.send_midi_at(
-                                MidiEvent::ChannelAftertouch { channel: ch, pressure: d1 },
+                                MidiEvent::ChannelAftertouch {
+                                    channel: ch,
+                                    pressure: d1,
+                                },
                                 delta,
                             ),
                             0xA0 => c.send_midi_at(
-                                MidiEvent::PolyAftertouch { note: d1, pressure: d2, channel: ch },
+                                MidiEvent::PolyAftertouch {
+                                    note: d1,
+                                    pressure: d2,
+                                    channel: ch,
+                                },
                                 delta,
                             ),
                             0xE0 => c.send_midi_at(
@@ -3162,9 +3214,10 @@ mod tests {
     /// Test entries open as concrete VST stage entries; several tests
     /// (measure/note_on/field access) need the concrete type.
     fn rt(e: &Arc<dyn StageEntry>) -> &RtStageEntry {
-        e.as_any().downcast_ref::<RtStageEntry>().expect("VST stage entry")
+        e.as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("VST stage entry")
     }
-
 
     /// v17 regression: `open_v3` must NOT seed from reported `default_value`
     /// metadata or write params back on a fresh (unsaved) open. Dexed and
@@ -3399,7 +3452,10 @@ mod tests {
         };
         // Let the plugin (and its latency) settle before measuring.
         let before = measure(entry, 24);
-        assert!(before > 1e-3, "baseline noise through wolf-shaper is silent");
+        assert!(
+            before > 1e-3,
+            "baseline noise through wolf-shaper is silent"
+        );
         // THE exact editor-drain call shape: (id, normalized) → cell — and
         // NOTHING else. Both directions must move the audio: on HEAD both
         // peaks sat equal (measured 1.0341 vs 1.0453 on the old assertion).
@@ -3487,7 +3543,10 @@ mod tests {
             VstKind::V3,
             48_000,
             None,
-            Some(&VstPatch { chunk: bytes.clone(), params: Vec::new() }),
+            Some(&VstPatch {
+                chunk: bytes.clone(),
+                params: Vec::new(),
+            }),
         ) {
             Ok(l) => l,
             Err(e) => {
@@ -3764,8 +3823,7 @@ mod tests {
     /// Wine loader whose BEHAVIOUR is `wine_body` (executed as a /bin/sh
     /// script by the probe). Sets the probe env seams; caller must tear down.
     fn v191_bridge_fixture(tag: &str, wine_body: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("sp-bridge-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("sp-bridge-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("plugins")).unwrap();
         std::fs::create_dir_all(root.join("yabridge")).unwrap();
@@ -3810,7 +3868,10 @@ mod tests {
         // The bitness decision for a wrapper follows its companion dll.
         std::fs::copy(dir.join("junk.dll"), dir.join("mystery.dll")).unwrap();
         std::fs::write(dir.join("mystery.dll.so"), b"#!/bin/sh\n").unwrap();
-        assert!(bridge_needs32(&dir.join("mystery.dll.so")), "unparseable PE must assume 32-bit");
+        assert!(
+            bridge_needs32(&dir.join("mystery.dll.so")),
+            "unparseable PE must assume 32-bit"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3826,8 +3887,14 @@ mod tests {
             .find(|e| e.path.to_string_lossy().contains("Monk.dll.so"))
             .expect("bridged wrapper must still be listed (greyed), never hidden");
         let err = e.error.as_deref().unwrap_or_default();
-        assert!(err.contains("32-bit"), "error must name the bitness gap: {err}");
-        assert!(err.contains("WINELOADER"), "error must name the remedy: {err}");
+        assert!(
+            err.contains("32-bit"),
+            "error must name the bitness gap: {err}"
+        );
+        assert!(
+            err.contains("WINELOADER"),
+            "error must name the remedy: {err}"
+        );
         // The raw `.dll` companion stays invisible — scan never probes PE.
         assert!(
             !found
@@ -3857,7 +3924,10 @@ mod tests {
             !err.contains("bridge unavailable"),
             "guard must not refuse when the probe passes: {err}"
         );
-        assert!(!err.is_empty(), "junk wrapper must still fail the real load: {e:?}");
+        assert!(
+            !err.is_empty(),
+            "junk wrapper must still fail the real load: {e:?}"
+        );
         v191_bridge_teardown(&root);
     }
 
@@ -3989,8 +4059,14 @@ mod tests {
         }
         let load = open(&path, VstKind::V2, 48_000, None).expect("open dragonfly");
         let h = load.entry.vst2_handle().expect("vst2 handle");
-        let mut editor =
-            crate::vstedit::open_editor(&h, &path.to_string_lossy(), "v16-ac1", crate::vsthost::VstParams::new(&[]), 0).expect("editor");
+        let mut editor = crate::vstedit::open_editor(
+            &h,
+            &path.to_string_lossy(),
+            "v16-ac1",
+            crate::vsthost::VstParams::new(&[]),
+            0,
+        )
+        .expect("editor");
         let t0 = std::time::Instant::now();
         while !editor.painted() && !editor.open_failed() && !editor.is_closed() {
             assert!(
@@ -4148,7 +4224,10 @@ mod tests {
         std::fs::write(root.join("top.dll"), b"MZ").unwrap();
         let got = dll_source_dirs(std::slice::from_ref(&root));
         assert!(got.contains(&root), "top-level dll dir scans: {got:?}");
-        assert!(got.contains(&root.join("commercial")), "subdir scans: {got:?}");
+        assert!(
+            got.contains(&root.join("commercial")),
+            "subdir scans: {got:?}"
+        );
         assert!(
             !got.contains(&root.join("yabridge")),
             "yabridge output dir must NEVER scan as source: {got:?}"
@@ -4198,7 +4277,8 @@ mod tests {
             std::fs::File::open(wrp.join("Delay Lama.dll")).is_err(),
             "fixture: the loop must fail to open"
         );
-        let fixed = repair_looped_companion(&wrapper, std::slice::from_ref(&src)).expect("loop repaired");
+        let fixed =
+            repair_looped_companion(&wrapper, std::slice::from_ref(&src)).expect("loop repaired");
         assert_eq!(fixed, src.join("Delay Lama.dll"));
         assert_eq!(
             std::fs::canonicalize(wrp.join("Delay Lama.dll")).unwrap(),
@@ -4228,7 +4308,11 @@ mod tests {
         const _: () = assert!(VST_MAX_PARAMS >= 8192, "param cap regressed");
         let home = crate::test_real_home();
         let mut checked = 0;
-        for name in ["Surge XT.vst3", "Overtonium.vst3", "Ultramaster KR-106.vst3"] {
+        for name in [
+            "Surge XT.vst3",
+            "Overtonium.vst3",
+            "Ultramaster KR-106.vst3",
+        ] {
             let p = std::path::Path::new(&home).join(".vst3").join(name);
             if !p.is_dir() {
                 continue;
@@ -4313,7 +4397,16 @@ mod tests {
 
         // Chunk alone must NOT reproduce the values (that is the bug);
         // if a future vendor build carries them, the pin is vacuous — skip.
-        let bare = match open_with_state(&kr, VstKind::V3, 48_000, None, Some(&VstPatch { chunk: chunk.clone(), params: Vec::new() })) {
+        let bare = match open_with_state(
+            &kr,
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: chunk.clone(),
+                params: Vec::new(),
+            }),
+        ) {
             Ok(l) => l,
             Err(_) => return,
         };
@@ -4336,7 +4429,10 @@ mod tests {
             VstKind::V3,
             48_000,
             None,
-            Some(&VstPatch { chunk, params: params_ids.clone() }),
+            Some(&VstPatch {
+                chunk,
+                params: params_ids.clone(),
+            }),
         )
         .expect("KR-106 reopen with patch");
         for (id, want) in &params_ids {

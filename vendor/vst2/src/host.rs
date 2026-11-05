@@ -1073,9 +1073,8 @@ static mut LOAD_POINTER: *mut c_void = 0 as *mut c_void;
 // container window lives in the host application. So requests park here,
 // keyed by `AEffect` pointer, and the pump drains them each beat.
 // ---------------------------------------------------------------------------
-static SIZE_REQUESTS: std::sync::Mutex<
-    Vec<(usize, (i32, i32))>,
-> = std::sync::Mutex::new(Vec::new());
+static SIZE_REQUESTS: std::sync::Mutex<Vec<(usize, (i32, i32))>> =
+    std::sync::Mutex::new(Vec::new());
 
 pub(crate) fn note_size_request(effect: usize, width: i32, height: i32) {
     if let Ok(mut v) = SIZE_REQUESTS.lock() {

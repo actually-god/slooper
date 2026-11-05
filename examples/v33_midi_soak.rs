@@ -21,7 +21,9 @@ fn stats() -> Vec<(String, f64)> {
     let mut out = Vec::new();
     for kv in s.trim().trim_matches(['{', '}']).split(',') {
         let mut it = kv.split(':');
-        let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
+        let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            continue;
+        };
         if let Ok(v) = v.trim().parse::<f64>() {
             out.push((k.trim_matches('"').to_string(), v));
         }
@@ -30,7 +32,10 @@ fn stats() -> Vec<(String, f64)> {
 }
 
 fn get(s: &[(String, f64)], k: &str) -> f64 {
-    s.iter().find(|(kk, _)| kk == k).map(|(_, v)| *v).unwrap_or(f64::NAN)
+    s.iter()
+        .find(|(kk, _)| kk == k)
+        .map(|(_, v)| *v)
+        .unwrap_or(f64::NAN)
 }
 
 fn main() {
@@ -39,7 +44,9 @@ fn main() {
         || std::fs::metadata(ORACLE_SO)
             .ok()
             .and_then(|m| m.modified().ok())
-            < std::fs::metadata(ORACLE_SRC).ok().and_then(|m| m.modified().ok());
+            < std::fs::metadata(ORACLE_SRC)
+                .ok()
+                .and_then(|m| m.modified().ok());
     if need {
         let st = Command::new("cc")
             .args(["-shared", "-fPIC", "-O1", "-o", ORACLE_SO, ORACLE_SRC])
@@ -50,10 +57,18 @@ fn main() {
     std::env::set_var("ORACLE_STATS", STATS);
     let _ = fs::remove_file(STATS);
 
-    let load = slooper::vsthost::open(Path::new(ORACLE_SO), slooper::vsthost::VstKind::V2, 48_000, None)
-        .expect("oracle open");
+    let load = slooper::vsthost::open(
+        Path::new(ORACLE_SO),
+        slooper::vsthost::VstKind::V2,
+        48_000,
+        None,
+    )
+    .expect("oracle open");
     let e_arc = load.entry;
-    let e = e_arc.as_any().downcast_ref::<slooper::vsthost::RtStageEntry>().unwrap();
+    let e = e_arc
+        .as_any()
+        .downcast_ref::<slooper::vsthost::RtStageEntry>()
+        .unwrap();
     let sil = vec![0f32; 512];
 
     let run = |e: &slooper::vsthost::RtStageEntry, blocks: usize| {
@@ -144,12 +159,15 @@ fn main() {
     // E — sustain: hold 4 notes, then 100 event-free blocks. The engine
     // must keep calling process() (v33 always-run) and voices must stay
     // held the whole time; CC64 (sustain) must be delivered cleanly.
-    pm(e, &[
-        (3, [0x90u8, 60, 100]),
-        (11, [0x90u8, 64, 100]),
-        (19, [0x90u8, 67, 100]),
-        (27, [0x90u8, 72, 100]),
-    ]);
+    pm(
+        e,
+        &[
+            (3, [0x90u8, 60, 100]),
+            (11, [0x90u8, 64, 100]),
+            (19, [0x90u8, 67, 100]),
+            (27, [0x90u8, 72, 100]),
+        ],
+    );
     run(e, 4);
     let mid1 = get(&stats(), "voices");
     run(e, 100);
@@ -190,7 +208,10 @@ fn main() {
         get(&s, "voices")
     );
 
-    println!("(final process_calls = {:.0})", get(&stats(), "process_calls"));
+    println!(
+        "(final process_calls = {:.0})",
+        get(&stats(), "process_calls")
+    );
     // Never drop plugin instances in probes (skill rule).
     std::mem::forget(e_arc.clone());
 }

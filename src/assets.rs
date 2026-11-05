@@ -210,8 +210,12 @@ impl RackFolder {
     /// in `pref` first (in `pref` order, ignoring vanished dirs), then any
     /// new one alphabetically. Does NOT include the root (dir "").
     pub fn dirs_in_order(&self, pref: &[String]) -> Vec<String> {
-        let mut present: std::collections::BTreeSet<&str> =
-            self.files.iter().map(|f| f.dir.as_str()).filter(|d| !d.is_empty()).collect();
+        let mut present: std::collections::BTreeSet<&str> = self
+            .files
+            .iter()
+            .map(|f| f.dir.as_str())
+            .filter(|d| !d.is_empty())
+            .collect();
         let mut out: Vec<String> = Vec::new();
         for p in pref {
             if present.remove(p.as_str()) {
