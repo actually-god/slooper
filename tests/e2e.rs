@@ -2061,11 +2061,12 @@ fn e2e_midi_seek_silences_held_note() {
 
 // ===================== v0.10 acceptance pins =====================
 
-/// AC8 (realtime, honest): audition voices are strictly ADDITIVE at the
-/// master out — two overlapping previews mix to a peak that NEITHER voice
-/// reaches alone. The old single-slot preview could only ever play one.
+/// AC8 (realtime, honest, v40 semantics): a new preview REPLACES the
+/// voice in flight — a silent second start silences the playing one —
+/// and when a voice runs out of samples the RT thread retires the pool
+/// (auto-stop + drain flag) so previews can never "run constantly".
 #[test]
-fn e2e_preview_voices_are_additive() {
+fn e2e_preview_replaces_and_drains() {
     let _g = e2e_lock();
     let Some((b, _client_name, sr)) = start_backend() else {
         return; // no audio server: skip
@@ -2125,33 +2126,50 @@ fn e2e_preview_voices_are_additive() {
         "first preview audible",
     );
     let solo = ring_peak(&ring, &widx, 4800).unwrap_or(0.0);
-    // Second voice WHILE the first still runs (1 s buffers, ~0.9 s left).
-    b.cmd(Cmd::PreviewPlay {
-        id: 12,
-        samples: mk(880.0),
-    });
-    let mut best = solo;
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(30));
-        best = best.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
-    }
+    // v40 REPLACE: a silent voice starts WHILE the 1 s sine still runs —
+    // the sine must go silent within a block or two, NOT keep mixing over
+    // (the old additive pool kept both voices; that stacking is exactly
+    // the "preview runs constantly" behavior this batch retired).
+    let silent: Arc<[f32]> = Arc::from(vec![0.0f32; sr as usize]);
+    b.cmd(Cmd::PreviewPlay { id: 12, samples: silent });
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_millis(500),
+        "the new start replaced the sine mid-voice (silence took over)",
+    );
+    // Drain retirement: the silent voice ends on its own; the RT thread
+    // clears `preview_on` and arms the UI retire flag. (The engine-side
+    // pool itself is cleared by the UI frame loop / next start — App::logic
+    // has its own headless pins.)
+    wait_until(
+        || !b.engine.preview_active(),
+        Duration::from_secs(3),
+        "preview auto-stopped at end of buffer",
+    );
     assert!(
-        best > solo * 1.25 && best > 0.35,
-        "two overlapping previews must MIX: solo {solo} vs best {best}"
+        b.engine.take_preview_drained(),
+        "RT armed the pool-retire flag when the voice drained"
     );
 
-    // Repeats of the SAME buffer stack too (two identical phases double up).
-    b.engine.stop_preview();
-    std::thread::sleep(Duration::from_millis(200));
+    // Same asset twice = one restarting voice, never a doubled sum (v40).
     let a = mk(660.0);
     b.engine.play_preview(31, a.clone());
     b.engine.play_preview(31, a);
+    assert_eq!(
+        b.engine.preview_snapshot().len(),
+        1,
+        "a repeat replaces, it does not stack"
+    );
     let mut best2 = 0.0f32;
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(30));
         best2 = best2.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
     }
-    assert!(best2 > 0.42, "same asset twice must double: {best2}");
+    assert!(
+        best2 < 0.42,
+        "single voice must NOT double its peak: {best2} (solo was {solo})"
+    );
+    b.engine.stop_preview();
 
     // AC6.2: starting the transport must clear every audition voice —
     // auditions never double over real playback (manager-path wiring).
