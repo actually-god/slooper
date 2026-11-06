@@ -1479,7 +1479,11 @@ unsafe fn validate(
             author,
             description,
             params,
-            sidechain: process_sc.is_some(),
+            // A v3 script MUST export the v2 prefix, so `process_sc`
+            // presence only proves sidechain INTENT on the exact v2
+            // generation. v3 scripts that want the key signal read the
+            // `sc` argument of process_st itself.
+            sidechain: process_sc.is_some() && process_st.is_none(),
             stereo: process_st.is_some(),
         },
         EffectFns {
