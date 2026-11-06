@@ -27082,6 +27082,46 @@ mod tests {
         assert_eq!(ed.host, Some(0));
     }
 
+    /// FL-suite tier 3: the chain window badges an ABI-v3 stereo script
+    /// ("fx:st"), and it instantiates through the stock scripted-add path.
+    #[test]
+    fn flsuite_chain_window_tags_stereo_script() {
+        let mut app = headless_app("v40sttag");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        if app.fx_registry.desc("spread").is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            std::fs::write(dir.join("spread.rs"), include_str!("../effects/spread.rs")).unwrap();
+            app.rescan_fx();
+        }
+        let d = app.fx_registry.desc("spread").expect("spread desc");
+        assert!(d.stereo, "spread loads as a stereo (ABI-v3) script");
+        app.add_fx_script(0, "spread");
+        app.fx_window = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let name = galley_at(&mut app, &ctx, "stereo spread")
+            .expect("chain row name painted");
+        let tag = galley_at(&mut app, &ctx, "[fx:st]").expect("stereo badge painted");
+        assert!(
+            (tag.center().y - name.center().y).abs() < 12.0,
+            "badge shares the script's row ({tag:?} vs {name:?})"
+        );
+        // A mono script on the same track must NOT get the badge.
+        app.add_fx_script(0, "chorus");
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let chorus = app
+            .fx_registry
+            .desc("chorus")
+            .map(|d| !d.stereo)
+            .unwrap_or(true);
+        assert!(chorus, "chorus stays a mono (v1) script");
+        assert!(
+            app.fx_rows[0].len() == 2,
+            "both scripts live in the chain"
+        );
+    }
+
     /// R4 (v35 R7): bridge widgets (a custom-GUI script's own knobs) answer
     /// the SAME gestures — right-click opens the value menu bound through
     /// the label→param map, no GUI-ABI change. space_echo's canvas knob

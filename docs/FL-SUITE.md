@@ -90,7 +90,12 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
    the master buses (pinned by `e2e_tier3_stereo_spread_live`, which ALSO
    asserts a v3 script decorrelates). Scripts: `spread.rs`,
    `panmatic.rs`. Write the pair into the L slot + out pointer; never
-   assume L == R in a v3 slot.
+   assume L == R in a v3 slot. FLAG SEMANTICS: `desc.sidechain` is
+   true only for the EXACT v2 generation — a v3 script must export the
+   v2 prefix, so `process_sc` presence alone proves nothing; a v3
+   effect wanting the key signal reads the `sc` argument of
+   `process_st` (pinned by `flsuite_chain_window_tags_stereo_script`:
+   chain row shows `[fx:st]`, never `[fx:sc,st]`).
 4. **Control-rate OUT** (an effect publishing a CV lane the automation
    system can bind) — Peak/Envelope/Formula-controller duties.
 5. **Block (vector) process** — CPU headroom for vocoder/multiband tiers.
