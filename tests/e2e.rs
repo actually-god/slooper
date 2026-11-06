@@ -3544,3 +3544,148 @@ fn e2e_tier3_stereo_spread_live() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Tier-4 live proof (docs/FL-SUITE.md rework): the upgraded v3 Echo 3
+/// (ping-pong) and Chorus Doubler (per-side tap banks) must put REAL
+/// side energy on the master buses through the production RT chain —
+/// registry load, FxSlot attach, looping asset, live JACK transport.
+#[test]
+fn e2e_tier4_stereo_echo_chorus_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    // Load the stock scripts through the REAL registry.
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-t4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    for stem in ["echo3", "chorus"] {
+        let d = reg.desc(stem).expect("stock script present").clone();
+        assert!(d.stereo, "{stem} must load as an ABI-v3 stereo script");
+    }
+    let de = reg.desc("echo3").unwrap().clone();
+    let dech = reg.desc("chorus").unwrap().clone();
+    let i_echo = reg.create_instance("echo3", sr as f64, &[]).expect("echo3 compiles");
+    let i_cho = reg.create_instance("chorus", sr as f64, &[]).expect("chorus compiles");
+
+    let ring_n = 1usize << 19;
+    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("t4_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async(
+            (),
+            DiffProc {
+                sink_l,
+                sink_r,
+                ring_sum: ring_sum.clone(),
+                ring_dif: ring_dif.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "dual-bus layout not applied"
+    );
+
+    // Constant-energy looping asset (toned noise).
+    let n = (sr as usize) * 2;
+    let sample: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let tone = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+                let h = (i as u32).wrapping_mul(2654435761);
+                let noise = (h as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                0.4 * (0.6 * tone + 0.4 * noise)
+            })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![sample]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.5); // dead centre: any L/R split is the effect's
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(i_echo, de)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
+        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring_sum, &widx, 480)
+                .map(|m| m > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "loop audible on master",
+    );
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Phase A: ping-pong delay decorrelates the master pair.
+    let s_a = rms(&ring_sum);
+    let d_a = rms(&ring_dif);
+    assert!(s_a > 0.01, "loop must be audible (sum rms {s_a})");
+    assert!(
+        d_a > s_a * 0.05,
+        "ping-pong echo3 must put side energy on the master buses (dif {d_a} vs sum {s_a})"
+    );
+
+    // Phase B: swap to the stereo chorus in the same live chain.
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(i_cho, dech)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    let s_b = rms(&ring_sum);
+    let d_b = rms(&ring_dif);
+    assert!(s_b > 0.01, "loop still audible with chorus (rms {s_b})");
+    assert!(
+        d_b > s_b * 0.1,
+        "stereo chorus must decorrelate on the master buses (dif {d_b} vs sum {s_b})"
+    );
+
+    b.cmd(Cmd::StopAll);
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx { slots: Arc::new(vec![]) },
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

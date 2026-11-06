@@ -3310,9 +3310,164 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             drop(inst);
         }
         assert!(
-            st_checked >= 2,
-            "expected the v3 spreads/panmatic to load as stereo, got {st_checked}"
+            st_checked >= 4,
+            "expected the v3 spread/panmatic/chorus/echo3 to load as stereo, got {st_checked}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tier-4 regression (docs/FL-SUITE.md rework log): tier-1 echo3 and
+    /// flanger `read_lin` indexed the ring at ABSOLUTE slots, and the
+    /// chorus feedback chased its own filter state — all three compiled,
+    /// loaded and passed the non-silence gate while producing NO usable
+    /// delay/feedback (an impulse came out as dry + a faint smear; RMS
+    /// gates are blind to a starved feedback loop). This pin feeds an
+    /// impulse / noise burst and demands real echo structure: echo3
+    /// places discrete echoes with the right decay ratio at its default
+    /// 320 ms, the chorus feedback sustains the tail long after the
+    /// input is gone, the flanger comb rings, and the ping-pong right
+    /// ear echo arrives a fraction of a repeat LATE.
+    #[test]
+    fn tier4_feedback_loops_ring() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t4fbk");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+        let n = (sr * 1.25) as usize;
+
+        // ---- echo3: the default 320 ms slider = real decaying echoes ----
+        let inst = reg.create_instance("echo3", sr, &[]).expect("echo3 inst");
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            y.push(inst.process_private(if i == 100 { 1.0 } else { 0.0 }));
+        }
+        let win_peak = |a: f64, b: f64, y: &[f32]| -> f32 {
+            y[(100.0 + a) as usize..(100.0 + b) as usize]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+        let dry = win_peak(0.0, 20.0, &y);
+        let t = 0.32 * sr; // default time = 320 ms
+        let e1 = win_peak(t - 500.0, t + 500.0, &y);
+        let e2 = win_peak(2.0 * t - 500.0, 2.0 * t + 500.0, &y);
+        assert!(dry > 0.5, "echo3 dry click missing ({dry})");
+        assert!(
+            e1 > dry * 0.15 && e1 < dry * 0.6,
+            "echo3 echo1 not at the 320 ms default (peak {e1}, dry {dry})"
+        );
+        let ratio = e2 / e1.max(1e-6);
+        assert!(
+            ratio > 0.25 && ratio < 0.85,
+            "echo3 echo2/echo1 ratio {ratio} off the 0.55-feedback decay"
+        );
+        drop(inst);
+
+        // ---- echo3 ping-pong (v3): the R echo lags pp * 320 ms --------
+        let inst = reg.create_instance("echo3", sr, &[]).expect("echo3 st inst");
+        let mut dp = [0.0f32; MAX_PARAMS];
+        for (k, pd) in reg.desc("echo3").unwrap().params.iter().enumerate() {
+            dp[k] = pd.default;
+        }
+        let (mut yl, mut yr) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let (l, r) = unsafe { inst.call_sample_st(if i == 100 { 1.0 } else { 0.0 }, 0.0, &dp, 0.0) };
+            yl.push(l);
+            yr.push(r);
+        }
+        drop(inst);
+        let r_lag = win_peak(1.7 * t - 600.0, 1.7 * t + 600.0, &yr);
+        let r_ontime = win_peak(t + 600.0, 1.7 * t - 700.0, &yr);
+        assert!(r_lag > 0.02, "ping-pong R echo never arrived ({r_lag})");
+        assert!(
+            r_lag > r_ontime * 2.5,
+            "R echo is NOT late: lag-window {r_lag} vs on-time-window {r_ontime}"
+        );
+
+        // ---- chorus feedback is ALIVE (tier-1: dead code, always 0) ----
+        let burst_rms_after = |fb: f32| -> f64 {
+            let p = [0.8, 3.5, 12.0, fb, 5500.0, 1.0, 1.0, 1.0, 1.0];
+            let inst = reg.create_instance("chorus", sr, &p).expect("chorus inst");
+            let mut e = 0.0f64;
+            let m = (sr * 1.0) as usize;
+            for i in 0..m {
+                let x = if i < (sr * 0.2) as usize {
+                    let h = (i as u32).wrapping_mul(2654435761);
+                    ((h as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.6
+                } else {
+                    0.0
+                };
+                let y = inst.process_private(x);
+                if i > (sr * 0.55) as usize {
+                    e += (y as f64) * (y as f64);
+                }
+            }
+            drop(inst);
+            (e / (m - (sr * 0.55) as usize) as f64).sqrt()
+        };
+        let lo = burst_rms_after(0.0);
+        let hi = burst_rms_after(0.85);
+        assert!(
+            hi > 5e-7 && hi > lo * 50.0,
+            "chorus feedback does not sustain a tail (fb0 {lo}, fb0.85 {hi})"
+        );
+
+        // ---- flanger comb rings with feedback --------------------------
+        let burst_rms_fl = |fb: f32| -> f64 {
+            let p = [0.22, 0.7, 1.8, fb, 3.0, 0.5, 1.0];
+            let inst = reg.create_instance("flanger", sr, &p).expect("flanger inst");
+            let mut e = 0.0f64;
+            let m = (sr * 1.0) as usize;
+            for i in 0..m {
+                let x = if i < (sr * 0.4) as usize {
+                    let h = (i as u32).wrapping_mul(2654435761);
+                    ((h as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.6
+                } else {
+                    0.0
+                };
+                let y = inst.process_private(x);
+                // Ring window: 20..60 ms after the burst ends — a 1.8 ms
+                // comb at 0.9 is down 20 dB/20 ms, so the LATE window a
+                // long-delay script would use would see only silence.
+                if i > (sr * 0.42) as usize && i < (sr * 0.46) as usize {
+                    e += (y as f64) * (y as f64);
+                }
+            }
+            drop(inst);
+            (e / ((sr * 0.46) as usize - (sr * 0.42) as usize) as f64).sqrt()
+        };
+        let flo = burst_rms_fl(0.0);
+        let fhi = burst_rms_fl(0.9);
+        assert!(
+            fhi > 1e-6 && fhi > flo * 20.0,
+            "flanger feedback comb does not ring (fb0 {flo}, fb0.9 {fhi})"
+        );
+        // Sabotage-proof absolute: with the tier-1 absolute read the tap
+        // never contained the impulse (impulse lands at slot 100, the tap
+        // reads slot ~86) — the wet was EXACTLY zero. Demand real energy.
+        {
+            let p = [0.22f32, 0.7, 1.8, 0.9, 3.0, 0.5, 1.0];
+            let inst = reg.create_instance("flanger", sr, &p).expect("flanger imp");
+            let mut e = 0.0f64;
+            for i in 0..(sr * 0.2) as usize {
+                let y = inst.process_private(if i == 1000 { 1.0 } else { 0.0 });
+                if i > (sr * 0.03) as usize {
+                    e += (y as f64) * (y as f64);
+                }
+            }
+            drop(inst);
+            let late = (e / ((sr * 0.2) as usize - (sr * 0.03) as usize) as f64).sqrt();
+            assert!(
+                late > 1e-5,
+                "flanger impulse leaves no comb ringing 30 ms late ({late})"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
