@@ -223,3 +223,4 @@ non-silence gate:
    `effect_api.rs` first.
 4. Transport sync (rung 2) — unlocks the Scratcher/Gross-Beat row and
    tempo-phase gater/echo.
+- Live smoke 2026-11-06 (tier-4 binary sha 707a3f3d…): boots on :1, seeds the new echo3/chorus into ~/.local/share/slooper/effects (backups .bak present), full clean window render, 0 kernel conflicts, clean exit.
