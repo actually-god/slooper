@@ -300,11 +300,12 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
         v
     }
     // space_echo params in PARAMS order; labels are the script's:
-    // time, feedback, tone, wobble, rate, decay, damp, mix, out, echo, verb.
-    fn se(v: [f32; 11]) -> Vec<(&'static str, f32)> {
-        const L: [&str; 11] = [
+    // time, feedback, tone, wobble, rate, decay, damp, mix, out, echo, verb,
+    // width (tier 5 appended width — indices are sticky per script stem).
+    fn se(v: [f32; 12]) -> Vec<(&'static str, f32)> {
+        const L: [&str; 12] = [
             "time", "feedback", "tone", "wobble", "rate", "decay", "damp", "mix", "out", "echo",
-            "verb",
+            "verb", "width",
         ];
         L.iter().zip(v).map(|(l, x)| (leak_str(l), x)).collect()
     }
@@ -437,7 +438,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Echo",
                 se([
-                    0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5,
+                    0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5, 0.6,
                 ]),
             ),
             // Tiny bright room: 70 ms first reflection, tight decay —
@@ -445,21 +446,21 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Practice Hall",
                 se([
-                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0,
+                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0, 1.0,
                 ]),
             ),
             // Medium hall, a touch of slap before the tail.
             (
                 "Auditorium",
                 se([
-                    0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0,
+                    0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0, 1.0,
                 ]),
             ),
             // The warm classic: 200 ms slap, longish damped tail.
             (
                 "Opera House",
                 se([
-                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0,
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0, 1.0,
                 ]),
             ),
             // Vast and dark: slow slap, 0.95 feedback, heavy air damping —
@@ -467,7 +468,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Cathedral",
                 se([
-                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0,
+                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0, 1.0,
                 ]),
             ),
         ],
@@ -1793,7 +1794,7 @@ mod tests {
                 g.max
             );
         }
-        assert_eq!(reg.desc("space_echo").unwrap().params.len(), 11);
+        assert_eq!(reg.desc("space_echo").unwrap().params.len(), 12);
         // v32 R5: the stock sidechain compressor is the ABI-v2 reference.
         // It must load (both entry symbols present) and be recognized as
         // sidechain-capable; every v1 stock effect must not be.
@@ -3041,7 +3042,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // seeded into the user preset folder).
         let se = builtin_presets("space_echo");
         assert_eq!(se.len(), 5, "five shipped rooms: {se:?}");
-        assert_eq!(se[0].1.len(), 11, "every room sets all eleven params");
+        assert_eq!(se[0].1.len(), 12, "every room sets all twelve params (tier 5 appended width)");
     }
 
     /// AC5.2: a default preset lands on a REAL compiled EQ instance —
@@ -3310,8 +3311,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             drop(inst);
         }
         assert!(
-            st_checked >= 4,
-            "expected the v3 spread/panmatic/chorus/echo3 to load as stereo, got {st_checked}"
+            st_checked >= 7,
+            "expected the v3 spread/panmatic/chorus/echo3/space_echo/phaser/flanger to load as stereo, got {st_checked}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3468,6 +3469,379 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             );
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FL Suite tier 5 pins (docs/FL-SUITE.md): space_echo went ABI-v3
+    /// STEREO (Reeverb 2 / LuxeVerb task). Impulse-STRUCTURE shape per the
+    /// tier-4 rule — energy gates are blind to dead loops, and here they
+    /// would ALSO be blind to a fake "stereo" that is just the same mono
+    /// tail twice. Asserts (mono feed l == r so every difference is the
+    /// effect's own decorrelation):
+    /// 1. discrete echoes at the default 380 ms with plausible decay —
+    ///    the per-side echo loops actually recirculate on the ST path;
+    /// 2. the late tail DECORRELATES (L-R energy vs tail energy) while the
+    ///    same run at width = 0 is BIT-IDENTICAL left/right — the width
+    ///    knob owns a real cross-mix (and this double assertion IS the
+    ///    negative control: one run must pass, the other must be exactly 0);
+    /// 3. the v1 fallback (`process`) equals the ST path's LEFT channel at
+    ///    default width — mono hosts keep the historical circuit exactly.
+    #[test]
+    fn tier5_space_echo_stereo_tail() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t5rev");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let d = reg.desc("space_echo").expect("space_echo desc").clone();
+        assert!(d.stereo, "space_echo must load as an ABI-v3 stereo script");
+        let sr = 48000.0f64;
+        let n = (sr * 2.5) as usize;
+        let imp = |i: usize| if i == 100 { 1.0f32 } else { 0.0 };
+
+        // Room-leaning settings for the STRUCTURE pins.
+        let mut dp = [0.0f32; MAX_PARAMS];
+        for (k, pd) in d.params.iter().enumerate() {
+            dp[k] = pd.default;
+        }
+        dp[5] = 0.95; // decay (max — the tail must outlive the echoes)
+        dp[7] = 0.9; // mix
+
+        // Pin 1: ECHO ONLY (verb closed) — discrete repeats with no room
+        // smear standing in for the loop.
+        dp[7] = 0.6; // 60 % wet: 0.4 dry click + roomy echo
+        dp[9] = 0.6; // echo
+        dp[10] = 0.0; // verb off
+        let (yl, yr) = {
+            let inst = reg.create_instance("space_echo", sr, &dp).expect("echo inst");
+            let mut p = dp;
+            p[11] = 1.0;
+            let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for i in 0..n {
+                let (l, r) = unsafe { inst.call_sample_st(imp(i), imp(i), &p, 0.0) };
+                yl.push(l);
+                yr.push(r);
+            }
+            drop(inst);
+            (yl, yr)
+        };
+
+        // ---- 1. discrete echoes at the default 380 ms ------------------
+        let win_peak = |a: f64, b: f64, y: &[f32]| -> f32 {
+            y[(100.0 + a) as usize..(100.0 + b) as usize]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+        let dry = win_peak(0.0, 20.0, &yl);
+        let t = 0.38 * sr; // default time slider
+        let e1 = win_peak(t - 500.0, t + 500.0, &yl);
+        let e2 = win_peak(2.0 * t - 500.0, 2.0 * t + 500.0, &yl);
+        eprintln!("T5 dry {dry} e1 {e1} e2 {e2} ratio {}", e2 / e1.max(1e-9));
+        assert!(dry > 0.3, "space_echo dry click missing ({dry})");
+        assert!(
+            e1 > dry * 0.10 && e1 < dry * 0.9,
+            "space_echo echo1 not at the 380 ms default (peak {e1}, dry {dry})"
+        );
+        let ratio = e2 / e1.max(1e-6);
+        assert!(
+            ratio > 0.15 && ratio < 0.95,
+            "space_echo echo2/echo1 ratio {ratio} off the 0.62-feedback decay"
+        );
+        // A CENTER impulse must exit bit-centered: the two echo paths
+        // share tuning, tap `d` and LFO phase, so identical sides run the
+        // identical circuit (measured max diff = 0 bit over the full run).
+        // Catches any future accidental L/R asymmetry in the echo path.
+        let asymmetric = yl
+            .iter()
+            .zip(&yr)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            asymmetric, 0,
+            "echo-only CENTER input did not stay bit-centered (asymmetric samples: {asymmetric})"
+        );
+
+        // Pin 2: REVERB ONLY (echo closed) — the correlated echo component
+        // would sink the decorrelation ratio (measured 0.17 with echo at
+        // 0.6: the shared echo is 100 % correlated BY DESIGN and belongs
+        // to the middle, not the sides; only the tail decorrelates).
+        dp[7] = 0.9; // wet-dominated for the tail measurement
+        dp[9] = 0.0; // echo off
+        dp[10] = 1.5; // verb full
+
+        let run_st = |width: f32| -> (Vec<f32>, Vec<f32>) {
+            let inst = reg.create_instance("space_echo", sr, &dp).expect("st inst");
+            let mut p = dp;
+            p[11] = width;
+            let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for i in 0..n {
+                let (l, r) = unsafe { inst.call_sample_st(imp(i), imp(i), &p, 0.0) };
+                yl.push(l);
+                yr.push(r);
+            }
+            drop(inst);
+            (yl, yr)
+        };
+        let (yl, yr) = run_st(1.0);
+
+        // ---- 2. late tail decorrelates (width 1) ------------------------
+        let tail = |yl: &[f32], yr: &[f32]| -> (f64, f64, f64) {
+            let (a, b) = ((sr * 0.5) as usize + 100, (sr * 0.9) as usize + 100);
+            let (mut el, mut er, mut ed) = (0.0f64, 0.0f64, 0.0f64);
+            for i in a..b {
+                el += (yl[i] as f64) * (yl[i] as f64);
+                er += (yr[i] as f64) * (yr[i] as f64);
+                let g = (yl[i] - yr[i]) as f64;
+                ed += g * g;
+            }
+            let m = (b - a) as f64;
+            ((el / m).sqrt(), (er / m).sqrt(), (ed / m).sqrt())
+        };
+        let (tl, tr, td) = tail(&yl, &yr);
+        let mean_tail = (tl + tr) * 0.5;
+        eprintln!("T5 tail w1: L {tl} R {tr} D {td} ratio {}", td / mean_tail.max(1e-12));
+        assert!(mean_tail > 1e-4, "space_echo room tail died (rms {mean_tail})");
+        assert!(
+            td > mean_tail * 0.35,
+            "stereo room tail never decorrelated (dif {td} vs tail {mean_tail})"
+        );
+        // Hard-panned input keeps its side (echo re-opened for this one:
+        // a source hard-panned left must ECHO left, not split).
+        let inst = reg.create_instance("space_echo", sr, &dp).expect("pan inst");
+        let mut p1 = dp;
+        p1[9] = 0.6; // echo on
+        p1[10] = 0.0; // verb off
+        p1[11] = 1.0;
+        let (mut pl, mut pr) = (0.0f64, 0.0f64);
+        // Window: everything between the dry click and just past echo 1 —
+        // the echo must arrive LEFT, with (at width 1) little in R.
+        let (w0, w1) = (900usize, (t + 600.0) as usize);
+        for i in 0..w1 {
+            let (l, r) = unsafe { inst.call_sample_st(if i == 100 { 1.0 } else { 0.0 }, 0.0, &p1, 0.0) };
+            if i >= w0 {
+                pl += (l as f64) * (l as f64);
+                pr += (r as f64) * (r as f64);
+            }
+        }
+        drop(inst);
+        eprintln!("T5 pan L-energy {pl} R-energy {pr}");
+        assert!(pr < pl * 0.5, "L-only feed did not stay left in the echo (L {pl} R {pr})");
+
+        // ---- 2b. width = 0 => BIT-IDENTICAL tail (exact mono) -----------
+        let (wl, wr) = run_st(0.0);
+        let (tl0, tr0, td0) = tail(&wl, &wr);
+        let exact = wl.iter().zip(wr.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
+        eprintln!("T5 tail w0: L {tl0} R {tr0} D {td0} bitexact {exact}");
+        assert!(td0 == 0.0 && exact, "width 0 is not an exact mono tail (dif {td0})");
+
+        // ---- 3. v1 fallback == ST path LEFT at default width ------------
+        // Self-contained pair of fresh runs (same frozen params) so the
+        // comparison can never drift from another section's settings.
+        {
+            let p = dp; // echo off, verb full, width default 1.0
+            let st = reg.create_instance("space_echo", sr, &p).expect("st3");
+            let mono = reg.create_instance("space_echo", sr, &p).expect("v13");
+            let mut exact3 = true;
+            for i in 0..n {
+                let l = unsafe { st.call_sample_st(imp(i), imp(i), &p, 0.0) }.0;
+                let y = mono.process_private(imp(i));
+                if y.to_bits() != l.to_bits() {
+                    exact3 = false;
+                    break;
+                }
+            }
+            drop(st);
+            drop(mono);
+            assert!(exact3, "v1 mono path drifted from the ST path's left channel");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tier 5 persistence guard: param indices are STICKY per script stem
+    /// (saved chain rows reference them by index), so the stereo upgrade
+    /// had to APPEND `width` — this pin freezes the historical label list
+    /// and defaults in order and fails loudly if anyone reorders, renames
+    /// or re-tunes 0..10, or flips the v3 flag semantics (stereo yes,
+    /// sidechain no: `desc.sidechain` is exact-v2-only, tier-3b rule).
+    #[test]
+    fn tier5_space_echo_params_appended_only() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t5params");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let d = reg.desc("space_echo").expect("space_echo desc");
+        let want: [(&str, f32); 12] = [
+            ("time", 0.38),
+            ("feedback", 0.62),
+            ("tone", 3600.0),
+            ("wobble", 0.0),
+            ("rate", 0.6),
+            ("decay", 0.84),
+            ("damp", 2800.0),
+            ("mix", 0.4),
+            ("out", 1.0),
+            ("echo", 1.0),
+            ("verb", 1.0),
+            ("width", 1.0),
+        ];
+        assert_eq!(d.params.len(), 12);
+        for (k, (lab, def)) in want.into_iter().enumerate() {
+            assert_eq!(d.params[k].label, lab, "param {k} label changed");
+            assert!((d.params[k].default - def).abs() < 1e-6, "param {k} default changed");
+        }
+        assert!(d.stereo, "tier-5 space_echo is an ABI-v3 script");
+        assert!(!d.sidechain, "v3 flag semantics: sidechain is exact-v2-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FL Suite tier 5 candidate #2 (docs/FL-SUITE.md): phaser and flanger
+    /// upgraded to ABI-v3 stereo (Vintage-Phaser dual path / shared comb
+    /// with opposite-sweep sides). STRUCTURE pins per the tier-4 rule —
+    /// an energy gate cannot tell a real stereo script from one mono
+    /// signal played twice:
+    ///  * spread 0 ⇒ BIT-identical L/R for identical inputs,
+    ///  * default spread ⇒ decorrelated sweep (probe-measured D/RMS:
+    ///    phaser 1.27, flanger 0.67 — thresholds well below),
+    ///  * flanger hard-panned L: dry keeps its side (R exactly 0 in the
+    ///    dry window) while the shared comb feeds BOTH sides,
+    ///  * v1 fallback ≡ ST-path LEFT bit-for-bit — the tier-4 mono pins
+    ///    and every pre-tier-5 chain keep measuring the same circuit.
+    /// Also freezes the param tables (0..6 sticky, 7 = appended `spread`).
+    #[test]
+    fn tier5_phaser_flanger_stereo() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t5pf");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+
+        // Deterministic LCG noise (never std::rand — pins must replay).
+        let n: usize = 14400;
+        let mut noise = Vec::with_capacity(n);
+        let mut seed: u32 = 0x5eed_1234;
+        for _ in 0..n {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            noise.push(((seed >> 8) as f32) * (2.0 / 16777216.0) - 1.0);
+        }
+        let sr = 48000.0f64;
+
+        for (stem, min_decor) in [("phaser", 0.5f64), ("flanger", 0.3f64)] {
+            let d = reg.desc(stem).unwrap_or_else(|| panic!("{stem} missing"));
+            assert!(d.stereo, "{stem}: must load as an ABI-v3 stereo script");
+            assert!(!d.sidechain, "{stem}: sidechain flag is exact-v2-only");
+            assert_eq!(d.params.len(), 8, "{stem}: seven sticky params + appended spread");
+            assert_eq!(d.params[7].label, "spread", "param 7 appended as 'spread'");
+            assert!(
+                (d.params[7].default - 0.5).abs() < 1e-6,
+                "spread default 0.5 — wide out of the box"
+            );
+
+            let mut dp = [0.0f32; MAX_PARAMS];
+            for (k, pd) in reg.desc(stem).unwrap().params.iter().enumerate() {
+                dp[k] = pd.default;
+            }
+            let run = |spread: f32| -> (Vec<f32>, Vec<f32>) {
+                let inst = reg.create_instance(stem, sr, &dp).expect("inst");
+                let mut p = dp;
+                p[7] = spread;
+                let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                for i in 0..n {
+                    let (l, r) = unsafe { inst.call_sample_st(noise[i], noise[i], &p, 0.0) };
+                    yl.push(l);
+                    yr.push(r);
+                }
+                drop(inst);
+                (yl, yr)
+            };
+
+            // 1. spread 0 => bit-exact mono for identical inputs.
+            let (zl, zr) = run(0.0);
+            let bad = zl
+                .iter()
+                .zip(&zr)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                bad, 0,
+                "{stem}: spread 0 is not an exact-mono output ({bad} differing samples)"
+            );
+
+            // 2. default spread => the sweep splits the sides.
+            let (yl, yr) = run(0.5);
+            let (mut el, mut er, mut ed) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 2000..12000 {
+                el += (yl[i] as f64).powi(2);
+                er += (yr[i] as f64).powi(2);
+                ed += (yl[i] as f64 - yr[i] as f64).powi(2);
+            }
+            let m = 10000.0;
+            let decor = (ed / m).sqrt() / (((el / m).sqrt() + (er / m).sqrt()) * 0.5).max(1e-12);
+            eprintln!("T5 {stem} decor {decor}");
+            assert!(
+                decor > min_decor,
+                "{stem}: sweep never split the sides (D/RMS {decor})"
+            );
+
+            // 3. v1 fallback == ST path LEFT, bit-for-bit.
+            let st = reg.create_instance(stem, sr, &dp).expect("st5");
+            let mono = reg.create_instance(stem, sr, &dp).expect("v15");
+            let mut drift = 0usize;
+            for i in 0..n {
+                let l = unsafe { st.call_sample_st(noise[i], noise[i], &dp, 0.0) }.0;
+                let y = unsafe { mono.call_sample(noise[i], &dp) };
+                if y.to_bits() != l.to_bits() {
+                    drift += 1;
+                }
+            }
+            drop(st);
+            drop(mono);
+            assert_eq!(drift, 0, "{stem}: v1 mono path drifted from the ST left channel");
+        }
+
+        // 4. Flanger image: hard-panned L — the DRY click stays exactly
+        // left, and the shared comb (mono by topology) feeds both sides
+        // about equally. Both halves matter: wet-only-left would fake
+        // "image preservation" while killing the width.
+        {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            for (k, pd) in reg.desc("flanger").unwrap().params.iter().enumerate() {
+                dp[k] = pd.default;
+            }
+            let inst = reg.create_instance("flanger", sr, &dp).expect("fl inst");
+            let (mut er95, mut el3, mut er3) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..20000 {
+                let x = if i == 100 { 1.0f32 } else { 0.0 };
+                let (l, r) = unsafe { inst.call_sample_st(x, 0.0, &dp, 0.0) };
+                if (95..101).contains(&i) {
+                    er95 += (r as f64).powi(2);
+                }
+                if (300..1500).contains(&i) {
+                    el3 += (l as f64).powi(2);
+                    er3 += (r as f64).powi(2);
+                }
+            }
+            drop(inst);
+            assert_eq!(er95, 0.0, "L-only impulse leaked into the RIGHT dry path");
+            assert!(el3 > 1e-5, "comb did not ring in L ({el3})");
+            assert!(
+                er3 > 1e-5 && er3 < el3 * 4.0 && el3 < er3 * 4.0,
+                "shared comb unbalanced between sides (L {el3} R {er3})"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

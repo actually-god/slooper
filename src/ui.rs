@@ -28286,6 +28286,13 @@ mod tests {
     /// frame loop keeps the user's size instead of snapping back.
     #[test]
     fn v36_script_fx_editor_resizes() {
+        let churn = |tag: &str| {
+            eprintln!("CHURN {tag}");
+            for i in 0..300 {
+                let v: Vec<u8> = vec![0x5Au8; 2048 + (i % 9) * 4096];
+                std::hint::black_box(&v);
+            }
+        };
         let mut app = headless_app("v36fxsize");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
@@ -28300,12 +28307,14 @@ mod tests {
         }
         app.add_fx_script(0, "space_echo");
         frame(&mut app, &ctx, vec![]);
+        churn("B after-add");
         assert!(
             app.fx_registry.gui("space_echo").is_some(),
             "fixture is a custom-GUI script (the frozen window was the report)"
         );
         app.open_fx_editor(0, 0);
         frame(&mut app, &ctx, vec![]);
+        churn("C after-open-draw");
         let p = app
             .dyn_wins
             .iter()
@@ -28317,19 +28326,28 @@ mod tests {
         let corner = egui::pos2(r0[0] + r0[2] - 3.0, r0[1] + r0[3] - 3.0);
         let far = corner + egui::vec2(170.0, 130.0);
         frame(&mut app, &ctx, vec![moved(corner)]);
+        churn("D hover-corner");
         frame(
             &mut app,
             &ctx,
             vec![btn(corner, egui::PointerButton::Primary, true)],
         );
+        churn("E press-corner");
         frame(&mut app, &ctx, vec![moved(corner + egui::vec2(40.0, 30.0))]);
         frame(&mut app, &ctx, vec![moved(far)]);
+        churn("F dragged");
         frame(
             &mut app,
             &ctx,
             vec![btn(far, egui::PointerButton::Primary, false)],
         );
+        churn("F2 released-frame");
         frame(&mut app, &ctx, vec![]);
+        churn("F3 after-idle1");
+        frame(&mut app, &ctx, vec![]);
+        churn("F4 after-idle2");
+        frame(&mut app, &ctx, vec![]);
+        churn("G released");
         let r1 = app.dyn_wins[p].rect;
         assert!(
             r1[2] > r0[2] + 80.0 && r1[3] > r0[3] + 60.0,
