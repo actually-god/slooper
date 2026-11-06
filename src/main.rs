@@ -20,17 +20,25 @@ fn main() -> eframe::Result {
             spec.to_string_lossy().as_ref(),
         ));
     }
-    // Plugin editors decide the app's windowing world: the VST2 spec has
-    // exactly one Linux UI ABI — native X11 embedding — so every hosted
-    // plugin opens plain X11 windows. Under a Wayland session winit would
-    // take the main window to Wayland while all those plugin windows land
-    // on Xwayland, and no host can manage across that seam (the v10.2
-    // "plugin GUIs don't even show up as a window" report on KDE). When
-    // an X display exists, run the whole app through it (Xwayland under
-    // Wayland): one server, one world, editors embed and stack normally.
-    // Opt back into Wayland (losing VST2 GUIs) with SLOOPER_FORCE_WAYLAND=1.
-    if std::env::var_os("SLOOPER_FORCE_WAYLAND").is_none() && std::env::var_os("DISPLAY").is_some()
-    {
+    // v41 windowing policy (crash forensics 2026-11, seven SIGABRTs):
+    // the main window used to be forced onto X11/XWayland so plugin
+    // editors and the app shared one server. That co-located slooper's
+    // OWN GLX/DRI3 context with every plugin editor's GPU traffic:
+    // loading editor-heavy plugins (session restore auto-opens the track
+    // synth GUI; a fresh mtime triggers a crash-guard probe; the user
+    // clicks Edit) tickled a Mesa/amdgpu VA-map conflict storm, the
+    // kernel rejected the command stream, and Mesa abort()s every DRI3
+    // client it served — starting with the DAW. Running the main window
+    // native-Wayland moves slooper's present path to EGL/Wayland, a
+    // different driver code path, so an editor-side driver fault can
+    // only take down that plugin's own X client, never slooper itself.
+    // (Plugin editors remain plain X11 windows via vstedit's own X
+    // connection; KWin stacks them over Wayland windows fine — the
+    // v10.2 seam report predates KWin 6.) On a pure-X11 session nothing
+    // changes; SLOOPER_FORCE_X11=1 opts back into the old whole-app-on-
+    // X11 world (all plugin editors included). SLOOPER_FORCE_WAYLAND is
+    // kept as the legacy override: it wins over FORCE_X11, as before.
+    if x11_world_preferred(|k| std::env::var_os(k)) {
         std::env::remove_var("WAYLAND_DISPLAY");
         std::env::remove_var("WAYLAND_SOCKET");
     }
@@ -56,6 +64,19 @@ fn main() -> eframe::Result {
     )
 }
 
+/// v41: main-window backend policy (see `main` for the why). True =
+/// strip the Wayland session vars so winit takes the X11 backend;
+/// false = keep native Wayland for the main window.
+fn x11_world_preferred(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    let wayland_session = env("WAYLAND_DISPLAY").is_some() || env("WAYLAND_SOCKET").is_some();
+    let force_x11 = env("SLOOPER_FORCE_X11").is_some();
+    let force_wayland = env("SLOOPER_FORCE_WAYLAND").is_some();
+    if force_wayland {
+        return false; // legacy override keeps Wayland, winning as before
+    }
+    force_x11 || !wayland_session
+}
+
 /// Decode the bundled icon into raw RGBA for the window title bar.
 fn load_icon() -> Option<std::sync::Arc<egui::IconData>> {
     let img = image::ImageReader::new(std::io::Cursor::new(ICON_PNG))
@@ -74,6 +95,41 @@ fn load_icon() -> Option<std::sync::Arc<egui::IconData>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn envof(pairs: &[&str]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let owned: Vec<String> = pairs.iter().map(|k| k.to_string()).collect();
+        move |k: &str| {
+            owned
+                .iter()
+                .any(|name| name == k)
+                .then(|| std::ffi::OsString::from("1"))
+        }
+    }
+
+    #[test]
+    fn v41_wayland_session_keeps_native_wayland() {
+        // The flip: under a KDE/Wayland session the main window must NOT
+        // be dragged onto XWayland anymore (crash blast-radius, v41).
+        assert!(!x11_world_preferred(envof(&["WAYLAND_DISPLAY", "DISPLAY"])));
+        assert!(!x11_world_preferred(envof(&["WAYLAND_SOCKET"])));
+    }
+
+    #[test]
+    fn v41_force_x11_optes_back_in() {
+        assert!(x11_world_preferred(envof(&["WAYLAND_DISPLAY", "SLOOPER_FORCE_X11"])));
+        // Legacy override still wins over FORCE_X11, as before.
+        assert!(!x11_world_preferred(envof(&[
+            "WAYLAND_DISPLAY",
+            "SLOOPER_FORCE_X11",
+            "SLOOPER_FORCE_WAYLAND"
+        ])));
+    }
+
+    #[test]
+    fn v41_pure_x11_session_unchanged() {
+        // No Wayland session vars: X11 as always.
+        assert!(x11_world_preferred(envof(&["DISPLAY"])));
+    }
 
     #[test]
     fn icon_decodes() {
