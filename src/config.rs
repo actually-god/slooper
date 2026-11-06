@@ -546,6 +546,12 @@ pub struct Config {
     /// either way (contrast for editing is intentional).
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// v42/MPE: MIDI Polyphonic Expression. When set, pitch-bend (0xEx)
+    /// and per-note aftertouch (0xAx) from the input port drive track
+    /// instruments per channel/voice. Default OFF — classic single-channel
+    /// rigs keep byte-identical behavior.
+    #[serde(default)]
+    pub mpe: bool,
 }
 
 impl Default for Config {
@@ -613,6 +619,7 @@ impl Default for Config {
             side_wins: SideWins::default(),
             dyn_docks: Vec::new(),
             theme: default_theme(),
+            mpe: false,
         }
     }
 }
@@ -812,6 +819,7 @@ mod tests {
     #[test]
     fn config_roundtrip() {
         let cfg = Config {
+            mpe: true,
             auto_snap_on: false,
             auto_snap_sub: 8,
             dir_memo: Default::default(),

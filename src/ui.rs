@@ -963,6 +963,9 @@ pub struct App {
     /// v25: light egui Visuals for the panel/window chrome. The arrangement
     /// canvas keeps its fixed studio palette either way.
     light_theme: bool,
+    /// v42/MPE: Settings switch — bend/poly-AT from the port reach
+    /// instruments (mirrored into the engine every frame it changes).
+    mpe_on: bool,
     /// v25: last theme actually pushed into the context (apply on change
     /// only, in `logic`).
     theme_was_light: Option<bool>,
@@ -1264,6 +1267,9 @@ pub struct App {
     /// Per-track mixer chains (ordered): scripted effects and VST plugins
     /// as one slot list — plugins sit anywhere in the chain.
     fx_rows: Vec<Vec<ChainRow>>,
+    /// v42: plugin names whose "bridge lost" parking has already been
+    /// surfaced in the status line (notify once, not every frame).
+    dead_reported: Vec<String>,
     /// Script instances backing `fx_rows` (None on plugin rows; same order).
     fx_live: Vec<Vec<Option<std::sync::Arc<fx::Instance>>>>,
     fx_window: Option<usize>,
@@ -1536,6 +1542,7 @@ impl App {
             dock_just_floated: None,
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
+            mpe_on: cfg.mpe,
             theme_was_light: None,
             status_at: std::time::Instant::now(),
             status_seen: "starting…".into(),
@@ -1671,6 +1678,7 @@ impl App {
             piano_roll: None,
             fx_registry,
             fx_rows,
+            dead_reported: Vec::new(),
             fx_live: vec![Vec::new(); MAX_LOOPS],
             fx_window: None,
             fx_vst_editors: std::collections::HashMap::new(),
@@ -4044,6 +4052,7 @@ impl App {
                 merged
             },
             theme: if self.light_theme { "light" } else { "dark" }.into(),
+            mpe: self.mpe_on,
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -7056,7 +7065,18 @@ impl App {
             } => {
                 evs.push((at, 4, channel, note, pressure));
             }
-            _ => return, // PC / pitch bend / sysex: not part of the pattern model
+            // v42/MPE: 14-bit bend stored as (LSB, MSB) in d1/d2.
+            MidiMsg::PitchBend { channel, value } => {
+                let v = (value + 8192).clamp(0, 16383) as u16;
+                evs.push((
+                    at,
+                    5,
+                    channel,
+                    (v & 0x7F) as u8,
+                    ((v >> 7) & 0x7F) as u8,
+                ));
+            }
+            _ => return, // PC / sysex: not part of the pattern model
         }
         for r in self.midi_rec.iter_mut() {
             if r.armed {
@@ -7115,12 +7135,21 @@ impl App {
                     ch,
                     val: d2,
                 }),
-                // Poly pressure: attach to the note that is still open.
-                _ => {
-                    if let Some(e) = open.get_mut(&(ch, d1)) {
-                        e.2 = d2;
-                    }
-                }
+                // v42/MPE: per-note aftertouch keeps its own timed lane
+                // (was: folded into the open note's single pressure byte).
+                4 => pat.polys.push(crate::midipat::Poly {
+                    at: tick(&pat, at),
+                    ch,
+                    note: d1,
+                    val: d2,
+                }),
+                // v42/MPE: 14-bit bend, d1 = LSB, d2 = MSB.
+                5 => pat.bends.push(crate::midipat::Bend {
+                    at: tick(&pat, at),
+                    ch,
+                    val: (((d2 as u16) << 7) | (d1 as u16)) & 0x3FFF,
+                }),
+                _ => {}
             }
         }
         // Notes still held at stop ring to the END OF THE TAKE (the stop
@@ -11147,6 +11176,11 @@ impl eframe::App for App {
         if self.backend.engine.recording() != rec_any {
             self.backend.engine.set_recording(rec_any);
         }
+        // v42/MPE: mirror the Settings switch into the engine (cheap atomic
+        // compare; covers startup restore and every later flip).
+        if self.backend.engine.mpe() != self.mpe_on {
+            self.backend.engine.set_mpe(self.mpe_on);
+        }
         self.sample_auto_controls();
 
         // v38 R4: while a roll audition plays, keep the frame clock
@@ -11219,7 +11253,47 @@ impl eframe::App for App {
         // tick drop here, so destructors (and the VST3 teardown the runner
         // hands off) run on the creating thread, never the audio thread.
         for e in self.backend.engine.drain_vst_held() {
-            drop(e);
+            // v42: plugin destructors dispatch teardown INTO the library
+            // (effClose / VST3 release) — a dying bridge can throw there.
+            // Parked entry or not, the drop must not take the app down.
+            if let Err(err) = crate::ffiguard::guarded(move || drop(e)) {
+                eprintln!("[slooper] plugin destructor threw (ignored): {err}");
+            }
+        }
+
+        // v42: a plugin whose C++ throw got caught by the firewall is now
+        // parked (RT thread bypassed it — it cannot show UI). Surface it
+        // ONCE per plugin here; the RT-side eprintln keeps the full reason.
+        let mut dead: Vec<String> = Vec::new();
+        for rows in &self.fx_rows {
+            for row in rows.iter() {
+                if let ChainRow::Vst { name, entry: Some(e), .. } = row {
+                    if e.is_dead() {
+                        dead.push(name.clone());
+                    }
+                }
+            }
+        }
+        for (i, h) in self.track_synth_inst.iter().enumerate() {
+            if let Some(h) = h {
+                if h.is_dead() {
+                    dead.push(
+                        self.track_synth
+                            .get(i)
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| "plugin instrument".to_string()),
+                    );
+                }
+            }
+        }
+        for name in dead {
+            if !self.dead_reported.contains(&name) {
+                self.dead_reported.push(name.clone());
+                self.status = format!(
+                    "\u{26a0} “{name}” lost its plugin bridge — bypassed. Remove and re-add it to restore sound."
+                );
+            }
         }
 
         let p = f32::from_bits(self.backend.peak.load(Ordering::Relaxed));
@@ -19510,6 +19584,29 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 .weak()
                 .small(),
             );
+
+            // ---- v42: MPE ----------------------------------------------------
+            ui.separator();
+            ui.label(RichText::new("MPE").strong());
+            if ui
+                .checkbox(&mut app.mpe_on, "MPE support (polyphonic expression)")
+                .on_hover_text(
+                    "For MPE controllers (LinnStrument, SEABOARD, KeyStage, \u{2026}): \
+                     pitch bend and per-note aftertouch arrive on each note's own \
+                     channel and drive the instrument per voice. Recorded takes keep \
+                     both lanes. Hosted plugins support this fully; built-in scripted \
+                     synths ignore bend/poly-AT.",
+                )
+                .changed()
+            {
+                app.backend.engine.set_mpe(app.mpe_on);
+                app.save_config();
+                app.status = if app.mpe_on {
+                    "MPE on \u{2014} per-channel bend & per-note pressure reach instruments".into()
+                } else {
+                    "MPE off".into()
+                };
+            }
 
             // ---- MIDI + keyboard bindings -----------------------------------
             ui.separator();

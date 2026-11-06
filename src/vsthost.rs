@@ -28,7 +28,7 @@
 
 use std::cell::UnsafeCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Fixed processing granularity handed to plugins (samples).
@@ -176,6 +176,11 @@ pub trait StageEntry: Send + Sync {
     fn descs(&self) -> &[VstParamDesc];
     fn params(&self) -> &std::sync::Arc<VstParams>;
     fn has_editor(&self) -> bool;
+    /// v42: true once this entry threw a C++ exception (dead wine bridge)
+    /// and was parked by the FFI firewall. Built-in entries never die.
+    fn is_dead(&self) -> bool {
+        false
+    }
     fn set_param(&self, index: usize, value: f32);
     fn set_param_rt(&self, index: usize, value: f32);
     /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
@@ -205,6 +210,9 @@ pub trait StageEntry: Send + Sync {
 }
 
 impl StageEntry for RtStageEntry {
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1077,7 +1085,28 @@ fn base_label(path: &Path) -> String {
         .to_string()
 }
 
+/// v42: shared error row for probes that threw (a crashing bridge during
+/// scan must grey out one row, not kill the scan or the app).
+fn probe_threw(path: &Path, kind: VstKind, e: &str) -> VstEntry {
+    VstEntry {
+        path: path.to_path_buf(),
+        kind,
+        name: base_label(path),
+        vendor: String::new(),
+        instrument: false,
+        plugin_id: None,
+        error: Some(format!("threw during probe: {e}")),
+    }
+}
+
 fn probe_vst3(path: &Path) -> VstEntry {
+    match crate::ffiguard::guarded(|| probe_vst3_inner(path)) {
+        Ok(entry) => entry,
+        Err(e) => probe_threw(path, VstKind::V3, &e),
+    }
+}
+
+fn probe_vst3_inner(path: &Path) -> VstEntry {
     // Never re-instantiate a live/unchanged library (see `cached_entry`).
     if let Some(cached) = cached_entry(path) {
         return cached;
@@ -1161,6 +1190,13 @@ pub fn vst2_is_instrument(flags: i32, inputs: i32) -> bool {
 }
 
 fn probe_vst2(path: &Path) -> VstEntry {
+    match crate::ffiguard::guarded(|| probe_vst2_inner(path)) {
+        Ok(entry) => entry,
+        Err(e) => probe_threw(path, VstKind::V2, &e),
+    }
+}
+
+fn probe_vst2_inner(path: &Path) -> VstEntry {
     use vst2::plugin::Plugin;
     // Never re-instantiate a live/unchanged library (see `cached_entry`).
     if let Some(cached) = cached_entry(path) {
@@ -1688,6 +1724,12 @@ pub struct RtStageEntry {
     /// ring was full. Nonzero means the HOST lost notes; compare against
     /// `RtState.midi_drops` being identical (same Arc).
     midi_drops: Arc<AtomicU64>,
+    /// v42: set once a C++ exception thrown by this plugin (dead wine
+    /// bridge, dying toolkit) is caught by the FFI firewall. The entry is
+    /// then PARKED: `process` becomes a dry passthrough, MIDI is dropped,
+    /// and nothing calls into that library again. Never cleared — the user
+    /// removes/reloads the plugin to get sound back.
+    dead: AtomicBool,
 }
 
 /// Raw editor-dispatch handle for a loaded VST2 plugin: just the
@@ -1946,9 +1988,19 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
                     };
                     match rx.recv_timeout(std::time::Duration::from_millis(tick)) {
                         Ok(job) => {
-                            job();
+                            // v42: plugin control/editor calls run as jobs
+                            // on THIS thread. A C++ throw through wine used
+                            // to hit std::terminate (measured 2026-11-06,
+                            // dying Arturia bridge); the firewall catches it
+                            // per job, so one dead library can no longer
+                            // take the session down.
+                            if let Err(e) = crate::ffiguard::guarded(job) {
+                                eprintln!("[slooper] plugin job threw on vst2-gui thread: {e}");
+                            }
                             while let Ok(job) = rx.try_recv() {
-                                job();
+                                if let Err(e) = crate::ffiguard::guarded(job) {
+                                    eprintln!("[slooper] plugin job threw on vst2-gui thread: {e}");
+                                }
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1958,7 +2010,11 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
                     // expect a steady effEditIdle; the fast tick only
                     // exists while editors are actually open.
                     let t0 = std::time::Instant::now();
-                    crate::vstedit::pump_editors();
+                    if let Err(e) =
+                        crate::ffiguard::guarded(|| crate::vstedit::pump_editors())
+                    {
+                        eprintln!("[slooper] editor idle pump threw: {e}");
+                    }
                     GUI_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
                     if stats {
                         window += 1;
@@ -2393,6 +2449,7 @@ fn assemble(
         vst2,
         editor_state: Mutex::new(editor_state),
         midi_drops,
+        dead: AtomicBool::new(false),
     }
 }
 
@@ -2768,6 +2825,10 @@ impl RtStageEntry {
     /// next fed audio reaches it (v33; used to be "start of the next
     /// internal block", which smeared fast retriggers).
     pub fn feed_midi(&self, msg: [u8; 3]) {
+        // v42: parked bridge — stop queueing messages into a dead library.
+        if self.dead.load(Ordering::Relaxed) {
+            return;
+        }
         // SAFETY: audio-thread-only access to `state` (see `flush`).
         let s = unsafe { &mut *self.state.get() };
         Self::queue(s, msg, s.abs_fed);
@@ -2811,6 +2872,9 @@ impl RtStageEntry {
         for c in 0..16u8 {
             self.cc(c, 123, 0);
             self.cc(c, 120, 0);
+            // v42/MPE: center the bend wheel too — a dead player's bent
+            // note must not haunt the next take.
+            self.feed_midi([0xE0 | c, 0, 64]);
         }
     }
 
@@ -2833,7 +2897,29 @@ impl RtStageEntry {
 
     /// Process one engine block: mono in, mono out, internally chunked to
     /// [`VST_BLOCK`]. Audio thread only.
+    ///
+    /// v42: this is the firewall boundary for the RT thread. A plugin that
+    /// throws (dead bridge) is caught here, PARKED, and bypassed from the
+    /// next block on — the DAW never dies with the user's session because a
+    /// wine host hiccupped.
     pub fn process(&self, input: &[f32], output: &mut [f32]) {
+        use crate::ffiguard;
+        if self.dead.load(Ordering::Relaxed) {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            return;
+        }
+        if let Err(e) = ffiguard::guarded(|| self.process_inner(input, output)) {
+            self.dead.store(true, Ordering::Relaxed);
+            eprintln!(
+                "[slooper] plugin threw during process (bridge lost?): {e} — \u{201c}{}\u{201d} bypassed; remove and re-add it to restore sound",
+                self.name
+            );
+            output.fill(0.0);
+        }
+    }
+
+    fn process_inner(&self, input: &[f32], output: &mut [f32]) {
         // SAFETY: audio-thread-only access to `state` (see `flush`).
         let s = unsafe { &mut *self.state.get() };
         let n = input.len().min(output.len());

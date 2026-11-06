@@ -185,6 +185,14 @@ pub enum SynthHandle {
 }
 
 impl SynthHandle {
+    /// v42: true when the hosted plugin behind this handle threw a C++
+    /// exception (dead bridge) and is parked/bypassed.
+    pub fn is_dead(&self) -> bool {
+        match self {
+            SynthHandle::Vst(e) => e.is_dead(),
+            SynthHandle::Script(_) => false,
+        }
+    }
     /// Silence every ringing voice (transport seek/stop).
     pub fn all_off(&self) {
         match self {
@@ -277,6 +285,11 @@ pub fn live_event_kind(bytes: &[u8]) -> Option<(u8, u8, u8, u8)> {
         0x8 => Some((0, ch, *bytes.get(1)?, 0)),
         0xB => Some((1, ch, *bytes.get(1)?, *bytes.get(2)?)),
         0xD => Some((2, ch, 0, *bytes.get(1)?)),
+        // v42/MPE: per-note aftertouch and (per-channel) pitch bend. The
+        // MPE engine toggle gates these two at the port; classic setups
+        // never see them, expressive controllers always send them.
+        0xA => Some((4, ch, *bytes.get(1)?, *bytes.get(2)?)),
+        0xE => Some((5, ch, *bytes.get(1)?, *bytes.get(2)?)),
         _ => None,
     }
 }
@@ -664,6 +677,11 @@ pub struct Engine {
     /// Playhead position in timeline samples (published by RT, seeks written
     /// by the manager through `seek`).
     pos: AtomicU64,
+    /// v42/MPE: when set, pitch-bend (0xEx) and polyphonic aftertouch
+    /// (0xAx) from the input port reach track instruments (and pattern
+    /// playback feeds them too). Off = the classic behavior where those
+    /// messages never left the recorder.
+    mpe: AtomicBool,
     /// v37 R5: any recorder is armed (audio take / MIDI take / write
     /// automation) — the transport must NOT park or wrap at the project
     /// end while a take runs. Truncating the take at the content length is
@@ -854,6 +872,7 @@ impl Engine {
             loop_end: AtomicU64::new(0),
             pos: AtomicU64::new(0),
             recording: AtomicBool::new(false),
+            mpe: AtomicBool::new(false),
             seek: AtomicU64::new(NO_SEEK),
             // Empty project: an idle timeline as long as a take buffer, so
             // a transport parked on it never wraps/parks on a 1-sample
@@ -1021,6 +1040,15 @@ impl Engine {
 
     pub fn recording(&self) -> bool {
         self.recording.load(Ordering::Relaxed)
+    }
+
+    /// v42/MPE: publish the Settings menu's "MPE support" switch.
+    pub fn set_mpe(&self, on: bool) {
+        self.mpe.store(on, Ordering::Relaxed);
+    }
+
+    pub fn mpe(&self) -> bool {
+        self.mpe.load(Ordering::Relaxed)
     }
 
     /// v37 test seam: publish a playhead position exactly the way RT does
@@ -2870,6 +2898,27 @@ fn stage_midi_events(
         }
         ev.push((base + s, 2, m.ch, 0, m.val));
     }
+    // v42/MPE lanes: bends (kind 5, 14-bit split) and per-note AT (kind 4).
+    for m in pat.bends.iter() {
+        let s = pat.ticks_to_samples(m.at, sr);
+        if s < cl.cut || s - cl.cut >= span {
+            continue;
+        }
+        ev.push((
+            base + s,
+            5,
+            m.ch,
+            (m.val & 0x7F) as u8,
+            ((m.val >> 7) & 0x7F) as u8,
+        ));
+    }
+    for m in pat.polys.iter() {
+        let s = pat.ticks_to_samples(m.at, sr);
+        if s < cl.cut || s - cl.cut >= span {
+            continue;
+        }
+        ev.push((base + s, 4, m.ch, m.note, m.val));
+    }
 }
 
 /// Render staged absolute-sample events through `inst` into `len` samples
@@ -2912,6 +2961,7 @@ pub fn render_midi_events(
                 0 => inst.note_off(ch, d1),
                 1 => inst.cc(ch, d1, d2),
                 2 => inst.press(ch, d2),
+                4 | 5 => {} // v42/MPE: scripted ABI v1 has no bend/poly-AT
                 _ => inst.note_on(ch, d1, d2),
             }
             i += 1;
@@ -3029,6 +3079,33 @@ fn stage_track_events(
                 let at = base + s;
                 if at >= p0 && at < span_end {
                     ev.push(((at - p0) as usize, 2, m.ch, 0, m.val));
+                }
+            }
+            // v42/MPE lanes: pattern bends and per-note aftertouch.
+            for m in pat.bends.iter() {
+                let s = pat.ticks_to_samples(m.at, sr);
+                if s < cl.cut || s - cl.cut >= span {
+                    continue;
+                }
+                let at = base + s;
+                if at >= p0 && at < span_end {
+                    ev.push((
+                        (at - p0) as usize,
+                        5,
+                        m.ch,
+                        (m.val & 0x7F) as u8,
+                        ((m.val >> 7) & 0x7F) as u8,
+                    ));
+                }
+            }
+            for m in pat.polys.iter() {
+                let s = pat.ticks_to_samples(m.at, sr);
+                if s < cl.cut || s - cl.cut >= span {
+                    continue;
+                }
+                let at = base + s;
+                if at >= p0 && at < span_end {
+                    ev.push(((at - p0) as usize, 4, m.ch, m.note, m.val));
                 }
             }
         }
@@ -3372,6 +3449,9 @@ impl Proc {
                                 0 => inst.note_off(ch, d1),
                                 1 => inst.cc(ch, d1, d2),
                                 2 => inst.press(ch, d2),
+                                // v42/MPE: scripted synth ABI v1 has no
+                                // bend/poly-AT callbacks — drop cleanly.
+                                4 | 5 => {}
                                 _ => inst.note_on(ch, d1, d2),
                             }
                             i += 1;
@@ -3399,6 +3479,11 @@ impl Proc {
                             0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
                             1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
                             2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+                            // v42/MPE: per-note aftertouch and 14-bit bend
+                            // (d1 = LSB, d2 = MSB) ride straight into the
+                            // entry's raw-message queue.
+                            4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                            5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
                             _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
                         };
                         evq.push(((_off).min(block_n), m));
@@ -3985,6 +4070,10 @@ impl ProcessHandler for Proc {
         }
         // MIDI: copy events out (bounded channel; count drops if the GUI is slow).
         let off_cap = n.saturating_sub(1);
+        // v42/MPE: read once per block — bend/poly-AT ride the port only
+        // when the user opted into MPE (classic single-channel rigs stay
+        // byte-for-byte in the legacy behavior).
+        let mpe_on = self.engine.mpe();
         for e in self.midi_in.iter(ps) {
             let bytes = e.bytes.to_vec();
             // v32: stage the message for the track synths too. Bound
@@ -3994,7 +4083,7 @@ impl ProcessHandler for Proc {
             // ringing across event-free blocks.
             if live_mask != 0 {
                 if let Some((kind, ch, d1, d2)) = live_event_kind(&bytes) {
-                    if !self.bound_cache.claims(kind, ch, d1) {
+                    if (kind < 4 || mpe_on) && !self.bound_cache.claims(kind, ch, d1) {
                         if self.live_ev.len() < 1024 {
                             let off = (e.time) as usize;
                             self.live_ev.push((off.min(off_cap), kind, ch, d1, d2));
@@ -5828,10 +5917,13 @@ mod tests {
         assert_eq!(live_event_kind(&[0xB1, 7, 90]), Some((1, 1, 7, 90)));
         assert_eq!(live_event_kind(&[0xD2, 40]), Some((2, 2, 0, 40)));
         // Outside the vocabulary (the e2e monitor's own message list sends
-        // the first two — they must drop, not wedge anything).
+        // program change / system — they must drop, not wedge anything).
         assert_eq!(live_event_kind(&[0xC2, 11]), None); // program change
-        assert_eq!(live_event_kind(&[0xE0, 0, 64]), None); // pitch bend
-        assert_eq!(live_event_kind(&[0xA0, 60, 9]), None); // poly AT
+        // v42/MPE: bend (kind 5, LSB/MSB) and poly AT (kind 4, note/val)
+        // are parsed now — the engine's MPE switch gates whether they ever
+        // reach an instrument.
+        assert_eq!(live_event_kind(&[0xE0, 0, 64]), Some((5, 0, 0, 64))); // pitch bend
+        assert_eq!(live_event_kind(&[0xA3, 60, 9]), Some((4, 3, 60, 9))); // poly AT
         assert_eq!(live_event_kind(&[0xF0, 1, 2]), None); // system
         assert_eq!(live_event_kind(&[0x3C]), None); // non-status
         assert_eq!(live_event_kind(&[]), None);
