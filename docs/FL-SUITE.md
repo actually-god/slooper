@@ -21,7 +21,7 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 |---|---|---|---|
 | Fruity Parametric EQ, Parametric EQ 2 | visual 7-band EQ + analyzer | `parametric_eq.rs` | done (26-param graph GUI, +30 dB, 240-band analyzer) |
 | Fruity Reeverb 2, LuxeVerb, part of Fast Reverb | algorithmic reverb | `space_echo.rs` | done (11 params + space presets GUI) |
-| Fruity Chorus, Hyper Chorus, Vintage Chorus | chorus / doubler / ensembles | `chorus.rs` | done |
+| Fruity Chorus, Hyper Chorus, Vintage Chorus | chorus / doubler / ensembles | `chorus.rs` | done tier-4 (ABI-v3 stereo: `voices` taps/side, R bank phase-spread; dead tier-1 feedback rewritten as a delayed wet-recirculation loop) |
 | Fruity Compressor | single-band comp | `compressor.rs` | done |
 | Fruity Limiter sidechain duties | ducking comp | `sidechain_comp.rs` | done (ABI-v2 reference) |
 | (tremolo starter) | amplitude LFO | `template.rs` | done |
@@ -33,9 +33,9 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Maximus, Fruity Multiband Compressor | 3-band split dynamics | `multiband.rs` | done |
 | Fruity Filter, Fruity Love Philter (single core), Fruity Wah | resonant LP/BP/HP + env auto-wah | `vfilter.rs` | done |
 | Fruity Phaser, Vintage Phaser | phaser | `phaser.rs` | done |
-| Fruity Flanger, Fruity Flangus | flanger / unison | `flanger.rs` | done |
+| Fruity Flanger, Fruity Flangus | flanger / unison | `flanger.rs` | done tier-4 (absolute-index ring read fixed — the comb now actually recirculates; base time slewed) |
 | Fruity PanOMatic (vol), Gross Beat (gate/stutter lite) | tempo volume-gating | `gater.rs` | done |
-| Fruity Delay 2, Fruity Delay 3, Fruity Delay Bank (single-bank core) | delay + filtered feedback | `echo3.rs` | done |
+| Fruity Delay 2, Fruity Delay 3, Fruity Delay Bank (single-bank core) | delay + filtered feedback | `echo3.rs` | done tier-4 (ABI-v3 ping-pong: R taps `time×(1+pp)` so repeats trail L→R; tier-1 absolute-index ring read fixed — see rework log) |
 | Frequency Shifter | SSB shift (metallic/vibrato) | `shifter.rs` | done |
 | Transient Processor, Transmitter (split lite) | transient/sustain shaping | `transient.rs` | done |
 | Fruity Vocoder, Vocodex | vocoder (SC carrier feed) | `vocoder.rs` | done |
@@ -89,7 +89,9 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
    pan-law only in the master fold) — a v1/v2 chain measures L−R = 0 on
    the master buses (pinned by `e2e_tier3_stereo_spread_live`, which ALSO
    asserts a v3 script decorrelates). Scripts: `spread.rs`,
-   `panmatic.rs`. Write the pair into the L slot + out pointer; never
+   `panmatic.rs`, plus tier-4 `chorus.rs` (per-side tap banks) and
+   `echo3.rs` (ping-pong reads). Write the pair into the L slot +
+   out pointer; never
    assume L == R in a v3 slot. FLAG SEMANTICS: `desc.sidechain` is
    true only for the EXACT v2 generation — a v3 script must export the
    v2 prefix, so `process_sc` presence alone proves nothing; a v3
@@ -161,3 +163,48 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
   host); headless they fail deterministically for the wrong reason.
 - Live test: boot the freshly built binary on the X display and capture
   the Effects window (all rows valid), plus one loaded-chain screenshot.
+
+## Tier-4 rework log (2026-11-06 — the standing "re-check with fresh eyes" pass)
+
+The whole bundle was re-audited script by script (string-literal
+non-ASCII sweep: clean — all non-ASCII sits in comments; NaN guards,
+`one_c`-style true-Hz poles, param-index discipline: clean except as
+below). Two SHIPPED-BUT-DEAD bug classes surfaced, both invisible to the
+non-silence gate:
+
+- **Absolute ring reads** (`echo3.rs`, `flanger.rs`): `read_lin` computed
+  the tap index as `buf[d]` instead of `(widx − d) mod MAX`. The tap then
+  heard input only at times `t ≡ d (mod MAX)` — a feedback loop fed this
+  way is STARVED (impulse → dry only, measured peak = exactly the dry
+  path), and continuous output became one scattered smear that swept the
+  ring once per wrap. RMS-based produce-sound gates pass smears. Fix:
+  head-relative reads in both scripts (chorus/space_echo/pitchshft/
+  granular/pluck were already correct — audited).
+- **Self-chasing feedback** (`chorus.rs`): `lp += k*(fb − lp)` with
+  `fb = lp` at the end of the same block freezes the filter at 0 — the
+  feedback slider had NO effect at any value since tier 1. Replaced with
+  delayed wet-recirculation (the tap average recirculates through the
+  tone lowpass; period = tap delay, like the BBD classics).
+- **Gate lesson**: every script with a feedback loop now needs an
+  IMPULSE-STRUCTURE pin, not an energy pin — `fx::tests::
+  tier4_feedback_loops_ring` asserts discrete echo3 echoes with the
+  correct decay ratio, chorus tail sustain, flanger comb ringing, and
+  that the ping-pong R echo arrives LATE (a smear cannot fake any of it).
+  When adding a delay/feedback script, copy that test's shape.
+- **Zipper-click sweep**: raw delay-time sliders move a tap by whole
+  samples per frame — `echo3`/`chorus`/`flanger` nominal times are now
+  slew-limited (~3–5 ms time constant). Modulation depth stays un-slewed
+  (that IS the effect).
+- **Stereo upgrades** (rung 3, zero ABI change — the capability shipped
+  in tier 3 was simply unused): `echo3.rs` gained ping-pong (R taps
+  `time × (1 + ping-pong)`; 0 = parallel, 1 = hard alternate) and
+  `chorus.rs` became the Hyper-Chorus per-side tap bank (`voices` taps
+  per side, R bank offset `spread × 180°`). The v3 script list is now
+  spread / panmatic / chorus / echo3 — `bundled_effects_produce_sound`
+  asserts `st_checked >= 4`, and `e2e_tier4_stereo_echo_chorus_live`
+  proves both decorrelate on the LIVE master buses.
+- Appended params are persistence-safe: chain slots pad stored values
+  with descriptor defaults (`fx.rs` `slot values`), so new sliders must
+  only be APPENDED (indices are sticky per script stem).
+- UI pin `flsuite_chain_window_tags_stereo_script` updated: the mono
+  counterexample is now `compressor` (chorus carries the badge).

@@ -27243,19 +27243,27 @@ mod tests {
             "badge shares the script's row ({tag:?} vs {name:?})"
         );
         // A mono script on the same track must NOT get the badge.
-        app.add_fx_script(0, "chorus");
+        app.add_fx_script(0, "compressor");
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
-        let chorus = app
+        let comp = app
             .fx_registry
-            .desc("chorus")
+            .desc("compressor")
             .map(|d| !d.stereo)
             .unwrap_or(true);
-        assert!(chorus, "chorus stays a mono (v1) script");
+        assert!(comp, "compressor stays a mono (v1) script");
         assert!(
             app.fx_rows[0].len() == 2,
             "both scripts live in the chain"
         );
+        // Tier 4: the chorus joined the v3 stereo world (per-side tap
+        // banks, Hyper Chorus task) — this pin used to assert it was the
+        // mono counterexample; the roster in docs/FL-SUITE.md is the
+        // authority for who carries (ST).
+        app.add_fx_script(0, "chorus");
+        frame(&mut app, &ctx, vec![]);
+        let ch = app.fx_registry.desc("chorus").expect("chorus desc");
+        assert!(ch.stereo, "chorus is an ABI-v3 stereo script since tier 4");
     }
 
     /// R4 (v35 R7): bridge widgets (a custom-GUI script's own knobs) answer
