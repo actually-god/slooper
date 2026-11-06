@@ -59,8 +59,18 @@ src/            application source (Rust 2021 edition)
   assets.rs       asset rack store: folder scan (audio + .mid), take WAVs
                   into the primary folder, name resolution
   midipat.rs      SMF format-0 MIDI pattern model (PPQ 480; notes with
-                  channel pressure, CC, channel pressure; read + write;
-                  pattern length survives via a private text meta)
+                  channel pressure, CC, channel pressure; v42/MPE adds
+                  14-bit pitch-bend + per-note aftertouch lanes, read +
+                  write; pattern length survives via a private text meta)
+  ffiguard.rs     C++ exception firewall wrapped around every call into a
+                  plugin library (the fg_try_call shim in src/ffiguard/
+                  *.cpp, compiled by build.rs via cc): a yabridge/C++
+                  throw on the RT, GUI, editor-pump, probe or drop path
+                  becomes an Err (and a parked, bypassed entry) instead
+                  of std::terminate. Requires release panic = "unwind";
+                  the release pins in ffiguard::tests verify the round
+                  trip — switching back to panic = "abort" makes them
+                  abort, loudly.
   synth.rs        scripted synth plugins (rust-script): own ABI v1 + host
                   vtable, global-Mutex compile cache, bundled piano (recorded
                   physical model) + sampler seeded/updated-in-place in the

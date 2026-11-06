@@ -12,6 +12,17 @@
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result {
+    // v42: release now compiles panic = "unwind" because the plugin FFI
+    // firewall (src/ffiguard.rs) must be able to UNWIND C++ exceptions to
+    // its catch. To keep the shipped failure mode exactly as loud as the
+    // old panic = "abort", every app-level Rust panic aborts right after
+    // printing (core-dump forensics unchanged: `strings core | grep
+    // panicked`). C++ exceptions are not panics — they keep unwinding to
+    // the guard.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[slooper] panic: {info}");
+        std::process::abort();
+    }));
     // v23: editor crash-guard child (see `vstedit::probe_child`). This
     // process only ever tests ONE plugin window and exits — no JACK, no
     // eframe, no config, nothing that could be confused for a second DAW.

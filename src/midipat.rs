@@ -47,6 +47,27 @@ pub struct Press {
     pub at: u32,
 }
 
+/// A timed pitch-bend (0xE) message, v42/MPE. `val` is the raw 14-bit
+/// unsigned value (0..=16383, center 8192) — exactly what the VST3 host
+/// shim hands plugins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bend {
+    pub ch: u8,
+    pub val: u16,
+    pub at: u32,
+}
+
+/// A timed polyphonic aftertouch (0xA) message, v42/MPE: pressure for ONE
+/// held note while other voices on the same channel stay unaffected — the
+/// core per-voice expression message of MPE performance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Poly {
+    pub ch: u8,
+    pub note: u8,
+    pub val: u8,
+    pub at: u32,
+}
+
 /// A musical pattern in ticks. `bpm` is the embedded tempo (BPM × 1); the
 /// UI always shows/edits it through the project tempo when recording.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -57,6 +78,10 @@ pub struct Pattern {
     pub notes: Vec<Note>,
     pub ccs: Vec<Cc>,
     pub press: Vec<Press>,
+    /// v42/MPE lanes: 14-bit bends and per-note aftertouch. Round-trip
+    /// through the SMF file like every other lane.
+    pub bends: Vec<Bend>,
+    pub polys: Vec<Poly>,
 }
 
 impl Pattern {
@@ -67,12 +92,18 @@ impl Pattern {
             notes: Vec::new(),
             ccs: Vec::new(),
             press: Vec::new(),
+            bends: Vec::new(),
+            polys: Vec::new(),
         }
     }
 
     /// True when nothing sounds.
     pub fn is_empty(&self) -> bool {
-        self.notes.is_empty() && self.ccs.is_empty() && self.press.is_empty()
+        self.notes.is_empty()
+            && self.ccs.is_empty()
+            && self.press.is_empty()
+            && self.bends.is_empty()
+            && self.polys.is_empty()
     }
 
     /// Samples per tick at `bpm` and `rate` (f64 to survive long patterns).
@@ -165,6 +196,17 @@ impl Pattern {
         }
         for p in &self.press {
             ev.push((p.at, vec![0xD0 | p.ch & 0xF, p.val & 0x7F]));
+        }
+        // v42/MPE lanes: 0xE carries LSB then MSB (7-bit halves), 0xA is
+        // (note, pressure) — standard SMF voice encodings.
+        for b in &self.bends {
+            ev.push((
+                b.at,
+                vec![0xE0 | b.ch & 0xF, (b.val & 0x7F) as u8, ((b.val >> 7) & 0x7F) as u8],
+            ));
+        }
+        for p in &self.polys {
+            ev.push((p.at, vec![0xA0 | p.ch & 0xF, p.note & 0x7F, p.val & 0x7F]));
         }
         ev.sort_by_key(|(t, b)| (*t, b[0] >> 4, b[1]));
         let mut last = 0u32;
@@ -334,17 +376,30 @@ impl Pattern {
                         // Pitch bend: TWO data bytes (LSB, MSB). Consuming
                         // one desynced the stream — every event after the
                         // first bend in a file parsed as garbage.
+                        // v42/MPE: captured into the bend lane (14-bit).
                         if p + 2 > end {
                             break;
                         }
+                        pat.bends.push(Bend {
+                            ch,
+                            val: ((b[p + 1] as u16) << 7) | (b[p] as u16),
+                            at: tick,
+                        });
                         p += 2;
                         running = st;
                     }
                     0xA0 => {
-                        // Poly aftertouch: two data bytes.
+                        // Poly aftertouch: two data bytes. v42/MPE: kept as
+                        // a per-note pressure lane.
                         if p + 2 > end {
                             break;
                         }
+                        pat.polys.push(Poly {
+                            ch,
+                            note: b[p] & 0x7F,
+                            val: b[p + 1] & 0x7F,
+                            at: tick,
+                        });
                         p += 2;
                         running = st;
                     }
@@ -526,5 +581,52 @@ mod tests {
             "pitch bend must consume exactly its two payload bytes \
              (one-byte consumption desynced every following event)"
         );
+        // v42/MPE: the bend and poly-AT messages in this file are kept.
+        assert_eq!(
+            pat.bends,
+            vec![Bend {
+                ch: 0,
+                val: 0x20 << 7 | 0x40,
+                at: 0
+            }],
+            "pitch bend captured into the bend lane (14-bit)"
+        );
+        assert_eq!(
+            pat.polys,
+            vec![Poly {
+                ch: 0,
+                note: 60,
+                val: 50,
+                at: 0x10 + 0
+            }],
+            "poly aftertouch captured into the poly lane"
+        );
+    }
+
+    /// v42/MPE: both new lanes must survive a save/load round trip.
+    #[test]
+    fn v42_mpe_lanes_roundtrip_through_smf() {
+        let mut p = Pattern::new(120);
+        p.bends.push(Bend {
+            ch: 3,
+            val: 8392,
+            at: 100,
+        });
+        p.bends.push(Bend { ch: 3, val: 0, at: 200 });
+        p.polys.push(Poly {
+            ch: 5,
+            note: 64,
+            val: 77,
+            at: 150,
+        });
+        let f = std::env::temp_dir().join(format!(
+            "sp-mpe-rt-{}.mid",
+            std::process::id()
+        ));
+        p.save_mid(&f).unwrap();
+        let q = Pattern::load_mid(&f).unwrap();
+        assert_eq!(q.bends, p.bends, "bend lane round trip");
+        assert_eq!(q.polys, p.polys, "poly lane round trip");
+        std::fs::remove_file(&f).ok();
     }
 }

@@ -22,6 +22,7 @@ pub mod audio_io;
 pub mod automation;
 pub mod claphost;
 pub mod config;
+pub mod ffiguard;
 pub mod fx;
 pub mod fxgui;
 pub mod meter;

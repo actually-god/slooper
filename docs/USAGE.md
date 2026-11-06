@@ -459,6 +459,18 @@ Messages that are **not bound to anything** are the ones
 - **Reset to defaults** restores the factory keyboard table.
 - Bindings persist across sessions.
 
+### MPE (polyphonic expression)
+
+Settings → **MPE support** toggles MIDI Polyphonic Expression. With it on,
+**pitch bend** and **per-note aftertouch** from `slooper:midi_in` reach the
+track instruments on their own MIDI channel/voice — what MPE controllers
+(LinnStrument, SEABOARD, KeyStep 37 in MPE mode, …) send per note group.
+MIDI takes record both lanes (14-bit bends, per-note pressure), pattern
+playback replays them, and every **hosted plugin** reacts per channel.
+Built-in scripted synths don't respond to bend/poly-AT (ABI v1). Recorded
+bends are also centered on stop/seek (panic clears all 16 channels). Off
+by default — classic single-channel setups are byte-for-byte unchanged.
+
 ## Track effects & plugins
 
 Each track has **one ordered mixer chain** — runtime-compiled Rust effect

@@ -63,6 +63,10 @@ vst2 = { path = "vendor/vst2" }
 [workspace]
 members = ["vendor/vst2"]
 
+[build-dependencies]
+# v42: compiles the C++ exception-firewall shim (src/ffiguard/ffiguard.cpp).
+cc = "1"
+
 # SLOOPER PATCH (v0.11): winit 0.30.13's X11 backend panics (panic=abort ->
 # whole DAW dies) when libX11's input-context focus plumbing reports a stale
 # error during WM focus churn - reproduced by closing and re-opening a hosted
@@ -75,9 +79,14 @@ winit = { path = "vendor/winit" }
 lto = true
 codegen-units = 1
 strip = true
-# The app never unwinds (no catch_unwind anywhere); aborting keeps panic
-# landing pads and unwinding tables out of the shipped binary.
-panic = "abort"
+# v42: UNWIND tables are load-bearing. The plugin FFI firewall
+# (src/ffiguard.rs) catches C++ exceptions thrown by dying plugin bridges,
+# and the unwinder must be able to pass through Rust frames to reach the
+# C++ catch — with panic = "abort" that unwind aborts the process (the
+# exact crash this guard fixes; the v42_ffiguard_* pins abort on release
+# if this ever flips back). App-level Rust PANICS still core-dump loudly:
+# main.rs installs a hook that prints and aborts on every panic.
+panic = "unwind"
 
 # tier-5 forensics (2026-11-06 v2): release codegen + debuginfo for ASAN runs
 [profile.asanrel]
