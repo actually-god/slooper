@@ -6,20 +6,23 @@
 > Linux build, the JACK engine, yabridge/WINE hosting, the X11 editor path, or
 > any existing pin. Every Windows change is additive behind `cfg` seams.
 
-STATUS: W1 in progress (2026-11-06, session 1: research + toolchain).
+STATUS: W1 DONE 2026-11-06 (session 1). NEXT: W2 (`paths` module).
 
 ## Ground rules (apply to every task)
 
-- Target triple for development: `x86_64-pc-windows-gnu`, cross-built on Linux
-  with llvm-mingw at `~/Tools/llvm-mingw-*/bin` (no root needed). MSVC target
-  (`x86_64-pc-windows-msvc` via `xwin`) is release polish (W11), not required
-  until plugin-compat friction appears.
+- Target triple for development: `x86_64-pc-windows-gnullvm`, cross-built on
+  Linux with llvm-mingw (UCRT build) at
+  `~/Tools/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64/bin` (no root
+  needed; linker wired in `.cargo/config.toml`). Plain `-gnu` is NOT usable
+  with llvm-mingw (see W1). MSVC target (`x86_64-pc-windows-msvc` via
+  `xwin`) is release polish (W11), not required until plugin-compat friction
+  appears.
 - Linux code paths change ONLY by being moved behind functions/modules, never
   by behavior change. The full lib suite + e2e + clippy-zero stay green on
   Linux for every commit (existing slooper-dev gates).
 - Windows-only deps go under `[target.'cfg(windows)'.dependencies]`;
   Linux-only deps (jack, libc) stay default. `cargo check --target
-  x86_64-pc-windows-gnu` must pass before any Windows task is DONE; Linux
+  x86_64-pc-windows-gnullvm` must pass before any Windows task is DONE; Linux
   gates must pass before pushing at all.
 - New pins per slooper-dev standing order (`vNN_<area>_<behavior>`); OS-gated
   pins use `#[cfg(windows)]` / `#[cfg(unix)]` so each OS asserts its own truth.
@@ -70,16 +73,35 @@ Inventory of Linux-isms (measured, not guessed):
 
 Order = dependency order. One task per cron session unless trivial.
 
-### W1 — Cross toolchain + compile triage (session: 2026-11-06)
-Goal: `cargo check --target x86_64-pc-windows-gnu` runs and every error is
-bucketed, so the later tasks are driven by compiler truth, not guesses.
-- [ ] rustup target add x86_64-pc-windows-gnu
-- [ ] llvm-mingw (20261104) unpacked to ~/Tools, linker wired in
-      `.cargo/config.toml` under `[target.x86_64-pc-windows-gnu]`
-      (env-free so future sessions just run the check).
-- [ ] `cargo check` for the target; classify errors (audio/jack, X11, libc,
-      paths, deps). Record the triage table HERE.
-Acceptance: triage table committed; Linux gates untouched (no src change).
+### W1 — Cross toolchain + compile triage — **DONE 2026-11-06 (session 1)**
+Goal: `cargo check` for a Windows target runs; every error bucketed.
+Findings (measured):
+- **Target = `x86_64-pc-windows-gnullvm`** (NOT `-gnu`): the rustup prebuilt
+  windows-gnu std links `-lgcc/-lgcc_eh/libpthread.a` — GCC-isms llvm-mingw
+  does not provide (verified failure). gnullvm + llvm-mingw **UCRT build** is
+  the upstream-official pairing; hello-world links (`PE32+ executable for MS
+  Windows 6.00`) with `~/Tools/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64/bin/
+  x86_64-w64-mingw32-gcc` (2026 releases name even UCRT-build shims
+  `*-w64-mingw32-*`; trust `ls bin/`, not docs). Linker wired in
+  `.cargo/config.toml` under the gnullvm target key — inert for Linux.
+  Consequence: UCRT-only (Win10+), which is fine for a DAW.
+- **ALL dependencies cross-compile clean** (eframe/glow/accesskit, jack-sys
+  build.rs tolerates the target, vst3-host with winapi, rfd, symphonia, …).
+- `cargo check --lib` error surface = **19 errors, 3 sites**:
+  | bucket | site | count | task |
+  |---|---|---|---|
+  | probe libc calls (fork/pipe/poll/waitpid/kill/WIF*/read/write size_t) | vsthost.rs 1352–1476 | 16 | W7 |
+  | `std::os::unix::fs::symlink` (yabridge) | vsthost.rs:736 | 1 | W6 |
+  | `WindowHandle::from_x11` (vst3-host enum) | vstedit.rs:1607 | 1 | W8 |
+- **check hides link-time debt**: `#[link(name="X11")]` (vstedit) and
+  jack-sys extern blocks compile as bare `extern "C"` but will fail the
+  *link* of slooper.exe — the cfg seams of W5 (jack out on Windows) and W8
+  (X11 editor behind OS seam) are mandatory, not optional.
+- Acceptance met: triage committed; Linux gates green after config edit
+  (additive section only); hello.exe link proof above.
+- [x] rustup targets added (`windows-gnu` + `windows-gnullvm`)
+- [x] llvm-mingw 20261104 (UCRT build) in ~/Tools, linker wired
+- [x] triage table above
 
 ### W2 — `paths` module (portable base dirs)
 All XDG/HOME/dir literals behind `paths::data_dir()/cache_dir()/config_dir()`
@@ -168,3 +190,8 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
 
 ## DONE log
 - (none yet)
+- **2026-11-06 session 1 — W1**: research inventory (docs/WINDOWS-PORT.md "why" section), 12-task
+  breakdown, toolchain (rustup gnullvm std + llvm-mingw 20261104 UCRT in ~/Tools,
+  linker in .cargo/config.toml), hello.exe link proof, triage: 19 errors / 3 sites
+  (probe libc 16, unix symlink 1, vst3 WindowHandle 1); link-time debt (X11/jack
+  externs) documented. No src changes — Linux untouched (native check re-verified).
