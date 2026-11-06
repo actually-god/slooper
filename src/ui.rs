@@ -3317,9 +3317,13 @@ impl App {
 
     /// Audition asset `k` at the master output (asset-rack preview): an
     /// asset no longer than the preview length plays in full, a longer one
-    /// plays its first `preview_secs` seconds. Clicking the asset that is
-    /// already auditioning stops it. Engine-side the buffer auto-stops at
-    /// its end, so `preview_playing` is only ever a hair stale.
+    /// plays its first `preview_secs` seconds — i.e. playback stops at the
+    /// SHORTER of the user-set length and the sample (v40). Clicking the
+    /// asset that is auditioning stops it. A new preview REPLACES whatever
+    /// was playing (v0.10 stacked up to 12 overlapping voices — rack
+    /// browsing became a wall of sound that seemed to "run forever").
+    /// When the buffer runs out the RT thread retires the pool, so
+    /// `preview_playing` is only ever a hair stale.
     fn preview_asset(&mut self, k: usize) {
         // MIDI patterns audition through the default synth instead.
         if self.assets.get(k).is_some_and(|a| a.is_midi()) {
@@ -3360,6 +3364,10 @@ impl App {
         };
         let secs = end as f64 / self.sample_rate as f64;
         let nm = a.name.clone();
+        // v40: one audition at a time — a roll audition still running when
+        // the user browses the rack is stopped with it (engine-side
+        // `play_preview` replaces any previous preview voice).
+        self.stop_previews();
         self.preview_playing = Some(key);
         self.backend.cmd(Cmd::PreviewPlay {
             id: k as u32,
@@ -7361,12 +7369,16 @@ impl App {
         }
     }
 
-    /// Audition a MIDI asset through the default synth.
+    /// Audition a MIDI asset through the default synth. v40: same
+    /// one-audition-at-a-time rule as `preview_asset` — the toggle key is
+    /// the asset PATH (matching the preview machinery), and a new
+    /// audition stops whatever was playing.
     fn audition_pattern(&mut self, id: usize) {
         if self.sample_rate == 0 || id >= self.assets.len() {
             return;
         }
-        if self.preview_playing.as_deref() == Some(self.assets[id].name.as_str()) {
+        let key = self.assets[id].path.to_string_lossy().into_owned();
+        if self.preview_playing.as_deref() == Some(key.as_str()) {
             self.stop_previews();
             self.status = "preview stopped".into();
             return;
@@ -7375,6 +7387,8 @@ impl App {
             return;
         };
         let name = self.assets[id].name.clone();
+        // v40: one audition at a time — stop anything still playing first.
+        self.stop_previews();
         // v38 R1: with a track picked the pattern plays through that
         // track's LIVE instrument + chain as an RT audition voice (the
         // per-click private-plugin bounce is gone for good).
@@ -7389,7 +7403,7 @@ impl App {
             if self.metro_on {
                 self.preview_metro_only(&pat);
             }
-            self.preview_playing = Some(name);
+            self.preview_playing = Some(key);
             self.status = format!("preview playing \u{b7} {}", self.roll_track_label(t));
             return;
         }
@@ -7399,7 +7413,7 @@ impl App {
                     id: id as u32,
                     samples: buf,
                 });
-                self.preview_playing = Some(name);
+                self.preview_playing = Some(key);
                 self.status = "preview playing \u{b7} default (piano)".into();
             }
             None => self.status = "preview: no synth available".into(),
@@ -11093,6 +11107,32 @@ impl eframe::App for App {
             && (self.backend.engine.preview_active() || self.backend.engine.audition_active())
         {
             ctx.request_repaint();
+        }
+
+        // v40: retire pools the RT thread has drained. The RT side can
+        // only flip a flag (no locks on the audio thread); the engine-side
+        // voice tables still hold the dead voices and their Arc sample
+        // buffers. Left in place they pinned memory and — the reported
+        // "preview runs constantly" / replay bug — a freshly built RT
+        // handler reseeded every stale voice at cursor 0. Also drop the
+        // UI's `preview_playing` bookkeeping exactly when the sound is
+        // over, so the next click on the same row starts a preview
+        // instead of toggling a voice that already ended.
+        let eng = &self.backend.engine;
+        let pdrain = eng.take_preview_drained();
+        if pdrain {
+            if !eng.preview_pool_empty() && !eng.preview_active() {
+                eng.stop_preview();
+            }
+            self.preview_playing = None;
+        } else if eng.transport_on() && !eng.preview_active() && self.preview_playing.is_some()
+        {
+            // Transport start kills previews engine-side (manager drain) —
+            // keep the rack highlight honest with it.
+            self.preview_playing = None;
+        }
+        if eng.take_aud_drained() && !eng.aud_pool_empty() && !eng.audition_active() {
+            eng.stop_audition();
         }
 
         self.handle_shortcuts(ctx);
@@ -24716,13 +24756,12 @@ mod tests {
         assert!(app.track_synth[1].as_deref() == Some("sampler"));
     }
 
-    /// AC8.4: clicking a rack row that is auditioning stops ONLY that
-    /// asset's preview voices; other assets keep playing (the engine half
-    /// is pinned by v10_preview_voices_retire_and_stop_clears — here the
-    /// UI's per-id routing and highlight bookkeeping).
+    /// AC8.4 (v40 semantics): the rack row toggle key is the asset PATH
+    /// and follows the LAST click; a new click moves the highlight (the
+    /// engine replaces the voice — pinned in audio.rs `v40_preview_*`).
     #[test]
-    fn v10_rack_toggle_stops_only_that_asset() {
-        let mut app = headless_app("v10-racktoggle");
+    fn v40_rack_toggle_and_replace_bookkeeping() {
+        let mut app = headless_app("v40-racktoggle");
         let mk = |name: &str| {
             crate::assets::Asset::audio(
                 0,
@@ -24737,41 +24776,89 @@ mod tests {
         app.sample_rate = 48_000;
         app.preview_enabled = true;
 
-        // Arm both on the engine directly (the null backend has no manager),
-        // mirroring what preview_asset's commands do on a live engine.
-        let a = app.assets[0].data.clone();
-        let b = app.assets[1].data.clone();
-        app.backend.engine.play_preview(0, a.clone());
-        app.backend.engine.play_preview(0, a); // repeat stacks
-        app.backend.engine.play_preview(1, b);
-
-        // Audition kick through the UI, then hat through the UI.
+        // Kick → highlight follows by PATH (same key the toggle compares).
         app.preview_asset(0);
         assert_eq!(
             app.preview_playing.as_deref(),
             Some("/tmp/kick.wav".to_string().as_str())
         );
+        // Hat → highlight REPLACES (one audition at a time, never two).
         app.preview_asset(1);
         assert_eq!(
             app.preview_playing.as_deref(),
             Some("/tmp/hat.wav".to_string().as_str())
         );
-
-        // Toggle kick OFF (click while its highlight is current after the
-        // hat finished flag-wise is not the flow; simulate the row click
-        // for the CURRENTLY highlighted asset):
+        // Re-click the highlighted row → stop it, clear the highlight.
         app.preview_asset(1);
+        assert!(app.preview_playing.is_none(), "re-click stops the highlight");
+        // Engine-side: two starts = ONE voice (the v0.10 stack is gone).
+        let a = app.assets[0].data.clone();
+        let b = app.assets[1].data.clone();
+        app.backend.engine.play_preview(0, a);
+        app.backend.engine.play_preview(1, b);
+        let snap = app.backend.engine.preview_snapshot();
+        assert_eq!(snap.len(), 1, "new start replaces, never stacks");
+        assert_eq!(snap[0].1, 1, "the latest asset owns the single slot");
+        app.backend.engine.stop_preview();
+    }
+
+    /// v40: when the RT thread drains the preview pool, the next UI frame
+    /// retires the engine pool (dead Arc buffers stop pinning memory) AND
+    /// clears the `preview_playing` highlight — otherwise the next click
+    /// on the row is a no-op stop of a voice that already ended (the user
+    /// sees "preview stuck / won't restart"). The audition pool retires on
+    /// the same contract.
+    #[test]
+    fn v40_preview_drain_retires_pool_and_label() {
+        use eframe::App as _;
+        let mut app = headless_app("v40-drain");
+        let ctx = egui::Context::default();
+        let mut f = eframe::Frame::_new_kittest();
+        let v: std::sync::Arc<[f32]> = std::sync::Arc::from(vec![0.1f32; 4800]);
+        app.backend.engine.play_preview(9, v);
+        app.preview_playing = Some("/tmp/old.wav".into());
+        // The null-audio harness has no RT thread — simulate its drain
+        // exactly where `Proc::process` would leave the flags.
+        app.backend.engine.debug_mark_auditions_drained();
+        app.logic(&ctx, &mut f);
+        assert!(
+            app.backend.engine.preview_snapshot().is_empty(),
+            "the drained pool was retired on the UI thread"
+        );
+        assert!(!app.backend.engine.preview_active());
         assert!(
             app.preview_playing.is_none(),
-            "re-click stops the highlight"
+            "the highlight flips exactly when the sound ends"
         );
+        // The audition pool retires on the same contract.
+        let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
+        app.backend.engine.play_audition(0, ev.into());
+        app.backend.engine.debug_mark_auditions_drained();
+        app.logic(&ctx, &mut f);
+        assert!(
+            app.backend.engine.aud_pool_empty(),
+            "the drained audition pool was retired too"
+        );
+    }
 
-        // Engine-side per-id isolation (what the toggle command routes to):
-        app.backend.engine.stop_preview_id(0);
-        let snap = app.backend.engine.preview_snapshot();
-        assert!(snap.iter().all(|(_v, id, _)| *id != 0), "kick voices gone");
-        assert_eq!(snap.len(), 1, "hat voice untouched by the kick toggle");
-        app.backend.engine.stop_preview();
+    /// v40: transport start kills previews engine-side (manager drain,
+    /// pinned e2e) — the UI highlight must follow within one frame so the
+    /// rack never shows a phantom "playing" row.
+    #[test]
+    fn v40_transport_start_drops_preview_label() {
+        use eframe::App as _;
+        let mut app = headless_app("v40-translabel");
+        let ctx = egui::Context::default();
+        let mut f = eframe::Frame::_new_kittest();
+        app.preview_playing = Some("/tmp/kick.wav".into());
+        app.backend.engine.stop_preview(); // what transport-on does
+        app.backend.engine.set_transport(true);
+        app.logic(&ctx, &mut f);
+        assert!(
+            app.preview_playing.is_none(),
+            "the highlight is honest with the transport"
+        );
+        app.backend.engine.set_transport(false);
     }
 
     /// v10.2 "deleting assets crashes to desktop" sweep: delete every

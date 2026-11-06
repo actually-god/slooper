@@ -457,10 +457,10 @@ pub enum Cmd {
     },
     /// Audition a sample at the master output (asset-preview click). The
     /// buffer plays once from its start through the output mix only (never
-    /// recorded, never loops). v0.10: ADDITIVE — every play starts a new
-    /// independent voice, and repeated clicks of the same asset stack
-    /// instead of cutting each other off. `id` tags the source asset so a
-    /// rack row re-click can stop just its own voices.
+    /// recorded, never loops). v40: a new preview REPLACES whatever was
+    /// playing — the old v0.10 additive stacking turned rack browsing into
+    /// a wall of up to 12 overlapping voices. `id` tags the source asset
+    /// so a rack row re-click can stop just its own voice.
     PreviewPlay {
         id: u32,
         samples: Arc<[f32]>,
@@ -759,16 +759,23 @@ pub struct Engine {
     metro_num: AtomicU32,
 
     // ---- asset preview -----------------------------------------------------
-    /// Sample buffer being auditioned (swapped wholesale, RT reads an Arc
-    /// clone refreshed on `preview_gen`).
-    /// Audition voice pool (v0.10). Each voice is (voice id, asset id,
-    /// buffer). Starts are additive: every play_preview appends a voice and
-    /// the RT thread runs all of them with independent cursors.
+    /// Audition voice pool (v40: SINGLE voice — each voice is
+    /// (voice id, asset id, buffer); a new start REPLACES whatever was
+    /// playing, see `play_preview`). The old v0.10 additive pool turned
+    /// rack browsing into a wall of up to 12 stacked, never-retired
+    /// voices; previews now always mean "audition THIS, stop everything
+    /// else", capped at min(preview_secs, sample length) by the UI.
     preview_voices: std::sync::Mutex<PreviewVoices>,
     preview_vid: AtomicU64,
     preview_gen: AtomicU64,
     /// 1 = a preview is playing (RT clears it when the buffer runs out).
     preview_on: AtomicU8,
+    /// v40: set by the RT thread when the pool drains naturally (the voice
+    /// ran out of samples). The UI retires the dead pool on the next frame
+    /// (`take_preview_drained`) so stale Arc buffers stop pinning memory
+    /// and a freshly built RT handler can never reseed a dead voice at
+    /// cursor 0 (the "preview plays forever / replays on its own" report).
+    preview_drained: AtomicBool,
     /// Samples consumed by the YOUNGEST preview voice, republished per RT
     /// block — the piano-roll playhead follows its own preview (transport
     /// does not move while auditioning, so reading `pos` left the bar
@@ -788,6 +795,10 @@ pub struct Engine {
     aud_on: AtomicBool,
     /// Samples consumed by the YOUNGEST audition voice (roll playhead).
     aud_pos: AtomicU64,
+    /// v40: RT set-on-drain flag for the audition pool (mirrors
+    /// `preview_drained`); the UI retires the engine-side pool when it
+    /// takes this, same one-frame-later contract.
+    aud_drained: AtomicBool,
 }
 
 /// v38 R1: one requested audition voice. `ev` MUST be sorted by
@@ -886,12 +897,14 @@ impl Engine {
             preview_vid: AtomicU64::new(0),
             preview_gen: AtomicU64::new(0),
             preview_on: AtomicU8::new(0),
+            preview_drained: AtomicBool::new(false),
             preview_pos: AtomicU64::new(0),
             aud_voices: std::sync::Mutex::new(Arc::new(Vec::new())),
             aud_vid: AtomicU64::new(0),
             aud_gen: AtomicU64::new(0),
             aud_on: AtomicBool::new(false),
             aud_pos: AtomicU64::new(0),
+            aud_drained: AtomicBool::new(false),
         })
     }
 
@@ -1396,22 +1409,20 @@ impl Engine {
 
     // ---- asset preview -----------------------------------------------------------
 
-    /// Add an audition voice at the master output (mono, mixed to both
-    /// channels). STRICTLY ADDITIVE (v0.10): every call is a NEW voice with
-    /// its own RT cursor, so repeated clicks stack, including repeats of the
-    /// same asset, instead of cutting each other off. Bounded pool: the
-    /// oldest voice is dropped when the ceiling is reached.
+    /// Start a SINGLE preview voice (v40): a new audition REPLACES
+    /// whatever was playing — the v0.10 additive pool stacked up to 12
+    /// never-retired voices (rack browsing became a wall of overlapping
+    /// audio, and dead voices pinned their sample buffers until
+    /// eviction). `id` still tags the source asset so a rack row re-click
+    /// can stop just its own voice.
     pub fn play_preview(&self, id: u32, samples: Arc<[f32]>) {
-        const MAX_VOICES: usize = 12;
-        let mut v = (**self.preview_voices.lock().unwrap()).clone();
-        if v.len() >= MAX_VOICES {
-            v.remove(0);
-        }
         let vid = self.preview_vid.fetch_add(1, Ordering::Relaxed) + 1;
-        v.push((vid, id, samples));
-        *self.preview_voices.lock().unwrap() = Arc::new(v);
+        *self.preview_voices.lock().unwrap() = Arc::new(vec![(vid, id, samples)]);
         self.preview_gen.fetch_add(1, Ordering::SeqCst);
         self.preview_on.store(1, Ordering::Relaxed);
+        // A fresh start arms a fresh drain cycle: never inherit the flag
+        // from the voice this one replaced.
+        self.preview_drained.store(false, Ordering::Relaxed);
     }
 
     /// Stop every audition voice (transport stop / global stop).
@@ -1454,6 +1465,38 @@ impl Engine {
         self.preview_gen.load(Ordering::Relaxed)
     }
 
+    /// v40: consume the RT drain flag for the preview pool exactly once
+    /// (true = the RT thread just heard the voice run out of samples;
+    /// `Proc::process` sets it).
+    pub fn take_preview_drained(&self) -> bool {
+        self.preview_drained.swap(false, Ordering::Relaxed)
+    }
+
+    /// v40: is the preview voice pool empty? (UI retire guard.)
+    pub fn preview_pool_empty(&self) -> bool {
+        self.preview_voices.lock().unwrap().is_empty()
+    }
+
+    /// v40: consume the RT drain flag for the audition pool exactly once.
+    pub fn take_aud_drained(&self) -> bool {
+        self.aud_drained.swap(false, Ordering::Relaxed)
+    }
+
+    /// v40: is the audition voice pool empty? (UI retire guard.)
+    pub fn aud_pool_empty(&self) -> bool {
+        self.aud_voices.lock().unwrap().is_empty()
+    }
+
+    #[cfg(test)]
+    /// Test hook: mirror the exact state an RT-thread drain leaves —
+    /// run-flags cleared, retire flags armed (see `Proc::process`).
+    pub fn debug_mark_auditions_drained(&self) {
+        self.preview_on.store(0, Ordering::Relaxed);
+        self.preview_drained.store(true, Ordering::Relaxed);
+        self.aud_on.store(false, Ordering::Relaxed);
+        self.aud_drained.store(true, Ordering::Relaxed);
+    }
+
     // ---- v38 R1 roll audition voices --------------------------------------
 
     /// Stage `ev` (sorted `(sample, kind, ch, d1, d2)` events relative to
@@ -1476,6 +1519,9 @@ impl Engine {
         v.push(AudVoiceReq { vid, track, ev });
         *self.aud_voices.lock().unwrap() = Arc::new(v);
         self.aud_pos.store(0, Ordering::Relaxed);
+        // v40: a fresh start never inherits a drained-idle flag from the
+        // pool generation this start extends.
+        self.aud_drained.store(false, Ordering::Relaxed);
         self.aud_gen.fetch_add(1, Ordering::SeqCst);
         self.aud_on.store(true, Ordering::Relaxed);
     }
@@ -4239,17 +4285,38 @@ impl ProcessHandler for Proc {
         let ag = self.engine.aud_gen.load(Ordering::Relaxed);
         if ag != self.aud_seen_gen {
             self.aud_seen_gen = ag;
+            let snap = self.engine.audition_snapshot();
             // A replaced/stopped pool may leave held notes mid-voice:
             // those tracks get an all-notes-off (queued for the render).
+            // v40: only voices actually LEAVING the pool — survivors now
+            // keep their cursors (no rewind/replay), and their pending
+            // held notes are still live, not orphans.
             for (req, cur) in self.aud.iter() {
+                if snap.iter().any(|r| r.vid == req.vid) {
+                    continue;
+                }
                 let pend = aud_pending(req.ev.as_ref(), *cur);
                 if pend > 0 && req.track < MAX_LOOPS {
                     self.aud_held[req.track] -= pend.min(self.aud_held[req.track].max(0));
                     self.aud_purge |= 1u128 << req.track;
                 }
             }
-            let snap = self.engine.audition_snapshot();
-            self.aud = snap.iter().map(|r| (r.clone(), 0u64)).collect();
+            // v40: preserve per-voice cursors keyed by vid — a new voice
+            // joining used to reseed EVERY voice at 0, replaying still
+            // running auditions from the top on every click (the roll
+            // preview "wall of sound").
+            let old = std::mem::take(&mut self.aud);
+            self.aud = snap
+                .iter()
+                .map(|r| {
+                    let cur = old
+                        .iter()
+                        .find(|(q, _)| q.vid == r.vid)
+                        .map(|(_, c)| *c)
+                        .unwrap_or(0);
+                    (r.clone(), cur)
+                })
+                .collect();
         }
         {
             // Clear last block's rows first (bounded by aud_mask).
@@ -4306,6 +4373,9 @@ impl ProcessHandler for Proc {
                 && self.engine.aud_on.load(Ordering::Relaxed)
             {
                 self.engine.aud_on.store(false, Ordering::Relaxed);
+                // v40: the engine-side audition pool still holds retired
+                // voices — arm the UI retire pass (mirrors preview_drained).
+                self.engine.aud_drained.store(true, Ordering::Relaxed);
             }
         }
         // A voice whose every event is staged can already have retired
@@ -4809,6 +4879,11 @@ impl ProcessHandler for Proc {
                     // All voices finished: auto-stop like a single one-shot.
                     self.preview_live = false;
                     self.engine.preview_on.store(0, Ordering::Relaxed);
+                    // v40: arm the UI retire pass (App::logic) — the engine
+                    // pool still holds the dead voice and its sample Arc;
+                    // leaving it is what made previews replay when a new RT
+                    // handler reseeded cursors at 0.
+                    self.engine.preview_drained.store(true, Ordering::Relaxed);
                 }
             }
 
@@ -5482,75 +5557,91 @@ mod tests {
         assert_eq!(e.metro(), (false, 120, 1, 4));
     }
 
-    // ===================== v0.10 acceptance pins =====================
+    // ===================== v0.10 acceptance pins (v40 semantics) ============
+    //
+    // v40 flipped the v0.10 ADDITIVE preview pool (stack up to 12 voices) to
+    // a SINGLE replacing voice: rack browsing stacked overlapping previews
+    // that never retired and looked like "preview runs constantly". The
+    // per-id stop stays (rack row toggle), only the stacking died.
 
-    /// AC8.1/8.2: the audition pool is additive — every start is a new
-    /// voice, and the same asset twice is two voices with distinct ids.
+    /// AC8.1/8.2 (v40): a new preview start REPLACES the previous voice —
+    /// one preview at a time, with a fresh unique voice id.
     #[test]
-    fn v10_preview_voices_play_in_parallel() {
+    fn v40_preview_new_start_replaces_previous() {
         let e = Engine::new();
         let a: Arc<[f32]> = Arc::from(vec![0.5f32; 100]);
         let b: Arc<[f32]> = Arc::from(vec![0.25f32; 80]);
         e.play_preview(1, a.clone());
+        let vid1 = e.preview_snapshot()[0].0;
         e.play_preview(2, b.clone());
         let snap = e.preview_snapshot();
-        assert_eq!(snap.len(), 2, "two starts = two simultaneous voices");
-        assert_eq!(snap[0].1, 1);
-        assert_eq!(snap[1].1, 2);
-        assert_ne!(snap[0].0, snap[1].0, "voice ids are unique");
+        assert_eq!(snap.len(), 1, "a new start retires the previous voice");
+        assert_eq!(snap[0].1, 2, "the NEW asset is the one auditioning");
+        assert_ne!(snap[0].0, vid1, "voice ids are unique");
         assert!(e.preview_active());
     }
 
     #[test]
-    fn v10_preview_same_asset_twice_is_two_voices() {
+    fn v40_preview_repeat_same_asset_restarts() {
         let e = Engine::new();
         let a: Arc<[f32]> = Arc::from(vec![0.5f32; 100]);
         e.play_preview(7, a.clone());
         e.play_preview(7, a);
         let snap = e.preview_snapshot();
-        assert_eq!(
-            snap.len(),
-            2,
-            "a repeat of the SAME asset stacks, never cuts off"
-        );
-        assert_ne!(snap[0].0, snap[1].0);
+        assert_eq!(snap.len(), 1, "a repeat restarts — never stacks");
+        assert_ne!(snap[0].0, 0);
+        assert!(e.preview_active());
     }
 
     #[test]
-    fn v10_preview_voices_retire_and_stop_clears() {
+    fn v40_preview_stop_clears() {
         let e = Engine::new();
         let a: Arc<[f32]> = Arc::from(vec![0.5f32; 40]);
-        let b: Arc<[f32]> = Arc::from(vec![0.5f32; 40]);
         e.play_preview(3, a.clone());
-        e.play_preview(4, b.clone());
-        // Rack toggle stops ONLY that asset's voices (AC8.4 semantics).
+        assert!(e.preview_active());
+        // Rack toggle on a voice that was already replaced: no-op.
+        e.stop_preview_id(1);
+        assert!(e.preview_active(), "stopping an absent id keeps the voice");
+        // Stopping the live id empties the pool and clears the flag.
         e.stop_preview_id(3);
-        let snap = e.preview_snapshot();
-        assert_eq!(snap.len(), 1, "stopping asset 3 leaves asset 4 auditioning");
-        assert_eq!(snap[0].1, 4);
-        assert!(e.preview_active(), "a voice is still playing");
-        e.stop_preview_id(4);
         assert!(e.preview_snapshot().is_empty());
         assert!(!e.preview_active(), "nothing left: auditions fully stopped");
         // Global stop clears everything at once.
-        e.play_preview(5, a.clone());
-        e.play_preview(6, a);
+        e.play_preview(5, a);
         e.stop_preview();
         assert!(e.preview_snapshot().is_empty());
         assert!(!e.preview_active());
     }
 
     #[test]
-    fn v10_preview_voice_pool_is_bounded() {
+    fn v40_preview_pool_stays_single() {
         let e = Engine::new();
         for i in 0..30u32 {
             let a: Arc<[f32]> = Arc::from(vec![0.05f32; 20]);
             e.play_preview(i, a);
         }
         let snap = e.preview_snapshot();
-        assert!(snap.len() <= 12, "pool stays bounded: {}", snap.len());
-        // Oldest-first eviction: the most recent start survives.
-        assert_eq!(snap.last().unwrap().1, 29);
+        assert_eq!(snap.len(), 1, "single-voice pool: {}", snap.len());
+        assert_eq!(snap.last().unwrap().1, 29, "the most recent start survives");
+    }
+
+    /// v40: the RT→UI retire handshake. RT drains → flag; UI `take_*`
+    /// consumes it EXACTLY once; a fresh start re-arms (clears) it.
+    #[test]
+    fn v40_drain_flag_roundtrip() {
+        let e = Engine::new();
+        let a: Arc<[f32]> = Arc::from(vec![0.5f32; 10]);
+        e.play_preview(1, a.clone());
+        assert!(!e.take_preview_drained(), "no drain yet");
+        assert!(!e.preview_pool_empty(), "voice is in the pool");
+        e.debug_mark_auditions_drained(); // simulate the RT drain branch
+        assert!(e.take_preview_drained(), "flag consumed exactly once");
+        assert!(!e.take_preview_drained(), "flag cleared by the take");
+        assert!(e.take_aud_drained(), "audition flag mirrored too");
+        // A fresh start must never inherit the drain flag.
+        e.debug_mark_auditions_drained();
+        e.play_preview(2, a);
+        assert!(!e.take_preview_drained(), "new start disarms the old flag");
     }
 
     /// AC7.2: per-block work scales with ACTIVE tracks, not the 128
@@ -5696,24 +5787,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// AC6.2: audition voices are additive AND isolated per asset: stopping
-    /// one asset never touches another voice, and the same asset stacks.
+    /// AC6.2 (v40 semantics): preview is a SINGLE replacing voice and the
+    /// per-id stop stays a safe no-op for ids the pool no longer holds.
     #[test]
     fn v10_audition_voices_are_additive_and_isolated() {
         let e = Engine::new();
         let a: Arc<[f32]> = Arc::from(vec![0.5f32; 500]);
         let b: Arc<[f32]> = Arc::from(vec![0.5f32; 500]);
         e.play_preview(1, a.clone());
-        e.play_preview(1, a.clone()); // repeat of the same asset stacks
+        e.play_preview(1, a.clone()); // v40: a repeat replaces, never stacks
+        assert_eq!(e.preview_snapshot().len(), 1, "one voice after repeats");
         e.play_preview(2, b);
         let snap = e.preview_snapshot();
-        assert_eq!(snap.len(), 3, "three additive voices live");
-        e.stop_preview_id(1);
-        let snap = e.preview_snapshot();
-        assert_eq!(snap.len(), 1, "asset 1's voices all stop; asset 2 survives");
+        assert_eq!(snap.len(), 1, "the new start replaced asset 1");
         assert_eq!(snap[0].1, 2);
+        // Stopping an id the pool no longer holds: no-op, never panics,
+        // and it must not stop the live voice of another asset.
+        e.stop_preview_id(1);
+        assert_eq!(e.preview_snapshot().len(), 1, "the live voice survives");
         e.stop_preview_id(99); // unknown id: no-op, never panics
         assert_eq!(e.preview_snapshot().len(), 1);
+        e.stop_preview_id(2);
+        assert!(e.preview_snapshot().is_empty(), "stopping the live id clears");
     }
 
     /// v32: the live-MIDI feed subset. The bug: MIDI reached the UI (the
