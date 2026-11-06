@@ -30,8 +30,9 @@ mod api {
     include!("effect_api.rs");
 }
 pub use api::{
-    EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectParamV1, GuiApiV1, GuiFrameV1,
-    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
+    EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectInfoV3, EffectParamV1, GuiApiV1, GuiFrameV1,
+    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2, SLOOPER_EFFECT_ABI_V3, SLOOPER_EFFECT_GUI_ABI,
+    SLOOPER_MAX_PARAMS,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
@@ -43,6 +44,8 @@ pub const MAX_FX_PER_TRACK: usize = 8;
 pub const ABI_VERSION: u32 = SLOOPER_EFFECT_ABI;
 /// v32 R5: sidechain-capable ABI generation this build also accepts.
 pub const ABI_VERSION_V2: u32 = SLOOPER_EFFECT_ABI_V2;
+/// Tier-3 R: stereo-pair ABI generation this build also accepts.
+pub const ABI_VERSION_V3: u32 = SLOOPER_EFFECT_ABI_V3;
 /// Child-GUI ABI version this build speaks.
 pub const GUI_ABI_VERSION: u32 = SLOOPER_EFFECT_GUI_ABI;
 
@@ -87,6 +90,8 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("shifter.rs", include_str!("../effects/shifter.rs")),
     ("transient.rs", include_str!("../effects/transient.rs")),
     ("pitchshft.rs", include_str!("../effects/pitchshft.rs")),
+    ("spread.rs", include_str!("../effects/spread.rs")),
+    ("panmatic.rs", include_str!("../effects/panmatic.rs")),
     ("vocoder.rs", include_str!("../effects/vocoder.rs")),
     ("convolver.rs", include_str!("../effects/convolver.rs")),
 ];
@@ -96,6 +101,8 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 const ENTRY: &[u8] = b"slooper_effect_info\0";
 /// v32 R5: optional symbol exporting the sidechain-capable v2 vtable.
 const ENTRY_V2: &[u8] = b"slooper_effect_info_v2\0";
+/// Tier-3: optional symbol exporting the stereo-pair-capable v3 vtable.
+const ENTRY_V3: &[u8] = b"slooper_effect_info_v3\0";
 /// Optional symbol exporting the custom child-GUI vtable. Absent = the
 /// effect gets the auto slider window; the audio ABI does not care.
 const GUI_ENTRY: &[u8] = b"slooper_effect_gui\0";
@@ -732,6 +739,10 @@ pub struct EffectDesc {
     /// v32 R5: loaded through the ABI-v2 entry — the host feeds it the
     /// track's sidechain bus (mixer shows an "(SC)" tag on these).
     pub sidechain: bool,
+    /// Tier-3: loaded through the ABI-v3 entry — the host feeds it the
+    /// chain's stereo pair and carries its output pair to the track pan
+    /// (mixer shows an "(ST)" tag on these).
+    pub stereo: bool,
 }
 
 /// The three live callbacks, copied out of the library (plain fn pointers —
@@ -748,6 +759,18 @@ struct EffectFns {
             input: f32,
             params: *const f32,
             sc: f32,
+        ) -> f32,
+    >,
+    /// Tier-3 ABI v3 stereo-pair entry (None for v1/v2 scripts — they are
+    /// fed the mid sample through `process_sc`/`process` instead).
+    process_st: Option<
+        extern "C" fn(
+            state: *mut core::ffi::c_void,
+            l: f32,
+            r: f32,
+            params: *const f32,
+            sc: f32,
+            out_r: *mut f32,
         ) -> f32,
     >,
 }
@@ -901,6 +924,44 @@ impl Instance {
         }
     }
 
+    /// Tier-3: true when this script exports the v3 stereo entry (the
+    /// audio path may feed it a real L/R pair; every other slot is fed
+    /// the mid sample and replaces both sides with its output).
+    #[inline]
+    pub fn is_stereo(&self) -> bool {
+        self.fns.process_st.is_some()
+    }
+
+    /// `call_sample_sc` for the stereo chain bus. v3 scripts receive the
+    /// real pair; v1/v2 scripts are fed the mid exactly once (mono slot
+    /// semantics) and their output stands for both sides.
+    ///
+    /// # Safety
+    /// As `call_sample_sc`, plus: this thread owns the instance state.
+    #[inline]
+    pub unsafe fn call_sample_st(
+        &self,
+        l: f32,
+        r: f32,
+        params: &[f32; MAX_PARAMS],
+        sc: f32,
+    ) -> (f32, f32) {
+        match self.fns.process_st {
+            Some(f) => {
+                let mut or = 0.0f32;
+                let ol = f(self.state, l, r, params.as_ptr(), sc, &mut or);
+                (ol, or)
+            }
+            None => {
+                let y = match self.fns.process_sc {
+                    Some(f) => f(self.state, (l + r) * 0.5, params.as_ptr(), sc),
+                    None => (self.fns.process)(self.state, (l + r) * 0.5, params.as_ptr()),
+                };
+                (y, y)
+            }
+        }
+    }
+
     /// A brand-new instance of the same effect at the same rate, seeded with
     /// this instance's current slider values. For offline renders, which
     /// must never share mutable state with the live audio thread.
@@ -921,6 +982,15 @@ impl Instance {
         let mut p = [0.0f32; MAX_PARAMS];
         self.read_params(&mut p);
         unsafe { self.call_sample(input, &p) }
+    }
+
+    /// `process_private` on the (typically mid, mid) pair — used by the
+    /// offline chain pass for v3 scripts, whose REAL processing lives in
+    /// `process_st` (the v1 `process` of a v3 script is only a fallback).
+    pub fn process_private_st(&self, l: f32, r: f32) -> (f32, f32) {
+        let mut p = [0.0f32; MAX_PARAMS];
+        self.read_params(&mut p);
+        unsafe { self.call_sample_st(l, r, &p, 0.0) }
     }
 
     fn snapshot_params(&self) -> Vec<f32> {
@@ -1291,8 +1361,30 @@ unsafe fn validate(
     // exporting both symbols lands here; v1-only scripts are unchanged.
     // The v2 struct's prefix is bit-identical to v1 (validated in the ABI
     // file), so the common path below reads it as a plain v1 description.
+    // Tier-3: v3 side symbol takes priority over v2 — same prefix rule.
     let mut process_sc = None;
-    let d: &EffectInfoV1 = match lib.get(ENTRY_V2) {
+    let mut process_st = None;
+    let d: &EffectInfoV1 = match lib.get(ENTRY_V3) {
+        Ok(s) => {
+            let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV3> = s;
+            let p = s();
+            if p.is_null() {
+                return Err("slooper_effect_info_v3 returned null".into());
+            }
+            let v3 = &*p;
+            if v3.abi != ABI_VERSION_V3 {
+                return Err(format!(
+                    "effect ABI v3 version {} (this slooper speaks v3 = {ABI_VERSION_V3})",
+                    v3.abi
+                ));
+            }
+            process_sc = Some(v3.process_sc);
+            process_st = Some(v3.process_st);
+            std::mem::transmute::<*const EffectInfoV3, *const EffectInfoV1>(v3)
+                .as_ref()
+                .unwrap()
+        }
+        Err(_) => match lib.get(ENTRY_V2) {
         Ok(s) => {
             let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV2> = s;
             let p = s();
@@ -1328,6 +1420,7 @@ unsafe fn validate(
                 ));
             }
             d
+            }
         }
     };
     let name = read_cstr(d.name).ok_or("effect has no name — DESC.name must be text")?;
@@ -1387,12 +1480,14 @@ unsafe fn validate(
             description,
             params,
             sidechain: process_sc.is_some(),
+            stereo: process_st.is_some(),
         },
         EffectFns {
             create: d.create,
             destroy: d.destroy,
             process: d.process,
             process_sc,
+            process_st,
         },
         gui,
     ))
@@ -2418,6 +2513,7 @@ mod tests {
                 },
             ],
             sidechain: false,
+            stereo: false,
         };
         assert_eq!(seed_values(&[0.9, 1.5, 9.0], &d), vec![0.9, 1.5]);
         assert_eq!(seed_values(&[], &d), vec![0.25, 1.0]);
@@ -3159,7 +3255,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // Sidechain path: the v2 entry must run with a live key signal.
         for stem in ["sidechain_comp", "vocoder"] {
             let inst = reg
-                .create_instance(stem, sr, &[])
+                .create_instance(stem, sr, &[]
+                )
                 .unwrap_or_else(|| panic!("{stem}: no instance"));
             for (i, &x) in fixture.iter().take(4410).enumerate() {
                 let sc = if i < 2200 { x } else { 0.0 };
@@ -3168,6 +3265,50 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             }
             drop(inst);
         }
+        // Tier-3 STEREO path: every bundled v3 script must (a) run the
+        // pair path without NaN, (b) stay non-silent, and (c) actually
+        // DECORRELATE a one-sided pulse — ol != or is the whole point.
+        let mut st_checked = 0;
+        for (name, _) in EXAMPLES {
+            let stem = name.trim_end_matches(".rs");
+            let Some(d) = reg.desc(stem) else { continue };
+            if !d.stereo {
+                continue;
+            }
+            st_checked += 1;
+            let inst = reg
+                .create_instance(stem, sr, &[])
+                .unwrap_or_else(|| panic!("{stem}: no instance"));
+            // Seed the DEFAULT slider values (a zeroed param array would
+            // legitimately mute any effect whose gain defaults > 0).
+            let d = reg.desc(stem).unwrap();
+            let mut dp = [0.0f32; MAX_PARAMS];
+            for (k, pd) in d.params.iter().enumerate() {
+                dp[k] = pd.default;
+            }
+            let (mut peak, mut depro, mut energy) = (0.0f32, 0.0f64, 0.0f64);
+            for (i, &x) in fixture.iter().enumerate() {
+                // Left-only feed, with occasional right content too so
+                // internal side-branches (delay lines) see both rails.
+                let (l, r) = if i % 7000 < 3500 { (x, 0.0) } else { (x * 0.5, x) };
+                let (ol, or) = unsafe { inst.call_sample_st(l, r, &dp, 0.0) };
+                assert!(ol.is_finite() && or.is_finite(), "{stem}: st path NaN");
+                peak = peak.max(ol.abs()).max(or.abs());
+                let d = (ol - or) as f64;
+                depro += d * d;
+                energy += (ol as f64).powi(2) + (or as f64).powi(2);
+            }
+            let rms = (energy / (2 * n) as f64).sqrt();
+            assert!(peak <= 4.0, "{stem}: st peak {peak} out of range");
+            assert!(rms > 1e-5, "{stem}: st path silent (rms {rms})");
+            let decor = (depro / n as f64).sqrt();
+            assert!(decor > 1e-3, "{stem}: st path never decorrelated L/R ({decor})");
+            drop(inst);
+        }
+        assert!(
+            st_checked >= 2,
+            "expected the v3 spreads/panmatic to load as stereo, got {st_checked}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

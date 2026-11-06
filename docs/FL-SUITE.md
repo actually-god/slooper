@@ -41,8 +41,9 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Fruity Vocoder, Vocodex | vocoder (SC carrier feed) | `vocoder.rs` | done |
 | Convolver | impulse reverb | `convolver.rs` | done (partitioned overlap-save FFT, **folder IR capability** — `~/.local/share/slooper/impulses`, env override, index 0 = built-in hall) |
 | Multiband Delay | split echo | `echo3` + `multiband` chain | later (chainable today) |
-| Spreader, Stereo Enhancer, Stereo Shaper, PanOMatic pan, Flangus stereo, ping-pong delays | stereo width/image | — | later (**stereo-buffers capability**, see below) |
-| Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | — | later (pitch-detect capability) |
+| Spreader, Stereo Enhancer, Stereo Shaper, Flangus stereo, ping-pong delays | stereo width/image | `spread.rs` | done (ABI-v3 reference: mid/side + comb-Haas width, mix/gain; **stereo-pair capability** shipped, see capability log 3) |
+| Fruity PanOMatic (pan side; vol side in `gater.rs`) | tempo pan LFO | `panmatic.rs` | done (ABI-v3: equal-power sine/tri/inverse-tri pan + optional volume wheel, tempo-synced) |
+| Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | `pitchshft.rs` | done (dual delay-line shifter + internal decimated-YIN auto-correct + tuner-meter GUI; pitch detect needs no ABI change — decimate inside `process`, rung 1) |
 | Scratcher, Transporter, Wave Traveller, part of Gross Beat | transport scrub / retrigger | — | later (**transport-sync capability**) |
 | Peak Controller, Envelope Controller, X-Y/Z, Formula Controller, VFX Envelope/Sequencer/Key Mapper, Control Surface | automation SOURCES | — | later (**control-rate OUT capability**); slooper automation clips + per-param automation cover the DESTINATION side today |
 | Fruity Balance / Send / VFX Level Scaler | trim / routing | track gain/volume + sends | host |
@@ -62,7 +63,7 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | 3x OSC, SimSynth, PoiZone, BooBass, MiniSynth, Sawer, Kepler Exo, GMS | subtractive workhorse synth | `tri_osc.rs` | done (waveforms + detune + sub + 24 dB env filter + glide; Transistor Bass role via presets) |
 | Transistor Bass | 303-style bass | `tri_osc.rs` presets | done (saw + high fenv + resonance + glide) |
 | Sytrus, Fruity DX10, part of Toxic Biohazard | FM | `fm.rs` | done (2-op + feedback + dual envs + sub) |
-| Harmor, Morphine, Ogun, Harmless | additive | `additive.rs` | later (next tier; engine design done: partial bank + morph tables) |
+| Harmor, Morphine, Ogun, Harmless | additive | `additive.rs` | done rung 1 (up to 48 partials, two morph level banks + XY morph, formant-bell bank, per-partial decay tilt; rung 2 candidates: unison/detune stack, per-partial vibrato) |
 | Plucked!, Sakura | plucked string model (Karplus–Strong) | `pluck.rs` | done (fractional-delay KS, pick comb, body, stiffness) |
 | Fruity Granulizer, BeepMap (texture role) | granular | `granular.rs` | done (rack-asset grain clouds, notes = playheads) |
 | FLEX, GMS, Kepler, Drumaxx, Harmor et al. (content depth) | preset factories | script presets + hosted Vitalium/Dexed/Geonkick/sfizz set | host |
@@ -77,9 +78,19 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
    today: quantize in `process`, label spells out the steps.
 2. **MIDI-clock / transport sync** (per-sample block call with pos) —
    sync'd echo/gater phases, Gross-Beat-class scrubbing.
-3. **Stereo or multichannel buffers** — Spreader/wideners, true stereo
-   chorus/flanger, ping-pong, PanOMatic pan. Engine is mono per chain slot
-   today; pan exists per track but effects cannot touch it.
+3. **Stereo or multichannel buffers** — **SHIPPED tier 3 as ABI v3**:
+   `EffectInfoV3` = the full V2 struct + one appended fn
+   `process_st(state, l, r, params, sc) -> l` (out-R through a trailing
+   pointer). Prefix layout is compile-time-asserted, so V1/V2 scripts
+   load unchanged and the loader sets `desc.stereo` only on a valid
+   `slooper_effect_info_v3` export with abi==3. The engine chain now runs
+   `(l, r)` per slot: mono slots process the mid and return (y, y); the
+   mono per-track fold is bit-true (`play_l += ml*pgl; play_r += mr*pgr`,
+   pan-law only in the master fold) — a v1/v2 chain measures L−R = 0 on
+   the master buses (pinned by `e2e_tier3_stereo_spread_live`, which ALSO
+   asserts a v3 script decorrelates). Scripts: `spread.rs`,
+   `panmatic.rs`. Write the pair into the L slot + out pointer; never
+   assume L == R in a v3 slot.
 4. **Control-rate OUT** (an effect publishing a CV lane the automation
    system can bind) — Peak/Envelope/Formula-controller duties.
 5. **Block (vector) process** — CPU headroom for vocoder/multiband tiers.
@@ -110,7 +121,10 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
   every bundle; `bundled_effects_produce_sound` renders a fixed fixture
   (tone + percussive bursts) through every bundled effect and asserts
   finite / in-range / non-silent output (plus a live-key pass over the
-  v2 sidechain path). Special surfaces pin in
+  v2 sidechain path, plus an STEREO pass: every desc.stereo bundle runs
+  the pair path with DEFAULT param values and must stay non-silent AND
+  decorrelate L/R — seed defaults, a zeroed param array legitimately
+  mutes any effect whose gain default is > 0). Special surfaces pin in
   `bundled_examples_load_with_custom_guis` (waveshaper curve GUI,
   vocoder = second stock ABI-v2, v1 effects stay GUI/sidechain-free).
 - Tier-2 patterns (2026-11-05): FFT scripts work (radix-2 + precomputed
@@ -129,5 +143,16 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
   SAMPLE-exact; host blocks range from ~1 ms (RT) to seconds (preview).
   Granular test assets must be constant-energy (note→playhead mapping
   can park a grain on a sine's zero crossing → legitimate silence).
+- Tier-3 patterns (2026-11-05): the ABI-v3 stereo export needs the
+  `(info, info_v2, info_v3, gui)` symbol quartet — the loader accepts
+  v3 only with all prefix versions present (mirror the sidechain_comp
+  dual-export source exactly, incl. `desc.stereo` only from a valid
+  v3 struct). Engine-side: mono slots MUST return (mid, mid) and the
+  per-track fold multiplies L by pgl and R by pgr separately — never
+  re-sum to mono before the master fold. GUI meters read state through
+  the same atomics/audio_state pattern as v1 (ABI bump ≠ GUI change).
+  UI picker marks v3 scripts with an (ST) suffix, same as (SC).
+  GUI-test trap: plugin-editor pins need a real DISPLAY (:1 on this
+  host); headless they fail deterministically for the wrong reason.
 - Live test: boot the freshly built binary on the X display and capture
   the Effects window (all rows valid), plus one loaded-chain screenshot.

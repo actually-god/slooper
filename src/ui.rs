@@ -18578,12 +18578,14 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 let (tag, label, ok) = match row {
                     ChainRow::Script { stem, .. } => {
                         let d = app.fx_registry.desc(stem);
+                        let tag = match d {
+                            Some(d) if d.stereo && d.sidechain => "fx:sc,st",
+                            Some(d) if d.stereo => "fx:st",
+                            Some(d) if d.sidechain => "fx:sc",
+                            _ => "fx",
+                        };
                         (
-                            if d.map(|d| d.sidechain).unwrap_or(false) {
-                                "fx:sc"
-                            } else {
-                                "fx"
-                            },
+                            tag,
                             d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
                             d.is_some(),
                         )

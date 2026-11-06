@@ -3354,5 +3354,175 @@ fn e2e_tier2_new_bundled_plugins_live() {
         len: 4_800,
     });
     b.cmd(Cmd::SetMidiAssets(Arc::new(vec![])));
-    let _ = b.cmd(Cmd::StopAll);
+    b.cmd(Cmd::StopAll);
+}
+
+/// Tier-3: an ABI-v3 script produces a REAL stereo image at the master
+/// out. Track 0 loops a constant-energy asset through the stock `spread`
+/// script; the probe captures bus L and bus R sample-synchronously. With
+/// the chain on, the L/R difference is strong (sideband energy only a v3
+/// slot can create — every mono stage returns (y, y)); with the chain
+/// cleared, L and R are identical within float noise, proving the mono
+/// fold stays bit-true for every older script.
+struct DiffProc {
+    sink_l: Port<AudioIn>,
+    sink_r: Port<AudioIn>,
+    ring_sum: Arc<Vec<AtomicU32>>,
+    ring_dif: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+}
+
+impl ProcessHandler for DiffProc {
+    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+        let n = ps.n_frames() as usize;
+        if n == 0 {
+            return Control::Continue;
+        }
+        let l = self.sink_l.as_slice(ps);
+        let r = self.sink_r.as_slice(ps);
+        let nring = self.ring_sum.len() as u64;
+        let mut w = self.widx.load(Ordering::Relaxed);
+        for i in 0..n {
+            let (sl, sr) = (l.get(i).copied().unwrap_or(0.0), r.get(i).copied().unwrap_or(0.0));
+            self.ring_sum[(w % nring) as usize].store(((sl + sr) * 0.5).to_bits(), Ordering::Relaxed);
+            self.ring_dif[(w % nring) as usize].store(((sl - sr) * 0.5).to_bits(), Ordering::Relaxed);
+            w += 1;
+        }
+        self.widx.store(w, Ordering::Relaxed);
+        Control::Continue
+    }
+}
+
+#[test]
+fn e2e_tier3_stereo_spread_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    // Load the stock spread script through the REAL registry.
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-st-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    let desc = reg
+        .desc("spread")
+        .expect("stock spread present")
+        .clone();
+    assert!(desc.stereo, "spread must load as an ABI-v3 stereo script");
+    let inst = reg
+        .create_instance("spread", sr as f64, &[])
+        .expect("spread compiles and instantiates");
+
+    let ring_n = 1usize << 19;
+    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("st_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async(
+            (),
+            DiffProc {
+                sink_l,
+                sink_r,
+                ring_sum: ring_sum.clone(),
+                ring_dif: ring_dif.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "dual-bus layout not applied"
+    );
+
+    // Constant-energy looping asset (toned noise).
+    let n = (sr as usize) * 2;
+    let sample: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let tone = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+                let h = (i as u32).wrapping_mul(2654435761);
+                let noise = (h as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                0.4 * (0.6 * tone + 0.4 * noise)
+            })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![sample]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.5); // dead centre: any L/R split is the effect's
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
+        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring_sum, &widx, 480)
+                .map(|m| m > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "loop audible on master",
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let s_on = rms(&ring_sum);
+    let d_on = rms(&ring_dif);
+    assert!(s_on > 0.01, "loop must be audible (sum rms {s_on})");
+    assert!(
+        d_on > s_on * 0.15,
+        "spread must put real side energy on the master buses (dif {d_on} vs sum {s_on})"
+    );
+
+    // Clear the chain: the mono fold must be identical L/R again.
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: TrackFx {
+            slots: Arc::new(vec![]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let s_off = rms(&ring_sum);
+    let d_off = rms(&ring_dif);
+    b.cmd(Cmd::StopAll);
+    assert!(s_off > 0.01, "loop still audible after clearing (rms {s_off})");
+    assert!(
+        d_off < s_off * 1e-3,
+        "mono chain must produce bit-identical L/R buses (dif {d_off} vs sum {s_off})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
