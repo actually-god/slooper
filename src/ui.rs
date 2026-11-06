@@ -1689,7 +1689,13 @@ impl App {
             vst_synth_open: (0..MAX_LOOPS).map(|_| None).collect(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
-            editor_probe: cfg.editor_probe.clone(),
+            editor_probe: cfg
+                .editor_probe
+                .iter()
+                // v41: legacy configs hold pre-canonicalisation keys — the
+                // `~/.vst3` symlink forms that made every restore miss.
+                .map(|(k, v)| (Self::probe_key(k), *v))
+                .collect(),
             editor_probes: Vec::new(),
             params_win: None,
             params_filter: String::new(),
@@ -2457,6 +2463,18 @@ impl App {
         }
     }
 
+    /// v41: canonical probe-cache key. The rack/scan world references
+    /// plugins through `~/.vst3` symlinks while projects store the real
+    /// (`~/AudioFOSS`) paths — keyed verbatim, every project restore MISSED
+    /// the cached verdict and silently re-armed a probe child at boot
+    /// (the 2026-11 crash forensics: a GL-heavy editor probed 13 s into
+    /// every launch). One filesystem identity, one cache key.
+    fn probe_key(path: &str) -> String {
+        std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string())
+    }
+
     /// The ONE path to a plugin's own window. Cached-safe opens directly;
     /// cached-banned opens the parameter window instead; unknown plugins
     /// are probed in a disposable child first (status line announces it —
@@ -2465,6 +2483,7 @@ impl App {
         &mut self,
         target: GuiTarget,
         entry: std::sync::Arc<dyn crate::vsthost::StageEntry>,
+        user_initiated: bool,
     ) {
         let path = entry.path().to_string_lossy().into_owned();
         // Escape hatch for development: open without the guard.
@@ -2474,7 +2493,7 @@ impl App {
         }
         let known = Self::plugin_mtime(&path).and_then(|m| {
             self.editor_probe
-                .get(&path)
+                .get(&Self::probe_key(&path))
                 .filter(|(cm, _)| *cm == m)
                 .map(|(_, ok)| *ok)
         });
@@ -2489,6 +2508,20 @@ impl App {
                 self.params_filter.clear();
             }
             None => {
+                if !user_initiated {
+                    // v41: an auto-open (session restore / land-time GUI)
+                    // never arms a fresh crash-guard probe. A package
+                    // update bumps the mtime, silently re-arming probes
+                    // that used to fire 13 s after launch — one of them a
+                    // GL-heavy editor — and the resulting X driver fault
+                    // killed the DAW (see main.rs v41). The user clicks
+                    // Edit to run the check; cached verdicts open freely.
+                    self.status = format!(
+                        "{}: window left closed after load \u{2014} press Edit to open it (first-time safety check runs on click)",
+                        entry.name()
+                    );
+                    return;
+                }
                 if self
                     .editor_probes
                     .iter()
@@ -2545,7 +2578,7 @@ impl App {
                     let (target, path, _, entry) = self.editor_probes.remove(i);
                     let ps = path.to_string_lossy().into_owned();
                     if let Some(m) = Self::plugin_mtime(&ps) {
-                        self.editor_probe.insert(ps.clone(), (m, true));
+                        self.editor_probe.insert(Self::probe_key(&ps), (m, true));
                         self.save_config();
                     }
                     if self.target_alive(target, &ps) {
@@ -2562,7 +2595,7 @@ impl App {
                     let ps = path.to_string_lossy().into_owned();
                     if persist {
                         if let Some(m) = Self::plugin_mtime(&ps) {
-                            self.editor_probe.insert(ps.clone(), (m, false));
+                            self.editor_probe.insert(Self::probe_key(&ps), (m, false));
                             self.save_config();
                         }
                     }
@@ -2995,7 +3028,9 @@ impl App {
                 };
                 if let Some((entry, _)) = plan {
                     // v23: gated — the window may be probe-checked or banned.
-                    self.open_plugin_gui(GuiTarget::Chain(t, row), entry);
+                    // The pending queue only ever holds rows the USER added
+                    // (add_fx_plugin), landing after their click.
+                    self.open_plugin_gui(GuiTarget::Chain(t, row), entry, true);
                 }
             }
             self.vst_pending_gui = keep;
@@ -3024,7 +3059,9 @@ impl App {
                 Ok(entry) => {
                     self.land_track_synth_vst(t, entry);
                     let mut msg = format!("track {t}: synth {label} loaded");
-                    if open_gui && !self.auto_open_synth_gui(t) {
+                    // v41: an open landing after an explicit bind (♪ pick
+                    // is the only path with open_gui=true) is user intent.
+                    if open_gui && !self.synth_gui_open(t, true) {
                         // auto_open records WHY in the status line; keep
                         // it visible alongside the bind message.
                         let why = std::mem::take(&mut self.status);
@@ -9349,6 +9386,18 @@ impl App {
     /// refuses to open (a refused editor is reaped by `reap_vst_editors`
     /// and the status line names the reason).
     fn auto_open_synth_gui(&mut self, t: usize) -> bool {
+        self.synth_gui_open(t, true)
+    }
+
+    /// v41: shared open path. `user_initiated` gates the crash-guard
+    /// PROBE: session restore (open_gui-on-land) must never spawn probe
+    /// child processes — the 2026-11 crash forensics showed a fresh
+    /// plugin mtime (package update) silently re-arming the probe for
+    /// every editor-heavy synth at launch, 13 s into boot, before the
+    /// user touched anything. Restore only opens editors already
+    /// verified safe; anything else waits for the Edit click, which is
+    /// an explicit "yes, that window please" and probes as before.
+    fn synth_gui_open(&mut self, t: usize, user_initiated: bool) -> bool {
         // v0.11 double-open guard: a second effEditOpen against the same
         // live instance while an editor is open races two toolkit editor
         // states (and silently leaked the first container when the map
@@ -9381,7 +9430,7 @@ impl App {
         }
         // v23: gated open (crash guard); the status line announces what
         // happens either way.
-        self.open_plugin_gui(GuiTarget::Synth(t), entry);
+        self.open_plugin_gui(GuiTarget::Synth(t), entry, user_initiated);
         true
     }
 
@@ -9433,7 +9482,7 @@ impl App {
             // v23: gated — safe plugins open now, unknown ones get probed,
             // banned ones land on the parameter window. All announced in
             // the status line.
-            self.open_plugin_gui(GuiTarget::Chain(t, row), entry);
+            self.open_plugin_gui(GuiTarget::Chain(t, row), entry, true);
             return;
         }
         // v0.11 R3: hosted plugins with their own window never got a
@@ -27890,6 +27939,43 @@ mod tests {
         texts
     }
 
+    /// v41 gate pin: an AUTO open (session restore / land-time GUI) of a
+    /// plugin with no cached probe verdict must NOT spawn a probe child —
+    /// it leaves the window closed and says so. (The 2026-11 crash chain:
+    /// mtime bump → silent boot-time probe → X driver fault → DAW died.)
+    #[test]
+    fn v41_auto_open_never_arms_probe() {
+        let home = real_home();
+        let wolf = format!("{home}/.vst3/wolf-shaper.vst3");
+        let p = std::path::Path::new(&wolf);
+        if !p.is_dir() {
+            eprintln!("skip: no wolf-shaper");
+            return;
+        }
+        let mut app = headless_app("v41gate");
+        app.show_master = false;
+        let load = crate::vsthost::open(p, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("wolf-shaper opens");
+        let entry = load.entry;
+        // Empty editor_probe: the verdict is UNKNOWN — the arm-the-probe
+        // branch. Via the auto path it must bail to the status line.
+        app.editor_probe.clear();
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone(), false);
+        assert!(
+            app.status.contains("press Edit"),
+            "auto-open must defer, got: {}",
+            app.status
+        );
+        assert!(
+            app.editor_probes.is_empty(),
+            "auto-open must not arm a probe child"
+        );
+        assert!(app.fx_vst_editors.is_empty() && app.vst_editors.is_empty());
+        // The same open flagged user-initiated may arm the probe (or open
+        // when the environment lacks the X display to probe — either is
+        // acceptable; spawning a silent probe at BOOT is the forbidden one).
+    }
+
     /// v23 gate pin (issue 3, UI half): a plugin with a CACHED-BAN verdict
     /// never opens its vendor window; it opens the stand-in parameter
     /// window, announces itself in the status line, and its sliders feed
@@ -27912,7 +27998,7 @@ mod tests {
             .expect("wolf-shaper opens");
         let entry = load.entry;
         let m = App::plugin_mtime(&wolf).expect("mtime");
-        app.editor_probe.insert(wolf.clone(), (m, false));
+        app.editor_probe.insert(App::probe_key(&wolf), (m, false));
         app.fx_rows[0].push(ChainRow::Vst {
             path: wolf.clone(),
             kind: crate::vsthost::VstKind::V3,
@@ -27923,7 +28009,7 @@ mod tests {
             state: None,
             open_rx: None,
         });
-        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone());
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone(), true);
         assert!(
             app.status.contains("parameter window"),
             "ban must announce itself: {}",
@@ -27932,7 +28018,7 @@ mod tests {
         assert_eq!(app.params_win, Some(GuiTarget::Chain(0, 0)));
         // A second click on a banned plugin stays on the stand-in (no
         // vendor window is ever attempted — that is the crash never eaten).
-        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone());
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone(), true);
         assert!(app.fx_vst_editors.is_empty() && app.vst_editors.is_empty());
         let texts = v23_texts(&mut app);
         assert!(
@@ -28364,7 +28450,7 @@ mod tests {
             .expect("wolf-shaper opens");
         let entry = load.entry;
         let m = App::plugin_mtime(&wolf).expect("mtime");
-        app.editor_probe.insert(wolf.clone(), (m, true));
+        app.editor_probe.insert(App::probe_key(&wolf), (m, true));
         app.fx_rows[0].push(ChainRow::Vst {
             path: wolf.clone(),
             kind: crate::vsthost::VstKind::V3,
@@ -28375,7 +28461,7 @@ mod tests {
             state: None,
             open_rx: None,
         });
-        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone());
+        app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone(), true);
         assert!(
             app.status.contains("plugin window opened"),
             "cached-safe must open directly: {}",
