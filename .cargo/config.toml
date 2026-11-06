@@ -5,3 +5,11 @@
 # The whole suite runs in ~2 s, so keep it single-threaded and race-free.
 [env]
 RUST_TEST_THREADS = "1"
+
+# WINDOWS-PORT W1: cross-target linker (llvm-mingw UCRT build; the official
+# pairing for the x86_64-pc-windows-gnullvm Rust target — the plain
+# windows-gnu prebuilt std wants GCC's libgcc which llvm-mingw lacks).
+# Additive: inert for Linux builds. If ~/Tools moves, set
+# CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER to override.
+[target.x86_64-pc-windows-gnullvm]
+linker = "/home/admin/Tools/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-gcc"
