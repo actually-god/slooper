@@ -187,6 +187,69 @@ pub struct EffectInfoV2 {
 }
 
 // ---------------------------------------------------------------------------
+// ABI v3: stereo field
+// ---------------------------------------------------------------------------
+// A v3 effect is a v2 effect that ALSO processes a stereo pair. Export a
+// third entry point beside the other two:
+//
+//     #[no_mangle]
+//     pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 { &DESC3 }
+//
+// The loader tries v3 first, then v2, then v1 — existing scripts never
+// change. The v3 prefix is bit-identical to v2, so a v2 host still reads
+// a v3 struct as a valid v2 one.
+//
+// What the host guarantees (tier-3 rule, mirror of the v2 contract):
+//   * The chain bus turns STEREO only in the sense that `process_st`
+//     receives a left and a right sample and returns a left plus a right
+//     (through `out_r`). Sources upstream are MONO: the first slot of a
+//     chain always sees l == r, and a mono stage is fed the mid
+//     (l+r)*0.5 and has its output replace BOTH sides.
+//   * The pair the effect emits survives to the track pan (dual-mono
+//     law: l*pan_l into the mix left, r*pan_r into the mix right), so a
+//     spreader/panner's image is real — but only in the LIVE mix.
+//     Offline renders and preview bounces are mono: they feed the stereo
+//     slot (mid, mid) and keep its LEFT output (documented fold).
+//   * `sc` keeps its full v2 meaning (0.0 when no send is routed).
+//   * A v3 effect MUST still export v1 `process` (return `input`) and,
+//     in practice, a real `process_sc` too — every older entry stays a
+//     valid graceful fallback.
+//   * Time-based math stays SAMPLE-exact: block sizes run ~1 ms (RT) to
+//     seconds (preview bounce).
+pub const SLOOPER_EFFECT_ABI_V3: u32 = 3;
+
+/// A v2 layout with one extra entry point appended (prefix bit-identical
+/// to [`EffectInfoV2`]).
+#[repr(C)]
+pub struct EffectInfoV3 {
+    /// Must be [`SLOOPER_EFFECT_ABI_V3`].
+    pub abi: u32,
+    pub name: *const core::ffi::c_char,
+    pub author: *const core::ffi::c_char,
+    pub description: *const core::ffi::c_char,
+    pub n_params: u32,
+    pub params: *const EffectParamV1,
+    pub create: extern "C" fn(sample_rate: f64) -> *mut core::ffi::c_void,
+    pub destroy: extern "C" fn(state: *mut core::ffi::c_void),
+    pub process:
+        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32,
+    pub process_sc:
+        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32,
+    /// Stereo step. `l`/`r` are this sample's chain pair, `sc` the v2
+    /// sidechain sample. Return the LEFT output; write the RIGHT through
+    /// `out_r` (never null — the host passes a real address). Do not
+    /// assume l == r: your own output pair feeds the NEXT slot's input.
+    pub process_st: extern "C" fn(
+        state: *mut core::ffi::c_void,
+        l: f32,
+        r: f32,
+        params: *const f32,
+        sc: f32,
+        out_r: *mut f32,
+    ) -> f32,
+}
+
+// ---------------------------------------------------------------------------
 // OPTIONAL: the child GUI (editor window) contract
 // ---------------------------------------------------------------------------
 // By default slooper gives every effect a child window with one slider
@@ -370,5 +433,6 @@ pub struct EffectGuiV1 {
 unsafe impl Sync for EffectParamV1 {}
 unsafe impl Sync for EffectInfoV1 {}
 unsafe impl Sync for EffectInfoV2 {}
+unsafe impl Sync for EffectInfoV3 {}
 unsafe impl Sync for GuiApiV1 {}
 unsafe impl Sync for EffectGuiV1 {}

@@ -2002,10 +2002,12 @@ fn run(
         mix_l: Vec::new(),
         mix_r: Vec::new(),
         trk_bufs: vec![Vec::new(); MAX_LOOPS],
+        trk_bufs2: vec![Vec::new(); MAX_LOOPS],
         sc_apply: vec![Vec::new(); MAX_LOOPS],
         sc_build: vec![Vec::new(); MAX_LOOPS],
         sc_active: [false; MAX_LOOPS],
         mon_buf: Vec::new(),
+        mon_buf2: Vec::new(),
         vst_tmp: Vec::new(),
         dflt_synth: engine.default_synth(),
         midi_cache: engine.midi(),
@@ -2689,8 +2691,17 @@ fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32]) {
         match &slot.kind {
             FxKind::Scripted { inst, desc } => {
                 if let Some(f) = inst.spawn_fresh(desc) {
-                    for x in buf.iter_mut() {
-                        *x = f.process_private(*x);
+                    // Tier-3: offline renders are mono — a v3 stereo slot
+                    // is fed (mid, mid) and keeps its LEFT output (the
+                    // documented fold, see effect_api.rs ABI v3).
+                    if f.is_stereo() {
+                        for x in buf.iter_mut() {
+                            *x = f.process_private_st(*x, *x).0;
+                        }
+                    } else {
+                        for x in buf.iter_mut() {
+                            *x = f.process_private(*x);
+                        }
                     }
                 }
             }
@@ -3490,6 +3501,10 @@ struct Proc {
     /// Held-back track sums (tracks with a plugin in the chain) and monitor
     /// tap; plus the VST scratch buffer for block-wise chain passes.
     trk_bufs: Vec<Vec<f32>>,
+    /// Tier-3: right halves of the held-back track sums (and the monitor
+    /// tap). Only sized for tracks whose chain ran on this block; mono
+    /// chains fill it identically to the left, stereo slots split it.
+    trk_bufs2: Vec<Vec<f32>>,
     /// v32 R5: sidechain bus. `sc_apply[t]` is what track `t`'s scripted
     /// effects read THIS block (the previous block's source sum — one
     /// block of detection latency, see docs/SIDECHAIN.md); `sc_build[t]`
@@ -3499,6 +3514,7 @@ struct Proc {
     sc_build: Vec<Vec<f32>>,
     sc_active: [bool; MAX_LOOPS],
     mon_buf: Vec<f32>,
+    mon_buf2: Vec<f32>,
     vst_tmp: Vec<f32>,
     /// v0.11 R5: automation asset table refresh pair.
     auto_cache: Arc<Vec<Option<Arc<crate::automation::Automation>>>>,
@@ -3616,12 +3632,12 @@ impl Proc {
     /// volume x gain trim has already been multiplied into `x`). Only for
     /// scripted-only chains; plugin chains go through `run_chain_block`.
     #[inline]
-    fn fx_mix(&mut self, t: usize, x: f32, sc: f32) -> f32 {
+    fn fx_mix(&mut self, t: usize, x: f32, sc: f32) -> (f32, f32) {
         let chain = &self.fx_cache[t];
         if chain.is_empty() {
-            return x;
+            return (x, x);
         }
-        let mut s = x;
+        let mut pair = (x, x);
         for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
             let FxKind::Scripted { inst, .. } = &slot.kind else {
                 continue;
@@ -3633,17 +3649,21 @@ impl Proc {
             }
             // SAFETY: the live chain is advanced by this thread only, and
             // `rt.p` holds the instance's current slider snapshot.
-            s = unsafe { inst.call_sample_sc(s, &rt.p, sc) }
+            // Tier-3: mono slots take the mid and return (y, y) — the
+            // v3 dispatch itself, so mono chains behave bit-identically.
+            pair = unsafe { inst.call_sample_st(pair.0, pair.1, &rt.p, sc) }
         }
-        s
+        pair
     }
 
-    /// Run a plugin-bearing chain over a whole block (mono in, mono out,
-    /// in place — `tmp` is scratch). Scripted slots keep their per-slot
+    /// Run a plugin-bearing chain over a whole block (stereo pair in,
+    /// pair out — `tmp` is scratch). Scripted slots keep their per-slot
     /// slider snapshots (`fx_rt`); plugins consume/replenish their rings.
+    /// Tier-3: scripted slots run the pair path; a plugin slot processes
+    /// the LEFT buffer and copies its mono output to both sides.
     /// The dry input is already trim-scaled; pan/master are folded later.
-    fn run_chain_block(&mut self, t: usize, buf: &mut [f32], tmp: &mut [f32], sc: &[f32]) {
-        let n = buf.len().min(tmp.len());
+    fn run_chain_block(&mut self, t: usize, buf: &mut [f32], buf2: &mut [f32], tmp: &mut [f32], sc: &[f32]) {
+        let n = buf.len().min(tmp.len()).min(buf2.len());
         let Self {
             fx_cache, fx_rt, ..
         } = self;
@@ -3657,13 +3677,23 @@ impl Proc {
                         rt.gen = g;
                     }
                     // SAFETY: audio thread owns the live chain (as fx_mix).
-                    for (j, x) in buf[..n].iter_mut().enumerate() {
-                        *x = unsafe { inst.call_sample_sc(*x, &rt.p, *sc.get(j).unwrap_or(&0.0)) };
+                    for j in 0..n {
+                        let (l, r) = unsafe {
+                            inst.call_sample_st(
+                                buf[j],
+                                buf2[j],
+                                &rt.p,
+                                *sc.get(j).unwrap_or(&0.0),
+                            )
+                        };
+                        buf[j] = l;
+                        buf2[j] = r;
                     }
                 }
                 FxKind::Vst(e) => {
                     e.process(&buf[..n], &mut tmp[..n]);
                     buf[..n].copy_from_slice(&tmp[..n]);
+                    buf2[..n].copy_from_slice(&tmp[..n]);
                 }
             }
         }
@@ -4565,7 +4595,9 @@ impl ProcessHandler for Proc {
         let mut mix_l = std::mem::take(&mut self.mix_l);
         let mut mix_r = std::mem::take(&mut self.mix_r);
         let mut trk_bufs = std::mem::take(&mut self.trk_bufs);
+        let mut trk_bufs2 = std::mem::take(&mut self.trk_bufs2);
         let mut mon_buf = std::mem::take(&mut self.mon_buf);
+        let mut mon_buf2 = std::mem::take(&mut self.mon_buf2);
         let mut vst_tmp = std::mem::take(&mut self.vst_tmp);
         mix_l.clear();
         mix_l.resize(n, 0.0);
@@ -4579,9 +4611,17 @@ impl ProcessHandler for Proc {
                 buf.resize(n, 0.0);
             }
         }
+        for (t, buf) in trk_bufs2.iter_mut().enumerate() {
+            buf.clear();
+            if vst_mask[t] {
+                buf.resize(n, 0.0);
+            }
+        }
         if sel_vst {
             mon_buf.clear();
             mon_buf.resize(n, 0.0);
+            mon_buf2.clear();
+            mon_buf2.resize(n, 0.0);
         }
 
         let mut peak_val: u32 = 0;
@@ -4675,6 +4715,7 @@ impl ProcessHandler for Proc {
                         // plugins, in chain order) runs block-wise over
                         // the pre-pan sum after the sample loop.
                         trk_bufs[t][i] = a * av;
+                        trk_bufs2[t][i] = a * av;
                     } else {
                         // v32 R5: this track's scripted chain sees last
                         // block's sidechain sum (0.0 when no send routed).
@@ -4683,9 +4724,12 @@ impl ProcessHandler for Proc {
                         } else {
                             0.0
                         };
-                        let m = self.fx_mix(t, a * av, scv);
-                        play_l += m * pgl[t];
-                        play_r += m * pgr[t];
+                        // Tier-3: the chain returns a pair; mono-only
+                        // chains return (y, y), so the pan fold is the
+                        // historical mono law bit-for-bit.
+                        let (ml, mr) = self.fx_mix(t, a * av, scv);
+                        play_l += ml * pgl[t];
+                        play_r += mr * pgr[t];
                     }
                 }
             }
@@ -4774,10 +4818,11 @@ impl ProcessHandler for Proc {
             // The monitored chain still runs every sample (tails decay);
             // with a VST insert on the monitored track its output is held
             // back for the plugin instead of feeding the mix directly.
-            let mut mon = 0.0f32;
+            let mut mon = (0.0f32, 0.0f32);
             let mon_i = mon_a + mon_s * i as f32;
             if sel_vst {
                 mon_buf[i] = src_in * mon_i;
+                mon_buf2[i] = src_in * mon_i;
             } else {
                 mon = self.fx_mix(sel, src_in * mon_i, 0.0);
             }
@@ -4787,8 +4832,8 @@ impl ProcessHandler for Proc {
             // the user hears stays exactly on the timeline grid (latency
             // compensation only trims the start of a fresh take — see
             // `Engine::rec_sample`).
-            mix_l[i] = mon * mon_l + clickc + play_l + pvc;
-            mix_r[i] = mon * mon_r + clickc + play_r + pvc;
+            mix_l[i] = mon.0 * mon_l + clickc + play_l + pvc;
+            mix_r[i] = mon.1 * mon_r + clickc + play_r + pvc;
 
             // Advance the transport clock (only while running).
             if live && advance {
@@ -4804,7 +4849,8 @@ impl ProcessHandler for Proc {
                 if !vst_mask[t] {
                     continue;
                 }
-                let (buf, tmp) = (&mut trk_bufs[t], &mut vst_tmp);
+                let (buf, buf2, tmp) =
+                    (&mut trk_bufs[t], &mut trk_bufs2[t], &mut vst_tmp);
                 // v32 R5: scripted slots inside a plugin-bearing chain get
                 // their sidechain row too; the plugin slots ignore it.
                 let scrow: &[f32] = if self.sc_active[t] {
@@ -4812,18 +4858,18 @@ impl ProcessHandler for Proc {
                 } else {
                     &sc_empty
                 };
-                self.run_chain_block(t, buf, tmp, scrow);
+                self.run_chain_block(t, buf, buf2, tmp, scrow);
                 for i in 0..n {
                     mix_l[i] += buf[i] * pgl[t];
-                    mix_r[i] += buf[i] * pgr[t];
+                    mix_r[i] += buf2[i] * pgr[t];
                 }
             }
             if sel_vst {
-                let (buf, tmp) = (&mut mon_buf, &mut vst_tmp);
-                self.run_chain_block(sel, buf, tmp, &sc_empty);
+                let (buf, buf2, tmp) = (&mut mon_buf, &mut mon_buf2, &mut vst_tmp);
+                self.run_chain_block(sel, buf, buf2, tmp, &sc_empty);
                 for i in 0..n {
                     mix_l[i] += buf[i] * mon_l;
-                    mix_r[i] += buf[i] * mon_r;
+                    mix_r[i] += buf2[i] * mon_r;
                 }
             }
         }
@@ -4865,11 +4911,13 @@ impl ProcessHandler for Proc {
         self.mix_l = mix_l;
         self.mix_r = mix_r;
         self.trk_bufs = trk_bufs;
+        self.trk_bufs2 = trk_bufs2;
         // v32 R5: publish this block's taps as next block's SC input.
         std::mem::swap(&mut sc_apply, &mut sc_build);
         self.sc_apply = sc_apply;
         self.sc_build = sc_build;
         self.mon_buf = mon_buf;
+        self.mon_buf2 = mon_buf2;
         self.vst_tmp = vst_tmp;
 
         // Give the clip window list back for the next block.
