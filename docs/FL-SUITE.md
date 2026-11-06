@@ -208,3 +208,18 @@ non-silence gate:
   only be APPENDED (indices are sticky per script stem).
 - UI pin `flsuite_chain_window_tags_stereo_script` updated: the mono
   counterexample is now `compressor` (chorus carries the badge).
+
+## Tier-5 candidates (next rework cycle, in value order)
+
+1. `space_echo.rs` → ABI v3 stereo reverb (Reeverb 2 / LuxeVerb are stereo
+   devices; the script is still mid-only). Highest remaining FL-parity
+   gap; highest-risk rewrite (GUI + presets + shipped users) — pin FIRST
+   (impulse tail symmetry, preset roundtrip), then dual decorrelated FDN
+   banks sharing the input.
+2. `phaser.rs` / `flanger.rs` v3 width modes (Vintage Phaser dual-path);
+   cheap once the space_echo pattern is proven.
+3. Param metadata (rung 1): enum labels for the mode sliders (overdrive
+   character, gater shapes, shifter modes) — proper ABI bump, design in
+   `effect_api.rs` first.
+4. Transport sync (rung 2) — unlocks the Scratcher/Gross-Beat row and
+   tempo-phase gater/echo.
