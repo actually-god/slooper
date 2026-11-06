@@ -20,7 +20,7 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | FL Studio plugin(s) | Task | slooper plugin | Status |
 |---|---|---|---|
 | Fruity Parametric EQ, Parametric EQ 2 | visual 7-band EQ + analyzer | `parametric_eq.rs` | done (26-param graph GUI, +30 dB, 240-band analyzer) |
-| Fruity Reeverb 2, LuxeVerb, part of Fast Reverb | algorithmic reverb | `space_echo.rs` | done (11 params + space presets GUI) |
+| Fruity Reeverb 2, LuxeVerb, part of Fast Reverb | algorithmic reverb | `space_echo.rs` | done tier-5 (ABI-v3 **stereo** FDN: dual decorrelated comb banks + per-side echo, tail-width 0..2 with 0 = bit-exact mono tail; 12 params + space-presets GUI) |
 | Fruity Chorus, Hyper Chorus, Vintage Chorus | chorus / doubler / ensembles | `chorus.rs` | done tier-4 (ABI-v3 stereo: `voices` taps/side, R bank phase-spread; dead tier-1 feedback rewritten as a delayed wet-recirculation loop) |
 | Fruity Compressor | single-band comp | `compressor.rs` | done |
 | Fruity Limiter sidechain duties | ducking comp | `sidechain_comp.rs` | done (ABI-v2 reference) |
@@ -32,8 +32,8 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Fruity Limiter, Emphasis, (legacy) Soft Limiter, noise gate | comp/limiter/gate, ceiling | `limiter.rs` | done |
 | Maximus, Fruity Multiband Compressor | 3-band split dynamics | `multiband.rs` | done |
 | Fruity Filter, Fruity Love Philter (single core), Fruity Wah | resonant LP/BP/HP + env auto-wah | `vfilter.rs` | done |
-| Fruity Phaser, Vintage Phaser | phaser | `phaser.rs` | done |
-| Fruity Flanger, Fruity Flangus | flanger / unison | `flanger.rs` | done tier-4 (absolute-index ring read fixed — the comb now actually recirculates; base time slewed) |
+| Fruity Phaser, Vintage Phaser | phaser | `phaser.rs` | done tier-5 (ABI-v3 dual path: R cascade runs the LFO `spread` further along, opposite-traveling notches; L path = the historical mono circuit bit-for-bit) |
+| Fruity Flanger, Fruity Flangus | flanger / unison | `flanger.rs` | done tier-5 (ABI-v3: ONE shared comb written with the mid, per-side modulated taps + R-side `spread` offset — opposite-sweep sides; tier-4 absolute-index ring read fixed — the comb now actually recirculates; base time slewed) |
 | Fruity PanOMatic (vol), Gross Beat (gate/stutter lite) | tempo volume-gating | `gater.rs` | done |
 | Fruity Delay 2, Fruity Delay 3, Fruity Delay Bank (single-bank core) | delay + filtered feedback | `echo3.rs` | done tier-4 (ABI-v3 ping-pong: R taps `time×(1+pp)` so repeats trail L→R; tier-1 absolute-index ring read fixed — see rework log) |
 | Frequency Shifter | SSB shift (metallic/vibrato) | `shifter.rs` | done |
@@ -90,7 +90,8 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
    the master buses (pinned by `e2e_tier3_stereo_spread_live`, which ALSO
    asserts a v3 script decorrelates). Scripts: `spread.rs`,
    `panmatic.rs`, plus tier-4 `chorus.rs` (per-side tap banks) and
-   `echo3.rs` (ping-pong reads). Write the pair into the L slot +
+   `echo3.rs` (ping-pong reads), plus tier-5 `space_echo.rs` (dual-bank
+   FDN + per-side echo). Write the pair into the L slot +
    out pointer; never
    assume L == R in a v3 slot. FLAG SEMANTICS: `desc.sidechain` is
    true only for the EXACT v2 generation — a v3 script must export the
@@ -209,18 +210,101 @@ non-silence gate:
 - UI pin `flsuite_chain_window_tags_stereo_script` updated: the mono
   counterexample is now `compressor` (chorus carries the badge).
 
+## Tier-5 stereo reverb log (2026-11-06 — `space_echo.rs` → ABI v3)
+
+The FL rooms (Reeverb 2 / LuxeVerb) are stereo devices; the tier-1 script
+was mid-only. Rebuilt as: per-side echo paths (own delay/tone pole/DC
+blocker — a hard-panned source now ECHOES to its side, measured R-energy
+exactly 0 for an L-only impulse), and an FDN built from TWO comb banks —
+L bank carries the tier-1 tunings verbatim, R bank is spread (`BANK_SPREAD`
+= 1.031 lengths, `BANK_PHASE` = 2.3 rad modulation offset) so identical
+feeds decorrelate within a few loop rounds. The `width` param (11, APPENDED
+— indices sticky) cross-mixes the bank sums: `L' = a(1+w)/2 + b(1−w)/2`.
+`ap_r` reuses the L diffuser tunings DELIBERATELY: at width 0 both sides
+then receive the identical sum through identical chains → the tail is
+BIT-EXACTLY mono (pinned). Width default 1.0 keeps the v1 `process`
+fallback (call `process_st(x,x)`, return LEFT) equal to the historical
+circuit — every pre-tier-5 forensic pin (v13 DC wash, v14 snap glitch,
+mode density, wet tail) passes unchanged at default params.
+
+- Gate design (`tier5_space_echo_stereo_tail`, impulse-structure shape per
+  tier-4 rule): echo measured with VERB OFF (discrete repeats, ratio
+  0.232); decorrelation measured with ECHO OFF — the echo component is
+  100 % correlated BY DESIGN (shared taps) and sank the ratio to 0.17 when
+  both were open. Verb-only window 0.5–0.9 s measured D/tail = 1.417
+  (= √2, textbook full decorrelation); width-0 run asserted BIT-equality
+  (`to_bits()`), not a threshold. Sabotage-verified BOTH ways: identical
+  banks (spread AND phase zeroed — phase alone still decorrelates, so
+  sabotage must neutralize every differentiator) → decor pin fails
+  (dif 0); `ap_r` tuning +1 → width-0 pin fails. A "stereo" tail that is
+  really the same mono signal twice passes energy gates; it cannot pass
+  this pair.
+- The ST-fixture gate in `bundled_effects_produce_sound` now demands
+  `st_checked >= 5` (spread/panmatic/chorus/echo3/space_echo);
+  `e2e_tier5_stereo_reverb_live` proves real master-bus decorrelation on
+  the RT thread. Host `builtin_presets` mirror and `v10_eq_ships_default_presets`
+  carry the 12th value (that pin caught the drift for free).
+- GUI: knob row pitch 66 → 61 px for twelve knobs, new `width` knob, tail
+  wedge drawn as an L/R pair. All pins are galley/label-based, so pitch
+  changes are layout-safe (verified).
+- CPU note: dual bank doubles reverb cost (16 combs + 12 diffusers at
+  ~200 flops/sample — fine per the convolver precedent); a future block-
+  process ABI rung (5) is the lever if that ever bites.
+
+## Tier-5 stereo modulation log (2026-11-06 — `phaser.rs` + `flanger.rs` → ABI v3)
+
+Candidate #2 from the tier-5 list, same ladder rung (rung 3 already
+shipped — zero ABI/engine change, mirror the spread.rs export trio).
+Both scripts got ONE appended param, `spread` (index 7, default 0.5) —
+persistence-safe by the append rule; the `bundled_effects_produce_sound`
+roster gate moved `st_checked >= 5 → 7`.
+
+- **Phaser = dual-path Vintage Phaser**: the all-pass cascade runs twice
+  (per-side state), the R path reads the SAME LFO clock `spread` further
+  along (one clock, two read heads — drift impossible by construction).
+  L path unchanged → the v1 fallback (`process_st(x,x)`, return LEFT)
+  is the historical mono circuit. Measured on LCG noise: spread 0 →
+  L/R bit-identical (0 differing samples / 14400); spread 0.5 →
+  D/RMS 1.27 ≈ full decorrelation.
+- **Flanger = shared comb, opposite-sweep taps**: ONE feedback ring
+  written with the MID `(l+r)/2`, voice taps read per side with the R
+  bank offset by `spread`, dry strictly per-side. For identical inputs
+  the mid IS the tier-4 mono write and the L taps carry the tier-4
+  phase — `tier4_feedback_loops_ring` passes unchanged (fallback
+  identity pinned bit-for-bit in `tier5_phaser_flanger_stereo`).
+  Measured: spread 0 bit-identical; spread 0.5 D/RMS 0.67 (comb taps
+  decorrelate less than the phaser's resonant peaks — different physics,
+  threshold 0.3 keeps margin); hard-panned L impulse: R energy exactly
+  0 in the dry window, comb tail balanced L≈R within 2x (topology IS
+  mono — a wet-only-left flanger would fake image preservation).
+- Pins: `fx::tests::tier5_phaser_flanger_stereo` (structure shape:
+  bit-exactness at spread 0, decorrelation floors, image split, fallback
+  identity, param-table freeze for 0..7). Sabotage-verified THREE ways
+  before trusting: flanger R-offset zeroed → decor pin fails (D/RMS 0);
+  R dry fed from xl → image pin fails; phaser R-offset zeroed → decor
+  pin fails. Restored tree re-green.
+- Probe-tooling trap (reusable): ctypes FFI probes must read DESC
+  *contents* via `ctypes.cast(addr, POINTER(c_void_p))[0]` — `cast(addr,
+  c_void_p).value` returns the SLOT ADDRESS, so a "function pointer"
+  turned out to be the static-data region (segfault that looks like an
+  effect bug). And never end a ctypes probe without `os._exit(0)`:
+  interpreter teardown dlcloses the Rust cdylib (the never-dlclose rule).
+
 ## Tier-5 candidates (next rework cycle, in value order)
 
-1. `space_echo.rs` → ABI v3 stereo reverb (Reeverb 2 / LuxeVerb are stereo
-   devices; the script is still mid-only). Highest remaining FL-parity
-   gap; highest-risk rewrite (GUI + presets + shipped users) — pin FIRST
-   (impulse tail symmetry, preset roundtrip), then dual decorrelated FDN
-   banks sharing the input.
-2. `phaser.rs` / `flanger.rs` v3 width modes (Vintage Phaser dual-path);
-   cheap once the space_echo pattern is proven.
+1. ~~`space_echo.rs` → ABI v3 stereo reverb~~ **DONE 2026-11-06** (see
+   tier-5 log above).
+2. ~~`phaser.rs` / `flanger.rs` v3 width modes (Vintage Phaser dual
+   path)~~ **DONE 2026-11-06** (see stereo modulation log above).
 3. Param metadata (rung 1): enum labels for the mode sliders (overdrive
    character, gater shapes, shifter modes) — proper ABI bump, design in
    `effect_api.rs` first.
 4. Transport sync (rung 2) — unlocks the Scratcher/Gross-Beat row and
    tempo-phase gater/echo.
+5. Remaining mono scripts for the rung-3 pass (value order): `shifter.rs`
+   (true stereo SSB — FL's freq shifter is per-side), `gater.rs`
+   (per-side step gates), `pitchshft.rs` (dual delay-line already — just
+   needs independent R modulation to spread), `vocoder.rs` (carrier
+   decorrelation). Each = mirror spread.rs trio + one appended `spread`
+   + structure pins per the tier-4/5 shape.
 - Live smoke 2026-11-06 (tier-4 binary sha 707a3f3d…): boots on :1, seeds the new echo3/chorus into ~/.local/share/slooper/effects (backups .bak present), full clean window render, 0 kernel conflicts, clean exit.

@@ -78,3 +78,15 @@ strip = true
 # The app never unwinds (no catch_unwind anywhere); aborting keeps panic
 # landing pads and unwinding tables out of the shipped binary.
 panic = "abort"
+
+# tier-5 forensics (2026-11-06 v2): release codegen + debuginfo for ASAN runs
+[profile.asanrel]
+inherits = "release"
+debug = 2
+strip = false
+
+# tier-5 forensics (2026-11-06 v3): DEBUG codegen + ASAN (crash reproduces only in debug)
+[profile.asandbg]
+inherits = "dev"
+debug = 2
+strip = false

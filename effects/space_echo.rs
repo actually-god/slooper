@@ -1,16 +1,29 @@
 // ============================================================ slooper ==
-// space_echo.rs — echo AND reverb in one effect, with a custom child GUI.
+// space_echo.rs — echo AND stereo reverb in one effect, custom child GUI.
 //
-// A mono effects chain: a modulated feedback delay (tone-controlled damping
-// in the loop) running in parallel with a Schroeder FDN reverb (damped comb
-// banks + all-pass diffusers) fed from the echo path, mixed by independent
-// echo/reverb levels, then dry/wet mix and output trim. Turning "echo" down
-// and "verb" up turns the same circuit into a pure room simulator: the
-// factory presets ship that way (practice hall .. cathedral).
+// A STEREO (ABI v3) effects chain: a modulated feedback delay per side
+// (tone-controlled damping in each loop, preserving the input image)
+// running in parallel with an FDN reverb built from TWO decorrelated
+// comb banks + all-pass diffusers fed from the echo loop state, cross-
+// mixed by a tail-width knob, then dry/wet mix and output trim. Turning
+// "echo" down and "verb" up turns the same circuit into a pure room
+// simulator: the factory presets ship that way (practice hall ..
+// cathedral). Mono input still WIDENS (the banks never share modes);
+// width 0 collapses the tail to exact mono (bit-identical sides).
 //
-//   dry ───────────────────────┐
-//   in → delay ──┬─ ×echo ─────┤
-//        └→ reverb ─ ×verb ────┤ mix → out
+//   in_L ─ delay_L ─┬─ ×echo ──┐
+//        └→ bank_L ──┐         │
+//                   ├─ ×verb ──┤ mix → out_L
+//   in_R ─ delay_R ─┬─ ×echo ──┤
+//        └→ bank_R ──┘ ×verb ──┘
+//   banks cross-mix: L' = a·(1+w)/2 + b·(1−w)/2  (w = tail width)
+//
+// Tier 5 (docs/FL-SUITE.md): this is Reeverb 2 / LuxeVerb made native —
+// the FL rooms are stereo devices and the tier-1 script was mid-only.
+// The v1 fallback is `process_st(x,x)` returning the LEFT channel: with
+// the default width=1 the L bank carries the tier-1/2 tunings verbatim,
+// so every mono forensic pin (v13 DC wash, v14 snap glitch, mode
+// density, wet tail) measures the historical circuit unchanged.
 //
 // (The file stem stays `space_echo` because saved chains and persisted
 // param rows reference it; only the display name says "Echo + Reverb".)
@@ -18,15 +31,17 @@
 // Params are ordinary effect params, so the auto slider window works too;
 // the child GUI below is a scripted canvas showing the echo pattern
 // (tick spacing = time, fade = feedback, jitter = wobble) over a reverb
-// tail wedge, plus an input level history trace (bottom-up: silence at the
-// floor), a factory row of presets (Echo, Practice Hall, Auditorium,
+// tail wedge, plus an input level history trace (bottom-up: silence at
+// the floor), a factory row of presets (Echo, Practice Hall, Auditorium,
 // Opera House, Cathedral) and the knob row.
 // ---------------------------------------------------------------------------
 
 include!("effect_api.rs");
 
 // ---------------------------------------------------------------------------
-// Params
+// Params — indices are STICKY per script stem (chain rows persist by index;
+// appended params load as their descriptor default). 0..10 are the tier-1
+// set; `width` (11) was APPENDED by tier 5.
 // ---------------------------------------------------------------------------
 const P_TIME: usize = 0; // delay seconds (log range via slider range)
 const P_FEED: usize = 1; // delay feedback 0..0.95
@@ -39,19 +54,22 @@ const P_MIX: usize = 7; // wet mix 0..1
 const P_OUT: usize = 8; // output trim 0..2
 const P_ECHO: usize = 9; // echo-path level 0..1.5
 const P_VERB: usize = 10; // reverb-path level 0..1.5
-const NPARAMS: u32 = 11;
+const P_WIDTH: usize = 11; // tail width 0..2 (0 = exact-mono tail, 1 = banks split)
+const NPARAMS: u32 = 12;
 
 /// Factory presets — name + all params (same order as PARAMS).
 /// "Echo" is the plain dub-style effect (the old default); the rooms run
 /// echo LOW and reverb FULL so the FDN tail, not the slap, dominates —
 /// bright tight hall → auditorium → opera house → vast dark cathedral.
-/// (Time/feedbk shape the early slap, decay/damp the tail length/colour.)
+/// (Time/feedbk shape the early slap, decay/damp the tail length/colour,
+/// width the stereo image of the tail — rooms full, dub echo narrow.)
+/// THE HOST MIRRORS THESE (`builtin_presets("space_echo")` in src/fx.rs).
 const PRESETS: [(&str, [f32; NPARAMS as usize]); 5] = [
-    ("Echo", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5]),
-    ("Practice Hall", [0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0]),
-    ("Auditorium", [0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0]),
-    ("Opera House", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0]),
-    ("Cathedral", [0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0]),
+    ("Echo", [0.38, 0.62, 3600.0, 0.0, 0.6, 0.84, 2800.0, 0.4, 1.0, 1.0, 0.5, 0.6]),
+    ("Practice Hall", [0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0, 1.0]),
+    ("Auditorium", [0.14, 0.38, 5200.0, 0.1, 0.35, 0.84, 4500.0, 0.55, 0.95, 0.25, 1.0, 1.0]),
+    ("Opera House", [0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0, 1.0]),
+    ("Cathedral", [0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0, 1.0]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -205,30 +223,47 @@ impl Allpass {
 // ---------------------------------------------------------------------------
 use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-struct SpaceEcho {
-    sr: f64,
+/// One side of the modulated echo: its own delay line, damped feedback
+/// state, and in-loop DC blocker. Two instances = the input image survives
+/// the echo (a hard-panned source echoes to the side it came from).
+struct EchoPath {
     delay: Delay,
     /// one-pole damping state in the delay feedback loop
     tone_lp: f64,
-    tone_c: f64,
-    phase: f64, // LFO phase (radians)
+    blk: DcBlock,
+}
+
+struct SpaceEcho {
+    sr: f64,
+    /// echo per side (L, R) — see [`EchoPath`]
+    echo: [EchoPath; 2],
+    phase: f64, // LFO phase (radians) — shared, both heads of one tape
+    /// reverb comb banks: L keeps the tier-1 tunings verbatim (the v1
+    /// fallback must stay bit-identical), R is spread 3.1 % with offset
+    /// modulation phases so the banks never share modes — a MONO feed
+    /// still decorrelates the tail.
     combs: [Comb; 8],
-    /// comb-length modulation clock (radians)
+    combs_r: [Comb; 8],
+    /// comb-length modulation clock (radians), one clock, per-comb offsets
     vphase: f64,
+    /// The diffuser tunings are IDENTICAL between the banks on purpose:
+    /// at width = 0 both sides receive the same cross-sum, so the R chain
+    /// reproduces the L chain bit-for-bit once its buffers refresh — that
+    /// is what makes "width 0" an EXACT mono tail (pinned by
+    /// `tier5_space_echo_stereo_tail` in the host test suite).
     ap: [Allpass; 6],
-    /// reverb-input pre-damp (one-pole at the TONE cutoff): real rooms are
-    /// fed AIR-ROLLED sound, and raw dry/echo fizz into the comb bank is
-    /// where the "tinny" starts — filter before ringing, not after.
-    verb_lp: f64,
+    ap_r: [Allpass; 6],
+    /// reverb-input pre-damp (one-pole at the TONE cutoff) per side: real
+    /// rooms are fed AIR-ROLLED sound, and raw dry/echo fizz into the comb
+    /// bank is where the "tinny" starts — filter before ringing, not after.
+    verb_lp: [f64; 2],
     /// DC blockers on the two wet-path injections (see [`HP_FC`]): one on
-    /// the reverb feed (dry + echo copies), one on the echo read before it
-    /// re-enters the feedback loop and the wet echo tap.
-    verb_blk: DcBlock,
-    echo_blk: DcBlock,
+    /// each reverb feed (dry + echo copies). The echo loops carry their own
+    /// blockers in [`EchoPath`].
+    verb_blk: [DcBlock; 2],
     /// DC-blocker pole (see [`HP_FC`]); constant per instance.
     r_hp: f64,
-    /// comb lengths at sr=44.1 kHz; scaled by sr and by a 0.9..1.1 "room"
-    /// spread so the two banks don't share modes.
+    /// comb lengths at sr=44.1 kHz; scaled by sr (R bank × the mode spread)
     mix: f64,
     out: f64,
     gui_open: AtomicU32,
@@ -244,10 +279,17 @@ struct SpaceEcho {
 // mode density and smears the resonance into a wash; the 0.5 sum below
 // keeps the bank at the old level.
 const COMB_TUNE: [f64; 8] = [1116.0, 1188.0, 1277.0, 1356.0, 1422.0, 1491.0, 1557.0, 1617.0];
+/// Right-bank mode spread: every R comb is 3.1 % longer and its length-LFO
+// offset is shifted 2.3 rad, so identical feeds exit the banks decorrelated
+// within a few loop rounds (early reflections stay centred, the LATE tail
+// opens — which is how real stereo rooms read).
+const BANK_SPREAD: f64 = 1.031;
+const BANK_PHASE: f64 = 2.3;
 /// All-pass tunings (samples @ 44100). Six diffusers instead of the
 /// original four: more smear per unit of ring, and the two added lengths
 /// (672, 773) sit above the old top so the diffusion stays even up to
-/// ~2 kHz where the ear reads "metal".
+/// ~2 kHz where the ear reads "metal". IDENTICAL in both banks (see the
+/// [`SpaceEcho::ap`] comment — it is what makes width 0 exactly mono).
 const AP_TUNE: [f64; 6] = [225.0, 341.0, 441.0, 556.0, 672.0, 773.0];
 
 impl SpaceEcho {
@@ -256,19 +298,21 @@ impl SpaceEcho {
         let dl_n = (sr * 2.5) as usize + 16; // up to 2.5 s delay
         let scale = sr / 44100.0;
         let combs = COMB_TUNE.map(|t| Comb::new(t * scale, t)); // phase offset = tuning
+        let combs_r = COMB_TUNE.map(|t| Comb::new(t * scale * BANK_SPREAD, t + BANK_PHASE));
         let ap = AP_TUNE.map(|t| Allpass::new((t * scale) as usize + 1));
+        let ap_r = AP_TUNE.map(|t| Allpass::new((t * scale) as usize + 1));
+        let path = || EchoPath { delay: Delay::new(dl_n), tone_lp: 0.0, blk: DcBlock::ZERO };
         Self {
             sr,
-            delay: Delay::new(dl_n),
-            tone_lp: 0.0,
-            tone_c: 0.5,
+            echo: [path(), path()],
             phase: 0.0,
             combs,
+            combs_r,
             vphase: 0.0,
             ap,
-            verb_lp: 0.0,
-            verb_blk: DcBlock::ZERO,
-            echo_blk: DcBlock::ZERO,
+            ap_r,
+            verb_lp: [0.0; 2],
+            verb_blk: [DcBlock::ZERO; 2],
             r_hp: one_c(HP_FC, sr),
             mix: 0.4,
             out: 1.0,
@@ -347,20 +391,49 @@ const AIR_FC: f64 = 6500.0;
 /// Room-feed brightness cap in Hz (see the feed comment in `process`).
 const FEED_CAP_FC: f64 = 4200.0;
 
-
+/// v1 entry / graceful fallback: run the stereo circuit with the pair
+/// (x, x) and return the LEFT channel. At the default width=1 the L bank
+/// and L diffuser carry the tier-1/2 tunings verbatim, so the mono path is
+/// the historical circuit bit-for-bit (every pre-tier-5 forensic pin of
+/// this effect measures the same DSP it was calibrated on).
 extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32 {
+    let mut or = 0.0f32;
+    let ol = process_st(state, input, input, params, 0.0, &mut or);
+    ol
+}
+
+/// v2 entry: the vocoder-style sidechain key is not used here — ducking
+/// is internal by design (echo loop state feeds the room).
+extern "C" fn process_sc(
+    state: *mut core::ffi::c_void,
+    input: f32,
+    params: *const f32,
+    _sc: f32,
+) -> f32 {
+    process(state, input, params)
+}
+
+/// The v3 stereo step: real pair in, real pair out.
+extern "C" fn process_st(
+    state: *mut core::ffi::c_void,
+    l: f32,
+    r: f32,
+    params: *const f32,
+    _sc: f32,
+    out_r: *mut f32,
+) -> f32 {
     if state.is_null() {
-        return input;
+        unsafe { *out_r = r };
+        return l;
     }
     let st = unsafe { &mut *(state as *mut SpaceEcho) };
     let sr = st.sr;
     let g = |k: usize| unsafe { *params.add(k) };
-    let x = input as f64;
-    let x = if x.is_finite() { x } else { 0.0 };
+    let xs = [if l.is_finite() { l as f64 } else { 0.0 }, if r.is_finite() { r as f64 } else { 0.0 }];
 
     // Input level for the GUI meter (free when the editor is closed).
     if st.gui_open.load(Relaxed) != 0 {
-        let m = if x < 0.0 { -x } else { x };
+        let m = xs[0].max(xs[1]);
         let prev = f32::from_bits(st.in_peak.load(Relaxed)) as f64;
         let env = if m > prev { m } else { prev * 0.999 };
         st.in_peak.store((env as f32).to_bits(), Relaxed);
@@ -374,35 +447,43 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     let decay = (g(P_DECAY) as f64).clamp(0.5, 0.95);
     let echo_lvl = (g(P_ECHO) as f64).clamp(0.0, 1.5);
     let verb_lvl = (g(P_VERB) as f64).clamp(0.0, 1.5);
+    let width = (g(P_WIDTH) as f64).clamp(0.0, 2.0);
     st.mix += ((g(P_MIX) as f64).clamp(0.0, 1.0) - st.mix) * 0.01;
     st.out += ((g(P_OUT) as f64).clamp(0.0, 2.0) - st.out) * 0.01;
 
-    st.tone_c = one_c(g(P_TONE) as f64, sr);
+    let tone_c = one_c(g(P_TONE) as f64, sr);
     st.phase += core::f64::consts::TAU * rate / sr;
     if st.phase > core::f64::consts::TAU {
         st.phase -= core::f64::consts::TAU;
     }
     let w = 1.0 + wobble * 0.01 * st.phase.sin();
-    let d = (time_s * sr * w).clamp(1.0, (st.delay.buf.len() - 4) as f64);
+    let d = (time_s * sr * w).clamp(1.0, (st.echo[0].delay.buf.len() - 4) as f64);
 
-    let echoed_raw = st.delay.read(d);
-    // The DC blocker (see [`HP_FC`]) belongs INSIDE the loop, on the signal
-    // that re-enters feedback — never on the wet tap. On the read side it
-    // acts as a differentiator across the stored click step: every repeat
-    // of a transient re-sprouted a 2x edge spike at full tap level no
-    // matter how damped the loop was (the "high-pitched tick on each
-    // repeat after a drum hit"). Inside the loop it still cannot
-    // accumulate: the filter's output feeds the damped state, so subsonic
-    // content is drained once per round, and the tap hears the plain
-    // delayed copy — DC and all, exactly like the input it came from.
-    let damped_in = st.echo_blk.run(echoed_raw, st.r_hp);
-    // damped feedback loop
-    st.tone_lp = damped_in * (1.0 - st.tone_c) + st.tone_lp * st.tone_c;
-    if !st.tone_lp.is_finite() {
-        st.tone_lp = 0.0;
+    let mut echoed = [0.0f64; 2];
+    let mut tone = [0.0f64; 2];
+    for s in 0..2 {
+        let e = &mut st.echo[s];
+        let echoed_raw = e.delay.read(d);
+        // The DC blocker (see [`HP_FC`]) belongs INSIDE the loop, on the
+        // signal that re-enters feedback — never on the wet tap. On the
+        // read side it acts as a differentiator across the stored click
+        // step: every repeat of a transient re-sprouted a 2x edge spike at
+        // full tap level no matter how damped the loop was (the "high-
+        // pitched tick on each repeat after a drum hit"). Inside the loop
+        // it still cannot accumulate: the filter's output feeds the damped
+        // state, so subsonic content is drained once per round, and the
+        // tap hears the plain delayed copy — DC and all, exactly like the
+        // input it came from.
+        let damped_in = e.blk.run(echoed_raw, st.r_hp);
+        // damped feedback loop
+        e.tone_lp = damped_in * (1.0 - tone_c) + e.tone_lp * tone_c;
+        if !e.tone_lp.is_finite() {
+            e.tone_lp = 0.0;
+        }
+        e.delay.write(xs[s] + e.tone_lp * fb);
+        echoed[s] = echoed_raw;
+        tone[s] = e.tone_lp;
     }
-    st.delay.write(x + st.tone_lp * fb);
-    let echoed = echoed_raw;
 
     // ---- FDN reverb in parallel with the echo (fed from echo + dry) ----
     // 0.45 feed: rooms need the reverb to read as the ROOM, not as a faint
@@ -434,39 +515,65 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     // tone knob): real rooms are fed air-rolled sound, and even the dry
     // copy must not hand the bank the input's raw edge. Below the cap the
     // tone knob still voices the feed exactly as before.
-    let feed_c = st.tone_c.max(one_c(FEED_CAP_FC, sr));
-    st.verb_lp = st.verb_blk.run(st.tone_lp * 0.6 + x * 0.4, st.r_hp) * 0.45 * (1.0 - feed_c)
-        + st.verb_lp * feed_c;
-    if !st.verb_lp.is_finite() {
-        st.verb_lp = 0.0;
-    }
-    let verb_in = st.verb_lp;
+    let feed_c = tone_c.max(one_c(FEED_CAP_FC, sr));
     let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
     let air_c = 1.0 - one_c(AIR_FC, sr);
     // Room stretch: decay 0.5 → 1.0× comb length, decay 0.95 → ~1.95×.
     // Long tails through SHORT combs are the boxy, metallic "cathedral
     // prison" ring — the modes have to actually descend for the room.
     let room = 1.0 + ((decay - 0.5) / 0.45).clamp(0.0, 1.0) * 0.95;
-    // comb-length LFO: ~0.85 Hz, one clock, per-comb offsets from the tunings.
+    // comb-length LFO: ~0.85 Hz, one clock, per-comb offsets from the tunings
+    // (the R bank carries the extra BANK_PHASE shift — see [`BANK_SPREAD`]).
     st.vphase += core::f64::consts::TAU * 0.85 / sr;
     if st.vphase > core::f64::consts::TAU {
         st.vphase -= core::f64::consts::TAU;
     }
-    let mut sum = 0.0f64;
-    for c in st.combs.iter_mut() {
-        sum += c.process(verb_in, decay, damp_c, air_c, st.vphase, room);
+    let mut bank = [0.0f64; 2];
+    for s in 0..2 {
+        let feed = st.verb_blk[s].run(tone[s] * 0.6 + xs[s] * 0.4, st.r_hp) * 0.45 * (1.0 - feed_c)
+            + st.verb_lp[s] * feed_c;
+        if !feed.is_finite() {
+            st.verb_lp[s] = 0.0;
+            continue;
+        }
+        st.verb_lp[s] = feed;
+        let combs = if s == 0 { st.combs.iter_mut() } else { st.combs_r.iter_mut() };
+        for c in combs {
+            bank[s] += c.process(feed, decay, damp_c, air_c, st.vphase, room);
+        }
     }
-    let mut v = sum * 0.5;
+    // Tail cross-mix (the width knob): w=1 → each side hears only its own
+    // bank (full image), w=0 → both hear the same sum and, with identical
+    // diffuser tunings, the tails become bit-identical — exact mono.
+    let ca = 0.5 * (1.0 + width);
+    let cb = 0.5 * (1.0 - width);
+    let mut vl = (bank[0] * ca + bank[1] * cb) * 0.5;
+    let mut vr = (bank[1] * ca + bank[0] * cb) * 0.5;
     for a in st.ap.iter_mut() {
-        v = allpass(a, v, 0.5);
+        vl = allpass(a, vl, 0.5);
+    }
+    for a in st.ap_r.iter_mut() {
+        vr = allpass(a, vr, 0.5);
     }
 
-    let wet = echoed * echo_lvl + v * verb_lvl;
-    let o = x * (1.0 - st.mix) + wet * st.mix * st.out;
-    if !o.is_finite() {
+    let wet = [
+        echoed[0] * echo_lvl + vl * verb_lvl,
+        echoed[1] * echo_lvl + vr * verb_lvl,
+    ];
+    let ol = xs[0] * (1.0 - st.mix) + wet[0] * st.mix * st.out;
+    let orv = xs[1] * (1.0 - st.mix) + wet[1] * st.mix * st.out;
+    if !(ol.is_finite() && orv.is_finite()) {
+        // Reset LOOP FILTERS only — never zero the delay lines / comb rings
+        // on the audio thread (tier-4 rule: that is milliseconds of work).
+        for e in st.echo.iter_mut() {
+            e.tone_lp = 0.0;
+        }
+        st.verb_lp = [0.0; 2];
+        unsafe { *out_r = 0.0 };
         return 0.0;
     }
-    o as f32
+    unsafe { *out_r = orv as f32 };
+    ol as f32
 }
 
 // ---------------------------------------------------------------------------
@@ -584,14 +691,18 @@ extern "C" fn gui_draw(
             et += time;
             n += 1;
         }
-        // reverb tail wedge behind each echo, sized by decay
+        // reverb tail wedge behind each echo, sized by decay — drawn as an
+        // L/R pair (tier 5: the tail is a stereo device) straddling the
+        // echo line, spread by the width knob.
         let tail = (0.05_f32).max((decay.ln() / (0.95_f32).ln()).sqrt()) * time * 4.0;
+        let wsp = gp(P_WIDTH as u32) * 3.0;
         et = clk % time;
         for n in 0..6 {
             let amp = feed.powi(n as i32);
             let x = cw + 8.0 - et * px_per_s;
             let tl = (tail * px_per_s * amp).clamp(0.0, cw * 2.0);
-            (api.rect_filled)(c, x, midy - 2.0, tl, 4.0, 0.42, 0.60, 0.95, 0.10 + amp * 0.20);
+            (api.rect_filled)(c, x, midy - 4.0 - wsp, tl, 3.0, 0.42, 0.60, 0.95, 0.08 + amp * 0.16);
+            (api.rect_filled)(c, x, midy + 1.0 + wsp, tl, 3.0, 0.95, 0.60, 0.42, 0.08 + amp * 0.16);
             et += time;
         }
 
@@ -602,7 +713,7 @@ extern "C" fn gui_draw(
 
         // ---- knob row ----------------------------------------------------
         // (ky starts high in the strip: the preset row lives at its bottom.)
-        // Pitch 66 fits eleven knobs across the 760 px window.
+        // Pitch 61 fits twelve knobs across the 760 px window.
         let ky = canvas_h + 6.0;
         let row = |i: usize, label: &str, idx: usize, min: f32, max: f32, curve: f32, fmt: &str| {
             let mut v = gp(idx as u32);
@@ -615,7 +726,7 @@ extern "C" fn gui_draw(
                 _ => format!("{label} {v:.2}"),
             };
             let s = std::ffi::CString::new(shown).unwrap();
-            if (api.knob)(c, 12.0 + i as f32 * 66.0, ky + 18.0, 44.0, s.as_ptr(), &mut v, min, max, curve) != 0 {
+            if (api.knob)(c, 12.0 + i as f32 * 61.0, ky + 18.0, 44.0, s.as_ptr(), &mut v, min, max, curve) != 0 {
                 sp(idx as u32, v);
             }
         };
@@ -630,9 +741,10 @@ extern "C" fn gui_draw(
         row(8, "damp", P_DAMP, 200.0, 16000.0, 0.0, "khz");
         row(9, "mix", P_MIX, 0.0, 1.0, 1.0, "pct");
         row(10, "out", P_OUT, 0.0, 2.0, 1.0, "db");
+        row(11, "width", P_WIDTH, 0.0, 2.0, 1.0, "pct");
 
         // ---- factory presets ------------------------------------------
-        // One click applies all eleven params: plain echo, or a room with
+        // One click applies all twelve params: plain echo, or a room with
         // the reverb carrying the tail (echo low, verb full).
         let py = canvas_h + 96.0;
         let s = std::ffi::CString::new("presets:").unwrap();
@@ -650,8 +762,10 @@ extern "C" fn gui_draw(
 
 // ---------------------------------------------------------------------------
 // Descriptor + GUI tables + exports.
+// Tier 3/4 export quartet: a v3 script must export ALL prefix symbols
+// (mirror spread.rs / echo3.rs exactly); the loader validates the prefix.
 // ---------------------------------------------------------------------------
-static PARAMS: [EffectParamV1; 11] = [
+static PARAMS: [EffectParamV1; 12] = [
     EffectParamV1 { label: c"time".as_ptr(), min: 0.02, max: 2.4, default: 0.38 },
     EffectParamV1 { label: c"feedback".as_ptr(), min: 0.0, max: 0.95, default: 0.62 },
     EffectParamV1 { label: c"tone".as_ptr(), min: 200.0, max: 16000.0, default: 3600.0 },
@@ -663,19 +777,49 @@ static PARAMS: [EffectParamV1; 11] = [
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
     EffectParamV1 { label: c"echo".as_ptr(), min: 0.0, max: 1.5, default: 1.0 },
     EffectParamV1 { label: c"verb".as_ptr(), min: 0.0, max: 1.5, default: 1.0 },
+    EffectParamV1 { label: c"width".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
 ];
+
+const DESC_TEXT: &core::ffi::CStr =
+    c"Modulated echo and STEREO FDN reverb (Fruity Reeverb 2 / LuxeVerb task): per-side echo, dual decorrelated comb banks, tail width (0 = exact mono). Damped loops, wobble LFO, animated echo-pattern window, factory presets (plain echo + practice hall .. cathedral).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
     name: c"Echo + Reverb".as_ptr(),
     author: c"slooper".as_ptr(),
-    description:
-        c"Modulated echo and FDN reverb with independent echo/reverb levels; damped loops, wobble LFO, animated echo-pattern window, factory presets (plain echo + practice hall .. cathedral).".as_ptr(),
+    description: DESC_TEXT.as_ptr(),
     n_params: NPARAMS,
     params: PARAMS.as_ptr(),
     create,
     destroy,
     process,
+};
+
+pub static DESC2: EffectInfoV2 = EffectInfoV2 {
+    abi: SLOOPER_EFFECT_ABI_V2,
+    name: c"Echo + Reverb".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TEXT.as_ptr(),
+    n_params: NPARAMS,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+};
+
+pub static DESC3: EffectInfoV3 = EffectInfoV3 {
+    abi: SLOOPER_EFFECT_ABI_V3,
+    name: c"Echo + Reverb".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TEXT.as_ptr(),
+    n_params: NPARAMS,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
 };
 
 pub static GUI: EffectGuiV1 = EffectGuiV1 {
@@ -690,6 +834,16 @@ pub static GUI: EffectGuiV1 = EffectGuiV1 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
+    &DESC2
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
+    &DESC3
 }
 
 #[no_mangle]
