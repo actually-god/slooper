@@ -67,7 +67,7 @@ run live and in export.
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
 | **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** on/off checkbox + subdivision, **♫ Piano roll** (opens the [note editor](#piano-roll)), zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles; MIDI clips draw their **notes** right on the grid |
-| **Mixer** (right dock) | top band (level with the grid header, above Track 1): **master** peak meter + master volume row (−∞…+6 dB; editable dB box, slider and a **0** zeroize button); then one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll): **name · REC/STOP · on/mute · MREC · +/− child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button), an **FX** chip + enabled chain-slot buttons, and a **synth picker** + **sliders** — strips scroll in lockstep with the timeline |
+| **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll): **name · REC/STOP · on/mute · MREC · +/− child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button), an **FX** chip + enabled chain-slot buttons, and a **synth picker** + **sliders** — strips scroll in lockstep with the timeline. (The master volume/meters are NOT here — they live in the **master out** window, one place, one set of controls.) |
 | **Bottom** | MIDI monitor (every event on `slooper:midi_in`) |
 
 Each **mixer strip** holds the track's whole control surface: the name row
@@ -94,15 +94,29 @@ Every window — the four panels AND every tool/plugin window (piano roll,
 drum machine, master out, chain, synth, FX editor, plugin parameters) — is
 either **docked** into a screen edge or a **free-floating** window:
 
-- **Drag a title bar** to carry a window. Over a screen edge a band lights
-  up AND a **ghost slot shows exactly where the window will land and how
-  big it will be**; release there to dock (dropping further along an edge
-  re-orders the windows stacked there), release mid-screen to float.
+- **Drag a title bar** to carry a window. While over a dock edge ONE
+  blue **ghost slot** shows exactly where the window will land and how
+  big it will be — nothing else lights up; release inside it to dock
+  (dropping further along an edge re-orders the windows stacked there).
+  Carrying a DOCKED window to a different edge/slot just re-slots it;
+  releasing it away from every edge simply returns it to its slot —
+  moving inside the dock never undocks. (To make a docked window float:
+  its float button, the slot menu, or double-click the title.)
+- **Dock / float buttons**: every free window's title bar carries a
+  **dock** button (re-docks into its last slot); every docked header
+  carries a **float** button beside `–`/`x` (pulls it out as a free
+  window). Moving within the dock never requires undocking.
 - **Double-click a title bar** to toggle docked ⇄ floating.
 - **Right-click a title bar** for the slot menu: dock to any edge, float
   out, or close. (Docked headers answer right-click too.)
 - Resize a docked strip by dragging its inner divider (along the edge) or
   its outer edge (thickness); collapse with `–`, close with `x`.
+- **Windows shrink as small as you drag them.** A window never holds a
+  minimum size dictated by its contents — panels fold instead (the MIDI
+  monitor drops the hex tail then the log, master out folds its meter
+  column, headers shorten their titles) and whatever is left clips
+  inside. Tiny windows stay usable, and the bottom bar can hold every
+  window at once.
 - The top bar's **Windows** menu lists every window with a live checkmark,
   plus **dock all windows / float all windows / reset window layout**
   (stock slots, sizes and un-collapsed headers). The same three actions
