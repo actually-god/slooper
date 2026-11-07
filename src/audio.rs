@@ -4734,7 +4734,6 @@ impl ProcessHandler for Proc {
         // (first e2e to run a sidechain-consuming script on the SELECTED
         // track). Drive the monitor chain only while an input stream
         // exists — and per sample only while it (or its own tail) rings.
-        let mut monitor_live = false;
         let mut in_bufs: [*const f32; MAX_SLOTS] = [std::ptr::null(); MAX_SLOTS];
         let mut nin = 0usize;
         for s in 0..MAX_SLOTS {
@@ -4747,7 +4746,7 @@ impl ProcessHandler for Proc {
                 }
             }
         }
-        monitor_live = nin > 0;
+        let monitor_live = nin > 0;
         // Cache output buffers too: the stereo mix is computed once per
         // sample and written to every enabled slot according to its routing
         // — left bus, right bus, or the mono downmix (both bits).
@@ -5095,14 +5094,14 @@ impl ProcessHandler for Proc {
                         // v42 "p": preview take — tap the track bus right
                         // here (post-FX, post-trim, mono fold): exactly the
                         // contribution this track adds to the master.
-                        if any_pv && pv_mask & (1u128 << t) != 0 {
-                            if self.engine.rec_sample(t, (pl + pr) * F1S2)
-                                && self.rec_full & (1u128 << t) == 0
-                            {
-                                self.rec_full |= 1u128 << t;
-                                self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
-                                self.engine.mark_take_pending(t);
-                            }
+                        if any_pv
+                            && pv_mask & (1u128 << t) != 0
+                            && self.engine.rec_sample(t, (pl + pr) * F1S2)
+                            && self.rec_full & (1u128 << t) == 0
+                        {
+                            self.rec_full |= 1u128 << t;
+                            self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                            self.engine.mark_take_pending(t);
                         }
                         play_l += pl;
                         play_r += pr;

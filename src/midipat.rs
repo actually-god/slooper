@@ -636,7 +636,7 @@ mod tests {
                 ch: 0,
                 note: 60,
                 val: 50,
-                at: 0x10 + 0
+                at: 0x10
             }],
             "poly aftertouch captured into the poly lane"
         );
