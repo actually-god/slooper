@@ -8,11 +8,21 @@
 // mixer "sidechain in"). Each band's modulator envelope rides the same
 // band on the carrier; the band-sum is reshaped by `peakiness` — the
 // classic Vocodex "peak" knob.
+//
+// ABI v3 (tier 5b): carrier decorrelation, the Vocodex stereo role. ONE
+// shared modulator envelope per band (so the articulation can never
+// wobble the image); the CARRIER runs a per-side biquad per band and
+// the two rails interleave the bands with opposite signs — L weights
+// bands 0,2,4… by (1+spread), R by (1−spread), odd bands mirrored. The
+// side component is antisymmetric, so the mono downmix (L+R)/2 is the
+// historical mono circuit for ANY spread (pinned). spread 0 folds the
+// rails bit-exactly. The key keeps flowing as the `sc` argument of
+// process_st (tier-3b flag semantics).
 include!("effect_api.rs");
 
 const NBANDS: usize = 18;
 
-const NPARAMS: usize = 8;
+const NPARAMS: usize = 9;
 const P_ATT: usize = 0; //     0.5..50 ms envelope attack
 const P_REL: usize = 1; //     5..300 ms envelope release
 const P_PEAK: usize = 2; //    0.5..2.5 band reshaping
@@ -21,6 +31,7 @@ const P_FHI: usize = 4; //     3000..12000 Hz highest band
 const P_BRIGHT: usize = 5; //  -12..12 tilt on the summed output
 const P_MIX: usize = 6; //     0..1
 const P_OUT: usize = 7; //     0..2
+const P_SPREAD: usize = 8; //  0..1 band-interleave depth
 
 #[derive(Clone, Copy)]
 struct Biquad {
@@ -71,6 +82,7 @@ impl Biquad {
 struct Band {
     m: Biquad,
     c: Biquad,
+    cr: Biquad,
     env: f64,
 }
 
@@ -84,6 +96,9 @@ struct St {
     k_att: f32,
     k_rel: f32,
     lp: f64,
+    // Per-side tilt lowpasses for the ST path (the v2 mono path keeps `lp`).
+    lp_l: f64,
+    lp_r: f64,
 }
 
 #[inline]
@@ -114,7 +129,7 @@ fn rebuild(s: &mut St) {
     let q = (1.0 / (ratio - 1.0)).clamp(1.0, 12.0);
     if s.bands.len() != NBANDS {
         s.bands = vec![
-            Band { m: Biquad::BYPASS, c: Biquad::BYPASS, env: 0.0 };
+            Band { m: Biquad::BYPASS, c: Biquad::BYPASS, cr: Biquad::BYPASS, env: 0.0 };
             NBANDS
         ];
     }
@@ -130,6 +145,7 @@ fn rebuild(s: &mut St) {
         };
         mk(&mut s.bands[i].m);
         mk(&mut s.bands[i].c);
+        mk(&mut s.bands[i].cr);
     }
 }
 
@@ -145,6 +161,8 @@ extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
         k_att: 5.0,
         k_rel: 60.0,
         lp: 0.0,
+        lp_l: 0.0,
+        lp_r: 0.0,
     };
     rebuild(&mut st);
     Box::into_raw(Box::new(st)) as *mut core::ffi::c_void
@@ -244,6 +262,114 @@ extern "C" fn process_sc(
     o.clamp(-3.0, 3.0) as f32
 }
 
+/// The v3 stereo step: ONE shared modulator envelope per band rides a
+/// per-side carrier bank. The rails interleave band signs — L weights
+/// band i by (1 + spread·(−1)^i), R by (1 − spread·(−1)^i) — so the
+/// antisymmetric side component cancels in the mono downmix: (L+R)/2 is
+/// the historical mono circuit for ANY spread, while identical inputs at
+/// spread 0 fold BIT-exactly.
+extern "C" fn process_st(
+    state: *mut core::ffi::c_void,
+    l: f32,
+    r: f32,
+    params: *const f32,
+    sc: f32,
+    out_r: *mut f32,
+) -> f32 {
+    if state.is_null() {
+        unsafe { *out_r = r };
+        return l;
+    }
+    let s = unsafe { &mut *(state as *mut St) };
+    let att = unsafe { *params.add(P_ATT) };
+    let rel = unsafe { *params.add(P_REL) };
+    let peak = unsafe { *params.add(P_PEAK) } as f64;
+    let flo = unsafe { *params.add(P_FLO) };
+    let fhi = unsafe { *params.add(P_FHI) };
+    let bright = unsafe { *params.add(P_BRIGHT) } as f64;
+    let mix = unsafe { *params.add(P_MIX) } as f64;
+    let out = unsafe { *params.add(P_OUT) } as f64;
+    let spread = unsafe { *params.add(P_SPREAD) }.clamp(0.0, 1.0) as f64;
+
+    let car_l = if l.is_finite() { l as f64 } else { 0.0 };
+    let car_r = if r.is_finite() { r as f64 } else { 0.0 };
+    let mut modu = sc as f64;
+    if !modu.is_finite() {
+        modu = 0.0;
+    }
+    if !l.is_finite() {
+        // v1 semantics on the primary rail: a dead carrier zeroes envs.
+        for b in s.bands.iter_mut() {
+            b.env = 0.0;
+        }
+        unsafe { *out_r = 0.0 };
+        return 0.0;
+    }
+
+    if att != s.k_att {
+        s.k_att = att;
+        s.c_att = (-(1.0 / ((att.max(0.1) as f64) * 0.001 * s.sr))).exp();
+    }
+    if rel != s.k_rel {
+        s.k_rel = rel;
+        s.c_rel = (-(1.0 / ((rel.max(1.0) as f64) * 0.001 * s.sr))).exp();
+    }
+    if flo != s.k_flo || fhi != s.k_fhi {
+        s.k_flo = flo;
+        s.k_fhi = fhi;
+        rebuild(s);
+    }
+
+    // Per band: modulator envelope rides BOTH carrier banks from one
+    // shared envelope (an image must never wobble the articulation).
+    let mut sum_l = 0.0f64;
+    let mut sum_r = 0.0f64;
+    for (i, b) in s.bands.iter_mut().enumerate() {
+        let m = b.m.run(modu);
+        let ma = m.abs();
+        if ma > b.env {
+            b.env += (ma - b.env) * (1.0 - s.c_att);
+        } else {
+            b.env += (ma - b.env) * (1.0 - s.c_rel);
+        }
+        let w = if b.env <= 1e-9 {
+            0.0
+        } else if (peak - 1.0).abs() < 0.02 {
+            b.env
+        } else {
+            (peak * b.env.ln()).exp()
+        };
+        let sgn = if i % 2 == 0 { 1.0 } else { -1.0 };
+        sum_l += b.c.run(car_l) * w * (1.0 + spread * sgn);
+        sum_r += b.cr.run(car_r) * w * (1.0 - spread * sgn);
+    }
+
+    // Brightness tilt on each rail (linear one-poles => the downmix of
+    // the tilted rails equals the tilt of the downmix).
+    let clp = (-(core::f64::consts::TAU * 3000.0 / s.sr)).exp();
+    s.lp_l += (sum_l - s.lp_l) * (1.0 - clp);
+    s.lp_r += (sum_r - s.lp_r) * (1.0 - clp);
+    let tilt_l = if bright >= 0.0 {
+        sum_l + (sum_l - s.lp_l) * (bright / 6.0)
+    } else {
+        sum_l - (sum_l - s.lp_l) * (bright.abs() / 6.0) * 0.9
+    };
+    let tilt_r = if bright >= 0.0 {
+        sum_r + (sum_r - s.lp_r) * (bright / 6.0)
+    } else {
+        sum_r - (sum_r - s.lp_r) * (bright.abs() / 6.0) * 0.9
+    };
+
+    let ol = car_l * (1.0 - mix) + tilt_l * mix * out;
+    let orv = car_r * (1.0 - mix) + tilt_r * mix * out;
+    if !ol.is_finite() || !orv.is_finite() {
+        unsafe { *out_r = 0.0 };
+        return 0.0;
+    }
+    unsafe { *out_r = orv.clamp(-3.0, 3.0) as f32 };
+    ol.clamp(-3.0, 3.0) as f32
+}
+
 static PARAMS: [EffectParamV1; NPARAMS] = [
     EffectParamV1 { label: c"attack ms".as_ptr(), min: 0.5, max: 50.0, default: 5.0 },
     EffectParamV1 { label: c"release ms".as_ptr(), min: 5.0, max: 300.0, default: 60.0 },
@@ -253,13 +379,14 @@ static PARAMS: [EffectParamV1; NPARAMS] = [
     EffectParamV1 { label: c"brightness".as_ptr(), min: -12.0, max: 12.0, default: 0.0 },
     EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 1.0 },
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 1.1 },
+    EffectParamV1 { label: c"spread".as_ptr(), min: 0.0, max: 1.0, default: 0.5 },
 ];
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
     name: c"Vocoder".as_ptr(),
     author: c"slooper".as_ptr(),
-    description: c"18-band vocoder (ABI v2): this track's audio is the CARRIER, route a voice/synth via the mixer sidechain-in as MODULATOR.".as_ptr(),
+    description: c"18-band vocoder: this track's audio is the CARRIER, route a voice/synth via the mixer sidechain-in as MODULATOR. ABI v3: per-band carrier decorrelation (mono downmix unchanged).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -271,13 +398,27 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     abi: SLOOPER_EFFECT_ABI_V2,
     name: c"Vocoder".as_ptr(),
     author: c"slooper".as_ptr(),
-    description: c"18-band vocoder (ABI v2): this track's audio is the CARRIER, route a voice/synth via the mixer sidechain-in as MODULATOR.".as_ptr(),
+    description: c"18-band vocoder: this track's audio is the CARRIER, route a voice/synth via the mixer sidechain-in as MODULATOR. ABI v3: per-band carrier decorrelation (mono downmix unchanged).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
     destroy,
     process,
     process_sc,
+};
+
+pub static DESC3: EffectInfoV3 = EffectInfoV3 {
+    abi: SLOOPER_EFFECT_ABI_V3,
+    name: c"Vocoder".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: c"18-band vocoder: this track's audio is the CARRIER, route a voice/synth via the mixer sidechain-in as MODULATOR. ABI v3: per-band carrier decorrelation (mono downmix unchanged).".as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
 };
 
 #[no_mangle]
@@ -288,4 +429,9 @@ pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
     &DESC2
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
+    &DESC3
 }

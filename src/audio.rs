@@ -4725,6 +4725,16 @@ impl ProcessHandler for Proc {
         // Cache this cycle's input buffers (raw pointers are stable). Only
         // the connected slots are kept, compacted to the front, so the sample
         // loop iterates the live ones with no per-sample null checks.
+        // v42 MONITOR-STEAL FIX (tier-5b, docs/FL-SUITE.md): with NO input
+        // connected, the monitored chain used to run every sample on
+        // silence — through the SAME script instances the playback path
+        // uses. Narrow band/biquad state (vocoder banks) and envelope
+        // followers cannot survive 2x-rate (signal, 0, signal, 0...)
+        // interleaving; the vocoder's wet collapsed ~25x on the live bus
+        // (first e2e to run a sidechain-consuming script on the SELECTED
+        // track). Drive the monitor chain only while an input stream
+        // exists — and per sample only while it (or its own tail) rings.
+        let mut monitor_live = false;
         let mut in_bufs: [*const f32; MAX_SLOTS] = [std::ptr::null(); MAX_SLOTS];
         let mut nin = 0usize;
         for s in 0..MAX_SLOTS {
@@ -4737,6 +4747,7 @@ impl ProcessHandler for Proc {
                 }
             }
         }
+        monitor_live = nin > 0;
         // Cache output buffers too: the stereo mix is computed once per
         // sample and written to every enabled slot according to its routing
         // — left bus, right bus, or the mono downmix (both bits).
@@ -4971,6 +4982,7 @@ impl ProcessHandler for Proc {
         }
 
         let mut peak_val: u32 = 0;
+        let mut mon_pre = (0.0f32, 0.0f32);
         let mut pos_now = self.pos;
         for i in 0..n {
             // Output buffer writes beyond `block_n` (the auto-stop tail of a
@@ -5190,11 +5202,20 @@ impl ProcessHandler for Proc {
             let mut mon = (0.0f32, 0.0f32);
             let mon_i = mon_a + mon_s * i as f32;
             if sel_vst {
-                mon_buf[i] = src_in * mon_i;
-                mon_buf2[i] = src_in * mon_i;
-            } else {
+                if monitor_live {
+                    mon_buf[i] = src_in * mon_i;
+                    mon_buf2[i] = src_in * mon_i;
+                }
+            } else if monitor_live
+                && (src_in != 0.0
+                    || mon_pre.0 * mon_pre.0 + mon_pre.1 * mon_pre.1 > 1e-12)
+            {
+                // Runs only while input is present or the monitor's own
+                // tail still rings; otherwise the playback path stays the
+                // ONLY writer to the chain's script instances.
                 mon = self.fx_mix(sel, src_in * mon_i, 0.0);
             }
+            mon_pre = mon;
             let clickc = click * F1S2;
             // Pre-master, pre-gain mix; ports get written post-loop (once any
             // VST inserts have run). The output mix is NEVER delayed: what
@@ -5245,7 +5266,7 @@ impl ProcessHandler for Proc {
                     }
                 }
             }
-            if sel_vst {
+            if sel_vst && monitor_live {
                 let (buf, buf2, tmp) = (&mut mon_buf, &mut mon_buf2, &mut vst_tmp);
                 self.run_chain_block(sel, buf, buf2, tmp, &sc_empty);
                 for i in 0..n {

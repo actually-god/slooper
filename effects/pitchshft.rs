@@ -17,6 +17,14 @@
 // supplies the correction target and the GUI atomics. As in all FL
 // shifters, monophonic sources track best.
 //
+// ABI v3 (tier 5b): TWO delay lines, ONE modulation clock. The R rail
+// reads the same saw phase `spread × 0.5` periods further along (one
+// clock, two read heads — drift impossible, phaser precedent), through
+// its own delay line and tone LP. The detector tracks the MID, so
+// identical inputs measure bit-identically to the tier-3 mono circuit;
+// hard-panned material never crosses rails (each rail shifts its own
+// signal). spread 0 folds the rails bit-exactly.
+//
 // Params:
 //   mode        — 0 shift / 1 correct / 2 tune-only (quantised in process)
 //   semitones   — manual shift, -24..24 (used by mode 0, added in 1)
@@ -28,11 +36,12 @@
 //   gain        — output trim
 //   ref Hz      — A4 reference for detection/snapping (435..445)
 //   gate dB     — detector floor; below it nothing tracks (-70..-20)
+//   spread      — R-rail modulation-phase offset (x0.5 periods)
 // ---------------------------------------------------------------------------
 
 include!("effect_api.rs");
 
-const NPARAMS: usize = 10;
+const NPARAMS: usize = 11;
 const P_MODE: usize = 0;
 const P_SEMI: usize = 1;
 const P_FINE: usize = 2;
@@ -43,6 +52,7 @@ const P_WET: usize = 6;
 const P_GAIN: usize = 7;
 const P_REF: usize = 8;
 const P_GATE: usize = 9;
+const P_SPREAD: usize = 10;
 
 // --- shift core ---
 const MOD_BITS: usize = 14; // 16384-sample mod delay (0.34 s at 48k)
@@ -112,9 +122,12 @@ impl Dl {
 struct St {
     sr: f64,
     modl: Dl,
+    modr: Dl,
     phi: f64,
     lp1: Lp,
     lp2: Lp,
+    lp1r: Lp,
+    lp2r: Lp,
     // --- detector ---
     det: Vec<f32>, // decimated ring
     dwp: usize,
@@ -138,9 +151,12 @@ extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
     Box::into_raw(Box::new(St {
         sr,
         modl: Dl::new(MOD_BITS),
+        modr: Dl::new(MOD_BITS),
         phi: 0.0,
         lp1: Lp::new(a),
         lp2: Lp::new(a),
+        lp1r: Lp::new(a),
+        lp2r: Lp::new(a),
         det: vec![0.0f32; DET_SZ],
         dwp: 0,
         acc: 0.0,
@@ -229,9 +245,41 @@ fn yin(det: &[f32], dwp: usize, sr_d: f64, refa: f64) -> (f64, f64, f64) {
     (err, conf, f)
 }
 
+/// v1 entry: mono — LEFT of the pair is the tier-3 shifter.
 extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32 {
+    let mut or = input;
+    process_st(state, input, input, params, 0.0, &mut or)
+}
+
+/// v2 entry: mono bus — emit the mid of the two shifters.
+extern "C" fn process_sc(
+    state: *mut core::ffi::c_void,
+    input: f32,
+    params: *const f32,
+    _sc: f32,
+) -> f32 {
     if state.is_null() {
         return input;
+    }
+    let mut or = input;
+    let ol = process_st(state, input, input, params, 0.0, &mut or);
+    (ol + or) * 0.5
+}
+
+/// The v3 stereo step: two delay lines, ONE modulation clock (the R
+/// rail reads `spread × 0.5` periods further along), per-rail tone LP,
+/// a mid-driven detector shared by both rails.
+extern "C" fn process_st(
+    state: *mut core::ffi::c_void,
+    l: f32,
+    r: f32,
+    params: *const f32,
+    _sc: f32,
+    out_r: *mut f32,
+) -> f32 {
+    if state.is_null() {
+        unsafe { *out_r = r };
+        return l;
     }
     let s = unsafe { &mut *(state as *mut St) };
     let sr = s.sr;
@@ -246,8 +294,12 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     let gain = unsafe { *params.add(P_GAIN) }.clamp(0.0, 2.0) as f64;
     let refa = unsafe { *params.add(P_REF) }.clamp(435.0, 445.0) as f64;
     let gate_db = unsafe { *params.add(P_GATE) }.clamp(-70.0, -20.0) as f64;
+    let spread = unsafe { *params.add(P_SPREAD) }.clamp(0.0, 1.0) as f64;
 
-    let dry = if input.is_finite() { input } else { 0.0 };
+    let dry_l = if l.is_finite() { l } else { 0.0 };
+    let dry_r = if r.is_finite() { r } else { 0.0 };
+    // Detector/RMS ride the MID: identical inputs == the mono circuit.
+    let dry_m = (dry_l + dry_r) * 0.5;
 
     // --- tone LP (cutoff follows the `tone` slider, 600 Hz..18 kHz) ---
     let fc = 600.0f64 * (18000.0f64 / 600.0).powf(tone);
@@ -255,13 +307,17 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     let a = 1.0 - (-core::f64::consts::TAU * fc / sr).exp();
     s.lp1.a = a;
     s.lp2.a = a;
-    let x = s.lp2.run(s.lp1.run(dry as f64)) as f32;
+    s.lp1r.a = a;
+    s.lp2r.a = a;
+    let x_l = s.lp2.run(s.lp1.run(dry_l as f64)) as f32;
+    let x_r = s.lp2r.run(s.lp1r.run(dry_r as f64)) as f32;
+    let x_m = (x_l + x_r) * 0.5;
 
     // --- detector feed: decimate x8 by boxcar mean (null at the Nyquist
     // of the decimated rate — cheap anti-alias that kills the worst
     // folding band), hop = YIN_W/2 decimated samples ---
-    s.rms = s.rms * 0.999 + (dry as f64) * (dry as f64) * 0.001;
-    s.acc += x as f64;
+    s.rms = s.rms * 0.999 + (dry_m as f64) * (dry_m as f64) * 0.001;
+    s.acc += x_m as f64;
     s.dci += 1;
     if s.dci == DEC {
         s.dci = 0;
@@ -293,8 +349,9 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
         s.g_hz.store((s.hz_d as f32).to_bits(), Relaxed);
     }
 
-    // --- dual delay-line modulation shift ---
-    s.modl.push(x, MOD_MASK);
+    // --- dual delay-line modulation shift (per rail) ---
+    s.modl.push(x_l, MOD_MASK);
+    s.modr.push(x_r, MOD_MASK);
     let cents = if mode == 2 { 0.0 } else { s.shift_cents };
     let ratio = (2.0f64).powf(cents / 1200.0);
     let smag = (ratio - 1.0).abs();
@@ -308,30 +365,49 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
         s.phi -= 1.0;
     }
     let wet_s = if mode == 2 { 0.0 } else { wet };
-    let out = if wet_s <= 0.001 {
-        dry
+    let off_r = 0.5 * spread;
+    let out_l;
+    let out_rv;
+    if wet_s <= 0.001 {
+        out_l = dry_l;
+        out_rv = dry_r;
     } else {
         // Up-shift walks the delay DOWN (read chases write), down-shift
         // walks it UP; the two taps share the ramp half a period apart.
         let dir = if ratio < 1.0 { 1.0 } else { -1.0 };
-        let mut acc = 0.0f32;
+        let mut acc_l = 0.0f32;
+        let mut acc_r = 0.0f32;
         for tap in 0..2usize {
             let p = (s.phi + 0.5 * tap as f64) % 1.0;
             let win = (core::f64::consts::PI * p).sin();
             let win = (win * win) as f32;
             let d = MOD_D as f64 + dir * travel * (p - 0.5);
             let d = d.max(1.5).min(MOD_SZ as f64 - 2.0);
-            acc += win * s.modl.read(d, MOD_MASK);
+            acc_l += win * s.modl.read(d, MOD_MASK);
+            // R rail: same clock, read head offset — unity crossfade
+            // per side is preserved (the window is re-derived from the
+            // offset phase, not reused).
+            let pr = (p + off_r) % 1.0;
+            let winr = (core::f64::consts::PI * pr).sin();
+            let winr = (winr * winr) as f32;
+            let dr = MOD_D as f64 + dir * travel * (pr - 0.5);
+            let dr = dr.max(1.5).min(MOD_SZ as f64 - 2.0);
+            acc_r += winr * s.modr.read(dr, MOD_MASK);
         }
         let w = wet_s as f32;
-        dry * (1.0 - w) + acc * w
-    };
-    let y = out * gain as f32;
-    if y.is_finite() {
-        y
+        out_l = dry_l * (1.0 - w) + acc_l * w;
+        out_rv = dry_r * (1.0 - w) + acc_r * w;
+    }
+    let yl = out_l * gain as f32;
+    let yr = out_rv * gain as f32;
+    if yl.is_finite() && yr.is_finite() {
+        unsafe { *out_r = yr };
+        yl
     } else {
-        // NaN recovery: flush the delay line in place (no RT alloc).
+        // NaN recovery: flush both delay lines in place (no RT alloc).
         s.modl.b.iter_mut().for_each(|v| *v = 0.0);
+        s.modr.b.iter_mut().for_each(|v| *v = 0.0);
+        unsafe { *out_r = 0.0 };
         0.0
     }
 }
@@ -461,12 +537,13 @@ extern "C" fn gui_draw(
     sl!(7, 1, 3, 0.0, 2.0, c"gain".as_ptr(), 1.0);
     sl!(8, 0, 4, 435.0, 445.0, c"ref Hz".as_ptr(), 1.0);
     sl!(9, 1, 4, -70.0, -20.0, c"gate dB".as_ptr(), 1.0);
+    sl!(10, 1, 5, 0.0, 1.0, c"spread (R phase)".as_ptr(), 1.0);
 }
 
 pub static GUI: EffectGuiV1 = EffectGuiV1 {
     abi: SLOOPER_EFFECT_GUI_ABI,
     want_width: 430.0,
-    want_height: 240.0,
+    want_height: 336.0,
     create: gui_create,
     draw: gui_draw,
     destroy: gui_destroy,
@@ -483,6 +560,7 @@ static PARAMS: [EffectParamV1; NPARAMS] = [
     EffectParamV1 { label: c"gain".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
     EffectParamV1 { label: c"ref Hz".as_ptr(), min: 435.0, max: 445.0, default: 440.0 },
     EffectParamV1 { label: c"gate dB".as_ptr(), min: -70.0, max: -20.0, default: -55.0 },
+    EffectParamV1 { label: c"spread (R phase x180deg)".as_ptr(), min: 0.0, max: 1.0, default: 0.5 },
 ];
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
@@ -490,7 +568,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     name: c"pitch shifter".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Pitch shifter / chromatic corrector / tuner meter (Pitch Shifter, Pitcher and Tuner task). Internal YIN detector; mono sources track best.".as_ptr(),
+        c"Pitch shifter / chromatic corrector / tuner meter (Pitch Shifter, Pitcher and Tuner task). Internal YIN detector; mono sources track best. ABI v3: dual delay lines, R rail modulation-phase spread.".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -498,9 +576,48 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     process,
 };
 
+pub static DESC2: EffectInfoV2 = EffectInfoV2 {
+    abi: SLOOPER_EFFECT_ABI_V2,
+    name: c"pitch shifter".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description:
+        c"Pitch shifter / chromatic corrector / tuner meter (Pitch Shifter, Pitcher and Tuner task). Internal YIN detector; mono sources track best. ABI v3: dual delay lines, R rail modulation-phase spread.".as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+};
+
+pub static DESC3: EffectInfoV3 = EffectInfoV3 {
+    abi: SLOOPER_EFFECT_ABI_V3,
+    name: c"pitch shifter".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description:
+        c"Pitch shifter / chromatic corrector / tuner meter (Pitch Shifter, Pitcher and Tuner task). Internal YIN detector; mono sources track best. ABI v3: dual delay lines, R rail modulation-phase spread.".as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
+    &DESC2
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
+    &DESC3
 }
 
 #[no_mangle]
