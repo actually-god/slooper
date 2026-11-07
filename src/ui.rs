@@ -424,6 +424,12 @@ impl DrumMachine {
 #[derive(Clone, Copy)]
 struct RecSrc {
     audio: bool,
+    /// v42 "p": preview — bounce the track's PLAYBACK (its bus, post-FX)
+    /// to an audio asset while the transport runs.
+    preview: bool,
+    /// v42 "l": loop record — every pass of the timeline loop commits as
+    /// its own take, stacked as child clips, so the loop adds up live.
+    loop_rec: bool,
     midi: bool,
     auto: bool,
 }
@@ -1640,6 +1646,8 @@ impl App {
                     let a = cfg.rec_src.get(t).copied().unwrap_or([true, false, false]);
                     RecSrc {
                         audio: a[0],
+                        preview: cfg.rec_prev.get(t).copied().unwrap_or(false),
+                        loop_rec: cfg.rec_loop.get(t).copied().unwrap_or(false),
                         midi: a[1],
                         auto: a[2],
                     }
@@ -4134,6 +4142,8 @@ impl App {
                 .iter()
                 .map(|s| [s.audio, s.midi, s.auto])
                 .collect(),
+            rec_prev: self.rec_src.iter().map(|s| s.preview).collect(),
+            rec_loop: self.rec_src.iter().map(|s| s.loop_rec).collect(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
@@ -9841,6 +9851,8 @@ impl App {
         let auto = self.auto_rec.get(i).is_some_and(|a| a.armed);
         if rec || midi || auto {
             if rec {
+                // v42: STOP ends a loop for good (armed + live flags).
+                self.backend.engine.set_rec_loop(i, false);
                 self.toggle_record(i);
             }
             if midi {
@@ -9856,12 +9868,28 @@ impl App {
             Some(s) => *s,
             None => return,
         };
-        if !src.audio && !src.midi && !src.auto {
-            self.status = format!("track {}: tick a source (aud / mid / auto) first", i + 1);
+        if !src.audio && !src.preview && !src.loop_rec && !src.midi && !src.auto {
+            self.status = format!("track {}: tick a source (aud / prev / loop / mid / auto) first", i + 1);
             return;
         }
-        if src.audio {
+        // v42 "p": the preview take rides the SAME take buffer as the audio
+        // take — arm it via the engine's preview flag (snapshotted by
+        // start_rec). 'a' wins if both are ticked; the clash is announced.
+        if src.preview && src.audio {
+            self.status = format!("track {}: 'a' wins over 'p' — untick 'a' to preview", i + 1);
+        }
+        if src.preview && !src.audio && !src.loop_rec {
+            self.backend.engine.set_rec_preview(i, true);
             self.toggle_record(i);
+        } else if src.audio || src.loop_rec {
+            // v42 "l": a loop take IS an audio take + the loop flag; the
+            // RT commits one take per pass while the timeline wraps.
+            self.backend.engine.set_rec_loop(i, src.loop_rec);
+            self.toggle_record(i);
+            if src.loop_rec && !self.backend.engine.loop_tl() {
+                self.status =
+                    format!("track {}: loop record needs the LOOP button on", i + 1);
+            }
         }
         if src.midi {
             self.toggle_midi_rec(i);
@@ -9883,7 +9911,7 @@ impl App {
     /// A finished take becomes: optional content quantize → WAV into the
     /// primary rack folder (when set) → asset → clip placed at the take's
     /// start position, snapped to the snap grid.
-    fn take_pipeline(&mut self, track: usize, at: u64, data: Arc<[f32]>) {
+    fn take_pipeline(&mut self, track: usize, at: u64, data: Arc<[f32]>, preview: bool) {
         if track >= MAX_LOOPS {
             return;
         }
@@ -9897,7 +9925,8 @@ impl App {
         };
         let mut path = PathBuf::new();
         let mut dirty = true;
-        let name = format!("rec-t{}-{}", track + 1, Self::fstamp());
+        let stem = if preview { "preview" } else { "rec" };
+        let name = format!("{}-t{}-{}", stem, track + 1, Self::fstamp());
         if let Some(f) = self.rack.first_mut() {
             let dir = PathBuf::from(f.path.trim());
             if !dir.as_os_str().is_empty() {
@@ -9925,7 +9954,12 @@ impl App {
         let lane = self.arr.place_auto(track, Clip::new(id, pos), len);
         self.grow_for_lanes(track, nl0);
         self.push_project();
-        self.status = format!("track {}: recorded · clip in lane {}", track + 1, lane + 1);
+        self.status = format!(
+            "track {}: {} · clip in lane {}",
+            track + 1,
+            if preview { "preview bounced" } else { "recorded" },
+            lane + 1
+        );
     }
 
     /// Load (or reuse) an asset for a rack file path; returns its index.
@@ -10884,7 +10918,12 @@ impl App {
                     "transport stopped".into()
                 };
             }
-            Evt::Take { track, at, data } => self.take_pipeline(track, at, data),
+            Evt::Take {
+                track,
+                at,
+                data,
+                preview,
+            } => self.take_pipeline(track, at, data, preview),
 
             Evt::Midi(raw) => {
                 if let Some(msg) = MidiMsg::parse(&raw.bytes) {
@@ -15393,6 +15432,25 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                  playhead; recording over an occupied lane opens a child \
                  lane automatically",
             );
+        let pc = ui
+            .checkbox(&mut src.preview, "p")
+            .on_hover_text(
+                "PREVIEW take: bounces this track's PLAYBACK (its whole \
+                 post-effects bus, exactly what it adds to the mix) to an \
+                 audio asset — start the transport, play the MIDI through, \
+                 press STOP: the take lands as 'preview-…' + a clip. \
+                 Follows the transport; mutually exclusive with 'a'.",
+            );
+        let lc = ui
+            .checkbox(&mut src.loop_rec, "l")
+            .on_hover_text(
+                "LOOP record: keep recording across every pass of the \
+                 timeline loop — each pass commits as its own asset + clip \
+                 stacked on child lanes, so passes ADD UP by playback. \
+                 Stop (button or transport) ends the loop. Needs the LOOP \
+                 button on; records the raw input like 'a'.",
+            );
+        let lc = ac.clone();
         let mc = ui
             .checkbox(&mut src.midi, "m")
             .on_hover_text(
@@ -15407,7 +15465,7 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                  (track controls here; master controls go to the first \
                  armed track)",
             );
-        if ac.changed() || mc.changed() || xc.changed() {
+        if ac.changed() || pc.changed() || lc.changed() || mc.changed() || xc.changed() {
             app.rec_src[t] = src;
             app.save_config();
         }
@@ -27591,12 +27649,15 @@ mod tests {
                 key_ev(egui::Key::C, egui::Modifiers::COMMAND),
             ],
         );
-        // Real left-click on track 3's EMPTY grid area (x far right of the
-        // 3 s clip at 160 px/s). Settle a frame first so the props-strip
-        // shift is baked into grid_anchor before geometry is sampled.
+        // Real left-click on track 3's EMPTY grid area: x sits in the
+        // stable span between the clip's right edge (~510 px at 160 px/s)
+        // and the strip control cluster (which is right-anchored and moves
+        // as strip content grows — pins at 1100 broke twice on that).
+        // Settle a frame first so the props-strip shift is baked into
+        // grid_anchor before geometry is sampled.
         frame(&mut app, &ctx, vec![]);
         let top3 = app.grid_anchor - app.vscroll + 2.0 * (app.track_h(2) + TRACK_SEP_HIT);
-        let p = egui::pos2(1100.0, top3 + app.track_h(2) * 0.5);
+        let p = egui::pos2(800.0, top3 + app.track_h(2) * 0.5);
         frame(&mut app, &ctx, vec![moved(p)]);
         frame(
             &mut app,
@@ -30430,6 +30491,8 @@ mod tests {
         clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         app.rec_src[0] = RecSrc {
+            preview: false,
+            loop_rec: false,
             audio: true,
             midi: true,
             auto: true,
@@ -30537,12 +30600,79 @@ mod tests {
         }
     }
 
+    /// v42 "p": ticking ONLY preview arms the engine's preview flag before
+    /// the take command queues ('a' + 'p' together announces that 'a' wins).
+    /// Headless: the null backend never runs the audio callback, so like the
+    /// v29 pins we assert the synchronous arming, not the live take state.
+    #[test]
+    fn v42_preview_source_arms_preview_take() {
+        let mut app = headless_app("v42pvsrc");
+        app.sample_rate = 48_000;
+        app.rec_src[0] = RecSrc {
+            audio: false,
+            preview: true,
+            loop_rec: false,
+            midi: false,
+            auto: false,
+        };
+        app.toggle_record_all(0);
+        assert!(
+            app.backend.engine.rec_preview_armed(0),
+            "preview-only must arm the engine preview flag"
+        );
+        // Clash rule: 'a' wins, announced in the status line, and the
+        // preview flag must NOT be armed for track 1.
+        app.rec_src[1] = RecSrc {
+            audio: true,
+            preview: true,
+            loop_rec: false,
+            midi: false,
+            auto: false,
+        };
+        app.toggle_record_all(1);
+        assert!(app.status.contains("'a' wins over 'p'"), "{}", app.status);
+        assert!(
+            !app.backend.engine.rec_preview_armed(1),
+            "'a' + 'p' records audio, not preview"
+        );
+    }
+
+    /// v42 "l": ticking loop arms the engine loop flag and, without the
+    /// timeline loop on, says so; clearing mirrors the mixer's STOP.
+    #[test]
+    fn v42_loop_source_arms_loop_take() {
+        let mut app = headless_app("v42lpsrc");
+        app.sample_rate = 48_000;
+        app.backend.engine.set_loop_tl(false);
+        app.rec_src[0] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: true,
+            midi: false,
+            auto: false,
+        };
+        app.toggle_record_all(0);
+        assert!(
+            app.backend.engine.rec_loop_armed(0),
+            "loop tick must arm the engine loop flag"
+        );
+        assert!(
+            app.status.contains("LOOP button"),
+            "no timeline loop -> hint expected, got {}",
+            app.status
+        );
+        app.backend.engine.set_rec_loop(0, false);
+        assert!(!app.backend.engine.rec_loop_armed(0), "STOP clears the loop");
+    }
+
     /// v29: untick EVERYTHING and REC refuses with a hint instead of
     /// silently arming nothing.
     #[test]
     fn v29_record_button_needs_a_source() {
         let mut app = headless_app("v29recnone");
         app.rec_src[0] = RecSrc {
+            preview: false,
+            loop_rec: false,
             audio: false,
             midi: false,
             auto: false,
@@ -30566,6 +30696,8 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         app.selected = 1;
         app.rec_src[1] = RecSrc {
+            preview: false,
+            loop_rec: false,
             audio: false,
             midi: true,
             auto: false,

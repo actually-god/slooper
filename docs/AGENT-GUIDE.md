@@ -240,6 +240,15 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 
 - Commands/events: `Cmd::` / `Evt::` in `src/audio.rs` (take placement
   lands in the manager thread's `Evt::Take` handler)
+- Take sources (v42): the mixer's `a/p/l/m/x` ticks live in `RecSrc`
+  (`src/ui.rs`, persisted as `rec_src` + parallel `rec_prev`/`rec_loop`
+  bool vecs in config). Engine-side: `set_rec_preview`/`set_rec_loop`
+  arm flags snapshotted by `start_rec` (`rec_is_preview`/`rec_is_loop`
+  read the live snapshot; `*_armed` the arm flags). A PREVIEW take
+  captures the post-FX track bus (tap in the RT mix, transport-gated);
+  a LOOP take survives the timeline wrap — each wrap commits one pass
+  (`mark_take_pending`) and RT restarts capture ~50 ms later
+  (`lr_restart`), so passes stack as child clips. STOP clears both.
 - Clip/lane rules: `src/arrange.rs` (`insert`, `place_auto`, `remove_lane`)
   + edge drag in `src/ui.rs` (`ClipResize`, signed `new_cut`)
 - MIDI pattern IO: `Pattern::save_mid` / `Pattern::load_mid` (`src/midipat.rs`)
