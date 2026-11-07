@@ -991,6 +991,11 @@ pub struct App {
     /// code turned every header click into a snap decision, which made
     /// double-click-to-toggle impossible and taps feel slippery.
     drag_press_pt: [f32; 2],
+    /// v44 R3: whether the carried window lived in the dock at grab time.
+    /// A docked window released OUTSIDE any snap band simply returns to
+    /// its slot — carrying a docked window can never accidentally undock
+    /// it (that is what the title-bar float/dock buttons are for).
+    carry_was_docked: bool,
     dock_rects: Vec<[f32; 4]>,
     dock_collapsed: Vec<bool>,
     /// v35 R5: dynamic windows (plugin params, FX chain, synth, drums,
@@ -1594,6 +1599,7 @@ impl App {
             free_drag: None,
             drag_pos: [0.0; 2],
             drag_press_pt: [0.0; 2],
+            carry_was_docked: false,
             dock_rects: vec![[0.0; 4]; 4],
             dock_collapsed: vec![false; 4],
             dyn_wins: Vec::new(),
@@ -2840,7 +2846,9 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(ctx, |ui| self.params_body(ui, target, &entry));
+        let resp = w.show(ctx, |ui| {
+            body_clipped(ui, |ui| self.params_body(ui, target, &entry))
+        });
         if !open {
             self.params_win = None;
         }
@@ -3246,6 +3254,9 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
+        // v44: deliberately NOT wrapped in `body_clipped` — the plugin
+        // editor is a native window with its own WM-pinned size (v36);
+        // its content floor is the editor's real minimum.
         let resp = w.show(ui, |ui| self.fx_editor_body(ui, t, r));
         if !open {
             self.fx_editor = None;
@@ -5727,7 +5738,9 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(&ctx, |ui| self.drum_win_body(ui));
+        let resp = w.show(&ctx, |ui| {
+            body_clipped(ui, |ui| self.drum_win_body(ui))
+        });
         self.show_drums = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
@@ -5764,21 +5777,37 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(&ctx, |ui| self.master_out_body(ui));
+        let resp = w.show(&ctx, |ui| {
+            body_clipped(ui, |ui| self.master_out_body(ui))
+        });
         self.show_master = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
         }
     }
 
-    /// v39: MASTER OUT body — ONE body shared by the floating window and
-    /// the docked panel. Layout (wide): [volume] [L/R meters] [LUFS
-    /// numbers] [spectrum]; when narrow the spectrum drops to a second
-    /// full-width row. Every readout is the LIVE master output.
+    /// v39/v44 R4: MASTER OUT — THE master section (the mixer no longer
+    /// duplicates any of it). ONE body shared by the floating window and
+    /// the docked panel. Order of importance left to right:
+    /// `[volume / reset / peak] | [L/R meters] | [LUFS] [| spectrum]`, with
+    /// explicit fold rules so it degrades cleanly instead of sprawling:
+    /// the spectrum rides inline when there is width, drops below the
+    /// controls when there is height, and is simply hidden when there is
+    /// neither; a very narrow body keeps only momentary + integrated.
+    /// Every readout is the LIVE master output.
     fn master_out_body(&mut self, ui: &mut egui::Ui) {
         let wide = ui.available_width() >= 470.0;
-        let meter_h = (ui.available_height() - 26.0).clamp(56.0, 130.0);
-        let mut spec_rect = egui::Rect::NOTHING;
+        // Below this width the LUFS column keeps only the two numbers the
+        // user actually watches (momentary + integrated).
+        let lufs_lean = ui.available_width() < 330.0;
+        // Room for a second (spectrum) row under the controls: control band
+        // ~140 px + spectrum row ~90 px.
+        let tall = ui.available_height() >= 250.0;
+        let meter_h = if wide || tall {
+            (ui.available_height() - 26.0).clamp(56.0, 130.0)
+        } else {
+            56.0
+        };
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 master_volume_controls(ui, self);
@@ -5861,7 +5890,9 @@ impl App {
                     m,
                     "Momentary loudness (BS.1770 400 ms window) — the live reading.",
                 );
-                lufs_row(ui, "S", s, "Short-term loudness (3 s window).");
+                if !lufs_lean {
+                    lufs_row(ui, "S", s, "Short-term loudness (3 s window).");
+                }
                 lufs_row(
                     ui,
                     "I",
@@ -5869,12 +5900,14 @@ impl App {
                     "Integrated loudness since reset/start: gated mean (−70 LUFS absolute, \
                      −10 LU relative). Silence is excluded — EBU R 128 / Tech 3341.",
                 );
-                lufs_row(
-                    ui,
-                    "LRA",
-                    self.meter_lra,
-                    "Loudness range: P95−P10 of the gated short-term series (EBU Tech 3342).",
-                );
+                if !lufs_lean {
+                    lufs_row(
+                        ui,
+                        "LRA",
+                        self.meter_lra,
+                        "Loudness range: P95−P10 of the gated short-term series (EBU Tech 3342).",
+                    );
+                }
             });
             if wide {
                 ui.separator();
@@ -5883,17 +5916,15 @@ impl App {
                     Sense::hover(),
                 );
                 paint_spectrum(ui, self.meter_state.as_ref(), r2);
-                spec_rect = r2;
             }
         });
-        if !wide {
+        if !wide && tall {
             let h = (ui.available_height() - 8.0).max(46.0);
             let (r2, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width().max(150.0), h),
                 Sense::hover(),
             );
             paint_spectrum(ui, self.meter_state.as_ref(), r2);
-            let _ = spec_rect;
         }
     }
 
@@ -6183,7 +6214,11 @@ impl App {
             let mut w = egui::Window::new("Automation")
                 .id(egui::Id::new("dynwin-auto"))
                 .default_pos([190.0, 320.0])
-                .default_width(620.0)
+                // v44: explicit natural size (HEAD auto-expanded from
+                // content to ~685x459; a clipped body needs the defaults —
+                // 620 was too narrow and truncated the length DragValue).
+                .default_width(685.0)
+                .default_height(460.0)
                 .min_width(80.0)
                 .min_height(70.0)
                 .open(&mut open);
@@ -6197,6 +6232,7 @@ impl App {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
             let resp = w.show(ui.ctx(), |ui| {
+                body_clipped(ui, |ui| {
                 self.auto_inner(
                     ui,
                     &mut ed,
@@ -6208,6 +6244,7 @@ impl App {
                     bar_s,
                     &mut action,
                 )
+                });
             });
             if let Some(out) = resp.map(|r| r.response.rect) {
                 self.dyn_remember(idx, out);
@@ -7884,6 +7921,7 @@ impl App {
                 w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
             }
             resp = w.show(ui, |ui| {
+                body_clipped(ui, |ui| {
                 self.roll_inner(
                     ui,
                     &mut roll,
@@ -7899,6 +7937,7 @@ impl App {
                     &mut audition,
                     &mut placed,
                 )
+                });
             });
             if let Some(out) = resp.as_ref().map(|r| r.response.rect) {
                 self.dyn_remember(idx, out);
@@ -9079,7 +9118,7 @@ impl App {
         let mut w = egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
             .id(egui::Id::new(("synthwin", t)))
             .open(&mut open)
-            .default_size([320.0, 340.0])
+            .default_size([420.0, 430.0])
             .min_width(80.0)
             .min_height(70.0);
         if let Some(r) = self.dyn_rect(idx) {
@@ -9091,7 +9130,9 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(ui, |ui| self.synth_sliders_body(ui, t));
+        let resp = w.show(ui, |ui| {
+            body_clipped(ui, |ui| self.synth_sliders_body(ui, t))
+        });
         if !open {
             self.synth_win = None;
         }
@@ -9320,122 +9361,136 @@ impl App {
         let mut kit_changed = false;
         let mut remove_pad: Option<usize> = None;
         self.kit_drop_rects.retain(|(tt, _, _)| *tt != t);
+        // v44 R1: the pad list SCROLLS so the "+ add pad" control stays
+        // reachable when the window is too small for every row (HEAD let
+        // the whole window auto-grow instead). Inside a window body the
+        // available extent is INFINITE (the window's own scroll), so the
+        // viewport is bounded explicitly: everything but the label row,
+        // the toolbar and the add-row, floored so tiny frames still show
+        // a strip of pads.
+        let pad_list_h = (ui.available_height() - 150.0).max(88.0);
+        egui::ScrollArea::vertical()
+            .id_salt(("kitlist", t))
+            .max_height(pad_list_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
         for p in 0..kit.len() {
-            let rowr = ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut kit[p].name)
-                            .desired_width(56.0)
-                            .font(egui::TextStyle::Monospace),
-                    )
-                    .changed()
-                {
-                    kit_changed = true;
-                }
-                if ui
-                    .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
-                    .on_hover_text("Audition this pad")
-                    .clicked()
-                {
-                    let k = self
-                        .assets
-                        .iter()
-                        .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
-                    if let Some(k) = k {
-                        let v = kit[p].vel.max(1);
-                        self.audition_impulse(k, v);
+                let rowr = ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut kit[p].name)
+                                .desired_width(56.0)
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .changed()
+                    {
+                        kit_changed = true;
                     }
-                }
-                let cur_path = kit[p].asset_path.clone();
-                let label = cur_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("(sound)")
-                    .trim_end_matches(".wav")
-                    .to_string();
-                egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
-                    .selected_text(label)
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(cur_path.is_empty(), "(silent)")
-                            .clicked()
-                        {
-                            kit[p].asset_path.clear();
-                            kit[p].asset = None;
-                            kit_changed = true;
+                    if ui
+                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                        .on_hover_text("Audition this pad")
+                        .clicked()
+                    {
+                        let k = self
+                            .assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
+                        if let Some(k) = k {
+                            let v = kit[p].vel.max(1);
+                            self.audition_impulse(k, v);
                         }
-                        for (path, nm) in &audio_rows {
+                    }
+                    let cur_path = kit[p].asset_path.clone();
+                    let label = cur_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("(sound)")
+                        .trim_end_matches(".wav")
+                        .to_string();
+                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                        .selected_text(label)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(&cur_path == path, nm.as_str())
+                                .selectable_label(cur_path.is_empty(), "(silent)")
                                 .clicked()
                             {
-                                kit[p].asset_path = path.clone();
+                                kit[p].asset_path.clear();
                                 kit[p].asset = None;
                                 kit_changed = true;
                             }
-                        }
-                    });
-                let before_v = kit[p].vel;
-                let rv = ui
-                    .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
-                    .on_hover_text("Default paint velocity");
-                if p_changed(&rv, before_v, &mut kit[p].vel) {
-                    kit_changed = true;
+                            for (path, nm) in &audio_rows {
+                                if ui
+                                    .selectable_label(&cur_path == path, nm.as_str())
+                                    .clicked()
+                                {
+                                    kit[p].asset_path = path.clone();
+                                    kit[p].asset = None;
+                                    kit_changed = true;
+                                }
+                            }
+                        });
+                    let before_v = kit[p].vel;
+                    let rv = ui
+                        .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
+                        .on_hover_text("Default paint velocity");
+                    if p_changed(&rv, before_v, &mut kit[p].vel) {
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
+                                .min_size(egui::vec2(16.0, 18.0)),
+                        )
+                        .on_hover_text("Mute pad")
+                        .clicked()
+                    {
+                        kit[p].muted = !kit[p].muted;
+                        kit_changed = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                        .on_hover_text("Remove this pad")
+                        .clicked()
+                        && kit.len() > 1
+                    {
+                        remove_pad = Some(p);
+                    }
+                });
+                // v34 R5: every pad row is a drop target. IN-APP drags
+                // (rack rows carry the asset-index payload) land here
+                // directly; OS files are hit-tested centrally against
+                // the rect registered just below.
+                self.kit_drop_rects.push((t, p, rowr.response.rect));
+                let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                    || ui.input(|i| !i.raw.hovered_files.is_empty());
+                if armed {
+                    ui.painter().rect_stroke(
+                        rowr.response.rect,
+                        3.0,
+                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                        egui::StrokeKind::Inside,
+                    );
                 }
-                if ui
-                    .add(
-                        egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                            .min_size(egui::vec2(16.0, 18.0)),
-                    )
-                    .on_hover_text("Mute pad")
-                    .clicked()
+                if let Some(a) = rowr
+                    .response
+                    .interact(egui::Sense::hover())
+                    .dnd_release_payload::<usize>()
+                    .map(|a| *a)
                 {
-                    kit[p].muted = !kit[p].muted;
-                    kit_changed = true;
+                    if let Some(path) = self
+                        .assets
+                        .get(a)
+                        .map(|as_| as_.path.to_string_lossy().into_owned())
+                    {
+                        kit[p].asset_path = path;
+                        kit[p].asset = None;
+                        kit_changed = true;
+                        self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
+                    }
                 }
-                if ui
-                    .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
-                    .on_hover_text("Remove this pad")
-                    .clicked()
-                    && kit.len() > 1
-                {
-                    remove_pad = Some(p);
-                }
-            });
-            // v34 R5: every pad row is a drop target. IN-APP drags
-            // (rack rows carry the asset-index payload) land here
-            // directly; OS files are hit-tested centrally against
-            // the rect registered just below.
-            self.kit_drop_rects.push((t, p, rowr.response.rect));
-            let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
-                || ui.input(|i| !i.raw.hovered_files.is_empty());
-            if armed {
-                ui.painter().rect_stroke(
-                    rowr.response.rect,
-                    3.0,
-                    egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
-                    egui::StrokeKind::Inside,
-                );
             }
-            if let Some(a) = rowr
-                .response
-                .interact(egui::Sense::hover())
-                .dnd_release_payload::<usize>()
-                .map(|a| *a)
-            {
-                if let Some(path) = self
-                    .assets
-                    .get(a)
-                    .map(|as_| as_.path.to_string_lossy().into_owned())
-                {
-                    kit[p].asset_path = path;
-                    kit[p].asset = None;
-                    kit_changed = true;
-                    self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
-                }
-            }
-        }
+        });
         ui.horizontal(|ui| {
             let full = kit.len() >= DRUM_MAX_PADS;
             if ui
@@ -13511,9 +13566,53 @@ const SNAP_EDGE: f32 = 150.0;
 const SNAP_BOTTOM: f32 = 110.0;
 const WIN_HEAD_H: f32 = 27.0;
 const WIN_BTN_STRIP: f32 = 64.0;
+/// v44 R3: the title-bar dock/float toggle painted onto every FREE window
+/// (egui owns only collapse+close, so this one rides on the Foreground
+/// layer with its own geometry hit-test, same mechanism as the carry).
+const WIN_DOCK_BTN_W: f32 = 22.0;
 /// Height of the main-GUI header (`top_bar`); docked strips and the v43
 /// drop-slot ghost both start below it.
 const TOPBAR_H: f32 = 44.0;
+
+/// v44 R3: the free-window title-bar dock button rect for a window floating
+/// at `r` — immediately LEFT of egui's own collapse+close strip, which the
+/// header-carry hit-test already excludes. One function so the paint pass
+/// and the press hit-test can never disagree.
+fn win_dock_btn_rect(r: &[f32; 4]) -> egui::Rect {
+    let x1 = r[0] + r[2] - WIN_BTN_STRIP - 2.0;
+    egui::Rect::from_min_max(
+        egui::pos2(x1 - WIN_DOCK_BTN_W, r[1] + 4.0),
+        egui::pos2(x1, r[1] + WIN_HEAD_H - 5.0),
+    )
+}
+
+/// v44 R3: put floating window `idx` back into the dock at its LAST used
+/// edge/order slot (undocking never erases those fields); default edge if
+/// it never docked.
+fn dock_last(app: &mut App, idx: usize) {
+    if is_docked(app, idx) {
+        return;
+    }
+    if idx < 4 {
+        app.side_wins.dock[idx][0] = 1;
+    } else {
+        app.dyn_wins[idx - 4].dock[0] = 1;
+    }
+    app.dock_rects[idx] = [0.0; 4];
+    app.dock_collapsed[idx] = false;
+    app.side_dirty = true;
+    app.save_config();
+}
+
+/// v44 R3: float `idx` out at its docked rect (shared by the docked header
+/// button, the slot menu and the double-click toggle).
+fn float_out(app: &mut App, idx: usize) {
+    let r = app.dock_rects[idx];
+    undock_to(app, idx, [r[0], r[1]]);
+    app.dock_just_floated = Some(idx);
+    app.side_dirty = true;
+    app.save_config();
+}
 
 fn win_count(app: &App) -> usize {
     4 + app.dyn_wins.len()
@@ -13596,7 +13695,12 @@ fn def_w(idx: usize) -> f32 {
         0 => 340.0,
         1 => 300.0,
         2 => 520.0,
-        3 => 250.0,
+        // v44: was 250 — the dock used to end up ~361 wide only because
+        // the master section inside the mixer forced its content min that
+        // wide. With the master controls gone (R4) the band collapsed to
+        // 250 and every strip header row wrapped. Keep the COMFORTABLE
+        // default explicitly; windows can still shrink freely by hand.
+        3 => 360.0,
         _ => 440.0,
     }
 }
@@ -13925,7 +14029,8 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             let mut head =
                 egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
             if floats_only {
-                head.max.x -= WIN_BTN_STRIP; // never steal collapse/close
+                // never steal collapse/close or the v44 dock button
+                head.max.x -= WIN_BTN_STRIP + WIN_DOCK_BTN_W + 6.0;
             }
             if head.contains(pt) {
                 return Some(idx);
@@ -13968,9 +14073,7 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             app.dbl_dock_lock = now + 0.35;
             app.free_drag = None;
             if is_docked(app, idx) {
-                let r = app.dock_rects[idx];
-                undock_to(app, idx, [r[0], r[1]]);
-                app.dock_just_floated = Some(idx);
+                float_out(app, idx);
             } else {
                 let r = win_rect(app, idx);
                 let mid = egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
@@ -13981,7 +14084,28 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             app.side_dirty = true;
         }
     }
-    if pressed && down && app.free_drag.is_none() && !dbl {
+    // v44 R3: before ANY carry, a press on a free window's title-bar dock
+    // button re-docks that window and is consumed here (the carry never
+    // sees it). Geometry comes from the same `win_dock_btn_rect` the paint
+    // pass uses; topmost (highest idx) wins like the header loop below.
+    let mut btn_hit = false;
+    if pressed {
+        if let Some(p) = pos {
+            for idx in (0..win_count(app)).rev() {
+                if !win_visible(app, idx) || is_docked(app, idx) {
+                    continue;
+                }
+                let r = win_rect(app, idx);
+                if r[2] > 8.0 && win_dock_btn_rect(&r).expand(2.0).contains(p) {
+                    dock_last(app, idx);
+                    app.win_menu = None;
+                    btn_hit = true;
+                    break;
+                }
+            }
+        }
+    }
+    if pressed && down && app.free_drag.is_none() && !dbl && !btn_hit {
         // Iterate top-down (floats above docked; higher idx above lower)
         // so the visually topmost header wins the grab.
         let n = win_count(app);
@@ -13998,11 +14122,12 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             }
             let mut head =
                 egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
-            head.max.x -= WIN_BTN_STRIP; // never steal collapse/close
+            head.max.x -= WIN_BTN_STRIP + WIN_DOCK_BTN_W + 6.0; // buttons
             if head.contains(press_pos) {
                 app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
                 app.drag_pos = [r[0], r[1]];
                 app.drag_press_pt = [press_pos.x, press_pos.y];
+                app.carry_was_docked = is_docked(app, idx);
                 break;
             }
         }
@@ -14021,11 +14146,17 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
                 match snap_zone(vp, pt) {
                     Some(edge) => dock_at(app, idx, edge, pt),
                     None => {
-                        if is_docked(app, idx) {
-                            undock_to(app, idx, [pt.x - grab[0], pt.y - grab[1]]);
-                            app.dock_just_floated = Some(idx);
-                        } else {
-                            app.side_dirty = true;
+                        // v44 R3: a window grabbed FROM the dock released
+                        // off-band just returns to its slot — moving inside
+                        // the dock must never silently undock. Only windows
+                        // that were already free stay where they're dropped.
+                        if !app.carry_was_docked {
+                            if is_docked(app, idx) {
+                                undock_to(app, idx, [pt.x - grab[0], pt.y - grab[1]]);
+                                app.dock_just_floated = Some(idx);
+                            } else {
+                                app.side_dirty = true;
+                            }
                         }
                     }
                 }
@@ -14037,8 +14168,44 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
     }
 }
 
+/// v44 R1: a NON-size-propagating window body. egui's `Resize` measures the
+/// content's minimum size every frame and clamps the user's drag to it (and
+/// re-expands to it: `Resize::end` does `desired_size.max(last_content_size)`),
+/// which is why a subwindow could never shrink below its widest unbreakable
+/// row — the MIDI monitor's monospace lines made it the poster child. The
+/// body instead draws in a child ui that registers EXACTLY the rect it was
+/// offered, so a window's real minimum is its own `min_width`/`min_height`
+/// and over-long content CLIPS as a last resort. Bodies should additionally
+/// fold their optional rows away when small (fold first, clip later) — that
+/// pass is what keeps information visible until the window is truly too
+/// small, and clipping is only the backstop.
+fn body_clipped<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let rect = ui.available_rect_before_wrap().intersect(ui.max_rect());
+    if !rect.is_finite() {
+        // Unbounded region (e.g. inside a tall ScrollArea): there is no
+        // frame to clip to and the parent never size-clamps anyway — draw
+        // straight through.
+        return add(ui);
+    }
+    let layout = *ui.layout();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let out = add(&mut child);
+    // Register min(CONTENT, OFFERED): while the content FITS this is
+    // exactly the old propagation (auto-sized windows still expand and
+    // frames still wrap their contents); once the frame is too small,
+    // only the OFFERED size registers — the content minimum can never
+    // push back, and the body simply clips. Windows that open without a
+    // height default pass one (v44: the auto manager opens at 460),
+    // because a fresh wrapper would otherwise size to min_height.
+    let cmin = child.min_size();
+    let (w, h) = (rect.width().min(cmin.x), rect.height().min(cmin.y));
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(rect.min, egui::vec2(w, h)));
+    out
+}
+
 fn window_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
-    match idx {
+    body_clipped(ui, |ui| match idx {
         0 => rack_body(ui, app),
         1 => value_binds_body(ui, app),
         2 => monitor_body(ui, app),
@@ -14046,7 +14213,7 @@ fn window_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // v35 R5: dynamic windows paint the SAME body whether floating or
         // docked — one dispatch, no duplicated widgets.
         _ => dyn_body(ui, app, idx),
-    }
+    });
 }
 
 /// v35 R5: body dispatch for dynamic windows. Each kind shares ONE body
@@ -14124,16 +14291,46 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                 wr[2] = size;
             }
         }
+        // v44 R1: record the ALONG-edge size too. The cross rule above only
+        // latches real divider moves, but the along dimension is exactly the
+        // member's strip share — without persisting it, every reflow (a new
+        // neighbour arriving on the edge changes the panel-id salt) fed the
+        // stale FLOAT width (e.g. the monitor's 520) back as the fair-share
+        // default, snapping the window back huge and squeezing everyone else
+        // out of the strip ("can't fit other windows in the bottom bar").
+        // The along axis reserves nothing, so this cannot run away.
+        let (cur_a, size_a) = if cross {
+            (wr[2], r.width())
+        } else {
+            (wr[3], r.height())
+        };
+        if size_a > 16.0 && (cur_a - size_a).abs() > 2.0 {
+            if cross {
+                wr[2] = size_a;
+                if dragging_divider {
+                    app.side_dirty = true;
+                }
+            } else {
+                wr[3] = size_a;
+                if dragging_divider {
+                    app.side_dirty = true;
+                }
+            }
+        }
     }
     ui.horizontal(|ui| {
-        let title = ui.label(RichText::new(win_title(app, idx)).strong());
-        // v30-batch-2: one-stop dock menu on the header title — every
-        // window can be re-slotted (or floated out) without a precise
-        // drag; the drag-to-edge gesture stays as the quick path.
-        title.context_menu(|ui| {
-            let mut done = false;
-            window_slot_menu(ui, app, idx, &mut done);
-        });
+        // v44 R1: fold the header itself — the title gives way first, then
+        // the window buttons clip only at truly degenerate widths.
+        if r.width() > 90.0 {
+            let title = ui.label(RichText::new(win_title(app, idx)).strong());
+            // v30-batch-2: one-stop dock menu on the header title — every
+            // window can be re-slotted (or floated out) without a precise
+            // drag; the drag-to-edge gesture stays as the quick path.
+            title.context_menu(|ui| {
+                let mut done = false;
+                window_slot_menu(ui, app, idx, &mut done);
+            });
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .small_button("x")
@@ -14154,6 +14351,17 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
             {
                 app.dock_collapsed[idx] = !c;
                 app.side_dirty = true;
+            }
+            // v44 R3: dock/float toggle, right beside collapse and close.
+            if ui
+                .small_button("float")
+                .on_hover_text(
+                    "Take this window out of the dock as a free window \
+                     (the dock button on its title bar puts it back)",
+                )
+                .clicked()
+            {
+                float_out(app, idx);
             }
         });
     });
@@ -14526,53 +14734,109 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
         let vp = ui.ctx().input(|i| i.viewport_rect());
         let pt = ui.ctx().input(|i| i.pointer.interact_pos());
         if let Some(pt) = pt {
-            if let Some(edge) = snap_zone(vp, pt) {
-                let z = match edge {
-                    0 => {
-                        egui::Rect::from_min_max(vp.min, egui::pos2(vp.min.x + SNAP_EDGE, vp.max.y))
-                    }
-                    1 => {
-                        egui::Rect::from_min_max(egui::pos2(vp.max.x - SNAP_EDGE, vp.min.y), vp.max)
-                    }
-                    3 => egui::Rect::from_min_max(
-                        vp.min,
-                        egui::pos2(vp.max.x, vp.min.y + SNAP_BOTTOM),
-                    ),
-                    _ => egui::Rect::from_min_max(
-                        egui::pos2(vp.min.x, vp.max.y - SNAP_BOTTOM),
-                        vp.max,
-                    ),
-                };
+            // v44 R2: exactly ONE overlay while carrying — the predicted
+            // slot itself. The old full-edge band highlight next to the
+            // slot box read as two competing ghosts ("which one is where
+            // it lands?"); the slot IS the precise answer, so it is alone.
+            if let (Some(edge), Some(idx)) = (snap_zone(vp, pt), carried) {
+                let g = dock_slot_rect(app, idx, edge, pt, vp);
                 let lid =
                     egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-zone-hl"));
                 let p = ui.ctx().layer_painter(lid);
-                p.rect_filled(
-                    z,
-                    0.0,
-                    Color32::from_rgb(120, 190, 255).linear_multiply(0.12),
-                );
+                p.rect_filled(g, 3.0, Color32::from_rgb(150, 215, 255).linear_multiply(0.22));
                 p.rect_stroke(
-                    z,
-                    0.0,
-                    egui::Stroke::new(2.5, Color32::from_rgb(120, 190, 255)),
+                    g,
+                    3.0,
+                    egui::Stroke::new(2.0, Color32::from_rgb(150, 215, 255)),
                     egui::StrokeKind::Inside,
                 );
-                // v43 R1: the PREDICTED SLOT inside the band — where and
-                // how big the window will end up if released right now.
-                if let Some(idx) = carried {
-                    let g = dock_slot_rect(app, idx, edge, pt, vp);
-                    p.rect_filled(
-                        g,
-                        4.0,
-                        Color32::from_rgb(150, 215, 255).linear_multiply(0.25),
-                    );
-                    p.rect_stroke(
-                        g,
-                        4.0,
-                        egui::Stroke::new(2.0, Color32::from_rgb(150, 215, 255)),
-                        egui::StrokeKind::Inside,
-                    );
-                }
+            }
+        }
+    }
+    // v44 R3: the dock button on every FREE window's title bar, immediately
+    // left of egui's collapse+close. Painted on a Foreground layer with a
+    // geometry hit-test in `free_drag_pass` (same mechanism as the carry):
+    // egui 0.36 windows cannot host widgets in their title bar.
+    {
+        let hover = ui.ctx().input(|i| i.pointer.interact_pos());
+        let p = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("win-dock-btn"),
+        ));
+        let fid = ui.style().text_styles[&egui::TextStyle::Small].clone();
+        for idx in 0..n {
+            if !win_visible(app, idx) || is_docked(app, idx) || carried == Some(idx) {
+                continue;
+            }
+            let r = win_rect(app, idx);
+            if r[2] < 8.0 {
+                continue;
+            }
+            let br = win_dock_btn_rect(&r);
+            let hot = hover.map(|h| br.expand(2.0).contains(h)).unwrap_or(false);
+            let (fill, stroke) = if hot {
+                (
+                    Color32::from_rgb(70, 96, 128),
+                    egui::Stroke::new(1.2, Color32::from_rgb(150, 215, 255)),
+                )
+            } else {
+                (
+                    Color32::from_rgb(48, 52, 60),
+                    egui::Stroke::new(1.0, Color32::from_gray(110)),
+                )
+            };
+            p.rect_filled(br, 3.0, fill);
+            p.rect_stroke(
+                br,
+                3.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            // Vector icon: a pane docking into the right edge of a frame
+            // (arrow/pictogram glyphs outside the bundled fonts render as
+            // tofu — shapes only, per the glyph-coverage rule).
+            let ic = br.shrink(4.0);
+            p.rect_stroke(
+                ic,
+                0.0,
+                egui::Stroke::new(1.2, Color32::from_gray(220)),
+                egui::StrokeKind::Inside,
+            );
+            let bar_w = ic.width() * 0.32;
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(ic.max.x - bar_w, ic.min.y),
+                    ic.max,
+                ),
+                0.0,
+                Color32::from_rgb(150, 215, 255),
+            );
+            if hot {
+                let msg = "dock into the last slot";
+                let tw = p.fonts_mut(|f| {
+                    let fid = fid.clone();
+                    msg.chars()
+                        .map(|c| f.glyph_width(&fid, c))
+                        .sum::<f32>()
+                });
+                let tr = egui::Rect::from_min_size(
+                    egui::pos2(br.min.x - 2.0, br.max.y + 6.0),
+                    egui::vec2(tw + 10.0, 18.0),
+                );
+                p.rect_filled(tr, 3.0, Color32::from_rgb(24, 26, 30));
+                p.rect_stroke(
+                    tr,
+                    3.0,
+                    egui::Stroke::new(1.0, Color32::from_gray(90)),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    tr.center() + egui::vec2(0.0, 1.0),
+                    egui::Align2::CENTER_CENTER,
+                    msg,
+                    fid.clone(),
+                    Color32::from_gray(210),
+                );
             }
         }
     }
@@ -16033,62 +16297,11 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
     }
 }
 
-/// v39: the mixer's master header — controls via the shared
-/// `master_volume_controls`, then a compact STEREO peak meter (was a
-/// single mono bar) and a live integrated-LUFS number next to it. The
-/// full pro section (vertical meters, M/S/I/LRA, spectrum) lives in the
-/// MASTER OUT panel.
-fn master_strip(ui: &mut egui::Ui, app: &mut App) {
-    ui.spacing_mut().item_spacing.x = 5.0;
-    master_volume_controls(ui, app);
-    // Live integrated loudness, next to the meter it belongs to.
-    let i_txt = match app.meter_i {
-        Some(v) if v > -99.0 => format!("I {:5.1}", v),
-        _ => "I    —".into(),
-    };
-    ui.label(
-        RichText::new(i_txt)
-            .monospace()
-            .small()
-            .color(Color32::from_rgb(150, 150, 158)),
-    )
-    .on_hover_text(
-        "Integrated loudness (EBU R 128 / BS.1770 gating) of the master \
-         output. Momentary/short-term readings + LRA + spectrum: MASTER OUT panel.",
-    );
-    // Peak meter last: it absorbs whatever width is left, so the fixed
-    // widgets (slider, dB readout, zeroize) can never be clipped off the
-    // edge when the mixer dock is narrow.
-    let meter_w = (ui.available_width() - ui.spacing().item_spacing.x).max(12.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(meter_w, 8.0), Sense::hover());
-    let painter = ui.painter();
-    let (lp, rp) = match app.meter_state.as_ref() {
-        Some(ms) => (ms.l_peak, ms.r_peak),
-        None => (app.peak_disp, app.peak_disp),
-    };
-    for (i, amp) in [(0usize, lp), (1, rp)] {
-        let row = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x, rect.min.y + i as f32 * 4.0),
-            egui::vec2(rect.width(), 3.5),
-        );
-        painter.rect_filled(row, 1.0, Color32::from_rgb(40, 40, 45));
-        let frac = (amp * 0.9).clamp(0.0, 1.0);
-        let color = if amp > 0.99 {
-            Color32::RED
-        } else if amp > 0.7 {
-            Color32::YELLOW
-        } else {
-            Color32::LIGHT_GREEN
-        };
-        if frac > 0.01 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(row.min, egui::vec2(row.width() * frac, row.height())),
-                1.0,
-                color,
-            );
-        }
-    }
-}
+// v44 R4: the mixer's embedded master strip was REMOVED from here — it
+// duplicated the MASTER OUT window (both carried master volume + a meter,
+// and the mixer copy could not hold the loudness readouts anyway). MASTER
+// OUT (top-bar "Meter", Windows ▸ master out) is now the one master
+// section; it docks beside the mixer out of the box.
 
 fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
     // v30-batch-2: the dock/window header carries the title, so
@@ -16136,17 +16349,18 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             base.min.y
         }
     } else {
-        // Independent mode: right below the master band.
-        base.min.y + 44.0
+        // Independent mode: strips start at the panel top (v44 R4: the
+        // master band that used to occupy this space is gone).
+        base.min.y + 8.0
     };
     let scroll_y = if tied { app.vscroll } else { free_scroll };
     let mut y = top - scroll_y;
     // Master strip in the header band: from the panel header down
     // to where the track stack begins — the band level with the
-    // timeline grid header, directly above the Track 1 strip.
-    // The band gets an OPAQUE backdrop that belongs to it: without
-    // one, scrolled track-strip widgets show through the transparent
-    // header and overlay the master controls (user report).
+    // timeline grid header. v44 R4: the band is now EMPTY — the old
+    // embedded master strip duplicated the MASTER OUT window (volume,
+    // meter, loudness twice). The band keeps its opaque backdrop: it
+    // hides track strips scrolling up through the header area.
     let band_bottom = top.max(base.min.y);
     if band_bottom - base.min.y > 24.0 {
         let band = egui::Rect::from_min_max(
@@ -16159,13 +16373,6 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             band.x_range(),
             band.bottom() - 0.5,
             egui::Stroke::new(1.0, Color32::from_gray(64)),
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .id_salt("masterstrip")
-                .max_rect(band)
-                .layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(false)),
-            |ui| master_strip(ui, app),
         );
     }
     // Track strips may only paint BELOW the band — their absolute
@@ -16488,7 +16695,9 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
     }
-    let resp = w.show(ui, |ui| synth_pick_body(ui, app, t));
+    let resp = w.show(ui, |ui| {
+        body_clipped(ui, |ui| synth_pick_body(ui, app, t))
+    });
     if !open {
         app.synth_pick = None;
     }
@@ -19585,7 +19794,11 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
             .open(&mut open)
             .min_width(240.0)
             .min_height(120.0)
-            .default_height(480.0);
+            // v44: HEAD auto-sized this window to its content's DESIRED
+            // extent (measured 617x630 fresh: slot list + add-row + rescan);
+            // the clipped body propagates only mins, so pin the natural
+            // opening size. Users may now shrink freely below it (R1).
+            .default_size([617.0, 630.0]);
     if let Some(r) = app.dyn_rect(idx) {
         w = w
             .default_pos([r[0], r[1]])
@@ -19595,7 +19808,9 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
     }
-    let resp = w.show(ui, |ui| chain_win_body(ui, app, loop_i));
+    let resp = w.show(ui, |ui| {
+        body_clipped(ui, |ui| chain_win_body(ui, app, loop_i))
+    });
     if !open {
         app.fx_window = None;
     }
@@ -20081,13 +20296,36 @@ fn port_list_lr(
     }
 }
 
+/// v44 R1: truncate `s` to roughly `px` CSS px of the monospace style
+/// (measured, not guessed) with a `…` tail. Used by bodies that must STAY
+/// readable when their window is squeezed — the fold happens before the
+/// clip, so the row's leading (most important) text survives.
+fn fit_mono(ui: &egui::Ui, s: &str, px: f32) -> String {
+    let fid = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
+    let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&fid, '0')).max(1.0);
+    let maxc = (px / cw).floor() as usize;
+    let n = s.chars().count();
+    if maxc < 2 || n <= maxc {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(maxc - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
     // v25: ONE honest state line instead of a static paragraph.
     // It says what the monitor sees RIGHT NOW; the pw-link
     // instructions moved to its tooltip so the dock stops reading
     // like a wall of documentation.
-    ui.horizontal(|ui| {
-        let _ = ();
+    //
+    // v44 R1 (fold first, clip later): the monitor is the window users
+    // park in the bottom bar, so every row degrades by WIDTH instead of
+    // forcing the window wide — status text wraps, the hex tail and the
+    // source list give way when narrow, and log lines truncate with the
+    // timestamp + event name (the part you read) always intact.
+    let wide = ui.available_width() >= 430.0;
+    ui.horizontal_wrapped(|ui| {
         let (state, warn) = match (&app.last_midi, app.midi_sources.is_empty()) {
             (Some(_), false) => (
                 format!(
@@ -20124,16 +20362,18 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
                      automatically (manually: pw-link 'your-midi-port' 'slooper:midi_in'). \
                      Detected input is also printed to stdout.",
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("Clear")
-                .on_hover_text("empty the monitor log")
-                .clicked()
-            {
-                app.midi_log.clear();
-                app.last_midi = None;
-            }
-        });
+    });
+    // v44: Clear rides its own row when the status text ate the width
+    // (it is one click either way; clipping it away would be worse).
+    ui.horizontal(|ui| {
+        if ui
+            .small_button("Clear")
+            .on_hover_text("empty the monitor log")
+            .clicked()
+        {
+            app.midi_log.clear();
+            app.last_midi = None;
+        }
     });
 
     if let Some(last) = &app.last_midi {
@@ -20144,23 +20384,35 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("[{}]  last:", last.ts))
+                        RichText::new(format!("[{}]", last.ts))
                             .weak()
                             .monospace(),
                     );
                     ui.label(RichText::new(last.type_name).strong().monospace());
-                    ui.label(RichText::new(&last.describe).monospace());
-                    ui.separator();
+                    let name_w = ui.available_width();
                     ui.label(
-                        RichText::new(format!("| {}", last.raw_hex))
-                            .weak()
-                            .monospace(),
+                        RichText::new(if wide {
+                            last.describe.clone()
+                        } else {
+                            fit_mono(ui, &last.describe, (name_w * 0.55).max(40.0))
+                        })
+                        .monospace(),
                     );
+                    // The raw bytes are debugging detail — a narrow
+                    // monitor drops them first (v44 fold order).
+                    if wide {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("| {}", last.raw_hex))
+                                .weak()
+                                .monospace(),
+                        );
+                    }
                 });
             });
     }
 
-    if !app.midi_sources.is_empty() {
+    if !app.midi_sources.is_empty() && wide {
         ui.add_space(4.0);
         ui.label(
             RichText::new("sources auto-linked to slooper:midi_in")
@@ -20183,15 +20435,25 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
         .show(ui, |ui| {
             // Newest first (log is push_front).
             for line in app.midi_log.iter() {
+                // One budgeted row: ts + name are sacred, describe
+                // truncates, hex rides only when wide (v44 R1).
+                let avail = ui.available_width();
+                let desc_w = (avail - 190.0 - if wide { 110.0 } else { 0.0 }).max(50.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("[{}]", line.ts)).weak().monospace());
                     ui.label(RichText::new(line.type_name).monospace());
-                    ui.label(RichText::new(&line.describe).weak().monospace());
                     ui.label(
-                        RichText::new(format!("| {}", line.raw_hex))
+                        RichText::new(fit_mono(ui, &line.describe, desc_w))
                             .weak()
                             .monospace(),
                     );
+                    if wide {
+                        ui.label(
+                            RichText::new(format!("| {}", line.raw_hex))
+                                .weak()
+                                .monospace(),
+                        );
+                    }
                 });
             }
         });
@@ -22039,12 +22301,30 @@ mod tests {
         assert!(app.value_dialog.is_none(), "dialog closes on apply");
 
         // Zeroize button (checked LAST: its click is exactly the prior-click
-        // that poisons headless double-click accounting above): the first
-        // painted "0" galley is the mixer dock's master strip — panels draw
-        // in add order and the master strip precedes every track strip.
+        // that poisons headless double-click accounting above). v44 R4: the
+        // master controls live ONLY in MASTER OUT now — pick the "0" that
+        // sits inside its area; the mixer's track strips paint "0" buttons
+        // too, and resetting one of those must not count.
         app.master_midi = 50;
         frame(&mut app, &ctx, vec![]);
-        let z = label_center(&mut app, &ctx, "0").expect("a \"0\" button is painted");
+        let mi = 4 + app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Master)
+            .expect("master registered");
+        let dr = app.dock_rects[mi];
+        let r = if dr[2] > 8.0 {
+            dr
+        } else {
+            win_rect(&app, mi)
+        };
+        let z = galley_centers(&mut app, &ctx, "0", true)
+            .into_iter()
+            .find(|c| {
+                egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], r[3]))
+                    .contains(*c)
+            })
+            .expect("MASTER OUT's \"0\" zeroize button is painted");
         frame(
             &mut app,
             &ctx,
@@ -27343,7 +27623,9 @@ mod tests {
             "press on a dynamic window title arms the carry"
         );
 
-        // Mid-air over the right zone: the blue snap outline must paint.
+        // Mid-air over the right zone: the predicted-slot ghost must paint
+        // (v44 R2: it is the ONLY overlay — the full-edge band highlight
+        // was removed, so the assertion targets the ghost's color).
         let dst = egui::pos2(1380.0, 400.0);
         frame(&mut app, &ctx, vec![moved(from + (dst - from) * 0.5)]);
         let raw = egui::RawInput {
@@ -27359,12 +27641,12 @@ mod tests {
         // egui 0.36: rect_stroke tessellates as a stroked RectShape.
         let blue = out.shapes.iter().any(|cs| {
             matches!(&cs.shape, egui::epaint::Shape::Rect(r)
-                if r.stroke.color == egui::Color32::from_rgb(120, 190, 255))
+                if r.stroke.color == egui::Color32::from_rgb(150, 215, 255))
         });
         let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
         drop(prims);
         out.textures_delta.clear();
-        assert!(blue, "blue snap-zone outline paints during the carry");
+        assert!(blue, "predicted-slot ghost paints during the carry");
 
         // Release inside the zone: docked.
         frame(
@@ -32616,11 +32898,11 @@ mod tests {
         let mut app = headless_app("v30sw");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        // v30-batch-2: windows START DOCKED. Grab the rack's dock header
-        // and release mid-screen: it lifts out into a free float and its
-        // geometry is captured.
-        let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("rack dock header");
-        drag_pt(&mut app, &ctx, t.center(), egui::pos2(900.0, 400.0));
+        // v44: dragging a docked header off-band no longer floats (it
+        // returns the window to its slot) — the header's "float" button is
+        // the way out. Click it and the float geometry is captured.
+        let p = label_center(&mut app, &ctx, "float").expect("float button painted");
+        click_pt(&mut app, &ctx, p);
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -33495,13 +33777,17 @@ mod tests {
         let strip_top = app.dock_rects[2][1].min(app.dock_rects[3][1]);
         assert!(strip_top > 100.0, "bottom strip heads visible: {strip_top}");
         let before = app.side_wins.mixer[3].max(app.side_wins.monitor[3]);
-        // Grab the strip's top divider (a hair BELOW the strip top so the
-        // panel resize handle, not the canvas, owns the press) and pull up.
+        // Grab the strip's top divider — the panel resize handle rides the
+        // wrapper's TOP edge, a hair ABOVE the heads' inner top line. (The
+        // old press at strip_top + 1 landed on the HEAD: on HEAD it
+        // "passed" by accidentally undocking the window, whose float height
+        // jumped past the assertion; v44's return-to-slot semantics
+        // exposed the cheat — press the actual handle now.)
         let x = ctx.viewport_rect().center().x;
         drag_pt(
             &mut app,
             &ctx,
-            egui::pos2(x, strip_top + 1.0),
+            egui::pos2(x, strip_top - 3.0),
             egui::pos2(x, strip_top - 260.0),
         );
         for _ in 0..5 {
@@ -34578,5 +34864,372 @@ mod tests {
             !galley_centers(&mut app, &ctx, "MONITORING", false).is_empty(),
             "everything restored"
         );
+    }
+
+    // =========================================================================
+    // v44 — sub-minimum window sizing, ONE drop overlay, dock/float buttons,
+    // MASTER OUT as the single master section.
+    // =========================================================================
+
+    /// Shapes painted with the OLD full-edge band-highlight stroke
+    /// (rgb 120,190,255) while carrying. v44 R2 removed that overlay; the
+    /// predicted-slot ghost (150,215,255) must be alone.
+    fn band_shapes(app: &mut App, ctx: &egui::Context, held: egui::Pos2) -> Vec<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            events: vec![moved(held), btn(held, egui::PointerButton::Primary, true)],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hits = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                    if r.stroke.color == egui::Color32::from_rgb(120, 190, 255) {
+                        return Some(r.rect);
+                    }
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hits
+    }
+
+    /// R1: a floating window resizes DOWN PAST its content minimum — egui's
+    /// Resize used to clamp the corner drag to the content's unbreakable
+    /// width (the MIDI monitor's monospace rows), so the window simply
+    /// could not be made small. Now the body clips; the window's own floor
+    /// is the only floor.
+    #[test]
+    fn v44_float_shrinks_below_content_floor() {
+        let mut app = headless_app("v44shrink");
+        let ctx = egui::Context::default();
+        // Float the MIDI monitor with real (wide, unbreakable) content.
+        app.side_wins.dock[2] = [0, 2, 0];
+        app.show_midi = true;
+        let line = MidiLine {
+            ts: "12:34:56".into(),
+            type_name: "Note On",
+            describe: "C4 vel 100 ch 0".into(),
+            raw_hex: "90 3C 64".into(),
+        };
+        app.last_midi = Some(line.clone());
+        app.midi_log.push_front(line);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let r = app.side_wins.monitor;
+        assert!(r[2] > 200.0, "floating monitor painted at content size");
+        let before = r[2];
+        // Grab the bottom-right resize corner and drag hard inward.
+        let c = egui::pos2(r[0] + r[2] - 1.5, r[1] + r[3] - 1.5);
+        let mid = c + egui::vec2(-160.0, -60.0);
+        let to = egui::pos2(r[0] + 90.0, r[1] + 80.0);
+        frame(&mut app, &ctx, vec![moved(c)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let r2 = app.side_wins.monitor;
+        assert!(
+            r2[2] < before - 150.0,
+            "corner drag actually narrowed the window ({before} -> {})",
+            r2[2]
+        );
+        assert!(
+            r2[2] < 200.0 && r2[3] < 180.0,
+            "window shrank BELOW its content floor: {:?}",
+            r2
+        );
+    }
+
+    /// R1: the monitor FOLDS before it clips — narrow width drops the raw
+    /// hex tail and the source list, keeps status, Clear and event names,
+    /// and truncates log descriptions.
+    #[test]
+    fn v44_monitor_folds_before_clipping() {
+        let mut app = headless_app("v44fold");
+        let ctx = egui::Context::default();
+        app.side_wins.monitor = [100.0, 100.0, 240.0, 320.0];
+        app.side_wins.dock[2] = [0, 2, 0];
+        app.show_midi = true;
+        app.midi_sources = vec!["dev-a:out".into(), "dev-b:out".into()];
+        app.last_midi = Some(MidiLine {
+            ts: "12:34:56".into(),
+            type_name: "Note On",
+            describe: "C4 vel 100 ch 0".into(),
+            raw_hex: "90 3C 64".into(),
+        });
+        app.midi_log.push_front(MidiLine {
+            ts: "12:34:56".into(),
+            type_name: "Note On",
+            describe: "C4 vel 100 ch 0".into(),
+            raw_hex: "90 3C 64".into(),
+        });
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let r = app.side_wins.monitor;
+        assert!(r[2] < 300.0, "small monitor STAYED small: {}", r[2]);
+        assert!(
+            galley_at(&mut app, &ctx, "| 90 3C 64").is_none(),
+            "raw hex folded away when narrow"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "sources auto-linked").is_none(),
+            "source list folds when narrow"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "source(s)").is_some(),
+            "the honest status line survives (wrapped is fine)"
+        );
+        assert!(galley_at(&mut app, &ctx, "Clear").is_some(), "Clear always offered");
+        assert!(
+            !galley_centers(&mut app, &ctx, "Note On", false).is_empty(),
+            "event names survive narrow widths"
+        );
+    }
+
+    /// R1: the bottom bar's along-edge shares persist. Docking an extra
+    /// window to the strip re-salts the panel ids (fair-share defaults ask
+    /// again) — those defaults must come from the RECORDED share, never
+    /// from the stale float width that squeezed everyone else out.
+    #[test]
+    fn v44_bottom_share_survives_reflow() {
+        let mut app = headless_app("v44reflow");
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let m = app.dock_rects[2]; // monitor: bottom strip, left of binds
+        assert!(
+            m[2] > 8.0 && m[1] > 400.0 && m[0] < app.dock_rects[1][0],
+            "monitor owns the bottom-left slot: {m:?} all={:?}",
+            app.dock_rects
+        );
+        // Drag the resize handle riding the monitor panel's right edge
+        // ~150 px leftward (a couple px INSIDE the edge is inside the
+        // handle strip; on the content side it would grab the window).
+        let d = egui::pos2(m[0] + m[2] + 2.0, m[1] + 60.0);
+        let d2 = d - egui::vec2(150.0, 0.0);
+        frame(&mut app, &ctx, vec![moved(d)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(d), btn(d, egui::PointerButton::Primary, true)],
+        );
+        for k in 1..=3 {
+            let p = d - egui::vec2(50.0 * k as f32, 0.0);
+            frame(&mut app, &ctx, vec![moved(p)]);
+        }
+        frame(&mut app, &ctx, vec![btn(d2, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let m2 = app.dock_rects[2];
+        assert!(m2[2] < m[2] - 100.0, "divider narrowed the monitor share: {m:?} -> {m2:?}");
+        let rec = app.side_wins.monitor[2];
+        assert!(
+            (rec - m2[2]).abs() < 40.0,
+            "along-edge share recorded ({} vs {m2:?})",
+            rec
+        );
+        // Reflow: MASTER OUT joins the bottom strip (id salts change).
+        let mi = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Master)
+            .expect("master registered");
+        app.dyn_wins[mi].dock = [1, 2, 2];
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let m3 = app.dock_rects[2];
+        assert!(
+            m3[2] <= m2[2] + 30.0,
+            "monitor kept its narrow share after the reflow, no snap-back to 520: {m3:?}"
+        );
+    }
+
+    /// R2: carrying paints EXACTLY ONE overlay — the precise predicted
+    /// slot; the full-edge band highlight is gone for good.
+    #[test]
+    fn v44_drop_preview_is_a_single_overlay() {
+        let mut app = headless_app("v44single");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let h = app.dock_rects[3]; // mixer docked right
+        let from = egui::pos2(h[0] + 30.0, h[1] + 12.0);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        let to = egui::pos2(70.0, 200.0);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(700.0, 300.0))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        let ghosts = ghost_rects(&mut app, &ctx, to);
+        assert_eq!(ghosts.len(), 1, "exactly one overlay: {ghosts:?}");
+        assert!(
+            band_shapes(&mut app, &ctx, to).is_empty(),
+            "the old full-edge band highlight no longer paints"
+        );
+        let g = ghosts[0];
+        assert!(
+            g.width() < 700.0 && g.height() < 700.0,
+            "slot-sized, never edge-sized: {g:?}"
+        );
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+    }
+
+    /// R3: carrying a DOCKED window by its title and releasing outside
+    /// every snap band simply returns it to its slot — moving inside the
+    /// dock can no longer silently undock.
+    #[test]
+    fn v44_docked_title_drag_offband_returns_to_slot() {
+        let mut app = headless_app("v44returns");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let h = app.dock_rects[0]; // rack docked left
+        let from = egui::pos2(h[0] + 30.0, h[1] + 12.0);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        let to = egui::pos2(700.0, 400.0); // dead centre: no snap band
+        frame(&mut app, &ctx, vec![moved(egui::pos2(500.0, 300.0))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 0), "a docked carry released off-band stays docked");
+        assert_eq!(dock_edge(&app, 0), 0, "same edge as before the drag");
+    }
+
+    /// R3: the title-bar dock button re-docks a free window into its LAST
+    /// used edge — and the press is consumed (never becomes a carry).
+    #[test]
+    fn v44_title_bar_dock_button_redocks_last_slot() {
+        let mut app = headless_app("v44dockbtn");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Float the bindings window (default dock: bottom, order 1).
+        app.side_wins.dock[1] = [0, 2, 1];
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(!is_docked(&app, 1), "bindings floating");
+        let r = app.side_wins.binds;
+        assert!(r[2] > 8.0, "floating bindings recorded a rect");
+        let b = win_dock_btn_rect(&r).center();
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(b), btn(b, egui::PointerButton::Primary, true)],
+        );
+        assert!(app.free_drag.is_none(), "the dock button press is not a carry");
+        frame(&mut app, &ctx, vec![btn(b, egui::PointerButton::Primary, false)]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 1), "title-bar button put it back in the dock");
+        assert_eq!(dock_edge(&app, 1), 2, "into its LAST used edge (bottom)");
+    }
+
+    /// R3: the docked header answers with a float button beside the
+    /// collapse and close buttons.
+    #[test]
+    fn v44_docked_header_float_button() {
+        let mut app = headless_app("v44flbtn");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.show_mixer = false;
+        app.show_midi = true; // docked bottom, the only window around
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 2), "monitor docked");
+        let p = label_center(&mut app, &ctx, "float").expect("float button painted");
+        click_pt(&mut app, &ctx, p);
+        assert!(!is_docked(&app, 2), "the float button floated it out");
+    }
+
+    /// R4: the mixer dock carries NO master controls any more — MASTER OUT
+    /// is the single master section.
+    #[test]
+    fn v44_master_out_is_the_only_master_section() {
+        let mut app = headless_app("v44master1");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false; // mixer alone
+        app.show_mixer = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.show_mixer && is_docked(&app, 3), "mixer alone and docked");
+        assert!(
+            galley_at(&mut app, &ctx, "reset I").is_none(),
+            "mixer dock has no master controls (v44 R4)"
+        );
+        app.show_master = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            galley_at(&mut app, &ctx, "reset I").is_some(),
+            "MASTER OUT carries the master controls"
+        );
+    }
+
+    /// R4 + R1: MASTER OUT at a SMALL float size stays small (bodies no
+    /// longer size-lock their window) and folds its readout column: the
+    /// spectrum disappears, the LUFS list keeps momentary + integrated.
+    #[test]
+    fn v44_master_out_folds_when_small() {
+        let mut app = headless_app("v44master2");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Master)
+            .expect("master registered");
+        app.dyn_wins[mi].dock = [0, 1, 0];
+        app.dyn_wins[mi].rect = [300.0, 200.0, 260.0, 140.0];
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let r = app.dyn_wins[mi].rect;
+        assert!(
+            (r[2] - 260.0).abs() < 24.0 && (r[3] - 140.0).abs() < 24.0,
+            "small master out stayed small: {r:?}"
+        );
+        assert!(galley_at(&mut app, &ctx, "LRA").is_none(), "LRA folded when narrow");
+        assert!(galley_at(&mut app, &ctx, "reset I").is_some(), "controls survive");
     }
 }

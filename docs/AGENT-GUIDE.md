@@ -235,6 +235,22 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
      themselves — see `auto_menu`).
    - Hover feedback brightens painted fills; the test probe
      `painted_rects()` parks the pointer away before reading rgb.
+   - V44 window contracts (ui.rs): (a) window BODIES draw through
+     `body_clipped` — a body's minimum must never propagate past the
+     frame it was offered, so windows shrink below content and panels
+     FOLD first (`fit_mono`/width gates); do not add un-wrapped
+     `ui.horizontal` rows to a foldable body without a width gate.
+     (b) MASTER OUT is the ONLY master section — the mixer carries no
+     master controls (v44 pins assert both sides); master needles must
+     target the MASTER OUT rect, not "first painted galley".
+     (c) docking: docked windows stay docked when a title carry is
+     released off-band; dock/float are the header buttons
+     (`dock_last`/`float_out`); float-window dock buttons are painted
+     on a Foreground layer and hit-tested in `free_drag_pass` (egui
+     0.36 Windows take no title-bar widgets). (d) `docked_head` latches
+     BOTH panel dims: cross only on real divider moves (the runaway
+     rule) but the ALONG share records freely — fair-share defaults
+     read it after every id-salt reflow.
 
 ## Where things are wired (quick grep targets)
 
