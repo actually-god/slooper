@@ -97,6 +97,25 @@ impl Pattern {
         }
     }
 
+    /// v42: additive merge — every note / CC / press / bend / poly event of
+    /// BOTH patterns lands in the result (nothing is replaced); the merged
+    /// length is the longer pattern's, and the tempo stays `self`'s.
+    pub fn merged_with(&self, other: &Pattern) -> Pattern {
+        let mut out = self.clone();
+        out.notes.extend(other.notes.iter().copied());
+        out.ccs.extend(other.ccs.iter().copied());
+        out.press.extend(other.press.iter().copied());
+        out.bends.extend(other.bends.iter().copied());
+        out.polys.extend(other.polys.iter().copied());
+        out.notes.sort_by_key(|n| (n.start, n.note));
+        out.ccs.sort_by_key(|c| (c.at, c.num));
+        out.press.sort_by_key(|p| (p.at, p.ch));
+        out.bends.sort_by_key(|b| (b.at, b.ch));
+        out.polys.sort_by_key(|p| (p.at, p.note));
+        out.len_ticks = out.len_ticks.max(other.len_ticks);
+        out
+    }
+
     /// True when nothing sounds.
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty()
@@ -475,6 +494,26 @@ fn read_vlq(b: &[u8], mut p: usize) -> Option<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v42: merged_with layers BOTH patterns additively — every event
+    /// survives, lanes stay sorted, the longer length wins.
+    #[test]
+    fn v42_merged_with_layers_every_lane() {
+        let mut a = Pattern::new(120);
+        a.notes.push(Note { ch: 0, note: 60, vel: 90, press: 0, start: 0, len: 96 });
+        a.bends.push(Bend { ch: 0, val: 8192, at: 10 });
+        let mut b = Pattern::new(120);
+        b.len_ticks = 8 * 4 * PPQ as u32;
+        b.notes.push(Note { ch: 1, note: 64, vel: 70, press: 0, start: 24, len: 48 });
+        b.polys.push(Poly { ch: 0, note: 60, val: 33, at: 5 });
+        let m = a.merged_with(&b);
+        assert_eq!(m.notes.len(), 2, "both notes keep sounding");
+        assert_eq!(m.notes[0].note, 60);
+        assert_eq!(m.notes[1].note, 64);
+        assert_eq!(m.bends.len(), 1);
+        assert_eq!(m.polys.len(), 1);
+        assert_eq!(m.len_ticks, b.len_ticks, "the longer pattern sets length");
+    }
 
     #[test]
     fn pattern_roundtrips_through_smf() {

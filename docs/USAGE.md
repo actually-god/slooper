@@ -113,6 +113,15 @@ on the clip). Three buttons then act on the selected asset:
 | **Trim** | clips silence off the start and end (short edge fades prevent clicks) |
 | **Remove** | drops the asset **and every clip that references it** (the file on disk is untouched) |
 
+- **Merge two assets**: click one asset to select it, then right-click
+  another of the SAME kind and pick **merge into "…"**. Audio assets are
+  MIXED (both buffers summed — additive, longest wins); MIDI patterns are
+  layered (every note and expression event of both keeps its timing, the
+  length is the longer pattern's). The result is a brand-new asset written
+  into the primary rack folder (`merge-a+b`); both originals stay exactly
+  where they were. Automation assets never merge (their curves bind to one
+  control — two sources would fight).
+
 - **+ folder** adds a folder (`[...]` browse dialog); **x** removes a folder
   from the rack (files stay on disk); **scan** re-reads it after external
   changes. The first entry is tagged *primary* — that's where recordings are
@@ -398,8 +407,16 @@ windowing lives on the clip — see [Clip trimming](#clip-trimming).)
   (save-as). The **Save** button mirrors the key; **Save as** opens the
   prompt.
 - **Load** lists every project in the projects folder, newest first —
-  clicking one replaces the session (unsaved changes are lost, so save
-  first).
+  clicking one asks **what to import** (v42): the arrangement (tracks,
+  clips, assets) always travels, and checkboxes pick the setup slices —
+  **main instruments**, **synth setup** (patches + slider values), **MIDI
+  bindings**, **mixer levels**, **effects setup** (chains), **drum
+  machine**, and **tempo/meter/grid**. Unticked slices keep whatever the
+  session has. MIDI bindings only import when they actually land: an FX
+  parameter binding needs that chain slot present (import the effects
+  first, or the binding is skipped and the status line says how many), a
+  synth-parameter binding needs an instrument on that track. Unsaved
+  changes are lost, so save first.
 - The **projects folder** is a setting (☰ settings → Projects): default
   `~/.local/share/slooper-projects`, changeable/browsable.
 - A `.slooper` file is a small versioned JSON document: grid settings,

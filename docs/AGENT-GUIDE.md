@@ -249,6 +249,31 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   a LOOP take survives the timeline wrap — each wrap commits one pass
   (`mark_take_pending`) and RT restarts capture ~50 ms later
   (`lr_restart`), so passes stack as child clips. STOP clears both.
+  `p` and `l` are mutually exclusive per track (the UI clears the peer
+  flag); a preview takes the TIMELINE loop, must not be armed while
+  playing, plays exactly one pass (seek-to-start honored once, then
+  self-disarm — never re-arms; `v42_preview_take_arming_snapshots_and_clears`),
+  while a loop take RE-ARMS every pass
+  (`v42_loop_take_flags_survive_pass_restarts`).
+- Selective project import (v42): `do_load` = full import; the picker
+  parks the parsed file in `pending_proj` and `load_opts_window` picks
+  the slices (`LoadSel`: instruments / synth_setup / bindings / mixer /
+  fx / drum / tempo — arrangement always loads) fed to
+  `apply_load(dir, pr, sel)`. `bind_lands(vb)` decides which MIDI
+  bindings import: `fx:{row}:{param}` needs a chain slot owning that
+  param, `synth:{param}` needs an instrument on the track, mixer/master
+  targets always land; skipped count rides the status line.
+- Asset merge (v42): right-click a rack row (both menus), same kind
+  only, automation NEVER merges. `Pattern::merged_with` layers all lanes
+  (sorted, longer length wins), `assets::mix_audio` sums sample-wise.
+  Result = NEW asset `merge-a+b` (id = len) written to the primary
+  rack's folder; originals untouched.
+- MPE (v42): `Config.mpe` (Settings ▸ Audio; default OFF = legacy omni)
+  drives the
+  per-device `ChannelStrategy::Mpe` — zone 0 channel 1 is OMNI for
+  non-MPE sources, zone 1+ own channels 2..16; expression rides the
+  pattern lanes (per-note `press`, per-note `poly`, per-note channel
+  pitch-bend `bends`) and round-trips through SMF.
 - Clip/lane rules: `src/arrange.rs` (`insert`, `place_auto`, `remove_lane`)
   + edge drag in `src/ui.rs` (`ClipResize`, signed `new_cut`)
 - MIDI pattern IO: `Pattern::save_mid` / `Pattern::load_mid` (`src/midipat.rs`)

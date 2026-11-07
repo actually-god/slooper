@@ -126,7 +126,7 @@ mod tests {
         // Err path runs the closure NOT at all is not the contract: a
         // successful call runs it exactly once (out is taken).
         let mut n = 0u32;
-        guarded(|| n += 1);
+        let _ = guarded(|| n += 1);
         assert_eq!(n, 1);
     }
 }
