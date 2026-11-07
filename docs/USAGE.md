@@ -185,6 +185,28 @@ the playhead first, then punch in), or while the project plays. The
 metronome can keep rolling while you record — its click is output-only and
 is **never** captured into a take.
 
+### Preview bounce (`p`)
+
+Tick **p** on a strip (between **a** and **l**) and press REC: the take now
+captures this track's **playback** — its whole post-effects bus, exactly
+what it adds to the mix — instead of the raw input. Start the transport,
+let the MIDI play through your synth + FX chain, press **STOP** (or reach
+the take cap): the audio lands as a `preview-…` asset plus a clip at the
+take position. This is how a MIDI performance becomes a rendered audio
+clip without leaving the timeline. A preview take follows the transport
+(it captures nothing while stopped) and is mutually exclusive with **a**.
+
+### Loop record (`l`)
+
+Tick **l** and press REC with the transport rolling inside the timeline
+**LOOP**: recording survives every wrap. Each pass commits as its own
+asset + clip stacked on child lanes, so by pass three you hear pass 1 +
+pass 2 + your live input — an additive looper built from the arrangement
+itself. Press STOP (or stop the transport) to end the loop; the take cap
+ends it too. Needs the LOOP button on (the status line says so); records
+the raw input like **a**. A ~50 ms hand-off gap at each wrap is normal —
+it is the asset being written between passes.
+
 ## MIDI recording (MREC)
 
 Every strip carries **MREC** next to REC. Arm it (button, bound MIDI

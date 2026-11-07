@@ -451,6 +451,13 @@ pub struct Config {
     /// the three the track's single REC button arms. Defaults to audio.
     #[serde(default)]
     pub rec_src: Vec<[bool; 3]>,
+    /// v42 "p": per-track PREVIEW arming (kept beside `rec_src` but a
+    /// separate field so older configs deserialize untouched).
+    #[serde(default)]
+    pub rec_prev: Vec<bool>,
+    /// v42: per-track LOOP-record ticks (parallel to rec_src, same trick).
+    #[serde(default)]
+    pub rec_loop: Vec<bool>,
     /// v29 R7: session copy of the project's MIDI-value bindings (the
     /// project file is authoritative on load; this keeps a bare session).
     #[serde(default)]
@@ -597,6 +604,8 @@ impl Default for Config {
             rack_dir_order: Vec::new(),
             rack_group_by_dir: false,
             rec_src: vec![[true, false, false]; 8],
+            rec_prev: Vec::new(),
+            rec_loop: Vec::new(),
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
@@ -867,6 +876,8 @@ mod tests {
             }],
             rack_group_by_dir: true,
             rec_src: vec![[true, true, false], [false, false, true]],
+            rec_prev: vec![true],
+            rec_loop: vec![true],
             value_binds: vec![ValueBind {
                 target: "track.vol".into(),
                 track: 1,

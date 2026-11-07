@@ -512,10 +512,13 @@ pub enum Evt {
     /// A recording take finished: `at` is the playhead position when
     /// recording started, `data` the captured mono samples. The GUI stores
     /// it as an asset and places a clip; the engine keeps nothing.
+    /// v42: `preview` marks a "p" take — captured from the track bus while
+    /// the transport played; stored under a "preview" asset name.
     Take {
         track: usize,
         at: u64,
         data: Arc<[f32]>,
+        preview: bool,
     },
     /// A remote MIDI source ports currently wired into `slooper:midi_in`
     /// (auto-connected; refreshed on port/client registration events).
@@ -649,6 +652,18 @@ pub struct Engine {
     /// Playhead position (samples) when the current take started — reported
     /// back with the finished take so the GUI places the clip there.
     rec_at: [AtomicU64; MAX_LOOPS],
+    /// v42 "p": preview-take arming — a take armed with this flag captures
+    /// the TRACK BUS (post-FX, post-trim, mono fold: exactly what the track
+    /// contributes to the master) instead of the raw input, and follows the
+    /// transport: capture runs only while the transport plays, and the take
+    /// commits itself when the transport stops. Armed via
+    /// `set_rec_preview`, snapshotted by `start_rec`, cleared by `copy_take`
+    /// (which reports it to the manager so the asset is named "preview").
+    rec_preview: [AtomicBool; MAX_LOOPS],
+    rec_pv_active: [AtomicBool; MAX_LOOPS],
+    /// v42 loop record: armed for the next take / live for the current one.
+    rec_loop: [AtomicBool; MAX_LOOPS],
+    rec_loop_active: [AtomicBool; MAX_LOOPS],
     /// Latency compensation in samples (0 = off): every fresh take discards
     /// its first `latency` input samples (armed in `start_rec`, consumed in
     /// `rec_sample`) so the click of pressing the record button — caught a
@@ -863,6 +878,10 @@ impl Engine {
             rec_len: core::array::from_fn(|_| AtomicU32::new(0)),
             rec_state: core::array::from_fn(|_| AtomicU8::new(TR_IDLE)),
             rec_at: core::array::from_fn(|_| AtomicU64::new(0)),
+            rec_preview: core::array::from_fn(|_| AtomicBool::new(false)),
+            rec_pv_active: core::array::from_fn(|_| AtomicBool::new(false)),
+            rec_loop: core::array::from_fn(|_| AtomicBool::new(false)),
+            rec_loop_active: core::array::from_fn(|_| AtomicBool::new(false)),
             latency: AtomicU32::new(0),
             rec_skip: core::array::from_fn(|_| AtomicU32::new(0)),
             take_pending: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -995,6 +1014,71 @@ impl Engine {
         self.rec_at[i].load(Ordering::Relaxed)
     }
 
+    /// v42 "p": arm/disarm preview mode for the NEXT take on track i.
+    pub fn set_rec_preview(&self, i: usize, on: bool) {
+        if let Some(a) = self.rec_preview.get(i) {
+            a.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// v42: true while the running take on track i is a preview take
+    /// (track-bus source, transport-following).
+    pub fn rec_is_preview(&self, i: usize) -> bool {
+        self.rec_pv_active
+            .get(i)
+            .is_some_and(|a| a.load(Ordering::Relaxed))
+    }
+
+    /// v42 loop record: arm the NEXT take (and keep the live one flagged)
+    /// as a LOOP take: the timeline wrap commits each pass as a take of its
+    /// own and RT restarts capture ~50 ms after the wrap, so every pass
+    /// stacks as a child clip — additive by playback.
+    pub fn set_rec_loop(&self, i: usize, on: bool) {
+        if let Some(a) = self.rec_loop.get(i) {
+            a.store(on, Ordering::Relaxed);
+        }
+        if !on {
+            self.stop_rec_loop(i);
+        }
+    }
+
+    /// v42: armed (not yet snapshotted) preview / loop flags — headless
+    /// tests and status hints read these; the RT reads only the snapshots.
+    pub fn rec_preview_armed(&self, i: usize) -> bool {
+        self.rec_preview
+            .get(i)
+            .is_some_and(|a| a.load(Ordering::Relaxed))
+    }
+
+    pub fn rec_loop_armed(&self, i: usize) -> bool {
+        self.rec_loop
+            .get(i)
+            .is_some_and(|a| a.load(Ordering::Relaxed))
+    }
+
+    pub fn rec_is_loop(&self, i: usize) -> bool {
+        self.rec_loop_active
+            .get(i)
+            .is_some_and(|a| a.load(Ordering::Relaxed))
+    }
+
+    /// End the loop for good (user STOP, take cap, transport stop): clears
+    /// armed AND live flags. Pass commits keep both set.
+    pub fn stop_rec_loop(&self, i: usize) {
+        if let Some(a) = self.rec_loop.get(i) {
+            a.store(false, Ordering::Relaxed);
+        }
+        if let Some(a) = self.rec_loop_active.get(i) {
+            a.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// v42: the loop pass hand-off must not re-arm the input latency skip
+    /// (only the very first take start follows a button press).
+    pub fn clear_rec_skip(&self, i: usize) {
+        self.rec_skip[i].store(0, Ordering::Relaxed);
+    }
+
     /// Zero the take buffer, arm the latency-compensation skip, remember the
     /// playhead, and start capturing on track i.
     pub fn start_rec(&self, i: usize) {
@@ -1002,6 +1086,14 @@ impl Engine {
         let buf = unsafe { std::slice::from_raw_parts_mut(self.rec_bufs[i], LOOP_CAP as usize) };
         buf.fill(0.0f32);
         self.rec_len[i].store(0, Ordering::Relaxed);
+        // v42: snapshot the preview arming (flipping the checkbox mid-take
+        // must never retarget a running take).
+        self.rec_pv_active[i].store(self.rec_preview[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        // v42: the loop arming ORs with a live loop flag so a mid-loop
+        // restart keeps the take flagged without re-arming anything.
+        let la = self.rec_loop[i].load(Ordering::Relaxed)
+            || self.rec_loop_active[i].load(Ordering::Relaxed);
+        self.rec_loop_active[i].store(la, Ordering::Relaxed);
         // Snapshot the compensation at arm time: changing latency mid-take
         // must never retroactively shift a recording in progress.
         self.rec_skip[i].store(self.latency.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1013,11 +1105,14 @@ impl Engine {
     /// and clone the take's content. The caller must let one or two audio
     /// cycles elapse between the stop and this read (same discipline the old
     /// clear/quantize used); `finish_take` on the manager wraps that.
-    pub fn copy_take(&self, i: usize) -> (u64, Arc<[f32]>) {
+    pub fn copy_take(&self, i: usize) -> (u64, Arc<[f32]>, bool) {
         self.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
         let n = self.rec_len[i].load(Ordering::Relaxed) as usize;
         let data = unsafe { std::slice::from_raw_parts(self.rec_bufs[i], n) };
-        (self.rec_at[i].load(Ordering::Relaxed), Arc::from(data))
+        let preview = self.rec_pv_active[i].load(Ordering::Relaxed);
+        self.rec_preview[i].store(false, Ordering::Relaxed);
+        self.rec_pv_active[i].store(false, Ordering::Relaxed);
+        (self.rec_at[i].load(Ordering::Relaxed), Arc::from(data), preview)
     }
 
     // ---- global transport ---------------------------------------------------
@@ -1923,16 +2018,20 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
         // The GUI owns this take now; drop any capacity-stop flag so the
         // manager poll doesn't ship the same take twice.
         engine.mark_take_pending(i);
-        // Let the RT thread quiesce before cloning the take buffer.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let (at, data) = engine.copy_take(i);
+        let (at, data, preview) = engine.copy_take(i);
         if data.is_empty() {
             let _ = tx.try_send(Evt::Notice(format!(
                 "track {}: empty take discarded",
                 i + 1
             )));
         } else {
-            let _ = tx.try_send(Evt::Take { track: i, at, data });
+            let _ = tx.try_send(Evt::Take {
+                track: i,
+                at,
+                data,
+                preview,
+            });
         }
     } else {
         engine.start_rec(i);
@@ -2047,6 +2146,8 @@ fn run(
         engine: engine.clone(),
         prev_rec: [TR_IDLE; MAX_LOOPS],
         rec_full: 0,
+        pv_seen: false,
+        lr_restart: [u64::MAX; MAX_LOOPS],
         pos: 0,
         prev_transport: false,
         prev_metro: false,
@@ -2322,9 +2423,14 @@ fn run(
                     let i = pend.trailing_zeros() as usize;
                     pend &= !(1u128 << i);
                     std::thread::sleep(std::time::Duration::from_millis(25));
-                    let (at, data) = engine.copy_take(i);
+                    let (at, data, preview) = engine.copy_take(i);
                     if !data.is_empty() {
-                        let _ = evt_tx.try_send(Evt::Take { track: i, at, data });
+                        let _ = evt_tx.try_send(Evt::Take {
+                            track: i,
+                            at,
+                            data,
+                            preview,
+                        });
                     }
                 }
                 // No command pending: re-derive the MIDI source set. This is
@@ -3568,6 +3674,13 @@ struct Proc {
     engine: Arc<Engine>,
     // RT-local take-capture state (audio thread only).
     prev_rec: [u8; MAX_LOOPS],
+    /// v42 "p": the transport ran at least once since the current preview
+    /// take armed — only then does a stopped transport COMMIT the preview
+    /// (a take armed while stopped must not instantly self-commit empty).
+    pv_seen: bool,
+    /// v42: loop-record pass hand-off: sample position at which track t
+    /// resumes capture after a wrap-commit (u64::MAX = nothing pending).
+    lr_restart: [u64; MAX_LOOPS],
     /// Tracks that hit LOOP_CAP while recording: suppresses the auto-stop
     /// state store from re-firing on every remaining sample of the block.
     /// Cleared on the track's next state edge.
@@ -4123,7 +4236,12 @@ impl ProcessHandler for Proc {
         // suspended, so a take records the whole window the user recorded
         // (truncating at content length = "MIDI records only 1 bar").
         let rec_open = self.engine.recording();
-        let looping = self.engine.loop_tl() && !rec_open;
+        // v42: a LOOP take WANTS the timeline to keep wrapping — each wrap
+        // commits one pass, so recording must not suspend the loop.
+        let looprec_open = (0..MAX_LOOPS).any(|t| {
+            self.engine.rec_state_of(t) == TR_REC && self.engine.rec_is_loop(t)
+        });
+        let looping = self.engine.loop_tl() && (!rec_open || looprec_open);
 
         // Project snapshots: refresh Arcs when a generation moved (try_lock —
         // never blocks on the manager thread). Swapping the Arrangement also
@@ -4247,17 +4365,69 @@ impl ProcessHandler for Proc {
             core::array::from_fn(|i| self.engine.rec_state[i].load(Ordering::Relaxed));
         let mut rec_tracks: [u8; MAX_LOOPS] = [0u8; MAX_LOOPS];
         let mut nrec = 0usize;
+        // v42 "p": tracks whose running take is a PREVIEW take capture the
+        // track bus later (post-FX), not the raw input — so they leave the
+        // input-capture list. Preview follows the transport: with the
+        // transport stopped it captures nothing, and the moment the
+        // transport stops with a preview running, the take commits itself.
+        let mut pv_mask: u128 = 0;
+        // v42: tracks whose live take is a loop take (pass commits on wrap).
+        let mut loop_mask: u128 = 0;
         for (t, &s) in st_now.iter().enumerate() {
             if s != self.prev_rec[t] {
                 self.rec_full &= !(1u128 << t);
                 self.prev_rec[t] = s;
+                // A freshly armed take has not seen the transport run yet.
+                if s == TR_REC && self.engine.rec_is_preview(t) {
+                    self.pv_seen = false;
+                }
             }
             if s == TR_REC {
-                rec_tracks[nrec] = t as u8;
-                nrec += 1;
+                if self.engine.rec_is_preview(t) {
+                    pv_mask |= 1u128 << t;
+                } else {
+                    rec_tracks[nrec] = t as u8;
+                    nrec += 1;
+                    if self.engine.rec_is_loop(t) {
+                        loop_mask |= 1u128 << t;
+                    }
+                }
             }
         }
         let any_rec = nrec > 0;
+        // v42: a loop take ends with the transport — the last pass commits
+        // like any other take and the loop flags are cleared for good.
+        if loop_mask != 0 && !transport {
+            for t in 0..MAX_LOOPS {
+                if loop_mask & (1u128 << t) != 0 {
+                    self.engine.stop_rec_loop(t);
+                    self.lr_restart[t] = u64::MAX;
+                    if self.engine.rec_state_of(t) == TR_REC {
+                        self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                        self.engine.mark_take_pending(t);
+                    }
+                }
+            }
+            loop_mask = 0;
+        }
+        if pv_mask != 0 {
+            if transport {
+                self.pv_seen = true;
+            } else if self.pv_seen {
+                // Transport actually ran since arming — end every preview
+                // take now: TR_IDLE + hand the buffer to the manager.
+                for t in 0..MAX_LOOPS {
+                    if pv_mask & (1u128 << t) != 0 {
+                        self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                        self.engine.mark_take_pending(t);
+                    }
+                }
+                self.pv_seen = false;
+                pv_mask = 0;
+            }
+        }
+        let pv_mask = if transport { pv_mask } else { 0 };
+        let any_pv = pv_mask != 0;
 
         let clip_sound = transport
             && self.arr.tracks.iter().enumerate().any(|(t, tr)| {
@@ -4783,6 +4953,23 @@ impl ProcessHandler for Proc {
             mon_buf2.resize(n, 0.0);
         }
 
+        // v42: loop pass hand-off — resume capture at the scheduled
+        // position (set at the wrap commit; the manager has copied the
+        // finished pass out of the buffer long before this fires).
+        for t in 0..MAX_LOOPS {
+            if self.lr_restart[t] != u64::MAX {
+                if self.pos >= self.lr_restart[t] {
+                    self.lr_restart[t] = u64::MAX;
+                    if self.engine.rec_is_loop(t) && self.engine.rec_state_of(t) == TR_IDLE {
+                        self.engine.start_rec(t);
+                        self.engine.clear_rec_skip(t);
+                    }
+                } else if !self.engine.rec_is_loop(t) {
+                    self.lr_restart[t] = u64::MAX;
+                }
+            }
+        }
+
         let mut peak_val: u32 = 0;
         let mut pos_now = self.pos;
         for i in 0..n {
@@ -4815,6 +5002,11 @@ impl ProcessHandler for Proc {
                         self.rec_full |= 1u128 << t;
                         self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
                         self.engine.mark_take_pending(t);
+                        // v42: the take cap ends a loop for good.
+                        if self.engine.rec_is_loop(t) {
+                            self.engine.stop_rec_loop(t);
+                            self.lr_restart[t] = u64::MAX;
+                        }
                     }
                 }
             }
@@ -4887,8 +5079,21 @@ impl ProcessHandler for Proc {
                         // chains return (y, y), so the pan fold is the
                         // historical mono law bit-for-bit.
                         let (ml, mr) = self.fx_mix(t, a * av, scv);
-                        play_l += ml * pgl[t];
-                        play_r += mr * pgr[t];
+                        let (pl, pr) = (ml * pgl[t], mr * pgr[t]);
+                        // v42 "p": preview take — tap the track bus right
+                        // here (post-FX, post-trim, mono fold): exactly the
+                        // contribution this track adds to the master.
+                        if any_pv && pv_mask & (1u128 << t) != 0 {
+                            if self.engine.rec_sample(t, (pl + pr) * F1S2)
+                                && self.rec_full & (1u128 << t) == 0
+                            {
+                                self.rec_full |= 1u128 << t;
+                                self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                                self.engine.mark_take_pending(t);
+                            }
+                        }
+                        play_l += pl;
+                        play_r += pr;
                     }
                 }
             }
@@ -5023,9 +5228,21 @@ impl ProcessHandler for Proc {
                     &sc_empty
                 };
                 self.run_chain_block(t, buf, buf2, tmp, scrow);
+                // v42 "p": preview tap for plugin-bearing chains (same
+                // post-FX, post-trim mono fold as the scripted path).
+                let pvt = any_pv && pv_mask & (1u128 << t) != 0;
                 for i in 0..n {
-                    mix_l[i] += buf[i] * pgl[t];
-                    mix_r[i] += buf2[i] * pgr[t];
+                    let (l, r) = (buf[i] * pgl[t], buf2[i] * pgr[t]);
+                    mix_l[i] += l;
+                    mix_r[i] += r;
+                    if pvt
+                        && self.engine.rec_sample(t, (l + r) * F1S2)
+                        && self.rec_full & (1u128 << t) == 0
+                    {
+                        self.rec_full |= 1u128 << t;
+                        self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                        self.engine.mark_take_pending(t);
+                    }
                 }
             }
             if sel_vst {
@@ -5097,6 +5314,21 @@ impl ProcessHandler for Proc {
                     pos_now = wrapped;
                     // Wrap re-anchors the metronome grid without a burst.
                     self.metro_idx = (pos_now as f64 / sub_len).ceil() as i64 - 1;
+                    // v42: loop record — every pass commits as its own take
+                    // and capture resumes ~50 ms after the wrap; passes
+                    // stack as child clips, so the loop ADDS up by playback.
+                    if loop_mask != 0 {
+                        for t in 0..MAX_LOOPS {
+                            if loop_mask & (1u128 << t) != 0
+                                && self.engine.rec_state_of(t) == TR_REC
+                            {
+                                self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                                self.engine.mark_take_pending(t);
+                                self.lr_restart[t] =
+                                    pos_now + (self.engine.sample_rate() as u64) / 20;
+                            }
+                        }
+                    }
                 }
                 self.pos = pos_now;
             } else {
@@ -5325,11 +5557,55 @@ mod tests {
             e.rec_write(2, k, k as f32 * 0.01);
         }
         e.rec_len[2].store(100, Ordering::Relaxed);
-        let (at, data) = e.copy_take(2);
+        let (at, data, _pv) = e.copy_take(2);
         assert_eq!(at, 500);
         assert_eq!(data.len(), 100);
         assert!((data[50] - 0.5).abs() < 1e-6);
         assert_eq!(e.rec_state_of(2), TR_IDLE);
+    }
+
+    /// v42 "p": the preview arming must snapshot at start_rec, survive the
+    /// take, report out of copy_take exactly once, and clear for next time.
+    #[test]
+    fn v42_preview_take_arming_snapshots_and_clears() {
+        let e = Engine::new();
+        // plain take: no preview flag anywhere
+        e.start_rec(1);
+        assert!(!e.rec_is_preview(1), "default take is an audio take");
+        let (_, _, pv) = e.copy_take(1);
+        assert!(!pv, "plain take reports preview=false");
+        // preview take
+        e.set_rec_preview(2, true);
+        e.start_rec(2);
+        assert!(e.rec_is_preview(2));
+        e.set_rec_preview(2, false);
+        assert!(e.rec_is_preview(2), "start_rec snapshots — mid-take flips ignored");
+        let (_, _, pv) = e.copy_take(2);
+        assert!(pv, "the finished take reports preview=true");
+        assert!(!e.rec_is_preview(2), "cleared at commit");
+        e.start_rec(2);
+        assert!(!e.rec_is_preview(2), "the next take starts clean");
+        e.copy_take(2);
+    }
+
+    /// v42: pass commits must keep the loop flag across start_rec restarts,
+    /// while STOP (stop_rec_loop) clears armed AND live.
+    #[test]
+    fn v42_loop_take_flags_survive_pass_restarts() {
+        let e = Engine::new();
+        e.set_rec_loop(3, true);
+        e.start_rec(3);
+        assert!(e.rec_is_loop(3), "the take inherits the loop arming");
+        // A pass commit (RT idles + pends, manager copies) must NOT clear
+        // the flag — the user has not stopped yet.
+        e.copy_take(3);
+        assert!(e.rec_is_loop(3), "pass commit keeps the loop alive");
+        e.start_rec(3); // next pass
+        assert!(e.rec_is_loop(3), "restart re-snapshots from the live flag");
+        e.copy_take(3);
+        e.stop_rec_loop(3);
+        assert!(!e.rec_is_loop(3), "STOP clears armed AND live");
+        assert!(!e.rec_loop_armed(3), "STOP clears armed AND live");
     }
 
     /// Latency compensation is a START-of-take skip: a fresh recording
@@ -5360,7 +5636,7 @@ mod tests {
         }
         // The first 5 samples were discarded; content starts at sample #6 —
         // exactly the latency-compensated moment.
-        let (_at, data) = e.copy_take(0);
+        let (_at, data, _pv) = e.copy_take(0);
         assert_eq!(&data[..], &[6.0, 7.0, 8.0, 9.0, 10.0]);
 
         // A second take re-arms from the current latency, and a latency of 0
@@ -5384,7 +5660,7 @@ mod tests {
         assert!(!e.rec_sample(0, 2.0)); // armed skip has 2 left
         assert!(!e.rec_sample(0, 3.0)); // ...and captures nothing more
         assert!(!e.rec_sample(0, 4.0)); // skip exhausted: capture resumes
-        let (_at, data) = e.copy_take(0);
+        let (_at, data, _pv) = e.copy_take(0);
         assert_eq!(
             &data[..],
             &[4.0],
