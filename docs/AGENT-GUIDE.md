@@ -290,6 +290,19 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   non-MPE sources, zone 1+ own channels 2..16; expression rides the
   pattern lanes (per-note `press`, per-note `poly`, per-note channel
   pitch-bend `bends`) and round-trips through SMF.
+- GL backend (v45, crash forensics attempt #4): `main()` forces
+  `LIBGL_ALWAYS_SOFTWARE=1` (llvmpipe) by default — policy fn
+  `gl_force_software`, pinned `v45_*` x3. WHY: Mesa 26.2.x `abort()`s the
+  whole process when the kernel rejects ANY command stream on a non-robust
+  context (`amdgpu_ctx_set_sw_reset_status` → abort; winit/eframe never
+  request lose-context-on-reset), and the non-aborting variant of the same
+  fault hangs the UI thread in `dri_flush` forever — slooper's
+  "no obvious cause" freezes AND crashes were both this (kernel `bo ...
+  va ... conflict` line precedes every instance; Mesa 26.2.5's own VA
+  manager made the off-by-one overlap). v41's windowing split cannot help:
+  plugin editors share the process. Escape hatch `SLOOPER_GPU_GL=1`
+  (wins over everything); an externally-set `LIBGL_ALWAYS_SOFTWARE` value
+  is honored verbatim. Never re-enable kernel GL as a default.
 - Clip/lane rules: `src/arrange.rs` (`insert`, `place_auto`, `remove_lane`)
   + edge drag in `src/ui.rs` (`ClipResize`, signed `new_cut`)
 - MIDI pattern IO: `Pattern::save_mid` / `Pattern::load_mid` (`src/midipat.rs`)

@@ -23,6 +23,25 @@ fn main() -> eframe::Result {
         eprintln!("[slooper] panic: {info}");
         std::process::abort();
     }));
+    // v45 GL policy (crash forensics attempt #4): run the WHOLE process on
+    // software GL by default. Rationale in `gl_force_software`; the kill
+    // chain we are removing: kernel rejects one Mesa command stream over a
+    // VA-map conflict → Mesa's cs0 queue thread abort()s (non-robust
+    // context) → DAW dead; when it does NOT abort, the UI thread hangs
+    // forever in dri_flush instead — the same fault as a "freeze". With
+    // llvmpipe there is no kernel command stream to reject: the entire
+    // fault class becomes unrepresentable, editors and probe children
+    // included (they inherit the environment).
+    if gl_force_software(|k| std::env::var_os(k)) {
+        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        eprintln!(
+            "[slooper] GL: llvmpipe (v45 — Mesa 26.2 CS-reject aborts kill \
+             co-located DAWs; SLOOPER_GPU_GL=1 opts back onto GPU GL)"
+        );
+    } else if std::env::var_os("SLOOPER_GPU_GL").is_some() {
+        std::env::remove_var("LIBGL_ALWAYS_SOFTWARE");
+        eprintln!("[slooper] GL: GPU path per SLOOPER_GPU_GL (known abort risk)");
+    }
     // v23: editor crash-guard child (see `vstedit::probe_child`). This
     // process only ever tests ONE plugin window and exits — no JACK, no
     // eframe, no config, nothing that could be confused for a second DAW.
@@ -88,6 +107,42 @@ fn x11_world_preferred(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool
     force_x11 || !wayland_session
 }
 
+/// v45 GL backend policy (crash forensics, attempt #4 — kills the last
+/// "no obvious cause" freeze/crash class). Mesa 26.2.x (installed
+/// 2026-10-30 here) hard-kills a process whose GL command stream the
+/// kernel rejects: `amdgpu_ctx_set_sw_reset_status` ends in `abort()`
+/// whenever the context lacks `PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET`, and
+/// winit/eframe NEVER request robust/lose-on-reset contexts. One transient
+/// amdgpu VA-map conflict — Mesa 26.2.5's own VA manager produced a 1-byte
+/// overlap (`va ...03bc7` vs `...03bc8`) during a routine egui repaint on
+/// slooper-bin e0ad6dd, kernel `bo ... conflict` line, then Mesa's cs0
+/// thread aborted the whole DAW — is fatal. When the same fault does not
+/// abort, the UI thread parks forever in `dri_flush`: that is the
+/// "freeze" half of the reports. v41 moved the main window to native
+/// Wayland to shrink blast radius, but slooper hosts GL-capable plugin
+/// editors IN-PROCESS, so any co-located Mesa context can still reach the
+/// kernel and abort the process. The durable fix is for the DAW process to
+/// own NO kernel command streams at all: `LIBGL_ALWAYS_SOFTWARE=1` makes
+/// `eglInitialize` and GLX create llvmpipe screens instead
+/// (Mesa honors it on the Wayland path via `Options.ForceSoftware`), and
+/// every in-process editor / forked probe / yabridge child inherits that.
+/// Priority: `SLOOPER_GPU_GL` (any value) opts back onto GPU GL at the
+/// user's own risk and beats everything; an externally-set
+/// `LIBGL_ALWAYS_SOFTWARE` value is honored verbatim ("0"/"false" = GPU);
+/// otherwise software GL is the default (true).
+fn gl_force_software(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    if env("SLOOPER_GPU_GL").is_some() {
+        return false;
+    }
+    match env("LIBGL_ALWAYS_SOFTWARE") {
+        Some(v) => {
+            let v = v.to_string_lossy().trim().to_ascii_lowercase();
+            !(v == "0" || v == "false")
+        }
+        None => true,
+    }
+}
+
 /// Decode the bundled icon into raw RGBA for the window title bar.
 fn load_icon() -> Option<std::sync::Arc<egui::IconData>> {
     let img = image::ImageReader::new(std::io::Cursor::new(ICON_PNG))
@@ -140,6 +195,49 @@ mod tests {
     fn v41_pure_x11_session_unchanged() {
         // No Wayland session vars: X11 as always.
         assert!(x11_world_preferred(envof(&["DISPLAY"])));
+    }
+
+    /// Value-aware env fixture (v45 policy needs to distinguish "0" vs "1").
+    fn envv(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| {
+            owned
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn v45_software_gl_is_the_default() {
+        // A DAW must NEVER own kernel GL command streams by default: one
+        // Mesa CS-reject aborts the process (or hangs dri_flush = the
+        // "freeze" reports). Bare session and Wayland session both → soft.
+        assert!(gl_force_software(envv(&[])));
+        assert!(gl_force_software(envv(&[("WAYLAND_DISPLAY", "1"), ("DISPLAY", ":1")])));
+    }
+
+    #[test]
+    fn v45_gpu_gl_optout_beats_everything() {
+        // SLOOPER_GPU_GL is the documented escape hatch and wins even over
+        // an explicit external LIBGL_ALWAYS_SOFTWARE=1.
+        assert!(!gl_force_software(envv(&[("SLOOPER_GPU_GL", "1")])));
+        assert!(!gl_force_software(envv(&[
+            ("SLOOPER_GPU_GL", "1"),
+            ("LIBGL_ALWAYS_SOFTWARE", "1"),
+        ])));
+    }
+
+    #[test]
+    fn v45_external_softgl_value_honored_verbatim() {
+        // A launcher that already picked a side is respected as-is.
+        assert!(gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "1")])));
+        assert!(gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "true")])));
+        assert!(!gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "0")])));
+        assert!(!gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "false")])));
     }
 
     #[test]
