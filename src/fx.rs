@@ -3725,6 +3725,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     ///    dry window) while the shared comb feeds BOTH sides,
     ///  * v1 fallback ≡ ST-path LEFT bit-for-bit — the tier-4 mono pins
     ///    and every pre-tier-5 chain keep measuring the same circuit.
+    ///
     /// Also freezes the param tables (0..6 sticky, 7 = appended `spread`).
     #[test]
     fn tier5_phaser_flanger_stereo() {
@@ -3768,8 +3769,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 let mut p = dp;
                 p[7] = spread;
                 let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                for i in 0..n {
-                    let (l, r) = unsafe { inst.call_sample_st(noise[i], noise[i], &p, 0.0) };
+                for &sx in noise.iter().take(n) {
+                    let (l, r) = unsafe { inst.call_sample_st(sx, sx, &p, 0.0) };
                     yl.push(l);
                     yr.push(r);
                 }
@@ -3809,9 +3810,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             let st = reg.create_instance(stem, sr, &dp).expect("st5");
             let mono = reg.create_instance(stem, sr, &dp).expect("v15");
             let mut drift = 0usize;
-            for i in 0..n {
-                let l = unsafe { st.call_sample_st(noise[i], noise[i], &dp, 0.0) }.0;
-                let y = unsafe { mono.call_sample(noise[i], &dp) };
+            for &sx in noise.iter().take(n) {
+                let l = unsafe { st.call_sample_st(sx, sx, &dp, 0.0) }.0;
+                let y = unsafe { mono.call_sample(sx, &dp) };
                 if y.to_bits() != l.to_bits() {
                     drift += 1;
                 }
@@ -3918,8 +3919,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 let mut p = dp;
                 p[sidx] = spread;
                 let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                for i in 0..n {
-                    let (l, r) = unsafe { inst.call_sample_st(noise[i], noise[i], &p, 0.0) };
+                for &sx in noise.iter().take(n) {
+                    let (l, r) = unsafe { inst.call_sample_st(sx, sx, &p, 0.0) };
                     yl.push(l);
                     yr.push(r);
                 }
@@ -3978,9 +3979,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             let st = reg.create_instance(stem, sr, &dp).expect("st5b");
             let mono = reg.create_instance(stem, sr, &dp).expect("v15b");
             let mut drift = 0usize;
-            for i in 0..n {
-                let l = unsafe { st.call_sample_st(noise[i], noise[i], &dp, 0.0) }.0;
-                let y = unsafe { mono.call_sample(noise[i], &dp) };
+            for &sx in noise.iter().take(n) {
+                let l = unsafe { st.call_sample_st(sx, sx, &dp, 0.0) }.0;
+                let y = unsafe { mono.call_sample(sx, &dp) };
                 if y.to_bits() != l.to_bits() {
                     drift += 1;
                 }
@@ -4004,8 +4005,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 let mut p = dp;
                 p[8] = spread;
                 let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                for i in 0..n {
-                    let (l, r) = unsafe { inst.call_sample_st(noise[i], noise[i], &p, noise[i]) };
+                for &sx in noise.iter().take(n) {
+                    let (l, r) = unsafe { inst.call_sample_st(sx, sx, &p, sx) };
                     yl.push(l);
                     yr.push(r);
                 }
@@ -4054,8 +4055,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             // v1 semantics: the vocoder stays a documented passthrough.
             let v1 = reg.create_instance(stem, sr, &dp).expect("voc v1");
             let mut drift = 0usize;
-            for i in 0..n {
-                if unsafe { v1.call_sample(noise[i], &dp) }.to_bits() != noise[i].to_bits() {
+            for &sx in noise.iter().take(n) {
+                if unsafe { v1.call_sample(sx, &dp) }.to_bits() != sx.to_bits() {
                     drift += 1;
                 }
             }

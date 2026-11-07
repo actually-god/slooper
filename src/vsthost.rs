@@ -2011,7 +2011,7 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
                     // exists while editors are actually open.
                     let t0 = std::time::Instant::now();
                     if let Err(e) =
-                        crate::ffiguard::guarded(|| crate::vstedit::pump_editors())
+                        crate::ffiguard::guarded(crate::vstedit::pump_editors)
                     {
                         eprintln!("[slooper] editor idle pump threw: {e}");
                     }

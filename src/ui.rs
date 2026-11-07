@@ -986,6 +986,11 @@ pub struct App {
     /// JUST left the dock (one-frame position hand-off).
     free_drag: Option<(usize, [f32; 2])>,
     drag_pos: [f32; 2],
+    /// v43 R3: where the current carry was picked up. A release that never
+    /// moved (a TAP on the header) must not dock/float anything — the old
+    /// code turned every header click into a snap decision, which made
+    /// double-click-to-toggle impossible and taps feel slippery.
+    drag_press_pt: [f32; 2],
     dock_rects: Vec<[f32; 4]>,
     dock_collapsed: Vec<bool>,
     /// v35 R5: dynamic windows (plugin params, FX chain, synth, drums,
@@ -993,6 +998,18 @@ pub struct App {
     /// stack, re-order and float exactly like the four primary panels.
     dyn_wins: Vec<DynWin>,
     dock_just_floated: Option<usize>,
+    /// v43: egui time until which another title double-toggle is ignored
+    /// (click-mashing must not oscillate docked<->floating).
+    dbl_dock_lock: f64,
+    /// v43 R2: floating-title right-click slot menu: (window idx, press
+    /// point). Opened by `free_drag_pass`, drawn/dismissed by
+    /// `win_menu_pass` (which follows the v18 `.open()` rule of
+    /// `value_popups`: the state flag is the authority, the egui Window
+    /// merely renders it).
+    win_menu: Option<(usize, [f32; 2])>,
+    win_menu_armed: bool,
+    /// v43 R5: SETTINGS search/chip filter (transient — never persisted).
+    sett_filter: String,
     show_midi: bool,
     /// v25: light egui Visuals for the panel/window chrome. The arrangement
     /// canvas keeps its fixed studio palette either way.
@@ -1575,11 +1592,16 @@ impl App {
             dyn_seed: dyn_seed_for(&cfg.dyn_docks),
             side_dirty: false,
             free_drag: None,
-            drag_pos: [0.0, 0.0],
+            drag_pos: [0.0; 2],
+            drag_press_pt: [0.0; 2],
             dock_rects: vec![[0.0; 4]; 4],
             dock_collapsed: vec![false; 4],
             dyn_wins: Vec::new(),
             dock_just_floated: None,
+            dbl_dock_lock: 0.0,
+            win_menu: None,
+            win_menu_armed: false,
+            sett_filter: String::new(),
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
             mpe_on: cfg.mpe,
@@ -10742,7 +10764,7 @@ impl App {
         self.assets = assets;
         self.arr = arr;
         // The saved project carries its own configured track count.
-        self.n_tracks = pr.n_tracks.unwrap_or(16).clamp(1, MAX_LOOPS) as usize;
+        self.n_tracks = pr.n_tracks.unwrap_or(16).clamp(1, MAX_LOOPS);
         // Per-track synths (missing slots fall back to the default piano).
         for t in 0..MAX_LOOPS {
             if sel.instruments {
@@ -12206,6 +12228,9 @@ impl App {
                 self.status = status;
             }
         }
+        // v43 R2: the floating-title slot menu rides on top of EVERYTHING
+        // (all windows have been drawn by now), like `value_popups`.
+        win_menu_pass(ui, self);
     }
 
     /// v35 R5: get-or-create the dock registry slot for a dynamic window.
@@ -12506,7 +12531,7 @@ impl App {
 }
 
 fn top_bar(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::top("topbar").exact_size(44.0).show(ui, |ui| {
+    egui::Panel::top("topbar").exact_size(TOPBAR_H).show(ui, |ui| {
         ui.horizontal(|ui| {
             // Hamburger (settings) button: three horizontal bars.
             let size = egui::vec2(26.0, 18.0);
@@ -12698,6 +12723,78 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 {
                     app.show_drums = !app.show_drums;
                 }
+                // v43 R4: the window navigation hub. Everything the GUI
+                // shows is listed here with a live checkmark, plus the
+                // layout actions — no more hunting through Settings to
+                // find where a window went (Septabee/Ableton keep one
+                // View/Window menu for exactly this reason).
+                let wresp = ui
+                    .button("Windows")
+                    .on_hover_text("Show / hide / re-dock any window; layout actions.");
+                egui::Popup::menu(&wresp).show(|ui| {
+                    if ui
+                        .checkbox(&mut app.show_rack, "asset rack")
+                        .on_hover_text("The asset browser / import panel.")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                    if ui
+                        .checkbox(&mut app.show_mixer, "mixer dock")
+                        .on_hover_text("Per-track mixer strips (grid-aligned).")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                    if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
+                        app.save_config();
+                    }
+                    if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
+                        app.save_config();
+                    }
+                    if ui
+                        .checkbox(&mut app.show_master, "master out")
+                        .on_hover_text("Master meters + LUFS + spectrum panel.")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                    if ui
+                        .checkbox(&mut app.show_drums, "drum machine")
+                        .on_hover_text("Pattern builder (FL-FPC style pads + grid).")
+                        .changed()
+                    {
+                        app.save_config();
+                    }
+                    ui.separator();
+                    if ui
+                        .button("dock all windows")
+                        .on_hover_text("Snap every visible window back into dock slots.")
+                        .clicked()
+                    {
+                        dock_all_windows(app);
+                        ui.close();
+                    }
+                    if ui
+                        .button("float all windows")
+                        .on_hover_text("Undock every window into free windows.")
+                        .clicked()
+                    {
+                        float_all_windows(app);
+                        ui.close();
+                    }
+                    if ui
+                        .button("reset window layout")
+                        .on_hover_text(
+                            "Restore the stock arrangement: slots, sizes and \
+                             un-collapsed headers — as after a fresh install.",
+                        )
+                        .clicked()
+                    {
+                        reset_window_layout(app);
+                        ui.close();
+                    }
+                });
                 if ui
                     .button("Load")
                     .on_hover_text("Browse saved projects")
@@ -13414,6 +13511,9 @@ const SNAP_EDGE: f32 = 150.0;
 const SNAP_BOTTOM: f32 = 110.0;
 const WIN_HEAD_H: f32 = 27.0;
 const WIN_BTN_STRIP: f32 = 64.0;
+/// Height of the main-GUI header (`top_bar`); docked strips and the v43
+/// drop-slot ghost both start below it.
+const TOPBAR_H: f32 = 44.0;
 
 fn win_count(app: &App) -> usize {
     4 + app.dyn_wins.len()
@@ -13536,6 +13636,137 @@ fn snap_zone(vp: egui::Rect, pt: egui::Pos2) -> Option<i16> {
     }
 }
 
+/// v43 R1: the rect window `idx` WOULD occupy if released at `edge` NOW.
+/// This is a dry-run of the REAL layout: `dock_at`'s rank logic decides
+/// the insertion order, then the edge wrapper's own fair-share packing
+/// (draw_docked_edge) decides each member's along-size — so the ghost
+/// shows where the window lands AND how big it ends up. The band
+/// highlight alone told the user only WHICH EDGE, never where or how big.
+fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Rect) -> egui::Rect {
+    let n = win_count(app);
+    let horiz = edge == 2 || edge == 3; // band runs horizontally (bottom/top)
+    // The live neighbours of the target edge + `idx` itself, packed in the
+    // order `dock_at` would assign (insert by position along the band).
+    let mut ids: Vec<usize> = (0..n)
+        .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge && app.dock_rects[*i][2] > 8.0)
+        .collect();
+    ids.sort_by_key(|i| dock_order(app, *i));
+    let along_center = |i: usize| -> f32 {
+        let r = app.dock_rects[i];
+        if horiz {
+            r[0] + r[2] * 0.5
+        } else {
+            r[1] + r[3] * 0.5
+        }
+    };
+    let me = if horiz { pt.x } else { pt.y };
+    let rank = ids.iter().filter(|i| along_center(**i) < me).count();
+    ids.insert(rank.min(ids.len()), idx);
+
+    // Band limits: the top bar and the OTHER edges' live strips claim
+    // band corners (the carried window's own old strip is excluded — it is
+    // about to vacate).
+    let mut top = vp.min.y + TOPBAR_H;
+    let mut bot = vp.max.y;
+    let mut left = vp.min.x;
+    let mut right = vp.max.x;
+    // One SHARED strip per edge: the inset is that edge's strip CROSS max,
+    // never a sum (windows stacked on one edge tile along it, not in depth).
+    for e in 0..4i16 {
+        if e == edge {
+            continue;
+        }
+        let mem = (0..n).filter(|i| {
+            *i != idx && is_docked(app, *i) && dock_edge(app, *i) == e && app.dock_rects[*i][2] > 8.0
+        });
+        if e == 0 {
+            left += mem.map(|i| app.dock_rects[i][2]).fold(0.0f32, f32::max);
+        } else if e == 1 {
+            right -= mem.map(|i| app.dock_rects[i][2]).fold(0.0f32, f32::max);
+        } else if e == 3 {
+            top += mem.map(|i| app.dock_rects[i][3]).fold(0.0f32, f32::max);
+        } else {
+            bot -= mem.map(|i| app.dock_rects[i][3]).fold(0.0f32, f32::max);
+        }
+    }
+    // Shared strip cross size (thickness): the wrapper takes the members'
+    // cross max — a member's recorded cross only counts when measured in
+    // the SAME orientation (a side window dragged to the bottom has its
+    // width/height meaning swapped).
+    let same_orient = |i: usize| -> bool {
+        !is_docked(app, i)
+            || (dock_edge(app, i) == 2 || dock_edge(app, i) == 3) == horiz
+    };
+    let thick_raw = ids
+        .iter()
+        .map(|i| {
+            let wr = win_rect(app, *i);
+            let own = if same_orient(*i) {
+                if horiz {
+                    wr[3]
+                } else {
+                    wr[2]
+                }
+            } else {
+                0.0
+            };
+            own.max(strip_def(*i, edge))
+        })
+        .fold(0.0f32, f32::max);
+    let (band_a, band_b) = if horiz { (left, right) } else { (top, bot) };
+    let thick = if horiz {
+        thick_raw.min((bot - top) * 0.6).max(24.0)
+    } else {
+        thick_raw.min((right - left) * 0.6).max(24.0)
+    };
+    // Along-band sizes: EXACTLY draw_docked_edge's fair-share loop — every
+    // non-final member asks for its recorded size capped at its share of
+    // what remains, the final member fills the rest.
+    let strip_len = (band_b - band_a).max(0.0);
+    let mut cur = band_a;
+    let mut alloc = 0.0f32;
+    let mut slot = (band_a, 0.0f32);
+    for (k, &i) in ids.iter().enumerate() {
+        let sz = if k + 1 == ids.len() {
+            (strip_len - alloc).max(48.0)
+        } else {
+            let rec = {
+                let wr = win_rect(app, i);
+                if horiz {
+                    wr[2]
+                } else {
+                    wr[3]
+                }
+            };
+            let want = if same_orient(i) && rec > 8.0 { rec } else { strip_def(i, edge) };
+            let cap = ((strip_len - alloc) / (ids.len() - k) as f32).max(48.0);
+            want.min(cap).max(48.0)
+        };
+        if i == idx {
+            slot = (cur, sz);
+        }
+        cur += sz;
+        alloc += sz;
+    }
+    if horiz {
+        let y0 = if edge == 3 { top } else { bot - thick };
+        egui::Rect::from_min_max(egui::pos2(slot.0, y0), egui::pos2(slot.0 + slot.1, y0 + thick))
+    } else {
+        let x0 = if edge == 0 { left } else { right - thick };
+        egui::Rect::from_min_max(egui::pos2(x0, slot.0), egui::pos2(x0 + thick, slot.0 + slot.1))
+    }
+}
+
+/// The along/cross size a never-measured window asks for at this edge
+/// (mirrors `draw_docked`'s `def_w/def_h` fallback).
+fn strip_def(i: usize, edge: i16) -> f32 {
+    if edge == 2 || edge == 3 {
+        def_h(i)
+    } else {
+        def_w(i)
+    }
+}
+
 /// Snap `idx` onto `edge` at drop point `pt`: insert it among the other
 /// docked windows of that edge by position (outer edge first) and
 /// re-pack the edge's orders to 0..n-1.
@@ -13580,6 +13811,58 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
     app.side_dirty = true;
 }
 
+/// v43 R4: the shared layout actions offered by BOTH the Settings ▸ GUI
+/// buttons and the new top-bar Windows menu. Unlike the old Settings-only
+/// inline versions they now include the dynamic windows (plugin params,
+/// chain, roll, drum machine, …), which used to be silently left in place
+/// by "dock all / float all".
+fn dock_all_windows(app: &mut App) {
+    let def = crate::config::default_dock();
+    for (d, f) in app.side_wins.dock.iter_mut().zip(def) {
+        *d = f;
+    }
+    for (n, w) in app.dyn_wins.iter_mut().enumerate() {
+        w.dock = [1, 1, n as i16];
+    }
+    app.side_dirty = true;
+    app.save_config();
+}
+
+fn float_all_windows(app: &mut App) {
+    for i in 0..win_count(app) {
+        if is_docked(app, i) {
+            let r = app.dock_rects[i];
+            let base = float_footprint(app, i);
+            let at = if r[2] > 8.0 {
+                [r[0], r[1]]
+            } else {
+                [base[0], base[1]]
+            };
+            undock_to(app, i, at);
+        }
+    }
+    app.side_dirty = true;
+    app.save_config();
+}
+
+/// v43 R4: full restore of the stock arrangement — slots AND recorded
+/// thicknesses AND collapse flags (the old "dock all" left every window's
+/// saved size and every collapsed dock intact, so a squeezed GUI stayed
+/// squeezed no matter how often you clicked it).
+fn reset_window_layout(app: &mut App) {
+    app.side_wins = crate::config::SideWins::default();
+    for (n, w) in app.dyn_wins.iter_mut().enumerate() {
+        // Re-dock every dynamic window onto the RIGHT edge (its stock
+        // home, next to the MIXER); float rects survive for later.
+        w.dock = [1, 1, n as i16];
+    }
+    for c in app.dock_collapsed.iter_mut() {
+        *c = false;
+    }
+    app.side_dirty = true;
+    app.save_config();
+}
+
 /// Pull `idx` out of its dock and float it at `at` (top-left).
 fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
     let r = &mut app.side_wins;
@@ -13615,20 +13898,90 @@ fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
 }
 
 /// Track a header/title-bar grab across frames: press on a header starts
-/// a carry; release docks (with reorder) or floats.
+/// a carry; release docks (with reorder) or floats. v43 also hosts the
+/// two click-gestures the header answers with besides dragging:
+/// RIGHT-press opens the slot menu (floating windows — docked headers
+/// already carry an egui context menu on their title), and a DOUBLE-click
+/// toggles docked <-> floating (the VSCode/Ableton muscle memory).
 fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
-    let (pressed, down, pos) = ui.ctx().input(|i| {
+    /// The title-bar band of a visible window (docked or floating), if
+    /// `pt` is on it. Top-down so the visually topmost header wins.
+    fn header_hit(app: &App, pt: egui::Pos2, floats_only: bool) -> Option<usize> {
+        let n = win_count(app);
+        let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
+        order.sort_by_key(|i| is_docked(app, *i));
+        for idx in order.into_iter().rev() {
+            if floats_only && is_docked(app, idx) {
+                continue;
+            }
+            let r = if is_docked(app, idx) {
+                app.dock_rects[idx]
+            } else {
+                win_rect(app, idx)
+            };
+            if r[2] < 8.0 {
+                continue;
+            }
+            let mut head =
+                egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
+            if floats_only {
+                head.max.x -= WIN_BTN_STRIP; // never steal collapse/close
+            }
+            if head.contains(pt) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    let (pressed, down, pos, rpressed, dbl) = ui.ctx().input(|i| {
         (
-            // PRIMARY only: a right-press on a header must open the
-            // re-slot menu, never start a window carry.
+            // PRIMARY only: a right-press on a header opens the slot menu,
+            // never starts a window carry.
             i.pointer.any_pressed() && i.pointer.button_down(egui::PointerButton::Primary),
             i.pointer.button_down(egui::PointerButton::Primary),
             i.pointer.interact_pos(),
+            i.pointer.button_pressed(egui::PointerButton::Secondary),
+            // egui's triple-click classification can swallow a real
+            // double-click when an unrelated click landed within 6 px in the
+            // last 0.6 s (count 3, not 2). Both counts mean "toggle me".
+            i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                || i.pointer.button_triple_clicked(egui::PointerButton::Primary),
         )
     });
     // On the press frame `interact_pos` IS the press position.
     let press_pos = pos.unwrap_or_default();
-    if pressed && down && app.free_drag.is_none() {
+    if rpressed {
+        if let Some(idx) = pos.and_then(|p| header_hit(app, p, true)) {
+            app.win_menu = Some((idx, [press_pos.x, press_pos.y]));
+            app.win_menu_armed = false;
+        }
+    }
+    if dbl {
+        // egui fires double-click on the SECOND RELEASE — the tap-drag the
+        // first press started is discarded, the header decides by toggle.
+        // A short lockout keeps a mashed third click (which egui may report
+        // as another >=2 click) from toggling straight back.
+        let now = ui.ctx().input(|i| i.time);
+        if let Some(idx) = pos.and_then(|p| header_hit(app, p, false)).filter(|_| now >= app.dbl_dock_lock)
+        {
+            app.dbl_dock_lock = now + 0.35;
+            app.free_drag = None;
+            if is_docked(app, idx) {
+                let r = app.dock_rects[idx];
+                undock_to(app, idx, [r[0], r[1]]);
+                app.dock_just_floated = Some(idx);
+            } else {
+                let r = win_rect(app, idx);
+                let mid = egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+                let edge = dock_edge(app, idx);
+                dock_at(app, idx, edge, mid);
+            }
+            app.win_menu = None;
+            app.side_dirty = true;
+        }
+    }
+    if pressed && down && app.free_drag.is_none() && !dbl {
         // Iterate top-down (floats above docked; higher idx above lower)
         // so the visually topmost header wins the grab.
         let n = win_count(app);
@@ -13649,6 +14002,7 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             if head.contains(press_pos) {
                 app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
                 app.drag_pos = [r[0], r[1]];
+                app.drag_press_pt = [press_pos.x, press_pos.y];
                 break;
             }
         }
@@ -13657,14 +14011,22 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
         if !down {
             let pt = pos.unwrap_or_else(|| egui::pos2(app.drag_pos[0], app.drag_pos[1]));
             let vp = ui.ctx().input(|i| i.viewport_rect());
-            match snap_zone(vp, pt) {
-                Some(edge) => dock_at(app, idx, edge, pt),
-                None => {
-                    if is_docked(app, idx) {
-                        undock_to(app, idx, [pt.x - grab[0], pt.y - grab[1]]);
-                        app.dock_just_floated = Some(idx);
-                    } else {
-                        app.side_dirty = true;
+            // v43 R3: a TAP (release at the grab point) does nothing —
+            // only real carrying snaps or floats. Taps belong to the
+            // double-click toggle, not to the drop logic.
+            let far = (app.drag_pos[0] - app.drag_press_pt[0]).abs()
+                + (app.drag_pos[1] - app.drag_press_pt[1]).abs()
+                > 3.0;
+            if far {
+                match snap_zone(vp, pt) {
+                    Some(edge) => dock_at(app, idx, edge, pt),
+                    None => {
+                        if is_docked(app, idx) {
+                            undock_to(app, idx, [pt.x - grab[0], pt.y - grab[1]]);
+                            app.dock_just_floated = Some(idx);
+                        } else {
+                            app.side_dirty = true;
+                        }
                     }
                 }
             }
@@ -13769,26 +14131,8 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // window can be re-slotted (or floated out) without a precise
         // drag; the drag-to-edge gesture stays as the quick path.
         title.context_menu(|ui| {
-            let cur = dock_edge(app, idx);
-            for (e, name) in [(0i16, "left"), (1, "right"), (2, "bottom"), (3, "top")] {
-                if e == cur {
-                    continue;
-                }
-                if ui.button(format!("dock to the {name} edge")).clicked() {
-                    let r = app.dock_rects[idx];
-                    let mid = egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
-                    dock_at(app, idx, e, mid);
-                    app.save_config();
-                    ui.close();
-                }
-            }
-            if ui.button("float out (free window)").clicked() {
-                let r = app.dock_rects[idx];
-                undock_to(app, idx, [r[0], r[1]]);
-                app.dock_just_floated = Some(idx);
-                app.save_config();
-                ui.close();
-            }
+            let mut done = false;
+            window_slot_menu(ui, app, idx, &mut done);
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
@@ -13815,6 +14159,99 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     });
     if !app.dock_collapsed[idx] {
         ui.separator();
+    }
+}
+
+/// v43 R2/R6: the ONE slot-menu body: (re-)dock to any edge, float out,
+/// close. Shared by the docked header's right-click context menu and the
+/// floating title-bar menu (`win_menu_pass`), so every window — the four
+/// primaries AND the dynamic/plugin chrome (FX editor, params, chain,
+/// drum machine, roll, automation, master out) — answers identically in
+/// both placements.
+fn window_slot_menu(ui: &mut egui::Ui, app: &mut App, idx: usize, done: &mut bool) {
+    let docked = is_docked(app, idx);
+    let cur = dock_edge(app, idx);
+    for (e, name) in [(0i16, "left"), (1, "right"), (2, "bottom"), (3, "top")] {
+        if docked && e == cur {
+            continue;
+        }
+        if ui.button(format!("dock to the {name} edge")).clicked() {
+            let r = if docked {
+                app.dock_rects[idx]
+            } else {
+                win_rect(app, idx)
+            };
+            let mid = egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+            dock_at(app, idx, e, mid);
+            app.save_config();
+            *done = true;
+            ui.close();
+        }
+    }
+    if docked && ui.button("float out (free window)").clicked() { {
+            let r = app.dock_rects[idx];
+            undock_to(app, idx, [r[0], r[1]]);
+            app.dock_just_floated = Some(idx);
+            app.save_config();
+            *done = true;
+            ui.close();
+        }
+    }
+    ui.separator();
+    if ui.button("close this window").clicked() {
+        set_visible(app, idx, false);
+        *done = true;
+        ui.close();
+    }
+}
+
+/// v43 R2: draw the floating-title slot menu at the press point. Follows
+/// the `value_popups` family rules exactly: the App flag is the authority,
+/// `.open(&mut true)` keeps the egui Window re-openable (the v18
+/// closed-forever trap), armed click-away, and a press of EITHER button or
+/// Escape OUTSIDE dismisses it — the right-click that opened it releases
+/// on top of it and never dismisses itself.
+fn win_menu_pass(ui: &mut egui::Ui, app: &mut App) {
+    let Some((idx, pos)) = app.win_menu else {
+        app.win_menu_armed = false;
+        return;
+    };
+    if !win_visible(app, idx) {
+        app.win_menu = None;
+        return;
+    }
+    let armed = app.win_menu_armed;
+    app.win_menu_armed = true;
+    let mut open = true;
+    let mut done = false;
+    let resp = egui::Window::new(RichText::new("window menu").strong())
+        .id(egui::Id::new("slooper_win_slot_menu"))
+        .open(&mut open)
+        .fixed_pos(egui::pos2(pos[0], pos[1]))
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            window_slot_menu(ui, app, idx, &mut done);
+        });
+    if let Some(r) = resp {
+        let rect = r.response.rect;
+        let click_elsewhere = armed
+            && ui.ctx().input(|i| {
+                (i.pointer.button_clicked(egui::PointerButton::Primary)
+                    || i.pointer.button_clicked(egui::PointerButton::Secondary)
+                    || i.key_pressed(egui::Key::Escape))
+                    && !rect
+                        .expand(4.0)
+                        .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
+            });
+        if done || click_elsewhere || !open {
+            app.win_menu = None;
+            app.win_menu_armed = false;
+        }
+    } else {
+        // Window could not draw at all — never keep stale state.
+        app.win_menu = None;
+        app.win_menu_armed = false;
     }
 }
 
@@ -14120,6 +14557,22 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                     egui::Stroke::new(2.5, Color32::from_rgb(120, 190, 255)),
                     egui::StrokeKind::Inside,
                 );
+                // v43 R1: the PREDICTED SLOT inside the band — where and
+                // how big the window will end up if released right now.
+                if let Some(idx) = carried {
+                    let g = dock_slot_rect(app, idx, edge, pt, vp);
+                    p.rect_filled(
+                        g,
+                        4.0,
+                        Color32::from_rgb(150, 215, 255).linear_multiply(0.25),
+                    );
+                    p.rect_stroke(
+                        g,
+                        4.0,
+                        egui::Stroke::new(2.0, Color32::from_rgb(150, 215, 255)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
         }
     }
@@ -19749,9 +20202,47 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading(RichText::new("SETTINGS").strong());
 
+            // ---- v43 R5: navigation -----------------------------------------
+            // The panel is one long scroll otherwise; finding (say) the MPE
+            // switch means hunting every section. A query — typed or from a
+            // chip — hides every section whose heading and keyword list both
+            // miss it. Transient: never persisted, cleared on relaunch.
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.sett_filter)
+                        .hint_text("search settings\u{2026}")
+                        .desired_width(190.0),
+                );
+                if !app.sett_filter.is_empty() && ui.small_button("clear").clicked() {
+                    app.sett_filter.clear();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(app.sett_filter.is_empty(), "all")
+                    .clicked()
+                {
+                    app.sett_filter.clear();
+                }
+                for (name, q) in SETTINGS_CHIPS {
+                    if ui
+                        .selectable_label(app.sett_filter.trim().eq_ignore_ascii_case(q), name)
+                        .clicked()
+                    {
+                        app.sett_filter = q.to_string();
+                    }
+                }
+            });
+            let mut any = false;
+
             // ---- GUI -----------------------------------------------------
-            ui.separator();
-            ui.label(RichText::new("GUI").strong());
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "GUI",
+                "gui scale zoom interface tracks panel visible dock float layout theme light dark latency record latency_ms",
+            ) {
+                any = true;
             ui.horizontal(|ui| {
                 let before = app.gui_scale;
                 let r = ui.add(egui::Slider::new(&mut app.gui_scale, 0.7..=1.6).suffix("×"));
@@ -19821,40 +20312,25 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 if ui
                     .button("dock all windows")
                     .on_hover_text(
-                        "Snap every visible window back into its dock slot \
-                         (rack left, mixer right, bindings + monitor bottom).",
+                        "Snap every visible window — panels AND plugin/tool \
+                         windows — back into dock slots (rack left, mixer \
+                         right, bindings + monitor bottom, tools right).",
                     )
                     .clicked()
                 {
-                    let def = crate::config::default_dock();
-                    for (d, f) in app.side_wins.dock.iter_mut().zip(def) {
-                        *d = f;
-                    }
-                    app.side_dirty = true;
-                    app.save_config();
+                    dock_all_windows(app);
                 }
                 if ui
                     .button("float all windows")
                     .on_hover_text(
                         "Undock every window into a free-floating window \
                          (the classic layout) — drag headers to re-place, \
-                         drop on an edge to re-dock.",
+                         drop on an edge to re-dock, double-click a title \
+                         bar to toggle, right-click it for options.",
                     )
                     .clicked()
                 {
-                    for i in 0..4usize {
-                        if app.side_wins.dock[i][0] == 1 {
-                            let r = app.dock_rects[i];
-                            let base = float_footprint(app, i);
-                            let at = if r[2] > 8.0 {
-                                [r[0], r[1]]
-                            } else {
-                                [base[0], base[1]]
-                            };
-                            undock_to(app, i, at);
-                        }
-                    }
-                    app.save_config();
+                    float_all_windows(app);
                 }
             });
             ui.horizontal(|ui| {
@@ -19912,8 +20388,14 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             );
 
             // ---- monitoring -------------------------------------------------
-            ui.separator();
-            ui.label(RichText::new("MONITORING").strong());
+            }
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "MONITORING",
+                "monitor monitoring live input mic direct synth",
+            ) {
+                any = true;
             if ui
                 .checkbox(&mut app.monitor_enabled, "live input monitoring")
                 .on_hover_text(
@@ -19948,8 +20430,14 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             }
 
             // ---- asset preview --------------------------------------------
-            ui.separator();
-            ui.label(RichText::new("ASSET PREVIEW").strong());
+            }
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "ASSET PREVIEW",
+                "preview audition asset rack click length seconds",
+            ) {
+                any = true;
             if ui
                 .checkbox(&mut app.preview_enabled, "audition rack entries on click")
                 .on_hover_text("Clicking an asset-rack entry plays it at the master output (never recorded). Click the entry again to stop.")
@@ -19978,8 +20466,14 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             );
 
             // ---- projects --------------------------------------------------
-            ui.separator();
-            ui.label(RichText::new("PROJECTS").strong());
+            }
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "PROJECTS",
+                "projects project folder dir browse save sidecar",
+            ) {
+                any = true;
             ui.horizontal(|ui| {
                 ui.label("folder:");
                 if ui
@@ -20011,8 +20505,14 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             );
 
             // ---- v42: MPE ----------------------------------------------------
-            ui.separator();
-            ui.label(RichText::new("MPE").strong());
+            }
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "MPE",
+                "mpe expression bend pressure aftertouch channel polyphonic linnstrument",
+            ) {
+                any = true;
             if ui
                 .checkbox(&mut app.mpe_on, "MPE support (polyphonic expression)")
                 .on_hover_text(
@@ -20034,9 +20534,15 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             }
 
             // ---- MIDI + keyboard bindings -----------------------------------
-            ui.separator();
+            }
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "MIDI + KEYBOARD BINDINGS",
+                "midi keyboard keys shortcut binding bindings reset defaults global track transport",
+            ) {
+                any = true;
             ui.horizontal(|ui| {
-                ui.label(RichText::new("MIDI + KEYBOARD BINDINGS").strong());
                 if ui.button("Reset to Defaults").clicked() {
                     for (k, d) in app.short_keys.iter_mut().zip(SHORTCUT_DEFAULTS.iter()) {
                         *k = *d;
@@ -20128,8 +20634,14 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             );
 
             // ---- audio ports -------------------------------------------------
-            ui.separator();
-            ui.label(RichText::new("AUDIO PORTS").strong());
+            }
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "AUDIO PORTS",
+                "audio ports jack input output apply stop refresh disconnect xrun server",
+            ) {
+                any = true;
             port_list(ui, "INPUTS", "remote output ports (sources)", &app.avail_in, &mut app.sel_in);
             ui.add_space(8.0);
             port_list_lr(
@@ -20173,9 +20685,51 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.backend.cmd(Cmd::Refresh);
                 }
             });
+            }
+            if !any {
+                // v43 R5: an explicit dead end — a query that hits nothing
+                // must say so, not paint an empty panel.
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "nothing matches \u{201c}{}\u{201d} \u{2014} clear the search or \
+                         pick \u{201c}all\u{201d} to see every setting",
+                        app.sett_filter
+                    ))
+                    .weak(),
+                );
+            }
         });
     });
 }
+
+/// v43 R5: one SETTINGS section gate. A section shows when the filter is
+/// empty, or its heading or its keyword list contains every (whitespace-
+/// split) query word. Chips inject one-word queries; the search box takes
+/// free text. Draws the separator + bold heading for a matching section.
+fn settings_sect(ui: &mut egui::Ui, filt: &str, title: &str, keys: &str) -> bool {
+    let f = filt.trim().to_lowercase();
+    let hit = f.is_empty()
+        || title.to_lowercase().contains(&f)
+        || f.split_whitespace().all(|w| keys.contains(w));
+    if hit {
+        ui.separator();
+        ui.label(RichText::new(title).strong());
+    }
+    hit
+}
+
+/// The settings category chips: (label, query). Each query must hit its
+/// section through `settings_sect` — heading or keywords.
+const SETTINGS_CHIPS: [(&str, &str); 7] = [
+    ("GUI", "gui"),
+    ("monitoring", "monitoring"),
+    ("preview", "preview"),
+    ("projects", "projects"),
+    ("MPE", "mpe"),
+    ("MIDI keys", "midi"),
+    ("ports", "ports"),
+];
 
 /// First-save (or Save As) name prompt.
 fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
@@ -33620,5 +34174,409 @@ mod tests {
         assert_eq!(dock_order(&app, 1), 0, "bindings stays leftmost");
         assert_eq!(dock_order(&app, 3), 1, "mixer landed in the MIDDLE slot");
         assert_eq!(dock_order(&app, 2), 2, "monitor pushed right");
+    }
+
+    // =========================================================================
+    // v43 — window freedom, placement feedback, settings navigation.
+    // =========================================================================
+
+    /// The v43 ghost-slot rects (stroke color rgb(150,215,255)) painted while
+    /// a window is carried. The probe MUST re-inject the held button or
+    /// `free_drag_pass` would read a release and complete the drop.
+    fn ghost_rects(app: &mut App, ctx: &egui::Context, held: egui::Pos2) -> Vec<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            events: vec![moved(held), btn(held, egui::PointerButton::Primary, true)],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hits = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                    if r.stroke.color == egui::Color32::from_rgb(150, 215, 255)
+                        && r.stroke.width > 1.0
+                    {
+                        return Some(r.rect);
+                    }
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hits
+    }
+
+    /// R1: carrying a window over a dock band paints the PREDICTED SLOT —
+    /// the rect it will actually occupy (own cross size, inserted between
+    /// the future neighbours), not just the whole-edge band.
+    #[test]
+    fn v43_carry_ghost_paints_slot() {
+        let mut app = headless_app("v43ghost");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 1, "mixer docked right");
+        let h = app.dock_rects[3];
+        assert!(h[2] > 8.0, "mixer dock header rect recorded");
+        let from = egui::pos2(h[0] + 30.0, h[1] + 12.0);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        assert!(app.free_drag.is_some(), "header grab carried the mixer");
+        let to = egui::pos2(70.0, 200.0);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(700.0, 300.0))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        let ghosts = ghost_rects(&mut app, &ctx, to);
+        assert_eq!(ghosts.len(), 1, "exactly one predicted slot: {ghosts:?}");
+        let g = ghosts[0];
+        // Left edge: the slot hugs x=0 at a REAL panel width, starts at the
+        // band top (the drop is ABOVE the rack's center), and is a sized
+        // slot — a share of the band, not the whole band.
+        assert!(g.min.x < 10.0 && g.width() > 120.0, "left-edge slot geometry: {g:?}");
+        assert!(g.min.y < 100.0, "slot starts at the band top: {g:?}");
+        assert!(g.height() > 150.0 && g.height() < 520.0, "sized slot, not the band: {g:?}");
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 0, "released into the left edge");
+        assert_eq!(dock_order(&app, 3), 0, "landed at the drop rank (above the rack)");
+        assert!(ghost_rects(&mut app, &ctx, to).is_empty(), "ghost gone after release");
+    }
+
+    /// R2: right-clicking the TITLE of a floating primary window opens the
+    /// slot menu; a pick docks it to the chosen edge.
+    #[test]
+    fn v43_float_title_menu_docks() {
+        let mut app = headless_app("v43flmenu");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "float all windows").expect("float-all button");
+        click_pt(&mut app, &ctx, p);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock[0][0], 0, "rack floated out");
+        let t = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title");
+        let tp = t.center();
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.win_menu.is_some(), "right-press opened the slot menu");
+        let item = galley_at(&mut app, &ctx, "dock to the right edge").expect("menu item");
+        click_pt(&mut app, &ctx, item.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock[0][0], 1, "menu docked the rack");
+        assert_eq!(app.side_wins.dock[0][1], 1, "… to the RIGHT edge");
+        assert!(app.win_menu.is_none(), "menu closed after the pick");
+    }
+
+    /// R2 (plugin pass-through): the DYNAMIC windows — the drum machine
+    /// here, standing for every kind through the shared chrome — answer the
+    /// same right-click slot menu, and a pick docks them into the system.
+    #[test]
+    fn v43_plugin_window_gets_slot_menu() {
+        let mut app = headless_app("v43plugmenu");
+        let ctx = egui::Context::default();
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let t = galley_at(&mut app, &ctx, "drum machine").expect("drum float title");
+        let tp = t.center();
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let item = match galley_at(&mut app, &ctx, "dock to the bottom edge") {
+            Some(r) => r,
+            None => {
+                // The title may sit over another window; park it clear first
+                // and retry once — the gesture itself is the assertion.
+                park_window(&mut app, &ctx, "drum machine", egui::vec2(120.0, 200.0));
+                frame(&mut app, &ctx, vec![]);
+                let tp = galley_at(&mut app, &ctx, "drum machine")
+                    .expect("title after park")
+                    .center();
+                frame(&mut app, &ctx, vec![moved(tp)]);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
+                );
+                frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+                frame(&mut app, &ctx, vec![]);
+                galley_at(&mut app, &ctx, "dock to the bottom edge")
+                    .expect("slot menu on the plugin window")
+            }
+        };
+        click_pt(&mut app, &ctx, item.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .expect("drum registry slot");
+        assert_eq!(drum.dock[0], 1, "drum machine docked");
+        assert_eq!(drum.dock[1], 2, "… to the BOTTOM edge");
+    }
+
+    /// R2: the slot menu dismisses on a press outside (and never on the
+    /// release of the right-click that opened it).
+    #[test]
+    fn v43_float_menu_closes_outside() {
+        let mut app = headless_app("v43closes");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "float all windows").expect("float-all button");
+        click_pt(&mut app, &ctx, p);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let tp = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title").center();
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(galley_at(&mut app, &ctx, "close this window").is_some(), "menu open");
+        // The opening release did NOT dismiss it — now press far away:
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.win_menu.is_none(), "click-away dismissed the menu");
+        assert!(galley_at(&mut app, &ctx, "close this window").is_none(), "menu unpainted");
+    }
+
+    /// R3: double-clicking a title bar toggles docked <-> floating, in BOTH
+    /// directions, with no drag needed.
+    #[test]
+    fn v43_dbl_title_toggles_dock_float() {
+        let mut app = headless_app("v43dbl");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "float all windows").expect("float-all button");
+        click_pt(&mut app, &ctx, p);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Park the rack title mid-screen so the inter-press release lands
+        // outside every snap band (a band release would re-dock first).
+        park_window(&mut app, &ctx, "ASSET RACK", egui::vec2(300.0, 250.0));
+        frame(&mut app, &ctx, vec![]);
+        let tp = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title").center();
+        assert!(tp.x > 200.0 && tp.x < 1200.0, "title parked off any band: {tp:?}");
+        // Double-click: press · release · press (same point, same moment).
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(&mut app, &ctx, vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock[0][0], 1, "double-click docked the float");
+        assert_eq!(app.side_wins.dock[0][1], 0, "… to its remembered edge (left)");
+        // Let the mash-guard window expire (a real user never re-dbls a
+        // title inside 0.35 s).
+        for _ in 0..25 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // And back: double-click the now-docked header floats it again.
+        let h = app.dock_rects[0];
+        assert!(h[2] > 8.0, "docked header rect recorded");
+        let dp = egui::pos2(h[0] + 30.0, h[1] + 12.0);
+        frame(&mut app, &ctx, vec![moved(dp)]);
+        frame(&mut app, &ctx, vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(dp, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(dp, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock[0][0], 0, "double-click floated the docked window");
+    }
+
+    /// R4: the top-bar Windows menu toggles window visibility with live
+    /// checkmarks (and persists the choice).
+    #[test]
+    fn v43_windows_menu_toggles_visibility() {
+        let mut app = headless_app("v43wmenu");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let c = label_center(&mut app, &ctx, "mixer dock").expect("menu checkbox");
+        click_pt(&mut app, &ctx, c);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(!app.show_mixer, "menu hid the mixer");
+        assert!(!win_visible(&app, 3), "… and it stops being visible");
+        // Re-show through the same hub.
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0)); // close the popup
+        frame(&mut app, &ctx, vec![]);
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let c = label_center(&mut app, &ctx, "mixer dock").expect("menu checkbox");
+        click_pt(&mut app, &ctx, c);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.show_mixer, "menu brought the mixer back");
+    }
+
+    /// R4: the layout actions in the Windows menu cover the DYNAMIC windows
+    /// too, and "reset window layout" restores the stock arrangement fully.
+    #[test]
+    fn v43_windows_menu_layout_actions() {
+        let mut app = headless_app("v43wlayout");
+        let ctx = egui::Context::default();
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        let open_menu = |app: &mut App, ctx: &egui::Context| {
+            let w = label_center(app, ctx, "Windows").expect("Windows button");
+            click_pt(app, ctx, w);
+            frame(app, ctx, vec![]);
+        };
+        open_menu(&mut app, &ctx);
+        let d = label_center(&mut app, &ctx, "dock all windows").expect("dock-all item");
+        click_pt(&mut app, &ctx, d);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "primaries snapped");
+        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).expect("dyn slot");
+        assert_eq!(drum.dock[0], 1, "dock-all INCLUDED the dynamic window");
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
+        open_menu(&mut app, &ctx);
+        let f = label_center(&mut app, &ctx, "float all windows").expect("float-all item");
+        click_pt(&mut app, &ctx, f);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.side_wins.dock.iter().all(|d| d[0] == 0), "primaries floated");
+        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).unwrap();
+        assert_eq!(drum.dock[0], 0, "float-all INCLUDED the dynamic window");
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
+        open_menu(&mut app, &ctx);
+        let r = label_center(&mut app, &ctx, "reset window layout").expect("reset item");
+        click_pt(&mut app, &ctx, r);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "stock slots restored");
+        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).unwrap();
+        assert_eq!(drum.dock[0], 1, "dynamic re-docked");
+        assert!(app.dock_collapsed.iter().all(|c| !*c), "nothing collapsed");
+    }
+
+    /// R5: a settings search hides non-matching sections; the query that
+    /// hits nothing says so; "clear" restores everything.
+    #[test]
+    fn v43_settings_search_filters_sections() {
+        let mut app = headless_app("v43sfilter");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !galley_centers(&mut app, &ctx, "MONITORING", false).is_empty(),
+            "sections open unfiltered"
+        );
+        assert!(
+            !galley_centers(&mut app, &ctx, "AUDIO PORTS", false).is_empty(),
+            "the bottom-most section paints too"
+        );
+        let f = galley_at(&mut app, &ctx, "search settings").expect("filter box");
+        click_pt(&mut app, &ctx, f.center());
+        type_into_focused(&mut app, &ctx, "theme");
+        frame(&mut app, &ctx, vec![]);
+        assert!(galley_at(&mut app, &ctx, "MONITORING").is_none(), "monitoring filtered out");
+        assert!(galley_at(&mut app, &ctx, "AUDIO PORTS").is_none(), "ports filtered out");
+        assert!(galley_at(&mut app, &ctx, "GUI").is_some(), "GUI survives its keyword 'theme'");
+        assert!(
+            galley_at(&mut app, &ctx, "live input monitoring").is_none(),
+            "hidden section paints nothing, not even its widgets"
+        );
+        // Enter committed and DROPPED focus (egui singleline behavior) —
+        // re-click the box before replacing the query.
+        let fb = galley_at(&mut app, &ctx, "theme").expect("query still painted");
+        click_pt(&mut app, &ctx, fb.center());
+        type_into_focused(&mut app, &ctx, "zzzz");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            galley_centers(&mut app, &ctx, "nothing matches", false).len(),
+            1,
+            "explicit dead end for a zero-hit query"
+        );
+        let c = galley_at(&mut app, &ctx, "clear").expect("clear button");
+        click_pt(&mut app, &ctx, c.center());
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.sett_filter.is_empty(), "clear emptied the filter");
+        assert!(
+            !galley_centers(&mut app, &ctx, "MONITORING", false).is_empty(),
+            "sections restored"
+        );
+    }
+
+    /// R5: a category chip filters to its section and "all" clears it.
+    #[test]
+    fn v43_settings_chip_filters() {
+        let mut app = headless_app("v43schip");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = galley_at(&mut app, &ctx, "ports").expect("ports chip");
+        click_pt(&mut app, &ctx, p.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.sett_filter, "ports", "chip injected its query");
+        assert!(galley_at(&mut app, &ctx, "AUDIO PORTS").is_some(), "ports section shown");
+        assert!(galley_at(&mut app, &ctx, "MONITORING").is_none(), "others hidden");
+        assert!(galley_at(&mut app, &ctx, "PROJECTS").is_none(), "others hidden");
+        let all = galley_centers(&mut app, &ctx, "all", true);
+        assert!(!all.is_empty(), "the 'all' chip is an exact label");
+        click_pt(&mut app, &ctx, all[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.sett_filter.is_empty(), "'all' cleared the filter");
+        assert!(
+            !galley_centers(&mut app, &ctx, "MONITORING", false).is_empty(),
+            "everything restored"
+        );
     }
 }
