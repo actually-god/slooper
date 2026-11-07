@@ -947,11 +947,11 @@ impl Instance {
         params: &[f32; MAX_PARAMS],
         sc: f32,
     ) -> (f32, f32) {
-        match self.fns.process_st {
+                        match self.fns.process_st {
             Some(f) => {
                 let mut or = 0.0f32;
                 let ol = f(self.state, l, r, params.as_ptr(), sc, &mut or);
-                (ol, or)
+                                (ol, or)
             }
             None => {
                 let y = match self.fns.process_sc {
@@ -1820,14 +1820,19 @@ mod tests {
             "template keeps the auto slider window"
         );
         // FL-suite tier: the waveshaper carries the draggable-curve GUI,
-        // and the vocoder is the second stock ABI-v2 (sidechain) effect.
+        // and the vocoder ships the full v1/v2/v3 export quartet (tier-5b
+        // stereo). v3 flag semantics (tier-3b): `sidechain` is EXACT-v2
+        // only — a v3 script reads the key through the `sc` argument of
+        // process_st — so vocoder now flags stereo, never sidechain.
         assert!(
             reg.gui("waveshaper").is_some(),
             "waveshaper must expose its curve editor GUI"
         );
+        let voc = reg.desc("vocoder").unwrap();
+        assert!(voc.stereo, "vocoder must load through the v3 entry");
         assert!(
-            reg.desc("vocoder").unwrap().sidechain,
-            "vocoder must load through the v2 entry"
+            !voc.sidechain,
+            "vocoder sidechain flag is exact-v2-only (it keys off process_st's sc arg)"
         );
         assert!(!reg.desc("overdrive").unwrap().sidechain, "overdrive is v1");
         assert!(
@@ -3296,7 +3301,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 // Left-only feed, with occasional right content too so
                 // internal side-branches (delay lines) see both rails.
                 let (l, r) = if i % 7000 < 3500 { (x, 0.0) } else { (x * 0.5, x) };
-                let (ol, or) = unsafe { inst.call_sample_st(l, r, &dp, 0.0) };
+                // Tier-5b: feed a LIVE key — a v3 script that wants the
+                // sidechain (vocoder) reads the `sc` arg of process_st,
+                // and sc=0 legitimately mutes it (silent-modulator design),
+                // which is NOT the decorrelation gate's business.
+                let (ol, or) = unsafe { inst.call_sample_st(l, r, &dp, x) };
                 assert!(ol.is_finite() && or.is_finite(), "{stem}: st path NaN");
                 peak = peak.max(ol.abs()).max(or.abs());
                 let d = (ol - or) as f64;
@@ -3311,8 +3320,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             drop(inst);
         }
         assert!(
-            st_checked >= 7,
-            "expected the v3 spread/panmatic/chorus/echo3/space_echo/phaser/flanger to load as stereo, got {st_checked}"
+            st_checked >= 11,
+            "expected the v3 spread/panmatic/chorus/echo3/space_echo/phaser/flanger/shifter/gater/vocoder/pitchshft to load as stereo, got {st_checked}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3842,6 +3851,271 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 "shared comb unbalanced between sides (L {el3} R {er3})"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FL Suite tier 5b (docs/FL-SUITE.md): shifter / gater / pitchshft /
+    /// vocoder upgraded to ABI-v3 stereo. STRUCTURE pins per the tier-4
+    /// rule (energy gates cannot tell a real stereo script from one mono
+    /// signal played twice). Measured probe values (2026-11-07): decor
+    /// shifter 1.41, gater 0.93 (antiphase 2.00), vocoder 0.43,
+    /// pitchshft 1.43; vocoder downmix error 1.1e-8 against a 0.25 peak.
+    ///  * spread 0 ⇒ BIT-identical L/R for identical inputs (all four),
+    ///  * default spread ⇒ decorrelation floors (halves of measured),
+    ///  * true-rail scripts (shifter/gater/pitchshft): a hard-panned L
+    ///    impulse leaves the R rail EXACTLY zero — no cross-feed at all,
+    ///  * vocoder: the antisymmetric band interleave keeps the mono
+    ///    downmix equal to the v2 mono circuit at ANY spread,
+    ///  * v1 fallback ≡ ST-path LEFT bit-for-bit (vocoder: v1 stays the
+    ///    documented passthrough).
+    #[test]
+    fn tier5b_stereo_mods() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t5b");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+
+        let n: usize = 14400;
+        let mut noise = Vec::with_capacity(n);
+        let mut seed: u32 = 0x5eed_1234;
+        for _ in 0..n {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            noise.push(((seed >> 8) as f32) * (2.0 / 16777216.0) - 1.0);
+        }
+        let sr = 48000.0f64;
+        let defp = |stem: &str| -> [f32; MAX_PARAMS] {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            for (k, pd) in reg.desc(stem).unwrap().params.iter().enumerate() {
+                dp[k] = pd.default;
+            }
+            dp
+        };
+
+        // ---- shared shape: bit-exact 0, decor floor, hard-pan image,
+        // fallback identity — for the three true-rail scripts.
+        // (stem, spread idx, decor floor, extra param tweak)
+        for (stem, sidx, min_decor, tweak) in
+            [("shifter", 4usize, 0.6f64, 0.0f32), ("gater", 7, 0.5, 0.0), ("pitchshft", 10, 0.6, 5.0)]
+        {
+            let d = reg.desc(stem).unwrap_or_else(|| panic!("{stem} missing"));
+            assert!(d.stereo, "{stem}: must load as an ABI-v3 stereo script");
+            assert!(!d.sidechain, "{stem}: sidechain flag is exact-v2-only");
+            assert!(
+                d.params.last().unwrap().label.starts_with("spread"),
+                "{stem}: last param is spread"
+            );
+            let mut dp = defp(stem);
+            if tweak != 0.0 {
+                dp[1] = tweak; // pitchshft semitones: an idle shifter never decorrelates
+            }
+            let run = |spread: f32| -> (Vec<f32>, Vec<f32>) {
+                let inst = reg.create_instance(stem, sr, &dp).expect("inst");
+                let mut p = dp;
+                p[sidx] = spread;
+                let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                for i in 0..n {
+                    let (l, r) = unsafe { inst.call_sample_st(noise[i], noise[i], &p, 0.0) };
+                    yl.push(l);
+                    yr.push(r);
+                }
+                drop(inst);
+                (yl, yr)
+            };
+
+            // 1. spread 0 => bit-exact mono for identical inputs.
+            let (zl, zr) = run(0.0);
+            let bad = zl
+                .iter()
+                .zip(&zr)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                bad, 0,
+                "{stem}: spread 0 is not an exact-mono output ({bad} differing samples)"
+            );
+
+            // 2. default spread => the sides split.
+            let (yl, yr) = run(0.5);
+            let (mut el, mut er, mut ed) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 2000..12000 {
+                el += (yl[i] as f64).powi(2);
+                er += (yr[i] as f64).powi(2);
+                ed += (yl[i] as f64 - yr[i] as f64).powi(2);
+            }
+            let m = 10000.0;
+            let decor = (ed / m).sqrt() / (((el / m).sqrt() + (er / m).sqrt()) * 0.5).max(1e-12);
+            eprintln!("T5b {stem} decor {decor}");
+            assert!(
+                decor > min_decor,
+                "{stem}: the spread never split the sides (D/RMS {decor})"
+            );
+
+            // 3. hard-panned L impulse: the R rail stays EXACTLY zero —
+            // these scripts are per-side circuits, any R energy at all
+            // would mean a cross-feed nobody asked for. WINDOW 12000:
+            // pitchshft's mod delay line is 6000 samples deep, so a
+            // shorter window cannot reach the wet taps and a wet
+            // cross-feed sabotage would sail through (tier-5b sabotage
+            // matrix caught exactly this).
+            let inst = reg.create_instance(stem, sr, &dp).expect("inst5b");
+            let mut p = dp;
+            p[sidx] = 0.5;
+            let mut ermax = 0.0f32;
+            for i in 0..12000usize {
+                let x = if i == 100 { 1.0f32 } else { 0.0 };
+                let (_, r) = unsafe { inst.call_sample_st(x, 0.0, &p, 0.0) };
+                ermax = ermax.max(r.abs());
+            }
+            drop(inst);
+            assert_eq!(ermax, 0.0, "{stem}: hard-panned L leaked {ermax} into the R rail");
+
+            // 4. v1 fallback == ST path LEFT, bit-for-bit.
+            let st = reg.create_instance(stem, sr, &dp).expect("st5b");
+            let mono = reg.create_instance(stem, sr, &dp).expect("v15b");
+            let mut drift = 0usize;
+            for i in 0..n {
+                let l = unsafe { st.call_sample_st(noise[i], noise[i], &dp, 0.0) }.0;
+                let y = unsafe { mono.call_sample(noise[i], &dp) };
+                if y.to_bits() != l.to_bits() {
+                    drift += 1;
+                }
+            }
+            drop(st);
+            drop(mono);
+            assert_eq!(drift, 0, "{stem}: v1 mono path drifted from the ST left channel");
+        }
+
+        // ---- vocoder: shared envelopes + antisymmetric band interleave.
+        {
+            let stem = "vocoder";
+            let d = reg.desc(stem).unwrap();
+            assert!(d.stereo, "vocoder must load through the v3 entry");
+            assert!(!d.sidechain, "vocoder flags stereo, never sidechain (tier-3b semantics)");
+            let dp = defp(stem);
+            assert_eq!(dp[8], 0.5, "vocoder spread default 0.5");
+            // Carrier AND key ride the same noise stream (envs must open).
+            let run = |spread: f32| -> (Vec<f32>, Vec<f32>) {
+                let inst = reg.create_instance(stem, sr, &dp).expect("voc inst");
+                let mut p = dp;
+                p[8] = spread;
+                let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                for i in 0..n {
+                    let (l, r) = unsafe { inst.call_sample_st(noise[i], noise[i], &p, noise[i]) };
+                    yl.push(l);
+                    yr.push(r);
+                }
+                drop(inst);
+                (yl, yr)
+            };
+            let (zl, zr) = run(0.0);
+            let bad = zl
+                .iter()
+                .zip(&zr)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(bad, 0, "vocoder: spread 0 is not an exact-mono output ({bad} differing)");
+
+            let (yl, yr) = run(0.5);
+            let (mut el, mut er, mut ed) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 2000..12000 {
+                el += (yl[i] as f64).powi(2);
+                er += (yr[i] as f64).powi(2);
+                ed += (yl[i] as f64 - yr[i] as f64).powi(2);
+            }
+            let m = 10000.0;
+            let decor = (ed / m).sqrt() / (((el / m).sqrt() + (er / m).sqrt()) * 0.5).max(1e-12);
+            eprintln!("T5b vocoder decor {decor}");
+            assert!(decor > 0.25, "vocoder: band interleave never split the sides (D/RMS {decor})");
+
+            // Downmix invariance: (L+R)/2 == the v2 mono circuit (a fresh
+            // process_sc instance) — the side component must be exactly
+            // antisymmetric, so the mono sum is untouchable by `spread`.
+            let mono = reg.create_instance(stem, sr, &dp).expect("voc mono");
+            let mut worst = 0.0f64;
+            let mut peak = 0.0f64;
+            for i in 0..n {
+                let m0 = unsafe { mono.call_sample_sc(noise[i], &dp, noise[i]) };
+                let dm = (yl[i] as f64 + yr[i] as f64) * 0.5;
+                worst = worst.max((dm - m0 as f64).abs());
+                peak = peak.max(m0.abs() as f64);
+            }
+            drop(mono);
+            assert!(peak > 0.05, "vocoder sc path silent ({peak})");
+            assert!(
+                worst < peak * 1e-4,
+                "vocoder: spread changed the mono downmix ({worst:.2e} vs peak {peak:.3})"
+            );
+
+            // v1 semantics: the vocoder stays a documented passthrough.
+            let v1 = reg.create_instance(stem, sr, &dp).expect("voc v1");
+            let mut drift = 0usize;
+            for i in 0..n {
+                if unsafe { v1.call_sample(noise[i], &dp) }.to_bits() != noise[i].to_bits() {
+                    drift += 1;
+                }
+            }
+            drop(v1);
+            assert_eq!(drift, 0, "vocoder: v1 entry stopped passing through");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tier-5b persistence guard (mirrors tier5_space_echo_params_appended_only):
+    /// chain rows index params by SLOT, so the stereo upgrade had to APPEND
+    /// `spread` in all four scripts. This freezes the historical label +
+    /// default tables in order and fails if anyone reorders, renames or
+    /// re-tunes the sticky 0..N-1 params, or flips the v3 flag semantics.
+    #[test]
+    fn tier5b_params_appended_only() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t5bparams");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        macro_rules! freeze {
+            ($stem:expr, [$($lab:expr => $def:expr),+], $spread_lab:expr) => {{
+                let d = reg.desc($stem).unwrap_or_else(|| panic!("{} desc", $stem));
+                let want: &[(&str, f32)] = &[$(($lab, $def)),+];
+                assert_eq!(d.params.len(), want.len() + 1, "{}: exactly one appended param", $stem);
+                for (k, (lab, def)) in want.iter().enumerate() {
+                    assert_eq!(&d.params[k].label, lab, "{}: sticky param {k} label changed", $stem);
+                    assert!((d.params[k].default - def).abs() < 1e-6, "{}: sticky param {k} default changed", $stem);
+                }
+                let last = d.params.len() - 1;
+                assert!(d.params[last].label.starts_with("spread"), "{}: appended param must be 'spread…'", $stem);
+                assert!((d.params[last].default - 0.5).abs() < 1e-6, "{}: spread default 0.5 — wide out of the box", $stem);
+                assert!(d.stereo, "{}: tier-5b script must be ABI v3", $stem);
+                assert!(!d.sidechain, "{}: sidechain flag is exact-v2-only", $stem);
+            }};
+        }
+        freeze!("shifter", [
+            "shift Hz" => 240.0, "feedback" => 0.0, "mix" => 1.0, "out" => 1.0
+        ], "spread");
+        freeze!("gater", [
+            "rate Hz" => 2.0,
+            "shape (0 sine/1 tri/2 pulse/3 pluck/4 rnd)" => 2.0,
+            "width/decay" => 0.5, "smooth ms" => 4.0, "phase" => 0.0,
+            "mix" => 1.0, "out" => 1.0
+        ], "spread");
+        freeze!("vocoder", [
+            "attack ms" => 5.0, "release ms" => 60.0, "peakiness" => 1.3,
+            "freq low" => 220.0, "freq high" => 7500.0, "brightness" => 0.0,
+            "mix" => 1.0, "out" => 1.1
+        ], "spread");
+        freeze!("pitchshft", [
+            "mode (0shift 1corr 2tune)" => 0.0, "semitones" => 0.0, "fine cents" => 0.0,
+            "strength" => 0.7, "slew ms" => 15.0, "tone" => 0.8, "wet" => 1.0,
+            "gain" => 1.0, "ref Hz" => 440.0, "gate dB" => -55.0
+        ], "spread");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

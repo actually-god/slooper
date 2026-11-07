@@ -3814,3 +3814,164 @@ fn e2e_tier5_stereo_reverb_live() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FL Suite tier 5b live-RT proof (docs/FL-SUITE.md): shifter, gater,
+/// pitchshft and vocoder upgraded to ABI-v3 must put real SIDE energy on
+/// the LIVE master buses. For the vocoder (the only key-consuming script
+/// of the four) a one-bit self-send keys its envelopes off the track's
+/// own dry sum (the sc tap is pre-FX — no feedback path). The source is
+/// hard-centred, so ANY L/R difference is the effect.
+#[test]
+fn e2e_tier5b_stereo_mods_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-t5b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    let stems = ["shifter", "gater", "pitchshft", "vocoder"];
+    for stem in stems {
+        let d = reg.desc(stem).expect("stock script present").clone();
+        assert!(d.stereo, "{stem} must load as an ABI-v3 stereo script");
+    }
+
+    let ring_n = 1usize << 19;
+    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("t5b_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async(
+            (),
+            DiffProc {
+                sink_l,
+                sink_r,
+                ring_sum: ring_sum.clone(),
+                ring_dif: ring_dif.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "dual-bus layout not applied"
+    );
+
+    // Constant-energy looping asset (toned noise), same fixture as tier 4/5.
+    let n = (sr as usize) * 2;
+    let sample: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let tone = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+                let h = (i as u32).wrapping_mul(2654435761);
+                let noise = (h as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                0.4 * (0.6 * tone + 0.4 * noise)
+            })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    // Track 1 carries the same asset as the vocoder's KEY source:
+    // `set_sc_send` masks the target's own bit, so a self-send is
+    // impossible by construction (no feedback path, ever) — the key
+    // must come from another track. Silent (vol 0) on every other pass;
+    // the tap is post-trim, so 0 vol doubles as "no key".
+    arr.insert(1, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![sample]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.5); // dead centre: any L/R split is the effect's
+
+    let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
+        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+
+    for stem in stems {
+        let d = reg.desc(stem).unwrap().clone();
+        // pitchshft at default shift (semitones 0) has travel 0.5 samples —
+        // the spread needs REAL tap movement, same seed as the unit pin.
+        let mut dp = vec![0.0f32; 32];
+        for (k, pd) in d.params.iter().enumerate() {
+            dp[k] = pd.default;
+        }
+        if stem == "pitchshft" {
+            dp[1] = 5.0;
+        }
+        if stem == "vocoder" {
+            dp[8] = 1.0; // full band-interleave: assert at maximum decorrelation
+        }
+        let inst = reg
+            .create_instance(stem, sr as f64, &dp)
+            .unwrap_or_else(|| panic!("{stem} compiles"));
+        // Vocoder keying: the track-1 asset (see above) is the modulator;
+        // its volume doubles as the key gate since the tap is post-trim.
+        let keying = stem == "vocoder";
+        b.engine.set_loop_vol(1, if keying { 1.0 } else { 0.0 });
+        b.engine.set_loop_pan(1, 0.5);
+        b.engine.set_sc_send(0, if keying { 1 << 1 } else { 0 });
+        b.cmd(Cmd::SetTrackEffects {
+            i: 0,
+            chain: TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, d)]),
+            },
+        });
+        std::thread::sleep(Duration::from_millis(120));
+
+        b.cmd(Cmd::PlayAll);
+        wait_until(
+            || {
+                ring_peak(&ring_sum, &widx, 480)
+                    .map(|m| m > 0.01)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(3),
+            &format!("{stem} audible on master"),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        let s = rms(&ring_sum);
+        let dd = rms(&ring_dif);
+        eprintln!("T5b {stem}: sum {s:.6} dif {dd:.6} D/S {:.4}", dd / s);
+        assert!(s > 0.01, "{stem}: loop must be audible through the effect (sum rms {s})");
+        assert!(
+            dd > s * 0.05,
+            "{stem}: stereo script must put side energy on the master buses (dif {dd} vs sum {s})"
+        );
+
+        b.cmd(Cmd::StopAll);
+        b.cmd(Cmd::SetTrackEffects {
+            i: 0,
+            chain: TrackFx { slots: Arc::new(vec![]) },
+        });
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    b.engine.set_sc_send(0, 0);
+    b.engine.set_loop_vol(1, 0.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

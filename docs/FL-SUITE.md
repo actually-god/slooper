@@ -34,16 +34,16 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Fruity Filter, Fruity Love Philter (single core), Fruity Wah | resonant LP/BP/HP + env auto-wah | `vfilter.rs` | done |
 | Fruity Phaser, Vintage Phaser | phaser | `phaser.rs` | done tier-5 (ABI-v3 dual path: R cascade runs the LFO `spread` further along, opposite-traveling notches; L path = the historical mono circuit bit-for-bit) |
 | Fruity Flanger, Fruity Flangus | flanger / unison | `flanger.rs` | done tier-5 (ABI-v3: ONE shared comb written with the mid, per-side modulated taps + R-side `spread` offset — opposite-sweep sides; tier-4 absolute-index ring read fixed — the comb now actually recirculates; base time slewed) |
-| Fruity PanOMatic (vol), Gross Beat (gate/stutter lite) | tempo volume-gating | `gater.rs` | done |
+| Fruity PanOMatic (vol), Gross Beat (gate/stutter lite) | tempo volume-gating | `gater.rs` | done tier-5b (ABI-v3 dual-lane: one LFO clock, R rail reads it `spread×180°` later with its own edge smoother — 1.0 = antiphase Gross-Beat gating; dry never crosses rails) |
 | Fruity Delay 2, Fruity Delay 3, Fruity Delay Bank (single-bank core) | delay + filtered feedback | `echo3.rs` | done tier-4 (ABI-v3 ping-pong: R taps `time×(1+pp)` so repeats trail L→R; tier-1 absolute-index ring read fixed — see rework log) |
-| Frequency Shifter | SSB shift (metallic/vibrato) | `shifter.rs` | done |
+| Frequency Shifter | SSB shift (metallic/vibrato) | `shifter.rs` | done tier-5b (ABI-v3 TRUE STEREO: independent Hilbert/oscillator/feedback per side, R = `shift×(1+spread)` — hard-panned input never crosses rails) |
 | Transient Processor, Transmitter (split lite) | transient/sustain shaping | `transient.rs` | done |
-| Fruity Vocoder, Vocodex | vocoder (SC carrier feed) | `vocoder.rs` | done |
+| Fruity Vocoder, Vocodex | vocoder (SC carrier feed) | `vocoder.rs` | done tier-5b (ABI-v3 carrier decorrelation: shared per-band envelopes + antisymmetric band interleave ⇒ spread splits the sides while the mono downmix stays the v2 circuit; keys off `process_st`'s sc arg — chain row now badges `[fx:st]`, not `[fx:sc]`) |
 | Convolver | impulse reverb | `convolver.rs` | done (partitioned overlap-save FFT, **folder IR capability** — `~/.local/share/slooper/impulses`, env override, index 0 = built-in hall) |
 | Multiband Delay | split echo | `echo3` + `multiband` chain | later (chainable today) |
 | Spreader, Stereo Enhancer, Stereo Shaper, Flangus stereo, ping-pong delays | stereo width/image | `spread.rs` | done (ABI-v3 reference: mid/side + comb-Haas width, mix/gain; **stereo-pair capability** shipped, see capability log 3) |
 | Fruity PanOMatic (pan side; vol side in `gater.rs`) | tempo pan LFO | `panmatic.rs` | done (ABI-v3: equal-power sine/tri/inverse-tri pan + optional volume wheel, tempo-synced) |
-| Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | `pitchshft.rs` | done (dual delay-line shifter + internal decimated-YIN auto-correct + tuner-meter GUI; pitch detect needs no ABI change — decimate inside `process`, rung 1) |
+| Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | `pitchshft.rs` | done tier-5b (ABI-v3: two delay lines, ONE modulation clock — R read head offset `spread×180°` (phaser topology); detector tracks the mid; NOTE: spread decorrelates only when the shift actually moves taps — at 0 shift both rails ride the same static delay) |
 | Scratcher, Transporter, Wave Traveller, part of Gross Beat | transport scrub / retrigger | — | later (**transport-sync capability**) |
 | Peak Controller, Envelope Controller, X-Y/Z, Formula Controller, VFX Envelope/Sequencer/Key Mapper, Control Surface | automation SOURCES | — | later (**control-rate OUT capability**); slooper automation clips + per-param automation cover the DESTINATION side today |
 | Fruity Balance / Send / VFX Level Scaler | trim / routing | track gain/volume + sends | host |
@@ -88,10 +88,11 @@ ladder: `slooper-effect-authoring` skill §ABI evolution):
    mono per-track fold is bit-true (`play_l += ml*pgl; play_r += mr*pgr`,
    pan-law only in the master fold) — a v1/v2 chain measures L−R = 0 on
    the master buses (pinned by `e2e_tier3_stereo_spread_live`, which ALSO
-   asserts a v3 script decorrelates). Scripts: `spread.rs`,
-   `panmatic.rs`, plus tier-4 `chorus.rs` (per-side tap banks) and
-   `echo3.rs` (ping-pong reads), plus tier-5 `space_echo.rs` (dual-bank
-   FDN + per-side echo). Write the pair into the L slot +
+   asserts a v3 script decorrelates). Scripts (11 total since tier 5b):
+   `spread.rs`, `panmatic.rs`, tier-4 `chorus.rs` (per-side tap banks) +
+   `echo3.rs` (ping-pong reads), tier-5 `space_echo.rs` (dual-bank
+   FDN + per-side echo) + `phaser.rs`/`flanger.rs`, and tier-5b
+   `shifter.rs`/`gater.rs`/`vocoder.rs`/`pitchshft.rs`. Write the pair into the L slot +
    out pointer; never
    assume L == R in a v3 slot. FLAG SEMANTICS: `desc.sidechain` is
    true only for the EXACT v2 generation — a v3 script must export the
@@ -290,6 +291,80 @@ roster gate moved `st_checked >= 5 → 7`.
   effect bug). And never end a ctypes probe without `os._exit(0)`:
   interpreter teardown dlcloses the Rust cdylib (the never-dlclose rule).
 
+## Tier-5b stereo finals log (2026-11-07 — `shifter` / `gater` / `vocoder` / `pitchshft` → ABI v3)
+
+Candidate #5 done — the last four mono scripts joined rung 3 (zero ABI
+change, mirror the spread.rs export quartet + one appended `spread`,
+default 0.5; `bundled_effects_produce_sound` gate: `st_checked >= 11`).
+Structural pins `tier5b_stereo_mods` + `tier5b_params_appended_only`
+(param tables frozen 0..N-1); measured decor: shifter 1.41, gater 0.93
+(antiphase at spread 1 = 2.00), vocoder 0.43, pitchshft 1.43.
+
+- **shifter = TRUE stereo dual SSB**: a full Hilbert pair + rotator +
+  feedback loop PER SIDE (R shifts `shift × (1+spread)`). A hard-panned
+  input measures EXACTLY zero on the other rail — pinned at 12000
+  samples (see window rule below).
+- **gater = dual-lane Gross Beat**: ONE LFO clock, the R lane reads it
+  `spread × 0.5` cycles further along with its own attack/release
+  smoother (1.0 = antiphase: L open while R closed — measured D/RMS
+  2.00 = the textbook maximum).
+- **vocoder = carrier decorrelation with a mono guarantee**: one shared
+  per-band envelope (the articulation can never wobble the image),
+  per-side carrier biquads, and the rails interleave band signs —
+  L weights band i by (1+spread·(−1)^i), R by (1−spread·(−1)^i). The
+  side component is ANTISYMMETRIC, so (L+R)/2 equals the v2 mono circuit
+  at ANY spread (pinned: max error 1.1e-8 on a 0.25 peak; the per-side
+  tilt one-poles stay linear, so the downmix commutes through them).
+  FLAG CONSEQUENCE (tier-3b semantics): vocoder now loads through the
+  v3 entry, so `desc.sidechain == false` and the UI badges it (ST),
+  never (SC) — it keys off the `sc` ARGUMENT of process_st, which the
+  engine always supplies (`fx_mix`/`run_chain_block`).
+- **pitchshft = two delay lines, ONE modulation clock** (phaser
+  topology): the R read head reads the same saw phase `spread × 0.5`
+  periods further along through its own delay line + tone LP; the YIN
+  detector tracks the MID (identical inputs ⇒ bit-identical to the
+  tier-3 mono circuit, pinned). GUI gained a `spread` slider
+  (want_height 240 → 336). **Semantics**: spread only moves the WET —
+  and at 0 shift the taps barely travel, so the e2e seeds semitones 5
+  to test with real tap movement.
+
+Harness fixes this tier exposed:
+- **produce_sound ST pass must feed a LIVE key** (`sc = x`): a v3
+  script that consumes the sidechain (vocoder) reads the `sc` argument
+  of process_st, and sc=0 legitimately mutes it — the non-silence gate
+  must not mistake design for failure.
+- **Image windows must out-run the script's deepest internal delay**:
+  the first sabotage matrix MISSED a pitchshft wet cross-feed because
+  the image impulse ran 4000 samples while the mod delay line is 6000
+  deep — no sabotage could reach R. All image pins now run 12000
+  samples. Rule: image/measurement window > deepest delay line, always.
+- Sabotage matrix (7 mechanisms: per-script decor engine, shifter &
+  pitchshft wet cross-feed, vocoder downmix antisymmetry) — after the
+  window fix ALL SEVEN collapse their pins; probe tooling note: ctypes
+  v3 struct slots are 6 create / 7 destroy / 8 process / 9 process_sc /
+  10 process_st (5 is the params POINTER — calling it segfaults), and
+  a probe ending in `os._exit(0)` must `sys.stdout.flush()` FIRST or
+  every print vanishes.
+- Live proof: `e2e_tier5b_stereo_mods_live` runs all four through the
+  RT thread on the master buses. The vocoder pass keys from a SECOND
+  track (same asset, vol-gated): `set_sc_send(i, mask)` masks off bit i
+  — a self-send is impossible by construction, and the sc tap is
+  post-trim so track volume doubles as the key gate.
+- **MONITOR-STEAL BUG (found by that e2e, fixed same day)**: with no
+  input connected, the handler still ran the SELECTED track's chain
+  every sample on silence (`mon = fx_mix(sel, 0, 0.0)`) through the
+  SAME script instances as the playback path. The interleaved
+  (signal, 0, signal, 0…) stream at 2x the sample rate decimates
+  narrow band-pass state (a vocoder band's output fell ~25x — its wet
+  went D/S 0.4 → 0.0003 on the live bus) and starves envelope
+  followers. Fix: the monitor chain runs only while inputs are
+  connected AND per sample only while the input (or the monitor's own
+  decaying tail) is non-zero. Rule for future scripts: the playback
+  chain's instance must stay single-writer; anything else that wants
+  the effect `spawn_fresh`es its own instance (offline render already
+  does). The e2e only exposed this because it was the first
+  sidechain-CONSUMING script placed on the selected track.
+
 ## Tier-5 candidates (next rework cycle, in value order)
 
 1. ~~`space_echo.rs` → ABI v3 stereo reverb~~ **DONE 2026-11-06** (see
@@ -301,10 +376,13 @@ roster gate moved `st_checked >= 5 → 7`.
    `effect_api.rs` first.
 4. Transport sync (rung 2) — unlocks the Scratcher/Gross-Beat row and
    tempo-phase gater/echo.
-5. Remaining mono scripts for the rung-3 pass (value order): `shifter.rs`
+5. ~~Remaining mono scripts for the rung-3 pass (value order): `shifter.rs`
    (true stereo SSB — FL's freq shifter is per-side), `gater.rs`
    (per-side step gates), `pitchshft.rs` (dual delay-line already — just
    needs independent R modulation to spread), `vocoder.rs` (carrier
    decorrelation). Each = mirror spread.rs trio + one appended `spread`
-   + structure pins per the tier-4/5 shape.
+   + structure pins per the tier-4/5 shape.~~ **DONE 2026-11-07** (see
+   tier-5b log above — ALL bundled effects that can hold a stereo image
+   are now ABI v3; the remaining v1/v2 scripts are per-mid by nature:
+   dynamics/split/shaping, where a stereo pair adds nothing).
 - Live smoke 2026-11-06 (tier-4 binary sha 707a3f3d…): boots on :1, seeds the new echo3/chorus into ~/.local/share/slooper/effects (backups .bak present), full clean window render, 0 kernel conflicts, clean exit.
