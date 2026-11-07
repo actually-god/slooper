@@ -918,6 +918,34 @@ type InFlightProbe = (
 // now auditions through the LIVE track synth via `Engine::play_audition`
 // instead of bouncing private plugin copies per click.
 
+/// v42: which slices of a project file a load should import. The
+/// arrangement itself (tracks, clips, assets) always loads — the toggles
+/// cover the SETUP riding in the file: instruments, synth patches, MIDI
+/// bindings, mixer levels, effect chains, drum machine, tempo/grid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LoadSel {
+    pub instruments: bool,
+    pub synth_setup: bool,
+    pub bindings: bool,
+    pub mixer: bool,
+    pub fx: bool,
+    pub drum: bool,
+    pub tempo: bool,
+}
+impl LoadSel {
+    pub fn all() -> Self {
+        LoadSel {
+            instruments: true,
+            synth_setup: true,
+            bindings: true,
+            mixer: true,
+            fx: true,
+            drum: true,
+            tempo: true,
+        }
+    }
+}
+
 pub struct App {
     backend: Backend,
 
@@ -1141,6 +1169,12 @@ pub struct App {
 
     // --- project file ---
     proj_name: String,
+    /// v42: the project waiting behind the “what to load?” picker.
+    pending_proj: Option<project::Project>,
+    /// v42: the folder of the project behind the chooser.
+    pending_proj_dir: Option<PathBuf>,
+    load_sel: LoadSel,
+    show_load_opts: bool,
     /// v34 R10: status lines from the OFF-THREAD export worker (rendering
     /// a whole project on the manager thread used to starve RT while it
     /// ran, and the queued snapshot could lag the GUI state on screen).
@@ -1625,6 +1659,10 @@ impl App {
             preview_playing: None,
             aud_default_inst: None,
             proj_name: String::new(),
+            pending_proj: None,
+            pending_proj_dir: None,
+            load_sel: LoadSel::all(),
+            show_load_opts: false,
             export_tx: __se_tx,
             export_rx: __se_rx,
             project_dir: cfg.project_dir.clone(),
@@ -9962,6 +10000,122 @@ impl App {
         );
     }
 
+    /// v42: merge the selected asset with asset `j` into a NEW asset.
+    /// Same kind only: audio + audio mixes (sums) the two buffers, MIDI +
+    /// MIDI layers every event of both patterns; automation assets never
+    /// merge. The result is written into the primary rack folder exactly
+    /// like a take and becomes the selection; both originals stay put.
+    fn merge_assets(&mut self, j: usize) {
+        let i = match self.sel_asset {
+            Some(i) if i != j => i,
+            _ => {
+                self.status = "merge: click the first asset, then right-click the second".into();
+                return;
+            }
+        };
+        if j >= self.assets.len() {
+            return;
+        }
+        let (a, b) = (&self.assets[i], &self.assets[j]);
+        if a.automation.is_some() || b.automation.is_some() {
+            self.status = "merge: automation assets cannot be merged".into();
+            return;
+        }
+        let base = format!("merge-{}+{}", a.name, b.name);
+        let dir = self.record_dir();
+        let pat_a = a.pattern.clone();
+        let pat_b = b.pattern.clone();
+        let data_a = a.data.clone();
+        let data_b = b.data.clone();
+        let merged_pat = pat_a.as_ref().zip(pat_b.as_ref()).map(|(pa, pb)| pa.merged_with(pb));
+        if let Some(merged) = merged_pat {
+            if dir.as_os_str().is_empty() {
+                self.status = "merge: set a rack folder first".into();
+                return;
+            }
+            let mut n = 1u32;
+            let path = loop {
+                let name = if n == 1 {
+                    base.clone()
+                } else {
+                    format!("{base}-{n}")
+                };
+                let p = dir.join(format!("{name}.mid"));
+                if !p.exists() {
+                    break p;
+                }
+                n += 1;
+            };
+            if let Err(e) = merged.save_mid(&path) {
+                self.status = format!("merge: {e}");
+                return;
+            }
+            let id = self.assets.len() as u32;
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or(base);
+            self.assets
+                .push(Asset::midi(id, name.clone(), path, Arc::new(merged), false));
+            self.sel_asset = Some(id as usize);
+            if let Some(f) = self.rack.first_mut() {
+                f.rescan();
+            }
+            self.push_project();
+            self.status = format!("merged MIDI \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
+        } else if pat_a.is_none() && pat_b.is_none() {
+            let mixed: Arc<[f32]> =
+                Arc::from(crate::assets::mix_audio(&data_a, &data_b).into_boxed_slice());
+            let mut name = base.clone();
+            let mut path = PathBuf::new();
+            let mut dirty = true;
+            if let Some(f) = self.rack.first_mut() {
+                let d = PathBuf::from(f.path.trim());
+                if !d.as_os_str().is_empty() {
+                    let mut n = 1u32;
+                    loop {
+                        let stem = if n == 1 {
+                            base.clone()
+                        } else {
+                            format!("{base}-{n}")
+                        };
+                        let p = d.join(format!("{stem}.wav"));
+                        if !p.exists() {
+                            path = p;
+                            name = stem;
+                            break;
+                        }
+                        n += 1;
+                    }
+                    if std::fs::create_dir_all(&d).is_ok()
+                        && crate::audio_io::export(
+                            &path,
+                            self.sample_rate,
+                            &mixed,
+                            crate::audio_io::ExportFormat::Wav,
+                        )
+                        .is_ok()
+                    {
+                        dirty = false;
+                    } else {
+                        path = PathBuf::new();
+                    }
+                }
+            }
+            let id = self.assets.len() as u32;
+            self.assets
+                .push(Asset::audio(id, name.clone(), path, mixed, dirty));
+            self.sel_asset = Some(id as usize);
+            if let Some(f) = self.rack.first_mut() {
+                f.rescan();
+            }
+            self.push_project();
+            self.status = format!("merged audio \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
+        } else {
+            self.status = "merge: same kind only (audio+audio or MIDI+MIDI)".into();
+        }
+    }
+
     /// Load (or reuse) an asset for a rack file path; returns its index.
     fn ensure_asset(&mut self, path: &Path) -> Option<usize> {
         if let Some(k) = self.assets.iter().position(|a| !a.dirty && a.path == path) {
@@ -10406,21 +10560,29 @@ impl App {
         self.save_config();
     }
 
-    /// Replace the whole working state with a saved project. Assets resolve
-    /// through the project's audio folder first, then the rack folders.
+    /// Full import (every slice) — the one-call entry used by tests and
+    /// any future headless path; the interactive picker drives
+    /// `apply_load` through `load_opts_window` instead.
+    #[allow(dead_code)]
     fn do_load(&mut self, path: &Path) {
+        match project::load(path) {
+            Ok(pr) => {
+                let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                self.apply_load(&dir, &pr, &LoadSel::all())
+            }
+            Err(e) => self.status = format!("load: {e}"),
+        }
+    }
+
+    /// v42: selectively replace the working state with a saved project.
+    /// The arrangement (assets, tracks, clips, heights) always travels;
+    /// every SETUP slice obeys `sel`. Assets resolve through the
+    /// project's audio folder first, then the rack folders.
+    fn apply_load(&mut self, dir: &Path, pr: &project::Project, sel: &LoadSel) {
         // v18: a loaded project replaces the whole arrange — any armed
         // grid gesture points into the OLD indices.
         self.cancel_grid_gestures();
-        let pr = match project::load(path) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("load: {e}");
-                return;
-            }
-        };
-        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let mut dirs = vec![dir.clone(), dir.join(format!("{} audio", pr.name))];
+        let mut dirs = vec![dir.to_path_buf(), dir.join(format!("{} audio", pr.name))];
         for f in &self.rack {
             let p = PathBuf::from(f.path.trim());
             if !p.as_os_str().is_empty() {
@@ -10499,13 +10661,15 @@ impl App {
         }
         let mut arr = Arrangement::new();
         for (t, pt) in pr.tracks.iter().enumerate().take(MAX_LOOPS) {
-            self.trk_vol[t] = pt.vol;
-            self.trk_gain[t] = pt.gain;
-            self.trk_pan[t] = pt.pan;
-            self.backend.engine.set_loop_vol(t, vol_amp(pt.vol));
-            self.backend.engine.set_loop_gain(t, gain_amp(pt.gain));
-            self.backend.engine.set_loop_pan(t, pan01(pt.pan));
-            self.backend.cmd(Cmd::SetTrackOn { i: t, on: pt.on });
+            if sel.mixer {
+                self.trk_vol[t] = pt.vol;
+                self.trk_gain[t] = pt.gain;
+                self.trk_pan[t] = pt.pan;
+                self.backend.engine.set_loop_vol(t, vol_amp(pt.vol));
+                self.backend.engine.set_loop_gain(t, gain_amp(pt.gain));
+                self.backend.engine.set_loop_pan(t, pan01(pt.pan));
+                self.backend.cmd(Cmd::SetTrackOn { i: t, on: pt.on });
+            }
             while arr.tracks[t].lanes.len() < pt.lanes.len() {
                 arr.tracks[t].add_lane();
             }
@@ -10533,6 +10697,9 @@ impl App {
             // Chains: prefer the full saved chain (scripts + plugins);
             // legacy fx-only projects materialize script rows. Plugin rows
             // open lazily on the first rebuild after the rate is known.
+            if !sel.fx {
+                continue;
+            }
             let chain_src: Vec<ChainSave> = if !pt.chain.is_empty() {
                 pt.chain.clone()
             } else {
@@ -10578,7 +10745,12 @@ impl App {
         self.n_tracks = pr.n_tracks.unwrap_or(16).clamp(1, MAX_LOOPS) as usize;
         // Per-track synths (missing slots fall back to the default piano).
         for t in 0..MAX_LOOPS {
-            self.track_synth[t] = pr.track_synths.get(t).cloned().flatten();
+            if sel.instruments {
+                self.track_synth[t] = pr.track_synths.get(t).cloned().flatten();
+            }
+            if !sel.synth_setup {
+                continue;
+            }
             self.track_synth_params[t] = pr.track_synth_params.get(t).cloned().unwrap_or_default();
             // v22: patches are REAL project state — decode the chunk the
             // project carried (the v20 "session-only" rule here is what
@@ -10589,21 +10761,43 @@ impl App {
                 .and_then(|s| s.as_deref())
                 .and_then(crate::config::b64_decode);
         }
-        self.rebuild_all_synths();
+        if sel.instruments || sel.synth_setup {
+            self.rebuild_all_synths();
+        }
         // v29 R7: value bindings travel WITH the project — replace the
         // session copy wholesale (the rack then reflects the project).
-        self.value_binds = pr.value_binds.clone();
-        // v32: the RT live feed mirror follows the project's bindings.
-        self.push_bound_snapshot();
-        // v29 R5: and so does the drum machine.
-        if let Some(d) = pr.drum.as_ref() {
-            self.drum = DrumMachine::from_save(d);
-        } else {
-            self.drum = DrumMachine::defaults();
+        // v42: but ONLY the ones that actually land. A binding whose
+        // control is not in the room (fx slot that was never imported,
+        // synth slot that stays empty) would silently dead-weight the
+        // session, so it is left in the file instead.
+        let mut skipped_binds = 0usize;
+        if sel.bindings {
+            self.value_binds = pr
+                .value_binds
+                .iter()
+                .filter(|vb| {
+                    let ok = self.bind_lands(vb);
+                    if !ok {
+                        skipped_binds += 1;
+                    }
+                    ok
+                })
+                .cloned()
+                .collect();
+            // v32: the RT live feed mirror follows the project's bindings.
+            self.push_bound_snapshot();
         }
-        // v30 R1: kits travel with the project too (legacy v29 pad sets
-        // seed the pattern's target track).
-        self.load_kits(&pr.drum_kits, pr.drum.as_ref());
+        if sel.drum {
+            // v29 R5: and so does the drum machine.
+            if let Some(d) = pr.drum.as_ref() {
+                self.drum = DrumMachine::from_save(d);
+            } else {
+                self.drum = DrumMachine::defaults();
+            }
+            // v30 R1: kits travel with the project too (legacy v29 pad
+            // sets seed the pattern's target track).
+            self.load_kits(&pr.drum_kits, pr.drum.as_ref());
+        }
         self.save_config();
         // v34 R4: heights travel with the PROJECT. Older files (and any
         // track they never sized) get the standard automatic height —
@@ -10620,6 +10814,10 @@ impl App {
         self.sel_asset = None;
         self.sel_clips.clear();
         self.sel_anchor = None;
+        if !sel.tempo {
+            self.finish_load(pr, skipped_binds, missing);
+            return;
+        }
         self.metro_bpm = pr.metro.bpm.to_string();
         self.metro_num = pr.metro.num.to_string();
         self.metro_sub = SUBDIVISIONS
@@ -10638,6 +10836,11 @@ impl App {
         self.loop_tl = pr.quantize.loop_tl;
         self.backend.cmd(Cmd::SetLoop(self.loop_tl));
         self.send_loop_region();
+        self.finish_load(pr, skipped_binds, missing);
+    }
+
+    /// Shared tail of a selective load.
+    fn finish_load(&mut self, pr: &project::Project, skipped_binds: usize, missing: usize) {
         self.proj_name = pr.name.clone();
         // v34 R8: the project remembers where its pickers were.
         for (k, v) in &pr.dirs {
@@ -10656,6 +10859,130 @@ impl App {
                 pr.name, missing
             )
         };
+        if skipped_binds > 0 {
+            self.status = format!(
+                "{} — {} binding(s) skipped (their control is not loaded)",
+                self.status, skipped_binds
+            );
+        }
+    }
+
+    /// v42: does this value binding actually land on something the
+    /// session has right now? `fx:{row}:{param}` needs a chain slot with
+    /// that parameter, `synth:{param}` needs an instrument on the track;
+    /// plain mixer/master targets always land.
+    fn bind_lands(&self, vb: &crate::config::ValueBind) -> bool {
+        let t = vb.target.as_str();
+        if let Some(rest) = t.strip_prefix("fx:") {
+            let mut it = rest.split(':');
+            let (Some(r), Some(i)) = (
+                it.next().and_then(|s| s.parse::<usize>().ok()),
+                it.next().and_then(|s| s.parse::<usize>().ok()),
+            ) else {
+                return false;
+            };
+            self.fx_rows
+                .get(vb.track as usize)
+                .map(|rows| {
+                    rows.get(r)
+                        .map(|row| match row {
+                            ChainRow::Script { params, .. } => params.len() > i,
+                            ChainRow::Vst { params, .. } => params.len() > i,
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        } else if t.starts_with("synth:") {
+            self.track_synth
+                .get(vb.track as usize)
+                .is_some_and(|s| s.is_some())
+        } else {
+            true
+        }
+    }
+
+    /// v42: the "what should this project load?" chooser shown after
+    /// picking a .slooper file. The arrangement rides along with the
+    /// import itself; these toggles pick the setup slices.
+    fn load_opts_window(&mut self, ui: &mut egui::Ui) {
+        if !self.show_load_opts {
+            return;
+        }
+        let Some(pr) = self.pending_proj.as_ref() else {
+            self.show_load_opts = false;
+            return;
+        };
+        let name = pr.name.clone();
+        let nbind = pr.value_binds.len();
+        let mut sel = self.load_sel;
+        let mut import = false;
+        let mut cancel = false;
+        egui::Window::new("Load project")
+            .id(egui::Id::new("v42-load-opts"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("\u{201c}{name}\u{201d} \u{2014} what should be imported?"));
+                ui.label(
+                    egui::RichText::new(
+                        "Tracks, clips and assets always load \u{2014} these are the setup slices.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.separator();
+                ui.checkbox(&mut sel.instruments, "Main instruments (track synths)");
+                ui.checkbox(&mut sel.synth_setup, "Synth setup (patches + slider values)");
+                ui.checkbox(&mut sel.bindings, "MIDI bindings");
+                if nbind > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} binding(s) in the file; ones whose control is not \
+                             loaded are skipped",
+                            nbind
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+                ui.checkbox(&mut sel.mixer, "Mixer levels (volume / gain / pan / on)");
+                ui.checkbox(&mut sel.fx, "Effects setup (track chains)");
+                ui.checkbox(&mut sel.drum, "Drum machine + kits");
+                ui.checkbox(&mut sel.tempo, "Tempo, meter and grid");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Import").strong())
+                                .min_size(egui::vec2(110.0, 0.0)),
+                        )
+                        .clicked()
+                    {
+                        import = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if import {
+            self.show_load_opts = false;
+            self.load_sel = sel;
+            if let Some(pr) = self.pending_proj.take() {
+                let dir = self
+                    .pending_proj_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("."));
+                self.apply_load(&dir, &pr, &sel);
+            }
+        } else if cancel {
+            self.show_load_opts = false;
+            self.pending_proj = None;
+            self.status = "load cancelled".into();
+        } else {
+            self.load_sel = sel;
+        }
     }
 
     fn do_export(&mut self) {
@@ -11809,6 +12136,7 @@ impl App {
         }
         save_prompt_window(ui, self);
         load_window(ui, self);
+        self.load_opts_window(ui);
         knob_learn_window(ui, self);
         if self.fx_window.is_some() {
             effects_window(ui, self);
@@ -14129,6 +14457,28 @@ fn rack_file_row(
     // sub-folders, delete (file + clips; ids remap safely).
     let fp_disp = fp.display().to_string();
     dr.context_menu(|ui| {
+        // v42: merge with the current selection (same kind only; the
+        // engine-side rule + automation ban live in merge_assets).
+        if app.sel_asset.is_some() && kind != 2 {
+            let selname = app
+                .sel_asset
+                .and_then(|i| app.assets.get(i))
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            if ui
+                .button(format!("merge into \u{201c}{selname}\u{201d}"))
+                .on_hover_text(
+                    "Audio mixes both buffers; MIDI layers both patterns. \
+                     Automation never merges. The originals are kept.",
+                )
+                .clicked()
+            {
+                if let Some(k) = app.ensure_asset(fp) {
+                    app.merge_assets(k);
+                }
+                ui.close();
+            }
+        }
         if ui.button("rename\u{2026}").clicked() {
             app.rack_rename = Some((fp_disp.clone(), name.to_string(), true));
             ui.close();
@@ -14820,6 +15170,24 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             if !apath.as_os_str().is_empty() {
                                 let apdisp = apath.display().to_string();
                                 dr.context_menu(|ui| {
+                                    if let (Some(i), true) = (app.sel_asset, app.sel_asset != Some(k)) {
+                                        let selname = app
+                                            .assets
+                                            .get(i)
+                                            .map(|a| a.name.clone())
+                                            .unwrap_or_default();
+                                        if ui
+                                            .button(format!("merge into \u{201c}{selname}\u{201d}"))
+                                            .on_hover_text(
+                                                "Audio mixes both buffers; MIDI layers both \
+                                                 patterns. Automation never merges.",
+                                            )
+                                            .clicked()
+                                        {
+                                            app.merge_assets(k);
+                                            ui.close();
+                                        }
+                                    }
                                     if ui.button("rename\u{2026}").clicked() {
                                         app.rack_rename =
                                             Some((apdisp.clone(), name.clone(), true));
@@ -15450,7 +15818,6 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                  Stop (button or transport) ends the loop. Needs the LOOP \
                  button on; records the raw input like 'a'.",
             );
-        let lc = ac.clone();
         let mc = ui
             .checkbox(&mut src.midi, "m")
             .on_hover_text(
@@ -19891,7 +20258,16 @@ fn load_window(ui: &mut egui::Ui, app: &mut App) {
                 });
         });
     if let Some(p) = load {
-        app.do_load(&p);
+        // v42: opening a project asks WHAT to import first.
+        match project::load(&p) {
+            Ok(pr) => {
+                app.pending_proj = Some(pr);
+                app.pending_proj_dir = p.parent().map(|d| d.to_path_buf());
+                app.load_sel = LoadSel::all();
+                app.show_load_opts = true;
+            }
+            Err(e) => app.status = format!("load: {e}"),
+        }
     }
     app.show_load = open;
 }
@@ -30598,6 +30974,116 @@ mod tests {
             let back = crate::automation::Automation::from_json(&txt).unwrap();
             assert_eq!(back.target, tgt);
         }
+    }
+
+    /// v42: opening a project imports ONLY the chosen slices, and MIDI
+    /// bindings whose control is not in the room are left in the file.
+    #[test]
+    fn v42_selective_project_import() {
+        let mut app = headless_app("v42sel");
+        // Session has one script-FX row on track 0 (2 params), no synth
+        // on track 7, stock mixer.
+        app.fx_rows[0] = vec![ChainRow::Script {
+            stem: "LowPass".into(),
+            params: vec![0.5, 0.5],
+        }];
+        let mut pr = app.build_project("selproj".into());
+        pr.tracks[0].vol = 200;
+        pr.metro.bpm = 177;
+        let mk = |target: &str, track: u32| crate::config::ValueBind {
+            target: target.into(),
+            track,
+            bind: MidiBind { ty: 1, ch: 0, d1: 5 },
+            kind: 0,
+            lo: 0,
+            hi: 127,
+        };
+        pr.value_binds = vec![
+            mk("fx:0:1", 0),    // lands: chain slot 0 param 1 exists
+            mk("fx:9:0", 0),    // phantom: no such chain slot
+            mk("synth:0", 7),   // phantom: track 7 has no instrument
+        ];
+        let vol0 = app.trk_vol[0];
+        let bpm0 = app.metro_bpm.clone();
+
+        // Setup-free import: arrangement only.
+        app.apply_load(
+            Path::new("."),
+            &pr,
+            &LoadSel {
+                instruments: false,
+                synth_setup: false,
+                bindings: true,
+                mixer: false,
+                fx: false,
+                drum: false,
+                tempo: false,
+            },
+        );
+        assert_eq!(app.trk_vol[0], vol0, "mixer unchecked keeps the faders");
+        assert_eq!(app.metro_bpm, bpm0, "tempo unchecked keeps the tempo");
+        assert_eq!(app.value_binds.len(), 1, "only the landing bind imports");
+        assert_eq!(app.value_binds[0].target, "fx:0:1");
+        assert!(app.status.contains("skipped"), "{}", app.status);
+
+        // Full import takes everything.
+        app.apply_load(Path::new("."), &pr, &LoadSel::all());
+        assert_eq!(app.trk_vol[0], 200);
+        assert_eq!(app.metro_bpm, "177");
+        assert_eq!(app.value_binds.len(), 1, "phantoms never bind");
+    }
+
+    /// v42: merge rules — audio+audio mixes into a NEW asset (originals
+    /// kept), automation never merges, kinds must match.
+    #[test]
+    fn v42_merge_asset_rules() {
+        let mut app = headless_app("v42merge");
+        app.assets.push(Asset::audio(
+            0,
+            "aa".into(),
+            std::path::PathBuf::new(),
+            Arc::from(vec![1.0f32, 0.5].into_boxed_slice()),
+            true,
+        ));
+        app.assets.push(Asset::audio(
+            1,
+            "bb".into(),
+            std::path::PathBuf::new(),
+            Arc::from(vec![0.5f32, 0.25].into_boxed_slice()),
+            true,
+        ));
+        app.assets.push(Asset::audio(
+            2,
+            "cc".into(),
+            std::path::PathBuf::new(),
+            Arc::from(Vec::new().into_boxed_slice()),
+            true,
+        ));
+        let n0 = app.assets.len();
+        // audio + audio -> new summed asset selected, originals untouched
+        app.sel_asset = Some(0);
+        app.merge_assets(1);
+        assert_eq!(app.assets.len(), n0 + 1, "merge creates a NEW asset");
+        let merged = app.assets.last().unwrap();
+        assert_eq!(merged.name, "merge-aa+bb");
+        assert_eq!(&merged.data[..], &[1.5f32, 0.75][..]);
+        assert_eq!(app.sel_asset, Some(n0));
+        assert!((app.assets[0].data[0] - 1.0).abs() < 1e-9, "original kept");
+        // automation never merges
+        let mut auto = Asset::audio(
+            9,
+            "ax".into(),
+            std::path::PathBuf::new(),
+            Arc::from(Vec::new().into_boxed_slice()),
+            true,
+        );
+        auto.automation = Some(Arc::new(crate::automation::Automation::flat("t", 0.0, 16)));
+        app.assets.push(auto);
+        let n1 = app.assets.len();
+        app.sel_asset = Some(0);
+        app.merge_assets(n1 - 1);
+        assert_eq!(app.assets.len(), n1, "automation must not merge");
+        assert!(app.status.contains("automation"), "{}", app.status);
     }
 
     /// v42 "p": ticking ONLY preview arms the engine's preview flag before

@@ -112,6 +112,20 @@ pub struct RackFile {
 }
 
 /// True when a file's extension is a format the import pipeline decodes.
+/// v42: additive audio merge for the rack: two mono takes summed sample
+/// by sample; the longer asset sets the length (the shorter is silence
+/// past its end). Nothing is replaced — this is a MIX, not an append.
+pub fn mix_audio(a: &[f32], b: &[f32]) -> Vec<f32> {
+    let n = a.len().max(b.len());
+    let mut out = vec![0.0f32; n];
+    for (i, o) in out.iter_mut().enumerate() {
+        let x = if i < a.len() { a[i] } else { 0.0 };
+        let y = if i < b.len() { b[i] } else { 0.0 };
+        *o = x + y;
+    }
+    out
+}
+
 pub fn is_audio_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -250,6 +264,14 @@ impl RackFolder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v42: mix_audio sums overlap and extends with the longer tail.
+    #[test]
+    fn v42_mix_audio_is_additive_with_tail() {
+        let out = mix_audio(&[1.0, 2.0, 3.0], &[0.5, 0.5]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(&out[..], &[1.5, 2.5, 3.0][..]);
+    }
 
     #[test]
     fn rack_entry_construction_roundtrip() {
