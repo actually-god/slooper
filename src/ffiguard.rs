@@ -23,8 +23,13 @@ pub const GUARD: bool = cfg!(not(windows));
 pub fn guarded<R, F: FnOnce() -> R>(f: F) -> Result<R, String> {
     use std::ffi::c_void;
     extern "C" {
+        // C-unwind: a C++ throw must be able to UNWIND THROUGH the thunk
+        // frame into the catch in fg_try_call. Plain extern "C" got a
+        // panic_cannot_unwind guard emitted (rustc 1.99), aborting the
+        // process instead — which is exactly the yabridge-death scenario
+        // this firewall exists to survive.
         fn fg_try_call(
-            fun: extern "C" fn(*mut c_void),
+            fun: extern "C-unwind" fn(*mut c_void),
             ctx: *mut c_void,
             err: *mut i8,
             errlen: i32,
@@ -34,7 +39,7 @@ pub fn guarded<R, F: FnOnce() -> R>(f: F) -> Result<R, String> {
         f: Option<F>,
         out: Option<R>,
     }
-    extern "C" fn thunk<F: FnOnce() -> R, R>(p: *mut c_void) {
+    extern "C-unwind" fn thunk<F: FnOnce() -> R, R>(p: *mut c_void) {
         // Only ever entered through fg_try_call; a C++ exception is caught
         // out there, so this frame is unwound THROUGH, never returned to.
         let pack = unsafe { &mut *(p as *mut Pack<F, R>) };
