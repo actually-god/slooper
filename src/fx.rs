@@ -179,20 +179,18 @@ pub fn default_effects_dir() -> PathBuf {
     if std::fs::create_dir_all(&primary).is_ok() {
         return primary;
     }
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".local").join("share"));
-    let fallback = base.join("slooper").join("effects");
-    let _ = std::fs::create_dir_all(&fallback);
-    fallback
+    default_effects_fallback_dir()
 }
 
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+/// The `bin/`-sibling rule's fallback: `paths::data_dir()/effects`
+/// (`$XDG_DATA_HOME/slooper/effects` or `~/.local/share/slooper/effects`
+/// on Linux, `%LOCALAPPDATA%\slooper\effects` on Windows — WINDOWS-PORT
+/// W2). Created best-effort, returned even when creation fails (a missing
+/// folder reads as "no bundled effects yet", same as before).
+pub fn default_effects_fallback_dir() -> PathBuf {
+    let fallback = crate::paths::data_dir().join("effects");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
 }
 
 /// Resolve the effects folder and make it usable: create it when missing,

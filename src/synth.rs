@@ -60,32 +60,14 @@ pub fn default_dir() -> PathBuf {
     if let Ok(d) = std::env::var("SLOOPER_SYNTHS_DIR") {
         return PathBuf::from(d);
     }
-    let base = dirs_like_data();
-    base.join("slooper").join("synths")
-}
-
-fn dirs_like_data() -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".local")
-                .join("share")
-        })
+    crate::paths::data_dir().join("synths")
 }
 
 fn cache_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".cache")
-        });
-    base.join("slooper-synth")
+    // Folder name predates paths.rs: `<cache home>/slooper-synth`
+    // (`~/.cache/slooper-synth` on Linux, `%LOCALAPPDATA%\slooper-synth`
+    // on Windows — WINDOWS-PORT W2).
+    crate::paths::cache_home().join("slooper-synth")
 }
 
 /// Write the ABI contract + bundled scripts into the folder. Bundled scripts

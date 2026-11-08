@@ -88,10 +88,14 @@ src/            application source (Rust 2021 edition)
                   listing, audio re-resolution by file name
   audio_io.rs     import (symphonia: wav/mp3/ogg/flac/m4a/aac/aiff…) +
                   export (WAV/FLAC native; MP3/OGG shell out to ffmpeg)
-  config.rs       JSON persistence: $XDG_CONFIG_HOME/slooper/config.json
+  config.rs       JSON persistence: config from paths::config_dir()/config.json
                   (rack folders, projects dir, quantize/snap, mixer,
                   `track_chain` + `track_synth`(+params), `vst_dirs`,
                   `n_tracks`, shortcut + MIDI tables + `midi_axis` cal)
+  paths.rs        SINGLE source of base dirs (W2): config_dir()/data_dir()/
+                  cache_home() — XDG+HOME on Linux, %APPDATA%/%LOCALAPPDATA%
+                  on Windows, SLOOPER_DATA_DIR/SLOOPER_CONFIG_DIR override;
+                  never memoized (tests swap HOME/XDG mid-suite)
   effect_api.rs   the effect-script ABI contract (also copied into every
                   user effects folder; scripts include! this file)
   fx.rs           effects scan/compile/cache/load, ABI validation, chains,
@@ -153,7 +157,11 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 
 ## Runtime state (outside the repo)
 
-- Config: `$XDG_CONFIG_HOME/slooper/config.json` (fallback `~/.config/…`)
+- Base dirs resolve through `paths.rs` (W2): Linux `$XDG_CONFIG_HOME/slooper`
+  / `$XDG_DATA_HOME/slooper` (fallbacks `~/.config/…`, `~/.local/share/…`);
+  Windows `%APPDATA%\slooper` / `%LOCALAPPDATA%\slooper`;
+  `SLOOPER_CONFIG_DIR` / `SLOOPER_DATA_DIR` override everything.
+- Config: `paths::config_dir()/config.json`
 - Projects: `~/.local/share/slooper-projects/` by default (setting in
   the config: `project_dir`); one `<name>.slooper` JSON per project,
   plus a `<name> audio/` sidecar folder for derived assets at save time

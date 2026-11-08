@@ -734,14 +734,11 @@ fn default_true() -> bool {
 }
 
 impl Config {
-    /// `$XDG_CONFIG_HOME/slooper/config.json` (or `~/.config/...`).
+    /// `paths::config_dir()/config.json` — `$XDG_CONFIG_HOME/slooper/`
+    /// (or `~/.config/...`) on Linux, `%APPDATA%\slooper\` on Windows
+    /// (WINDOWS-PORT W2; resolution lives in [`crate::paths`]).
     pub fn path() -> PathBuf {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".config"));
-        base.join("slooper").join("config.json")
+        crate::paths::config_dir().join("config.json")
     }
 
     /// Effective mixer chains: `track_chain` when present, else migrated
@@ -824,7 +821,7 @@ impl Config {
     /// `slooper-projects` folder in the user's home when unset.
     pub fn projects_dir(&self) -> PathBuf {
         if self.project_dir.trim().is_empty() {
-            home_dir().join("slooper-projects")
+            crate::paths::default_projects_dir()
         } else {
             PathBuf::from(self.project_dir.trim())
         }
@@ -837,12 +834,6 @@ impl Config {
             .find(|b| b.action == a)
             .and_then(|b| b.bind)
     }
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 #[cfg(test)]

@@ -6,7 +6,8 @@
 > Linux build, the JACK engine, yabridge/WINE hosting, the X11 editor path, or
 > any existing pin. Every Windows change is additive behind `cfg` seams.
 
-STATUS: W1 DONE 2026-11-06 (session 1). NEXT: W2 (`paths` module).
+STATUS: W1 DONE 2026-11-06 (session 1). W2 DONE 2026-11-08 (session 2).
+NEXT: W3 (script loaders portable — rustc effects/synths `.dll`).
 
 ## Ground rules (apply to every task)
 
@@ -103,13 +104,30 @@ Findings (measured):
 - [x] llvm-mingw 20261104 (UCRT build) in ~/Tools, linker wired
 - [x] triage table above
 
-### W2 — `paths` module (portable base dirs)
-All XDG/HOME/dir literals behind `paths::data_dir()/cache_dir()/config_dir()`
-(+ impulses, plugin-default). Linux behavior byte-identical (XDG precedence,
+### W2 — `paths` module (portable base dirs) — **DONE 2026-11-08 (session 2)**
+All XDG/HOME/dir literals behind `paths::data_dir()/cache_home()/config_dir()`
+(+ impulses, default projects dir). Linux behavior byte-identical (XDG precedence,
 documented fallbacks); Windows: `%LOCALAPPDATA%\slooper` / `%APPDATA%\slooper`.
 `SLOOPER_DATA_DIR`/`SLOOPER_CONFIG_DIR` env overrides (test/CI convenience).
-Acceptance: `v42_paths_*` pins (XDG win-order preserved, override works);
-full suite + clippy green.
+Acceptance: `w2_paths_*` pins (XDG win-order preserved, override works,
+live-not-memoized); full suite + clippy green.
+- [x] `src/paths.rs` (300 ln) + `pub mod paths` in lib.rs
+- [x] call sites migrated: config.rs (`Config::path`, `projects_dir`),
+      fx.rs (`default_effects_fallback_dir`), synth.rs (`default_dir`,
+      `cache_dir`), samples808.rs (`data_dir`), ui.rs (`projects_dir`)
+- [x] effects/convolver.rs standalone resolver gained the cfg(windows)
+      branch (it compiles alone — kept-in-sync comment added)
+- [x] AGENT-GUIDE.md paths.rs section
+- DONE note: one duplicate-resolution audit found the four legacy sites
+  DISAGREED on empty-string env vars (spec: empty = unset); the unified
+  rule is spec-correct and only changes the degenerate empty-var case.
+  vsthost's HOME uses (default VST dirs, wine prefixes, yabridgectl)
+  deliberately stay — they are Linux-convention constants, and W6 owns
+  the cfg(windows) scan-dir set. Windows check: `paths.rs` error-free;
+  lib total stays exactly 19 errors, all in the W6/W7/W8 buckets.
+  Pins `w2_paths_*` x8 (one is `#[cfg(windows)]` — fires in Windows CI).
+  Gates (Linux): release lib 497/498 + known-HEAD `v36_script_fx_editor_
+  resizes` boot abort (rest-run 117/117 isolated), e2e 32/32, clippy-zero.
 
 ### W3 — Script loaders portable (rustc effects/synths)
 `.so`→exe-suffix helper; fx.rs/synth.rs build paths via W2; `rustc_available`
@@ -195,3 +213,9 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   linker in .cargo/config.toml), hello.exe link proof, triage: 19 errors / 3 sites
   (probe libc 16, unix symlink 1, vst3 WindowHandle 1); link-time debt (X11/jack
   externs) documented. No src changes — Linux untouched (native check re-verified).
+- **2026-11-08 session 2 — W2**: `src/paths.rs` single base-dir seam (live env
+  reads, no memoization — the suite swaps HOME/XDG mid-run); migrated config.rs/
+  fx.rs/synth.rs/samples808.rs/ui.rs call sites + convolver script windows branch;
+  AGENT-GUIDE updated. Gates: w2_paths x8, release lib 497/498 (+1 known-HEAD v36
+  abort, rest 117/117 isolated), e2e 32/32, clippy-zero; windows-gnullvm lib check
+  stays at the 19 triaged errors (none in paths.rs).

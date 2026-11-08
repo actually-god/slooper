@@ -79,18 +79,11 @@ pub const FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// `$XDG_DATA_HOME/slooper` (default `~/.local/share/slooper`).
+/// slooper data dir — `paths::data_dir()`: `$XDG_DATA_HOME/slooper`
+/// (default `~/.local/share/slooper`) on Linux, `%LOCALAPPDATA%\slooper`
+/// on Windows (WINDOWS-PORT W2).
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".local")
-                .join("share")
-        });
-    base.join("slooper")
+    crate::paths::data_dir()
 }
 
 /// The folder the pack is seeded into.
