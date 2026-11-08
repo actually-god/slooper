@@ -4371,7 +4371,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             "mix" => 1.0, "out" => 1.1
         ], "spread");
         freeze!("pitchshft", [
-            "mode (0shift 1corr 2tune)" => 0.0, "semitones" => 0.0, "fine cents" => 0.0,
+            "mode" => 0.0, "semitones" => 0.0, "fine cents" => 0.0,
             "strength" => 0.7, "slew ms" => 15.0, "tone" => 0.8, "wet" => 1.0,
             "gain" => 1.0, "ref Hz" => 440.0, "gate dB" => -55.0
         ], "spread");
