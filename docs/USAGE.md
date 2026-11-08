@@ -299,6 +299,29 @@ The preview path is the same: piano-roll and rack auditions of MIDI go
 through the *picked track's* synth + chain, so what you audition is what
 mixes.
 
+**Mono / poly synth mode** — the strip's `mono` / `poly` toggle decides how
+a track's lanes use its instrument. **Monophonic** (default, historic):
+every child lane feeds the track's ONE synth instance. **Polyphonic**: every
+child lane renders through its OWN exact copy of that instrument (script
+copies stay param-synced with the configured one; plugin copies are private
+instances opened with the same settings), and all copies sum into the SAME
+track effect chain. Extra lanes past 12 share the last copy. Exported tracks
+honour the mode: a poly track bounces exactly as the sum of its per-lane
+renders.
+
+## Clip merging (`Ctrl+M`)
+
+Select two or more clips of ONE kind (all audio, or all MIDI) and press
+`Ctrl+M` (or right-click → **Merge into one asset**): slooper builds a NEW
+asset laid out exactly as your selection sits — the span runs from the
+earliest clip start to the latest clip end, overlapping content **adds**,
+gaps stay **silent**, and the merged clip replaces the selection on the
+earliest clip's lane. Audio merges stay audio (samples summed, per-clip
+gain and fades baked in); MIDI merges stay MIDI (every note/CC/bend shifted
+to its timeline position at the first clip's tempo — still fully editable
+in the piano roll). Mixed selections are refused with a status message and
+nothing is modified.
+
 ## Clip gain, fades & splitting
 
 Click exactly **one clip** and a property row appears under the grid
@@ -331,7 +354,11 @@ new asset:
   Note placement follows the grid-toolbar **snap** setting (off = any
   sample).
 - **Preview** routes through a picked **track** — its synth *and* its
-  effects chain — and fires as soon as a new note lands.
+  effects chain — and fires as soon as a new note lands. Hold the note
+  (mouse down) for as long as you want: the preview is an independent
+  headless voice, it never starts the transport, never feeds the track's
+  live synth, and goes silent the moment you release (or stop the
+  playback preview) — no stuck notes, ever.
 - The toolbar carries **−bar / +bar** (pattern length), **quantize** (snap
   every note onto the quantize grid), **▶ preview**, **clear**, and
   **save**. The status shows `notes · bars · bpm` — the tempo **is** the
@@ -500,6 +527,7 @@ in **any** text box, and auto-repeat never re-fires):
 | `Ctrl+C` | copy the selection (or the selected rack asset) |
 | `Ctrl+V` | paste at the playhead, on the track nearest your last click |
 | `Ctrl+D` | duplicate the selection at the playhead |
+| `Ctrl+M` | merge the selected clips (one kind) into one new asset |
 | `S` | split the selected clip(s) at the playhead |
 
 While the **piano roll has focus**, `Ctrl + A/C/V` and `Delete` edit notes

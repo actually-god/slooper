@@ -3383,6 +3383,131 @@ fn v46_e2e_default_route_hold_and_release() {
     b.cmd(Cmd::StopAll);
 }
 
+/// v46 R2: a POLY track renders every child lane through its OWN synth
+/// copy on the live RT thread — audio still reaches the master out, and
+/// flipping the mode back to mono (row gone mid-playback) keeps sounding
+/// through the shared instance instead of dying.
+#[test]
+fn v46_e2e_poly_track_renders_per_lane_copies() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("polyrt", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "backend did not apply the sink layout"
+    );
+
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let mk = || {
+        Arc::new(slooper::audio::SynthHandle::Script(
+            reg.create_instance("piano", sr as f64, &[])
+                .expect("bundled piano must compile and load"),
+        ))
+    };
+    let master = mk();
+    b.cmd(Cmd::SetDefaultSynth(Some(master.clone())));
+
+    // Two lanes, one bar each, distinct notes; both start at zero.
+    let pat = |notes: [u8; 2]| {
+        let mut p = slooper::midipat::Pattern::new(120);
+        for (i, n) in notes.iter().enumerate() {
+            p.notes.push(slooper::midipat::Note {
+                ch: 0,
+                note: *n,
+                vel: 110,
+                press: 0,
+                start: (i as u32) * slooper::midipat::PPQ as u32 * 2,
+                // Sustain to the end of the bar: the flip-back-to-mono
+                // window below always falls inside sounding notes.
+                len: slooper::midipat::PPQ as u32 * (2 - i as u32),
+            });
+        }
+        p.sort();
+        p
+    };
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![
+        Some(Arc::new(pat([60, 62]))),
+        Some(Arc::new(pat([67, 71]))),
+    ])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    arr.insert(0, 1, Clip::new(1, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: sr as u64 * 2,
+    });
+
+    // Monophonic baseline: the merged render is audible.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(5),
+        "mono baseline audible",
+    );
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(700));
+    wait_until(
+        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        Duration::from_secs(5),
+        "silence after StopAll",
+    );
+
+    // POLY: one exact copy of the instrument per child lane. If the RT
+    // poly pass were broken (row ignored, copies never fed), the track
+    // would go silent — every lane event now routes away from the live
+    // instance into the copy row.
+    b.engine
+        .set_track_poly(0, true, vec![slooper::audio::spawn_synth_copy(&master, sr), slooper::audio::spawn_synth_copy(&master, sr)]);
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(5),
+        "poly track audible through the lane copies",
+    );
+
+    // Flipping back to mono mid-playback (row cleared under the RT
+    // thread) must fall back to the shared instance, not stay silent:
+    // the live instance missed the notes already sounding, so it re-
+    // attacks at the NEXT pattern onset (correct — onsets never replay
+    // mid-span) — therefore wait for audible, not a fixed window.
+    b.engine.set_track_poly(0, false, Vec::new());
+    wait_until(
+        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        Duration::from_secs(4),
+        "mono fallback audible after the poly row was cleared mid-playback",
+    );
+    b.cmd(Cmd::StopAll);
+    drop(active);
+}
+
 // ---------------------------------------------------- FL-suite tier 2 live --
 
 /// FL-Suite tier 2: the four new bundled synths (tri_osc, pluck, fm,
