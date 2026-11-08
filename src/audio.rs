@@ -834,14 +834,28 @@ pub struct Engine {
     aud_drained: AtomicBool,
 }
 
+/// v46: pseudo-track id of the DEFAULT (no track picked) roll audition
+/// route. Its voice renders through a dedicated headless instance in the RT
+/// and mixes dead-centre into the master, exactly like asset previews —
+/// the audition never touches any real track's mixer, synth or bus.
+pub const AUD_PV: usize = usize::MAX;
+
 /// v38 R1: one requested audition voice. `ev` MUST be sorted by
 /// (sample, kind) — kind order puts offs (0) before ons (3) at equal
 /// samples — the RT advance loop relies on it.
+/// v46: `inst` = the HEADLESS SYNTH COPY this voice renders through.
+/// Roll auditions always carry one (an exact private copy of the track's
+/// configured synth, or the bundled piano for the default route) so an
+/// audition NEVER pushes MIDI into the live instance the clips and the
+/// keyboard play — the "preview feeds the synth / stuck note" family.
+/// `None` keeps the legacy behavior (render through the track's live
+/// synth) and is only used by pre-v46 callers and pins.
 #[derive(Clone)]
 pub struct AudVoiceReq {
     pub vid: u64,
     pub track: usize,
     pub ev: std::sync::Arc<[MidiEv]>,
+    pub inst: Option<Arc<SynthHandle>>,
 }
 
 /// Held (staged-but-not-yet-off) note count of a voice at cursor `cur`.
@@ -1623,13 +1637,21 @@ impl Engine {
     // ---- v38 R1 roll audition voices --------------------------------------
 
     /// Stage `ev` (sorted `(sample, kind, ch, d1, d2)` events relative to
-    /// NOW) through track `t`'s LIVE synth and mixer chain. Works with the
-    /// transport stopped and while the track's play flag is off; script
-    /// synths and the shared default synth work exactly like plugins —
-    /// NOTHING is instantiated here, the sound comes out of the instance
-    /// the audio thread already owns. The pool is bounded (oldest voice
-    /// dropped), mirroring the asset-preview voices.
-    pub fn play_audition(&self, track: usize, ev: Arc<[MidiEv]>) {
+    /// NOW) as an audition voice. v46: `inst` = the HEADLESS synth copy the
+    /// voice renders through (see [`AudVoiceReq`]) — the track's live synth
+    /// and its MIDI state are untouched, and on `track == AUD_PV` the audio
+    /// mixes dead-centre into the master instead of a track bus. `inst:
+    /// None` keeps the v38 behavior (render through track `t`'s LIVE synth +
+    /// chain); it exists for legacy pins only. A single-event stream with NO
+    /// note-off is a HELD note: it sustains until `stop_audition` (that is
+    /// how press-and-hold works). Works with the transport stopped and
+    /// while the track's play flag is off.
+    pub fn play_audition(
+        &self,
+        track: usize,
+        ev: Arc<[MidiEv]>,
+        inst: Option<Arc<SynthHandle>>,
+    ) {
         const MAX_AUD_VOICES: usize = 12;
         if ev.is_empty() {
             return;
@@ -1639,7 +1661,12 @@ impl Engine {
             v.remove(0);
         }
         let vid = self.aud_vid.fetch_add(1, Ordering::Relaxed) + 1;
-        v.push(AudVoiceReq { vid, track, ev });
+        v.push(AudVoiceReq {
+            vid,
+            track,
+            ev,
+            inst,
+        });
         *self.aud_voices.lock().unwrap() = Arc::new(v);
         self.aud_pos.store(0, Ordering::Relaxed);
         // v40: a fresh start never inherits a drained-idle flag from the
@@ -2218,6 +2245,18 @@ fn run(
         aud_mask: 0,
         aud_block: vec![Vec::new(); MAX_LOOPS],
         aud_purge: 0,
+        aud_iblock: vec![Vec::new(); MAX_LOOPS],
+        aud_iinst: vec![None; MAX_LOOPS],
+        aud_iheld: [0i32; MAX_LOOPS],
+        aud_isus: [false; MAX_LOOPS],
+        aud_iquiet: [0u32; MAX_LOOPS],
+        aud_pblock: Vec::new(),
+        aud_pv_inst: None,
+        aud_pv_held: 0,
+        aud_pv_sus: false,
+        aud_pv_quiet: 0,
+        aud_pv_row: Vec::new(),
+        aud_pv_any: false,
         bound_cache: engine.midi_bound(),
         bound_gen: engine.midi_bound_gen(),
         // v32 R7: start at the default unity controls (no boot ramp).
@@ -2849,6 +2888,19 @@ fn spawn_entry_private(
         .map(|l| l.entry)
 }
 
+/// v46: an EXACT headless copy of a track's configured synth — scripts
+/// clone through `spawn_fresh` (same script, current slider values), VSTi
+/// reload the same plugin at its current parameter values. This is what
+/// roll auditions and POLY child-lane synths render through. NEVER call it
+/// on the realtime thread: the VST branch loads a plugin (under the
+/// process-wide loader lock).
+pub fn spawn_synth_copy(h: &SynthHandle, sr: u32) -> Option<Arc<SynthHandle>> {
+    match h {
+        SynthHandle::Script(i) => i.spawn_fresh().map(|n| Arc::new(SynthHandle::Script(n))),
+        SynthHandle::Vst(e) => spawn_entry_private(&**e, sr).map(|n| Arc::new(SynthHandle::Vst(n))),
+    }
+}
+
 /// Fresh scripted instances for a chain (offline renders), or `None` when
 /// the chain has no scripted slot at all (cheap passthrough for callers).
 fn scripted_chain(chain: &TrackFx) -> Option<Vec<Arc<crate::fx::Instance>>> {
@@ -3356,9 +3408,20 @@ impl Proc {
         let live_any =
             live_on && (!self.live_ev.is_empty() || self.live_notes.iter().any(|x| *x > 0));
         // v38 R1: an audition voice in flight (or a held audition note)
-        // opens the render path exactly like a physically held key.
-        let aud_any =
-            !self.aud.is_empty() || self.aud_held.iter().any(|h| *h > 0) || self.aud_purge != 0;
+        // opens the render path exactly like a physically held key. v46:
+        // headless-copy rows and the default pseudo-slot drive it the same
+        // way (their quiet tails keep the block alive until they decay).
+        let aud_any = !self.aud.is_empty()
+            || self.aud_held.iter().any(|h| *h > 0)
+            || self.aud_iheld.iter().any(|h| *h > 0)
+            || self.aud_isus.iter().any(|s| *s)
+            || self.aud_pv_held > 0
+            || self.aud_pv_sus
+            || !self.aud_pblock.is_empty()
+            || self.aud_purge != 0;
+        // The PV row only means "audio this block" for blocks that
+        // actually reach a render pass.
+        self.aud_pv_any = false;
         // v33: with a plugin synth bound to any live track the render path
         // stays OPEN even fully idle: plugins run every block ("constantly
         // listening for all inputs") — their meters, mod/LFO displays and
@@ -3403,6 +3466,18 @@ impl Proc {
             aud_mask,
             aud_held,
             aud_block,
+            aud_iblock,
+            aud_iinst,
+            aud_iheld,
+            aud_isus,
+            aud_iquiet,
+            aud_pblock,
+            aud_pv_inst,
+            aud_pv_held,
+            aud_pv_sus,
+            aud_pv_quiet,
+            aud_pv_row,
+            aud_pv_any,
             ..
         } = self;
         // v33: pass 0 — shared-handle ownership for this cycle. Tracks
@@ -3636,6 +3711,201 @@ impl Proc {
                 }
             }
         }
+        // =============== v46 headless audition copies =====================
+        // Voices carrying their own synth copy render HERE, never in the
+        // owner map above: the copy is fed nothing but that row's events,
+        // so an audition can never touch the instance the clips and the
+        // live keyboard play. Its mono output sums into the track's scratch
+        // row afterwards, so it still rides that track's chain/gain/pan.
+        for t in 0..MAX_LOOPS {
+            let has_ev = !aud_iblock[t].is_empty();
+            let held = aud_iheld[t];
+            if !has_ev && held <= 0 && !aud_isus[t] {
+                aud_iinst[t] = None; // row finished: release the copy
+                continue;
+            }
+            let Some(handle) = aud_iinst[t].clone() else {
+                aud_iinst[t] = None;
+                continue;
+            };
+            let mut ev = std::mem::take(&mut aud_iblock[t]);
+            ev.sort_unstable();
+            let row = &mut midi_scratch[t];
+            if row.len() < block_n {
+                row.clear();
+                row.resize(block_n, 0.0);
+            }
+            mono.clear();
+            mono.resize(block_n, 0.0);
+            match handle.as_ref() {
+                SynthHandle::Script(inst) => {
+                    inst.read_params(synth_p);
+                    if has_ev {
+                        // Prime like the live pass (sampler asset sync).
+                        unsafe { inst.process_into(&mut [], synth_p) };
+                    }
+                    let mut cur = 0usize;
+                    let mut i = 0usize;
+                    while i < ev.len() {
+                        let off = ev[i].0.min(block_n);
+                        if off > cur {
+                            unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
+                            cur = off;
+                        }
+                        while i < ev.len() && ev[i].0 == off {
+                            let (_, kind, ch, d1, d2) = ev[i];
+                            match kind {
+                                0 => inst.note_off(ch, d1),
+                                1 => inst.cc(ch, d1, d2),
+                                2 => inst.press(ch, d2),
+                                4 | 5 => {}
+                                _ => inst.note_on(ch, d1, d2),
+                            }
+                            i += 1;
+                        }
+                    }
+                    if cur < block_n {
+                        unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
+                    }
+                }
+                SynthHandle::Vst(e) => {
+                    sil.clear();
+                    sil.resize(block_n, 0.0);
+                    evq.clear();
+                    for &(off, kind, ch, d1, d2) in ev.iter() {
+                        let m = match kind {
+                            0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
+                            1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                            2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+                            4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                            5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                            _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+                        };
+                        evq.push((off.min(block_n), m));
+                    }
+                    e.process_with_midi(&sil[..block_n], &mut mono[..block_n], evq);
+                }
+            }
+            let mut peak = 0.0f32;
+            for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
+                *r += *m;
+                let a = m.abs();
+                if a > peak {
+                    peak = a;
+                }
+            }
+            if peak >= MIDI_SILENCE_FLOOR {
+                midi_live[t] = true;
+                any = true;
+            }
+            // Copy-row sustain: keep advancing while its own notes are
+            // held, and decay out with the same quiet-tail rule the live
+            // pass uses (piano damper time, no infinite spin-up).
+            if has_ev {
+                aud_isus[t] = true;
+                aud_iquiet[t] = 0;
+            }
+            if held <= 0 && !has_ev {
+                if peak >= MIDI_SILENCE_FLOOR {
+                    aud_iquiet[t] = 0;
+                } else {
+                    aud_iquiet[t] = aud_iquiet[t].saturating_add(1);
+                    if aud_iquiet[t] >= MIDI_QUIET_BLOCKS {
+                        aud_isus[t] = false;
+                        aud_iquiet[t] = 0;
+                        aud_iinst[t] = None;
+                    }
+                }
+            }
+        }
+        // v46: the DEFAULT (no-track) audition pseudo-slot. Same private-
+        // copy rendering, but the mono row mixes dead-centre into the
+        // master in the sample loop (like an asset preview) — no track bus,
+        // no mixer, no synth of any kind is involved.
+        {
+            let has_ev = !aud_pblock.is_empty();
+            let live_pv = has_ev || *aud_pv_held > 0 || *aud_pv_sus;
+            *aud_pv_any = false;
+            if live_pv {
+                if let Some(handle) = aud_pv_inst.clone() {
+                    let mut ev = std::mem::take(aud_pblock);
+                    ev.sort_unstable();
+                    aud_pv_row.clear();
+                    aud_pv_row.resize(block_n, 0.0);
+                    match handle.as_ref() {
+                        SynthHandle::Script(inst) => {
+                            inst.read_params(synth_p);
+                            if has_ev {
+                                unsafe { inst.process_into(&mut [], synth_p) };
+                            }
+                            let mut cur = 0usize;
+                            let mut i = 0usize;
+                            while i < ev.len() {
+                                let off = ev[i].0.min(block_n);
+                                if off > cur {
+                                    unsafe {
+                                        inst.process_into(&mut aud_pv_row[cur..off], synth_p)
+                                    };
+                                    cur = off;
+                                }
+                                while i < ev.len() && ev[i].0 == off {
+                                    let (_, kind, ch, d1, d2) = ev[i];
+                                    match kind {
+                                        0 => inst.note_off(ch, d1),
+                                        1 => inst.cc(ch, d1, d2),
+                                        2 => inst.press(ch, d2),
+                                        4 | 5 => {}
+                                        _ => inst.note_on(ch, d1, d2),
+                                    }
+                                    i += 1;
+                                }
+                            }
+                            if cur < block_n {
+                                unsafe {
+                                    inst.process_into(&mut aud_pv_row[cur..block_n], synth_p)
+                                };
+                            }
+                        }
+                        SynthHandle::Vst(e) => {
+                            sil.clear();
+                            sil.resize(block_n, 0.0);
+                            evq.clear();
+                            for &(off, kind, ch, d1, d2) in ev.iter() {
+                                let m = match kind {
+                                    0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
+                                    1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                                    2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+                                    4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                                    5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                                    _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+                                };
+                                evq.push((off.min(block_n), m));
+                            }
+                            e.process_with_midi(&sil[..block_n], &mut aud_pv_row[..block_n], evq);
+                        }
+                    }
+                    let peak = aud_pv_row[..block_n]
+                        .iter()
+                        .fold(0.0f32, |m, x| m.max(x.abs()));
+                    *aud_pv_any = true;
+                    if has_ev {
+                        *aud_pv_sus = true;
+                        *aud_pv_quiet = 0;
+                    }
+                    if *aud_pv_held <= 0 && !has_ev {
+                        if peak >= MIDI_SILENCE_FLOOR {
+                            *aud_pv_quiet = 0;
+                        } else {
+                            *aud_pv_quiet = aud_pv_quiet.saturating_add(1);
+                            if *aud_pv_quiet >= MIDI_QUIET_BLOCKS {
+                                *aud_pv_sus = false;
+                                *aud_pv_quiet = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // v33: the live feed is CONSUMED here — an early return above
         // (idle gate, zero-length block) leaves it staged, and
         // `Proc::process` carries it into the next cycle instead of
@@ -3833,6 +4103,30 @@ struct Proc {
     /// Tracks whose held audition notes were purged (pool replaced) —
     /// `render_midi_block` all-offs them once.
     aud_purge: u128,
+    /// v46: STAGED-COPY audition rows — voices that carry their own
+    /// headless synth copy. Events stage into `aud_iblock` (never merged
+    /// into the track's live synth stream), `aud_iinst` names the copy the
+    /// row renders through (youngest voice's), `aud_iheld` counts its held
+    /// notes, and `aud_isus`/`aud_iquiet` are the copy-row's own sustain
+    /// bookkeeping (mirrors `midi_sustain`/`midi_quiet` for the live path).
+    /// The rendered mono row sums into `midi_scratch[t]` AFTER the live
+    /// synth pass, so the copy's audio still rides the track's chain.
+    aud_iblock: Vec<Vec<AudRow>>,
+    aud_iinst: Vec<Option<Arc<SynthHandle>>>,
+    aud_iheld: [i32; MAX_LOOPS],
+    aud_isus: [bool; MAX_LOOPS],
+    aud_iquiet: [u32; MAX_LOOPS],
+    /// v46: the DEFAULT (no-track) audition pseudo-slot (`AUD_PV`):
+    /// renders through `aud_pv_inst`, mixes dead-centre into the master
+    /// like an asset preview. `aud_pv_any` mirrors "the row has audio this
+    /// block" for the sample loop.
+    aud_pblock: Vec<AudRow>,
+    aud_pv_inst: Option<Arc<SynthHandle>>,
+    aud_pv_held: i32,
+    aud_pv_sus: bool,
+    aud_pv_quiet: u32,
+    aud_pv_row: Vec<f32>,
+    aud_pv_any: bool,
     /// v32: last bound-set snapshot + its generation (try_lock refresh).
     bound_cache: Arc<BoundSet>,
     bound_gen: u64,
@@ -4453,6 +4747,7 @@ impl ProcessHandler for Proc {
             && !env_held
             && !metro_on
             && !self.preview_live
+            && !self.aud_pv_any
         {
             return Control::Continue; // nothing connected, nothing playing: idle
         }
@@ -4555,15 +4850,76 @@ impl ProcessHandler for Proc {
                     continue;
                 }
                 let pend = aud_pending(req.ev.as_ref(), *cur);
-                if pend > 0 && req.track < MAX_LOOPS {
-                    self.aud_held[req.track] -= pend.min(self.aud_held[req.track].max(0));
-                    self.aud_purge |= 1u128 << req.track;
+                if pend == 0 {
+                    continue;
+                }
+                match (&req.inst, req.track < MAX_LOOPS) {
+                    // v46 copy voice: its OWN instance dies, never a track
+                    // synth — all_off kills the held notes on the copy.
+                    (Some(h), true) => {
+                        h.all_off();
+                        let t = req.track;
+                        self.aud_iheld[t] -= pend.min(self.aud_iheld[t].max(0));
+                    }
+                    (Some(h), false) => {
+                        h.all_off();
+                        self.aud_pv_held -= pend.min(self.aud_pv_held.max(0));
+                    }
+                    // Legacy live-route voice (v38): the track synth gets
+                    // the all-notes-off exactly like before.
+                    (None, true) => {
+                        self.aud_held[req.track] -=
+                            pend.min(self.aud_held[req.track].max(0));
+                        self.aud_purge |= 1u128 << req.track;
+                    }
+                    (None, false) => {
+                        if let Some(h) = &self.aud_pv_inst {
+                            h.all_off();
+                        }
+                        self.aud_pv_held -= pend.min(self.aud_pv_held.max(0));
+                    }
                 }
             }
             // v40: preserve per-voice cursors keyed by vid — a new voice
             // joining used to reseed EVERY voice at 0, replaying still
             // running auditions from the top on every click (the roll
             // preview "wall of sound").
+            // v46: THE STUCK-NOTE SWEEP. A held note-outlives its voice
+            // object (the stream ends at note-on; the held COUNT carries
+            // the sustain), so the leave-the-pool loop above can never see
+            // it — on STOP (empty snapshot) every held note of EVERY kind
+            // — legacy track synth, headless copy, default-slot piano —
+            // must die here, or its instance rings until the next loud
+            // event (the reported "stuck on until you preview something
+            // else"). All-off, then zero the books.
+            if snap.is_empty() {
+                for t in 0..MAX_LOOPS {
+                    if self.aud_held[t] > 0 {
+                        self.aud_purge |= 1u128 << t;
+                    }
+                    self.aud_held[t] = 0;
+                    if self.aud_iheld[t] > 0 || self.aud_isus[t] {
+                        if let Some(h) = &self.aud_iinst[t] {
+                            h.all_off();
+                        }
+                        self.aud_iinst[t] = None;
+                        self.aud_iheld[t] = 0;
+                        self.aud_isus[t] = false;
+                        self.aud_iquiet[t] = 0;
+                    }
+                }
+                if self.aud_pv_held > 0 || self.aud_pv_sus {
+                    if let Some(h) = &self.aud_pv_inst {
+                        h.all_off();
+                    }
+                }
+                self.aud_pv_held = 0;
+                self.aud_pv_sus = false;
+                self.aud_pv_quiet = 0;
+                self.aud_pv_inst = None;
+                self.aud_pblock.clear();
+                self.aud_mask = 0;
+            }
             let old = std::mem::take(&mut self.aud);
             self.aud = snap
                 .iter()
@@ -4585,9 +4941,11 @@ impl ProcessHandler for Proc {
                 m &= m - 1;
                 if t < MAX_LOOPS {
                     self.aud_block[t].clear();
+                    self.aud_iblock[t].clear();
                 }
             }
             self.aud_mask = 0;
+            self.aud_pblock.clear();
         }
         let nn = n as u64;
         let off_cap = (n.saturating_sub(1)) as u64;
@@ -4595,8 +4953,20 @@ impl ProcessHandler for Proc {
         while i < self.aud.len() {
             let (req, cur) = &mut self.aud[i];
             let end = cur.saturating_add(nn);
-            let t = req.track.min(MAX_LOOPS - 1);
             let mut done = true;
+            // v46: route this voice's due events to its row — the default
+            // pseudo-slot (`AUD_PV`), a track's headless-COPY row, or the
+            // legacy live-track row. Only copy/PV voices re-arm their
+            // instance slot (the row renders through whatever it names).
+            let pv = req.track >= MAX_LOOPS;
+            let copy = !pv && req.inst.is_some();
+            if pv {
+                if req.inst.is_some() {
+                    self.aud_pv_inst = req.inst.clone();
+                }
+            } else if copy {
+                self.aud_iinst[req.track] = req.inst.clone();
+            }
             for &(off, kind, ch, d1, d2) in req.ev.iter() {
                 if off >= end {
                     done = false;
@@ -4604,14 +4974,37 @@ impl ProcessHandler for Proc {
                 }
                 if off >= *cur {
                     let o = (off - *cur).min(off_cap) as usize;
-                    if self.aud_block[t].len() < 1024 {
-                        self.aud_block[t].push((o, kind, ch, d1, d2));
-                        match kind {
-                            3 => self.aud_held[t] += 1,
-                            0 => self.aud_held[t] = (self.aud_held[t] - 1).max(0),
-                            _ => {}
+                    if pv {
+                        if self.aud_pblock.len() < 1024 {
+                            self.aud_pblock.push((o, kind, ch, d1, d2));
+                            match kind {
+                                3 => self.aud_pv_held += 1,
+                                0 => self.aud_pv_held = (self.aud_pv_held - 1).max(0),
+                                _ => {}
+                            }
                         }
-                        self.aud_mask |= 1u128 << t;
+                    } else if copy {
+                        let t = req.track;
+                        if self.aud_iblock[t].len() < 1024 {
+                            self.aud_iblock[t].push((o, kind, ch, d1, d2));
+                            match kind {
+                                3 => self.aud_iheld[t] += 1,
+                                0 => self.aud_iheld[t] = (self.aud_iheld[t] - 1).max(0),
+                                _ => {}
+                            }
+                            self.aud_mask |= 1u128 << t;
+                        }
+                    } else {
+                        let t = req.track.min(MAX_LOOPS - 1);
+                        if self.aud_block[t].len() < 1024 {
+                            self.aud_block[t].push((o, kind, ch, d1, d2));
+                            match kind {
+                                3 => self.aud_held[t] += 1,
+                                0 => self.aud_held[t] = (self.aud_held[t] - 1).max(0),
+                                _ => {}
+                            }
+                            self.aud_mask |= 1u128 << t;
+                        }
                     }
                 }
             }
@@ -4624,7 +5017,11 @@ impl ProcessHandler for Proc {
                 i += 1;
             }
         }
-        if self.aud.is_empty() && !self.aud_held.iter().any(|h| *h > 0) {
+        if self.aud.is_empty()
+            && !self.aud_held.iter().any(|h| *h > 0)
+            && !self.aud_iheld.iter().any(|h| *h > 0)
+            && self.aud_pv_held <= 0
+        {
             // aud_on flips off only after OUR generation actually drained
             // — a voice staged the same frame stays armed (A3's stop
             // races resolved).
@@ -5192,6 +5589,15 @@ impl ProcessHandler for Proc {
                 }
             }
 
+            // v46: default-route audition row (headless piano copy) —
+            // dead centre like the click, output mix only (never recorded
+            // into a take).
+            let pvca = if self.aud_pv_any && i < self.aud_pv_row.len() {
+                self.aud_pv_row[i] * F1S2
+            } else {
+                0.0
+            };
+
             // Live input rides the selected track's chain/trim/pan; the click
             // always sits dead centre. At unity trim and centre pan the L/R
             // pair still sums to the historical unity mono mix.
@@ -5221,8 +5627,8 @@ impl ProcessHandler for Proc {
             // the user hears stays exactly on the timeline grid (latency
             // compensation only trims the start of a fresh take — see
             // `Engine::rec_sample`).
-            mix_l[i] = mon.0 * mon_l + clickc + play_l + pvc;
-            mix_r[i] = mon.1 * mon_r + clickc + play_r + pvc;
+            mix_l[i] = mon.0 * mon_l + clickc + play_l + pvc + pvca;
+            mix_r[i] = mon.1 * mon_r + clickc + play_r + pvc + pvca;
 
             // Advance the transport clock (only while running).
             if live && advance {
@@ -6398,10 +6804,10 @@ mod tests {
         let e = Engine::new();
         assert!(!e.audition_active(), "nothing armed by default");
         let ev: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 60u8, 100u8), (16000, 0, 0, 60, 0)].into();
-        e.play_audition(3, ev.clone());
+        e.play_audition(3, ev.clone(), None);
         assert!(e.audition_active(), "armed by a voice");
         assert_eq!(e.audition_snapshot().len(), 1, "one voice in the pool");
-        e.play_audition(3, ev); // additive taps stack (v0.10 key semantics)
+        e.play_audition(3, ev, None); // additive taps stack (v0.10 key semantics)
         assert_eq!(e.audition_snapshot().len(), 2);
         e.stop_audition();
         assert!(!e.audition_active(), "stopped");
@@ -6409,8 +6815,33 @@ mod tests {
         // An empty event list never arms the flag (an empty-pattern
         // preview must not stick the roll in STOP state).
         let empty: Arc<[MidiEv]> = vec![].into();
-        e.play_audition(0, empty);
+        e.play_audition(0, empty, None);
         assert!(!e.audition_active(), "empty voice is no voice");
+    }
+
+    /// v46: a voice given a headless synth COPY keeps it in the published
+    /// snapshot — RT renders that instance, never the track's live synth.
+    /// `AUD_PV` (the default no-track route) is a legal pseudo-slot.
+    #[test]
+    fn v46_audition_voice_carries_its_headless_copy() {
+        let e = Engine::new();
+        let reg = crate::synth::Registry::open(crate::synth::default_dir());
+        let inst = reg
+            .create_instance("piano", 44100.0, &[])
+            .expect("bundled piano must compile and load");
+        let h = std::sync::Arc::new(SynthHandle::Script(inst));
+        let ev: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 60u8, 100u8)].into();
+        e.play_audition(2, ev.clone(), Some(h.clone()));
+        let snap = e.audition_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].inst.as_ref().is_some_and(|c| std::sync::Arc::ptr_eq(c, &h)),
+            "the voice renders through the COPY it was given"
+        );
+        e.play_audition(AUD_PV, ev, Some(h));
+        assert_eq!(e.audition_snapshot().len(), 2, "PV pseudo-slot accepts voices");
+        e.stop_audition();
+        assert!(e.audition_snapshot().is_empty(), "stop purges the pool");
     }
 
     #[test]

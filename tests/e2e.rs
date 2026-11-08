@@ -3085,7 +3085,7 @@ fn e2e_roll_audition_note_sounds_with_transport_stopped() {
         (sr as u64, 0, 0, 57, 0), // one second of note
     ]
     .into();
-    b.engine.play_audition(0, ev);
+    b.engine.play_audition(0, ev, None);
     assert!(b.engine.audition_active(), "voice armed");
     wait_until(
         || {
@@ -3173,7 +3173,7 @@ fn e2e_roll_audition_stop_silences_held_note() {
     // A 3-second note; STOP it ~0.6 s in, while it is held.
     let ev: Arc<[MidiEv]> =
         vec![(0u64, 3u8, 0u8, 50u8, 120u8), (3 * sr as u64, 0, 0, 50, 0)].into();
-    b.engine.play_audition(0, ev);
+    b.engine.play_audition(0, ev, None);
     wait_until(
         || {
             ring_peak(&ring, &widx, 4800)
@@ -3206,6 +3206,178 @@ fn e2e_roll_audition_stop_silences_held_note() {
     assert!(
         after2_rms < 0.15 * body_rms.max(1e-9),
         "purged voice must stay silent: {after2_rms} vs {body_rms}"
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
+}
+
+/// v46: an audition voice that carries its OWN synth copy renders through
+/// that copy — the note sounds while held (transport stopped) and dies
+/// within a few blocks of `stop_audition` (the reported stuck-note bug:
+/// a held note-outlived its voice object and nothing could silence it).
+#[test]
+fn v46_e2e_copy_audition_release_silences() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("audcopy", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let live = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.engine
+        .set_track_synth(0, Some(Arc::new(slooper::audio::SynthHandle::Script(live))));
+    let copy = slooper::audio::spawn_synth_copy(
+        &slooper::audio::SynthHandle::Script(
+            reg.create_instance("piano", sr as f64, &[]).unwrap(),
+        ),
+        sr,
+    )
+    .expect("headless copy spawn");
+    std::thread::sleep(Duration::from_millis(150));
+
+    // A HELD note (no note-off ever) through the copy.
+    let ev: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 57u8, 110u8)].into();
+    b.engine.play_audition(0, ev, Some(copy));
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "held copy note audible with the transport stopped",
+    );
+    let body =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("body window");
+    let body_rms = rms(&body);
+    assert!(body_rms > 2e-3, "copy audition body: {body_rms}");
+
+    b.engine.stop_audition();
+    std::thread::sleep(Duration::from_millis(600));
+    let after =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("post window");
+    let after_rms = rms(&after);
+    assert!(
+        after_rms < 0.15 * body_rms.max(1e-9),
+        "copy stop must kill the held note: {after_rms} vs {body_rms}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let after2 = rms(
+        &read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+            .expect("late window"),
+    );
+    assert!(
+        after2 < 0.15 * body_rms.max(1e-9),
+        "released copy note must STAY dead: {after2} vs {body_rms}"
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
+}
+
+/// v46: the DEFAULT (no-track) audition route — the engine's `AUD_PV`
+/// pseudo-slot. Same hold/release contract, centre mix, no track or
+/// mixer involved at all.
+#[test]
+fn v46_e2e_default_route_hold_and_release() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("audpv", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let pv = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    std::thread::sleep(Duration::from_millis(150));
+
+    let ev: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 57u8, 110u8)].into();
+    b.engine.play_audition(
+        slooper::audio::AUD_PV,
+        ev,
+        Some(Arc::new(slooper::audio::SynthHandle::Script(pv))),
+    );
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "default-route hold audible",
+    );
+    let body =
+        read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500)).expect("body window");
+    let body_rms = rms(&body);
+    assert!(body_rms > 2e-3, "default-route body: {body_rms}");
+    b.engine.stop_audition();
+    std::thread::sleep(Duration::from_millis(600));
+    let after = rms(
+        &read_ring(&ring, &widx, sr as usize / 10, Duration::from_millis(500))
+            .expect("post window"),
+    );
+    assert!(
+        after < 0.15 * body_rms.max(1e-9),
+        "default-route release must silence: {after} vs {body_rms}"
     );
     drop(active);
     b.cmd(Cmd::StopAll);
