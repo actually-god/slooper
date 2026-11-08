@@ -735,13 +735,6 @@ const ZOOM_WHEEL_PX: f32 = 0.01;
 /// "horizontal scrolling is way too slow".)
 const PAN_WHEEL_LINE: f32 = 80.0;
 
-/// The user's home folder (projects default to `~/slooper-projects`).
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
 /// What a plugin editor window (or its stand-in) belongs to. The GUI
 /// hosts plugin instances at exactly two kinds of places, and the v23
 /// editor crash-guard must route its verdict back to the right one.
@@ -10847,7 +10840,7 @@ impl App {
     fn projects_dir(&self) -> PathBuf {
         let t = self.project_dir.trim();
         if t.is_empty() {
-            home_dir().join("slooper-projects")
+            crate::paths::default_projects_dir()
         } else {
             PathBuf::from(t)
         }

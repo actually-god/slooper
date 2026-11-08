@@ -5,8 +5,8 @@
 // Any .wav file dropped into the impulses folder becomes an IR:
 //
 //     $SLOOPER_IMPULSES_DIR   (env override, tests/dev)
-//     $XDG_DATA_HOME/slooper/impulses
-//     ~/.local/share/slooper/impulses
+//     Linux:   $XDG_DATA_HOME/slooper/impulses  or  ~/.local/share/...
+//     Windows: %LOCALAPPDATA%\slooper\impulses
 //
 // The folder (plus a README) is created on first use. Index 0 is ALWAYS
 // the built-in synthetic hall so the effect works with zero files. Up to
@@ -290,6 +290,21 @@ fn impulses_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(d);
         }
     }
+    // Keep in sync with crate::paths::impulses_dir() in the host (this
+    // script compiles standalone and cannot call host code).
+    #[cfg(windows)]
+    let base = std::env::var("LOCALAPPDATA")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(|h| std::path::PathBuf::from(h).join("AppData").join("Local"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    #[cfg(not(windows))]
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
         .filter(|p| !p.is_empty())
