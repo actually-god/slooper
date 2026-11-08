@@ -109,6 +109,15 @@ either **docked** into a screen edge or a **free-floating** window:
 - **Double-click a title bar** to toggle docked ⇄ floating.
 - **Right-click a title bar** for the slot menu: dock to any edge, float
   out, or close. (Docked headers answer right-click too.)
+- **Tab groups — two windows, one slot.** While carrying a window, drop
+  it ON ANOTHER docked window's HEADER: the ghost shows that window's
+  whole slot, and releasing tabs the carried window into it. The shared
+  header grows a tab strip — tap a tab to swap which window's body the
+  slot shows. Drag a tab OFF to carry just that window back out (drag a
+  non-active tab and it, not the visible one, comes with you); the slot
+  menu adds **tab with…** and **detach into own slot**. New windows
+  dropping along the same edge re-rank whole groups — members are never
+  squeezed apart. Float/reset/dock-all dissolve groups cleanly.
 - Resize a docked strip by dragging its inner divider (along the edge) or
   its outer edge (thickness); collapse with `–`, close with `x`.
 - **Windows shrink as small as you drag them.** A window never holds a
@@ -117,10 +126,19 @@ either **docked** into a screen edge or a **free-floating** window:
   column, headers shorten their titles) and whatever is left clips
   inside. Tiny windows stay usable, and the bottom bar can hold every
   window at once.
-- The top bar's **Windows** menu lists every window with a live checkmark,
-  plus **dock all windows / float all windows / reset window layout**
-  (stock slots, sizes and un-collapsed headers). The same three actions
-  are in **Settings ▸ GUI**.
+- The top bar's **Windows** menu lists every window with a live checkmark
+  — INCLUDING open plugin param / FX-editor windows — plus **dock all
+  windows / float all windows / reset window layout** (stock slots,
+  sizes and un-collapsed headers). The same three actions are in
+  **Settings ▸ GUI**.
+- **Layout templates** (same menu): name a view, **capture** it, and one
+  click later the whole arrangement — slots, sizes, tab groups, what was
+  floating, what was open — is back. Delete with the little `x`. Good
+  for a tracking view vs. a mixing view.
+- **Ctrl+K — command palette.** One box for everything the Windows menu
+  does plus every settings category: type to filter (`mixer`, `ports`,
+  `reset`…), `↑`/`↓` to choose, `Enter` runs, `Esc` closes. Settings
+  rows open Settings straight at that category.
 - **Settings** has a search box and category chips: type (e.g. `theme`)
   or tap a chip to hide everything unrelated.
 
