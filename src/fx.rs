@@ -1145,6 +1145,16 @@ impl Instance {
         unsafe { self.call_sample_st(l, r, &p, 0.0) }
     }
 
+    /// v48: `process_private_st` with this render pass's sidechain sample.
+    /// Offline chain passes that carry a routed send use this so v2+ scripts
+    /// duck in the export exactly like on the live bus; `sc = 0.0` is the
+    /// documented "no send routed" rule (identical to `process_private_st`).
+    pub fn process_private_st_sc(&self, l: f32, r: f32, sc: f32) -> (f32, f32) {
+        let mut p = [0.0f32; MAX_PARAMS];
+        self.read_params(&mut p);
+        unsafe { self.call_sample_st(l, r, &p, sc) }
+    }
+
     fn snapshot_params(&self) -> Vec<f32> {
         (0..MAX_PARAMS).map(|k| self.param(k)).collect()
     }
