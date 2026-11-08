@@ -1179,10 +1179,20 @@ pub struct App {
     /// Piano-roll note clipboard (Ctrl+C/V while the roll has focus).
     roll_clip: Option<Vec<crate::midipat::Note>>,
     /// v38 R1: cached instance of the DEFAULT audition synth (bundled
-    /// piano). Only used for the no-track preview path (script render —
-    /// instant, no plugin involved); the track path stages live RT
-    /// voices (`Engine::play_audition`) and touches NO instance here.
+    /// piano). Only used for the no-track PATTERN preview path (script
+    /// render — instant, no plugin involved); key holds never touch it.
     aud_default_inst: Option<std::sync::Arc<crate::synth::Instance>>,
+    /// v46: cached headless audition copies, one per track. The stored
+    /// `usize` is the live handle's Arc pointer at spawn time — a swap
+    /// (set/respawn/preset/load) changes it and the next press spawns
+    /// fresh. Script handles bypass the cache entirely (spawn is one file
+    /// read; fresh always matches the current params/sampler asset).
+    aud_copy: Vec<Option<(usize, std::sync::Arc<crate::audio::SynthHandle>)>>,
+    /// v46: the DEFAULT (no-track) key-hold route's piano copy.
+    aud_pv_copy: Option<std::sync::Arc<crate::audio::SynthHandle>>,
+    /// v46: pitch currently held by a press-and-hold roll gesture. Any
+    /// button-up, roll close, or preview start clears/stops it.
+    roll_hold: Option<u8>,
     /// Grid snap enable (main header checkbox). OFF = placement/resize
     /// snaps to ONE SAMPLE — the program's minimum resolution.
     snap_on: bool,
@@ -1686,6 +1696,9 @@ impl App {
             snap_on: cfg.snap_on,
             preview_playing: None,
             aud_default_inst: None,
+            aud_copy: (0..MAX_LOOPS).map(|_| None).collect(),
+            aud_pv_copy: None,
+            roll_hold: None,
             proj_name: String::new(),
             pending_proj: None,
             pending_proj_dir: None,
@@ -7409,41 +7422,127 @@ impl App {
     /// while the UI thread has its hands full. Status echoes every press
     /// (input feedback).
     fn audition_note(&mut self, note: u8) {
+        self.roll_key_hold(note.min(127));
+    }
+
+    /// v46: PRESS-and-HOLD audition. The voice is a note-on with NO
+    /// note-off: it sustains exactly as long as the mouse button does
+    /// (watchdog in `roll_pass` ends it on release), and it renders
+    /// through a private synth copy — the piano roll "playing" the grid
+    /// through the live instrument for one subdivision and leaving MIDI
+    /// stuck in the synth are both structurally impossible now.
+    fn roll_key_hold(&mut self, note: u8) {
+        if self.roll_hold == Some(note) {
+            return; // same pitch already held
+        }
         if self.sample_rate == 0 {
             self.status = "audition: audio engine not running yet".into();
             return;
         }
-        let sr = self.sample_rate;
-        let ev: Vec<(u64, u8, u8, u8, u8)> =
-            vec![(0, 3, 0, note, 100), ((sr as u64) / 3, 0, 0, note, 0)];
+        // One audition at a time: drop any previous held/rolling voice
+        // first (the sweep in the engine kills its held notes too).
+        if self.roll_hold.take().is_some() {
+            self.backend.engine.stop_audition();
+        }
+        self.roll_hold = Some(note);
+        let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, note, 100)];
         match self.preview_track {
             Some(t) => {
-                self.backend.engine.play_audition(t, ev.into());
+                let inst = self.audition_copy(t);
+                if inst.is_none() {
+                    self.roll_hold = None;
+                    self.status = "audition: no synth available".into();
+                    return;
+                }
+                self.backend.engine.play_audition(t, ev.into(), inst);
                 self.status = format!(
                     "\u{266a} {nm} \u{b7} {route}",
                     nm = note_name(note),
                     route = self.roll_track_label(t)
                 );
             }
-            None => match self.audition_render(&ev, 0.6) {
-                Some(buf) => {
-                    self.backend.cmd(Cmd::PreviewPlay {
-                        id: crate::audio::PREVIEW_TRANSIENT,
-                        samples: buf,
-                    });
-                    self.status =
-                        format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
+            None => {
+                // v46: the default route holds a private piano copy
+                // through the engine's `AUD_PV` pseudo-slot (centre mix,
+                // like an asset preview) — headless, and it answers with
+                // the real instrument while the UI thread is busy.
+                if self.aud_pv_copy.is_none() {
+                    self.aud_pv_copy = self
+                        .preview_synth_instance()
+                        .map(|i| Arc::new(crate::audio::SynthHandle::Script(i)));
                 }
-                None => {
+                let inst = self.aud_pv_copy.clone();
+                if inst.is_none() {
+                    self.roll_hold = None;
                     self.status = "audition: no synth available".into();
+                    return;
                 }
-            },
+                self.backend
+                    .engine
+                    .play_audition(crate::audio::AUD_PV, ev.into(), inst);
+                self.status =
+                    format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
+            }
         }
+    }
+
+    /// v46: end a held audition note (mouse released, roll closed,
+    /// pattern preview started). No-op when nothing is held.
+    fn roll_key_release(&mut self) {
+        if self.roll_hold.take().is_some() {
+            self.backend.engine.stop_audition();
+        }
+    }
+
+    /// v46: the exact headless copy of track `t`'s configured synth.
+    /// Script copies respawn every press (a file read — always matches
+    /// current sliders/sampler assets); VST copies — expensive to open —
+    /// cache under the live handle's pointer and resync host-visible
+    /// params on reuse. `None` = no playable instrument.
+    fn audition_copy(&mut self, t: usize) -> Option<Arc<crate::audio::SynthHandle>> {
+        let sr = self.sample_rate.max(1);
+        // v46: an UNBOUND track still auditions — through the same default
+        // piano an unbound clip playback uses (the old route silently died
+        // here: "preview track 1 · no synth").
+        let live = self
+            .track_synth_inst
+            .get(t)
+            .cloned()
+            .flatten()
+            .or_else(|| self.backend.engine.default_synth())
+            .or_else(|| {
+                self.preview_synth_instance()
+                    .map(|i| Arc::new(crate::audio::SynthHandle::Script(i)))
+            })?;
+        let fresh = matches!(live.as_ref(), crate::audio::SynthHandle::Script(_));
+        if !fresh {
+            if let Some((ptr, c)) = self.aud_copy.get(t).cloned().flatten() {
+                if ptr == Arc::as_ptr(&live) as usize {
+                    if let (
+                        crate::audio::SynthHandle::Vst(a),
+                        crate::audio::SynthHandle::Vst(b),
+                    ) = (live.as_ref(), c.as_ref())
+                    {
+                        let ps = a.params();
+                        for k in 0..ps.len() {
+                            b.set_param(k, ps.get(k));
+                        }
+                    }
+                    return Some(c);
+                }
+            }
+        }
+        let c = crate::audio::spawn_synth_copy(&live, sr)?;
+        if t < self.aud_copy.len() {
+            self.aud_copy[t] = Some((Arc::as_ptr(&live) as usize, c.clone()));
+        }
+        Some(c)
     }
 
     /// v38: stop everything the roll may be auditioning (preview voices
     /// AND audition voices) and clear the "playing" label.
     fn stop_previews(&mut self) {
+        self.roll_hold = None;
         self.backend.cmd(Cmd::PreviewStop { id: None });
         self.backend.engine.stop_audition();
         self.preview_playing = None;
@@ -7572,7 +7671,10 @@ impl App {
                 return;
             }
             ev.sort_unstable();
-            self.backend.engine.play_audition(t, ev.into());
+            // v46: through a private COPY of the track's instrument — an
+            // asset preview can never leave MIDI in the live synth.
+            let inst = self.audition_copy(t);
+            self.backend.engine.play_audition(t, ev.into(), inst);
             if self.metro_on {
                 self.preview_metro_only(&pat);
             }
@@ -7618,6 +7720,14 @@ impl App {
     /// close); otherwise paint the classic floating chrome, tracking the
     /// dock carry like every other dockable.
     fn roll_pass(&mut self, ui: &mut egui::Ui, idx: usize, docked: bool) {
+        // v46: release watchdog — a held audition note lasts exactly as
+        // long as the mouse button. ANY button-up ends it (on the roll,
+        // off-canvas, after the window closed): a held note with no
+        // button behind it is a stuck note. Runs before the take/return
+        // so it fires even when the roll window is gone.
+        if self.roll_hold.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.roll_key_release();
+        }
         let mut roll = match self.piano_roll.take() {
             Some(r) => r,
             None => return,
@@ -8035,7 +8145,13 @@ impl App {
                                 "preview: pattern has no notes yet \u{b7} draw one first".into();
                         } else {
                             ev.sort_unstable();
-                            self.backend.engine.play_audition(t, ev.into());
+                            // v46: starting a pattern preview ends any
+                            // held key, and the pattern itself plays
+                            // through a private COPY of the instrument.
+                            self.roll_key_release();
+                            self.backend.engine.stop_audition();
+                            let inst = self.audition_copy(t);
+                            self.backend.engine.play_audition(t, ev.into(), inst);
                             if self.metro_on {
                                 self.preview_metro_only(&pat);
                             }
@@ -8680,6 +8796,11 @@ impl App {
                                             "selected {} note(s) \u{b7} drag moves \u{b7} wheel over a note trims velocity",
                                             roll.sel_notes.len()
                                         );
+                                // v46: pressing a note body also HOLDS
+                                // its pitch (headless copy; ends with the
+                                // button). Resizing via end caps stays
+                                // silent — editing length is not playing.
+                                *audition = Some(roll.pat.notes[idx].note);
                             }
                         }
                         roll.changed = true;
@@ -8764,6 +8885,12 @@ impl App {
                                 }
                                 roll.drag_notes = dn;
                             }
+                            // v46: the drag changes pitch — the held
+                            // audition follows the pointer (same-pitch
+                            // calls no-op inside `roll_key_hold`).
+                            if let Some(nn) = roll.pat.notes.get(idx) {
+                                *audition = Some(nn.note);
+                            }
                             roll.changed = true;
                         }
                     }
@@ -8845,13 +8972,19 @@ impl App {
                 // would invalidate every selection index. Sorting
                 // happens at save (SMF write) only.
             }
-            // Piano keys: click plays the note through the
-            // preview track.
+            // v46: PRESS (not click) starts a piano-key hold — the note
+            // sustains while the button stays down; the release watchdog
+            // in `roll_pass` ends it. Click-and-go keeps working: the
+            // button is up one frame later, and the note stops with it.
+            let strip_press = ui.ctx().input(|i| {
+                i.pointer.button_down(egui::PointerButton::Primary)
+                    && i.pointer.button_pressed(egui::PointerButton::Primary)
+            });
             if pt.x >= rect.min.x
                 && pt.x < grid_x0
                 && pt.y >= grid_top
                 && pt.y <= grid_bot
-                && resp.clicked_by(egui::PointerButton::Primary)
+                && strip_press
             {
                 *audition = Some((row_at(pt.y).clamp(0, 127)) as u8);
             }
@@ -23254,11 +23387,12 @@ mod tests {
             "routed preview arms the engine audition"
         );
 
-        // 6) Clicking a piano key auditions that single note through the
-        // picked track's LIVE instrument — while the audition from step 5
-        // is live the toolbar reads STOP (state feedback), and the key
-        // press re-arms a fresh audition voice whose status names the
-        // track AND the instrument behind it.
+        // 6) PRESSING a piano key holds that note through a headless
+        // copy of the picked track's instrument, and the RELEASE stops it
+        // exactly (v46: press-and-hold; a held note with no button behind
+        // it is a stuck note). The toolbar reads STOP while held (state
+        // feedback), and the press re-arms a fresh audition voice whose
+        // status names the track AND the instrument behind it.
         assert!(
             find_exact(&mut app, &ctx, "STOP").is_some(),
             "button shows STOP while an audition is live: {}",
@@ -23266,10 +23400,15 @@ mod tests {
         );
         let kc = egui::pos2(canvas.min.x + 25.0, canvas.center().y);
         frame(&mut app, &ctx, vec![moved(kc), btn_btn(kc, true)]);
-        frame(&mut app, &ctx, vec![btn_btn(kc, false)]);
         assert!(
             app.status.contains('\u{266a}') && app.backend.engine.audition_active(),
-            "key click auditions through the track: {}",
+            "key press holds a note through the track: {}",
+            app.status
+        );
+        frame(&mut app, &ctx, vec![btn_btn(kc, false)]);
+        assert!(
+            !app.backend.engine.audition_active(),
+            "key release ends the held note \u{2014} nothing sticks: {}",
             app.status
         );
 
@@ -23431,7 +23570,11 @@ mod tests {
         // Arm an audition voice directly (null audio: no RT drain, the
         // flag stays up) — the next frame MUST show STOP, not preview.
         let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
-        app.backend.engine.play_audition(0, ev.into());
+        // v46: `None` = v38 legacy LIVE route (the pin checks stop_all's
+        // purge, not which instance renders).
+        app.backend
+            .engine
+            .play_audition(0, ev.into(), None);
         assert!(app.backend.engine.audition_active());
         frame(&mut app, &ctx, vec![]);
         assert!(
@@ -26246,7 +26389,11 @@ mod tests {
         );
         // The audition pool retires on the same contract.
         let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
-        app.backend.engine.play_audition(0, ev.into());
+        // v46: `None` = the v38 legacy LIVE-route (these pins check pool
+        // retirement, not which instance renders).
+        app.backend
+            .engine
+            .play_audition(0, ev.into(), None);
         app.backend.engine.debug_mark_auditions_drained();
         app.logic(&ctx, &mut f);
         assert!(
