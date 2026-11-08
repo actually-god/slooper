@@ -121,17 +121,65 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
 }
 
 static PARAMS: [EffectParamV1; NPARAMS] = [
-    EffectParamV1 { label: c"char (0 A bass/1 B fat/2 C pres/3 D air)".as_ptr(), min: 0.0, max: 3.0, default: 2.0 },
+    EffectParamV1 { label: c"char".as_ptr(), min: 0.0, max: 3.0, default: 2.0 },
     EffectParamV1 { label: c"amount".as_ptr(), min: 0.0, max: 1.0, default: 0.6 },
     EffectParamV1 { label: c"air".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 1.5, default: 1.0 },
 ];
 
+// ---- ABI v4 (tier 6): mono graceful prefix + param metadata --------------
+// Metadata-only trip: the four characters render as a picker in the auto
+// window; process_sc/process_st are the documented mid-channel fallbacks.
+
+extern "C" fn process_sc(
+    state: *mut core::ffi::c_void,
+    input: f32,
+    params: *const f32,
+    _sc: f32,
+) -> f32 {
+    process(state, input, params)
+}
+
+extern "C" fn process_st(
+    state: *mut core::ffi::c_void,
+    l: f32,
+    r: f32,
+    params: *const f32,
+    _sc: f32,
+    out_r: *mut f32,
+) -> f32 {
+    let y = process(state, ((l + r) * 0.5) as f32, params);
+    unsafe { *out_r = y };
+    y
+}
+
+#[repr(C)]
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+// SAFETY: read-only statics of pointers to literals, shared one way.
+unsafe impl<const N: usize> Sync for Labels<N> {}
+
+static CHAR_LABELS: Labels<4> = Labels([
+    c"A bass".as_ptr(),
+    c"B fat".as_ptr(),
+    c"C presence".as_ptr(),
+    c"D air".as_ptr(),
+]);
+
+static META: [ParamMetaV1; NPARAMS] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: CHAR_LABELS.0.as_ptr(), n_labels: 4 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+];
+
+static DESC_TXT: &core::ffi::CStr =
+    c"One-knob enhancer: band-weighted saturation with four characters (A-D), parallel air exciter and soft glue. Turn it up, job done.";
+
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
     name: c"Goodizer".as_ptr(),
     author: c"slooper".as_ptr(),
-    description: c"One-knob enhancer: band-weighted saturation with four characters (A-D), parallel air exciter and soft glue. Turn it up, job done.".as_ptr(),
+    description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -139,7 +187,67 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     process,
 };
 
+pub static DESC2: EffectInfoV2 = EffectInfoV2 {
+    abi: SLOOPER_EFFECT_ABI_V2,
+    name: c"Goodizer".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+};
+
+pub static DESC3: EffectInfoV3 = EffectInfoV3 {
+    abi: SLOOPER_EFFECT_ABI_V3,
+    name: c"Goodizer".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+};
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"Goodizer".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+    // Mono by design: process_st above is the documented graceful fallback.
+    stereo: 0,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
+    &DESC2
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
+    &DESC3
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }

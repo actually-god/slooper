@@ -550,7 +550,7 @@ pub static GUI: EffectGuiV1 = EffectGuiV1 {
 };
 
 static PARAMS: [EffectParamV1; NPARAMS] = [
-    EffectParamV1 { label: c"mode (0shift 1corr 2tune)".as_ptr(), min: 0.0, max: 2.0, default: 0.0 },
+    EffectParamV1 { label: c"mode".as_ptr(), min: 0.0, max: 2.0, default: 0.0 },
     EffectParamV1 { label: c"semitones".as_ptr(), min: -24.0, max: 24.0, default: 0.0 },
     EffectParamV1 { label: c"fine cents".as_ptr(), min: -100.0, max: 100.0, default: 0.0 },
     EffectParamV1 { label: c"strength".as_ptr(), min: 0.0, max: 1.0, default: 0.7 },
@@ -605,6 +605,48 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     process_st,
 };
 
+// ---- ABI v4 (tier 6): param metadata (mode picker + engineering units) ---
+// True-stereo from tier 5b (declared here honestly); set_sync stays null.
+
+#[repr(C)]
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+// SAFETY: read-only statics of pointers to literals, shared one way.
+unsafe impl<const N: usize> Sync for Labels<N> {}
+
+static MODE_LABELS: Labels<3> =
+    Labels([c"shift".as_ptr(), c"correct".as_ptr(), c"tune".as_ptr()]);
+
+static META: [ParamMetaV1; NPARAMS] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: MODE_LABELS.0.as_ptr(), n_labels: 3 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_SEMITONES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+];
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"pitch shifter".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC3.description,
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+    stereo: 1,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
@@ -618,6 +660,11 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
     &DESC3
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }
 
 #[no_mangle]
