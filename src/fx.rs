@@ -30,9 +30,10 @@ mod api {
     include!("effect_api.rs");
 }
 pub use api::{
-    EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectInfoV3, EffectParamV1, GuiApiV1, GuiFrameV1,
-    SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2, SLOOPER_EFFECT_ABI_V3, SLOOPER_EFFECT_GUI_ABI,
-    SLOOPER_MAX_PARAMS,
+    EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectInfoV3, EffectInfoV4, EffectParamV1, GuiApiV1,
+    GuiFrameV1, ParamMetaV1, SyncInfoV1, SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2,
+    SLOOPER_EFFECT_ABI_V3, SLOOPER_EFFECT_ABI_V4, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
+    SLOOPER_SYNC_ABI, SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_MS,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
@@ -46,8 +47,50 @@ pub const ABI_VERSION: u32 = SLOOPER_EFFECT_ABI;
 pub const ABI_VERSION_V2: u32 = SLOOPER_EFFECT_ABI_V2;
 /// Tier-3 R: stereo-pair ABI generation this build also accepts.
 pub const ABI_VERSION_V3: u32 = SLOOPER_EFFECT_ABI_V3;
+/// Tier-6 R: transport-sync + param-metadata ABI generation.
+pub const ABI_VERSION_V4: u32 = SLOOPER_EFFECT_ABI_V4;
 /// Child-GUI ABI version this build speaks.
 pub const GUI_ABI_VERSION: u32 = SLOOPER_EFFECT_GUI_ABI;
+
+impl SyncInfoV1 {
+    /// Frozen pre-transport snapshot (the RT seed before the first block;
+    /// never pushed — it exists so `Proc` can own a plain value).
+    pub fn idle() -> Self {
+        Self {
+            abi: SLOOPER_SYNC_ABI,
+            playing: 0,
+            sample_rate: 0.0,
+            bpm: 0.0,
+            beats_per_bar: 4.0,
+            pos_samples: 0,
+            pos_beats: 0.0,
+        }
+    }
+    /// One block push. `pos_samples` is the block/pass start on the
+    /// timeline; beats derive from it exactly as documented in the ABI.
+    pub fn block(
+        pos_samples: i64,
+        playing: bool,
+        bpm: f64,
+        beats_per_bar: f64,
+        sample_rate: f64,
+    ) -> Self {
+        let pos_beats = if sample_rate > 0.0 && bpm > 0.0 && pos_samples >= 0 {
+            pos_samples as f64 * bpm / (60.0 * sample_rate)
+        } else {
+            0.0
+        };
+        Self {
+            abi: SLOOPER_SYNC_ABI,
+            playing: playing as u32,
+            sample_rate,
+            bpm,
+            beats_per_bar: beats_per_bar.max(1.0),
+            pos_samples: pos_samples.max(0),
+            pos_beats,
+        }
+    }
+}
 
 /// The generated shared-contract file every script includes.
 pub const API_FILE: &str = "effect_api.rs";
@@ -103,6 +146,8 @@ const ENTRY: &[u8] = b"slooper_effect_info\0";
 const ENTRY_V2: &[u8] = b"slooper_effect_info_v2\0";
 /// Tier-3: optional symbol exporting the stereo-pair-capable v3 vtable.
 const ENTRY_V3: &[u8] = b"slooper_effect_info_v3\0";
+/// Tier-6: optional symbol exporting the sync/metadata-capable v4 vtable.
+const ENTRY_V4: &[u8] = b"slooper_effect_info_v4\0";
 /// Optional symbol exporting the custom child-GUI vtable. Absent = the
 /// effect gets the auto slider window; the audio ABI does not care.
 const GUI_ENTRY: &[u8] = b"slooper_effect_gui\0";
@@ -728,6 +773,16 @@ pub struct ParamDesc {
     pub min: f32,
     pub max: f32,
     pub default: f32,
+    /// Tier-6 ABI v4: `SLOOPER_UNIT_*` display unit (0 for v1..v3 scripts
+    /// and for v4 params with no declared unit).
+    pub unit: u32,
+    /// Tier-6: > 0 → the auto window snaps to `min + k*step` (ignored
+    /// when `labels` is non-empty, which implies its own grid).
+    pub step: f32,
+    /// Tier-6: enum labels for equally spaced values min..max (empty =
+    /// plain slider). The auto window shows the current label instead of
+    /// a number.
+    pub labels: Vec<String>,
 }
 
 /// Safe copy of the effect description shown in the GUI.
@@ -774,6 +829,26 @@ struct EffectFns {
             out_r: *mut f32,
         ) -> f32,
     >,
+    /// Tier-6 ABI v4 block-rate transport push (None for v1..v3 scripts).
+    set_sync: Option<
+        extern "C" fn(state: *mut core::ffi::c_void, sync: *const SyncInfoV1),
+    >,
+    /// Tier-6 display metadata table (NULL for v1..v3 scripts). Borrows
+    /// the script's read-only image, which the leaked LibHandle keeps
+    /// mapped for the process lifetime.
+    param_meta: *const ParamMetaV1,
+}
+
+/// Safe typed view of one param's display metadata (tier 6). Produced by
+/// [`Instance::param_meta`]; `labels` borrows the script's read-only image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamMetaView<'a> {
+    /// `SLOOPER_UNIT_*` (0 = none / plain float).
+    pub unit: u32,
+    /// Non-zero: slider snaps to multiples of `step` (in raw units).
+    pub step: f32,
+    /// Non-empty: the param is an enumerated choice list.
+    pub labels: Vec<&'a str>,
 }
 
 /// Owning wrapper for a loaded library (raw handle inside ⇒ manual impls;
@@ -931,6 +1006,82 @@ impl Instance {
     #[inline]
     pub fn is_stereo(&self) -> bool {
         self.fns.process_st.is_some()
+    }
+
+    /// Tier-6: true when this script wants block-rate transport pushes
+    /// (ABI v4 with a `set_sync` export).
+    #[inline]
+    pub fn wants_sync(&self) -> bool {
+        self.fns.set_sync.is_some()
+    }
+
+    /// Tier-6: push the block-start transport snapshot. Call ONCE per
+    /// audio block per instance, BEFORE any process call of that block,
+    /// from the thread that owns the instance (RT for live chains, the
+    /// render thread for private offline copies). No-op for v1..v3
+    /// scripts. The sync pointer is read synchronously — a stack value
+    /// at the call site is fine.
+    #[inline]
+    pub fn push_sync(&self, sync: &SyncInfoV1) {
+        if let Some(f) = self.fns.set_sync {
+            f(self.state, sync as *const SyncInfoV1);
+        }
+    }
+
+    /// Display meta for param `k` (tier 6): unit enum, log flag, snap
+    /// step, and enum labels. An empty view (unit 0, no labels) means
+    /// the script declared no meta — plain linear rendering. Label
+    /// strings borrow script-owned statics and live exactly as long as
+    /// this instance.
+    pub fn param_meta(&self, k: usize) -> ParamMetaView<'_> {
+        let mut v = ParamMetaView { unit: 0, step: 0.0, labels: Vec::new() };
+        if self.fns.param_meta.is_null() || k >= self.n_params {
+            return v;
+        }
+        let m = unsafe { &*self.fns.param_meta.add(k) };
+        v.unit = m.unit;
+        v.step = m.step;
+        if !m.labels.is_null() && m.n_labels > 0 {
+            v.labels = (0..m.n_labels as usize)
+                .map(|i| unsafe {
+                    let p = *m.labels.add(i);
+                    if p.is_null() {
+                        ""
+                    } else {
+                        // SAFETY: label literals live in the script's
+                        // read-only image for the instance's whole life.
+                        std::ffi::CStr::from_ptr(p).to_str().unwrap_or("")
+                    }
+                })
+                .collect();
+        }
+        v
+    }
+
+    /// Display string for param `k` honouring meta: enums -> the chosen
+    /// label; declared units -> engineering value; plain -> 3 decimals.
+    /// Declared dB ranges are read as absolute dB (scripts map to gain
+    /// internally), Hz/ms ranges as physical values.
+    pub fn fmt_param(&self, k: usize, norm: f32, lo: f32, hi: f32) -> String {
+        let m = self.param_meta(k);
+        if !m.labels.is_empty() {
+            let t = ((norm - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0);
+            let i = (t * m.labels.len() as f32) as usize;
+            return m.labels[i.min(m.labels.len() - 1)].to_string();
+        }
+        let v = lo + norm * (hi - lo);
+        match m.unit {
+            SLOOPER_UNIT_HZ => {
+                if v >= 1000.0 {
+                    format!("{:.2} kHz", v / 1000.0)
+                } else {
+                    format!("{:.1} Hz", v)
+                }
+            }
+            SLOOPER_UNIT_DB => format!("{:.1} dB", v),
+            SLOOPER_UNIT_MS => format!("{:.1} ms", v),
+            _ => format!("{:.3}", v),
+        }
     }
 
     /// `call_sample_sc` for the stereo chain bus. v3 scripts receive the
@@ -1365,7 +1516,34 @@ unsafe fn validate(
     // Tier-3: v3 side symbol takes priority over v2 — same prefix rule.
     let mut process_sc = None;
     let mut process_st = None;
-    let d: &EffectInfoV1 = match lib.get(ENTRY_V3) {
+    // Tier-6: v4-only captures (defaults = "not a v4 script").
+    let mut set_sync = None;
+    let mut stereo_decl: Option<bool> = None;
+    let mut param_meta: *const ParamMetaV1 = std::ptr::null();
+    let d: &EffectInfoV1 = match lib.get(ENTRY_V4) {
+        Ok(s) => {
+            let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV4> = s;
+            let p = s();
+            if p.is_null() {
+                return Err("slooper_effect_info_v4 returned null".into());
+            }
+            let v4 = &*p;
+            if v4.abi != ABI_VERSION_V4 {
+                return Err(format!(
+                    "effect ABI v4 version {} (this slooper speaks v4 = {ABI_VERSION_V4})",
+                    v4.abi
+                ));
+            }
+            process_sc = Some(v4.process_sc);
+            process_st = Some(v4.process_st);
+            set_sync = v4.set_sync;
+            stereo_decl = Some(v4.stereo != 0);
+            param_meta = v4.param_meta;
+            std::mem::transmute::<*const EffectInfoV4, *const EffectInfoV1>(v4)
+                .as_ref()
+                .unwrap()
+        }
+        Err(_) => match lib.get(ENTRY_V3) {
         Ok(s) => {
             let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV3> = s;
             let p = s();
@@ -1423,6 +1601,7 @@ unsafe fn validate(
             d
             }
         }
+        }
     };
     let name = read_cstr(d.name).ok_or("effect has no name — DESC.name must be text")?;
     let author = d.author.cast_non_null().and_then(read_cstr);
@@ -1450,7 +1629,52 @@ unsafe fn validate(
             min,
             max,
             default: p.default.clamp(min, max),
+            unit: 0,
+            step: 0.0,
+            labels: Vec::new(),
         });
+    }
+    // Tier-6 ABI v4: per-param display metadata. Only v4 scripts get here
+    // with a non-null table; every entry rides the already-validated
+    // (label/min/max/default) param at the same index.
+    if !param_meta.is_null() {
+        if d.n_params == 0 {
+            return Err("param_meta table without any params".into());
+        }
+        if d.n_params as usize > params.len() {
+            return Err("param_meta table longer than the param list".into());
+        }
+        for (k, pd) in params.iter_mut().enumerate().take(d.n_params as usize) {
+            let m = unsafe { &*param_meta.add(k) };
+            pd.unit = m.unit;
+            if m.step.is_finite() && m.step > 0.0 {
+                pd.step = m.step;
+            }
+            if m.n_labels > 0 {
+                if m.n_labels > 32 {
+                    return Err(format!(
+                        "param {k} declares {} enum labels (max 32)",
+                        m.n_labels
+                    ));
+                }
+                if m.labels.is_null() {
+                    return Err(format!("param {k}: n_labels > 0 but labels is null"));
+                }
+                if m.n_labels > 1
+                    && pd.max.partial_cmp(&pd.min) != Some(core::cmp::Ordering::Greater)
+                {
+                    return Err(format!("enum param {k} needs max > min"));
+                }
+                let mut ls = Vec::with_capacity(m.n_labels as usize);
+                for i in 0..m.n_labels as usize {
+                    let lp = unsafe { *m.labels.add(i) };
+                    let s = read_cstr(lp)
+                        .ok_or_else(|| format!("param {k} label {i} is null or not UTF-8"))?;
+                    ls.push(s);
+                }
+                pd.labels = ls;
+            }
+        }
     }
     let gui = match lib.get(GUI_ENTRY) {
         Ok(gsym) => {
@@ -1485,7 +1709,10 @@ unsafe fn validate(
             // generation. v3 scripts that want the key signal read the
             // `sc` argument of process_st itself.
             sidechain: process_sc.is_some() && process_st.is_none(),
-            stereo: process_st.is_some(),
+            // Tier-6: a v4 script DECLARES its stereo-ness (its required
+            // process_st may be the documented mono fallback); v1..v3
+            // scripts keep the structural rule (process_st == real pair).
+            stereo: stereo_decl.unwrap_or(process_st.is_some()),
         },
         EffectFns {
             create: d.create,
@@ -1493,6 +1720,8 @@ unsafe fn validate(
             process: d.process,
             process_sc,
             process_st,
+            set_sync,
+            param_meta,
         },
         gui,
     ))
@@ -2514,12 +2743,18 @@ mod tests {
                     min: 0.0,
                     max: 1.0,
                     default: 0.25,
+                    unit: 0,
+                    step: 0.0,
+                    labels: vec![],
                 },
                 ParamDesc {
                     label: "b".into(),
                     min: 0.0,
                     max: 2.0,
                     default: 1.0,
+                    unit: 0,
+                    step: 0.0,
+                    labels: vec![],
                 },
             ],
             sidechain: false,
@@ -3907,8 +4142,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             assert!(d.stereo, "{stem}: must load as an ABI-v3 stereo script");
             assert!(!d.sidechain, "{stem}: sidechain flag is exact-v2-only");
             assert!(
-                d.params.last().unwrap().label.starts_with("spread"),
-                "{stem}: last param is spread"
+                d.params[sidx].label.starts_with("spread"),
+                "{stem}: param {sidx} is spread"
             );
             let mut dp = defp(stem);
             if tweak != 0.0 {
@@ -4101,12 +4336,35 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         freeze!("shifter", [
             "shift Hz" => 240.0, "feedback" => 0.0, "mix" => 1.0, "out" => 1.0
         ], "spread");
-        freeze!("gater", [
-            "rate Hz" => 2.0,
-            "shape (0 sine/1 tri/2 pulse/3 pluck/4 rnd)" => 2.0,
-            "width/decay" => 0.5, "smooth ms" => 4.0, "phase" => 0.0,
-            "mix" => 1.0, "out" => 1.0
-        ], "spread");
+        // gater went tier-6 after tier-5b: the shape label's "(0 sine/…)"
+        // hint moved into META (an enum picker renders it), and `host` was
+        // appended after spread. The freeze below pins that every RANGE and
+        // DEFAULT of params 0..7 survived untouched — only that one label's
+        // text changed, plus the new trailing param.
+        {
+            let d = reg.desc("gater").expect("gater desc");
+            let want: &[(&str, f32)] = &[
+                ("rate", 2.0),
+                ("shape", 2.0),
+                ("width/decay", 0.5),
+                ("smooth ms", 4.0),
+                ("phase", 0.0),
+                ("mix", 1.0),
+                ("out", 1.0),
+                ("spread (R lane offset x180deg)", 0.5),
+                ("host", 0.0),
+            ];
+            assert_eq!(d.params.len(), want.len(), "gater: 9 params after host append");
+            for (k, (lab, def)) in want.iter().enumerate() {
+                assert_eq!(&d.params[k].label, lab, "gater: param {k} label changed");
+                assert!(
+                    (d.params[k].default - def).abs() < 1e-6,
+                    "gater: param {k} default changed"
+                );
+            }
+            assert!(d.stereo, "gater: still an ABI-v4 stereo script");
+            assert!(!d.sidechain, "gater: sidechain flag is exact-v2-only");
+        }
         freeze!("vocoder", [
             "attack ms" => 5.0, "release ms" => 60.0, "peakiness" => 1.3,
             "freq low" => 220.0, "freq high" => 7500.0, "brightness" => 0.0,
@@ -4117,6 +4375,111 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             "strength" => 0.7, "slew ms" => 15.0, "tone" => 0.8, "wet" => 1.0,
             "gain" => 1.0, "ref Hz" => 440.0, "gate dB" => -55.0
         ], "spread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FL Suite tier 6 CAPABILITY PIN (docs/FL-SUITE.md: param metadata +
+    /// host sync): v4 param meta surfaces host-side as enum pickers and
+    /// engineering units, and `host = song` locks a script's wheel to the
+    /// transport push — sample-exact against BPM, jumping on seeks, held
+    /// while paused, and self-advancing between pushes (block-size
+    /// agnostic), with free mode left bit-identical for old sessions.
+    #[test]
+    fn tier6_param_metadata_and_host_sync() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("t6sync");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+
+        // ---- meta surfaces host-side ------------------------------------
+        let g = reg.create_instance("gater", 48000.0, &[]).expect("gater inst");
+        assert_eq!(g.param_meta(1).labels, vec!["sine", "tri", "pulse", "pluck", "rnd"]);
+        assert_eq!(g.param_meta(8).labels, vec!["free", "song"]);
+        assert_eq!(g.param_meta(0).unit, SLOOPER_UNIT_HZ);
+        assert_eq!(g.param_meta(3).unit, SLOOPER_UNIT_MS);
+        let plain = g.param_meta(5); // mix: declared plain
+        assert_eq!((plain.unit, plain.labels.len(), plain.step), (0, 0, 0.0));
+        let d = reg.desc("gater").unwrap();
+        let (lo, hi) = (d.params[0].min, d.params[0].max);
+        let hz = lo + 0.5 * (hi - lo);
+        let want = if hz >= 1000.0 {
+            format!("{:.2} kHz", hz / 1000.0)
+        } else {
+            format!("{:.1} Hz", hz)
+        };
+        assert_eq!(g.fmt_param(0, 0.5, lo, hi), want, "Hz unit formats");
+        assert_eq!(g.fmt_param(8, 0.0, 0.0, 1.0), "free");
+        assert_eq!(g.fmt_param(8, 1.0, 0.0, 1.0), "song");
+        drop(g);
+        let o = reg.create_instance("overdrive", 48000.0, &[]).expect("drive inst");
+        assert_eq!(o.param_meta(1).labels, vec!["soft sat", "hard clip", "fold", "silky"]);
+        drop(o);
+        let od = reg.desc("overdrive").unwrap();
+        assert!(!od.stereo, "v4 declared-mono flag must stick");
+        assert!(!od.sidechain, "graceful process_sc must not read as sidechain");
+        assert!(reg.desc("panmatic").unwrap().stereo, "panmatic declares true stereo");
+
+        // ---- host = song locks the wheel ----------------------------------
+        let sr = 48000.0f64;
+        let bpm = 120.0f64;
+        let inst = reg.create_instance("gater", sr, &[]).expect("sync inst");
+        let mut dp = [0.0f32; MAX_PARAMS];
+        for (k, pd) in reg.desc("gater").unwrap().params.iter().enumerate() {
+            dp[k] = pd.default;
+        }
+        dp[0] = 0.5; // song mode: 0.5 cycles per beat = one 1 s period @120
+        dp[1] = 2.0; // pulse
+        dp[2] = 0.5; // duty
+        dp[3] = 0.1; // nearly hard edges
+        dp[8] = 1.0; // HOST = SONG
+        let push = |inst: &Instance, from_beats: f64, playing: bool| {
+            let pos = (from_beats * sr * 60.0 / bpm) as i64;
+            inst.push_sync(&SyncInfoV1::block(pos, playing, bpm, 4.0, sr));
+        };
+        let feed = |inst: &Instance, n: usize, p: &[f32; MAX_PARAMS]| -> Vec<f32> {
+            (0..n).map(|_| unsafe { inst.call_sample_st(1.0, 1.0, p, 0.0).0 }).collect()
+        };
+        let peak = |y: &[f32]| -> f32 { y.iter().fold(0.0f32, |m, v| m.max(*v)) };
+
+        // One full period in a single push: open for the first half-beat-
+        // second, closed for the second (self-advance inside the block).
+        push(&inst, 0.0, true);
+        let y = feed(&inst, 48000, &dp);
+        assert!(peak(&y[500..5000]) > 0.9, "song gate never opened ({})", peak(&y[500..5000]));
+        assert!(peak(&y[30000..40000]) < 0.05, "song gate never closed ({})", peak(&y[30000..40000]));
+
+        // Seek: push a pos inside the closed half → closed immediately.
+        push(&inst, 1.0, true); // beat 1 = phase 0.5 = closed edge
+        let y = feed(&inst, 2000, &dp);
+        assert!(peak(&y) < 0.05, "seek to beat 1 did not jump the phase ({})", peak(&y));
+
+        // Paused: phase held at beat 0.25 (open) — output stays open.
+        push(&inst, 0.25, false);
+        let y = feed(&inst, 2000, &dp);
+        assert!(peak(&y[1000..]) > 0.9, "paused push did not hold the open phase");
+
+        // Block-size agnostic: 1000-sample pushes along the same timeline
+        // reproduce the open half / closed half split.
+        push(&inst, 0.0, true);
+        let mut split = Vec::with_capacity(48000);
+        for b in 0..48 {
+            split.extend(feed(&inst, 1000, &dp));
+            push(&inst, (b + 1) as f64 * (1000.0 * bpm / (60.0 * sr)), true);
+        }
+        assert!(peak(&split[500..20000]) > 0.9, "split run lost the open half");
+        assert!(peak(&split[30000..47000]) < 0.05, "split run never closed ({})", peak(&split[30000..47000]));
+
+        // Free mode default: the very same instance ignores sync pushes.
+        dp[8] = 0.0;
+        push(&inst, 0.0, true);
+        let free = feed(&inst, 48000, &dp);
+        assert!(peak(&free) > 0.9, "free mode must still gate normally");
+        drop(inst);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

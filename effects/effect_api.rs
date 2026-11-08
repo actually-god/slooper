@@ -250,6 +250,146 @@ pub struct EffectInfoV3 {
 }
 
 // ---------------------------------------------------------------------------
+// ABI v4: transport sync + param display metadata
+// ---------------------------------------------------------------------------
+// A v4 effect is a v3 effect that ALSO receives transport/song position
+// pushes and (optionally) publishes display metadata for its sliders.
+// Export a fourth entry point beside the other three:
+//
+//     #[no_mangle]
+//     pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 { &DESC4 }
+//
+// The loader tries v4 first, then v3, v2, v1 — existing scripts never
+// change. The v4 prefix is bit-identical to v3, so a v3 host still reads
+// a v4 struct as a valid v3 one. Because the v3 prefix is REQUIRED, every
+// v4 script implements all four entry points — a script that wants ONLY
+// the metadata (no real stereo processing) implements `process_st` as the
+// documented mono graceful fallback (process the mid, return it for both
+// sides) and sets the appended `stereo` flag to 0.
+//
+// Transport sync (the Scratcher/Gross-Beat-class capability):
+//   * When `set_sync` is non-null the host calls it ONCE PER AUDIO BLOCK,
+//     on the audio thread, before any `process`/`process_st` sample call
+//     of that block, with a `SyncInfoV1` describing the block start.
+//     Offline renders and preview bounces push it once per chain pass
+//     with `playing = 1` and the pass's window origin as `pos_samples`.
+//   * The push marks the block START only. Between pushes, a tempo-synced
+//     script advances its own phase SAMPLE-EXACTLY:
+//         beats_per_sample = bpm / (60.0 * sample_rate)
+//     — at `set_sync` store `self.beats = s.pos_beats; self.in_block = 0`,
+//     in process: `let b = self.beats + self.in_block as f64 * bps;
+//     self.in_block += 1;`. Block sizes run ~1 ms (RT) to seconds
+//     (offline passes), and the self-advance keeps every scheduling
+//     sample-exact across the whole pass.
+//   * `playing == 0` means the transport is stopped: freeze your phase
+//     (do NOT self-advance), and re-anchor whenever a push arrives.
+//     Positions are timeline samples from project origin; a loop wrap or
+//     seek shows up as a jump in `pos_samples` on the next push.
+//
+// Param metadata: `param_meta` points at `n_params` `ParamMetaV1`
+// entries (null = none, everything default). It changes ONLY how the
+// host's AUTO slider window looks and snaps; scripted GUIs draw whatever
+// they like, and `process` must still quantize mode params itself (the
+// labels mirror the quantization, they do not create it).
+pub const SLOOPER_EFFECT_ABI_V4: u32 = 4;
+
+/// `SyncInfoV1::abi` value (versioned independently of the effect ABI).
+pub const SLOOPER_SYNC_ABI: u32 = 1;
+
+/// One transport/song position push. Plain data; valid only for the
+/// duration of the `set_sync` call — COPY what you need into your state.
+#[repr(C)]
+pub struct SyncInfoV1 {
+    /// Must be [`SLOOPER_SYNC_ABI`].
+    pub abi: u32,
+    /// 1 = the transport is running for this block; 0 = stopped (the
+    /// host still pushes when stopped/seeking, so you can re-anchor).
+    pub playing: u32,
+    /// Engine sample rate in Hz (0.0 only before the backend is up).
+    pub sample_rate: f64,
+    /// Project tempo in BPM (the metro/automation tempo — automation
+    /// tempo clips change it live).
+    pub bpm: f64,
+    /// Time-signature numerator (beats per bar, default 4).
+    pub beats_per_bar: f64,
+    /// Timeline position of THIS BLOCK'S FIRST SAMPLE, samples from
+    /// project origin (never negative).
+    pub pos_samples: i64,
+    /// Same position in musical beats: pos_samples * bpm / (60 * sr).
+    pub pos_beats: f64,
+}
+
+// `SyncInfoV1` unit conventions for `ParamMetaV1::unit`.
+pub const SLOOPER_UNIT_NONE: u32 = 0;
+pub const SLOOPER_UNIT_PERCENT: u32 = 1;
+pub const SLOOPER_UNIT_DB: u32 = 2;
+pub const SLOOPER_UNIT_HZ: u32 = 3;
+pub const SLOOPER_UNIT_MS: u32 = 4;
+pub const SLOOPER_UNIT_SEMITONES: u32 = 5;
+pub const SLOOPER_UNIT_BEATS: u32 = 6;
+pub const SLOOPER_UNIT_TIMES: u32 = 7; // multiplier, rendered "1.50x"
+pub const SLOOPER_UNIT_SAMPLES: u32 = 8;
+pub const SLOOPER_UNIT_SECONDS: u32 = 9;
+
+/// Display metadata for ONE slider (the auto window only).
+#[repr(C)]
+pub struct ParamMetaV1 {
+    /// One of the `SLOOPER_UNIT_*` constants (0 = plain number).
+    pub unit: u32,
+    /// Reserved, write 0.
+    pub flags: u32,
+    /// Non-zero: the auto window snaps the slider to `min + k*step` and
+    /// scripts MUST quantize identically inside `process`, since an auto
+    /// window can never be the only quantizer.
+    pub step: f32,
+    /// Enum labels, or null. With `n_labels = N >= 1` the param is an
+    /// enum of N equally spaced values across [min, max] (N = 1 or
+    /// min == max pins one value); label `i` names value
+    /// `min + i*(max-min)/(N-1)`. The auto window draws a picker and
+    /// shows the label instead of a number.
+    pub labels: *const *const core::ffi::c_char,
+    /// Number of valid entries in `labels` (max 32).
+    pub n_labels: u32,
+}
+
+/// A v3 layout with the sync/metadata entries appended (prefix
+/// bit-identical to [`EffectInfoV3`]).
+#[repr(C)]
+pub struct EffectInfoV4 {
+    /// Must be [`SLOOPER_EFFECT_ABI_V4`].
+    pub abi: u32,
+    pub name: *const core::ffi::c_char,
+    pub author: *const core::ffi::c_char,
+    pub description: *const core::ffi::c_char,
+    pub n_params: u32,
+    pub params: *const EffectParamV1,
+    pub create: extern "C" fn(sample_rate: f64) -> *mut core::ffi::c_void,
+    pub destroy: extern "C" fn(state: *mut core::ffi::c_void),
+    pub process:
+        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32,
+    pub process_sc:
+        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32,
+    pub process_st: extern "C" fn(
+        state: *mut core::ffi::c_void,
+        l: f32,
+        r: f32,
+        params: *const f32,
+        sc: f32,
+        out_r: *mut f32,
+    ) -> f32,
+    /// 1 = `process_st` really processes the pair (the mixer/UI shows
+    /// the (ST) tag, the bundle gate checks decorrelation); 0 = the mono
+    /// graceful fallback (no tag — do not claim stereo you do not do).
+    pub stereo: u32,
+    /// Block-rate transport push, called on the audio thread BEFORE any
+    /// sample call of the block (null = no sync; metadata-only v4 is a
+    /// legal effect). See the v4 header for the self-advance contract.
+    pub set_sync: Option<extern "C" fn(state: *mut core::ffi::c_void, sync: *const SyncInfoV1)>,
+    /// Per-param display metadata, `n_params` entries, or null.
+    pub param_meta: *const ParamMetaV1,
+}
+
+// ---------------------------------------------------------------------------
 // OPTIONAL: the child GUI (editor window) contract
 // ---------------------------------------------------------------------------
 // By default slooper gives every effect a child window with one slider
@@ -427,6 +567,22 @@ pub struct EffectGuiV1 {
     pub destroy: extern "C" fn(gs: *mut core::ffi::c_void),
 }
 
+// Compile-time prefix proof (this file is compiled into BOTH the host and
+// every script — the offsets below are enforced on both sides, so a layout
+// drift in any generation is a compile error, never a silent misread).
+const _: () = assert!(core::mem::offset_of!(EffectInfoV2, process_sc) > core::mem::offset_of!(EffectInfoV2, process));
+const _: () = assert!(core::mem::offset_of!(EffectInfoV3, process_st) > core::mem::offset_of!(EffectInfoV3, process_sc));
+const _: () = assert!(core::mem::size_of::<EffectInfoV2>()
+    == core::mem::offset_of!(EffectInfoV3, process_st));
+const _: () = assert!(core::mem::offset_of!(EffectInfoV4, process_st)
+    == core::mem::offset_of!(EffectInfoV3, process_st));
+const _: () = assert!(core::mem::offset_of!(EffectInfoV4, stereo)
+    == core::mem::size_of::<EffectInfoV3>());
+const _: () = assert!(core::mem::offset_of!(EffectInfoV4, set_sync)
+    == core::mem::offset_of!(EffectInfoV4, stereo) + 8);
+const _: () = assert!(core::mem::offset_of!(EffectInfoV4, param_meta)
+    == core::mem::offset_of!(EffectInfoV4, set_sync) + 8);
+
 // The description blocks live in read-only statics and are only ever shared
 // one way (effect -> loader); nothing in Rust mutates them after the library
 // is loaded, so cross-thread sharing is exactly the contract.
@@ -434,5 +590,8 @@ unsafe impl Sync for EffectParamV1 {}
 unsafe impl Sync for EffectInfoV1 {}
 unsafe impl Sync for EffectInfoV2 {}
 unsafe impl Sync for EffectInfoV3 {}
+unsafe impl Sync for EffectInfoV4 {}
+unsafe impl Sync for SyncInfoV1 {}
+unsafe impl Sync for ParamMetaV1 {}
 unsafe impl Sync for GuiApiV1 {}
 unsafe impl Sync for EffectGuiV1 {}

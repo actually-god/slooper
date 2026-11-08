@@ -149,23 +149,78 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
 }
 
 static PARAMS: [EffectParamV1; NPARAMS] = [
-    EffectParamV1 { label: c"mode (0 LP/1 BP/2 HP/3 notch)".as_ptr(), min: 0.0, max: 3.0, default: 0.0 },
+    EffectParamV1 { label: c"mode".as_ptr(), min: 0.0, max: 3.0, default: 0.0 },
     EffectParamV1 { label: c"cutoff".as_ptr(), min: 20.0, max: 18000.0, default: 4000.0 },
     EffectParamV1 { label: c"resonance".as_ptr(), min: 0.0, max: 1.0, default: 0.35 },
     EffectParamV1 { label: c"env (auto-wah)".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
     EffectParamV1 { label: c"attack ms".as_ptr(), min: 0.1, max: 30.0, default: 1.0 },
     EffectParamV1 { label: c"release ms".as_ptr(), min: 5.0, max: 600.0, default: 120.0 },
     EffectParamV1 { label: c"drive".as_ptr(), min: 1.0, max: 8.0, default: 1.0 },
-    EffectParamV1 { label: c"slope (0=12/1=24)".as_ptr(), min: 0.0, max: 1.0, default: 1.0 },
+    EffectParamV1 { label: c"slope".as_ptr(), min: 0.0, max: 1.0, default: 1.0 },
     EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 1.0 },
     EffectParamV1 { label: c"out".as_ptr(), min: 0.0, max: 2.0, default: 0.9 },
 ];
+
+// ---- ABI v4 (tier 6): mono graceful prefix + param metadata --------------
+// The SVF is per-mid by nature; the v4 upgrade is metadata only (mode and
+// slope render as pickers, cutoff/envelope times get units).
+
+extern "C" fn process_sc(
+    state: *mut core::ffi::c_void,
+    input: f32,
+    params: *const f32,
+    _sc: f32,
+) -> f32 {
+    process(state, input, params)
+}
+
+extern "C" fn process_st(
+    state: *mut core::ffi::c_void,
+    l: f32,
+    r: f32,
+    params: *const f32,
+    _sc: f32,
+    out_r: *mut f32,
+) -> f32 {
+    let y = process(state, ((l + r) * 0.5) as f32, params);
+    unsafe { *out_r = y };
+    y
+}
+
+#[repr(C)]
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+// SAFETY: read-only statics of pointers to literals, shared one way.
+unsafe impl<const N: usize> Sync for Labels<N> {}
+
+static MODE_LABELS: Labels<4> = Labels([
+    c"low pass".as_ptr(),
+    c"band pass".as_ptr(),
+    c"high pass".as_ptr(),
+    c"notch".as_ptr(),
+]);
+static SLOPE_LABELS: Labels<2> = Labels([c"12 dB/oct".as_ptr(), c"24 dB/oct".as_ptr()]);
+
+static META: [ParamMetaV1; NPARAMS] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: MODE_LABELS.0.as_ptr(), n_labels: 4 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: SLOPE_LABELS.0.as_ptr(), n_labels: 2 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+];
+
+static DESC_TXT: &core::ffi::CStr =
+    c"State-variable resonant filter: LP/BP/HP/notch, 12 or 24 dB/oct, drive, and an envelope follower for auto-wah. The Fruity Filter / Wah role.";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
     name: c"Filter".as_ptr(),
     author: c"slooper".as_ptr(),
-    description: c"State-variable resonant filter: LP/BP/HP/notch, 12 or 24 dB/oct, drive, and an envelope follower for auto-wah. The Fruity Filter / Wah role.".as_ptr(),
+    description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -173,7 +228,67 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     process,
 };
 
+pub static DESC2: EffectInfoV2 = EffectInfoV2 {
+    abi: SLOOPER_EFFECT_ABI_V2,
+    name: c"Filter".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+};
+
+pub static DESC3: EffectInfoV3 = EffectInfoV3 {
+    abi: SLOOPER_EFFECT_ABI_V3,
+    name: c"Filter".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+};
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"Filter".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+    // Mono by design: process_st above is the documented graceful fallback.
+    stereo: 0,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
+    &DESC2
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
+    &DESC3
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }

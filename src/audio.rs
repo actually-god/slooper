@@ -1854,6 +1854,12 @@ impl Engine {
                             trk[k] += x * tamp;
                         }
                     } else if let Some(fx) = scripted_chain(&chain) {
+                        // Tier-6: fresh private instances, buffer starts
+                        // at timeline 0 — one push covers the whole pass.
+                        let sync = offline_sync(self, sr, 0);
+                        for f in &fx {
+                            f.push_sync(&sync);
+                        }
                         let sbuf: Vec<f32> = buf
                             .into_iter()
                             .take(out.len())
@@ -1921,6 +1927,15 @@ impl Engine {
                     // range. Past the source is silence, per the
                     // documented rule.
                     let dend = dend.max(dstart as u64) as usize;
+                    // Tier-6: per-clip private chain is anchored at the
+                    // clip's timeline start (self-advancing scripts stay
+                    // sample-exact across the whole clip).
+                    if let Some(fx) = &fx {
+                        let sync = offline_sync(self, sr, dstart as i64);
+                        for f in fx {
+                            f.push_sync(&sync);
+                        }
+                    }
                     for k in dstart..dend {
                         any = true;
                         let s = data[(cl.cut + (k as u64 - cl.data_start())) as usize];
@@ -1936,7 +1951,7 @@ impl Engine {
             if span {
                 // Full chain over the whole track span (fresh copies: the
                 // live chain is never advanced by an export).
-                run_chain_over(&chain, sr, &mut trk);
+                run_chain_over(&chain, sr, &mut trk, &offline_sync(self, sr, 0));
                 for (k, s) in trk.into_iter().enumerate() {
                     out[k] += s * pdown;
                 }
@@ -1972,7 +1987,7 @@ impl Engine {
             }
         }
         let chain = self.fx.lock().unwrap()[t].clone();
-        run_chain_over(&chain, sr, &mut buf);
+        run_chain_over(&chain, sr, &mut buf, &offline_sync(self, sr, 0));
         Some(buf)
     }
 
@@ -2030,12 +2045,19 @@ impl Engine {
                     let mut buf = vec![0.0f32; len];
                     render_midi_any(&h, &mut ev, from, len, &mut buf, sr);
                     if span {
-                        run_chain_over(&chain, sr, &mut buf);
+                        run_chain_over(&chain, sr, &mut buf, &offline_sync(self, sr, from as i64));
                         for (k, s2) in buf.into_iter().enumerate() {
                             out[k] += s2 * tamp * pdown;
                         }
                     } else {
                         let fx = scripted_chain(&chain);
+                        // Tier-6: selection window origin is `from`.
+                        if let Some(fx) = &fx {
+                            let sync = offline_sync(self, sr, from as i64);
+                            for f in fx {
+                                f.push_sync(&sync);
+                            }
+                        }
                         let mut sbuf: Vec<f32> = buf
                             .into_iter()
                             .map(|x| {
@@ -2074,6 +2096,13 @@ impl Engine {
             // render_tracks; the selection window slices the output.
             let dstart = cl.data_start() as usize;
             let dend = cl.data_end(alen_u).min(cl.end(alen_u)) as usize;
+            // Tier-6: this chunk sits at timeline `dstart`.
+            if let Some(fx) = &fx {
+                let sync = offline_sync(self, sr, dstart as i64);
+                for f in fx {
+                    f.push_sync(&sync);
+                }
+            }
             let mut chunk: Vec<f32> = (dstart..dend)
                 .map(|k| data[(cl.cut + (k as u64 - cl.data_start())) as usize])
                 .enumerate()
@@ -2082,7 +2111,7 @@ impl Engine {
             if span {
                 // Fresh full-chain pass over this chunk (selection bounces
                 // stay clip-local, mirroring the scripted per-clip rule).
-                run_chain_over(&chain, sr, &mut chunk);
+                run_chain_over(&chain, sr, &mut chunk, &offline_sync(self, sr, dstart as i64));
             }
             for (j, k) in (dstart..dend).enumerate() {
                 if k >= from as usize {
@@ -2263,6 +2292,8 @@ fn run(
         sample_no: 0,
         fx_cache: engine.fx_table(),
         fx_cache_gen: engine.fx_gen(),
+        sync: crate::fx::SyncInfoV1::idle(),
+        sync_gen: 0,
         // Seed from the engine's current chains: a launch that restores
         // chains from config never bumps fx_gen, so waiting for a refresh
         // here left an empty grid beside a non-empty cache → RT panic.
@@ -3001,14 +3032,31 @@ fn scripted_chain(chain: &TrackFx) -> Option<Vec<Arc<crate::fx::Instance>>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Tier-6: sync snapshot for an offline chain pass — a render pass counts
+/// as "transport running"; `pos0` is where `buf[0]` sits on the timeline
+/// (per-clip passes are fed the clip's own start, whole-project renders 0).
+/// Scripts self-advance between pushes, so one push covers the whole pass.
+fn offline_sync(engine: &Engine, sr: u32, pos0: i64) -> crate::fx::SyncInfoV1 {
+    crate::fx::SyncInfoV1::block(
+        pos0,
+        true,
+        engine.metro_bpm.load(Ordering::Relaxed) as f64,
+        engine.metro_num.load(Ordering::Relaxed).max(1) as f64,
+        sr.max(1) as f64,
+    )
+}
+
 /// Run the whole chain (scripted + plugins, in order) over a full render
 /// buffer using fresh private copies. Plugin slots consume the buffer
 /// block-wise; scripted slots run sample-wise like the live path.
-fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32]) {
+fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32], sync: &crate::fx::SyncInfoV1) {
     for slot in chain.slots() {
         match &slot.kind {
             FxKind::Scripted { inst, desc } => {
                 if let Some(f) = inst.spawn_fresh(desc) {
+                    // Tier-6: fresh private copy gets the pass's sync
+                    // origin before its first sample (no-op for v1..v3).
+                    f.push_sync(sync);
                     // Tier-3: offline renders are mono — a v3 stereo slot
                     // is fed (mid, mid) and keeps its LEFT output (the
                     // documented fold, see effect_api.rs ABI v3).
@@ -4308,6 +4356,13 @@ struct Proc {
     /// moves (rare, user-driven — the only allocation left on this thread).
     fx_cache: Arc<[TrackFx; MAX_LOOPS]>,
     fx_cache_gen: u64,
+    /// Tier-6 ABI v4: block-start transport snapshot (refreshed once per
+    /// RT block after the automation pass — the automation tempo rides
+    /// `metro_bpm`, so read it AFTER that pass baked the value in).
+    sync: crate::fx::SyncInfoV1,
+    /// Bumped on every `sync` refresh; per-slot `sync_seen` lags it, so
+    /// each scripted instance gets exactly one push per block, lazily.
+    sync_gen: u64,
     /// Per-track, per-slot cached slider snapshots (+ the instance
     /// generation they were read at), refreshed per block on change.
     fx_rt: Vec<Vec<FxRt>>,
@@ -4480,6 +4535,9 @@ struct Proc {
 struct FxRt {
     gen: u64,
     p: [f32; crate::fx::MAX_PARAMS],
+    /// Tier-6: `Proc.sync_gen` this slot last received a block-sync push
+    /// at (ABI v4 scripts are fed once per block, lazily, on first use).
+    sync_seen: u64,
 }
 
 /// Build the per-slot RT slider grid matching `table` (one row per track,
@@ -4495,6 +4553,7 @@ fn seed_fx_rt(table: &[TrackFx]) -> Vec<Vec<FxRt>> {
                 .map(|_| FxRt {
                     gen: 0,
                     p: [0.0; crate::fx::MAX_PARAMS],
+                    sync_seen: 0,
                 })
                 .collect()
         })
@@ -4502,6 +4561,24 @@ fn seed_fx_rt(table: &[TrackFx]) -> Vec<Vec<FxRt>> {
 }
 
 impl Proc {
+    /// Tier-6 ABI v4: refresh the block-start transport snapshot and bump
+    /// the lazy-push generation. Called ONCE per RT block, AFTER the
+    /// automation pass (automation tempo lands in `metro_bpm` there).
+    /// Scripts get their push on first use of the block (`sync_seen` vs
+    /// `sync_gen`), so tracks that stay silent cost nothing.
+    fn refresh_sync(&mut self, p0: u64, playing: bool) {
+        let bpm = self.engine.metro_bpm.load(Ordering::Relaxed) as f64;
+        let bpb = self.engine.metro_num.load(Ordering::Relaxed).max(1) as f64;
+        self.sync = crate::fx::SyncInfoV1::block(
+            p0 as i64,
+            playing,
+            bpm,
+            bpb,
+            self.sr.max(1) as f64,
+        );
+        self.sync_gen = self.sync_gen.wrapping_add(1);
+    }
+
     /// Run one track-output sample through the track's effect chain (the
     /// volume x gain trim has already been multiplied into `x`). Only for
     /// scripted-only chains; plugin chains go through `run_chain_block`.
@@ -4512,6 +4589,7 @@ impl Proc {
             return (x, x);
         }
         let mut pair = (x, x);
+        let sg = self.sync_gen;
         for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
             let FxKind::Scripted { inst, .. } = &slot.kind else {
                 continue;
@@ -4520,6 +4598,10 @@ impl Proc {
             if g != rt.gen {
                 inst.read_params(&mut rt.p);
                 rt.gen = g;
+            }
+            if rt.sync_seen != sg {
+                inst.push_sync(&self.sync);
+                rt.sync_seen = sg;
             }
             // SAFETY: the live chain is advanced by this thread only, and
             // `rt.p` holds the instance's current slider snapshot.
@@ -4539,7 +4621,7 @@ impl Proc {
     fn run_chain_block(&mut self, t: usize, buf: &mut [f32], buf2: &mut [f32], tmp: &mut [f32], sc: &[f32]) {
         let n = buf.len().min(tmp.len()).min(buf2.len());
         let Self {
-            fx_cache, fx_rt, ..
+            fx_cache, fx_rt, sync, sync_gen, ..
         } = self;
         for (k, slot) in fx_cache[t].slots().iter().enumerate() {
             match &slot.kind {
@@ -4549,6 +4631,12 @@ impl Proc {
                     if g != rt.gen {
                         inst.read_params(&mut rt.p);
                         rt.gen = g;
+                    }
+                    // Tier-6: once-per-block transport push (this whole
+                    // call is one block).
+                    if rt.sync_seen != *sync_gen {
+                        inst.push_sync(sync);
+                        rt.sync_seen = *sync_gen;
                     }
                     // SAFETY: audio thread owns the live chain (as fx_mix).
                     for j in 0..n {
@@ -5410,6 +5498,10 @@ impl ProcessHandler for Proc {
                 self.gain.store(mv.max(0.0).to_bits(), Ordering::Relaxed);
             }
         }
+        // Tier-6 ABI v4: refresh the scripted sync clock AFTER the
+        // automation pass, so automation tempo rides this block's push.
+        // Runs even while stopped — a seek must re-anchor the position.
+        self.refresh_sync(p0, transport);
         let auto = self.auto_last;
         // v34 R11: publish the live automation values for the GUI.
         for t in 0..MAX_LOOPS {
