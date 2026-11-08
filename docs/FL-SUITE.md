@@ -27,9 +27,9 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | (tremolo starter) | amplitude LFO | `template.rs` | done |
 | Fruity Blood Overdrive, Fruity Fast Dist, Fruity Soft Clipper, legacy Overdrive | analog-ish drive / clipper family | `overdrive.rs` | done (tier-6: ABI-v4 metadata — curve picker, graceful mono prefix) |
 | Fruity WaveShaper, Hardcore (per-stage shaping), LSD | draw-a-curve distortion | `waveshaper.rs` | done (draggable curve GUI) |
-| Soundgoodizer, Emphasizer, Low Lifter, part of Maximus | one-knob enhancer / presence | `goodizer.rs` | done |
+| Soundgoodizer, Emphasizer, Low Lifter, part of Maximus | one-knob enhancer / presence | `goodizer.rs` | done (tier-6: ABI-v4 metadata — A–D character picker) |
 | Fruity Squeeze | bitcrush / downsample | `crush.rs` | done |
-| Fruity Limiter, Emphasis, (legacy) Soft Limiter, noise gate | comp/limiter/gate, ceiling | `limiter.rs` | done |
+| Fruity Limiter, Emphasis, (legacy) Soft Limiter, noise gate | comp/limiter/gate, ceiling | `limiter.rs` | done (tier-6: ABI-v4 metadata — mode picker, dB/times/ms units) |
 | Maximus, Fruity Multiband Compressor | 3-band split dynamics | `multiband.rs` | done |
 | Fruity Filter, Fruity Love Philter (single core), Fruity Wah | resonant LP/BP/HP + env auto-wah | `vfilter.rs` | done (tier-6: ABI-v4 metadata — mode/slope pickers, Hz/ms units) |
 | Fruity Phaser, Vintage Phaser | phaser | `phaser.rs` | done tier-5 (ABI-v3 dual path: R cascade runs the LFO `spread` further along, opposite-traveling notches; L path = the historical mono circuit bit-for-bit) |
@@ -43,8 +43,8 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Multiband Delay | split echo | `echo3` + `multiband` chain | later (chainable today) |
 | Spreader, Stereo Enhancer, Stereo Shaper, Flangus stereo, ping-pong delays | stereo width/image | `spread.rs` | done (ABI-v3 reference: mid/side + comb-Haas width, mix/gain; **stereo-pair capability** shipped, see capability log 3) |
 | Fruity PanOMatic (pan side; vol side in `gater.rs`) | tempo pan LFO | `panmatic.rs` | done tier-6 (ABI-v4: `host = song` locks both wheels to the transport — rates become cycles/beat; equal-power pan + phase-offset vol wheel + slewed shapes; shape/host pickers) |
-| Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | `pitchshft.rs` | done tier-5b (ABI-v3: two delay lines, ONE modulation clock — R read head offset `spread×180°` (phaser topology); detector tracks the mid; NOTE: spread decorrelates only when the shift actually moves taps — at 0 shift both rails ride the same static delay) |
-| Scratcher, Transporter, Wave Traveller, part of Gross Beat | transport scrub / retrigger | — | later (**transport-sync capability**) |
+| Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | `pitchshft.rs` | done tier-6 (tier-5b engine: two delay lines, ONE modulation clock — R read head offset `spread×180°` (phaser topology); detector tracks the mid; spread decorrelates only when the shift actually moves taps — at 0 shift both rails ride the same static delay; tier-6: ABI-v4 mode picker + semitones/ms/Hz/dB units) |
+| Scratcher, Transporter, Wave Traveller, part of Gross Beat | transport scrub / retrigger | — | later — the **transport-sync capability SHIPPED tier 6** (scripts can now read pos/BPM per block; the open work is scrub/retrigger DSP, not core) |
 | Peak Controller, Envelope Controller, X-Y/Z, Formula Controller, VFX Envelope/Sequencer/Key Mapper, Control Surface | automation SOURCES | — | later (**control-rate OUT capability**); slooper automation clips + per-param automation cover the DESTINATION side today |
 | Fruity Balance / Send / VFX Level Scaler | trim / routing | track gain/volume + sends | host |
 | Distructor, Effector (12 FX) | multi-effect presets | chains of the above | host (effect chains) |
@@ -406,9 +406,11 @@ SyncInfoV1)>` + `param_meta: *const ParamMetaV1` (len == n_params, or null).
   render call = one giant block; scripts self-advance across it).
 - **Scripts**: `gater.rs` and `panmatic.rs` grew a `host` param (appended
   LAST — sticky-ranges rule; default free = old behavior bit-for-bit) plus
-  full META tables (shape pickers, Hz/ms units); `overdrive.rs` and
-  `vfilter.rs` did the metadata-only trip with the documented mono
-  fallback (`process_st` = process the mid, `set_sync` = None) and dropped
+  full META tables (shape pickers, Hz/ms units); `overdrive.rs`,
+  `vfilter.rs`, `goodizer.rs`, `limiter.rs` (mono quartet — documented
+  graceful `process_st` fallbacks, `set_sync = None`) and
+  `pitchshft.rs` (metadata only; declared true-stereo, `set_sync = None`)
+  did the metadata-only trip, and all five dropped
   their "(0 x/1 y)" label suffixes for the pickers. panmatic's scripted
   GUI gained a host row; the auto window now renders any script's pickers
   and unit readouts generically.
