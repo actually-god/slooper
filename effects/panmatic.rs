@@ -22,11 +22,17 @@
 //   vol depth   — 0..1 tremolo depth
 //   slew ms     — glide time for shape steps 1..200
 //   gain        — output trim
+//
+// ABI v4 (tier 6): `host = song` drives BOTH wheels from the transport
+// push (rates then mean cycles per beat) — the PanOMatic tempo-lock.
+// host = free (default — pre-v4 sessions move not at all) keeps the
+// free-running clocks. Param metadata renders pickers/units in the auto
+// window (the scripted editor keeps its classic look + a host row).
 // ---------------------------------------------------------------------------
 
 include!("effect_api.rs");
 
-const NPARAMS: usize = 10;
+const NPARAMS: usize = 11;
 
 struct St {
     sr: f64,
@@ -36,6 +42,12 @@ struct St {
     gr: f32,  // slewed right pan gain
     hold: f32,
     hold_th: f64,
+    // Tier-6 sync state (audio thread only; see the ABI v4 contract).
+    sync_beats: f64,
+    sync_bps: f64,
+    sync_playing: bool,
+    sync_in: i64,
+    sync_ready: bool,
 }
 
 extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
@@ -48,12 +60,51 @@ extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
         gr: 1.0,
         hold: 1.0,
         hold_th: 0.0,
+        sync_beats: 0.0,
+        sync_bps: 0.0,
+        sync_playing: false,
+        sync_in: 0,
+        sync_ready: false,
     })) as *mut core::ffi::c_void
 }
 
 extern "C" fn destroy(state: *mut core::ffi::c_void) {
     if !state.is_null() {
         drop(unsafe { Box::from_raw(state as *mut St) });
+    }
+}
+
+/// Tier-6: block-start transport push; process self-advances it.
+extern "C" fn set_sync(state: *mut core::ffi::c_void, sync: *const SyncInfoV1) {
+    if state.is_null() || sync.is_null() {
+        return;
+    }
+    let s = unsafe { &mut *(state as *mut St) };
+    let sy = unsafe { &*sync };
+    if sy.abi == SLOOPER_SYNC_ABI && sy.sample_rate > 0.0 {
+        s.sync_beats = if sy.pos_beats.is_finite() && sy.pos_beats >= 0.0 {
+            sy.pos_beats
+        } else {
+            0.0
+        };
+        s.sync_bps = if sy.bpm > 0.0 && sy.bpm.is_finite() {
+            sy.bpm / (60.0 * sy.sample_rate)
+        } else {
+            0.0
+        };
+        s.sync_playing = sy.playing != 0;
+        s.sync_in = 0;
+        s.sync_ready = true;
+    }
+}
+
+#[inline]
+fn fract01(x: f64) -> f64 {
+    let f = x - x.floor();
+    if f < 0.0 || !f.is_finite() {
+        0.0
+    } else {
+        f
     }
 }
 
@@ -128,19 +179,30 @@ extern "C" fn process_st(
     let vdep = unsafe { *params.add(7) }.clamp(0.0, 1.0) as f64;
     let slew = (unsafe { *params.add(8) }.clamp(1.0, 200.0) / 1000.0) as f64;
     let gain = unsafe { *params.add(9) }.clamp(0.0, 2.0) as f32;
+    let host = unsafe { *params.add(10) } > 0.5;
 
-    // Advance wheels (sample-exact).
-    s.th1 += prate / sr;
-    if s.th1 >= 1.0 {
-        s.th1 -= 1.0;
-    }
-    s.th2 += vrate / sr;
-    if s.th2 >= 1.0 {
-        s.th2 -= 1.0;
-    }
+    // Wheel phases (sample-exact): free-running clocks, or the host
+    // transport between pushes (tier 6; rates = cycles per beat there).
+    let (th1, th2) = if host && s.sync_ready {
+        let b = s.sync_beats + if s.sync_playing { s.sync_in as f64 * s.sync_bps } else { 0.0 };
+        if s.sync_playing && s.sync_in < i64::MAX / 2 {
+            s.sync_in += 1;
+        }
+        (fract01(b * prate), fract01(b * vrate))
+    } else {
+        s.th1 += prate / sr;
+        if s.th1 >= 1.0 {
+            s.th1 -= 1.0;
+        }
+        s.th2 += vrate / sr;
+        if s.th2 >= 1.0 {
+            s.th2 -= 1.0;
+        }
+        (s.th1, s.th2)
+    };
 
     // Pan wheel -> equal-power angle in [-1,1] per side.
-    let w = shape(psh, s.th1); // -1..1
+    let w = shape(psh, th1); // -1..1
     let pan_l = (cent + w * pdep).clamp(-1.0, 1.0);
     let pan_r = (cent - w * pdep).clamp(-1.0, 1.0);
     // Constant-power pair: a = 0.5 - pan/2 (left angle), equal-power gains.
@@ -150,12 +212,12 @@ extern "C" fn process_st(
     let gr = ar.cos() as f32;
 
     // Volume wheel (phase-offset L/R; hold shape latches per cycle).
-    let t2l = s.th2;
-    let t2r = (s.th2 as f32 + phoff).fract();
+    let t2l = th2;
+    let t2r = (th2 as f32 + phoff).fract();
     let v2l = if vsh == 4 {
-        if (s.th2 + 1e-12) < s.hold_th {
-            s.hold = shape(0, s.th2).mul_add(0.5, 0.5) as f32;
-            s.hold_th = s.th2 + 1.0;
+        if (th2 + 1e-12) < s.hold_th {
+            s.hold = shape(0, th2).mul_add(0.5, 0.5) as f32;
+            s.hold_th = th2 + 1.0;
         }
         s.hold
     } else {
@@ -243,32 +305,65 @@ extern "C" fn gui_draw(
     sl!(4, 1, 3, 0.0, 1.0, c"phase off".as_ptr(), 1.0);
     sl!(8, 0, 4, 1.0, 200.0, c"slew ms".as_ptr(), 0.5);
     sl!(9, 1, 4, 0.0, 2.0, c"gain".as_ptr(), 1.0);
+    sl!(10, 0, 5, 0.0, 1.0, c"host 0 free / 1 song".as_ptr(), 1.0);
 }
 
 pub static GUI: EffectGuiV1 = EffectGuiV1 {
     abi: SLOOPER_EFFECT_GUI_ABI,
     want_width: 430.0,
-    want_height: 185.0,
+    want_height: 220.0,
     create: gui_create,
     draw: gui_draw,
     destroy: gui_destroy,
 };
 
 static PARAMS: [EffectParamV1; NPARAMS] = [
-    EffectParamV1 { label: c"pan shape (0sin 1tri 2sq 3saw)".as_ptr(), min: 0.0, max: 3.0, default: 0.0 },
+    EffectParamV1 { label: c"pan shape".as_ptr(), min: 0.0, max: 3.0, default: 0.0 },
     EffectParamV1 { label: c"pan rate hz".as_ptr(), min: 0.005, max: 24.0, default: 1.5 },
     EffectParamV1 { label: c"pan depth".as_ptr(), min: 0.0, max: 1.0, default: 0.8 },
     EffectParamV1 { label: c"centre".as_ptr(), min: -1.0, max: 1.0, default: 0.0 },
     EffectParamV1 { label: c"phase off".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
-    EffectParamV1 { label: c"vol shape (0sin 1tri 2sq 3saw 4hold)".as_ptr(), min: 0.0, max: 4.0, default: 0.0 },
+    EffectParamV1 { label: c"vol shape".as_ptr(), min: 0.0, max: 4.0, default: 0.0 },
     EffectParamV1 { label: c"vol rate hz".as_ptr(), min: 0.005, max: 24.0, default: 1.5 },
     EffectParamV1 { label: c"vol depth".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
     EffectParamV1 { label: c"slew ms".as_ptr(), min: 1.0, max: 200.0, default: 8.0 },
     EffectParamV1 { label: c"gain".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
+    EffectParamV1 { label: c"host".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
+];
+
+// Tier-6 param metadata (auto window): shape pickers, units, host switch.
+#[repr(C)]
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+// SAFETY: read-only statics of pointers to literals, shared one way.
+unsafe impl<const N: usize> Sync for Labels<N> {}
+
+static PAN_SHAPES: Labels<4> =
+    Labels([c"sine".as_ptr(), c"tri".as_ptr(), c"square".as_ptr(), c"saw".as_ptr()]);
+static VOL_SHAPES: Labels<5> = Labels([
+    c"sine".as_ptr(),
+    c"tri".as_ptr(),
+    c"square".as_ptr(),
+    c"saw".as_ptr(),
+    c"hold".as_ptr(),
+]);
+static HOST_LABELS: Labels<2> = Labels([c"free".as_ptr(), c"song".as_ptr()]);
+
+static META: [ParamMetaV1; NPARAMS] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: PAN_SHAPES.0.as_ptr(), n_labels: 4 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: VOL_SHAPES.0.as_ptr(), n_labels: 5 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: HOST_LABELS.0.as_ptr(), n_labels: 2 },
 ];
 
 static DESC_TXT: &core::ffi::CStr =
-    c"LFO pan + volume wheels (PanOMatic task). Equal-power pan, phase-offset tremolo, slewed squares. ABI v3.";
+    c"LFO pan + volume wheels (PanOMatic task). Equal-power pan, phase-offset tremolo, slewed squares. ABI v3. ABI v4: host = song locks both wheels to the transport (rates = cycles per beat).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
@@ -309,6 +404,23 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     process_st,
 };
 
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"pan matic".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: DESC_TXT.as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+    process_st,
+    stereo: 1,
+    set_sync: Some(set_sync),
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
@@ -322,6 +434,11 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
     &DESC3
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }
 
 #[no_mangle]

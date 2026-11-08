@@ -25,16 +25,16 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Fruity Compressor | single-band comp | `compressor.rs` | done |
 | Fruity Limiter sidechain duties | ducking comp | `sidechain_comp.rs` | done (ABI-v2 reference) |
 | (tremolo starter) | amplitude LFO | `template.rs` | done |
-| Fruity Blood Overdrive, Fruity Fast Dist, Fruity Soft Clipper, legacy Overdrive | analog-ish drive / clipper family | `overdrive.rs` | done |
+| Fruity Blood Overdrive, Fruity Fast Dist, Fruity Soft Clipper, legacy Overdrive | analog-ish drive / clipper family | `overdrive.rs` | done (tier-6: ABI-v4 metadata — curve picker, graceful mono prefix) |
 | Fruity WaveShaper, Hardcore (per-stage shaping), LSD | draw-a-curve distortion | `waveshaper.rs` | done (draggable curve GUI) |
 | Soundgoodizer, Emphasizer, Low Lifter, part of Maximus | one-knob enhancer / presence | `goodizer.rs` | done |
 | Fruity Squeeze | bitcrush / downsample | `crush.rs` | done |
 | Fruity Limiter, Emphasis, (legacy) Soft Limiter, noise gate | comp/limiter/gate, ceiling | `limiter.rs` | done |
 | Maximus, Fruity Multiband Compressor | 3-band split dynamics | `multiband.rs` | done |
-| Fruity Filter, Fruity Love Philter (single core), Fruity Wah | resonant LP/BP/HP + env auto-wah | `vfilter.rs` | done |
+| Fruity Filter, Fruity Love Philter (single core), Fruity Wah | resonant LP/BP/HP + env auto-wah | `vfilter.rs` | done (tier-6: ABI-v4 metadata — mode/slope pickers, Hz/ms units) |
 | Fruity Phaser, Vintage Phaser | phaser | `phaser.rs` | done tier-5 (ABI-v3 dual path: R cascade runs the LFO `spread` further along, opposite-traveling notches; L path = the historical mono circuit bit-for-bit) |
 | Fruity Flanger, Fruity Flangus | flanger / unison | `flanger.rs` | done tier-5 (ABI-v3: ONE shared comb written with the mid, per-side modulated taps + R-side `spread` offset — opposite-sweep sides; tier-4 absolute-index ring read fixed — the comb now actually recirculates; base time slewed) |
-| Fruity PanOMatic (vol), Gross Beat (gate/stutter lite) | tempo volume-gating | `gater.rs` | done tier-5b (ABI-v3 dual-lane: one LFO clock, R rail reads it `spread×180°` later with its own edge smoother — 1.0 = antiphase Gross-Beat gating; dry never crosses rails) |
+| Fruity PanOMatic (vol), Gross Beat (gate/stutter lite) | tempo volume-gating | `gater.rs` | done tier-6 (ABI-v4: transport-locked gate via `host` param — rate = cycles/beat in song mode, seek/freeze exact; dual-lane spread from tier-5b; shape/host pickers) |
 | Fruity Delay 2, Fruity Delay 3, Fruity Delay Bank (single-bank core) | delay + filtered feedback | `echo3.rs` | done tier-4 (ABI-v3 ping-pong: R taps `time×(1+pp)` so repeats trail L→R; tier-1 absolute-index ring read fixed — see rework log) |
 | Frequency Shifter | SSB shift (metallic/vibrato) | `shifter.rs` | done tier-5b (ABI-v3 TRUE STEREO: independent Hilbert/oscillator/feedback per side, R = `shift×(1+spread)` — hard-panned input never crosses rails) |
 | Transient Processor, Transmitter (split lite) | transient/sustain shaping | `transient.rs` | done |
@@ -42,7 +42,7 @@ Source of the inventory: image-line.com/fl-studio/pricing plugin table
 | Convolver | impulse reverb | `convolver.rs` | done (partitioned overlap-save FFT, **folder IR capability** — `~/.local/share/slooper/impulses`, env override, index 0 = built-in hall) |
 | Multiband Delay | split echo | `echo3` + `multiband` chain | later (chainable today) |
 | Spreader, Stereo Enhancer, Stereo Shaper, Flangus stereo, ping-pong delays | stereo width/image | `spread.rs` | done (ABI-v3 reference: mid/side + comb-Haas width, mix/gain; **stereo-pair capability** shipped, see capability log 3) |
-| Fruity PanOMatic (pan side; vol side in `gater.rs`) | tempo pan LFO | `panmatic.rs` | done (ABI-v3: equal-power sine/tri/inverse-tri pan + optional volume wheel, tempo-synced) |
+| Fruity PanOMatic (pan side; vol side in `gater.rs`) | tempo pan LFO | `panmatic.rs` | done tier-6 (ABI-v4: `host = song` locks both wheels to the transport — rates become cycles/beat; equal-power pan + phase-offset vol wheel + slewed shapes; shape/host pickers) |
 | Pitch Shifter, Pitcher, Tuner | pitch shift / correction / detect | `pitchshft.rs` | done tier-5b (ABI-v3: two delay lines, ONE modulation clock — R read head offset `spread×180°` (phaser topology); detector tracks the mid; NOTE: spread decorrelates only when the shift actually moves taps — at 0 shift both rails ride the same static delay) |
 | Scratcher, Transporter, Wave Traveller, part of Gross Beat | transport scrub / retrigger | — | later (**transport-sync capability**) |
 | Peak Controller, Envelope Controller, X-Y/Z, Formula Controller, VFX Envelope/Sequencer/Key Mapper, Control Surface | automation SOURCES | — | later (**control-rate OUT capability**); slooper automation clips + per-param automation cover the DESTINATION side today |
@@ -73,11 +73,30 @@ Everything shipped in tier 1 is expressible with the **current** ABI —
 deliberate proof that the ladder's rung 1 (no ABI change) carries most of a
 commercial suite. Recorded needs for the later tiers, cheapest first (full
 ladder: `slooper-effect-authoring` skill §ABI evolution):
-1. **Param metadata** (discrete steps / enum labels / units) — nicer auto
-   GUI for mode sliders (overdrive character, gater shapes). Workaround
-   today: quantize in `process`, label spells out the steps.
+1. **Param metadata** (discrete steps / enum labels / units) — **SHIPPED
+   tier 6 as part of ABI v4** (`ParamMetaV1`): per-param `unit`
+   (`SLOOPER_UNIT_*`), `step` (slider snap — `process` MUST quantize the
+   same way), and enum `labels` (up to 32; the param becomes N equally
+   spaced values across min..max). The auto window draws pickers and
+   engineering-unit readouts; `Instance::param_meta`/`fmt_param` expose
+   the same data to any host-side UI, and the loader validates + copies
+   the table into `desc.params[k].unit/.step/.labels` (empty for v1..v3,
+   which render exactly as before). Mode-slider labels should now drop
+   their "(0 x/1 y)" suffixes — the picker renders the choices.
 2. **MIDI-clock / transport sync** (per-sample block call with pos) —
-   sync'd echo/gater phases, Gross-Beat-class scrubbing.
+   **SHIPPED tier 6 as ABI v4** (`EffectInfoV4` = V3 + `stereo` flag +
+   `set_sync` + `param_meta`). The engine calls the script's
+   `set_sync(&SyncInfoV1)` ONCE per audio block before its first sample
+   (live RT path, the plugin-chain block path, and every offline/bounce
+   pass); `SyncInfoV1` carries playing flag, sample rate, BPM,
+   beats-per-bar and block-start pos (samples AND beats). Contract: the
+   push is valid only during the call (copy it), and the script
+   self-advances `pos + samples_since_push * beats_per_sample` while
+   playing — so phases are block-size agnostic, sample-exact, follow
+   seeks (new pos = jump) and hold while paused. Scripts gate the mode
+   behind a `host` param (0 = free / 1 = song); default FREE keeps every
+   pre-v4 session bit-identical. First adopters: `gater.rs`
+   (transport-locked gate) and `panmatic.rs` (tempo-locked wheels).
 3. **Stereo or multichannel buffers** — **SHIPPED tier 3 as ABI v3**:
    `EffectInfoV3` = the full V2 struct + one appended fn
    `process_st(state, l, r, params, sc) -> l` (out-R through a trailing
@@ -364,6 +383,43 @@ Harness fixes this tier exposed:
   the effect `spawn_fresh`es its own instance (offline render already
   does). The e2e only exposed this because it was the first
   sidechain-CONSUMING script placed on the selected track.
+
+## Tier-6 host-sync & metadata log (2026-11-08 — ABI v4: `set_sync` + `ParamMetaV1`)
+
+New capability (full contract in `effect_api.rs`; capability log 1+2 above):
+`EffectInfoV4` = V3 + `stereo: u32` (DECLARED stereo-ness — a mono script
+upgrading to v4 exports the required-but-graceful `process_st` and sets
+`stereo = 0`, so (ST) tags stay honest) + `set_sync: Option<fn(*mut, *const
+SyncInfoV1)>` + `param_meta: *const ParamMetaV1` (len == n_params, or null).
+
+- **Loader**: v4 entry takes priority; every v4 field validated at load
+  (abi tag, n_labels ≤ 32, labels non-null iff n_labels > 0, label grid
+  needs min < max when n > 1) — failure rejects the SCRIPT with the reason
+  in the row error, never silently. `desc.stereo` now comes from the DECL
+  for v4 scripts (structural rule kept for v1..v3).
+- **Engine**: `Proc::refresh_sync` builds a `SyncInfoV1` once per RT block
+  (after the automation pass, so automation tempo is in it) and bumps a
+  generation counter; every live slot push happens lazily on first use of
+  the block (`sync_seen != sync_gen`) — silent tracks cost nothing. The
+  plugin-chain block path pushes identically; offline/bounce passes seed
+  each fresh private copy with `offline_sync(engine, sr, pos0)` (one
+  render call = one giant block; scripts self-advance across it).
+- **Scripts**: `gater.rs` and `panmatic.rs` grew a `host` param (appended
+  LAST — sticky-ranges rule; default free = old behavior bit-for-bit) plus
+  full META tables (shape pickers, Hz/ms units); `overdrive.rs` and
+  `vfilter.rs` did the metadata-only trip with the documented mono
+  fallback (`process_st` = process the mid, `set_sync` = None) and dropped
+  their "(0 x/1 y)" label suffixes for the pickers. panmatic's scripted
+  GUI gained a host row; the auto window now renders any script's pickers
+  and unit readouts generically.
+- **Pins**: `tier6_param_metadata_and_host_sync` (fx::) — meta visible
+  through `Instance::param_meta`/`fmt_param`, declared-mono flag sticks,
+  song-mode gate: opens at the pushed beat, closes at duty, jumps on
+  seek, holds while paused, identical across 1000-sample vs single-push
+  replays, and free mode still free-runs after the same instance saw
+  sync pushes. The tier-5b freeze pin now carries the documented gater
+  exception (label text moved to META; every range/default of 0..7
+  frozen; `host` appended).
 
 ## Tier-5 candidates (next rework cycle, in value order)
 

@@ -1007,9 +1007,51 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
             for (k, p) in ed.desc.params.iter().enumerate() {
                 let mut v = ed.inst.param(k);
                 let before = v;
+                // Tier-6 ABI v4: enum params get a picker (values snap to
+                // equally spaced points min..max, readout shows the
+                // label); step params get a snapped slider; units ride
+                // the value readout. v1..v3 scripts have neither and
+                // render exactly as before.
+                if !p.labels.is_empty() {
+                    let n = p.labels.len();
+                    let val_of = |i: usize| {
+                        if n <= 1
+                            || p.max.partial_cmp(&p.min) != Some(core::cmp::Ordering::Greater)
+                        {
+                            p.min
+                        } else {
+                            p.min + (p.max - p.min) * i as f32 / (n - 1) as f32
+                        }
+                    };
+                    let cur = if p.max > p.min && n > 1 {
+                        (((v - p.min) / (p.max - p.min)) * (n - 1) as f32)
+                            .round()
+                            .clamp(0.0, (n - 1) as f32) as usize
+                    } else {
+                        0
+                    };
+                    let mut idx = cur;
+                    ComboBox::from_id_salt(("fxenum", ed.loop_i, ed.slot, k))
+                        .width(150.0)
+                        .show_index(ui, &mut idx, n, |i| p.labels[i].clone());
+                    if idx != cur {
+                        v = val_of(idx);
+                    }
+                    ui.label(&p.label);
+                    ui.label(RichText::new(p.labels[cur].clone()).monospace().small());
+                    if (v - before).abs() > f32::EPSILON {
+                        ed.inst.set_param(k, v);
+                        ed.pending.push((k, v));
+                    }
+                    ui.end_row();
+                    continue;
+                }
                 let mut sl = Slider::new(&mut v, p.min..=p.max);
                 if p.min > 0.0 && p.max / p.min > 50.0 {
                     sl = sl.logarithmic(true);
+                }
+                if p.step > 0.0 {
+                    sl = sl.step_by(p.step as f64);
                 }
                 // v29: raw click gestures instead of the drag-killing
                 // same-id click union (see the bridge slider above).
@@ -1038,7 +1080,11 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                     ed.dbl_set = Some((k, v));
                 }
                 ui.label(&p.label);
-                ui.label(RichText::new(format!("{v:.2}")).monospace().small());
+                ui.label(
+                    RichText::new(format!("{v:.2}{}", unit_suffix(p.unit)))
+                        .monospace()
+                        .small(),
+                );
                 if crate::ui::p_changed(&r, before, &mut v) {
                     ed.inst.set_param(k, v);
                     ed.pending.push((k, v));
@@ -1046,4 +1092,20 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 ui.end_row();
             }
         });
+}
+
+/// Tier-6: short readout suffix for `ParamMetaV1::unit` codes.
+fn unit_suffix(unit: u32) -> &'static str {
+    match unit {
+        1 => " %",
+        2 => " dB",
+        3 => " Hz",
+        4 => " ms",
+        5 => " st",
+        6 => " beats",
+        7 => "x",
+        8 => " smp",
+        9 => " s",
+        _ => "",
+    }
 }

@@ -4272,3 +4272,190 @@ fn e2e_tier5b_stereo_mods_live() {
     b.engine.set_loop_vol(1, 0.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FL Suite tier-6 LIVE pin (docs/FL-SUITE.md tier-6 log): the gater in
+/// `host = song` mode runs on the REAL RT thread — the per-block
+/// `refresh_sync -> push_sync` plumbing must lock the gate to SetMetro's
+/// BPM: 0.5 cycles/beat measures a 1.000 s period at 120 BPM and 2.000 s
+/// at 60 BPM (autocorrelation of the captured master-bus envelope).
+/// This is the only test that exercises the sync PUSH itself (unit pins
+/// cover the instance side; Proc cannot be built headless).
+#[test]
+fn e2e_tier6_host_sync_live() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-t6sync-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    let desc = reg.desc("gater").expect("stock gater present").clone();
+
+    let ring_n = 1usize << 20;
+    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("t6sync", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async(
+            (),
+            DiffProc {
+                sink_l,
+                sink_r,
+                ring_sum: ring_sum.clone(),
+                ring_dif: ring_dif.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "bus layout not applied"
+    );
+
+    // Constant-energy looping asset (toned noise, same fixture family).
+    let n = (sr as usize) * 2;
+    let sample: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let tone = (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+                let h = (i as u32).wrapping_mul(2654435761);
+                let noise = (h as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                0.4 * (0.6 * tone + 0.4 * noise)
+            })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![sample]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.5);
+
+    let mut dp = vec![0.0f32; 32];
+    for (k, pd) in desc.params.iter().enumerate() {
+        dp[k] = pd.default;
+    }
+    dp[0] = 0.5; // song mode: 0.5 cycles per beat
+    dp[1] = 2.0; // pulse
+    dp[2] = 0.5; // duty
+    dp[3] = 0.1; // nearly hard edges
+    dp[7] = 0.0; // mono (spread off)
+    dp[8] = 1.0; // HOST = SONG
+
+    // One measured run at a BPM: play, settle, capture 6 s, dominant
+    // envelope period via normalized autocorrelation, stop.
+    let measure = |bpm: u32| -> f64 {
+        b.cmd(Cmd::SetMetro {
+            on: false,
+            bpm,
+            sub: 4,
+            num: 4,
+        });
+        b.cmd(Cmd::PlayAll);
+        wait_until(
+            || {
+                ring_peak(&ring_sum, &widx, 960)
+                    .map(|m| m > 0.05)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(4),
+            "gater song output audible",
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        let need = (sr as usize) * 6;
+        let x = read_ring(&ring_sum, &widx, need, Duration::from_millis(9500)).expect("ring");
+        // 20 ms RMS envelope, then autocorrelate over 0.25..3.2 s lags.
+        let w = (sr as usize / 50).max(1);
+        let env: Vec<f32> = x
+            .chunks(w)
+            .map(|c| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt())
+            .collect();
+        let mean = env.iter().sum::<f32>() / env.len() as f32;
+        let d: Vec<f32> = env.iter().map(|v| v - mean).collect();
+        let lo = 12usize; // 0.25 s at 20 ms resolution
+        let hi = (env.len() - 2).min(160); // <= 3.2 s
+        let mut best = (f64::NAN, -1e9f32);
+        for lag in lo..=hi {
+            let m = d.len() - lag;
+            let num: f32 = (0..m).map(|i| d[i] * d[i + lag]).sum();
+            let na: f32 = d[..m].iter().map(|v| v * v).sum();
+            let nb: f32 = d[lag..].iter().map(|v| v * v).sum();
+            let c = num / (na.sqrt() * nb.sqrt()).max(1e-12);
+            if c > best.1 {
+                best = (lag as f64 / 50.0, c);
+            }
+        }
+        b.cmd(Cmd::StopAll);
+        b.cmd(Cmd::SetTrackEffects {
+            i: 0,
+            chain: TrackFx {
+                slots: Arc::new(vec![]),
+            },
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        eprintln!("T6 bpm {bpm}: period {:.3} s corr {:.3}", best.0, best.1);
+        assert!(
+            best.1 > 0.25,
+            "no periodic gating found at bpm {bpm} (best corr {:.3})",
+            best.1
+        );
+        best.0
+    };
+
+    let p120 = {
+        let inst = reg.create_instance("gater", sr as f64, &dp).expect("gater compiles");
+        b.cmd(Cmd::SetTrackEffects {
+            i: 0,
+            chain: TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc.clone())]),
+            },
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        measure(120)
+    };
+    let p60 = {
+        let inst = reg.create_instance("gater", sr as f64, &dp).expect("gater compiles");
+        b.cmd(Cmd::SetTrackEffects {
+            i: 0,
+            chain: TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        measure(60)
+    };
+
+    assert!(
+        (p120 - 1.0).abs() < 0.18,
+        "song-mode gate at 120 BPM measured {p120:.3} s, expected 1.000 s (0.5 cyc/beat)"
+    );
+    assert!(
+        (p60 - 2.0).abs() < 0.35,
+        "song-mode gate at 60 BPM measured {p60:.3} s, expected 2.000 s (0.5 cyc/beat)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
