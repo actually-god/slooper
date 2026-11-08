@@ -86,6 +86,11 @@ pub struct ProjTrack {
     pub chain: Vec<crate::config::ChainSave>,
     /// Lane 0 = the track itself, lanes 1.. = child tracks.
     pub lanes: Vec<Vec<ProjClip>>,
+    /// v46: per-track mono/poly synth mode (absent = false: every child
+    /// lane feeds the track's ONE synth). True = each child lane renders
+    /// through its own copy of the configured synth.
+    #[serde(default)]
+    pub poly: bool,
     /// v34 R4: the track's grid-block height in points as the user left
     /// it (`0` = automatic). A project's own heights used to be dropped
     /// on load while the SESSION heights from config leaked in, so a
@@ -286,6 +291,7 @@ mod tests {
                 gain: 80,
                 pan: 64,
                 on: true,
+                poly: false,
                 fx: vec![TrackFxSave {
                     stem: "template".into(),
                     params: vec![1.0],

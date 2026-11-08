@@ -771,6 +771,15 @@ pub struct Engine {
     /// (bundled piano) used by unbound tracks.
     synths: std::sync::Mutex<Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]>>,
     synths_gen: AtomicU64,
+    /// v46: per-track mono/poly synth mode. The copy table IS the flag:
+    /// an empty row = monophonic (every child lane merges into the track's
+    /// one synth, the historic behaviour); a non-empty row = polyphonic —
+    /// child lane `li` renders through copy `li` (lanes past the row share
+    /// copy 0), and the copies' outputs sum before the SAME track chain.
+    /// Spawned on the UI thread (`spawn_synth_copy`), published gen-swap.
+    poly_voices: std::sync::Mutex<Arc<Vec<Vec<Option<Arc<SynthHandle>>>>>>,
+    poly_gen: AtomicU64,
+    track_poly: [AtomicU8; MAX_LOOPS],
     default_synth: std::sync::Mutex<Option<Arc<SynthHandle>>>,
     /// Chain reaper: a chain swap displaces VST slots; the displaced entries
     /// are *held* in `vst_held` instead of dropping where the swap happened:
@@ -913,6 +922,9 @@ impl Engine {
             // Cmd::SetProject on every edit.
             proj_len: AtomicU64::new(LOOP_CAP as u64),
             track_on: core::array::from_fn(|_| AtomicU8::new(1)),
+            poly_voices: std::sync::Mutex::new(Arc::new(Vec::new())),
+            poly_gen: AtomicU64::new(0),
+            track_poly: core::array::from_fn(|_| AtomicU8::new(0)),
             vol: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             sc_send_lo: core::array::from_fn(|_| AtomicU64::new(0)),
@@ -1471,6 +1483,40 @@ impl Engine {
     pub fn synths_gen(&self) -> u64 {
         self.synths_gen.load(Ordering::Relaxed)
     }
+
+    /// v46: publish track `i`'s POLY copy row (spawned UI-side; see
+    /// [`spawn_synth_copy`]). `on` false (or an empty row) restores the
+    /// monophonic merge. The write is `try_lock` like every other table:
+    /// the RT thread snapshots it on the gen bump and never blocks.
+    pub fn set_track_poly(&self, i: usize, on: bool, voices: Vec<Option<Arc<SynthHandle>>>) {
+        if i >= MAX_LOOPS {
+            return;
+        }
+        let row = if on { voices } else { Vec::new() };
+        if let Ok(mut g) = self.poly_voices.try_lock() {
+            let mut next = g.clone();
+            let v = Arc::make_mut(&mut next);
+            while v.len() < MAX_LOOPS {
+                v.push(Vec::new());
+            }
+            v[i] = row;
+            *g = next;
+        }
+        self.track_poly[i].store(on as u8, Ordering::Relaxed);
+        self.poly_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn poly_on(&self, i: usize) -> bool {
+        self.track_poly
+            .get(i)
+            .map(|a| a.load(Ordering::Relaxed) != 0)
+            .unwrap_or(false)
+    }
+    pub fn poly_voices(&self) -> Arc<Vec<Vec<Option<Arc<SynthHandle>>>>> {
+        self.poly_voices.lock().unwrap().clone()
+    }
+    pub fn poly_gen(&self) -> u64 {
+        self.poly_gen.load(Ordering::Relaxed)
+    }
     pub fn set_default_synth(&self, synth: Option<Arc<SynthHandle>>) {
         *self.default_synth.lock().unwrap() = synth;
         // The RT handler snapshots `default_synth` inside its `synths_gen`
@@ -1761,16 +1807,47 @@ impl Engine {
                     .any(|c| matches!(midi.get(c.asset as usize), Some(Some(_))))
             }) {
                 if let Some(h) = self.synth_for(t) {
-                    let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
-                    for lane in &arr.tracks[t].lanes {
-                        for cl in &lane.clips {
-                            if let Some(Some(pat)) = midi.get(cl.asset as usize) {
-                                stage_midi_events(pat, cl, sr, &mut ev);
+                    let mut buf = vec![0.0f32; len.max(1)];
+                    // v46: POLY mode exports like the mix sounds: every
+                    // child lane renders through its own copy (holes
+                    // merge into copy 0 like the live path), sums to one
+                    // track row, then rides the same chain below.
+                    let poly_row = self.poly_voices().get(t).cloned().unwrap_or_default();
+                    if self.poly_on(t) && !poly_row.is_empty() {
+                        let n_cp = poly_row.len().min(32);
+                        for (li, lane) in arr.tracks[t].lanes.iter().enumerate() {
+                            let ci = li.min(n_cp - 1);
+                            let hh = match poly_row.get(ci).cloned().flatten() {
+                                Some(x) => x,
+                                None if ci == 0 => h.clone(),
+                                None => continue,
+                            };
+                            let mut lev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+                            for cl in &lane.clips {
+                                if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                                    stage_midi_events(pat, cl, sr, &mut lev);
+                                }
+                            }
+                            if lev.is_empty() {
+                                continue;
+                            }
+                            let mut lbuf = vec![0.0f32; len.max(1)];
+                            render_midi_any(&hh, &mut lev, 0, len.max(1), &mut lbuf, sr);
+                            for (k, x) in lbuf.into_iter().enumerate() {
+                                buf[k] += x;
                             }
                         }
+                    } else {
+                        let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+                        for lane in &arr.tracks[t].lanes {
+                            for cl in &lane.clips {
+                                if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                                    stage_midi_events(pat, cl, sr, &mut ev);
+                                }
+                            }
+                        }
+                        render_midi_any(&h, &mut ev, 0, len.max(1), &mut buf, sr);
                     }
-                    let mut buf = vec![0.0f32; len.max(1)];
-                    render_midi_any(&h, &mut ev, 0, len.max(1), &mut buf, sr);
                     if span {
                         for (k, x) in buf.into_iter().take(out.len()).enumerate() {
                             any = true;
@@ -2229,6 +2306,10 @@ fn run(
         synth_p: [0.0f32; crate::synth::MAX_PARAMS],
         synth_pg: [0u64; MAX_LOOPS],
         mono: Vec::new(),
+        mono2: Vec::new(),
+        poly_pg: [0u64; MAX_LOOPS],
+        poly_cache: engine.poly_voices(),
+        poly_cache_gen: engine.poly_gen(),
         sil: Vec::new(),
         evq: Vec::new(),
         own: Vec::new(),
@@ -3167,6 +3248,9 @@ fn slot_is_vst(
 /// events too (one merged stream per plugin instance; see
 /// `render_midi_block`). Kind order puts offs (0) before ons (3) at equal
 /// offsets so a retrigger never kills its own note.
+/// v46: `only_lane = Some(li)` stages that child lane ALONE (poly mode
+/// renders every child through its own synth copy; see the poly pass in
+/// `render_midi_block`).
 #[allow(clippy::too_many_arguments)]
 fn stage_track_events(
     t: usize,
@@ -3181,8 +3265,15 @@ fn stage_track_events(
     sr: u32,
     ev: &mut Vec<(usize, u8, u8, u8, u8)>,
     ring: &mut u64,
+    only_lane: Option<usize>,
 ) {
-    for l in arr.tracks[t].lanes.iter().filter(|_| pattern_run) {
+    for (li, l) in arr.tracks[t].lanes.iter().enumerate() {
+        if !pattern_run {
+            break;
+        }
+        if only_lane.map_or(false, |w| w != li) {
+            continue;
+        }
         for cl in l.clips.iter() {
             let Some(Some(pat)) = midi_cache.get(cl.asset as usize) else {
                 continue;
@@ -3431,10 +3522,18 @@ impl Proc {
         // their sliders are host-side.
         let vst_open = (0..MAX_LOOPS).any(|t| {
             (self.engine.track_on(t) || ((self.aud_mask >> t) & 1) != 0 || self.aud_held[t] > 0)
-                && slot_is_vst(
+                && (slot_is_vst(
                     self.synths_cache.get(t).and_then(|o| o.as_ref()),
                     self.dflt_synth.as_ref(),
                 )
+                    // v46: a poly track's live instance may be silent while
+                    // its copies (which can be plugins) run every block.
+                    || (self.engine.poly_on(t)
+                        && self.poly_cache.get(t).map_or(false, |row| {
+                            row.iter().any(|c| {
+                                matches!(c.as_deref(), Some(SynthHandle::Vst(_)))
+                            })
+                        })))
         });
         if render_gate_blocked(block_n, pattern_run, live_any || aud_any, vst_open) {
             return false;
@@ -3459,6 +3558,9 @@ impl Proc {
             midi_cache,
             sil,
             evq,
+            mono2,
+            poly_pg,
+            poly_cache,
             own,
             owner,
             live_ev,
@@ -3491,6 +3593,13 @@ impl Proc {
         own.clear();
         owner.fill(0xFF);
         for (t, owner_slot) in owner.iter_mut().enumerate() {
+            // v46: a POLY track never feeds its live instance (its copies
+            // render below), so it must not join the shared-handle
+            // ownership math — otherwise it would claim the shared
+            // default piano as "owner" and stage nothing into it.
+            if engine.poly_on(t) && matches!(poly_cache.get(t), Some(row) if !row.is_empty()) {
+                continue;
+            }
             // v38 R1: an audition target renders even with its play flag
             // OFF — auditioning must answer on ANY track, that is the
             // whole point ("place a note, hear the instrument").
@@ -3550,6 +3659,7 @@ impl Proc {
                     sr,
                     midi_ev,
                     &mut ring,
+                    None,
                 );
                 // v38 R1: this track's due audition events ride the SAME
                 // merged per-instance stream (the sort/dedup below places
@@ -3700,6 +3810,215 @@ impl Proc {
             // audition note counts the same way.
             if ring <= span_end && live_notes[t].max(0) == 0 && aud_held[t] <= 0 {
                 let peak = row[..block_n].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                if peak < MIDI_SILENCE_FLOOR {
+                    midi_quiet[t] = midi_quiet[t].saturating_add(1);
+                    if midi_quiet[t] >= MIDI_QUIET_BLOCKS {
+                        midi_sustain[t] = false;
+                        midi_quiet[t] = 0;
+                    }
+                } else {
+                    midi_quiet[t] = 0;
+                }
+            }
+        }
+        // =============== v46 POLY: one synth copy per child lane =========
+        // A poly track bypasses the shared-instance map above entirely:
+        // every child lane renders through its own headless copy of the
+        // configured instrument, and the copies' mono outputs sum into
+        // the track's scratch row — so the track's chain, gain, pan and
+        // metering are untouched. Lanes past the copy row share copy 0
+        // (the historic merged stream); the live keyboard feed and legacy
+        // audition events land on copy 0. The live instance is never fed.
+        for t in 0..MAX_LOOPS {
+            if !engine.poly_on(t) {
+                continue;
+            }
+            let mut copies: Vec<Option<Arc<SynthHandle>>> =
+                poly_cache.get(t).cloned().unwrap_or_default();
+            if copies.is_empty() {
+                continue;
+            }
+            // Keep script copies honest: the LIVE instance owns the
+            // sliders, so push its param generation onto every copy
+            // (cheap atomic pushes; VST copies resync from their own
+            // host-visible mirrors at spawn and on rebinding).
+            if let Some(live_h) = synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone())
+            {
+                if let SynthHandle::Script(live_i) = live_h.as_ref() {
+                    let g = live_i.param_gen();
+                    if g != poly_pg[t] {
+                        let mut pv = [0.0f32; crate::synth::MAX_PARAMS];
+                        live_i.read_params(&mut pv);
+                        for c in copies.iter_mut().flatten() {
+                            if let SynthHandle::Script(ci) = c.as_ref() {
+                                for (k, v) in pv.iter().enumerate() {
+                                    ci.set_param(k, *v);
+                                }
+                            }
+                        }
+                        poly_pg[t] = g;
+                    }
+                }
+            }
+            let n_cp = copies.len().min(32);
+            let n_lanes = arr.tracks[t].lanes.len();
+            let live_t = live_on && ((live_mask >> t) & 1) != 0;
+            let holding = (live_on && live_notes[t] > 0) || aud_held[t] > 0;
+            let always = copies
+                .iter()
+                .any(|c| matches!(c.as_deref(), Some(SynthHandle::Vst(_))));
+            let mut ring = 0u64;
+            let mut has_ev = false;
+            let row = &mut midi_scratch[t];
+            if row.len() < block_n {
+                row.clear();
+                row.resize(block_n, 0.0);
+            }
+            for ci in 0..n_cp {
+                midi_ev.clear();
+                let mut cring = 0u64;
+                if pattern_run {
+                    for li in 0..n_lanes {
+                        let target = if li < n_cp { li } else { 0 };
+                        if target != ci {
+                            continue;
+                        }
+                        stage_track_events(
+                            t,
+                            &arr,
+                            midi_cache,
+                            &[],
+                            false,
+                            true,
+                            p0,
+                            span_end,
+                            block_n,
+                            sr,
+                            midi_ev,
+                            &mut cring,
+                            Some(li),
+                        );
+                    }
+                }
+                if ci == 0 {
+                    if live_t {
+                        stage_track_events(
+                            t,
+                            &arr,
+                            midi_cache,
+                            live_ev,
+                            true,
+                            false,
+                            p0,
+                            span_end,
+                            block_n,
+                            sr,
+                            midi_ev,
+                            &mut cring,
+                            None,
+                        );
+                    }
+                    if !aud_block[t].is_empty() {
+                        midi_ev.extend_from_slice(&aud_block[t]);
+                    }
+                }
+                let cp_ev = !midi_ev.is_empty();
+                has_ev |= cp_ev;
+                ring = ring.max(cring);
+                if !cp_ev && !always && !midi_sustain[t] && !holding {
+                    continue;
+                }
+                let handle = match copies[ci].clone().or_else(|| {
+                    // Only copy 0 may fall back to the live handle (a
+                    // spawn failure keeps the lane audible as a merged
+                    // stream); a SECOND copy rendering through the live
+                    // instance would stage its events twice.
+                    if ci == 0 {
+                        synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone())
+                    } else {
+                        None
+                    }
+                }) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                midi_ev.sort_unstable();
+                midi_ev.dedup();
+                match handle.as_ref() {
+                    SynthHandle::Script(inst) => {
+                        let gen = inst.param_gen();
+                        if gen != synth_pg[t] {
+                            inst.read_params(synth_p);
+                            synth_pg[t] = gen;
+                        }
+                        if cp_ev {
+                            unsafe { inst.process_into(&mut [], synth_p) };
+                        }
+                        mono.clear();
+                        mono.resize(block_n, 0.0);
+                        let mut cur = 0usize;
+                        let mut i = 0usize;
+                        while i < midi_ev.len() {
+                            let off = midi_ev[i].0.min(block_n);
+                            if off > cur {
+                                // SAFETY: single-threaded here; one instance, one call.
+                                unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
+                                cur = off;
+                            }
+                            while i < midi_ev.len() && midi_ev[i].0 == off {
+                                let (_, kind, ch, d1, d2) = midi_ev[i];
+                                match kind {
+                                    0 => inst.note_off(ch, d1),
+                                    1 => inst.cc(ch, d1, d2),
+                                    2 => inst.press(ch, d2),
+                                    4 | 5 => {}
+                                    _ => inst.note_on(ch, d1, d2),
+                                }
+                                i += 1;
+                            }
+                        }
+                        if cur < block_n {
+                            unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
+                        }
+                        for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
+                            *r += *m;
+                        }
+                    }
+                    SynthHandle::Vst(e) => {
+                        sil.clear();
+                        sil.resize(block_n, 0.0);
+                        mono2.clear();
+                        mono2.resize(block_n, 0.0);
+                        evq.clear();
+                        for &(_off, kind, ch, d1, d2) in midi_ev.iter() {
+                            let m = match kind {
+                                0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
+                                1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                                2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+                                4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                                5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+                                _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+                            };
+                            evq.push(((_off).min(block_n), m));
+                        }
+                        e.process_with_midi(&sil[..block_n], &mut mono2[..block_n], evq);
+                        for (r, m) in row[..block_n].iter_mut().zip(mono2[..block_n].iter()) {
+                            *r += *m;
+                        }
+                    }
+                }
+            }
+            let peak = row[..block_n].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            if has_ev || midi_sustain[t] || holding || peak >= MIDI_SILENCE_FLOOR {
+                midi_live[t] = true;
+                any = true;
+            }
+            midi_ring_to[t] = ring;
+            if has_ev {
+                midi_sustain[t] = true;
+                midi_quiet[t] = 0;
+            }
+            if ring <= span_end && live_notes[t].max(0) == 0 && aud_held[t] <= 0 {
                 if peak < MIDI_SILENCE_FLOOR {
                     midi_quiet[t] = midi_quiet[t].saturating_add(1);
                     if midi_quiet[t] >= MIDI_QUIET_BLOCKS {
@@ -4060,6 +4379,17 @@ struct Proc {
     synth_pg: [u64; MAX_LOOPS],
     /// Reusable mono render buffer for one track's synth block.
     mono: Vec<f32>,
+    /// v46: second mono buffer — the POLY pass renders one synth copy at
+    /// a time into it and sums into the track row.
+    mono2: Vec<f32>,
+    /// v46: per-track snapshot of the LIVE instance's script param
+    /// generation; when it moves, every script copy of that track gets
+    /// the new values pushed (copies stay honest to the patch you dialed).
+    poly_pg: [u64; MAX_LOOPS],
+    /// v46: RT snapshot of the engine's per-track poly copy rows
+    /// (refreshed on `poly_gen`, gen-swap like every other table).
+    poly_cache: Arc<Vec<Vec<Option<Arc<SynthHandle>>>>>,
+    poly_cache_gen: u64,
     /// Reusable zero input for driving a VSTi with no audio side-chain.
     sil: Vec<f32>,
     /// v33: (block offset, status message) stream encoded for
@@ -4565,6 +4895,14 @@ impl ProcessHandler for Proc {
                     .try_lock()
                     .ok()
                     .and_then(|d| d.clone());
+            }
+        }
+        // v46: poly copy rows ride the same gen-swap discipline.
+        let pg = self.engine.poly_gen();
+        if pg != self.poly_cache_gen {
+            if let Ok(p) = self.engine.poly_voices.try_lock() {
+                self.poly_cache = p.clone();
+                self.poly_cache_gen = pg;
             }
         }
         let mg = self.engine.midi_gen();
@@ -6665,10 +7003,10 @@ mod tests {
         let mut ev = Vec::new();
         let mut ring = 0u64;
         stage_track_events(
-            0, &arr, &cache, &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring,
+            0, &arr, &cache, &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring, None,
         );
         stage_track_events(
-            1, &arr, &cache, &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring,
+            1, &arr, &cache, &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring, None,
         );
         ev.sort_unstable();
         let doubled = ev.len();
@@ -6686,7 +7024,7 @@ mod tests {
         let held = vec![(9usize, 3u8, 2u8, 70u8, 90u8)];
         let mut ev = Vec::new();
         stage_track_events(
-            4, &arr, &cache, &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring,
+            4, &arr, &cache, &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring, None,
         );
         assert_eq!(ev, vec![(9, 3, 2, 70, 90)]);
     }
@@ -6842,6 +7180,117 @@ mod tests {
         assert_eq!(e.audition_snapshot().len(), 2, "PV pseudo-slot accepts voices");
         e.stop_audition();
         assert!(e.audition_snapshot().is_empty(), "stop purges the pool");
+    }
+
+    /// Helper for the v46 poly pins: a 2-lane / 2-note arrangement.
+    fn v46_poly_arrangement(second_lane_only: Option<bool>) -> crate::arrange::Arrangement {
+        use crate::arrange::{Clip, Lane};
+        let mut arr = crate::arrange::Arrangement::new();
+        let clip = |a: u32| Clip::new(a, 0);
+        match second_lane_only {
+            Some(true) => {
+                arr.tracks[0].lanes = vec![Lane { clips: vec![clip(1)] }];
+            }
+            Some(false) => {
+                arr.tracks[0].lanes = vec![Lane { clips: vec![clip(0)] }];
+            }
+            None => {
+                arr.tracks[0].lanes =
+                    vec![Lane { clips: vec![clip(0)] }, Lane { clips: vec![clip(1)] }];
+            }
+        }
+        arr
+    }
+
+    /// v46: a fresh master instance of the bundled piano, bound as track
+    /// 0's instrument (a bare Engine has no default synth).
+    fn v46_piano_master() -> Arc<SynthHandle> {
+        let reg = crate::synth::Registry::open(crate::synth::default_dir());
+        Arc::new(SynthHandle::Script(
+            reg.create_instance("piano", 44100.0, &[])
+                .expect("bundled piano must compile and load"),
+        ))
+    }
+
+    fn poly_row(e: &Engine, t: usize) -> usize {
+        e.poly_voices().get(t).map(|r| r.len()).unwrap_or(0)
+    }
+
+    fn v46_poly_patterns() -> Arc<Vec<Option<Arc<crate::midipat::Pattern>>>> {
+        use crate::midipat::{Note, Pattern};
+        let mut pa = Pattern::new(120);
+        pa.len_ticks = 480;
+        pa.notes.push(Note { ch: 0, note: 48, vel: 100, press: 0, start: 0, len: 240 });
+        let mut pb = Pattern::new(120);
+        pb.len_ticks = 480;
+        pb.notes.push(Note { ch: 0, note: 55, vel: 90, press: 0, start: 0, len: 240 });
+        Arc::new(vec![Some(Arc::new(pa)), Some(Arc::new(pb))])
+    }
+
+    /// v46: the per-track poly mode flag + copy row publish atomically,
+    /// keep published handles, and die with the mode.
+    #[test]
+    fn v46_poly_row_publishes_and_clears() {
+        let e = Engine::new();
+        assert!(!e.poly_on(0) && poly_row(&e, 0) == 0, "mono by default");
+        let master = v46_piano_master();
+        e.set_track_synth(0, Some(master.clone()));
+        let copies: Vec<Option<Arc<SynthHandle>>> = (0..2)
+            .map(|_| spawn_synth_copy(&master, 44100))
+            .collect();
+        let keep = copies[0].clone();
+        e.set_track_poly(0, true, copies);
+        assert!(e.poly_on(0));
+        assert_eq!(poly_row(&e, 0), 2, "one copy per child lane");
+        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(None)), 22050);
+        assert!(
+            std::sync::Arc::ptr_eq(
+                e.poly_voices()[0][0].as_ref().unwrap(),
+                keep.as_ref().unwrap()
+            ),
+            "re-publishing the project keeps the copies (no respawn churn)"
+        );
+        e.set_track_poly(0, false, Vec::new());
+        assert!(!e.poly_on(0) && poly_row(&e, 0) == 0, "mono clears the row");
+    }
+
+    /// v46 R2: exporting a POLY track must equal the per-lane renders
+    /// summed (each lane through its own synth), while the monophonic
+    /// export keeps the historic single-instance merged rendering.
+    #[test]
+    fn v46_poly_export_equals_sum_of_lane_renders() {
+        let n = 22050usize;
+        let e = Engine::new();
+        e.set_midi_assets(v46_poly_patterns());
+        e.set_track_on(0, true);
+        let master = v46_piano_master();
+        e.set_track_synth(0, Some(master.clone()));
+        // Per-lane references (monophonic renders).
+        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(Some(false))), n as u64);
+        let a = e.render_tracks(Some(0), n).expect("lane A renders");
+        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(Some(true))), n as u64);
+        let b = e.render_tracks(Some(0), n).expect("lane B renders");
+        // Both lanes, monophonic: one shared instance (historic).
+        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(None)), n as u64);
+        let mono = e.render_tracks(Some(0), n).expect("mono renders");
+        // POLY: two fresh copies render one lane each; the sum must match
+        // A + B (the synth is linear, so lane renders add exactly).
+        let master = v46_piano_master();
+        e.set_track_synth(0, Some(master.clone()));
+        let copies: Vec<Option<Arc<SynthHandle>>> = (0..2)
+            .map(|_| spawn_synth_copy(&master, 44100))
+            .collect();
+        e.set_track_poly(0, true, copies);
+        let poly = e.render_tracks(Some(0), n).expect("poly renders");
+        assert_eq!(poly.len(), mono.len());
+        let mut max = 0.0f32;
+        let mut drift = 0.0f32;
+        for i in 0..n {
+            max = max.max(mono[i].abs()).max(poly[i].abs());
+            drift = drift.max((poly[i] - (a[i] + b[i])).abs());
+        }
+        assert!(drift < 1e-4 * (1.0 + max), "poly export drift {drift} (max {max})");
+        assert!(max > 0.01, "the renders must actually sound");
     }
 
     #[test]

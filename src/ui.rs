@@ -1226,6 +1226,11 @@ pub struct App {
     /// Live handles (mirrors `track_synth`; also pushed into the engine).
     /// VST instruments are first-class synths, so this holds both kinds.
     track_synth_inst: Vec<Option<Arc<crate::audio::SynthHandle>>>,
+    /// v46: per-track mono/poly synth mode (default false = monophonic:
+    /// every child lane feeds the track's ONE synth). ON = each child lane
+    /// renders through its own headless copy (published RT-side by
+    /// `refresh_poly_voices`); same track chain either way.
+    track_poly: Vec<bool>,
     /// Track whose synth sliders window is open.
     synth_win: Option<usize>,
     /// v18: files dropped from the OS file manager into the window,
@@ -1714,6 +1719,7 @@ impl App {
             track_synth,
             track_synth_params,
             track_synth_inst,
+            track_poly: vec![false; MAX_LOOPS],
             synth_win: None,
             os_drops: Vec::new(),
             synth_pick: None,
@@ -2143,6 +2149,11 @@ impl App {
         // Ctrl+D duplicates the selection at the playhead (documented).
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
             self.duplicate_selection();
+            return;
+        }
+        // v46: Ctrl+M merges the selected clips (one kind) into one asset.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::M)) {
+            self.merge_selection();
             return;
         }
         // Bare S splits the selection at the playhead (plain keyboard only:
@@ -3701,6 +3712,61 @@ impl App {
         }
     }
 
+    /// v46: (re)publish track `t`'s POLY copy row: one exact headless copy
+    /// of its configured synth per child lane (cap 12 — lanes beyond the
+    /// row share copy 0, the historic merged behaviour). Scripts respawn
+    /// cheaply and stay param-synced RT-side; VST copies are private
+    /// plugin instances opened with the host-visible params.
+    fn refresh_poly_voices(&mut self, t: usize) {
+        if t >= MAX_LOOPS {
+            return;
+        }
+        if !self.track_poly.get(t).copied().unwrap_or(false) {
+            self.backend.engine.set_track_poly(t, false, Vec::new());
+            return;
+        }
+        let sr = self.sample_rate.max(1);
+        let handle = self
+            .track_synth_inst
+            .get(t)
+            .cloned()
+            .flatten()
+            .or_else(|| self.backend.engine.default_synth());
+        let n = self.arr.tracks[t].lanes.len().max(1).min(12);
+        let voices: Vec<Option<Arc<crate::audio::SynthHandle>>> = match handle.as_ref() {
+            Some(h) => (0..n)
+                .map(|_| crate::audio::spawn_synth_copy(h, sr))
+                .collect(),
+            None => Vec::new(),
+        };
+        if voices.iter().any(|v| v.is_some()) {
+            self.backend.engine.set_track_poly(t, true, voices);
+        } else {
+            // Nothing could be spawned: keep the mono path, don't
+            // publish a row of holes.
+            self.backend.engine.set_track_poly(t, false, Vec::new());
+        }
+    }
+
+    /// v46: make every poly track's published copy row match its current
+    /// instrument + lane count (spawn only when the shape actually moved —
+    /// a script spawn compiles source).
+    fn poly_reconcile(&mut self) {
+        let snap = self.backend.engine.poly_voices();
+        for t in 0..self.n_tracks.min(MAX_LOOPS) {
+            let poly = self.track_poly.get(t).copied().unwrap_or(false);
+            let have = snap.get(t).map(|r| r.len()).unwrap_or(0);
+            let want = if poly {
+                self.arr.tracks[t].lanes.len().max(1).min(12)
+            } else {
+                0
+            };
+            if have != want || poly != (have > 0) {
+                self.refresh_poly_voices(t);
+            }
+        }
+    }
+
     fn push_project(&mut self) {
         let table: Arc<Vec<Arc<[f32]>>> =
             Arc::new(self.assets.iter().map(|a| a.data.clone()).collect());
@@ -3727,6 +3793,9 @@ impl App {
         }
         // "current longest" / "whole song" regions follow the arrangement.
         self.send_loop_region();
+        // v46: child lanes may have moved; poly copy rows follow the
+        // arrangement shape (no-op when nothing diverged).
+        self.poly_reconcile();
     }
 
     // ---- selection + clipboard ------------------------------------------------
@@ -3906,6 +3975,209 @@ impl App {
         }
         self.clipboard_copy();
         self.clipboard_paste();
+    }
+
+    /// v46: Merge selected clips of one kind (all audio, or all MIDI)
+    /// into a single NEW asset, laid out exactly as they sit on the grid:
+    /// the result spans earliest clip start → latest clip end, overlapping
+    /// content ADDS sample-for-sample, gaps stay silent. MIDI stays MIDI
+    /// (events time-shifted by each clip's timeline position, first
+    /// clip's tempo as the grid), audio stays audio (raw samples summed,
+    /// per-clip gain + fades baked in). The selection is replaced by the
+    /// one merged clip at the earliest position, on the earliest clip's
+    /// lane.
+    fn merge_selection(&mut self) {
+        if self.sel_clips.len() < 2 {
+            self.status = "merge: select two or more clips first".into();
+            return;
+        }
+        let mut ids = self.sel_clips.clone();
+        ids.sort();
+        // Resolve and type-check the selection up front.
+        let mut resolved: Vec<(usize, usize, usize, crate::arrange::Clip)> = Vec::new();
+        let mut kind: Option<bool> = None; // Some(true) = MIDI, Some(false) = audio
+        for &(t, k, c) in &ids {
+            let Some(cl) = self
+                .arr
+                .tracks
+                .get(t)
+                .and_then(|tr| tr.lanes.get(k))
+                .and_then(|ln| ln.clips.get(c))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(a) = self.assets.get(cl.asset as usize) else {
+                continue;
+            };
+            if a.automation.is_some() {
+                self.status = "merge: automation clips cannot be merged".into();
+                return;
+            }
+            let is_midi = a.pattern.is_some();
+            match kind {
+                Some(k0) if k0 != is_midi => {
+                    self.status = "merge: clips must all be audio or all MIDI".into();
+                    return;
+                }
+                None => kind = Some(is_midi),
+                _ => {}
+            }
+            resolved.push((t, k, c, cl));
+        }
+        if resolved.len() < 2 {
+            self.status = "merge: select two or more clips first".into();
+            return;
+        }
+        let is_midi = kind.unwrap_or(false);
+        let base = resolved.iter().map(|x| x.3.pos).min().unwrap_or(0);
+        let (ht, hk) = resolved
+            .iter()
+            .min_by_key(|x| (x.3.pos, x.0, x.1))
+            .map(|x| (x.0, x.1))
+            .unwrap_or((0, 0));
+        let names: Vec<String> = resolved
+            .iter()
+            .filter_map(|x| self.assets.get(x.3.asset as usize).map(|a| a.name.clone()))
+            .collect();
+        let mut name = names.join(" + ");
+        if name.chars().count() > 48 {
+            name = name.chars().take(48).collect();
+            name.push('…');
+        }
+        let sr = self.backend.engine.sample_rate().max(1);
+        let new_id = self.assets.len() as u32;
+        if is_midi {
+            use crate::midipat::{Bend, Cc, Note, Pattern, Poly, Press, PPQ};
+            // Grid tempo = the EARLIEST clip's pattern tempo.
+            let bpm0 = resolved
+                .iter()
+                .min_by_key(|x| (x.3.pos, x.1, x.2))
+                .and_then(|x| self.assets.get(x.3.asset as usize))
+                .and_then(|a| a.pattern.as_ref())
+                .map(|p| p.bpm.max(1))
+                .unwrap_or(120);
+            let tick_s = |tick: u32, bpm: u16| {
+                tick as f64 * 60.0 / bpm.max(1) as f64 / PPQ as f64 * sr as f64
+            };
+            let s_tick = |s: f64| {
+                ((s / sr as f64) * bpm0 as f64 / 60.0 * PPQ as f64)
+                    .round()
+                    .max(0.0) as u32
+            };
+            let mut out = Pattern::new(bpm0);
+            out.len_ticks = (PPQ as u32) * 4;
+            for (.., cl) in &resolved {
+                let Some(pat) = self
+                    .assets
+                    .get(cl.asset as usize)
+                    .and_then(|a| a.pattern.clone())
+                else {
+                    continue;
+                };
+                let alen = self.asset_len(cl.asset);
+                let w0 = cl.data_start() as f64;
+                let w1 = cl.data_end(alen).max(cl.data_start()) as f64;
+                for n in pat.notes.iter() {
+                    let at = (cl.pos as f64) + tick_s(n.start, pat.bpm);
+                    if at < w0 || at >= w1 {
+                        continue; // trimmed away by the clip edges
+                    }
+                    let st = s_tick(at - base as f64);
+                    out.notes.push(Note { start: st, ..n.clone() });
+                    out.len_ticks = out.len_ticks.max(st + n.len + 1);
+                }
+                for e in pat.ccs.iter() {
+                    let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
+                    if at >= w0 && at < w1 {
+                        out.ccs.push(Cc { at: s_tick(at - base as f64), ..*e });
+                    }
+                }
+                for e in pat.press.iter() {
+                    let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
+                    if at >= w0 && at < w1 {
+                        out.press.push(Press { at: s_tick(at - base as f64), ..*e });
+                    }
+                }
+                for e in pat.bends.iter() {
+                    let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
+                    if at >= w0 && at < w1 {
+                        out.bends.push(Bend { at: s_tick(at - base as f64), ..*e });
+                    }
+                }
+                for e in pat.polys.iter() {
+                    let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
+                    if at >= w0 && at < w1 {
+                        out.polys.push(Poly { at: s_tick(at - base as f64), ..*e });
+                    }
+                }
+            }
+            out.sort();
+            let id = self.assets.len() as u32;
+            self.assets
+                .push(Asset::midi(id, name, std::path::PathBuf::new(), Arc::new(out), true));
+        } else {
+            // Audio: sum the laid-out slices, clip gain + fades baked in
+            // (exact same windows/fade law the mix render uses).
+            let end = resolved
+                .iter()
+                .map(|x| x.3.end(self.asset_len(x.3.asset)))
+                .max()
+                .unwrap_or(0);
+            let len = end.saturating_sub(base);
+            if len == 0 || len > (1u64 << 31) {
+                self.status = "merge: the selection is empty or absurdly long".into();
+                return;
+            }
+            let mut buf = vec![0.0f32; len as usize];
+            for (.., cl) in &resolved {
+                let data = match self.assets.get(cl.asset as usize) {
+                    Some(a) if !a.data.is_empty() => a.data.clone(),
+                    _ => continue,
+                };
+                let alen = data.len() as u64;
+                let dstart = cl.data_start();
+                let dend = cl.data_end(alen).min(cl.end(alen)).max(dstart);
+                for j in dstart..dend {
+                    let k = j.saturating_sub(base);
+                    if k >= len {
+                        continue;
+                    }
+                    let s = data[(cl.cut + (j - dstart)) as usize];
+                    buf[k as usize] += s * cl.gain * cl.fade_at(j, alen);
+                }
+            }
+            let id = self.assets.len() as u32;
+            self.assets.push(Asset::audio(
+                id,
+                name,
+                std::path::PathBuf::new(),
+                Arc::from(buf.into_boxed_slice()),
+                true,
+            ));
+        }
+        // Replace the selection with the one merged clip.
+        for (t, k, c) in ids.iter().rev() {
+            self.arr.remove_clip(*t, *k, *c);
+        }
+        self.arr.insert(ht, hk, crate::arrange::Clip::new(new_id, base));
+        let idx = self.arr.tracks[ht].lanes[hk]
+            .clips
+            .iter()
+            .position(|c| c.asset == new_id)
+            .unwrap_or(0);
+        self.sel_clips = vec![(ht, hk, idx)];
+        self.sel_anchor = self.sel_clips.first().copied();
+        self.push_project();
+        self.status = format!(
+            "merged {} clips \u{b7} {} \u{201c}{}\u{201d}",
+            resolved.len(),
+            if is_midi { "MIDI" } else { "audio" },
+            self.assets
+                .get(new_id as usize)
+                .map(|a| a.name.clone())
+                .unwrap_or_default()
+        );
     }
 
     /// Ctrl+C: copy the whole selection as a group (track offsets from the
@@ -4579,6 +4851,9 @@ impl App {
             synth: inst.clone(),
         });
         self.track_synth_inst[t] = inst;
+        // v46: poly copies are copies OF this instrument — rebinding
+        // re-copies them (no-op when the track is monophonic).
+        self.refresh_poly_voices(t);
     }
 
     /// The fully synchronous rebuild — required by callers whose result
@@ -4646,6 +4921,7 @@ impl App {
             synth: inst.clone(),
         });
         self.track_synth_inst[t] = inst;
+        self.refresh_poly_voices(t);
         true
     }
 
@@ -10562,6 +10838,7 @@ impl App {
                 gain: self.trk_gain[t],
                 pan: self.trk_pan[t],
                 on: self.backend.engine.track_on(t),
+                poly: self.track_poly.get(t).copied().unwrap_or(false),
                 fx: self.fx_rows[t]
                     .iter()
                     .filter_map(|r| match r {
@@ -10879,6 +11156,11 @@ impl App {
                 self.backend.engine.set_loop_gain(t, gain_amp(pt.gain));
                 self.backend.engine.set_loop_pan(t, pan01(pt.pan));
                 self.backend.cmd(Cmd::SetTrackOn { i: t, on: pt.on });
+                // v46: mono/poly synth mode (copies get (re)spawned once
+                // the patch section has bound the instrument — the rebind
+                // hook does; a stale-free no-op until then).
+                self.track_poly[t] = pt.poly;
+                self.refresh_poly_voices(t);
             }
             while arr.tracks[t].lanes.len() < pt.lanes.len() {
                 arr.tracks[t].add_lane();
@@ -16790,6 +17072,45 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 ui.close();
             }
         });
+        // v46: mono/poly synth mode. MONO (default, the historic
+        // behaviour): every child lane feeds the track's ONE synth.
+        // POLY: every child lane renders through its OWN exact copy of
+        // this instrument (copies stay param-synced; the summed output
+        // still runs through the SAME track effect chain).
+        let poly = app.track_poly.get(t).copied().unwrap_or(false);
+        let ptxt = if poly { "poly" } else { "mono" };
+        let pbtn = egui::Button::new(
+            RichText::new(ptxt).color(if poly {
+                Color32::from_rgb(150, 220, 150)
+            } else {
+                Color32::from_rgb(150, 150, 150)
+            }),
+        )
+        .small()
+        .min_size(egui::vec2(38.0, 0.0));
+        if ui
+            .add(pbtn)
+            .on_hover_text(
+                "Synth mode: mono = every child lane feeds the track's ONE synth \
+                 (default). poly = every child lane gets its OWN copy of this \
+                 instrument; the copies sum and still run through this track's \
+                 effect chain. Extra lanes past 12 share the last copy.",
+            )
+            .clicked()
+        {
+            app.track_poly[t] = !poly;
+            app.refresh_poly_voices(t);
+            app.push_project();
+            app.status = format!(
+                "track {} synth: {}",
+                t + 1,
+                if !poly {
+                    "POLYPHONIC \u{b7} one synth copy per child lane"
+                } else {
+                    "monophonic \u{b7} one shared synth for all lanes"
+                }
+            );
+        }
     }
 }
 
@@ -18915,6 +19236,22 @@ fn grid_context_menu(
         if ui.button("Duplicate  (Ctrl+D)").clicked() {
             app.duplicate_selection();
             ui.close();
+        }
+        // v46: merge the whole selection (one kind) into a single asset.
+        if app.sel_clips.len() >= 2 {
+            if ui
+                .button("Merge into one asset  (Ctrl+M)")
+                .on_hover_text(
+                    "Merge every selected clip into ONE new asset, laid out \
+                     exactly as it sits: earliest start to latest end, \
+                     overlaps add, gaps stay silent. All clips must be the \
+                     same kind (audio or MIDI); the originals are replaced.",
+                )
+                .clicked()
+            {
+                app.merge_selection();
+                ui.close();
+            }
         }
         if ui.button("Delete  (Del)").clicked() {
             app.delete_selection();
@@ -35378,5 +35715,166 @@ mod tests {
         );
         assert!(galley_at(&mut app, &ctx, "LRA").is_none(), "LRA folded when narrow");
         assert!(galley_at(&mut app, &ctx, "reset I").is_some(), "controls survive");
+    }
+
+    /// v46: merging audio clips sums them AT THEIR POSITIONS — overlap
+    /// adds, a gap stays silent, the span is earliest→latest, and the
+    /// selection becomes the one merged clip.
+    #[test]
+    fn v46_merge_audio_adds_at_layout() {
+        use crate::assets::Asset;
+        let mut app = headless_app("v46mrg1");
+        let mk = |app: &mut App, name: &str, data: Vec<f32>| -> u32 {
+            let id = app.assets.len() as u32;
+            app.assets.push(Asset::audio(
+                id,
+                name.into(),
+                std::path::PathBuf::new(),
+                data.into(),
+                false,
+            ));
+            id
+        };
+        let a0 = mk(&mut app, "a", vec![1.0, 1.0, 1.0]);
+        let a1 = mk(&mut app, "b", vec![0.5, 0.5]);
+        app.arr.insert(0, 0, crate::arrange::Clip::new(a0, 0));
+        app.arr.insert(0, 1, crate::arrange::Clip::new(a1, 2)); // overlap
+        let b2 = mk(&mut app, "c", vec![0.25, 0.25]);
+        app.arr.insert(0, 2, crate::arrange::Clip::new(b2, 10)); // gap after
+        app.sel_clips = vec![(0, 2, 0), (0, 1, 0), (0, 0, 0)];
+        app.merge_selection();
+        let merged = app.assets.last().unwrap();
+        assert!(merged.pattern.is_none(), "audio merge stays audio");
+        assert_eq!(merged.data.len(), 12, "earliest start to latest end");
+        assert_eq!(
+            merged.data.as_ref(),
+            &[1.0, 1.0, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.25],
+            "overlaps add, the gap is silence"
+        );
+        let n_clips: usize = app.arr.tracks[0].lanes.iter().map(|l| l.clips.len()).sum();
+        assert_eq!(n_clips, 1, "the selection was replaced by the merged clip");
+        assert_eq!(app.sel_clips.len(), 1);
+    }
+
+    /// v46: merging MIDI clips stays MIDI — later clips' events shift by
+    /// their timeline offset at the grid tempo.
+    #[test]
+    fn v46_merge_midi_offsets_events() {
+        use crate::assets::Asset;
+        use crate::midipat::{Note, Pattern, PPQ};
+        let mut app = headless_app("v46mrg2");
+        app.backend.engine.set_sample_rate(44100);
+        let sr = app.backend.engine.sample_rate().max(1) as u64;
+        let mk = |app: &mut App, name: &str, note: u8| -> u32 {
+            let mut p = Pattern::new(120);
+            p.notes.push(Note { ch: 0, note, vel: 100, press: 0, start: 0, len: PPQ as u32 });
+            let id = app.assets.len() as u32;
+            app.assets.push(Asset::midi(
+                id,
+                name.into(),
+                std::path::PathBuf::new(),
+                std::sync::Arc::new(p),
+                false,
+            ));
+            id
+        };
+        let m0 = mk(&mut app, "one", 60);
+        let m1 = mk(&mut app, "two", 64);
+        app.arr.insert(0, 0, crate::arrange::Clip::new(m0, 0));
+        // Half a second later: at 120 BPM that is a full beat (PPQ ticks).
+        app.arr.insert(0, 1, crate::arrange::Clip::new(m1, sr / 2));
+        app.sel_clips = vec![(0, 1, 0), (0, 0, 0)];
+        app.merge_selection();
+        let merged = app.assets.last().unwrap();
+        let pat = merged.pattern.as_ref().expect("MIDI merge stays MIDI");
+        assert_eq!(pat.notes.len(), 2);
+        assert_eq!(pat.notes[0].note, 60);
+        assert_eq!(pat.notes[0].start, 0);
+        assert_eq!(pat.notes[1].note, 64);
+        assert!(
+            (pat.notes[1].start as i64 - PPQ as i64).abs() <= 1,
+            "second clip's note lands a beat in, got {}",
+            pat.notes[1].start
+        );
+        assert!(pat.len_ticks >= PPQ as u32 * 2);
+    }
+
+    /// v46: mixing kinds refuses cleanly — no new asset, selection intact.
+    #[test]
+    fn v46_merge_rejects_mixed_kinds() {
+        use crate::assets::Asset;
+        use crate::midipat::Pattern;
+        let mut app = headless_app("v46mrg3");
+        let a0 = app.assets.len() as u32;
+        app.assets.push(Asset::audio(
+            a0,
+            "a".into(),
+            std::path::PathBuf::new(),
+            vec![1.0; 4].into(),
+            false,
+        ));
+        let m0 = app.assets.len() as u32;
+        app.assets.push(Asset::midi(
+            m0,
+            "m".into(),
+            std::path::PathBuf::new(),
+            std::sync::Arc::new(Pattern::new(120)),
+            false,
+        ));
+        app.arr.insert(0, 0, crate::arrange::Clip::new(a0, 0));
+        app.arr.insert(0, 1, crate::arrange::Clip::new(m0, 4));
+        app.sel_clips = vec![(0, 1, 0), (0, 0, 0)];
+        let before = app.assets.len();
+        app.merge_selection();
+        assert_eq!(app.assets.len(), before, "nothing was merged");
+        assert!(app.status.contains("audio or all MIDI"), "status: {}", app.status);
+        let n_clips: usize = app.arr.tracks[0].lanes.iter().map(|l| l.clips.len()).sum();
+        assert_eq!(n_clips, 2, "the selection survived the refusal");
+    }
+
+    /// v46: turning POLY on a track publishes one headless copy of its
+    /// instrument per lane; the copy row follows lane changes through
+    /// `poly_reconcile` and dies with the mode.
+    #[test]
+    fn v46_app_poly_row_follows_lanes_and_mode() {
+        use crate::audio::SynthHandle;
+        use crate::synth::Registry;
+        let mut app = headless_app("v46poly1");
+        app.backend.engine.set_sample_rate(44100);
+        let reg = Registry::open(crate::synth::default_dir());
+        let inst = reg
+            .create_instance("piano", 44100.0, &[])
+            .expect("bundled piano must compile and load");
+        app.track_synth_inst[0] = Some(std::sync::Arc::new(SynthHandle::Script(inst)));
+        let row_len = |app: &App| {
+            app.backend.engine.poly_voices().get(0).map(|r| r.len()).unwrap_or(0)
+        };
+        // MONO (default): nothing published.
+        assert_eq!(row_len(&app), 0, "monophonic publishes nothing");
+        // POLY with three lanes: three exact copies.
+        while app.arr.tracks[0].lanes.len() < 3 {
+            app.arr.tracks[0].add_lane();
+        }
+        app.track_poly[0] = true;
+        app.refresh_poly_voices(0);
+        assert_eq!(row_len(&app), 3, "one copy per lane");
+        // Reconciling an unchanged shape must not respawn (compile churn).
+        let before = app.backend.engine.poly_voices()[0][0].clone();
+        app.poly_reconcile();
+        assert!(
+            std::sync::Arc::ptr_eq(
+                app.backend.engine.poly_voices()[0][0].as_ref().unwrap(),
+                before.as_ref().unwrap()
+            ),
+            "unchanged shape keeps the copies"
+        );
+        // A new lane grows the row on the next reconcile.
+        app.arr.tracks[0].add_lane();
+        app.poly_reconcile();
+        assert_eq!(row_len(&app), 4, "the row follows the lane count");
+        // Flipping back to mono clears the row.
+        app.track_poly[0] = false;
+        app.poly_reconcile();
+        assert_eq!(row_len(&app), 0, "mono clears the copy row");
     }
 }
