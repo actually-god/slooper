@@ -777,7 +777,7 @@ pub struct Engine {
     /// child lane `li` renders through copy `li` (lanes past the row share
     /// copy 0), and the copies' outputs sum before the SAME track chain.
     /// Spawned on the UI thread (`spawn_synth_copy`), published gen-swap.
-    poly_voices: std::sync::Mutex<Arc<Vec<Vec<Option<Arc<SynthHandle>>>>>>,
+    poly_voices: std::sync::Mutex<PolyTable>,
     poly_gen: AtomicU64,
     track_poly: [AtomicU8; MAX_LOOPS],
     default_synth: std::sync::Mutex<Option<Arc<SynthHandle>>>,
@@ -1488,7 +1488,7 @@ impl Engine {
     /// [`spawn_synth_copy`]). `on` false (or an empty row) restores the
     /// monophonic merge. The write is `try_lock` like every other table:
     /// the RT thread snapshots it on the gen bump and never blocks.
-    pub fn set_track_poly(&self, i: usize, on: bool, voices: Vec<Option<Arc<SynthHandle>>>) {
+    pub fn set_track_poly(&self, i: usize, on: bool, voices: PolyRow) {
         if i >= MAX_LOOPS {
             return;
         }
@@ -1511,7 +1511,7 @@ impl Engine {
             .map(|a| a.load(Ordering::Relaxed) != 0)
             .unwrap_or(false)
     }
-    pub fn poly_voices(&self) -> Arc<Vec<Vec<Option<Arc<SynthHandle>>>>> {
+    pub fn poly_voices(&self) -> PolyTable {
         self.poly_voices.lock().unwrap().clone()
     }
     pub fn poly_gen(&self) -> u64 {
@@ -2975,6 +2975,11 @@ fn spawn_entry_private(
 /// roll auditions and POLY child-lane synths render through. NEVER call it
 /// on the realtime thread: the VST branch loads a plugin (under the
 /// process-wide loader lock).
+/// v46: a track's poly voice row and the published whole-table snapshot.
+pub type PolyRow = Vec<Option<Arc<SynthHandle>>>;
+/// The gen-swapped poly table: one [`PolyRow`] per track.
+pub type PolyTable = std::sync::Arc<Vec<PolyRow>>;
+
 pub fn spawn_synth_copy(h: &SynthHandle, sr: u32) -> Option<Arc<SynthHandle>> {
     match h {
         SynthHandle::Script(i) => i.spawn_fresh().map(|n| Arc::new(SynthHandle::Script(n))),
@@ -3271,7 +3276,7 @@ fn stage_track_events(
         if !pattern_run {
             break;
         }
-        if only_lane.map_or(false, |w| w != li) {
+        if only_lane.is_some_and(|w| w != li) {
             continue;
         }
         for cl in l.clips.iter() {
@@ -3529,7 +3534,7 @@ impl Proc {
                     // v46: a poly track's live instance may be silent while
                     // its copies (which can be plugins) run every block.
                     || (self.engine.poly_on(t)
-                        && self.poly_cache.get(t).map_or(false, |row| {
+                        && self.poly_cache.get(t).is_some_and(|row| {
                             row.iter().any(|c| {
                                 matches!(c.as_deref(), Some(SynthHandle::Vst(_)))
                             })
@@ -3874,7 +3879,8 @@ impl Proc {
                 row.clear();
                 row.resize(block_n, 0.0);
             }
-            for ci in 0..n_cp {
+            for (ci, copy) in copies.iter_mut().take(n_cp).enumerate() {
+                let _ = &copy;
                 midi_ev.clear();
                 let mut cring = 0u64;
                 if pattern_run {
@@ -3928,7 +3934,7 @@ impl Proc {
                 if !cp_ev && !always && !midi_sustain[t] && !holding {
                     continue;
                 }
-                let handle = match copies[ci].clone().or_else(|| {
+                let handle = match copy.clone().or_else(|| {
                     // Only copy 0 may fall back to the live handle (a
                     // spawn failure keeps the lane audible as a merged
                     // stream); a SECOND copy rendering through the live
@@ -4388,7 +4394,7 @@ struct Proc {
     poly_pg: [u64; MAX_LOOPS],
     /// v46: RT snapshot of the engine's per-track poly copy rows
     /// (refreshed on `poly_gen`, gen-swap like every other table).
-    poly_cache: Arc<Vec<Vec<Option<Arc<SynthHandle>>>>>,
+    poly_cache: PolyTable,
     poly_cache_gen: u64,
     /// Reusable zero input for driving a VSTi with no audio side-chain.
     sil: Vec<f32>,

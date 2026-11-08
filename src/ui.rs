@@ -978,7 +978,7 @@ pub struct App {
     side_wins: crate::config::SideWins,
     /// v35: dock state loaded from config, applied when a dynamic window
     /// registers its registry slot for the FIRST time this session.
-    dyn_seed: Vec<(DynKind, [i16; 3], [f32; 4])>,
+    dyn_seed: Vec<(DynKind, [i16; 3], [f32; 4], bool)>,
     side_dirty: bool,
     /// v30-batch-2 docking: window currently carried by a header drag
     /// (idx, grab offset), its live top-left, the live rect of every
@@ -1013,6 +1013,21 @@ pub struct App {
     /// merely renders it).
     win_menu: Option<(usize, [f32; 2])>,
     win_menu_armed: bool,
+    /// v47 R1: tab rects painted by `docked_head` THIS frame as
+    /// `(window idx, rect)`. The carry/tap/double-click passes map a
+    /// pointer over a tab strip onto the exact member (dragging a tab
+    /// pulls THAT window out, VSCode/FL muscle memory), because a tab
+    /// group's shared header rect cannot tell its members apart.
+    tab_rects: Vec<(usize, [f32; 4])>,
+    /// v47 R2: named window-layout templates (persisted) and the
+    /// capture-name box (transient).
+    win_layouts: Vec<crate::config::WinLayout>,
+    layout_name: String,
+    /// v47 R3: command palette — Some((query, selected row)), plus the
+    /// click-away arming flag (same v18 rule as `win_menu`: state is the
+    /// authority, the Window merely renders it).
+    palette: Option<(String, usize)>,
+    palette_armed: bool,
     /// v43 R5: SETTINGS search/chip filter (transient — never persisted).
     sett_filter: String,
     show_midi: bool,
@@ -1610,6 +1625,11 @@ impl App {
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
             dyn_seed: dyn_seed_for(&cfg.dyn_docks),
+            tab_rects: Vec::new(),
+            win_layouts: cfg.win_layouts.clone(),
+            layout_name: String::new(),
+            palette: None,
+            palette_armed: false,
             side_dirty: false,
             free_drag: None,
             drag_pos: [0.0; 2],
@@ -2070,6 +2090,19 @@ impl App {
         });
         if save {
             self.request_save(shift);
+        }
+
+        // v47 R3: Ctrl/Cmd+K — the command palette. Checked BEFORE the
+        // text-focus guard like save, because the toggle must also CLOSE
+        // the palette while its own query box holds the keyboard.
+        let pal = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K));
+        if pal {
+            if self.palette.take().is_some() {
+                self.palette_armed = false;
+            } else {
+                self.palette = Some((String::new(), 0));
+                self.palette_armed = false;
+            }
         }
 
         // Clip clipboard: Ctrl/Cmd+C copies the whole selection (a group of
@@ -3732,7 +3765,7 @@ impl App {
             .cloned()
             .flatten()
             .or_else(|| self.backend.engine.default_synth());
-        let n = self.arr.tracks[t].lanes.len().max(1).min(12);
+        let n = self.arr.tracks[t].lanes.len().clamp(1, 12);
         let voices: Vec<Option<Arc<crate::audio::SynthHandle>>> = match handle.as_ref() {
             Some(h) => (0..n)
                 .map(|_| crate::audio::spawn_synth_copy(h, sr))
@@ -3757,7 +3790,7 @@ impl App {
             let poly = self.track_poly.get(t).copied().unwrap_or(false);
             let have = snap.get(t).map(|r| r.len()).unwrap_or(0);
             let want = if poly {
-                self.arr.tracks[t].lanes.len().max(1).min(12)
+                self.arr.tracks[t].lanes.len().clamp(1, 12)
             } else {
                 0
             };
@@ -4084,7 +4117,7 @@ impl App {
                         continue; // trimmed away by the clip edges
                     }
                     let st = s_tick(at - base as f64);
-                    out.notes.push(Note { start: st, ..n.clone() });
+                    out.notes.push(Note { start: st, ..*n });
                     out.len_ticks = out.len_ticks.max(st + n.len + 1);
                 }
                 for e in pat.ccs.iter() {
@@ -4402,19 +4435,22 @@ impl App {
                         kind: w.kind.key(),
                         dock: w.dock,
                         rect: w.rect,
+                        tab_act: w.tab_act,
                     })
                     .collect();
-                for (k, d, r) in &self.dyn_seed {
+                for (k, d, r, t) in &self.dyn_seed {
                     if !self.dyn_wins.iter().any(|w| w.kind == *k) {
                         merged.push(crate::config::DynDock {
                             kind: k.key(),
                             dock: *d,
                             rect: *r,
+                            tab_act: *t,
                         });
                     }
                 }
                 merged
             },
+            win_layouts: self.win_layouts.clone(),
             theme: if self.light_theme { "light" } else { "dark" }.into(),
             mpe: self.mpe_on,
             shortcuts: (0..N_ACTIONS)
@@ -12701,6 +12737,9 @@ impl App {
         // v43 R2: the floating-title slot menu rides on top of EVERYTHING
         // (all windows have been drawn by now), like `value_popups`.
         win_menu_pass(ui, self);
+        // v47 R3: the command palette rides above the slot menu (only one
+        // is ever open, but the z-order must match the intent).
+        palette_pass(ui, self);
     }
 
     /// v35 R5: get-or-create the dock registry slot for a dynamic window.
@@ -12709,17 +12748,18 @@ impl App {
             self.dyn_wins[n].title = title;
             return 4 + n;
         }
-        let (dock, rect) = self
+        let (dock, rect, tab_act) = self
             .dyn_seed
             .iter()
-            .find(|(k, _, _)| *k == kind)
-            .map(|(_, d, r)| (*d, *r))
-            .unwrap_or(([0, 1, 0], [0.0; 4]));
+            .find(|(k, _, _, _)| *k == kind)
+            .map(|(_, d, r, t)| (*d, *r, *t))
+            .unwrap_or(([0, 1, 0], [0.0; 4], false));
         self.dyn_wins.push(DynWin {
             kind,
             title,
             dock,
             rect,
+            tab_act,
         });
         self.dock_rects.resize(4 + self.dyn_wins.len(), [0.0; 4]);
         self.dock_collapsed.resize(4 + self.dyn_wins.len(), false);
@@ -13201,7 +13241,28 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 let wresp = ui
                     .button("Windows")
                     .on_hover_text("Show / hide / re-dock any window; layout actions.");
-                egui::Popup::menu(&wresp).show(|ui| {
+                // v47: CloseOnClickOutside, NOT the menu default — the
+                // layout-name box is a TextEdit, and CloseOnClick would
+                // kill the popup the instant it is focused. Action buttons
+                // close themselves via ui.close(); checkboxes stay usable
+                // so two windows can be toggled in one visit.
+                egui::Popup::menu(&wresp)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                    // v47 R3: the palette is the keyboard path to
+                    // everything in this menu (and every settings
+                    // category) — offer it right where people look.
+                    if ui
+                        .button("search commands (Ctrl+K)\u{2026}")
+                        .on_hover_text(
+                            "one box: windows, layouts, settings categories.",
+                        )
+                        .clicked()
+                    {
+                        app.palette = Some((String::new(), 0));
+                        app.palette_armed = false;
+                        ui.close();
+                    }
                     if ui
                         .checkbox(&mut app.show_rack, "asset rack")
                         .on_hover_text("The asset browser / import panel.")
@@ -13235,6 +13296,75 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                         .changed()
                     {
                         app.save_config();
+                    }
+                    // v47 R3 C4: the OPEN-WINDOWS roster — every dynamic
+                    // window (plugin params, FX editor, chain, synth,
+                    // roll, automation, …) shows here with a live tick,
+                    // so a window that wandered off is findable by name.
+                    if win_count(app) > 4 {
+                        ui.separator();
+                        for i in 4..win_count(app) {
+                            let mut v = win_visible(app, i);
+                            let t = win_title(app, i);
+                            let cb = ui.checkbox(&mut v, t).on_hover_text(
+                                "uncheck to close it; re-check re-opens the \
+                                 generic windows (plugin editors reopen via \
+                                 their own command)",
+                            );
+                            if cb.changed() {
+                                set_visible(app, i, v);
+                                app.save_config();
+                            }
+                        }
+                    }
+                    ui.separator();
+                    // v47 R2: layout templates — capture this exact view,
+                    // switch back with one click (Ableton view templates).
+                    ui.label(RichText::new("layout templates").weak());
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.layout_name)
+                                .hint_text("new layout name\u{2026}")
+                                .desired_width(150.0),
+                        );
+                        if ui
+                            .button("capture")
+                            .on_hover_text(
+                                "Save every window's placement, size, tab \
+                                 group and visibility under this name.",
+                            )
+                            .clicked()
+                        {
+                            let name = if app.layout_name.trim().is_empty() {
+                                format!("layout {}", app.win_layouts.len() + 1)
+                            } else {
+                                app.layout_name.clone()
+                            };
+                            capture_win_layout(app, name);
+                            app.layout_name.clear();
+                            ui.close();
+                        }
+                    });
+                    for n in 0..app.win_layouts.len() {
+                        let name = app.win_layouts[n].name.clone();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(&name)
+                                .on_hover_text("Apply this layout now")
+                                .clicked()
+                            {
+                                apply_win_layout(app, &name);
+                                ui.close();
+                            }
+                            if ui
+                                .small_button("x")
+                                .on_hover_text("Delete this layout")
+                                .clicked()
+                            {
+                                app.win_layouts.remove(n);
+                                app.save_config();
+                            }
+                        });
                     }
                     ui.separator();
                     if ui
@@ -13880,6 +14010,8 @@ pub(crate) struct DynWin {
     /// primary windows' `side_wins.dock`.
     dock: [i16; 3],
     rect: [f32; 4],
+    /// v47 R1: active-tab flag (see `SideWins::prim_tab`).
+    tab_act: bool,
 }
 
 impl DynKind {
@@ -13927,13 +14059,13 @@ impl DynKind {
 /// right beside the MIXER dock, whose default is right/0) so the new
 /// master section starts literally next to the master strip. Once the
 /// user's config holds their own entry for "master", it wins.
-fn dyn_seed_for(docks: &[crate::config::DynDock]) -> Vec<(DynKind, [i16; 3], [f32; 4])> {
-    let mut seed: Vec<(DynKind, [i16; 3], [f32; 4])> = docks
+fn dyn_seed_for(docks: &[crate::config::DynDock]) -> Vec<(DynKind, [i16; 3], [f32; 4], bool)> {
+    let mut seed: Vec<(DynKind, [i16; 3], [f32; 4], bool)> = docks
         .iter()
-        .filter_map(|d| DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect)))
+        .filter_map(|d| DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect, d.tab_act)))
         .collect();
-    if !seed.iter().any(|(k, _, _)| *k == DynKind::Master) {
-        seed.push((DynKind::Master, [1, 1, 1], [520.0, 46.0, 560.0, 190.0]));
+    if !seed.iter().any(|(k, _, _, _)| *k == DynKind::Master) {
+        seed.push((DynKind::Master, [1, 1, 1], [520.0, 46.0, 560.0, 190.0], false));
     }
     seed
 }
@@ -14001,9 +14133,33 @@ fn win_dock_btn_rect(r: &[f32; 4]) -> egui::Rect {
     )
 }
 
+/// v47 R1: a slot identity (edge, order) may hold only ONE group — if
+/// another window already lives at `idx`'s new slot (e.g. a re-dock into
+/// a "last used" spot that got occupied meanwhile), bump `idx` to the
+/// edge's free tail instead of merging into a stranger's tabs by accident.
+fn dedupe_slot(app: &mut App, idx: usize) {
+    let (e, o) = (dock_edge(app, idx), dock_order(app, idx));
+    let clash = (0..win_count(app))
+        .any(|i| i != idx && is_docked(app, i) && dock_edge(app, i) == e && dock_order(app, i) == o);
+    if !clash {
+        return;
+    }
+    let maxo = (0..win_count(app))
+        .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == e)
+        .map(|i| dock_order(app, i))
+        .max()
+        .unwrap_or(0);
+    if idx < 4 {
+        app.side_wins.dock[idx][2] = maxo + 1;
+    } else {
+        app.dyn_wins[idx - 4].dock[2] = maxo + 1;
+    }
+}
+
 /// v44 R3: put floating window `idx` back into the dock at its LAST used
 /// edge/order slot (undocking never erases those fields); default edge if
-/// it never docked.
+/// it never docked. v47: an occupied slot becomes a NEIGHBOUR slot —
+/// re-docking must never silently join a tab group the user didn't choose.
 fn dock_last(app: &mut App, idx: usize) {
     if is_docked(app, idx) {
         return;
@@ -14013,6 +14169,7 @@ fn dock_last(app: &mut App, idx: usize) {
     } else {
         app.dyn_wins[idx - 4].dock[0] = 1;
     }
+    dedupe_slot(app, idx);
     app.dock_rects[idx] = [0.0; 4];
     app.dock_collapsed[idx] = false;
     app.side_dirty = true;
@@ -14096,6 +14253,127 @@ fn dock_order(app: &App, idx: usize) -> i16 {
         app.dyn_wins[idx - 4].dock[2]
     }
 }
+
+// ---- v47 R1: tab groups ---------------------------------------------------
+// Docked windows sharing (edge, order) form ONE tab group: a single slot
+// with a tab strip in its header (FL-Studio-21 / VSCode model). Exactly one
+// member keeps the persisted active flag — its body is the one painted.
+fn get_tab_act(app: &App, idx: usize) -> bool {
+    if idx < 4 {
+        app.side_wins.prim_tab[idx]
+    } else {
+        app.dyn_wins[idx - 4].tab_act
+    }
+}
+fn set_tab_act(app: &mut App, idx: usize, v: bool) {
+    if idx < 4 {
+        app.side_wins.prim_tab[idx] = v;
+    } else {
+        app.dyn_wins[idx - 4].tab_act = v;
+    }
+}
+
+/// Every DOCKED window sharing `idx`'s (edge, order) — its tab group,
+/// including `idx` itself; hidden members stay (order is group identity,
+/// not visibility).
+fn tab_group(app: &App, idx: usize) -> Vec<usize> {
+    if !is_docked(app, idx) {
+        return vec![idx];
+    }
+    let (e, o) = (dock_edge(app, idx), dock_order(app, idx));
+    (0..win_count(app))
+        .filter(|i| is_docked(app, *i) && dock_edge(app, *i) == e && dock_order(app, *i) == o)
+        .collect()
+}
+
+/// The group members that draw this frame: visible and not carried.
+fn tab_group_drawn(app: &App, idx: usize) -> Vec<usize> {
+    let carried = app.free_drag.map(|(i, _)| i);
+    tab_group(app, idx)
+        .into_iter()
+        .filter(|i| win_visible(app, *i) && carried != Some(*i))
+        .collect()
+}
+
+/// The member that owns the slot: the flagged active tab, else the first.
+fn group_rep(app: &App, members: &[usize]) -> Option<usize> {
+    members
+        .iter()
+        .copied()
+        .find(|m| get_tab_act(app, *m))
+        .or_else(|| members.first().copied())
+}
+
+/// More than one drawn window shares this docked window's slot.
+fn is_tabbed(app: &App, idx: usize) -> bool {
+    tab_group_drawn(app, idx).len() > 1
+}
+
+fn set_group_active(app: &mut App, member: usize) {
+    let grp = tab_group(app, member);
+    for m in grp {
+        set_tab_act(app, m, m == member);
+    }
+    app.side_dirty = true;
+}
+
+/// v47 R1: put `idx` INTO `host`'s tab group — same edge and order (a
+/// floating window docks; its float rect stays in its pocket for the next
+/// float-out). `idx` becomes the group's active tab.
+fn dock_tab_into(app: &mut App, idx: usize, host: usize) {
+    let (e, o) = (dock_edge(app, host), dock_order(app, host));
+    if idx < 4 {
+        app.side_wins.dock[idx] = [1, e, o];
+    } else {
+        app.dyn_wins[idx - 4].dock = [1, e, o];
+    }
+    set_group_active(app, idx);
+    app.dock_collapsed[idx] = false;
+    app.dock_rects[idx] = [0.0; 4];
+    app.side_dirty = true;
+    app.save_config();
+}
+
+/// v47 R1: pull `idx` out of its group into a slot of its own, inserted
+/// right where the group sits (dock_at ranks by the live center — the old
+/// group's members take the following ranks).
+fn detach_tab(app: &mut App, idx: usize) {
+    let r = app.dock_rects[idx];
+    let e = dock_edge(app, idx);
+    let mid = egui::pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+    dock_at(app, idx, e, mid);
+    app.side_dirty = true;
+    app.save_config();
+}
+
+/// A press sitting on a painted tab of window `m` (tab_rects refreshed by
+/// `docked_head`). Topmost (last painted) wins.
+fn tab_hit(app: &App, pt: egui::Pos2) -> Option<usize> {
+    app.tab_rects.iter().rev().find_map(|(m, q)| {
+        let r = egui::Rect::from_min_max(egui::pos2(q[0], q[1]), egui::pos2(q[0] + q[2], q[1] + q[3]));
+        r.contains(pt).then_some(*m)
+    })
+}
+
+/// v47 R1: the docked window whose HEADER BAND contains `pt` — the merge
+/// drop target: releasing a carried window here tabs it into that window's
+/// group instead of re-ranking it along the edge.
+fn merge_host_hit(app: &App, pt: egui::Pos2, carried: usize) -> Option<usize> {
+    (0..win_count(app)).rev().find(|i| {
+        *i != carried
+            && win_visible(app, *i)
+            && is_docked(app, *i)
+            && {
+                let r = app.dock_rects[*i];
+                r[2] > 8.0
+                    && egui::Rect::from_min_max(
+                        egui::pos2(r[0], r[1]),
+                        egui::pos2(r[0] + r[2], r[1] + WIN_HEAD_H),
+                    )
+                    .contains(pt)
+            }
+    })
+}
 /// v34 R6: the mixer's vertical-rhythm rule, as one honest function
 /// (pinned): strips track the arrangement grid ONLY while docked to the
 /// left or right edge, where row geometry exists to align against.
@@ -14166,10 +14444,24 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
     let horiz = edge == 2 || edge == 3; // band runs horizontally (bottom/top)
     // The live neighbours of the target edge + `idx` itself, packed in the
     // order `dock_at` would assign (insert by position along the band).
+    // v47 R1: ONE entry per tab group — co-members share the slot, so the
+    // fair-share packing must count the group once, not once per member.
     let mut ids: Vec<usize> = (0..n)
         .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge && app.dock_rects[*i][2] > 8.0)
         .collect();
     ids.sort_by_key(|i| dock_order(app, *i));
+    {
+        let mut reps: Vec<usize> = Vec::new();
+        let mut k = 0;
+        while k < ids.len() {
+            let o = dock_order(app, ids[k]);
+            reps.push(ids[k]);
+            while k < ids.len() && dock_order(app, ids[k]) == o {
+                k += 1;
+            }
+        }
+        ids = reps;
+    }
     let along_center = |i: usize| -> f32 {
         let r = app.dock_rects[i];
         if horiz {
@@ -14291,11 +14583,21 @@ fn strip_def(i: usize, edge: i16) -> f32 {
 /// re-pack the edge's orders to 0..n-1.
 fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
     let n = win_count(app);
-    let mut others: Vec<(i16, usize)> = (0..n)
+    // v47 R1: rank by GROUPS, not windows — docked windows sharing
+    // (edge, order) are one tab group and re-rank as a unit (a new drop
+    // lands between groups, it never splits one).
+    let mut mem: Vec<usize> = (0..n)
         .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge)
-        .map(|i| (dock_order(app, i), i))
         .collect();
-    others.sort_by_key(|(o, _)| *o);
+    mem.sort_by_key(|i| (dock_order(app, *i), *i));
+    let mut groups: Vec<(i16, Vec<usize>)> = Vec::new();
+    for i in mem {
+        let o = dock_order(app, i);
+        match groups.last_mut() {
+            Some((lo, v)) if *lo == o => v.push(i),
+            _ => groups.push((o, vec![i])),
+        }
+    }
     // v37 R6: rank ALONG the tiling axis. The old rank compared
     // "outer-ness" (distance to the screen edge) — but EVERY window on
     // one strip shares that coordinate (they tile side by side, not in
@@ -14309,20 +14611,28 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
             _ => r[0] + r[2] * 0.5,
         }
     };
+    let center = |g: &(i16, Vec<usize>)| -> Option<f32> {
+        g.1.iter()
+            .find(|i| app.dock_rects[**i][2] > 8.0)
+            .map(|i| along(app.dock_rects[*i]))
+    };
     let me = match edge {
         0 | 1 => pt.y,
         _ => pt.x,
     };
-    let rank = others
+    let rank = groups
         .iter()
-        .filter(|(_, i)| app.dock_rects[*i][2] > 8.0 && along(app.dock_rects[*i]) < me)
+        .filter(|g| center(g).map(|c| c < me).unwrap_or(false))
         .count();
-    others.insert(rank.min(others.len()), (0, idx));
-    for (rank, (_, i)) in others.iter().enumerate() {
-        if *i < 4 {
-            app.side_wins.dock[*i] = [1, edge, rank as i16];
-        } else {
-            app.dyn_wins[*i - 4].dock = [1, edge, rank as i16];
+    let mut packed: Vec<Vec<usize>> = groups.into_iter().map(|(_, v)| v).collect();
+    packed.insert(rank.min(packed.len()), vec![idx]);
+    for (rank, g) in packed.iter().enumerate() {
+        for &i in g {
+            if i < 4 {
+                app.side_wins.dock[i] = [1, edge, rank as i16];
+            } else {
+                app.dyn_wins[i - 4].dock = [1, edge, rank as i16];
+            }
         }
     }
     app.dock_collapsed[idx] = false;
@@ -14337,11 +14647,41 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
 /// by "dock all / float all".
 fn dock_all_windows(app: &mut App) {
     let def = crate::config::default_dock();
-    for (d, f) in app.side_wins.dock.iter_mut().zip(def) {
-        *d = f;
+    // v47 R1: windows that ARE docked keep their slot — including tab
+    // groups (equal orders are group identity, "dock all" never shuffles
+    // them). Only floating windows get pulled in: primaries to their
+    // stock edge, dynamic windows below the right edge's tail.
+    for (i, (d, f)) in app.side_wins.dock.iter_mut().zip(def).enumerate() {
+        if d[0] != 1 {
+            *d = f;
+            let _ = i;
+        }
     }
-    for (n, w) in app.dyn_wins.iter_mut().enumerate() {
-        w.dock = [1, 1, n as i16];
+    let dyn_floats: Vec<usize> = app
+        .dyn_wins
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.dock[0] != 1)
+        .map(|(n, _)| n)
+        .collect();
+    for n in dyn_floats {
+        let maxo = (0..win_count(app))
+            .filter(|i| is_docked(app, *i) && dock_edge(app, *i) == 1)
+            .map(|i| dock_order(app, i))
+            .max()
+            .unwrap_or(0);
+        app.dyn_wins[n].dock = [1, 1, maxo + 1];
+    }
+    // Stock defaults may still collide with a kept group — push collisions
+    // to the free tail (explicit groups stay untouched).
+    for i in 0..win_count(app) {
+        if is_docked(app, i) {
+            let grp = tab_group(app, i);
+            if grp.len() > 1 {
+                continue;
+            }
+            dedupe_slot(app, i);
+        }
     }
     app.side_dirty = true;
     app.save_config();
@@ -14373,13 +14713,108 @@ fn reset_window_layout(app: &mut App) {
     for (n, w) in app.dyn_wins.iter_mut().enumerate() {
         // Re-dock every dynamic window onto the RIGHT edge (its stock
         // home, next to the MIXER); float rects survive for later.
-        w.dock = [1, 1, n as i16];
+        // v47: distinct orders + cleared tab flags dissolve every group.
+        w.dock = [1, 1, 1 + n as i16];
+        w.tab_act = false;
     }
     for c in app.dock_collapsed.iter_mut() {
         *c = false;
     }
     app.side_dirty = true;
     app.save_config();
+}
+
+// ---- v47 R2: named window-layout templates --------------------------------
+/// Capture the ENTIRE arrangement — all float rects, dock slots, tab
+/// groups and visibility (primaries live inside `side_wins`) — into a
+/// named template (Ableton "view template"). Re-capturing a name replaces.
+fn capture_win_layout(app: &mut App, name: String) {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    let dyns = app
+        .dyn_wins
+        .iter()
+        .map(|w| crate::config::DynDock {
+            kind: w.kind.key(),
+            dock: w.dock,
+            rect: w.rect,
+            tab_act: w.tab_act,
+        })
+        .collect();
+    let open = (4..win_count(app))
+        .filter(|i| win_visible(app, *i))
+        .map(|i| app.dyn_wins[i - 4].kind.key())
+        .collect();
+    let lay = crate::config::WinLayout {
+        name: name.clone(),
+        side: app.side_wins,
+        dyns,
+        open,
+    };
+    match app.win_layouts.iter_mut().find(|l| l.name == lay.name) {
+        Some(slot) => *slot = lay,
+        None => app.win_layouts.push(lay),
+    }
+    app.save_config();
+    app.status = format!("layout “{name}” captured");
+}
+
+/// Apply-time open/close for the window kinds that need no live target
+/// beyond a track number. Plugin-specific kinds (params/roll/auto/fx
+/// editor) keep their saved GEOMETRY and open via their own command.
+fn reopen_dyn(app: &mut App, k: DynKind, on: bool) {
+    match k {
+        DynKind::Drums => app.show_drums = on,
+        DynKind::Master => app.show_master = on,
+        DynKind::Chain(t) => app.fx_window = if on { Some(t) } else { None },
+        DynKind::Synth(t) => app.synth_win = if on { Some(t) } else { None },
+        DynKind::Synths(t) => app.synth_pick = if on { Some(t) } else { None },
+        _ => {}
+    }
+}
+
+fn apply_win_layout(app: &mut App, name: &str) {
+    let Some(lay) = app
+        .win_layouts
+        .iter()
+        .find(|l| l.name == name)
+        .cloned()
+    else {
+        return;
+    };
+    app.side_wins = lay.side;
+    // Visibility first: an opened window REGISTERS while drawing and the
+    // geometry pass below then overwrites whatever its seed carried.
+    for d in &lay.dyns {
+        let head = d.kind.split(':').next().unwrap_or("");
+        if !crate::config::WinLayout::reopenable(head) {
+            continue;
+        }
+        if let Some(k) = DynKind::from_key(&d.kind) {
+            reopen_dyn(app, k, lay.open.contains(&d.kind));
+        }
+    }
+    for d in &lay.dyns {
+        let Some(k) = DynKind::from_key(&d.kind) else {
+            continue;
+        };
+        match app.dyn_wins.iter_mut().find(|w| w.kind == k) {
+            Some(w) => {
+                w.dock = d.dock;
+                w.rect = d.rect;
+                w.tab_act = d.tab_act;
+            }
+            None => match app.dyn_seed.iter_mut().find(|(sk, ..)| *sk == k) {
+                Some(slot) => *slot = (k, d.dock, d.rect, d.tab_act),
+                None => app.dyn_seed.push((k, d.dock, d.rect, d.tab_act)),
+            },
+        }
+    }
+    app.side_dirty = true;
+    app.save_config();
+    app.status = format!("window layout “{}” applied", lay.name);
 }
 
 /// Pull `idx` out of its dock and float it at `at` (top-left).
@@ -14412,6 +14847,10 @@ fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
     } else {
         app.dyn_wins[idx - 4].dock[0] = 0;
     }
+    // v47 R1: leaving the dock leaves the tab group (the flag only means
+    // something inside a group; the remaining members fall back to their
+    // first member as the rep).
+    set_tab_act(app, idx, false);
     app.dock_rects[idx] = [0.0; 4];
     app.side_dirty = true;
 }
@@ -14426,6 +14865,13 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
     /// The title-bar band of a visible window (docked or floating), if
     /// `pt` is on it. Top-down so the visually topmost header wins.
     fn header_hit(app: &App, pt: egui::Pos2, floats_only: bool) -> Option<usize> {
+        // v47 R1: a tab IS a title bar — map the point onto the member
+        // that owns the tab before any shared group header geometry.
+        if !floats_only {
+            if let Some(m) = tab_hit(app, pt) {
+                return Some(m);
+            }
+        }
         let n = win_count(app);
         let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
         order.sort_by_key(|i| is_docked(app, *i));
@@ -14521,6 +14967,20 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
         }
     }
     if pressed && down && app.free_drag.is_none() && !dbl && !btn_hit {
+        // v47 R1: pressing a TAB carries THAT window — the tab is its
+        // title bar; the grab offset comes from the group's shared header
+        // so a float-out lands under the pointer like any title drag.
+        if let Some(m) = tab_hit(app, press_pos) {
+            let grp = tab_group_drawn(app, m);
+            let rep = group_rep(app, &grp).unwrap_or(m);
+            let r = app.dock_rects[rep];
+            if r[2] > 8.0 {
+                app.free_drag = Some((m, [press_pos.x - r[0], press_pos.y - r[1]]));
+                app.drag_pos = [r[0], r[1]];
+                app.drag_press_pt = [press_pos.x, press_pos.y];
+                app.carry_was_docked = true;
+            }
+        } else {
         // Iterate top-down (floats above docked; higher idx above lower)
         // so the visually topmost header wins the grab.
         let n = win_count(app);
@@ -14546,6 +15006,7 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
                 break;
             }
         }
+        }
     }
     if let Some((idx, grab)) = app.free_drag {
         if !down {
@@ -14557,7 +15018,22 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             let far = (app.drag_pos[0] - app.drag_press_pt[0]).abs()
                 + (app.drag_pos[1] - app.drag_press_pt[1]).abs()
                 > 3.0;
-            if far {
+            if !far {
+                // v47 R1: … EXCEPT a tap on a tab: that switches the
+                // group's active window (the press started the member's
+                // carry; a tap is the switch gesture, VSCode-style).
+                if let Some(p) = pos.or(Some(pt)) {
+                    if let Some(m) = tab_hit(app, p) {
+                        if is_docked(app, m) {
+                            set_group_active(app, m);
+                        }
+                    }
+                }
+            } else if let Some(host) = merge_host_hit(app, pt, idx) {
+                // v47 R1: released over another docked window's header —
+                // TAB into that group (the ghost showed exactly this).
+                dock_tab_into(app, idx, host);
+            } else {
                 match snap_zone(vp, pt) {
                     Some(edge) => dock_at(app, idx, edge, pt),
                     None => {
@@ -14737,14 +15213,49 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         // v44 R1: fold the header itself — the title gives way first, then
         // the window buttons clip only at truly degenerate widths.
         if r.width() > 90.0 {
-            let title = ui.label(RichText::new(win_title(app, idx)).strong());
-            // v30-batch-2: one-stop dock menu on the header title — every
-            // window can be re-slotted (or floated out) without a precise
-            // drag; the drag-to-edge gesture stays as the quick path.
-            title.context_menu(|ui| {
-                let mut done = false;
-                window_slot_menu(ui, app, idx, &mut done);
-            });
+            // v47 R1: tab group? The header row IS the tab strip: one tab
+            // per member — click switches the shown body, dragging a tab
+            // away carries THAT window out (the carry pass hit-tests the
+            // tab rects recorded here), and every tab answers with the
+            // same slot menu as a lone title.
+            let members = tab_group_drawn(app, idx);
+            if members.len() > 1 {
+                for &m in &members {
+                    let act = m == idx;
+                    let full = win_title(app, m);
+                    let short: String = if full.chars().count() > 13 {
+                        let s: String = full.chars().take(12).collect();
+                        format!("{}…", s.trim_end())
+                    } else {
+                        full.clone()
+                    };
+                    let resp = ui
+                        .add(egui::Button::selectable(act, &short).small())
+                        .on_hover_text(format!(
+                            "{full} — click to show · drag away to detach \
+                             · right-click for dock/tab/close"
+                        ));
+                    let rr = resp.rect;
+                    let clicked = resp.clicked();
+                    app.tab_rects.push((m, [rr.min.x, rr.min.y, rr.width(), rr.height()]));
+                    resp.context_menu(|ui| {
+                        let mut done = false;
+                        window_slot_menu(ui, app, m, &mut done);
+                    });
+                    if clicked && !act {
+                        set_group_active(app, m);
+                    }
+                }
+            } else {
+                let title = ui.label(RichText::new(win_title(app, idx)).strong());
+                // v30-batch-2: one-stop dock menu on the header title — every
+                // window can be re-slotted (or floated out) without a precise
+                // drag; the drag-to-edge gesture stays as the quick path.
+                title.context_menu(|ui| {
+                    let mut done = false;
+                    window_slot_menu(ui, app, idx, &mut done);
+                });
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
@@ -14811,20 +15322,252 @@ fn window_slot_menu(ui: &mut egui::Ui, app: &mut App, idx: usize, done: &mut boo
             ui.close();
         }
     }
-    if docked && ui.button("float out (free window)").clicked() { {
-            let r = app.dock_rects[idx];
-            undock_to(app, idx, [r[0], r[1]]);
-            app.dock_just_floated = Some(idx);
-            app.save_config();
-            *done = true;
-            ui.close();
+    // v47 R1: TAB groups — merge this window into another docked window's
+    // slot. One button per GROUP (the rep), never per member; a window
+    // already inside the host's group is not offered back to itself.
+    let own: Vec<usize> = tab_group(app, idx);
+    let hosts: Vec<usize> = (0..win_count(app))
+        .filter(|h| {
+            *h != idx
+                && win_visible(app, *h)
+                && is_docked(app, *h)
+                && !own.contains(h)
+                && group_rep(app, &tab_group_drawn(app, *h)) == Some(*h)
+        })
+        .collect();
+    if !hosts.is_empty() {
+        ui.separator();
+        for h in hosts {
+            if ui
+                .button(format!("tab with: {}", win_title(app, h)))
+                .on_hover_text("Share that window's slot as a tab group")
+                .clicked()
+            {
+                dock_tab_into(app, idx, h);
+                *done = true;
+                ui.close();
+            }
         }
+    }
+    if docked && is_tabbed(app, idx) && ui.button("detach into own slot").clicked() {
+        detach_tab(app, idx);
+        *done = true;
+        ui.close();
+    }
+    if docked && ui.button("float out (free window)").clicked() {
+        let r = app.dock_rects[idx];
+        undock_to(app, idx, [r[0], r[1]]);
+        app.dock_just_floated = Some(idx);
+        app.save_config();
+        *done = true;
+        ui.close();
     }
     ui.separator();
     if ui.button("close this window").clicked() {
         set_visible(app, idx, false);
         *done = true;
         ui.close();
+    }
+}
+
+/// v47 R3: the COMMAND PALETTE (Ctrl+K) — one search box over everything
+/// the GUI can navigate: show/hide ANY window (primaries plus every
+/// registered dynamic window — plugin params and FX editors included),
+/// dock/float all, reset layout, apply a saved layout template, open
+/// Settings straight at a category (the v43 search machinery is the jump).
+/// Enter runs the selected row, Up/Down move, Esc or a click outside
+/// closes. Same v18 authority rule as `win_menu_pass`: the App flag is the
+/// state, the egui Window merely renders it.
+fn palette_pass(ui: &mut egui::Ui, app: &mut App) {
+    enum Act {
+        ToggleWin(usize),
+        DockAll,
+        FloatAll,
+        Reset,
+        ApplyLayout(usize),
+        Settings(Option<String>),
+        Theme,
+    }
+    let Some((query, sel)) = app.palette.clone() else {
+        app.palette_armed = false;
+        return;
+    };
+    // ---- command list (rebuilt every frame — the window inventory moves) ----
+    let mut cmds: Vec<(String, &'static str, Act)> = Vec::new();
+    for i in 0..win_count(app) {
+        let vis = win_visible(app, i);
+        let t = win_title(app, i);
+        if i >= 4 {
+            let key = app.dyn_wins[i - 4].kind.key();
+            let head = key.split(':').next().unwrap_or("");
+            // Opening a plugin-specific window needs its live target —
+            // only offer what a toggle can honestly deliver.
+            if !vis && !crate::config::WinLayout::reopenable(head) {
+                continue;
+            }
+        }
+        cmds.push((
+            format!("{} {t}", if vis { "hide window" } else { "show window" }),
+            "window",
+            Act::ToggleWin(i),
+        ));
+    }
+    cmds.push(("dock all windows".into(), "layout", Act::DockAll));
+    cmds.push(("float all windows".into(), "layout", Act::FloatAll));
+    cmds.push(("reset window layout".into(), "layout", Act::Reset));
+    for (n, l) in app.win_layouts.iter().enumerate() {
+        cmds.push((
+            format!("apply layout \u{201c}{}\u{201d}", l.name),
+            "layout",
+            Act::ApplyLayout(n),
+        ));
+    }
+    cmds.push(("open settings".into(), "settings", Act::Settings(None)));
+    for (name, q) in SETTINGS_CHIPS {
+        cmds.push((
+            format!("settings \u{b7} {name}"),
+            "settings",
+            Act::Settings(Some(q.to_string())),
+        ));
+    }
+    cmds.push((
+        format!(
+            "switch to {} theme",
+            if app.light_theme { "dark" } else { "light" }
+        ),
+        "look",
+        Act::Theme,
+    ));
+    let ql = query.to_lowercase();
+    let toks: Vec<&str> = ql.split_whitespace().collect();
+    let rows: Vec<(String, &str, Act)> = cmds
+        .into_iter()
+        .filter(|(label, hint, _)| {
+            // titles paint UPPERCASE (window headers) — match
+            // case-insensitively or "mixer" would never find "MIXER".
+            let ll = label.to_lowercase();
+            toks.iter().all(|t| ll.contains(t) || hint.contains(t))
+        })
+        .collect();
+    let nsel = sel.min(rows.len().saturating_sub(1));
+
+    // ---- global keys while open (modal: the query box owns typing) ----
+    let (up, down, enter, esc) = ui.ctx().input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    let mut nsel = nsel;
+    if up {
+        nsel = nsel.saturating_sub(1);
+    }
+    if down {
+        nsel = (nsel + 1).min(rows.len().saturating_sub(1));
+    }
+    let run = if enter && !rows.is_empty() { Some(nsel) } else { None };
+    if esc {
+        app.palette = None;
+        app.palette_armed = false;
+        return;
+    }
+
+    // ---- draw ----
+    let armed = app.palette_armed;
+    app.palette_armed = true;
+    let vp = ui.ctx().input(|i| i.viewport_rect());
+    let mut open = true;
+    let mut click_run: Option<usize> = None;
+    let resp = egui::Window::new(RichText::new(
+        "commands \u{b7} Enter run \u{b7} Esc close",
+    ))
+    .id(egui::Id::new("slooper_palette"))
+    .open(&mut open)
+    .fixed_pos(egui::pos2(((vp.width() - 470.0) * 0.5).max(8.0), 80.0))
+    .collapsible(false)
+    .resizable(false)
+    .show(ui.ctx(), |ui| {
+        ui.set_width(440.0);
+        // The query box keeps keyboard focus for its whole life (modal
+        // search); `rows`/`cmds` were built BEFORE the closure, so the
+        // live edit of app.palette below cannot collide with them.
+        if let Some((q, s)) = app.palette.as_mut() {
+            let te = egui::TextEdit::singleline(q)
+                .hint_text("type to filter commands\u{2026}")
+                .desired_width(430.0);
+            ui.add(te).request_focus();
+            *s = nsel;
+        }
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (n, (label, hint, _)) in rows.iter().enumerate() {
+                    let row = ui.add(
+                        egui::Button::selectable(
+                            n == nsel,
+                            format!("{label}  \u{b7}  {hint}"),
+                        )
+                        .min_size(egui::vec2(ui.available_width(), 0.0)),
+                    );
+                    if row.clicked() {
+                        click_run = Some(n);
+                    }
+                }
+                if rows.is_empty() {
+                    ui.label(RichText::new("no matching command").weak());
+                }
+            });
+    });
+    if let Some(r) = resp {
+        let rect = r.response.rect;
+        let click_elsewhere = armed
+            && ui.ctx().input(|i| {
+                (i.pointer.button_clicked(egui::PointerButton::Primary)
+                    || i.pointer.button_clicked(egui::PointerButton::Secondary))
+                    && !rect
+                        .expand(6.0)
+                        .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
+            });
+        if click_elsewhere || !open {
+            app.palette = None;
+            app.palette_armed = false;
+            return;
+        }
+    } else {
+        app.palette = None;
+        app.palette_armed = false;
+        return;
+    }
+    if let Some(n) = run.or(click_run).filter(|n| *n < rows.len()) {
+        match &rows[n].2 {
+            Act::ToggleWin(i) => {
+                let i = *i;
+                let v = win_visible(app, i);
+                set_visible(app, i, !v);
+                app.save_config();
+            }
+            Act::DockAll => dock_all_windows(app),
+            Act::FloatAll => float_all_windows(app),
+            Act::Reset => reset_window_layout(app),
+            Act::ApplyLayout(n) => {
+                let name = app.win_layouts[*n].name.clone();
+                apply_win_layout(app, &name);
+            }
+            Act::Settings(q) => {
+                app.show_settings = true;
+                app.sett_filter = q.clone().unwrap_or_default();
+            }
+            Act::Theme => {
+                app.light_theme = !app.light_theme;
+                app.save_config();
+            }
+        }
+        app.palette = None;
+        app.palette_armed = false;
     }
 }
 
@@ -15121,6 +15864,9 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
     free_drag_pass(ui, app);
     let carried = app.free_drag.map(|(i, _)| i);
     let n = win_count(app);
+    // v47 R1: tab strips hit-test through `tab_rects`, refreshed every
+    // frame the dock draws (cleared first so a stale tab can never steal).
+    app.tab_rects.clear();
     for edge in 0..4i16 {
         let mut ids: Vec<usize> = (0..n)
             .filter(|i| {
@@ -15131,21 +15877,42 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             })
             .collect();
         ids.sort_by_key(|i| dock_order(app, *i));
-        if !ids.is_empty() {
-            draw_docked_edge(ui, app, edge, &ids);
+        // v47 R1: ONE slot per tab group — the group rep (active member,
+        // else first) draws the slot; co-members keep a zeroed dock rect
+        // so no stale geometry can be hit-tested or ghost-sized for them.
+        let mut reps: Vec<usize> = Vec::new();
+        let mut k = 0;
+        while k < ids.len() {
+            let o = dock_order(app, ids[k]);
+            let mut g = vec![ids[k]];
+            k += 1;
+            while k < ids.len() && dock_order(app, ids[k]) == o {
+                g.push(ids[k]);
+                k += 1;
+            }
+            let rep = group_rep(app, &g).unwrap_or(g[0]);
+            for &m in &g {
+                if m != rep {
+                    app.dock_rects[m] = [0.0; 4];
+                }
+            }
+            reps.push(rep);
+        }
+        if !reps.is_empty() {
+            draw_docked_edge(ui, app, edge, &reps);
         }
     }
     for i in 0..n {
         // v35: DYNAMIC windows own their floating chrome (each owner
         // draws its own Window — custom title/id/size, and take/restore
-        // state the generic chrome cannot host). Drawing them here too
+        // state the generic owner cannot host). Drawing them here too
         // painted every floating dynamic window TWICE (head probe:
         // body galley x2), one copy fighting the owner for the rect.
         if i < 4 && win_visible(app, i) && (!is_docked(app, i) || carried == Some(i)) {
             draw_float(ui, app, i);
         }
     }
-    if carried.is_some() {
+    if let Some(ci) = carried {
         let vp = ui.ctx().input(|i| i.viewport_rect());
         let pt = ui.ctx().input(|i| i.pointer.interact_pos());
         if let Some(pt) = pt {
@@ -15153,18 +15920,62 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             // slot itself. The old full-edge band highlight next to the
             // slot box read as two competing ghosts ("which one is where
             // it lands?"); the slot IS the precise answer, so it is alone.
-            if let (Some(edge), Some(idx)) = (snap_zone(vp, pt), carried) {
-                let g = dock_slot_rect(app, idx, edge, pt, vp);
-                let lid =
-                    egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-zone-hl"));
-                let p = ui.ctx().layer_painter(lid);
-                p.rect_filled(g, 3.0, Color32::from_rgb(150, 215, 255).linear_multiply(0.22));
-                p.rect_stroke(
-                    g,
-                    3.0,
-                    egui::Stroke::new(2.0, Color32::from_rgb(150, 215, 255)),
-                    egui::StrokeKind::Inside,
-                );
+            // v47 R1: over another docked window's HEADER the honest
+            // answer is the HOST's own slot — releasing there tabs the
+            // carried window into that group. The ghost is the host rect
+            // with a tab notch, so "where it lands AND how it will look"
+            // is one overlay, exactly as the band-drop ghost.
+            match merge_host_hit(app, pt, ci) {
+                Some(host) => {
+                    let r = app.dock_rects[host];
+                    let g = egui::Rect::from_min_max(
+                        egui::pos2(r[0], r[1]),
+                        egui::pos2(r[0] + r[2], r[1] + r[3].max(WIN_HEAD_H)),
+                    );
+                    let lid = egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("dock-zone-hl"),
+                    );
+                    let p = ui.ctx().layer_painter(lid);
+                    let ghost = Color32::from_rgb(150, 215, 255);
+                    p.rect_filled(g, 3.0, ghost.linear_multiply(0.22));
+                    p.rect_stroke(
+                        g,
+                        3.0,
+                        egui::Stroke::new(2.0, ghost),
+                        egui::StrokeKind::Inside,
+                    );
+                    // Tab notch: the strip the window becomes part of.
+                    p.rect_filled(
+                        egui::Rect::from_min_max(
+                            g.min + egui::vec2(4.0, 2.0),
+                            g.min + egui::vec2((g.width() * 0.3).min(96.0), 14.0),
+                        ),
+                        3.0,
+                        ghost,
+                    );
+                }
+                None => {
+                    if let Some(edge) = snap_zone(vp, pt) {
+                        let g = dock_slot_rect(app, ci, edge, pt, vp);
+                        let lid = egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("dock-zone-hl"),
+                        );
+                        let p = ui.ctx().layer_painter(lid);
+                        p.rect_filled(
+                            g,
+                            3.0,
+                            Color32::from_rgb(150, 215, 255).linear_multiply(0.22),
+                        );
+                        p.rect_stroke(
+                            g,
+                            3.0,
+                            egui::Stroke::new(2.0, Color32::from_rgb(150, 215, 255)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
             }
         }
     }
@@ -19238,8 +20049,8 @@ fn grid_context_menu(
             ui.close();
         }
         // v46: merge the whole selection (one kind) into a single asset.
-        if app.sel_clips.len() >= 2 {
-            if ui
+        if app.sel_clips.len() >= 2
+            && ui
                 .button("Merge into one asset  (Ctrl+M)")
                 .on_hover_text(
                     "Merge every selected clip into ONE new asset, laid out \
@@ -19248,10 +20059,9 @@ fn grid_context_menu(
                      same kind (audio or MIDI); the originals are replaced.",
                 )
                 .clicked()
-            {
-                app.merge_selection();
-                ui.close();
-            }
+        {
+            app.merge_selection();
+            ui.close();
         }
         if ui.button("Delete  (Del)").clicked() {
             app.delete_selection();
@@ -35847,7 +36657,7 @@ mod tests {
             .expect("bundled piano must compile and load");
         app.track_synth_inst[0] = Some(std::sync::Arc::new(SynthHandle::Script(inst)));
         let row_len = |app: &App| {
-            app.backend.engine.poly_voices().get(0).map(|r| r.len()).unwrap_or(0)
+            app.backend.engine.poly_voices().first().map(|r| r.len()).unwrap_or(0)
         };
         // MONO (default): nothing published.
         assert_eq!(row_len(&app), 0, "monophonic publishes nothing");
@@ -35877,4 +36687,508 @@ mod tests {
         app.poly_reconcile();
         assert_eq!(row_len(&app), 0, "mono clears the copy row");
     }
+
+    // ---- v47: tabbed dock groups, layout templates, command palette ----
+
+    /// Float the bindings window at a KNOWN rect clear of every docked
+    /// header, so title drags can never be stolen by the rack header.
+    fn float_binds_clear(app: &mut App) -> egui::Pos2 {
+        app.side_wins.dock[1] = [0, 2, 1];
+        app.side_wins.binds = [360.0, 120.0, 300.0, 400.0];
+        egui::pos2(390.0, 132.0) // its title band, away from any buttons
+    }
+
+    /// Carry `from` (a title-band point) and release at `to`.
+    fn drag_title(app: &mut App, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        frame(app, ctx, vec![moved(from)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        frame(app, ctx, vec![moved(egui::pos2(600.0, 400.0))]);
+        frame(app, ctx, vec![moved(to)]);
+        frame(app, ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(app, ctx, vec![]);
+        }
+    }
+
+    /// R1 A1: releasing a carried window over ANOTHER docked window's
+    /// header tabs it into that group — the drop feedback the brief asked
+    /// for, and the arrangement freedom (two windows, one slot).
+    #[test]
+    fn v47_drop_on_header_tabs_windows() {
+        let mut app = headless_app("v47tabin");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let from = float_binds_clear(&mut app);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let h = app.dock_rects[0]; // rack docked left
+        assert!(h[2] > 8.0, "rack header rect recorded");
+        let to = egui::pos2(h[0] + h[2] * 0.5, h[1] + 12.0);
+        drag_title(&mut app, &ctx, from, to);
+        assert!(is_docked(&app, 1), "bindings docked by the merge drop");
+        assert_eq!(dock_edge(&app, 1), 0, "into the rack's edge");
+        assert_eq!(
+            dock_order(&app, 1),
+            dock_order(&app, 0),
+            "same slot as the rack \u{2014} a tab group"
+        );
+        assert_eq!(tab_group(&app, 0).len(), 2, "two-member group");
+        assert!(get_tab_act(&app, 1), "the dropped window becomes active");
+        assert!(
+            galley_at(&mut app, &ctx, "ASSET RACK").is_some()
+                && galley_at(&mut app, &ctx, "MIDI BINDINGS").is_some(),
+            "both tabs paint in the shared header"
+        );
+    }
+
+    /// R1 A2: while carrying over the merge host, exactly ONE ghost — and
+    /// it is the HOST's own slot (where it lands AND how it will look).
+    #[test]
+    fn v47_merge_ghost_precise() {
+        let mut app = headless_app("v47ghost2");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let from = float_binds_clear(&mut app);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let h = app.dock_rects[0];
+        let to = egui::pos2(h[0] + h[2] * 0.5, h[1] + 12.0);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(600.0, 400.0))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        let ghosts = ghost_rects(&mut app, &ctx, to);
+        assert_eq!(ghosts.len(), 1, "one precise overlay: {ghosts:?}");
+        let g = ghosts[0];
+        let hr = app.dock_rects[0];
+        assert!(
+            (g.min.x - hr[0]).abs() < 2.0
+                && (g.min.y - hr[1]).abs() < 2.0
+                && (g.width() - hr[2]).abs() < 2.0,
+            "the ghost IS the host slot: ghost {g:?} host {hr:?}"
+        );
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+    }
+
+    /// R1 A3: clicking a tab switches which member's body the slot shows.
+    #[test]
+    fn v47_tab_click_switches_body() {
+        let mut app = headless_app("v47tabsw");
+        let ctx = egui::Context::default();
+        // Bindings shares the rack's slot; no active flag \u{2192} rack leads.
+        app.side_wins.dock[1] = [1, 0, 0];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(tab_group(&app, 0).len(), 2);
+        assert!(
+            galley_at(&mut app, &ctx, "kick").is_some(),
+            "rack body (asset list) shows while the rack is active"
+        );
+        let t = label_center(&mut app, &ctx, "MIDI BINDINGS").expect("bindings tab");
+        click_pt(&mut app, &ctx, t);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(get_tab_act(&app, 1), "the click activated bindings");
+        assert!(!get_tab_act(&app, 0), "\u{2026} and deactivated the rack");
+        assert!(
+            galley_at(&mut app, &ctx, "kick").is_none(),
+            "the rack body is gone \u{2014} the slot now shows the bindings body"
+        );
+    }
+
+    /// R1 A4: the docked float button takes only the ACTIVE member out.
+    #[test]
+    fn v47_tab_float_detaches_only_active() {
+        let mut app = headless_app("v47tabflt");
+        let ctx = egui::Context::default();
+        app.side_wins.dock[1] = [1, 0, 0];
+        app.side_wins.prim_tab[1] = true; // bindings is the visible member
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "float").expect("float button");
+        click_pt(&mut app, &ctx, p);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(!is_docked(&app, 1), "the active member floated out");
+        assert!(is_docked(&app, 0), "the rack stays docked");
+        assert_eq!(tab_group(&app, 0).len(), 1, "the group is gone with it");
+        assert!(!get_tab_act(&app, 1), "leaving the dock clears the flag");
+    }
+
+    /// R1 A5: dragging a NON-active tab carries THAT window out of the
+    /// group (VSCode muscle memory), and an edge drop gives it its own slot.
+    #[test]
+    fn v47_tab_drag_out_carries_that_member() {
+        let mut app = headless_app("v47tabout");
+        let ctx = egui::Context::default();
+        app.side_wins.dock[1] = [1, 0, 0];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let tr = app
+            .tab_rects
+            .iter()
+            .find(|(m, _)| *m == 1)
+            .map(|(_, q)| *q)
+            .expect("bindings tab painted");
+        let tp = egui::pos2(tr[0] + tr[2] * 0.5, tr[1] + tr[3] * 0.5);
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)],
+        );
+        assert_eq!(
+            app.free_drag.map(|(i, _)| i),
+            Some(1),
+            "pressing a tab carries THAT window, not the active one"
+        );
+        let to = egui::pos2(60.0, 600.0);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 1) && dock_edge(&app, 1) == 0, "re-docked left");
+        assert_ne!(
+            dock_order(&app, 1),
+            dock_order(&app, 0),
+            "in its own slot now"
+        );
+        assert_eq!(tab_group(&app, 0).len(), 1, "the rack stands alone again");
+    }
+
+    /// R1 A6: a new dock on the group's edge re-ranks GROUPS \u{2014} members
+    /// never get split apart by somebody else's drop.
+    #[test]
+    fn v47_group_survives_repack() {
+        let mut app = headless_app("v47repack");
+        let ctx = egui::Context::default();
+        // bindings + monitor tab together along the bottom.
+        app.side_wins.dock[1] = [1, 2, 0];
+        app.side_wins.dock[2] = [1, 2, 0];
+        // Mixer floats at a known spot clear of the headers.
+        app.side_wins.dock[3] = [0, 1, 0];
+        app.side_wins.mixer = [600.0, 120.0, 360.0, 600.0];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(tab_group(&app, 1).len(), 2, "bottom pair is a group");
+        drag_title(&mut app, &ctx, egui::pos2(630.0, 132.0), egui::pos2(300.0, 820.0));
+        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 2, "mixer docked bottom");
+        assert_eq!(
+            dock_order(&app, 1),
+            dock_order(&app, 2),
+            "the tab group kept a SINGLE shared rank"
+        );
+        assert_ne!(dock_order(&app, 3), dock_order(&app, 1), "mixer got its own slot");
+        assert_eq!(tab_group(&app, 1).len(), 2, "still two members");
+    }
+
+    /// R1 A7: the slot menu offers \u{201c}tab with\u{2026}\u{201d} both from a
+    /// floating title AND offers detach from inside a group.
+    #[test]
+    fn v47_slot_menu_tab_and_detach() {
+        let mut app = headless_app("v47tabmenu");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        float_binds_clear(&mut app);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // (a) floating bindings \u{2192} RMB title \u{2192} tab with the rack.
+        let tp = egui::pos2(390.0 + 40.0, 132.0);
+        frame(&mut app, &ctx, vec![moved(tp)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.win_menu.is_some(), "float title menu opened");
+        let item = galley_at(&mut app, &ctx, "tab with: ASSET RACK")
+            .expect("tab-with offers the rack group");
+        click_pt(&mut app, &ctx, item.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 1), "the menu docked it");
+        assert_eq!(dock_order(&app, 1), dock_order(&app, 0), "\u{2026} as a tab");
+        // (b) right-click the OTHER member's tab \u{2192} detach own slot.
+        let tab = galley_at(&mut app, &ctx, "ASSET RACK")
+            .expect("rack tab")
+            .center();
+        frame(&mut app, &ctx, vec![moved(tab)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tab), btn(tab, egui::PointerButton::Secondary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(tab, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let det = galley_at(&mut app, &ctx, "detach into own slot")
+            .expect("detach offered to a member");
+        click_pt(&mut app, &ctx, det.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_ne!(
+            dock_order(&app, 0),
+            dock_order(&app, 1),
+            "the rack got its own slot back"
+        );
+        assert_eq!(tab_group(&app, 0).len(), 1);
+    }
+
+    /// R1 A8: a tab group survives the config round trip.
+    #[test]
+    fn v47_tabs_persist() {
+        let mut app = headless_app("v47tabcfg");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let from = float_binds_clear(&mut app);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let h = app.dock_rects[0];
+        drag_title(
+            &mut app,
+            &ctx,
+            from,
+            egui::pos2(h[0] + h[2] * 0.5, h[1] + 12.0),
+        );
+        let cfg = crate::config::Config::load();
+        assert_eq!(
+            cfg.side_wins.dock[0][1..],
+            cfg.side_wins.dock[1][1..],
+            "same (edge, order) persisted \u{2014} that IS the group"
+        );
+        assert!(cfg.side_wins.prim_tab[1], "the active-tab flag persisted");
+    }
+
+    /// R1 A8b: \u{201c}reset window layout\u{201d} dissolves every group.
+    #[test]
+    fn v47_reset_dissolves_tabs() {
+        let mut app = headless_app("v47tabrst");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let from = float_binds_clear(&mut app);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let h = app.dock_rects[0];
+        drag_title(
+            &mut app,
+            &ctx,
+            from,
+            egui::pos2(h[0] + h[2] * 0.5, h[1] + 12.0),
+        );
+        assert_eq!(tab_group(&app, 0).len(), 2, "group exists first");
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let r = label_center(&mut app, &ctx, "reset window layout").expect("reset item");
+        click_pt(&mut app, &ctx, r);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(tab_group(&app, 0).len(), 1, "the stock layout has no groups");
+        assert!(!get_tab_act(&app, 0) && !get_tab_act(&app, 1), "flags cleared");
+        assert!(is_docked(&app, 1), "bindings re-docked (to its stock slot)");
+    }
+
+    /// R2 B1/B2: capture the arrangement under a name, wreck it, re-apply.
+    #[test]
+    fn v47_layout_capture_apply() {
+        let mut app = headless_app("v47layap");
+        let ctx = egui::Context::default();
+        // A view worth remembering: bindings float, rack has a chosen size.
+        app.side_wins.dock[1] = [0, 2, 1];
+        app.side_wins.binds = [40.0, 60.0, 301.0, 401.0];
+        app.side_wins.rack = [12.0, 50.0, 311.0, 500.0];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // \u{2026}capture it through the menu.
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let boxy = galley_at(&mut app, &ctx, "new layout name").expect("name box");
+        click_pt(&mut app, &ctx, boxy.center());
+        for c in "focus".chars() {
+            frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
+        }
+        let cap = label_center(&mut app, &ctx, "capture").expect("capture button");
+        click_pt(&mut app, &ctx, cap);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.win_layouts.len(), 1, "layout captured");
+        assert_eq!(app.win_layouts[0].name, "focus");
+        // Wreck the view: float the rack somewhere else.
+        app.side_wins.dock[0] = [0, 0, 0];
+        app.side_wins.rack = [700.0, 100.0, 250.0, 300.0];
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(!is_docked(&app, 0), "rack floating");
+        // Re-open and apply.
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let lay = label_center(&mut app, &ctx, "focus").expect("layout button");
+        click_pt(&mut app, &ctx, lay);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(is_docked(&app, 0), "the rack is back in its dock slot");
+        // The docked pass stretches the cross-axis to the column, so only
+        // the width is the user-meaningful number that must return.
+        assert_eq!(
+            app.side_wins.rack[2], 311.0,
+            "its width returned: {:?}",
+            app.side_wins.rack
+        );
+        assert!(!is_docked(&app, 1), "bindings stays floating as captured");
+        // Float windows auto-height to content; pos + width is the
+        // user-meaningful placement that must survive the round trip.
+        assert_eq!(&app.side_wins.binds[..3], &[40.0, 60.0, 301.0]);
+    }
+
+    /// R2 B3: a layout can be deleted.
+    #[test]
+    fn v47_layout_delete() {
+        let mut app = headless_app("v47laydel");
+        app.show_master = false;
+        app.show_mixer = false;
+        app.show_rack = false;
+        app.show_midi = false;
+        app.show_binds = false;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // Capture "gone" through the menu first.
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let boxy = galley_at(&mut app, &ctx, "new layout name").expect("name box");
+        click_pt(&mut app, &ctx, boxy.center());
+        for c in "gone".chars() {
+            frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
+        }
+        let cap = label_center(&mut app, &ctx, "capture").expect("capture button");
+        click_pt(&mut app, &ctx, cap);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.win_layouts.len(), 1);
+        // Re-open; the tiny x beside the layout row is now the ONLY painted
+        // "x" galley (every window header is hidden in this sandbox).
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let x = label_center(&mut app, &ctx, "x").expect("delete button");
+        click_pt(&mut app, &ctx, x);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.win_layouts.is_empty(), "layout deleted");
+    }
+
+    /// R3 C1/C2: Ctrl+K opens the palette; typing filters; Enter runs;
+    /// Esc and the toggle close it.
+    #[test]
+    fn v47_palette_filter_run_close() {
+        let mut app = headless_app("v47pal");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]); // layout pass
+        let open = |app: &mut App, ctx: &egui::Context| {
+            frame_keys(
+                app,
+                ctx,
+                vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                    key_ev(egui::Key::K, egui::Modifiers::COMMAND),
+                ],
+            );
+            frame_keys(app, ctx, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        };
+        open(&mut app, &ctx);
+        assert!(app.palette.is_some(), "Ctrl+K opened the palette");
+        frame(&mut app, &ctx, vec![]); // focus the query box
+        for c in "mixer".chars() {
+            frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
+        }
+        assert_eq!(app.palette.as_ref().unwrap().0, "mixer", "typing reached the query");
+        frame(&mut app, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
+        assert!(!app.show_mixer, "Enter ran \u{201c}hide window MIXER\u{201d}");
+        assert!(app.palette.is_none(), "the palette closed on run");
+        // reopen, then Esc.
+        open(&mut app, &ctx);
+        assert!(app.palette.is_some(), "reopened");
+        frame(&mut app, &ctx, vec![key_ev(egui::Key::Escape, Default::default())]);
+        assert!(app.palette.is_none(), "Esc closed it");
+        // and Ctrl+K toggles closed again.
+        open(&mut app, &ctx);
+        open(&mut app, &ctx);
+        assert!(app.palette.is_none(), "Ctrl+K toggled it closed");
+    }
+
+    /// R3 C3: a settings chip command opens Settings AT that category.
+    #[test]
+    fn v47_palette_settings_deeplink() {
+        let mut app = headless_app("v47palset");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::K, egui::Modifiers::COMMAND),
+            ],
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        for c in "ports".chars() {
+            frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
+        }
+        frame(&mut app, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
+        assert!(app.show_settings, "Settings opened");
+        assert_eq!(app.sett_filter, "ports", "\u{2026} straight at the ports category");
+    }
+
+    /// R3 C4: the Windows menu lists registered DYNAMIC windows (plugin
+    /// params / FX editors included) with live checkmarks.
+    #[test]
+    fn v47_windows_menu_lists_dyn_windows() {
+        let mut app = headless_app("v47wmdyn");
+        let ctx = egui::Context::default();
+        app.show_master = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(win_count(&app) > 4, "master out registered a slot");
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        frame(&mut app, &ctx, vec![]);
+        let row = galley_at_last(&mut app, &ctx, "MASTER OUT").expect("dyn window in menu");
+        click_pt(&mut app, &ctx, row.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(!app.show_master, "unchecking closed the dynamic window");
+    }
+
 }
+

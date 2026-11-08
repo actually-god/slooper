@@ -241,6 +241,12 @@ pub struct SideWins {
     pub monitor: [f32; 4],
     pub mixer: [f32; 4],
     pub dock: [[i16; 3]; 4],
+    /// v47 R1: ACTIVE-tab flag per primary window. Docked windows sharing
+    /// (edge, order) form one TAB GROUP (a shared slot with a tab strip);
+    /// exactly one member of a group keeps this flag set — the one whose
+    /// body is painted. (Dynamic windows carry the same flag in `DynDock`.)
+    #[serde(default)]
+    pub prim_tab: [bool; 4],
 }
 
 /// v35: dock/rect state for ONE dynamic window class instance — the
@@ -255,6 +261,9 @@ pub struct DynDock {
     pub kind: String,
     pub dock: [i16; 3],
     pub rect: [f32; 4],
+    /// v47 R1: active-tab flag (see `SideWins::prim_tab`).
+    #[serde(default)]
+    pub tab_act: bool,
 }
 
 impl Default for DynDock {
@@ -263,7 +272,32 @@ impl Default for DynDock {
             kind: String::new(),
             dock: [0, 1, 0],
             rect: [0.0; 4],
+            tab_act: false,
         }
+    }
+}
+
+/// v47 R2: a NAMED window-layout template (Ableton "view template"): all
+/// side-window geometry, dock slots and tab groups, every registered
+/// dynamic window's geometry, and the list of dynamic-window KINDS that
+/// were open at capture time. Applying restores geometry for everything
+/// and visibility only for windows that can be re-opened generically
+/// (drums, master, chain/synth pickers); plugin-specific windows
+/// (params, roll, automation, FX editor) need a live target and open only
+/// through their own command — but land in their saved slot when they do.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinLayout {
+    pub name: String,
+    pub side: SideWins,
+    pub dyns: Vec<DynDock>,
+    pub open: Vec<String>,
+}
+
+impl WinLayout {
+    /// Kind keys that applying may open/close generically.
+    pub fn reopenable(kind_head: &str) -> bool {
+        matches!(kind_head, "drums" | "master" | "chain" | "synth" | "synths")
     }
 }
 
@@ -277,6 +311,7 @@ impl Default for SideWins {
             // Classic layout: rack left, mixer flush right, bindings just
             // left of the mixer, monitor along the bottom — ALL DOCKED.
             dock: default_dock(),
+            prim_tab: [false; 4],
         }
     }
 }
@@ -548,6 +583,10 @@ pub struct Config {
     /// — per track where applicable). Kinds absent here start floating.
     #[serde(default)]
     pub dyn_docks: Vec<DynDock>,
+    /// v47 R2: named window-layout templates (Windows menu): capture,
+    /// apply, delete. Each holds the complete dock/float/tab geometry.
+    #[serde(default)]
+    pub win_layouts: Vec<WinLayout>,
     /// v25: panel/window theme — "dark" (default) or "light". The
     /// arrangement canvas and piano roll keep their fixed studio palette
     /// either way (contrast for editing is intentional).
@@ -627,6 +666,7 @@ impl Default for Config {
             show_binds: true,
             side_wins: SideWins::default(),
             dyn_docks: Vec::new(),
+            win_layouts: Vec::new(),
             theme: default_theme(),
             mpe: false,
         }
@@ -952,13 +992,16 @@ mod tests {
                 monitor: [0.0; 4],
                 mixer: [5.0, 6.0, 250.0, 600.0],
                 dock: [[0, 0, 0], [1, 1, 1], [1, 2, 0], [0, 1, 0]],
+                prim_tab: [false, true, false, false],
             },
             dyn_docks: vec![crate::config::DynDock {
                 kind: "chain:1".into(),
                 dock: [1, 3, 0],
                 rect: [4.0, 5.0, 440.0, 300.0],
+                tab_act: true,
             }],
             theme: "light".into(),
+            ..Default::default()
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
