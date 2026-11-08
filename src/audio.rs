@@ -1752,10 +1752,17 @@ impl Engine {
 
     /// Render the current project to mono f32 samples at the project length:
     /// every clip of every *sounding* track (stopped tracks contribute
-    /// nothing — the export is what the mix plays). Each track's contribution
-    /// runs through fresh private effect instances (phase 0) after its
-    /// vol x gain trim, panned to the mono downmix — the same chain the live
-    /// mix applies. `None` when the project holds no clips.
+    /// nothing — the export is what the mix plays). v48 EXPORT IDENTITY: a
+    /// track's contribution is built exactly like the live bus — the clip
+    /// sum (per-clip gain x fade, track vol x gain trim) feeds ONE
+    /// continuous pass of the track's effect chain, which is then panned
+    /// into the mono downmix. Delay/reverb tails therefore ring through
+    /// gaps and past the last clip exactly as in the preview, and chain
+    /// state carries across clips (the historical per-clip, phase-0 pass
+    /// cut tails at clip ends and reset state — exports did not match
+    /// what the user hears). Every slot runs on a fresh private instance,
+    /// so an export never advances the live chain. `None` when the project
+    /// holds no clips.
     pub fn render_project(&self) -> Option<Vec<f32>> {
         self.render_tracks(None, self.proj_len() as usize)
     }
@@ -1769,142 +1776,107 @@ impl Engine {
     fn render_tracks(&self, only: Option<usize>, len: usize) -> Option<Vec<f32>> {
         let arr = self.arrangement();
         let assets = self.assets();
+        let midi = self.midi();
         if only.is_none() && arr.is_empty() {
             return None;
         }
         let sr = self.sample_rate().max(1);
+        let chains = self.fx.lock().unwrap().clone();
         let mut out = vec![0.0f32; len.max(1)];
         let mut any = false;
-        for t in 0..MAX_LOOPS {
-            if let Some(want) = only {
-                if t != want {
-                    continue;
-                }
-            } else if !self.track_on(t) {
-                continue; // exports mirror the live mix
-            }
+
+        // v32 R5 sidechain mirror: the live bus taps every AUDIBLE source
+        // track's dry, post-trim sum and hands the routed targets' chains
+        // the summed taps. Offline the taps are sample-aligned (the live
+        // one-block detector lag cannot be reproduced without knowing the
+        // RT block size and is not part of what the user hears "as mixed").
+        // A track without a chain of its own can still be a source, so
+        // source buses are computed regardless of the export scope.
+        let mut send = [0u128; MAX_LOOPS];
+        let mut sc_any = false;
+        for (tg, s) in send.iter_mut().enumerate() {
+            *s = self.sc_send(tg);
+            sc_any |= *s != 0;
+        }
+        let mut dry_hold: Vec<Option<Vec<f32>>> =
+            if sc_any { vec![None; MAX_LOOPS] } else { Vec::new() };
+
+        // The track's DRY bus: all lanes' clips summed post-trim — exactly
+        // the signal the live chain is fed (`None` = nothing placed).
+        let track_dry = |t: usize| -> Option<Vec<f32>> {
             let tamp = self.loop_vol(t) * self.loop_gain(t);
-            let (pgl, pgr) = pan_gains(self.loop_pan(t));
-            let pdown = (pgl + pgr) * F1S2;
-            let chain = self.fx.lock().unwrap()[t].clone();
-            // A chain that hosts a plugin must run continuously over the
-            // track's whole contribution (all clips accumulate dry first),
-            // so tails ring past the last clip exactly like the live mix —
-            // the live RT path uses the same span rule. Scripted-only chains
-            // keep the historical per-clip phase-0 treatment.
-            let span = chain.has_vst();
-            let mut trk: Vec<f32> = if span {
-                vec![0.0f32; len.max(1)]
-            } else {
-                Vec::new()
-            };
-            let midi = self.midi();
-            // MIDI clips first: the whole track's patterns through one fresh
-            // synth, then through the same track FX + gain as audio clips.
-            if arr.tracks[t].lanes.iter().any(|l| {
+            let has_audio = arr.tracks[t].lanes.iter().any(|l| {
                 l.clips
                     .iter()
-                    .any(|c| matches!(midi.get(c.asset as usize), Some(Some(_))))
-            }) {
-                if let Some(h) = self.synth_for(t) {
-                    let mut buf = vec![0.0f32; len.max(1)];
-                    // v46: POLY mode exports like the mix sounds: every
-                    // child lane renders through its own copy (holes
-                    // merge into copy 0 like the live path), sums to one
-                    // track row, then rides the same chain below.
-                    let poly_row = self.poly_voices().get(t).cloned().unwrap_or_default();
-                    if self.poly_on(t) && !poly_row.is_empty() {
-                        let n_cp = poly_row.len().min(32);
-                        for (li, lane) in arr.tracks[t].lanes.iter().enumerate() {
-                            let ci = li.min(n_cp - 1);
-                            let hh = match poly_row.get(ci).cloned().flatten() {
-                                Some(x) => x,
-                                None if ci == 0 => h.clone(),
-                                None => continue,
-                            };
-                            let mut lev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
-                            for cl in &lane.clips {
-                                if let Some(Some(pat)) = midi.get(cl.asset as usize) {
-                                    stage_midi_events(pat, cl, sr, &mut lev);
-                                }
-                            }
-                            if lev.is_empty() {
-                                continue;
-                            }
-                            let mut lbuf = vec![0.0f32; len.max(1)];
-                            render_midi_any(&hh, &mut lev, 0, len.max(1), &mut lbuf, sr);
-                            for (k, x) in lbuf.into_iter().enumerate() {
-                                buf[k] += x;
-                            }
-                        }
-                    } else {
-                        let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
-                        for lane in &arr.tracks[t].lanes {
-                            for cl in &lane.clips {
-                                if let Some(Some(pat)) = midi.get(cl.asset as usize) {
-                                    stage_midi_events(pat, cl, sr, &mut ev);
-                                }
+                    .any(|c| matches!(assets.get(c.asset as usize), Some(d) if !d.is_empty()))
+            });
+            let has_midi = self.synth_for(t).is_some()
+                && arr.tracks[t].lanes.iter().any(|l| {
+                    l.clips
+                        .iter()
+                        .any(|c| matches!(midi.get(c.asset as usize), Some(Some(_))))
+                });
+            if !has_audio && !has_midi {
+                return None;
+            }
+            let mut trk = vec![0.0f32; len.max(1)];
+            // MIDI clips first: the whole track's patterns through one
+            // fresh synth, summed dry before the chain pass below.
+            if has_midi {
+                let h = self.synth_for(t).expect("checked above");
+                let mut buf = vec![0.0f32; len.max(1)];
+                // v46: POLY mode exports like the mix sounds: every child
+                // lane renders through its own copy (holes merge into copy
+                // 0 like the live path), sums to one track row.
+                let poly_row = self.poly_voices().get(t).cloned().unwrap_or_default();
+                if self.poly_on(t) && !poly_row.is_empty() {
+                    let n_cp = poly_row.len().min(32);
+                    for (li, lane) in arr.tracks[t].lanes.iter().enumerate() {
+                        let ci = li.min(n_cp - 1);
+                        let hh = match poly_row.get(ci).cloned().flatten() {
+                            Some(x) => x,
+                            None if ci == 0 => h.clone(),
+                            None => continue,
+                        };
+                        let mut lev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+                        for cl in &lane.clips {
+                            if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                                stage_midi_events(pat, cl, sr, &mut lev);
                             }
                         }
-                        render_midi_any(&h, &mut ev, 0, len.max(1), &mut buf, sr);
-                    }
-                    if span {
-                        for (k, x) in buf.into_iter().take(out.len()).enumerate() {
-                            any = true;
-                            trk[k] += x * tamp;
+                        if lev.is_empty() {
+                            continue;
                         }
-                    } else if let Some(fx) = scripted_chain(&chain) {
-                        // Tier-6: fresh private instances, buffer starts
-                        // at timeline 0 — one push covers the whole pass.
-                        let sync = offline_sync(self, sr, 0);
-                        for f in &fx {
-                            f.push_sync(&sync);
-                        }
-                        let sbuf: Vec<f32> = buf
-                            .into_iter()
-                            .take(out.len())
-                            .map(|x| {
-                                let mut s = x * tamp;
-                                for f in &fx {
-                                    s = f.process_private(s);
-                                }
-                                s
-                            })
-                            .collect();
-                        for (k, s) in sbuf.into_iter().enumerate() {
-                            any = true;
-                            out[k] += s * pdown;
-                        }
-                    } else {
-                        for (k, x) in buf.into_iter().take(out.len()).enumerate() {
-                            any = true;
-                            out[k] += x * tamp * pdown;
+                        let mut lbuf = vec![0.0f32; len.max(1)];
+                        render_midi_any(&hh, &mut lev, 0, len.max(1), &mut lbuf, sr);
+                        for (k, x) in lbuf.into_iter().enumerate() {
+                            buf[k] += x;
                         }
                     }
+                } else {
+                    let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+                    for lane in &arr.tracks[t].lanes {
+                        for cl in &lane.clips {
+                            if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                                stage_midi_events(pat, cl, sr, &mut ev);
+                            }
+                        }
+                    }
+                    render_midi_any(&h, &mut ev, 0, len.max(1), &mut buf, sr);
+                }
+                for (k, x) in buf.into_iter().enumerate() {
+                    trk[k] += x * tamp;
                 }
             }
+            // Audio clips: the clip is pinned at `pos` and the source
+            // starts at `cut` (identical to the live callback); `play_len`
+            // past the source contributes silence (nothing summed).
             for lane in &arr.tracks[t].lanes {
                 for cl in &lane.clips {
                     let data = match assets.get(cl.asset as usize) {
                         Some(d) if !d.is_empty() => d,
                         _ => continue, // empty (MIDI) or dangling asset
                     };
-                    any = true;
-                    // Fresh private instances per clip: every clip starts at
-                    // effect phase 0, and the live chain is never advanced.
-                    let fx = if span { None } else { scripted_chain(&chain) };
-                    let mix = |x: f32| {
-                        let mut s = x * tamp;
-                        if let Some(fx) = &fx {
-                            for f in fx {
-                                s = f.process_private(s);
-                            }
-                        }
-                        s
-                    };
-                    // The clip is pinned at `pos` and the source starts at
-                    // `cut` (identical to the live callback); `play_len`
-                    // past the source contributes silence (nothing summed).
                     let alen = data.len() as u64;
                     let dstart = cl.data_start() as usize;
                     let dend = cl
@@ -1912,49 +1884,86 @@ impl Engine {
                         .min(cl.end(alen))
                         .min(len as u64)
                         .max(cl.data_start());
-                    // v34 R10: when `play_len` exceeds the playable source
-                    // by ONE sample, `end` is the binding end and
-                    // `data_end` lags it — the loop then read
-                    // `data[alen]`, i.e. one element PAST the asset's
-                    // `Arc<[f32]>` into whatever the allocator neighbour
-                    // holds (often the previous asset's mid-sample). That
-                    // stale value was summed into the export at a position
-                    // that moved with the project length and neighbouring
-                    // assets — the "export starts at a random point, never
-                    // at the clip start, and depends on where the main GUI
-                    // sits" report. The LIVE path can never do this: it
-                    // indexes with `rem_euclid(alen)`, so every read is in
-                    // range. Past the source is silence, per the
-                    // documented rule.
+                    // v34 R10: past the playable source is SILENCE — the
+                    // live path indexes with `rem_euclid(alen)`, and an
+                    // export must never read `data[alen]` (the "export
+                    // starts at a random point" report).
                     let dend = dend.max(dstart as u64) as usize;
-                    // Tier-6: per-clip private chain is anchored at the
-                    // clip's timeline start (self-advancing scripts stay
-                    // sample-exact across the whole clip).
-                    if let Some(fx) = &fx {
-                        let sync = offline_sync(self, sr, dstart as i64);
-                        for f in fx {
-                            f.push_sync(&sync);
-                        }
-                    }
                     for k in dstart..dend {
-                        any = true;
                         let s = data[(cl.cut + (k as u64 - cl.data_start())) as usize];
-                        let m = mix(s) * cl.gain * cl.fade_at(k as u64, alen);
-                        if span {
-                            trk[k] += m;
-                        } else {
-                            out[k] += m * pdown;
-                        }
+                        trk[k] += s * tamp * cl.gain * cl.fade_at(k as u64, alen);
                     }
                 }
             }
-            if span {
-                // Full chain over the whole track span (fresh copies: the
-                // live chain is never advanced by an export).
-                run_chain_over(&chain, sr, &mut trk, &offline_sync(self, sr, 0));
-                for (k, s) in trk.into_iter().enumerate() {
-                    out[k] += s * pdown;
+            Some(trk)
+        };
+
+        // Target tracks: the export scope (an explicit track export
+        // ignores that track's play/stop flag; a project export mirrors
+        // the live mute state).
+        let mut targets: Vec<usize> = Vec::new();
+        for t in 0..MAX_LOOPS {
+            if let Some(w) = only {
+                if t != w {
+                    continue;
                 }
+            } else if !self.track_on(t) {
+                continue; // exports mirror the live mix
+            }
+            targets.push(t);
+        }
+        if sc_any {
+            // Hold the dry bus of every AUDIBLE sidechain source — also of
+            // sources OUTSIDE the export scope (they only ever feed another
+            // track's chain, exactly like the live tap).
+            let src_mask = send.iter().fold(0u128, |m, s| m | *s);
+            for (src, slot) in dry_hold.iter_mut().enumerate() {
+                if (src_mask >> src) & 1 != 0 && (self.track_on(src) || Some(src) == only) {
+                    *slot = track_dry(src);
+                }
+            }
+        }
+        // Sum the source taps into each target's sidechain row BEFORE the
+        // target loop consumes (moves out) any held dry bus.
+        let mut sc_rows: Vec<Option<Vec<f32>>> =
+            if sc_any { vec![None; MAX_LOOPS] } else { Vec::new() };
+        if sc_any {
+            for &t in &targets {
+                if send[t] != 0 {
+                    let mut row = vec![0.0f32; len.max(1)];
+                    for (src, d) in dry_hold.iter().enumerate() {
+                        if (send[t] >> src) & 1 != 0 {
+                            if let Some(d) = d {
+                                for (r, x) in row.iter_mut().zip(d.iter()) {
+                                    *r += *x;
+                                }
+                            }
+                        }
+                    }
+                    sc_rows[t] = Some(row);
+                }
+            }
+        }
+        for t in targets {
+            let (pgl, pgr) = pan_gains(self.loop_pan(t));
+            let pdown = (pgl + pgr) * F1S2;
+            let mut trk = match dry_hold.get_mut(t).and_then(|o| o.take()) {
+                Some(b) => b,
+                None => match track_dry(t) {
+                    Some(b) => b,
+                    None => continue,
+                },
+            };
+            // This target's sidechain row (empty = no send routed — the
+            // documented sc = 0.0 rule for scripts).
+            let sc_vec: Vec<f32> =
+                if sc_any { sc_rows[t].take().unwrap_or_default() } else { Vec::new() };
+            // One fresh full-chain pass over the whole span (fresh private
+            // copies: the live chain is never advanced by an export).
+            run_chain_over(&chains[t], sr, &mut trk, &offline_sync(self, sr, 0), &sc_vec);
+            for (k, s) in trk.into_iter().enumerate() {
+                any = true;
+                out[k] += s * pdown;
             }
         }
         if any {
@@ -1987,7 +1996,7 @@ impl Engine {
             }
         }
         let chain = self.fx.lock().unwrap()[t].clone();
-        run_chain_over(&chain, sr, &mut buf, &offline_sync(self, sr, 0));
+        run_chain_over(&chain, sr, &mut buf, &offline_sync(self, sr, 0), &[]);
         Some(buf)
     }
 
@@ -2030,96 +2039,70 @@ impl Engine {
         let len = (to - from) as usize;
         let mut out = vec![0.0f32; len];
         let chains = self.fx.lock().unwrap().clone();
+        // v48 EXPORT IDENTITY applies inside the window too: per track all
+        // selected clips sum dry (gain x fade x trim) and ONE fresh
+        // full-chain pass runs over the whole selection window — tails flow
+        // across clips and ring to the window end (state from before the
+        // window is, by definition, not part of a range render; sidechain
+        // sends feed the aligned dry taps of the SELECTED clips only).
+        let mut bytrk: Vec<(usize, Vec<crate::arrange::Clip>)> = Vec::new();
         for (t, cl) in &clips {
-            let tamp = self.loop_vol(*t) * self.loop_gain(*t);
-            let (pgl, pgr) = pan_gains(self.loop_pan(*t));
+            match bytrk.iter_mut().find(|(k, _)| *k == *t) {
+                Some(e) => e.1.push(*cl),
+                None => bytrk.push((*t, vec![*cl])),
+            }
+        }
+        for (t, tclips) in bytrk {
+            let tamp = self.loop_vol(t) * self.loop_gain(t);
+            let (pgl, pgr) = pan_gains(self.loop_pan(t));
             let pdown = (pgl + pgr) * F1S2;
-            let chain = chains[*t].clone();
-            let span = chain.has_vst();
-            // MIDI clip: fresh synth copy + fresh chain, same treatment as
-            // an audio clip (phase 0, live state untouched).
-            if let Some(Some(pat)) = midi.get(cl.asset as usize) {
-                if let Some(h) = self.synth_for(*t) {
-                    let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+            let mut trk = vec![0.0f32; len];
+            // MIDI clips through one fresh synth copy (window-aligned).
+            let mut ev: Vec<(u64, u8, u8, u8, u8)> = Vec::new();
+            let mut has_midi = false;
+            for cl in &tclips {
+                if let Some(Some(pat)) = midi.get(cl.asset as usize) {
+                    has_midi = true;
                     stage_midi_events(pat, cl, sr, &mut ev);
+                }
+            }
+            if has_midi {
+                if let Some(h) = self.synth_for(t) {
                     let mut buf = vec![0.0f32; len];
                     render_midi_any(&h, &mut ev, from, len, &mut buf, sr);
-                    if span {
-                        run_chain_over(&chain, sr, &mut buf, &offline_sync(self, sr, from as i64));
-                        for (k, s2) in buf.into_iter().enumerate() {
-                            out[k] += s2 * tamp * pdown;
-                        }
-                    } else {
-                        let fx = scripted_chain(&chain);
-                        // Tier-6: selection window origin is `from`.
-                        if let Some(fx) = &fx {
-                            let sync = offline_sync(self, sr, from as i64);
-                            for f in fx {
-                                f.push_sync(&sync);
-                            }
-                        }
-                        let mut sbuf: Vec<f32> = buf
-                            .into_iter()
-                            .map(|x| {
-                                let mut s2 = x * tamp;
-                                if let Some(fx) = &fx {
-                                    for f in fx {
-                                        s2 = f.process_private(s2);
-                                    }
-                                }
-                                s2
-                            })
-                            .collect();
-                        for (k, s2) in sbuf.drain(..).enumerate() {
-                            out[k] += s2 * pdown;
-                        }
+                    for (k, x) in buf.into_iter().enumerate() {
+                        trk[k] += x * tamp;
                     }
                 }
-                continue;
             }
-            let data = match assets.get(cl.asset as usize) {
-                Some(d) if !d.is_empty() => d,
-                _ => continue,
-            };
-            let fx = if span { None } else { scripted_chain(&chain) };
-            let mix = |x: f32| {
-                let mut s = x * tamp;
-                if let Some(fx) = &fx {
-                    for f in fx {
-                        s = f.process_private(s);
-                    }
-                }
-                s
-            };
-            let alen_u = data.len() as u64;
-            // Same clip-pinned-at-pos mapping as live playback and
-            // render_tracks; the selection window slices the output.
-            let dstart = cl.data_start() as usize;
-            let dend = cl.data_end(alen_u).min(cl.end(alen_u)) as usize;
-            // Tier-6: this chunk sits at timeline `dstart`.
-            if let Some(fx) = &fx {
-                let sync = offline_sync(self, sr, dstart as i64);
-                for f in fx {
-                    f.push_sync(&sync);
-                }
-            }
-            let mut chunk: Vec<f32> = (dstart..dend)
-                .map(|k| data[(cl.cut + (k as u64 - cl.data_start())) as usize])
-                .enumerate()
-                .map(|(j, x)| mix(x) * cl.gain * cl.fade_at((dstart + j) as u64, alen_u))
-                .collect();
-            if span {
-                // Fresh full-chain pass over this chunk (selection bounces
-                // stay clip-local, mirroring the scripted per-clip rule).
-                run_chain_over(&chain, sr, &mut chunk, &offline_sync(self, sr, dstart as i64));
-            }
-            for (j, k) in (dstart..dend).enumerate() {
-                if k >= from as usize {
+            // Audio clips: same clip-pinned-at-pos mapping as live playback
+            // and render_tracks; the selection window slices the output.
+            for cl in &tclips {
+                let data = match assets.get(cl.asset as usize) {
+                    Some(d) if !d.is_empty() => d,
+                    _ => continue,
+                };
+                let alen_u = data.len() as u64;
+                let dstart = cl.data_start() as usize;
+                let dend = cl.data_end(alen_u).min(cl.end(alen_u)) as usize;
+                for k in dstart..dend {
                     let o = k - from as usize;
-                    if o < len {
-                        out[o] += chunk[j] * pdown;
+                    if o >= len {
+                        break;
                     }
+                    let s = data[(cl.cut + (k as u64 - cl.data_start())) as usize];
+                    trk[o] += s * tamp * cl.gain * cl.fade_at(k as u64, alen_u);
                 }
+            }
+            run_chain_over(
+                &chains[t],
+                sr,
+                &mut trk,
+                &offline_sync(self, sr, from as i64),
+                &[],
+            );
+            for (o, s) in trk.into_iter().enumerate() {
+                out[o] += s * pdown;
             }
         }
         Some((from, out))
@@ -2976,9 +2959,9 @@ unsafe impl Send for ClipEntry {}
 /// ABSOLUTE timeline sample (kind: 0=note-off 1=CC 2=pressure 3=note-on).
 /// Shared by the offline renders; the RT path stages per block inline.
 /// Pass a render chunk through a track's private VST copy (offline export);
-/// a no-op when the track has no insert. Fresh per clip, mirroring the
-/// scripted-FX export rule (every clip starts at phase 0; the live chain is
-/// never advanced).
+/// a no-op when the track has no insert. Fresh per render PASS (v48: one
+/// continuous chain pass per track over the whole render span; the live
+/// chain is never advanced).
 fn vst_chunk(e: Option<&dyn crate::vsthost::StageEntry>, chunk: &mut [f32]) {
     if let Some(e) = e {
         let src = chunk.to_vec();
@@ -3018,20 +3001,6 @@ pub fn spawn_synth_copy(h: &SynthHandle, sr: u32) -> Option<Arc<SynthHandle>> {
     }
 }
 
-/// Fresh scripted instances for a chain (offline renders), or `None` when
-/// the chain has no scripted slot at all (cheap passthrough for callers).
-fn scripted_chain(chain: &TrackFx) -> Option<Vec<Arc<crate::fx::Instance>>> {
-    let v: Vec<Arc<crate::fx::Instance>> = chain
-        .slots()
-        .iter()
-        .filter_map(|s| match &s.kind {
-            FxKind::Scripted { inst, desc } => inst.spawn_fresh(desc),
-            FxKind::Vst(_) => None,
-        })
-        .collect();
-    (!v.is_empty()).then_some(v)
-}
-
 /// Tier-6: sync snapshot for an offline chain pass — a render pass counts
 /// as "transport running"; `pos0` is where `buf[0]` sits on the timeline
 /// (per-clip passes are fed the clip's own start, whole-project renders 0).
@@ -3048,8 +3017,17 @@ fn offline_sync(engine: &Engine, sr: u32, pos0: i64) -> crate::fx::SyncInfoV1 {
 
 /// Run the whole chain (scripted + plugins, in order) over a full render
 /// buffer using fresh private copies. Plugin slots consume the buffer
-/// block-wise; scripted slots run sample-wise like the live path.
-fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32], sync: &crate::fx::SyncInfoV1) {
+/// block-wise; scripted slots run sample-wise like the live path, fed the
+/// (mid, mid) pair and the sidechain row `sc` (empty = no send routed).
+/// v48: ONE pass over the whole render span is the export-identity rule —
+/// the same chain the live bus runs continuously.
+fn run_chain_over(
+    chain: &TrackFx,
+    sr: u32,
+    buf: &mut [f32],
+    sync: &crate::fx::SyncInfoV1,
+    sc: &[f32],
+) {
     for slot in chain.slots() {
         match &slot.kind {
             FxKind::Scripted { inst, desc } => {
@@ -3059,15 +3037,13 @@ fn run_chain_over(chain: &TrackFx, sr: u32, buf: &mut [f32], sync: &crate::fx::S
                     f.push_sync(sync);
                     // Tier-3: offline renders are mono — a v3 stereo slot
                     // is fed (mid, mid) and keeps its LEFT output (the
-                    // documented fold, see effect_api.rs ABI v3).
-                    if f.is_stereo() {
-                        for x in buf.iter_mut() {
-                            *x = f.process_private_st(*x, *x).0;
-                        }
-                    } else {
-                        for x in buf.iter_mut() {
-                            *x = f.process_private(*x);
-                        }
+                    // documented fold, see effect_api.rs ABI v3). v48: the
+                    // single dispatch mirrors the live one (`call_sample_st`
+                    // + the routed sc sample), so mono scripts see the
+                    // exact same mid — `(x + x) * 0.5 == x` bit-identically
+                    // — and v2 sidechain scripts duck like the live mix.
+                    for (i, x) in buf.iter_mut().enumerate() {
+                        *x = f.process_private_st_sc(*x, *x, *sc.get(i).unwrap_or(&0.0)).0;
                     }
                 }
             }
@@ -7403,5 +7379,284 @@ mod tests {
         assert_eq!(aud_pending(&ev, 50), 1, "first note ringing");
         assert_eq!(aud_pending(&ev, 150), 0, "its off arrived");
         assert_eq!(aud_pending(&ev, 250), 1, "second note held");
+    }
+
+    // ---- v48: export identity — one continuous chain pass per track -----
+    //
+    // Live bus rules the export must reproduce: the track chain is fed the
+    // clip sum post-trim and runs CONTINUOUSLY — delay/reverb tails ring
+    // across clip boundaries and past the last clip, chain state never
+    // resets between clips, and routed sidechain sends reach the target's
+    // chain (muted sources contribute no tap, mirroring the audible gate).
+
+    /// Deterministic feedback comb (a delay/reverb stand-in): taps every
+    /// `time` seconds, decaying by `fb`. Params: time (s), fb, wet mix.
+    const V48_ECHO_SRC: &str = r#"include!("effect_api.rs");
+
+struct Echo { sr: f64, buf: Vec<f32>, w: usize }
+
+const P_TIME: usize = 0;
+const P_FB: usize = 1;
+const P_MIX: usize = 2;
+
+extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
+    let sr = sample_rate.max(1.0);
+    let n = (sr * 0.125) as usize + 3;
+    Box::into_raw(Box::new(Echo { sr, buf: vec![0.0f32; n], w: 0 })) as *mut core::ffi::c_void
+}
+extern "C" fn destroy(state: *mut core::ffi::c_void) {
+    if !state.is_null() { drop(unsafe { Box::from_raw(state as *mut Echo) }); }
+}
+extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32 {
+    if state.is_null() { return input; }
+    let st = unsafe { &mut *(state as *mut Echo) };
+    let time = unsafe { *params.add(P_TIME) } as f64;
+    let fb = unsafe { *params.add(P_FB) };
+    let mix = unsafe { *params.add(P_MIX) };
+    let n = st.buf.len();
+    let d = ((time * st.sr).round() as usize).clamp(1, n - 1);
+    let wet = st.buf[(st.w + n - d) % n];
+    st.buf[st.w] = input + fb * wet;
+    st.w = (st.w + 1) % n;
+    input + mix * wet
+}
+
+static PARAMS: [EffectParamV1; 3] = [
+    EffectParamV1 { label: c"time".as_ptr(), min: 0.001, max: 0.1, default: 0.015625 },
+    EffectParamV1 { label: c"fb".as_ptr(), min: 0.0, max: 0.95, default: 0.5 },
+    EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 2.0, default: 1.0 },
+];
+pub static DESC: EffectInfoV1 = EffectInfoV1 {
+    abi: SLOOPER_EFFECT_ABI,
+    name: c"V48 Comb".as_ptr(),
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 3,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+};
+#[no_mangle]
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 { &DESC }
+"#;
+
+    /// v2 sidechain duck: output x (1 - 0.9 * min(|sc|, 1)).
+    const V48_SC_SRC: &str = r#"include!("effect_api.rs");
+
+extern "C" fn create(_sr: f64) -> *mut core::ffi::c_void {
+    Box::into_raw(Box::new(0usize)) as *mut core::ffi::c_void
+}
+extern "C" fn destroy(_s: *mut core::ffi::c_void) {
+    if !_s.is_null() { drop(unsafe { Box::from_raw(_s as *mut usize) }); }
+}
+extern "C" fn process(_s: *mut core::ffi::c_void, input: f32, _p: *const f32) -> f32 { input }
+extern "C" fn process_sc(_s: *mut core::ffi::c_void, input: f32, _p: *const f32, sc: f32) -> f32 {
+    input * (1.0 - 0.9 * sc.abs().min(1.0))
+}
+
+static PARAMS: [EffectParamV1; 1] = [
+    EffectParamV1 { label: c"none".as_ptr(), min: 0.0, max: 1.0, default: 0.0 },
+];
+pub static DESC: EffectInfoV1 = EffectInfoV1 {
+    abi: SLOOPER_EFFECT_ABI,
+    name: c"V48 Duck".as_ptr(),
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 1,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+};
+pub static DESC2: EffectInfoV2 = EffectInfoV2 {
+    abi: SLOOPER_EFFECT_ABI_V2,
+    name: c"V48 Duck".as_ptr(),
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 1,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc,
+};
+#[no_mangle]
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 { &DESC }
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
+"#;
+
+    /// Load a test effect script into a private registry (temp dir).
+    fn v48_reg(tag: &str, file: &str, src: &str) -> (crate::fx::Registry, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{file}.rs")), src).unwrap();
+        let mut reg = crate::fx::Registry::open(dir.clone());
+        reg.rescan();
+        assert!(reg.desc(file).is_some(), "test effect {file} must load");
+        (reg, dir)
+    }
+
+    fn v48_click(one: usize) -> Arc<[f32]> {
+        let mut d = vec![0.0f32; one];
+        d[0] = 1.0;
+        Arc::from(d)
+    }
+
+    /// Tap assert: powers of two on both sides, 1e-6 only absorbs the pan
+    /// downmix's last bit.
+    fn v48_tap(out: &[f32], i: usize, want: f32) {
+        assert!(
+            (out[i] - want).abs() < 1e-6,
+            "out[{i}] = {} want {want}",
+            out[i]
+        );
+    }
+
+    fn v48_comb(e: &Engine, reg: &crate::fx::Registry, t: usize) {
+        let inst = reg
+            .create_instance("v48echo", 48000.0, &[0.015625, 0.5, 1.0])
+            .unwrap();
+        let desc = reg.desc("v48echo").unwrap().clone();
+        e.set_track_fx(
+            t,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+    }
+
+    /// R1: an echo tail RINGS PAST the clip end. d = 750, fb 0.5, mix 1: a
+    /// 1000-sample click clip in a 4000-project must place comb taps at
+    /// 750, 1500, 2250, 3000, 3750 — everything past sample 1000 was hard
+    /// silence in the historical per-clip phase-0 render.
+    #[test]
+    fn v48_export_tail_rings_past_clip_end() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v48echo1", "v48echo", V48_ECHO_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0));
+        e.set_project(Arc::new(vec![v48_click(1000)]), Arc::new(arr), 4000);
+        v48_comb(&e, &reg, 0);
+        let out = e.render_project().expect("render");
+        v48_tap(&out, 0, 1.0); // dry click
+        v48_tap(&out, 750, 1.0); // tap 1 — inside the clip
+        v48_tap(&out, 1500, 0.5); // past the source: the reported bug
+        v48_tap(&out, 2250, 0.25);
+        v48_tap(&out, 3000, 0.125);
+        v48_tap(&out, 3750, 0.0625);
+        assert!(out[1200].abs() < 1e-9, "gap between taps stays silent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2: chain state SURVIVES the gap between clips. Click A at 0, click
+    /// B at 1200 (both 1000 long): ONE continuous chain hears both — A's
+    /// later taps ring inside and after B's window while B builds its own
+    /// echo train. Fresh per-clip instances could not produce tap(1500) =
+    /// 0.5 (inside B's span, from A).
+    #[test]
+    fn v48_export_chain_state_survives_gap() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v48echo2", "v48echo", V48_ECHO_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0));
+        arr.insert(0, 0, Clip::new(1, 1200));
+        e.set_project(
+            Arc::new(vec![v48_click(1000), v48_click(1000)]),
+            Arc::new(arr),
+            4000,
+        );
+        v48_comb(&e, &reg, 0);
+        let out = e.render_project().expect("render");
+        v48_tap(&out, 1200, 1.0); // B's dry click
+        v48_tap(&out, 1500, 0.5); // A's tap ringing INSIDE B's old window
+        v48_tap(&out, 1950, 1.0); // B's tap 1 (1200 + 750)
+        v48_tap(&out, 2250, 0.25); // A continues
+        v48_tap(&out, 2700, 0.5); // B continues
+        v48_tap(&out, 3000, 0.125);
+        v48_tap(&out, 3450, 0.25);
+        assert!(out[2400].abs() < 1e-9, "gap between taps stays silent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3: a selection export runs the chain over the WHOLE window, so
+    /// clip A's tail flows into clip B's part of the window; the window
+    /// still ends at the selection end (taps beyond it are truncated).
+    #[test]
+    fn v48_export_selection_window_chain() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v48echo3", "v48echo", V48_ECHO_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0));
+        arr.insert(0, 0, Clip::new(1, 1200));
+        e.set_project(
+            Arc::new(vec![v48_click(1000), v48_click(1000)]),
+            Arc::new(arr),
+            4000,
+        );
+        v48_comb(&e, &reg, 0);
+        let (from, out) = e
+            .render_selection(&[(0, 0, 0), (0, 0, 1)])
+            .expect("selection render");
+        assert_eq!(from, 0);
+        assert_eq!(out.len(), 2200, "window = first start .. last end");
+        v48_tap(&out, 1500, 0.5); // A's tail across the gap, inside window
+        v48_tap(&out, 1950, 1.0); // B's tap 1
+        assert!(out[2199].abs() < 1e-9, "window end is a cut, not a fade");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4: a routed sidechain send reaches the target's chain in the
+    /// export (v2 scripts duck under the source's post-trim dry taps), and
+    /// muting the source removes the tap — the live audible gate mirrored.
+    #[test]
+    fn v48_export_sidechain_ducks_target() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v48sc", "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![1.0f32; 1500]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0)); // track 0: constant source
+        arr.insert(1, 0, Clip::new(1, 500)); // track 1: click at 500
+        e.set_project(Arc::new(vec![src, v48_click(1000)]), Arc::new(arr), 1500);
+        let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+        let desc = reg.desc("v48sc").unwrap().clone();
+        e.set_track_fx(
+            1,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+        e.set_sc_send(1, 1 << 0);
+        let out = e.render_project().expect("render");
+        v48_tap(&out, 0, 1.0); // source is dry at unity
+        assert!(
+            (out[500] - 1.1).abs() < 1e-6,
+            "target click must duck to 0.1 under the tap, got {}",
+            out[500]
+        );
+        // Mute the source: no audible tap -> the duck disappears.
+        e.set_track_on(0, false);
+        let out2 = e.render_project().expect("render");
+        assert!(out2[0].abs() < 1e-9, "muted source contributes nothing");
+        v48_tap(&out2, 500, 1.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

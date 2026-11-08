@@ -251,6 +251,13 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
      BOTH panel dims: cross only on real divider moves (the runaway
      rule) but the ALONG share records freely — fair-share defaults
      read it after every id-salt reflow.
+10. **EXPORT IDENTITY (v48)**: offline renders reproduce the live bus — a
+   track's clip sum (per-clip gain × fade, post vol × gain trim) feeds ONE
+   continuous fresh-chain pass over the whole render span, then the pan
+   fold (`render_tracks`/`render_selection` + `run_chain_over`). Never
+   reintroduce per-clip fresh-chain passes: they cut delay/reverb tails at
+   clip ends and reset chain state (pins `v48_export_*`). Routed sidechain
+   sends feed the target's chain the summed dry taps of audible sources.
 
 ## Where things are wired (quick grep targets)
 

@@ -516,6 +516,12 @@ vol × gain × chain × pan), the **whole project** (every track summed
 through its chain), or the **current selection** — just the selected
 clips, bounced **time-aligned** with the first clip at sample 0 — as:
 
+Rendering follows the live signal path exactly: a track's clips sum
+(post-trim), its effect chain runs **once across the whole exported span**
+— delay/reverb tails ring through gaps and past the last clip, sidechain
+sends duck like in the preview — and the result is panned into the mix. A
+selection export cuts at the selection edges.
+
 | Format | Notes |
 | --- | --- |
 | WAV | 16-bit PCM, built in |
