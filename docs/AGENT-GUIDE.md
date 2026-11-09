@@ -46,7 +46,10 @@ require an X11 display (XWayland counts).
 src/            application source (Rust 2021 edition)
   main.rs         entry point, window setup
   lib.rs          crate root (pub mods)
-  audio.rs        JACK backend + realtime DAW engine (Cmd/Evt channels);
+  audio.rs        JACK shim + backend-neutral realtime DAW engine
+                  (Cmd/Evt channels); the RT core is Proc::process_block
+                  (W4) — every audio backend calls exactly that per block
+                  (jack: today, WASAPI: W5);
                   clip-lane mixing, take recording (Evt::Take handshake),
                   global transport/seek/loop-wrap, metronome, per-track
                   synth + chain playback, stereo buses with per-track
@@ -92,6 +95,9 @@ src/            application source (Rust 2021 edition)
                   (rack folders, projects dir, quantize/snap, mixer,
                   `track_chain` + `track_synth`(+params), `vst_dirs`,
                   `n_tracks`, shortcut + MIDI tables + `midi_axis` cal)
+  backend.rs      audio-backend contract (W4): BlockIo slot buffers + the
+                  per-block rules every backend shim must follow; the RT
+                  entry point itself is `Proc::process_block` (audio.rs)
   paths.rs        SINGLE source of base dirs (W2): config_dir()/data_dir()/
                   cache_home() — XDG+HOME on Linux, %APPDATA%/%LOCALAPPDATA%
                   on Windows, SLOOPER_DATA_DIR/SLOOPER_CONFIG_DIR override;
@@ -181,6 +187,9 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 
 1. **Realtime safety**: the JACK `ProcessHandler` must stay lock-free and
    allocation-free; GUI↔audio only via bounded Cmd/Evt channels + atomics.
+   Mix/transport/take logic lives ONLY in `Proc::process_block` (W4) —
+   backend shims (jack today, WASAPI in W5) stay pure plumbing
+   (frames/MIDI/buffers in, call, return); `w4_*` pins guard the seam.
    The arrangement crosses as one `Arc<Arrangement>` per edit
    (`Cmd::SetProject`); never read GUI state from RT. Replaced chain/plugin
    entries are HELD on the RT thread and reaped on the UI thread
