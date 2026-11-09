@@ -95,7 +95,9 @@ src/            application source (Rust 2021 edition)
   paths.rs        SINGLE source of base dirs (W2): config_dir()/data_dir()/
                   cache_home() — XDG+HOME on Linux, %APPDATA%/%LOCALAPPDATA%
                   on Windows, SLOOPER_DATA_DIR/SLOOPER_CONFIG_DIR override;
-                  never memoized (tests swap HOME/XDG mid-suite)
+                  never memoized (tests swap HOME/XDG mid-suite). Also the
+                  target-suffix helpers dylib_ext()/build_sidecar() (W3) —
+                  fx.rs/synth.rs never hardcode `.so` for build artifacts
   effect_api.rs   the effect-script ABI contract (also copied into every
                   user effects folder; scripts include! this file)
   fx.rs           effects scan/compile/cache/load, ABI validation, chains,
@@ -171,6 +173,7 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   app-shipped scripts **update in place** when stale (`.bak` backup)
 - Synth scripts: `~/.local/share/slooper/synths/` (same in-place update;
   `SLOOPER_SYNTHS_DIR` override); compile cache `~/.cache/slooper-synth`
+  (artifact suffix = `paths::dylib_ext()`: `.so` Linux, `.dll` Windows)
 - VST scan dirs: config `vst_dirs` (defaults `~/.vst`, `~/.vst3`, system
   dirs; yabridge dirs scan transparently)
 

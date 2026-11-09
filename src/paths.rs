@@ -34,7 +34,7 @@
 //! suite swaps `HOME`/`XDG_*` between tests (see `test_app`), so memoizing
 //! here would silently freeze every sandboxed test onto the first value.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Env var: full replacement for [`data_dir`] (wins over XDG).
 pub const DATA_DIR_ENV: &str = "SLOOPER_DATA_DIR";
@@ -134,6 +134,26 @@ pub fn impulses_dir() -> PathBuf {
 /// `Config.project_dir` is unset.
 pub fn default_projects_dir() -> PathBuf {
     home_dir().join("slooper-projects")
+}
+
+/// Suffix (no dot) the platform gives a loadable shared object: `so` on
+/// Unix, `dll` on Windows. Used by the two runtime-compile loaders
+/// (`fx.rs`, `synth.rs`) so no call site hardcodes `.so` again — this is
+/// the W3 step of the Windows port. The Linux value is unchanged.
+pub fn dylib_ext() -> &'static str {
+    if cfg!(windows) {
+        "dll"
+    } else {
+        "so"
+    }
+}
+
+/// A file next to `artifact` carrying `tag`:
+/// `kick.so` → `kick.so.tmp` / `kick.so.failed`. Both compile loaders use
+/// this for their staging and poison-marker files so those names follow
+/// the platform suffix too. Linux names are unchanged.
+pub fn build_sidecar(artifact: &Path, tag: &str) -> PathBuf {
+    artifact.with_extension(format!("{}.{}", dylib_ext(), tag))
 }
 
 #[cfg(test)]
@@ -296,5 +316,31 @@ mod tests {
             PathBuf::from("C:\\Users\\u\\AppData\\Local").join("slooper")
         );
         assert_eq!(cache_home(), PathBuf::from("C:\\Users\\u\\AppData\\Local"));
+    }
+
+    #[test]
+    fn w3_dylib_ext_matches_target() {
+        // Each OS asserts its own truth (W3): the runtime-compile loaders
+        // build and load `so` on Unix, `dll` on Windows.
+        if cfg!(windows) {
+            assert_eq!(dylib_ext(), "dll");
+        } else {
+            assert_eq!(dylib_ext(), "so");
+        }
+    }
+
+    #[test]
+    fn w3_build_sidecar_follows_target_ext() {
+        let art = PathBuf::from("/x").join(format!("kick-abcd.{}", dylib_ext()));
+        let p = build_sidecar(&art, "tmp");
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            format!("kick-abcd.{}.tmp", dylib_ext())
+        );
+        let p = build_sidecar(&art, "failed");
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            format!("kick-abcd.{}.failed", dylib_ext())
+        );
     }
 }

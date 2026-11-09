@@ -18079,10 +18079,11 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
     });
     if !fx::rustc_available() {
         ui.label(
-            RichText::new(
-                "rustc is not on PATH \u{2014} synth scripts cannot compile. Install \
-                         Rust (rustup).",
-            )
+            RichText::new(format!(
+                "rustc is not on PATH \u{2014} synth scripts cannot compile \u{2014} \
+                 {}.",
+                fx::rustc_install_hint()
+            ))
             .color(Color32::YELLOW),
         );
     }
@@ -21362,9 +21363,10 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
     });
     if !fx::rustc_available() {
         ui.label(
-            RichText::new(
-                "rustc is not on PATH — effect scripts cannot compile. Install Rust (rustup).",
-            )
+            RichText::new(format!(
+                "rustc is not on PATH \u{2014} effect scripts cannot compile \u{2014} {}.",
+                fx::rustc_install_hint()
+            ))
             .color(Color32::YELLOW),
         );
     }

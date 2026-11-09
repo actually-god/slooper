@@ -433,7 +433,7 @@ impl Registry {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let lib = build.join(format!("{stem}.so"));
+            let lib = build.join(format!("{stem}.{}", crate::paths::dylib_ext()));
             let entry = if needs_build(&src, &lib) {
                 match compile_synth(&src, &lib) {
                     Ok(()) => unsafe { load_one(&stem, &lib) },
@@ -476,7 +476,8 @@ fn needs_build(src: &Path, lib: &Path) -> bool {
 }
 
 /// Serializes rustc invocations: test threads (and a future rescan during
-/// playback) must not write the same `.so.tmp` concurrently.
+/// playback) must not write the same staging file (`.tmp` sidecar)
+/// concurrently.
 fn compile_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -502,7 +503,7 @@ fn compile_synth(src: &Path, out: &Path) -> Result<(), String> {
         }
         s
     };
-    let tmp = out.with_extension("so.tmp");
+    let tmp = crate::paths::build_sidecar(out, "tmp");
     let output = Command::new("rustc")
         .args([
             "--edition",
@@ -518,10 +519,15 @@ fn compile_synth(src: &Path, out: &Path) -> Result<(), String> {
         .arg(&tmp)
         .arg(src)
         .output()
-        .map_err(|e| format!("could not run rustc: {e} — install rust or rustup"))?;
+        .map_err(|e| {
+            format!(
+                "could not run rustc: {e} — {}",
+                crate::fx::rustc_install_hint()
+            )
+        })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        std::fs::write(out.with_extension("so.failed"), err.as_bytes()).ok();
+        std::fs::write(crate::paths::build_sidecar(out, "failed"), err.as_bytes()).ok();
         let mut err: String = err.trim().chars().take(1800).collect();
         err.push('…');
         return Err(format!("compile failed:\n{err}"));
@@ -1069,5 +1075,24 @@ mod tests {
             (peak3 - peak2).abs() < 1e-6,
             "stable table must not alter output"
         );
+    }
+
+    #[test]
+    fn w3_synth_compile_sidecar_ext() {
+        // W3 (WINDOWS-PORT): staging/poison names follow the target suffix.
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise
+        }
+        let dir = std::env::temp_dir().join("sp-synth-w3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("pin.{}", crate::paths::dylib_ext()));
+        let bad = dir.join("bad.rs");
+        std::fs::write(&bad, "fn broken( {").unwrap();
+        let e = compile_synth(&bad, &out).unwrap_err();
+        assert!(e.contains("compile failed"), "{e}");
+        assert!(crate::paths::build_sidecar(&out, "failed").is_file());
+        assert!(!out.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
