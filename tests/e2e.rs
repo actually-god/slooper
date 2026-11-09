@@ -14,6 +14,10 @@
 //!   to a decodable WAV;
 //! - midi: messages are sent to `slooper:midi_in` and must come back parsed.
 //!
+//! WINDOWS-PORT W5: the whole suite is Linux-only by construction — it drives
+//! a LIVE JACK server and a second JACK client, both absent on Windows
+//! (there the headless `SLOOPER_NULL_AUDIO` lib suite is the CI vehicle).
+#![cfg(not(windows))]
 //! If no JACK/PipeWire server is running, the tests skip themselves.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};

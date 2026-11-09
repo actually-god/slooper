@@ -1,4 +1,11 @@
-//! JACK/PipeWire-JACK audio backend for slooper (DAW engine).
+//! Audio engine + manager-thread core for slooper (DAW engine).
+//!
+//! Backend-neutral since WINDOWS-PORT W5: the OS device shims live in
+//! `audio/jack.rs` (Linux, primary) and `audio/wasapi.rs` (Windows);
+//! the block-level contract they implement is in `src/backend.rs`, the
+//! manager-level one on [`manager_loop`] / [`ManagerBackend`].
+//! Everything below — `Cmd`/`Evt`, `Backend`, `Engine`,
+//! `Proc::process_block` — is shared by both.
 //!
 //! A dedicated non-realtime "audio manager" thread owns the `jack::Client`.
 //! The GUI talks to it over an mpsc command channel and receives state
@@ -28,16 +35,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 
-use jack::jack_sys as j;
-use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, ClientStatus, Control, MidiIn, NotificationHandler,
-    Port, PortFlags, PortId, ProcessHandler, ProcessScope,
-};
+// OS backends (WINDOWS-PORT W5): exactly one compiles per OS.
+#[cfg(not(windows))]
+mod jack;
+#[cfg(windows)]
+mod wasapi;
 
 use crate::arrange::Arrangement;
 
-pub const CLIENT_NAME: &str = "slooper";
-const MIDI_PORT_SHORT: &str = "midi_in";
 /// Fixed pool of mix slots; `Apply` maps the selected ports onto slots 0..n-1.
 pub const MAX_SLOTS: usize = 16;
 
@@ -531,6 +536,50 @@ pub enum Evt {
     Error(String),
 }
 
+/// Spawn point of the manager thread — picks the live OS backend
+/// (WINDOWS-PORT W5). Everything past this call is backend-side.
+#[cfg(not(windows))]
+fn run_backend(
+    cmd_rx: Receiver<Cmd>,
+    evt_tx: SyncSender<Evt>,
+    gain: Arc<AtomicU32>,
+    peak: Arc<AtomicU32>,
+    meter: Arc<crate::meter::MeterRing>,
+    xruns: Arc<AtomicU64>,
+    midi_drops: Arc<AtomicU64>,
+    engine: Arc<Engine>,
+) {
+    jack::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+}
+
+#[cfg(windows)]
+fn run_backend(
+    cmd_rx: Receiver<Cmd>,
+    evt_tx: SyncSender<Evt>,
+    gain: Arc<AtomicU32>,
+    peak: Arc<AtomicU32>,
+    meter: Arc<crate::meter::MeterRing>,
+    xruns: Arc<AtomicU64>,
+    midi_drops: Arc<AtomicU64>,
+    engine: Arc<Engine>,
+) {
+    wasapi::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+}
+
+/// What `manager_loop` asks of the live backend device (WINDOWS-PORT W5).
+/// The loop body is OS-neutral; these four methods are the entire per-OS
+/// surface. Implementations: `jack::JackSession`, `wasapi::WasapiSession`.
+trait ManagerBackend {
+    /// Re-publish the selectable port/device list (`Cmd::Refresh`).
+    fn refresh(&mut self, tx: &SyncSender<Evt>);
+    /// Map the GUI-selected patch onto slots / devices (`Cmd::Apply`).
+    fn apply(&mut self, ins: &[String], outs: &[(String, u8)], tx: &SyncSender<Evt>);
+    /// Periodic tick (~250 ms idle): hot-plug scans etc.
+    fn idle(&mut self, tx: &SyncSender<Evt>);
+    /// Tear the live device down after the loop exits (Quit/Disconnect).
+    fn teardown(&mut self);
+}
+
 /// Handle kept by the GUI.
 pub struct Backend {
     pub cmd_tx: Sender<Cmd>,
@@ -575,7 +624,7 @@ impl Backend {
         let thread = std::thread::Builder::new()
             .name("slooper-audio".into())
             .spawn(move || {
-                run(
+                run_backend(
                     cmd_rx,
                     evt_tx,
                     t_gain,
@@ -1114,7 +1163,10 @@ impl Engine {
         self.rec_len[i].store(0, Ordering::Relaxed);
         // v42: snapshot the preview arming (flipping the checkbox mid-take
         // must never retarget a running take).
-        self.rec_pv_active[i].store(self.rec_preview[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        self.rec_pv_active[i].store(
+            self.rec_preview[i].load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         // v42: the loop arming ORs with a live loop flag so a mid-loop
         // restart keeps the take flagged without re-arming anything.
         let la = self.rec_loop[i].load(Ordering::Relaxed)
@@ -1138,7 +1190,11 @@ impl Engine {
         let preview = self.rec_pv_active[i].load(Ordering::Relaxed);
         self.rec_preview[i].store(false, Ordering::Relaxed);
         self.rec_pv_active[i].store(false, Ordering::Relaxed);
-        (self.rec_at[i].load(Ordering::Relaxed), Arc::from(data), preview)
+        (
+            self.rec_at[i].load(Ordering::Relaxed),
+            Arc::from(data),
+            preview,
+        )
     }
 
     // ---- global transport ---------------------------------------------------
@@ -1692,12 +1748,7 @@ impl Engine {
     /// note-off is a HELD note: it sustains until `stop_audition` (that is
     /// how press-and-hold works). Works with the transport stopped and
     /// while the track's play flag is off.
-    pub fn play_audition(
-        &self,
-        track: usize,
-        ev: Arc<[MidiEv]>,
-        inst: Option<Arc<SynthHandle>>,
-    ) {
+    pub fn play_audition(&self, track: usize, ev: Arc<[MidiEv]>, inst: Option<Arc<SynthHandle>>) {
         const MAX_AUD_VOICES: usize = 12;
         if ev.is_empty() {
             return;
@@ -1798,8 +1849,11 @@ impl Engine {
             *s = self.sc_send(tg);
             sc_any |= *s != 0;
         }
-        let mut dry_hold: Vec<Option<Vec<f32>>> =
-            if sc_any { vec![None; MAX_LOOPS] } else { Vec::new() };
+        let mut dry_hold: Vec<Option<Vec<f32>>> = if sc_any {
+            vec![None; MAX_LOOPS]
+        } else {
+            Vec::new()
+        };
 
         // The track's DRY bus: all lanes' clips summed post-trim — exactly
         // the signal the live chain is fed (`None` = nothing placed).
@@ -1925,8 +1979,11 @@ impl Engine {
         }
         // Sum the source taps into each target's sidechain row BEFORE the
         // target loop consumes (moves out) any held dry bus.
-        let mut sc_rows: Vec<Option<Vec<f32>>> =
-            if sc_any { vec![None; MAX_LOOPS] } else { Vec::new() };
+        let mut sc_rows: Vec<Option<Vec<f32>>> = if sc_any {
+            vec![None; MAX_LOOPS]
+        } else {
+            Vec::new()
+        };
         if sc_any {
             for &t in &targets {
                 if send[t] != 0 {
@@ -1956,11 +2013,20 @@ impl Engine {
             };
             // This target's sidechain row (empty = no send routed — the
             // documented sc = 0.0 rule for scripts).
-            let sc_vec: Vec<f32> =
-                if sc_any { sc_rows[t].take().unwrap_or_default() } else { Vec::new() };
+            let sc_vec: Vec<f32> = if sc_any {
+                sc_rows[t].take().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             // One fresh full-chain pass over the whole span (fresh private
             // copies: the live chain is never advanced by an export).
-            run_chain_over(&chains[t], sr, &mut trk, &offline_sync(self, sr, 0), &sc_vec);
+            run_chain_over(
+                &chains[t],
+                sr,
+                &mut trk,
+                &offline_sync(self, sr, 0),
+                &sc_vec,
+            );
             for (k, s) in trk.into_iter().enumerate() {
                 any = true;
                 out[k] += s * pdown;
@@ -2154,260 +2220,24 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
     }
 }
 
-// one bundle per RT thread: command/event channels, master gain, transport
-// mirrors and the v39 meter taps — every handle `run` owns for its lifetime
-#[allow(clippy::too_many_arguments)]
-fn run(
-    cmd_rx: Receiver<Cmd>,
-    evt_tx: SyncSender<Evt>,
-    gain: Arc<AtomicU32>,
-    peak: Arc<AtomicU32>,
-    meter: Arc<crate::meter::MeterRing>,
-    xruns: Arc<AtomicU64>,
-    midi_drops: Arc<AtomicU64>,
-    engine: Arc<Engine>,
+/// Backend-neutral manager-thread contract (WINDOWS-PORT W5): drains the
+/// GUI command queue, dispatches engine state, claims finished takes,
+/// serves exports, and polls the backend's idle tick. THE loop body is
+/// identical for every OS — anything device-specific lives behind
+/// [`ManagerBackend`], never in a copy of this loop. Exits on
+/// `Cmd::Quit`/channel loss; the caller then runs backend teardown.
+fn manager_loop(
+    cmd_rx: &Receiver<Cmd>,
+    evt_tx: &SyncSender<Evt>,
+    engine: &Arc<Engine>,
+    sample_rate: u32,
+    session: &mut dyn ManagerBackend,
 ) {
-    // Test-only kill switch: headless GUI tests must not open PipeWire-JACK
-    // clients at all. Spawning and closing dozens of clients per suite races
-    // libpipewire's own callback threads during teardown (UAF inside the
-    // client library, reported as glibc heap corruption), and none of that
-    // surface is what a headless UI test exercises. Behaves exactly like the
-    // "no JACK server" path below.
-    if std::env::var("SLOOPER_NULL_AUDIO").is_ok() {
-        let _ = evt_tx.send(Evt::Unavailable("null audio (SLOOPER_NULL_AUDIO)".into()));
-        return;
-    }
-    let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!(
-                "No JACK/PipeWire-JACK server available: {}",
-                describe_err(e)
-            );
-            eprintln!("[slooper] {}", msg);
-            let _ = evt_tx.send(Evt::Unavailable(msg));
-            return;
-        }
-    };
-    if status.contains(ClientStatus::NAME_NOT_UNIQUE) {
-        eprintln!("[slooper] client renamed to '{}'", client.name());
-    }
-
-    // Register the fixed slot pool + MIDI port before activation. Pool ports
-    // live for the whole client lifetime, so their raw pointers are stable and
-    // can be cached in the realtime handler (no lookups, no allocation in RT).
-    let mut ins_raw = [std::ptr::null_mut(); MAX_SLOTS];
-    let mut outs_raw = [std::ptr::null_mut(); MAX_SLOTS];
-    for i in 0..MAX_SLOTS {
-        match client.register_port(&format!("in{i}"), AudioIn::default()) {
-            Ok(p) => ins_raw[i] = p.raw(),
-            Err(e) => {
-                let _ = evt_tx.send(Evt::Error(format!(
-                    "failed to register input slot in{i}: {}",
-                    describe_err(e)
-                )));
-                return;
-            }
-        }
-        match client.register_port(&format!("out{i}"), AudioOut::default()) {
-            Ok(p) => outs_raw[i] = p.raw(),
-            Err(e) => {
-                let _ = evt_tx.send(Evt::Error(format!(
-                    "failed to register output slot out{i}: {}",
-                    describe_err(e)
-                )));
-                return;
-            }
-        }
-    }
-
-    let midi_port = match client.register_port(MIDI_PORT_SHORT, MidiIn::default()) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = evt_tx.send(Evt::Error(format!(
-                "failed to create MIDI input port: {}",
-                describe_err(e)
-            )));
-            return;
-        }
-    };
-
-    let mask_in = Arc::new(AtomicU64::new(0));
-    // Output slots carry independent L / R bits (see `Cmd::Apply`).
-    let mask_out_l = Arc::new(AtomicU64::new(0));
-    let mask_out_r = Arc::new(AtomicU64::new(0));
-    let notif = Notif {
-        tx: evt_tx.clone(),
-        xruns: xruns.clone(),
-    };
-    // Sample rate is queryable before activation; the metronome grid is
-    // sized from it.
-    let sr = client.sample_rate();
-    engine.set_sample_rate(sr);
-    let proc = Proc {
-        midi_in: midi_port,
-        ports: RawPorts {
-            ins: ins_raw,
-            outs: outs_raw,
-        },
-        midi_ev_scratch: Vec::new(),
-        mask_in: mask_in.clone(),
-        mask_out_l: mask_out_l.clone(),
-        mask_out_r: mask_out_r.clone(),
-        tx: evt_tx.clone(),
-        midi_drops,
-        gain: gain.clone(),
-        peak: peak.clone(),
-        meter,
-        tap_buf: Vec::new(),
-        engine: engine.clone(),
-        prev_rec: [TR_IDLE; MAX_LOOPS],
-        rec_full: 0,
-        pv_seen: false,
-        lr_restart: [u64::MAX; MAX_LOOPS],
-        pos: 0,
-        prev_transport: false,
-        prev_metro: false,
-        sr,
-        metro_idx: 0i64,
-        metro_start: -1,
-        metro_tone: 0,
-        metro_clock: 0.0,
-        sample_no: 0,
-        fx_cache: engine.fx_table(),
-        fx_cache_gen: engine.fx_gen(),
-        sync: crate::fx::SyncInfoV1::idle(),
-        sync_gen: 0,
-        // Seed from the engine's current chains: a launch that restores
-        // chains from config never bumps fx_gen, so waiting for a refresh
-        // here left an empty grid beside a non-empty cache → RT panic.
-        fx_rt: seed_fx_rt(&engine.fx_table()[..]),
-        arr: engine.arrangement(),
-        arr_cache_gen: engine.arr_gen(),
-        assets: engine.assets(),
-        assets_cache_gen: engine.assets_gen(),
-        preview: engine.preview_snapshot(),
-        preview_cache_gen: engine.preview_gen(),
-        preview_curs: Vec::new(),
-        preview_live: false,
-        clip_buf: Vec::new(),
-        synths_cache: engine.synths(),
-        synths_cache_gen: engine.synths_gen(),
-        mix_l: Vec::new(),
-        mix_r: Vec::new(),
-        trk_bufs: vec![Vec::new(); MAX_LOOPS],
-        trk_bufs2: vec![Vec::new(); MAX_LOOPS],
-        sc_apply: vec![Vec::new(); MAX_LOOPS],
-        sc_build: vec![Vec::new(); MAX_LOOPS],
-        sc_active: [false; MAX_LOOPS],
-        mon_buf: Vec::new(),
-        mon_buf2: Vec::new(),
-        vst_tmp: Vec::new(),
-        dflt_synth: engine.default_synth(),
-        midi_cache: engine.midi(),
-        midi_cache_gen: engine.midi_gen(),
-        auto_cache: engine.auto_assets(),
-        auto_last: AutoOut::default(),
-        auto_cache_gen: engine.auto_gen(),
-        midi_ev: Vec::new(),
-        // One row per track, EXACTLY like trk_bufs: `render_midi_block`
-        // indexes `midi_scratch[t]` the moment the first note stages, and an
-        // empty vector there aborted the RT thread (v0.6/v0.7 MIDI crash).
-        midi_scratch: vec![Vec::new(); MAX_LOOPS],
-        midi_live: [false; MAX_LOOPS],
-        midi_ring_to: [0u64; MAX_LOOPS],
-        midi_sustain: [false; MAX_LOOPS],
-        midi_quiet: [0u32; MAX_LOOPS],
-        synth_p: [0.0f32; crate::synth::MAX_PARAMS],
-        synth_pg: [0u64; MAX_LOOPS],
-        mono: Vec::new(),
-        mono2: Vec::new(),
-        poly_pg: [0u64; MAX_LOOPS],
-        poly_cache: engine.poly_voices(),
-        poly_cache_gen: engine.poly_gen(),
-        sil: Vec::new(),
-        evq: Vec::new(),
-        own: Vec::new(),
-        owner: [0xFFu8; MAX_LOOPS],
-        // v32: seeded like every other per-block buffer — the port reader
-        // pushes into `live_ev` on the FIRST message the app ever sees.
-        live_ev: Vec::with_capacity(64),
-        live_notes: [0i32; MAX_LOOPS],
-        // v38 R1: audition voices start empty; the engine's snapshot is
-        // taken on the first generation bump like every other table.
-        aud: Vec::new(),
-        aud_seen_gen: engine.aud_gen(),
-        aud_held: [0i32; MAX_LOOPS],
-        aud_mask: 0,
-        aud_block: vec![Vec::new(); MAX_LOOPS],
-        aud_purge: 0,
-        aud_iblock: vec![Vec::new(); MAX_LOOPS],
-        aud_iinst: vec![None; MAX_LOOPS],
-        aud_iheld: [0i32; MAX_LOOPS],
-        aud_isus: [false; MAX_LOOPS],
-        aud_iquiet: [0u32; MAX_LOOPS],
-        aud_pblock: Vec::new(),
-        aud_pv_inst: None,
-        aud_pv_held: 0,
-        aud_pv_sus: false,
-        aud_pv_quiet: 0,
-        aud_pv_row: Vec::new(),
-        aud_pv_any: false,
-        bound_cache: engine.midi_bound(),
-        bound_gen: engine.midi_bound_gen(),
-        // v32 R7: start at the default unity controls (no boot ramp).
-        amp_env: [1.0; MAX_LOOPS],
-        mon_env: 1.0,
-        g_env: 1.0,
-    };
-
-    let active = match client.activate_async(notif, proc) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = evt_tx.send(Evt::Error(format!(
-                "failed to activate JACK client: {}",
-                describe_err(e)
-            )));
-            return;
-        }
-    };
-
-    let client_name = active.as_client().name().to_string();
-    let sample_rate = active.as_client().sample_rate();
-    eprintln!(
-        "[slooper] JACK client '{}' active @ {} Hz",
-        client_name, sample_rate
-    );
-    let _ = evt_tx.send(Evt::Ready {
-        client_name: client_name.clone(),
-        sample_rate,
-    });
-    send_ports(active.as_client(), &evt_tx);
-
-    // Remote MIDI sources currently wired into our midi_in port. Devices often
-    // reappear on a fresh port name every connect, so this set is re-derived
-    // periodically and on registration events (see rescan_midi_sources).
-    let mut midi_sources: Vec<String> = Vec::new();
-
-    // What each slot is currently connected to (manager-thread state only).
-    let mut cur_in: Vec<Option<String>> = vec![None; MAX_SLOTS];
-    let mut cur_out: Vec<Option<(String, u8)>> = vec![None; MAX_SLOTS];
-
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(Cmd::Refresh) => send_ports(active.as_client(), &evt_tx),
+            Ok(Cmd::Refresh) => session.refresh(&evt_tx),
             Ok(Cmd::Apply { ins, outs }) => {
-                apply_layout(
-                    active.as_client(),
-                    &ins,
-                    &outs,
-                    &mut cur_in,
-                    &mut cur_out,
-                    &mask_in,
-                    &mask_out_l,
-                    &mask_out_r,
-                    &evt_tx,
-                );
+                session.apply(&ins, &outs, &evt_tx);
             }
             Ok(Cmd::ToggleRecord { i }) => {
                 toggle_record(&engine, i.min(MAX_LOOPS - 1), &evt_tx);
@@ -2572,309 +2402,10 @@ fn run(
                 // what makes bindings work when a device (re)appears on a new
                 // port name — e.g. hardware that gets a fresh ALSA/JACK port
                 // number on every connect instead of a fixed one.
-                rescan_midi_sources(active.as_client(), &evt_tx, &mut midi_sources);
+                session.idle(&evt_tx);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-    }
-
-    // Teardown: null out every callback before the handler context is freed.
-    // The jack crate's deactivate only clears thread-init/process, so without
-    // this a late notification would call into freed memory on PipeWire-JACK.
-    unsafe { clear_all_callbacks(active.as_client().raw()) };
-    // Nulling the pointers does NOT cancel an invocation PipeWire-JACK has
-    // already dispatched: its thread may have loaded the callback + context
-    // pointer microseconds ago. Closing the client right now frees the jack
-    // crate's Arc'd context underneath that in-flight call — a use-after-free
-    // that glibc reports (in whichever thread frees first) as "corrupted size
-    // vs. prev_size" and aborts. Let a dozen audio cycles elapse so every
-    // dispatched callback runs against still-live state, then close.
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    drop(active); // deactivates + closes the client; no live callbacks remain.
-}
-
-/// Connect with retries: PipeWire-JACK does not accept connections on a
-/// freshly-activated client's ports until its activation has settled into the
-/// graph, so a just-started remote client needs a few cycles before its ports
-/// can be wired up. Runs on the manager thread (sleeping is fine).
-fn connect_retry(client: &Client, src: &str, dst: &str) -> Result<(), jack::Error> {
-    let mut last_err = None;
-    for _ in 0..10 {
-        match client.connect_ports_by_name(src, dst) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        }
-    }
-    Err(last_err.expect("loop runs at least once"))
-}
-
-/// Connect / disconnect external ports against the fixed slot pool, updating
-/// the RT-visible masks. Runs on the manager thread (may block/allocate).
-#[allow(clippy::too_many_arguments)] // one arg per slot-pool state piece; a wrapper struct is pure ceremony
-fn apply_layout(
-    client: &Client,
-    ins: &[String],
-    outs: &[(String, u8)],
-    cur_in: &mut [Option<String>],
-    cur_out: &mut [Option<(String, u8)>],
-    mask_in: &AtomicU64,
-    mask_out_l: &AtomicU64,
-    mask_out_r: &AtomicU64,
-    tx: &SyncSender<Evt>,
-) {
-    if ins.len() > MAX_SLOTS || outs.len() > MAX_SLOTS {
-        let _ = tx.try_send(Evt::Error(format!(
-            "too many ports selected: max {MAX_SLOTS} inputs and {MAX_SLOTS} outputs"
-        )));
-    }
-
-    let mut applied_in = 0usize;
-    for (i, slot) in cur_in.iter_mut().enumerate() {
-        let new_in = ins.get(i).cloned();
-        if *slot == new_in {
-            continue; // unchanged: keep the existing connection
-        }
-        let pool_name = format!("{}:in{i}", client.name());
-        if slot.take().is_some() {
-            // Stop reading before disconnecting, so RT never reads a slot that
-            // is mid-teardown (unconnected input buffers hold stale data).
-            mask_in.fetch_and(!(1u64 << i), Ordering::Relaxed);
-            if let Some(pool) = client.port_by_name(&pool_name) {
-                if let Err(e) = client.disconnect(&pool) {
-                    let _ = tx.try_send(Evt::Error(format!(
-                        "could not disconnect input slot in{i}: {}",
-                        describe_err(e)
-                    )));
-                }
-            }
-        }
-        if let Some(src) = new_in {
-            match connect_retry(client, &src, &pool_name) {
-                Ok(()) => {
-                    // Only start reading once the connection exists.
-                    mask_in.fetch_or(1u64 << i, Ordering::Relaxed);
-                    *slot = Some(src);
-                    applied_in += 1;
-                }
-                Err(e) => {
-                    let msg = format!(
-                        "could not connect input {src} -> {pool_name}: {}",
-                        describe_err(e)
-                    );
-                    eprintln!("[slooper] {msg}");
-                    let _ = tx.try_send(Evt::Error(msg));
-                }
-            }
-        }
-    }
-
-    let mut applied_out = 0usize;
-    for (i, slot) in cur_out.iter_mut().enumerate() {
-        // Route bits: 1 = L bus, 2 = R bus; 0 counts as both (mono downmix
-        // — the historical behaviour, and the default for fresh selections).
-        let new_out = outs
-            .get(i)
-            .map(|(n, lr)| (n.clone(), if lr & 3 == 0 { 3 } else { lr & 3 }));
-        let same_name = slot.as_ref().map(|s| &s.0) == new_out.as_ref().map(|s| &s.0);
-        if same_name && slot.is_some() {
-            // Still connected to the same port: only the L/R routing can
-            // have moved — retarget the masks without touching the link.
-            if let Some((_, lr)) = &new_out {
-                if slot.as_ref().map(|s| s.1) != Some(*lr) {
-                    mask_out_l.fetch_and(!(1u64 << i), Ordering::Relaxed);
-                    mask_out_r.fetch_and(!(1u64 << i), Ordering::Relaxed);
-                    if lr & 1 != 0 {
-                        mask_out_l.fetch_or(1u64 << i, Ordering::Relaxed);
-                    }
-                    if lr & 2 != 0 {
-                        mask_out_r.fetch_or(1u64 << i, Ordering::Relaxed);
-                    }
-                    *slot = new_out;
-                }
-            }
-            continue;
-        }
-        if *slot == new_out {
-            continue;
-        }
-        let pool_name = format!("{}:out{i}", client.name());
-        if slot.take().is_some() {
-            // Keep writing until the disconnect completes, then stop.
-            if let Some(pool) = client.port_by_name(&pool_name) {
-                if let Err(e) = client.disconnect(&pool) {
-                    let _ = tx.try_send(Evt::Error(format!(
-                        "could not disconnect output slot out{i}: {}",
-                        describe_err(e)
-                    )));
-                }
-            }
-            mask_out_l.fetch_and(!(1u64 << i), Ordering::Relaxed);
-            mask_out_r.fetch_and(!(1u64 << i), Ordering::Relaxed);
-        }
-        if let Some((dst, lr)) = new_out {
-            match connect_retry(client, &pool_name, &dst) {
-                Ok(()) => {
-                    if lr & 1 != 0 {
-                        mask_out_l.fetch_or(1u64 << i, Ordering::Relaxed);
-                    }
-                    if lr & 2 != 0 {
-                        mask_out_r.fetch_or(1u64 << i, Ordering::Relaxed);
-                    }
-                    *slot = Some((dst, lr));
-                    applied_out += 1;
-                }
-                Err(e) => {
-                    let msg = format!(
-                        "could not connect output {pool_name} -> {dst}: {}",
-                        describe_err(e)
-                    );
-                    // v21: input failures already printed; output failures
-                    // only reached the status line, which made "no audio"
-                    // debugging blind in headless/launch-log runs.
-                    eprintln!("[slooper] {msg}");
-                    let _ = tx.try_send(Evt::Error(msg));
-                }
-            }
-        }
-    }
-
-    eprintln!("[slooper] applied {applied_in} input(s), {applied_out} output(s)");
-    let _ = tx.send(Evt::Applied {
-        ins: applied_in,
-        outs: applied_out,
-    });
-}
-
-/// Enumerate remote audio ports, hiding those whose client belongs to a
-/// disabled device (see [`crate::ports`]), and push them to the GUI.
-fn send_ports(client: &Client, tx: &SyncSender<Evt>) {
-    let (ins, outs) = enumerate_visible_ports(client);
-    let _ = tx.send(Evt::Ports { ins, outs });
-}
-
-/// Like `send_ports`, but non-blocking (for JACK's notification thread).
-fn send_ports_try(client: &Client, tx: &SyncSender<Evt>) {
-    let (ins, outs) = enumerate_visible_ports(client);
-    let _ = tx.try_send(Evt::Ports { ins, outs });
-}
-
-/// Re-derive which remote MIDI source ports feed `slooper:midi_in` and
-/// make the actual connections. Devices often get a brand-new port name on
-/// every connect (and may use any channel), so a single manually-made link
-/// is not enough: we wire *every* remote MIDI source port into our input,
-/// drop links whose source vanished, and report the live set to the GUI.
-/// Runs on the manager thread only (connects may block). Returns true if the
-/// connected set changed.
-fn rescan_midi_sources(client: &Client, tx: &SyncSender<Evt>, known: &mut Vec<String>) -> bool {
-    let mine = client.name().to_string();
-    let prefix = format!("{mine}:");
-    let dst = format!("{prefix}midi_in");
-
-    // Remote MIDI source ports (any client, any channel — channels are
-    // irrelevant for transport-level binding; the device picks its own).
-    let found: Vec<String> = client
-        .ports(None, Some("midi"), PortFlags::IS_OUTPUT)
-        .into_iter()
-        .filter(|n| !n.starts_with(&prefix))
-        .collect();
-
-    // Nothing to do if the set is unchanged (connect_retry would still work,
-    // but skipping avoids pointless connect calls every 250 ms).
-    if found == *known {
-        return false;
-    }
-
-    // Drop links whose source port no longer exists.
-    for name in known.iter() {
-        if !found.contains(name) {
-            let _ = client.disconnect_ports_by_name(name, &dst);
-        }
-    }
-    // (Re)connect everything currently present. connect_retry absorbs the
-    // PipeWire-JACK "freshly activated" delay for ports that just appeared.
-    for name in found.iter() {
-        if let Err(e) = connect_retry(client, name, &dst) {
-            eprintln!("[slooper] MIDI link {name} → {dst}: {e}");
-        }
-    }
-    *known = found.clone();
-    eprintln!(
-        "[slooper] MIDI sources: {}",
-        if known.is_empty() {
-            "none".into()
-        } else {
-            known.join(", ")
-        }
-    );
-    let _ = tx.try_send(Evt::MidiSources(known.clone()));
-    true
-}
-
-/// Shared port enumeration: candidates = other clients' audio ports, minus
-/// any client that belongs to a disabled device.
-fn enumerate_visible_ports(client: &Client) -> (Vec<PortInfo>, Vec<PortInfo>) {
-    let mine = client.name().to_string();
-    let prefix = format!("{mine}:");
-    let hidden = hidden_clients_cached();
-
-    // Candidate inputs = other clients' OUTPUT (source) audio ports.
-    let ins: Vec<PortInfo> = client
-        .ports(None, Some("audio"), PortFlags::IS_OUTPUT)
-        .into_iter()
-        .filter(|n| !n.starts_with(&prefix))
-        .filter(|n| port_visible(n, hidden.as_ref()))
-        .map(|name| port_info(&name))
-        .collect();
-
-    // Candidate outputs = other clients' INPUT (sink) audio ports.
-    let outs: Vec<PortInfo> = client
-        .ports(None, Some("audio"), PortFlags::IS_INPUT)
-        .into_iter()
-        .filter(|n| !n.starts_with(&prefix))
-        .filter(|n| port_visible(n, hidden.as_ref()))
-        .map(|name| port_info(&name))
-        .collect();
-
-    (ins, outs)
-}
-
-/// True when a full port name (`client:port`) should be shown.
-fn port_visible(full_name: &str, hidden: Option<&std::collections::HashSet<String>>) -> bool {
-    match hidden {
-        Some(set) => !set.contains(full_name.split(':').next().unwrap_or("")),
-        None => true, // can't determine device state → show everything
-    }
-}
-
-/// Cached "hidden clients" set. The pactl/pw-cli lookups cost a few process
-/// spawns, so the result is cached for two seconds (device state rarely
-/// changes, and port lists refresh on registration events anyway).
-fn hidden_clients_cached() -> Option<std::collections::HashSet<String>> {
-    use std::time::{Duration, Instant};
-    static CACHE: std::sync::Mutex<Option<(Instant, Option<std::collections::HashSet<String>>)>> =
-        std::sync::Mutex::new(None);
-
-    // Fresh enough? (The lock is released at the end of this statement.)
-    if let Some((t, set)) = CACHE.lock().unwrap().as_ref() {
-        if t.elapsed() < Duration::from_secs(2) {
-            return set.clone();
-        }
-    }
-
-    // Compute outside the lock (it spawns processes), then store.
-    let fresh = crate::ports::hidden_clients();
-    *CACHE.lock().unwrap() = Some((Instant::now(), fresh.clone()));
-    fresh
-}
-
-fn port_info(full_name: &str) -> PortInfo {
-    let client = full_name.split(':').next().unwrap_or("").to_string();
-    PortInfo {
-        name: full_name.to_string(),
-        client,
     }
 }
 
@@ -2896,45 +2427,6 @@ fn clamp_loop_region(ls: u64, le: u64, proj_len: u64) -> (u64, u64) {
 fn wrap_pos(pos: u64, ls: u64, le: u64) -> Option<u64> {
     (pos >= le).then_some(ls)
 }
-
-/// Notification handler: keeps the GUI port list live and counts xruns.
-struct Notif {
-    tx: SyncSender<Evt>,
-    xruns: Arc<AtomicU64>,
-}
-
-impl NotificationHandler for Notif {
-    fn port_registration(&mut self, client: &Client, _port_id: PortId, _is_registered: bool) {
-        // Remote ports appeared/disappeared — refresh the GUI list.
-        // try_send: this runs on JACK's client thread; a full list is carried in
-        // every Ports event, so dropping stale ones while the GUI lags is safe.
-        send_ports_try(client, &self.tx);
-    }
-
-    fn client_registration(&mut self, client: &Client, _name: &str, _is_registered: bool) {
-        send_ports_try(client, &self.tx);
-    }
-
-    fn xrun(&mut self, _client: &Client) -> Control {
-        self.xruns.fetch_add(1, Ordering::Relaxed);
-        // try_send: never block JACK's client thread on a full channel.
-        let _ = self.tx.try_send(Evt::Xrun);
-        Control::Continue
-    }
-}
-
-/// Raw JACK port pointers of the fixed slot pool. The pool ports are never
-/// unregistered, so the pointers stay valid for the whole client lifetime;
-/// `Send` is safe to assert (they are only ever read from the RT thread).
-/// `Copy` so the `BlockIo` shim can be built per cycle without borrowing
-/// `Proc` (WINDOWS-PORT W4).
-#[derive(Clone, Copy)]
-struct RawPorts {
-    ins: [*mut j::jack_port_t; MAX_SLOTS],
-    outs: [*mut j::jack_port_t; MAX_SLOTS],
-}
-
-unsafe impl Send for RawPorts {}
 
 /// One block's worth of live clips: a raw pointer to the asset data offset to
 /// the window start, and the window `[i0, i1)` of block-relative sample
@@ -3047,7 +2539,9 @@ fn run_chain_over(
                     // exact same mid — `(x + x) * 0.5 == x` bit-identically
                     // — and v2 sidechain scripts duck like the live mix.
                     for (i, x) in buf.iter_mut().enumerate() {
-                        *x = f.process_private_st_sc(*x, *x, *sc.get(i).unwrap_or(&0.0)).0;
+                        *x = f
+                            .process_private_st_sc(*x, *x, *sc.get(i).unwrap_or(&0.0))
+                            .0;
                     }
                 }
             }
@@ -3875,7 +3369,11 @@ impl Proc {
             // sliders, so push its param generation onto every copy
             // (cheap atomic pushes; VST copies resync from their own
             // host-visible mirrors at spawn and on rebinding).
-            if let Some(live_h) = synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone())
+            if let Some(live_h) = synths_cache
+                .get(t)
+                .cloned()
+                .flatten()
+                .or_else(|| dflt.clone())
             {
                 if let SynthHandle::Script(live_i) = live_h.as_ref() {
                     let g = live_i.param_gen();
@@ -3937,19 +3435,8 @@ impl Proc {
                 if ci == 0 {
                     if live_t {
                         stage_track_events(
-                            t,
-                            &arr,
-                            midi_cache,
-                            live_ev,
-                            true,
-                            false,
-                            p0,
-                            span_end,
-                            block_n,
-                            sr,
-                            midi_ev,
-                            &mut cring,
-                            None,
+                            t, &arr, midi_cache, live_ev, true, false, p0, span_end, block_n, sr,
+                            midi_ev, &mut cring, None,
                         );
                     }
                     if !aud_block[t].is_empty() {
@@ -3968,7 +3455,11 @@ impl Proc {
                     // stream); a SECOND copy rendering through the live
                     // instance would stage its events twice.
                     if ci == 0 {
-                        synths_cache.get(t).cloned().flatten().or_else(|| dflt.clone())
+                        synths_cache
+                            .get(t)
+                            .cloned()
+                            .flatten()
+                            .or_else(|| dflt.clone())
                     } else {
                         None
                     }
@@ -4281,15 +3772,12 @@ type AudRow = (usize, u8, u8, u8, u8);
 /// playhead (or follows seeks), clips are summed where the playhead crosses
 /// them, and takes capture raw input inline while armed.
 struct Proc {
-    midi_in: Port<MidiIn>,
-    ports: RawPorts,
     /// WINDOWS-PORT W4: scratch the JACK shim materializes this cycle's MIDI
     /// events into (borrowed `RawMidi` → owned) before handing off to the
     /// backend-neutral `process_block`. Kept on `Proc` so the outer buffer
     /// never reallocs block-to-block; the per-event `Vec<u8>` count equals the
     /// old inline `e.bytes.to_vec()` exactly. (Distinct from `midi_scratch`,
     /// the per-track synth sample buffer.)
-    midi_ev_scratch: Vec<(u32, Vec<u8>)>,
     mask_in: Arc<AtomicU64>,
     mask_out_l: Arc<AtomicU64>,
     mask_out_r: Arc<AtomicU64>,
@@ -4518,6 +4006,135 @@ struct Proc {
     g_env: f32,
 }
 
+/// Build a fresh engine-side realtime handler from the manager-thread
+/// handles (WINDOWS-PORT W5 extraction). Backend-neutral by construction:
+/// the jack shim wraps the result in its `JackProc` plumbing struct; the
+/// WASAPI shim wraps it the same way with device buffers. `sr` is the
+/// live device rate (already pushed into the engine via set_sample_rate).
+fn new_proc(
+    evt_tx: SyncSender<Evt>,
+    gain: Arc<AtomicU32>,
+    peak: Arc<AtomicU32>,
+    meter: Arc<crate::meter::MeterRing>,
+    midi_drops: Arc<AtomicU64>,
+    mask_in: Arc<AtomicU64>,
+    mask_out_l: Arc<AtomicU64>,
+    mask_out_r: Arc<AtomicU64>,
+    engine: Arc<Engine>,
+    sr: u32,
+) -> Proc {
+    Proc {
+        mask_in: mask_in.clone(),
+        mask_out_l: mask_out_l.clone(),
+        mask_out_r: mask_out_r.clone(),
+        tx: evt_tx.clone(),
+        midi_drops,
+        gain: gain.clone(),
+        peak: peak.clone(),
+        meter,
+        tap_buf: Vec::new(),
+        engine: engine.clone(),
+        prev_rec: [TR_IDLE; MAX_LOOPS],
+        rec_full: 0,
+        pv_seen: false,
+        lr_restart: [u64::MAX; MAX_LOOPS],
+        pos: 0,
+        prev_transport: false,
+        prev_metro: false,
+        sr,
+        metro_idx: 0i64,
+        metro_start: -1,
+        metro_tone: 0,
+        metro_clock: 0.0,
+        sample_no: 0,
+        fx_cache: engine.fx_table(),
+        fx_cache_gen: engine.fx_gen(),
+        sync: crate::fx::SyncInfoV1::idle(),
+        sync_gen: 0,
+        // Seed from the engine's current chains: a launch that restores
+        // chains from config never bumps fx_gen, so waiting for a refresh
+        // here left an empty grid beside a non-empty cache → RT panic.
+        fx_rt: seed_fx_rt(&engine.fx_table()[..]),
+        arr: engine.arrangement(),
+        arr_cache_gen: engine.arr_gen(),
+        assets: engine.assets(),
+        assets_cache_gen: engine.assets_gen(),
+        preview: engine.preview_snapshot(),
+        preview_cache_gen: engine.preview_gen(),
+        preview_curs: Vec::new(),
+        preview_live: false,
+        clip_buf: Vec::new(),
+        synths_cache: engine.synths(),
+        synths_cache_gen: engine.synths_gen(),
+        mix_l: Vec::new(),
+        mix_r: Vec::new(),
+        trk_bufs: vec![Vec::new(); MAX_LOOPS],
+        trk_bufs2: vec![Vec::new(); MAX_LOOPS],
+        sc_apply: vec![Vec::new(); MAX_LOOPS],
+        sc_build: vec![Vec::new(); MAX_LOOPS],
+        sc_active: [false; MAX_LOOPS],
+        mon_buf: Vec::new(),
+        mon_buf2: Vec::new(),
+        vst_tmp: Vec::new(),
+        dflt_synth: engine.default_synth(),
+        midi_cache: engine.midi(),
+        midi_cache_gen: engine.midi_gen(),
+        auto_cache: engine.auto_assets(),
+        auto_last: AutoOut::default(),
+        auto_cache_gen: engine.auto_gen(),
+        midi_ev: Vec::new(),
+        // One row per track, EXACTLY like trk_bufs: `render_midi_block`
+        // indexes `midi_scratch[t]` the moment the first note stages, and an
+        // empty vector there aborted the RT thread (v0.6/v0.7 MIDI crash).
+        midi_scratch: vec![Vec::new(); MAX_LOOPS],
+        midi_live: [false; MAX_LOOPS],
+        midi_ring_to: [0u64; MAX_LOOPS],
+        midi_sustain: [false; MAX_LOOPS],
+        midi_quiet: [0u32; MAX_LOOPS],
+        synth_p: [0.0f32; crate::synth::MAX_PARAMS],
+        synth_pg: [0u64; MAX_LOOPS],
+        mono: Vec::new(),
+        mono2: Vec::new(),
+        poly_pg: [0u64; MAX_LOOPS],
+        poly_cache: engine.poly_voices(),
+        poly_cache_gen: engine.poly_gen(),
+        sil: Vec::new(),
+        evq: Vec::new(),
+        own: Vec::new(),
+        owner: [0xFFu8; MAX_LOOPS],
+        // v32: seeded like every other per-block buffer — the port reader
+        // pushes into `live_ev` on the FIRST message the app ever sees.
+        live_ev: Vec::with_capacity(64),
+        live_notes: [0i32; MAX_LOOPS],
+        // v38 R1: audition voices start empty; the engine's snapshot is
+        // taken on the first generation bump like every other table.
+        aud: Vec::new(),
+        aud_seen_gen: engine.aud_gen(),
+        aud_held: [0i32; MAX_LOOPS],
+        aud_mask: 0,
+        aud_block: vec![Vec::new(); MAX_LOOPS],
+        aud_purge: 0,
+        aud_iblock: vec![Vec::new(); MAX_LOOPS],
+        aud_iinst: vec![None; MAX_LOOPS],
+        aud_iheld: [0i32; MAX_LOOPS],
+        aud_isus: [false; MAX_LOOPS],
+        aud_iquiet: [0u32; MAX_LOOPS],
+        aud_pblock: Vec::new(),
+        aud_pv_inst: None,
+        aud_pv_held: 0,
+        aud_pv_sus: false,
+        aud_pv_quiet: 0,
+        aud_pv_row: Vec::new(),
+        aud_pv_any: false,
+        bound_cache: engine.midi_bound(),
+        bound_gen: engine.midi_bound_gen(),
+        // v32 R7: start at the default unity controls (no boot ramp).
+        amp_env: [1.0; MAX_LOOPS],
+        mon_env: 1.0,
+        g_env: 1.0,
+    }
+}
+
 /// RT-side snapshot of one effect instance's sliders.
 struct FxRt {
     gen: u64,
@@ -4556,13 +4173,8 @@ impl Proc {
     fn refresh_sync(&mut self, p0: u64, playing: bool) {
         let bpm = self.engine.metro_bpm.load(Ordering::Relaxed) as f64;
         let bpb = self.engine.metro_num.load(Ordering::Relaxed).max(1) as f64;
-        self.sync = crate::fx::SyncInfoV1::block(
-            p0 as i64,
-            playing,
-            bpm,
-            bpb,
-            self.sr.max(1) as f64,
-        );
+        self.sync =
+            crate::fx::SyncInfoV1::block(p0 as i64, playing, bpm, bpb, self.sr.max(1) as f64);
         self.sync_gen = self.sync_gen.wrapping_add(1);
     }
 
@@ -4605,10 +4217,21 @@ impl Proc {
     /// Tier-3: scripted slots run the pair path; a plugin slot processes
     /// the LEFT buffer and copies its mono output to both sides.
     /// The dry input is already trim-scaled; pan/master are folded later.
-    fn run_chain_block(&mut self, t: usize, buf: &mut [f32], buf2: &mut [f32], tmp: &mut [f32], sc: &[f32]) {
+    fn run_chain_block(
+        &mut self,
+        t: usize,
+        buf: &mut [f32],
+        buf2: &mut [f32],
+        tmp: &mut [f32],
+        sc: &[f32],
+    ) {
         let n = buf.len().min(tmp.len()).min(buf2.len());
         let Self {
-            fx_cache, fx_rt, sync, sync_gen, ..
+            fx_cache,
+            fx_rt,
+            sync,
+            sync_gen,
+            ..
         } = self;
         for (k, slot) in fx_cache[t].slots().iter().enumerate() {
             match &slot.kind {
@@ -4628,12 +4251,7 @@ impl Proc {
                     // SAFETY: audio thread owns the live chain (as fx_mix).
                     for j in 0..n {
                         let (l, r) = unsafe {
-                            inst.call_sample_st(
-                                buf[j],
-                                buf2[j],
-                                &rt.p,
-                                *sc.get(j).unwrap_or(&0.0),
-                            )
+                            inst.call_sample_st(buf[j], buf2[j], &rt.p, *sc.get(j).unwrap_or(&0.0))
                         };
                         buf[j] = l;
                         buf2[j] = r;
@@ -4962,9 +4580,8 @@ impl Proc {
         let rec_open = self.engine.recording();
         // v42: a LOOP take WANTS the timeline to keep wrapping — each wrap
         // commits one pass, so recording must not suspend the loop.
-        let looprec_open = (0..MAX_LOOPS).any(|t| {
-            self.engine.rec_state_of(t) == TR_REC && self.engine.rec_is_loop(t)
-        });
+        let looprec_open = (0..MAX_LOOPS)
+            .any(|t| self.engine.rec_state_of(t) == TR_REC && self.engine.rec_is_loop(t));
         let looping = self.engine.loop_tl() && (!rec_open || looprec_open);
 
         // Project snapshots: refresh Arcs when a generation moved (try_lock —
@@ -5306,8 +4923,7 @@ impl Proc {
                     // Legacy live-route voice (v38): the track synth gets
                     // the all-notes-off exactly like before.
                     (None, true) => {
-                        self.aud_held[req.track] -=
-                            pend.min(self.aud_held[req.track].max(0));
+                        self.aud_held[req.track] -= pend.min(self.aud_held[req.track].max(0));
                         self.aud_purge |= 1u128 << req.track;
                     }
                     (None, false) => {
@@ -6054,8 +5670,7 @@ impl Proc {
                     mon_buf2[i] = src_in * mon_i;
                 }
             } else if monitor_live
-                && (src_in != 0.0
-                    || mon_pre.0 * mon_pre.0 + mon_pre.1 * mon_pre.1 > 1e-12)
+                && (src_in != 0.0 || mon_pre.0 * mon_pre.0 + mon_pre.1 * mon_pre.1 > 1e-12)
             {
                 // Runs only while input is present or the monitor's own
                 // tail still rings; otherwise the playback path stays the
@@ -6086,8 +5701,7 @@ impl Proc {
                 if !vst_mask[t] {
                     continue;
                 }
-                let (buf, buf2, tmp) =
-                    (&mut trk_bufs[t], &mut trk_bufs2[t], &mut vst_tmp);
+                let (buf, buf2, tmp) = (&mut trk_bufs[t], &mut trk_bufs2[t], &mut vst_tmp);
                 // v32 R5: scripted slots inside a plugin-bearing chain get
                 // their sidechain row too; the plugin slots ignore it.
                 let scrow: &[f32] = if self.sc_active[t] {
@@ -6235,82 +5849,7 @@ impl Proc {
             Ordering::Relaxed,
         );
         self.peak.store(peak_val, Ordering::Relaxed);
-
     }
-}
-
-/// JACK shim (WINDOWS-PORT W4): the ONLY job left here is JACK plumbing —
-/// frame count, materializing borrowed MIDI events into the owned scratch,
-/// and the slot-buffer addresses. All mix/transport/take logic lives in
-/// `Proc::process_block`; WASAPI (W5) builds its own shim against the same
-/// entry point and `crate::backend::BlockIo`.
-impl ProcessHandler for Proc {
-    fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
-        // The borrowed `RawMidi`s die with this loop; the engine sees owned
-        // events (same one-`Vec`-per-event allocation count as before W4).
-        let mut evs = std::mem::take(&mut self.midi_ev_scratch);
-        evs.clear();
-        for e in self.midi_in.iter(ps) {
-            evs.push((e.time, e.bytes.to_vec()));
-        }
-        let n = ps.n_frames() as usize;
-        let io = JackIo { ports: self.ports, ps };
-        self.process_block(n, &mut evs, &io);
-        self.midi_ev_scratch = evs;
-        Control::Continue
-    }
-}
-
-/// `BlockIo` over the fixed JACK port pool + this cycle's `ProcessScope`.
-/// A null return means "no buffer for this slot" — the same signal the old
-/// in-function null-port check produced. `jack_port_get_buffer` never
-/// allocates per call (JACK API), so this stays RT-safe.
-struct JackIo<'ps> {
-    ports: RawPorts,
-    ps: &'ps ProcessScope,
-}
-
-impl crate::backend::BlockIo for JackIo<'_> {
-    fn in_buf(&self, slot: usize) -> *const f32 {
-        let p = self.ports.ins[slot];
-        if p.is_null() {
-            std::ptr::null()
-        } else {
-            (unsafe { j::jack_port_get_buffer(p, self.ps.n_frames()) }) as *const f32
-        }
-    }
-    fn out_buf(&self, slot: usize) -> *mut f32 {
-        let p = self.ports.outs[slot];
-        if p.is_null() {
-            std::ptr::null_mut()
-        } else {
-            unsafe { j::jack_port_get_buffer(p, self.ps.n_frames()) as *mut f32 }
-        }
-    }
-}
-
-/// Null out every callback that `activate_async` registered (the non-slow-sync
-/// set), so no notification can reach freed handler memory after the context
-/// is dropped. The jack crate's own `clear_callbacks` only covers
-/// thread-init/process — not enough on PipeWire-JACK.
-unsafe fn clear_all_callbacks(client: *mut j::jack_client_t) {
-    let null = std::ptr::null_mut();
-    j::jack_set_thread_init_callback(client, None, null);
-    j::jack_on_info_shutdown(client, None, null);
-    j::jack_set_process_callback(client, None, null);
-    j::jack_set_freewheel_callback(client, None, null);
-    j::jack_set_buffer_size_callback(client, None, null);
-    j::jack_set_sample_rate_callback(client, None, null);
-    j::jack_set_client_registration_callback(client, None, null);
-    j::jack_set_port_registration_callback(client, None, null);
-    j::jack_set_port_connect_callback(client, None, null);
-    j::jack_set_graph_order_callback(client, None, null);
-    j::jack_set_xrun_callback(client, None, null);
-}
-
-/// Format a JACK error for display.
-fn describe_err(e: jack::Error) -> String {
-    e.to_string()
 }
 
 #[cfg(test)]
@@ -6496,7 +6035,10 @@ mod tests {
         e.start_rec(2);
         assert!(e.rec_is_preview(2));
         e.set_rec_preview(2, false);
-        assert!(e.rec_is_preview(2), "start_rec snapshots — mid-take flips ignored");
+        assert!(
+            e.rec_is_preview(2),
+            "start_rec snapshots — mid-take flips ignored"
+        );
         let (_, _, pv) = e.copy_take(2);
         assert!(pv, "the finished take reports preview=true");
         assert!(!e.rec_is_preview(2), "cleared at commit");
@@ -7090,7 +6632,10 @@ mod tests {
         e.stop_preview_id(99); // unknown id: no-op, never panics
         assert_eq!(e.preview_snapshot().len(), 1);
         e.stop_preview_id(2);
-        assert!(e.preview_snapshot().is_empty(), "stopping the live id clears");
+        assert!(
+            e.preview_snapshot().is_empty(),
+            "stopping the live id clears"
+        );
     }
 
     /// v32: the live-MIDI feed subset. The bug: MIDI reached the UI (the
@@ -7112,9 +6657,9 @@ mod tests {
         // Outside the vocabulary (the e2e monitor's own message list sends
         // program change / system — they must drop, not wedge anything).
         assert_eq!(live_event_kind(&[0xC2, 11]), None); // program change
-        // v42/MPE: bend (kind 5, LSB/MSB) and poly AT (kind 4, note/val)
-        // are parsed now — the engine's MPE switch gates whether they ever
-        // reach an instrument.
+                                                        // v42/MPE: bend (kind 5, LSB/MSB) and poly AT (kind 4, note/val)
+                                                        // are parsed now — the engine's MPE switch gates whether they ever
+                                                        // reach an instrument.
         assert_eq!(live_event_kind(&[0xE0, 0, 64]), Some((5, 0, 0, 64))); // pitch bend
         assert_eq!(live_event_kind(&[0xA3, 60, 9]), Some((4, 3, 60, 9))); // poly AT
         assert_eq!(live_event_kind(&[0xF0, 1, 2]), None); // system
@@ -7326,11 +6871,18 @@ mod tests {
         let snap = e.audition_snapshot();
         assert_eq!(snap.len(), 1);
         assert!(
-            snap[0].inst.as_ref().is_some_and(|c| std::sync::Arc::ptr_eq(c, &h)),
+            snap[0]
+                .inst
+                .as_ref()
+                .is_some_and(|c| std::sync::Arc::ptr_eq(c, &h)),
             "the voice renders through the COPY it was given"
         );
         e.play_audition(AUD_PV, ev, Some(h));
-        assert_eq!(e.audition_snapshot().len(), 2, "PV pseudo-slot accepts voices");
+        assert_eq!(
+            e.audition_snapshot().len(),
+            2,
+            "PV pseudo-slot accepts voices"
+        );
         e.stop_audition();
         assert!(e.audition_snapshot().is_empty(), "stop purges the pool");
     }
@@ -7342,14 +6894,24 @@ mod tests {
         let clip = |a: u32| Clip::new(a, 0);
         match second_lane_only {
             Some(true) => {
-                arr.tracks[0].lanes = vec![Lane { clips: vec![clip(1)] }];
+                arr.tracks[0].lanes = vec![Lane {
+                    clips: vec![clip(1)],
+                }];
             }
             Some(false) => {
-                arr.tracks[0].lanes = vec![Lane { clips: vec![clip(0)] }];
+                arr.tracks[0].lanes = vec![Lane {
+                    clips: vec![clip(0)],
+                }];
             }
             None => {
-                arr.tracks[0].lanes =
-                    vec![Lane { clips: vec![clip(0)] }, Lane { clips: vec![clip(1)] }];
+                arr.tracks[0].lanes = vec![
+                    Lane {
+                        clips: vec![clip(0)],
+                    },
+                    Lane {
+                        clips: vec![clip(1)],
+                    },
+                ];
             }
         }
         arr
@@ -7373,10 +6935,24 @@ mod tests {
         use crate::midipat::{Note, Pattern};
         let mut pa = Pattern::new(120);
         pa.len_ticks = 480;
-        pa.notes.push(Note { ch: 0, note: 48, vel: 100, press: 0, start: 0, len: 240 });
+        pa.notes.push(Note {
+            ch: 0,
+            note: 48,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
         let mut pb = Pattern::new(120);
         pb.len_ticks = 480;
-        pb.notes.push(Note { ch: 0, note: 55, vel: 90, press: 0, start: 0, len: 240 });
+        pb.notes.push(Note {
+            ch: 0,
+            note: 55,
+            vel: 90,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
         Arc::new(vec![Some(Arc::new(pa)), Some(Arc::new(pb))])
     }
 
@@ -7388,14 +6964,17 @@ mod tests {
         assert!(!e.poly_on(0) && poly_row(&e, 0) == 0, "mono by default");
         let master = v46_piano_master();
         e.set_track_synth(0, Some(master.clone()));
-        let copies: Vec<Option<Arc<SynthHandle>>> = (0..2)
-            .map(|_| spawn_synth_copy(&master, 44100))
-            .collect();
+        let copies: Vec<Option<Arc<SynthHandle>>> =
+            (0..2).map(|_| spawn_synth_copy(&master, 44100)).collect();
         let keep = copies[0].clone();
         e.set_track_poly(0, true, copies);
         assert!(e.poly_on(0));
         assert_eq!(poly_row(&e, 0), 2, "one copy per child lane");
-        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(None)), 22050);
+        e.set_project(
+            Arc::new(vec![]),
+            Arc::new(v46_poly_arrangement(None)),
+            22050,
+        );
         assert!(
             std::sync::Arc::ptr_eq(
                 e.poly_voices()[0][0].as_ref().unwrap(),
@@ -7419,20 +6998,31 @@ mod tests {
         let master = v46_piano_master();
         e.set_track_synth(0, Some(master.clone()));
         // Per-lane references (monophonic renders).
-        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(Some(false))), n as u64);
+        e.set_project(
+            Arc::new(vec![]),
+            Arc::new(v46_poly_arrangement(Some(false))),
+            n as u64,
+        );
         let a = e.render_tracks(Some(0), n).expect("lane A renders");
-        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(Some(true))), n as u64);
+        e.set_project(
+            Arc::new(vec![]),
+            Arc::new(v46_poly_arrangement(Some(true))),
+            n as u64,
+        );
         let b = e.render_tracks(Some(0), n).expect("lane B renders");
         // Both lanes, monophonic: one shared instance (historic).
-        e.set_project(Arc::new(vec![]), Arc::new(v46_poly_arrangement(None)), n as u64);
+        e.set_project(
+            Arc::new(vec![]),
+            Arc::new(v46_poly_arrangement(None)),
+            n as u64,
+        );
         let mono = e.render_tracks(Some(0), n).expect("mono renders");
         // POLY: two fresh copies render one lane each; the sum must match
         // A + B (the synth is linear, so lane renders add exactly).
         let master = v46_piano_master();
         e.set_track_synth(0, Some(master.clone()));
-        let copies: Vec<Option<Arc<SynthHandle>>> = (0..2)
-            .map(|_| spawn_synth_copy(&master, 44100))
-            .collect();
+        let copies: Vec<Option<Arc<SynthHandle>>> =
+            (0..2).map(|_| spawn_synth_copy(&master, 44100)).collect();
         e.set_track_poly(0, true, copies);
         let poly = e.render_tracks(Some(0), n).expect("poly renders");
         assert_eq!(poly.len(), mono.len());
@@ -7442,7 +7032,10 @@ mod tests {
             max = max.max(mono[i].abs()).max(poly[i].abs());
             drift = drift.max((poly[i] - (a[i] + b[i])).abs());
         }
-        assert!(drift < 1e-4 * (1.0 + max), "poly export drift {drift} (max {max})");
+        assert!(
+            drift < 1e-4 * (1.0 + max),
+            "poly export drift {drift} (max {max})"
+        );
         assert!(max > 0.01, "the renders must actually sound");
     }
 
@@ -7760,14 +7353,21 @@ mod w4_tests {
 
     #[test]
     fn w4_rt_core_is_backend_neutral() {
-        let src = include_str!("audio.rs");
+        // W5 split: the engine core lives in mod.rs; the jack shim in jack.rs.
+        let src = include_str!("mod.rs");
         let body = extract_fn(src, "pub fn process_block(");
         // Full-body sanity: the playhead/peak publish must be inside.
         assert!(body.contains("self.peak.store(peak_val"), "body truncated");
         // No JACK-specific identifier may appear in the engine core again.
-        for banned in
-            ["j::", "jack_port", "ProcessScope", "self.ports", "self.midi_in", "Control::", "n_frames()"]
-        {
+        for banned in [
+            "j::",
+            "jack_port",
+            "ProcessScope",
+            "self.ports",
+            "self.midi_in",
+            "Control::",
+            "n_frames()",
+        ] {
             assert!(
                 !body.contains(banned),
                 "process_block must be backend-neutral, found `{banned}`"
@@ -7777,7 +7377,7 @@ mod w4_tests {
 
     #[test]
     fn w4_backend_contract_wired() {
-        let be = include_str!("backend.rs");
+        let be = include_str!("../backend.rs");
         for shape in [
             "pub trait BlockIo",
             "fn in_buf(&self, slot: usize) -> *const f32;",
@@ -7786,16 +7386,16 @@ mod w4_tests {
             assert!(be.contains(shape), "backend.rs lost `{shape}`");
         }
         assert!(
-            include_str!("lib.rs").contains("pub mod backend;"),
+            include_str!("../lib.rs").contains("pub mod backend;"),
             "backend module not declared"
         );
-        let src = include_str!("audio.rs");
+        let src = include_str!("jack.rs");
         assert!(
             src.contains("impl crate::backend::BlockIo for JackIo"),
             "jack BlockIo impl missing"
         );
         // (needle split so this pin's own source does not count as a hit)
-        let needle = concat!("self.process_", "block(n, &mut evs, &io);");
+        let needle = concat!("self.proc.process_", "block(n, &mut evs, &io);");
         assert_eq!(
             src.matches(needle).count(),
             1,
@@ -7805,13 +7405,11 @@ mod w4_tests {
 
     #[test]
     fn w4_jack_shim_is_pure_plumbing() {
-        let src = include_str!("audio.rs");
+        let src = include_str!("jack.rs");
         let start = src
-            .find("impl ProcessHandler for Proc {")
+            .find("impl ProcessHandler for JackProc {")
             .expect("shim missing");
-        let end = src[start..]
-            .find("struct JackIo")
-            .expect("JackIo missing");
+        let end = src[start..].find("struct JackIo").expect("JackIo missing");
         let shim = &src[start..start + end];
         // The shim owns mix/transport state: none of its vocabulary.
         for banned in ["clip", "transport", "peak", "meter", "engine.", "gain"] {
@@ -7828,5 +7426,168 @@ mod w4_tests {
         ] {
             assert!(shim.contains(shape), "shim lost `{shape}`");
         }
+    }
+}
+
+/// W5 structural pins (WINDOWS-PORT): the split must STAY split. Source
+/// scans like the w4 family — they assert the seam shapes that let the two
+/// backends compile independently, and each fails if code migrates back
+/// into the shared module or across the cfg boundary.
+#[cfg(test)]
+mod w5_tests {
+    fn cargo_toml() -> &'static str {
+        include_str!("../../Cargo.toml")
+    }
+
+    /// Source for scanning: line comments stripped (prose may legitimately
+    /// name the symbols the pins ban) and the test tail dropped (the pins
+    /// themselves contain the literals — counting them would be self-referential).
+    fn code(src: &str) -> String {
+        let cut = src.find("\n#[cfg(test)]").unwrap_or(src.len());
+        src[..cut]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn w5_backend_deps_are_cfg_gated() {
+        let t = cargo_toml();
+        let lin = t
+            .split("[target.'cfg(windows)'.dependencies]")
+            .next()
+            .unwrap();
+        assert!(
+            lin.contains("[target.'cfg(not(windows))'.dependencies]") && lin.contains("jack = "),
+            "jack must live under the cfg(not(windows)) target table only"
+        );
+        assert!(
+            !lin.contains("windows = {"),
+            "windows crate leaked into the non-windows table"
+        );
+        let win = t
+            .split_once("[target.'cfg(windows)'.dependencies]")
+            .unwrap()
+            .1;
+        assert!(
+            win.contains("windows = {"),
+            "windows crate missing from cfg(windows) table"
+        );
+        assert!(win
+            .split("[build-dependencies]")
+            .next()
+            .unwrap()
+            .contains("Win32_Media_Audio"));
+        // shared [dependencies] must not re-add either crate
+        let shared = t.split_once("[target.").unwrap_or((t, "")).0;
+        assert!(
+            !shared.contains("\njack = ") && !shared.contains("\nwindows = "),
+            "backend dep left the target table"
+        );
+    }
+
+    #[test]
+    fn w5_shared_module_has_no_backend_vocabulary() {
+        let src = code(include_str!("mod.rs"));
+        // `jack::run` appears ONLY inside the cfg(not(windows)) run_backend.
+        assert_eq!(
+            src.matches("jack::run").count(),
+            1,
+            "exactly one jack:: entry call (run_backend)"
+        );
+        assert_eq!(src.matches("wasapi::run").count(), 1);
+        for banned in ["use jack::", "jack_sys", "ProcessScope", "j::"] {
+            assert!(
+                !src.contains(banned),
+                "backend vocabulary `{banned}` migrated into mod.rs"
+            );
+        }
+        // and the OS modules are cfg-declared
+        assert!(
+            src.contains("#[cfg(not(windows))]\nmod jack;"),
+            "jack mod not cfg-gated"
+        );
+        assert!(
+            src.contains("#[cfg(windows)]\nmod wasapi;"),
+            "wasapi mod not cfg-gated"
+        );
+    }
+
+    #[test]
+    fn w5_manager_loop_is_backend_neutral() {
+        let src = code(include_str!("mod.rs"));
+        let start = src.find("fn manager_loop(").expect("manager_loop missing");
+        let end = src[start..]
+            .find("fn clamp_loop_region(")
+            .expect("manager_loop region end missing");
+        let body = &src[start..start + end];
+        for banned in [
+            "send_ports",
+            "apply_layout",
+            "rescan_midi",
+            "active.",
+            "j::",
+            "jack",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "manager_loop must be backend-neutral, found `{banned}`"
+            );
+        }
+        for shape in [
+            "session.refresh(&evt_tx)",
+            "session.apply(&ins, &outs, &evt_tx)",
+            "session.idle(&evt_tx)",
+        ] {
+            assert!(
+                body.contains(shape),
+                "manager_loop lost seam call `{shape}`"
+            );
+        }
+    }
+
+    #[test]
+    fn w5_each_backend_builds_proc_once_and_shims_once() {
+        // (backend files need no filter: their literals ARE the pinned shapes)
+        let jack = include_str!("jack.rs");
+        let wasapi = include_str!("wasapi.rs");
+        assert_eq!(
+            jack.matches("proc: new_proc(").count(),
+            1,
+            "jack builds new_proc once"
+        );
+        assert_eq!(
+            wasapi.matches("proc: new_proc(").count(),
+            1,
+            "wasapi builds new_proc once"
+        );
+        // one process_block call site per shim (w4 pins guard the jack one)
+        assert_eq!(
+            wasapi
+                .matches("self.proc.process_block(n, evs, &io);")
+                .count(),
+            1,
+            "wasapi shim must hand off exactly once"
+        );
+        // each backend implements BlockIo
+        assert!(jack.contains("impl crate::backend::BlockIo for JackIo"));
+        assert!(wasapi.contains("impl crate::backend::BlockIo for WasapiIo"));
+        // engine-side init exists ONLY in the shared builder
+        let src = code(include_str!("mod.rs"));
+        assert_eq!(
+            src.matches("mix_l: Vec::new(),").count(),
+            1,
+            "Proc init duplicated"
+        );
+    }
+
+    #[test]
+    fn w5_e2e_suite_is_cfg_unix() {
+        let e2e = include_str!("../../tests/e2e.rs");
+        assert!(
+            e2e.contains("#![cfg(not(windows))]"),
+            "the live-JACK e2e suite must be cfg'd out on Windows"
+        );
     }
 }

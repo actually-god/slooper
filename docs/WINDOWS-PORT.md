@@ -196,7 +196,7 @@ DONE note: the only behavior delta is UB-cleanup — a slot whose
   harness from `scripts/porting/` (copy to `tests/`, `W4_TAG=… cargo test
   --release --test w4capture -- --nocapture`).
 
-### W5 — WASAPI backend (Windows transport)
+### W5 — WASAPI backend (Windows transport) — **DONE 2026-11-09 (session 5)**
 `audio_backend` split: `audio/jack.rs` (existing) + `audio/wasapi.rs`
 (wasapi crate; event-driven render+capture, f32 shared mode, device picked in
 the Ports window; NO_START ethos: empty patch = silence; graceful error when
@@ -291,3 +291,27 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   `scripts/porting/w4capture.rs`. Gates: e2e 32/32 live, release lib 506/507
   (known-boot v36 abort only), clippy-zero, gnullvm still exactly the 19 W1
   errors.
+- **2026-11-09 session 5 — W5**: WASAPI backend — `src/audio.rs` → `src/audio/`
+  (`mod.rs` shared core + `jack.rs` via mechanical split script + new
+  `wasapi.rs`, ~1000 lines: event-driven shared-mode f32, multithreaded COM on
+  the manager thread with teardown-before-CoUninitialize, `IMMEndpoint`
+  flow-based render/capture enumeration, friendly-name labels with ` [2]`
+  dedupe round-tripped through `Cmd::Apply`, WAVEFORMATEX/TENSIBLE mix parser,
+  engine-capture via device re-open in apply, NO_START ethos, silent-fallback
+  frames); `ManagerBackend` seam makes `manager_loop` backend-neutral (no jack
+  symbols in the shared module, enforced by 5 source-scan pins `w5_*`,
+  sabotage-verified red→green; scan uses comment-stripped, test-tail-cut
+  source so pins are not self-referential); jack→`cfg(not(windows))` target
+  table, windows-rs 0.62 (`Win32_Media_Audio`, `Win32_Security`, …)
+  `cfg(windows)`; `CoCreateInstance::<_, IMMDeviceEnumerator>` + pinned
+  `CLSID_MMDeviceEnumerator`/KS GUID consts (windows-rs ships neither).
+  windows-gnullvm lib check: wasapi.rs ZERO errors — tree sits at exactly
+  the 19 W1 vst-bucket errors (W6/W7 territory). Linux gates: w5 5/5, non-ui
+  lib 254/254 serial, e2e 32/32 live, clippy-zero, audio files rustfmt-clean.
+  Windows-gnullvm gotchas logged: `CreateEventW` hides behind
+  `Win32_Security`; `OpenPropertyStore` behind `Win32_UI_Shell_PropertiesSystem`;
+  `WAVEFORMATEX` is `packed(1)` (copy fields to locals before `format!`);
+  repo is NOT whole-crate rustfmt-clean (217 diffs at HEAD) — never run bare
+  `cargo fmt` here, it buries task diffs; the ui plugin-load test cluster
+  (`v20_fx_bridge_*`, `v36_script_fx_*`) heap-aborts under scratch-HOME Geonkick
+  config loss — environmental, reproduces at HEAD, skip-list is growing.
