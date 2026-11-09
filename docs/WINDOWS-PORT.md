@@ -7,7 +7,8 @@
 > any existing pin. Every Windows change is additive behind `cfg` seams.
 
 STATUS: W1 DONE 2026-11-06 (session 1). W2 DONE 2026-11-08 (session 2).
-NEXT: W3 (script loaders portable — rustc effects/synths `.dll`).
+W3 DONE 2026-11-08 (session 3). NEXT: W4 (neutralize the RT core — jack
+`ProcessHandler` shim around `Proc::process_block`).
 
 ## Ground rules (apply to every task)
 
@@ -129,11 +130,32 @@ live-not-memoized); full suite + clippy green.
   Gates (Linux): release lib 497/498 + known-HEAD `v36_script_fx_editor_
   resizes` boot abort (rest-run 117/117 isolated), e2e 32/32, clippy-zero.
 
-### W3 — Script loaders portable (rustc effects/synths)
+### W3 — Script loaders portable (rustc effects/synths) — **DONE 2026-11-08 (session 3)**
 `.so`→exe-suffix helper; fx.rs/synth.rs build paths via W2; `rustc_available`
 unchanged on Linux, Windows probe message mentions MSVC Build Tools; loader
 looks for `.{so|dll}` by target. Linux pins untouched.
 Acceptance: Windows check passes for these modules; Linux suite green.
+- [x] `paths::dylib_ext()` (`so`/`dll`) + `paths::build_sidecar(artifact, tag)`
+      (`kick.dll` → `kick.dll.tmp` / `.dll.failed`) in paths.rs
+- [x] fx.rs: stamped artifact `.build/<stem>-<stamp>.<ext>`; compile_effect
+      staging + poison marker via `build_sidecar`; `rustc_install_hint()`
+      (Linux = rustup text, Windows = rustup + MSVC Build Tools, ASCII-only
+      for the egui font); synth.rs: artifact `<stem>.<ext>` in the cache
+      dir, same sidecars + hint. Two settings/effects-window "rustc is not
+      on PATH" labels now embed the same hint (was hardcoded rustup twice).
+- [x] pins `w3_*` x7: value pins OS-gated (each OS asserts its own suffix
+      and hint), consistency pins prove every call site goes through the
+      seam (4/4 went red under a 4-site sabotage, incl. both marker paths
+      and both artifact constructions); rustc-dependent pins skip gracefully
+      where rustc is absent (CI)
+- DONE note: Linux artifact/sidecar NAMES are unchanged (`so` branch of the
+  seam), so existing caches and poison markers need no migration. Windows
+  runtime nuance documented in-code, not worked around: a loaded dll cannot
+  be deleted (prune_stale is best-effort by design) and stamp-per-content
+  already avoids any in-place overwrite of a mapped file. Windows gnullvm
+  check: still exactly the 19 W1-triaged errors (all vsthost/vstedit), zero
+  from fx/synth/paths. `→` glyph caught before shipping in the hint (font
+  tofu list). Gates (Linux): see DONE log.
 
 ### W4 — Neutralize the RT core (biggest-risk task, Linux-only refactor)
 Extract `Proc::process` body → `Proc::process_block(ins, outs, midi_in,
@@ -219,3 +241,13 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   AGENT-GUIDE updated. Gates: w2_paths x8, release lib 497/498 (+1 known-HEAD v36
   abort, rest 117/117 isolated), e2e 32/32, clippy-zero; windows-gnullvm lib check
   stays at the 19 triaged errors (none in paths.rs).
+- **2026-11-08 session 3 — W3**: script loaders portable — `paths::dylib_ext()`/
+  `build_sidecar()` seam; fx.rs stamped artifacts + staging/poison sidecars and
+  synth.rs cache artifacts + sidecars now carry the target suffix (Linux names
+  byte-identical, no cache migration); `fx::rustc_install_hint()` drives all four
+  user-facing rustc-missing messages (Windows variant names MSVC Build Tools;
+  ASCII-only for the egui font — a `→` was caught pre-ship). Gates: w3 pins 6/6
+  (7th fires on Windows CI) + 4-site sabotage 4/4 red then reverted clean;
+  windows-gnullvm check still exactly the 19 W1 errors (zero from fx/synth/paths);
+  Linux release lib 503/504 (only known-boot v36_script_fx_editor_resizes; rest
+  34 isolated 33 PASS + that known FAIL), clippy-zero, e2e 32/32.

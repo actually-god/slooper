@@ -760,6 +760,20 @@ pub fn rustc_available() -> bool {
     })
 }
 
+/// What to tell the user when `rustc` cannot be launched (W3). Linux
+/// keeps the classic rustup advice; on Windows plain rustup is NOT
+/// enough — the default `x86_64-pc-windows-msvc` toolchain needs the
+/// Microsoft C linker/headers, so the hint names MSVC Build Tools.
+pub fn rustc_install_hint() -> &'static str {
+    if cfg!(windows) {
+        "install Rust via rustup AND the MSVC Build Tools (Visual Studio \
+         Build Tools > \"Desktop development with C++\"; rustc needs the MSVC \
+         linker to build cdylibs)"
+    } else {
+        "install Rust (rustup)"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Descriptors & instances
 // ---------------------------------------------------------------------------
@@ -1364,7 +1378,10 @@ impl Registry {
             _lib: None,
         };
         if !rustc_available() {
-            return mk("rustc not found — install rust (or rustup) to compile effects".into());
+            return mk(format!(
+                "rustc not found — {} to compile effects",
+                rustc_install_hint()
+            ));
         }
         let so = match self.stamped_artifact(stem, src) {
             Ok(so) => so,
@@ -1393,9 +1410,9 @@ impl Registry {
         }
     }
 
-    /// `.build/<stem>-<stamp>.so`; the stamp folds source mtime+size so an
-    /// edited script builds to a fresh path (fresh dlopen, no in-place
-    /// overwrites of mapped files).
+    /// `.build/<stem>-<stamp>.<dylib>` (`so` on Linux, `dll` on Windows);
+    /// the stamp folds source mtime+size so an edited script builds to a
+    /// fresh path (fresh dlopen, no in-place overwrites of mapped files).
     fn stamped_artifact(&self, stem: &str, src: &Path) -> Result<PathBuf, String> {
         let meta = std::fs::metadata(src).map_err(|e| format!("stat failed: {e}"))?;
         let mut h = DefaultHasher::new();
@@ -1406,14 +1423,16 @@ impl Registry {
             .unwrap_or_default()
             .hash(&mut h);
         let stamp = h.finish();
-        Ok(self
-            .dir
-            .join(".build")
-            .join(format!("{stem}-{stamp:016x}.so")))
+        Ok(self.dir.join(".build").join(format!(
+            "{stem}-{stamp:016x}.{}",
+            crate::paths::dylib_ext()
+        )))
     }
 
     /// Delete older artifacts of the same stem (best-effort; deleting a
-    /// still-mapped file is safe on Linux).
+    /// still-mapped file is safe on Linux; on Windows the remove simply
+    /// fails while the dll is still loaded and the stale file lingers
+    /// until it unmaps — harmless, nothing looks it up by name).
     fn prune_stale(&self, stem: &str, keep: &Path) {
         let Some(dir) = keep.parent() else { return };
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -1469,7 +1488,7 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
             .and_then(|s| s.to_str())
             .unwrap_or("slooper_effect"),
     );
-    let tmp = out.with_extension("so.tmp");
+    let tmp = crate::paths::build_sidecar(out, "tmp");
     let output = Command::new("rustc")
         .args([
             "--edition",
@@ -1485,11 +1504,11 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
         .arg(&tmp)
         .arg(src)
         .output()
-        .map_err(|e| format!("could not run rustc: {e} — install rust or rustup"))?;
+        .map_err(|e| format!("could not run rustc: {e} — {}", rustc_install_hint()))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         let err = trim_head(err.trim(), 1800);
-        std::fs::write(out.with_extension("so.failed"), &err).ok();
+        std::fs::write(crate::paths::build_sidecar(out, "failed"), &err).ok();
         return Err(format!("compile failed:\n{err}"));
     }
     std::fs::rename(&tmp, out).map_err(|e| format!("could not store {}: {e}", out.display()))
@@ -4571,5 +4590,59 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert!(tail_e > 1e-4, "built-in hall has no reverb tail (energy {tail_e})");
         drop(inst);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- W3 (WINDOWS-PORT): script artifacts follow the target suffix --------
+
+    #[test]
+    fn w3_stamped_artifact_target_ext() {
+        let dir = temp_dir("w3-stamp");
+        let reg = Registry::open(dir.clone());
+        let src = dir.join("kick.rs");
+        std::fs::write(&src, "// w3\n").unwrap();
+        let p = reg.stamped_artifact("kick", &src).unwrap();
+        assert_eq!(p.parent().unwrap().file_name().unwrap(), ".build");
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("kick-"), "{name}");
+        assert!(name.ends_with(&format!(".{}", crate::paths::dylib_ext())), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn w3_compile_effect_sidecars_follow_target_ext() {
+        if !rustc_available() {
+            return; // no compiler on this machine: nothing to exercise
+        }
+        let dir = temp_dir("w3-compile");
+        let out = dir.join(format!("pin.{}", crate::paths::dylib_ext()));
+        // Broken source: the poison marker must carry the target suffix.
+        let bad = dir.join("bad.rs");
+        std::fs::write(&bad, "fn broken( {").unwrap();
+        let e = compile_effect(&bad, &out).unwrap_err();
+        assert!(e.contains("compile failed"), "{e}");
+        assert!(crate::paths::build_sidecar(&out, "failed").is_file());
+        assert!(!out.is_file());
+        // Good source: artifact itself carries the target suffix and the
+        // staging sidecar is renamed away.
+        let good = dir.join("good.rs");
+        std::fs::write(&good, "pub fn _noop() {}\n").unwrap();
+        compile_effect(&good, &out).unwrap();
+        assert!(out.is_file(), "{} missing", out.display());
+        assert!(!crate::paths::build_sidecar(&out, "tmp").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w3_rustc_hint_is_rustup_on_unix() {
+        let h = rustc_install_hint();
+        assert!(h.contains("rustup") && !h.contains("MSVC"), "{h}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn w3_rustc_hint_names_build_tools_on_windows() {
+        let h = rustc_install_hint();
+        assert!(h.contains("MSVC Build Tools") && h.contains("rustup"), "{h}");
     }
 }
