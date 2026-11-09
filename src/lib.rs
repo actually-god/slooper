@@ -20,6 +20,7 @@ pub mod assets;
 pub mod audio;
 pub mod audio_io;
 pub mod automation;
+pub mod backend;
 pub mod claphost;
 pub mod config;
 pub mod ffiguard;

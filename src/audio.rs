@@ -2250,6 +2250,7 @@ fn run(
             ins: ins_raw,
             outs: outs_raw,
         },
+        midi_ev_scratch: Vec::new(),
         mask_in: mask_in.clone(),
         mask_out_l: mask_out_l.clone(),
         mask_out_r: mask_out_r.clone(),
@@ -2925,6 +2926,9 @@ impl NotificationHandler for Notif {
 /// Raw JACK port pointers of the fixed slot pool. The pool ports are never
 /// unregistered, so the pointers stay valid for the whole client lifetime;
 /// `Send` is safe to assert (they are only ever read from the RT thread).
+/// `Copy` so the `BlockIo` shim can be built per cycle without borrowing
+/// `Proc` (WINDOWS-PORT W4).
+#[derive(Clone, Copy)]
 struct RawPorts {
     ins: [*mut j::jack_port_t; MAX_SLOTS],
     outs: [*mut j::jack_port_t; MAX_SLOTS],
@@ -4279,6 +4283,13 @@ type AudRow = (usize, u8, u8, u8, u8);
 struct Proc {
     midi_in: Port<MidiIn>,
     ports: RawPorts,
+    /// WINDOWS-PORT W4: scratch the JACK shim materializes this cycle's MIDI
+    /// events into (borrowed `RawMidi` → owned) before handing off to the
+    /// backend-neutral `process_block`. Kept on `Proc` so the outer buffer
+    /// never reallocs block-to-block; the per-event `Vec<u8>` count equals the
+    /// old inline `e.bytes.to_vec()` exactly. (Distinct from `midi_scratch`,
+    /// the per-track synth sample buffer.)
+    midi_ev_scratch: Vec<(u32, Vec<u8>)>,
     mask_in: Arc<AtomicU64>,
     mask_out_l: Arc<AtomicU64>,
     mask_out_r: Arc<AtomicU64>,
@@ -4835,9 +4846,25 @@ fn build_mix_lists(
     out
 }
 
-impl ProcessHandler for Proc {
-    fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
-        let n = ps.n_frames() as usize;
+impl Proc {
+    /// THE engine entry point EVERY audio backend must call (WINDOWS-PORT
+    /// W4; backend contract: `crate::backend`). Processes exactly one RT
+    /// block of `n` frames: `midi` carries this block's raw MIDI events
+    /// (block-relative sample offset + bytes, arrival order — fully consumed
+    /// here), `io` hands out the live input/output slot buffers for this
+    /// cycle. Reads the port masks and engine atomics, advances transport,
+    /// mixes clips, runs chains, drives recording — all backend-neutral.
+    ///
+    /// RT contract (unchanged from the old inline `process`): only
+    /// `try_lock` table refreshes, no IO, no panics, no allocation beyond
+    /// moving each event's bytes into the GUI channel. The backend calls
+    /// this from its realtime callback, once per cycle.
+    pub fn process_block(
+        &mut self,
+        n: usize,
+        midi: &mut Vec<(u32, Vec<u8>)>,
+        io: &dyn crate::backend::BlockIo,
+    ) {
         // v32 R7: one block in units of per-sample step.
         let inv_n = if n > 0 { 1.0 / n as f32 } else { 0.0 };
 
@@ -4881,8 +4908,11 @@ impl ProcessHandler for Proc {
         // when the user opted into MPE (classic single-channel rigs stay
         // byte-for-byte in the legacy behavior).
         let mpe_on = self.engine.mpe();
-        for e in self.midi_in.iter(ps) {
-            let bytes = e.bytes.to_vec();
+        // Consume the block's MIDI events in arrival order. The backend shim
+        // already materialized them (one owned `Vec<u8>` per event — exactly
+        // what the old inline `e.bytes.to_vec()` allocated); here the bytes
+        // move on into the GUI channel unchanged.
+        for (etime, bytes) in midi.drain(..) {
             // v32: stage the message for the track synths too. Bound
             // messages are CONTROL TRAFFIC (they drive bindings; the
             // recorder has always had the same rule) and never feed a
@@ -4892,7 +4922,7 @@ impl ProcessHandler for Proc {
                 if let Some((kind, ch, d1, d2)) = live_event_kind(&bytes) {
                     if (kind < 4 || mpe_on) && !self.bound_cache.claims(kind, ch, d1) {
                         if self.live_ev.len() < 1024 {
-                            let off = (e.time) as usize;
+                            let off = (etime) as usize;
                             self.live_ev.push((off.min(off_cap), kind, ch, d1, d2));
                         }
                         let mut m = live_mask;
@@ -4914,7 +4944,7 @@ impl ProcessHandler for Proc {
         }
 
         if n == 0 {
-            return Control::Continue;
+            return;
         }
 
         let in_mask = self.mask_in.load(Ordering::Relaxed);
@@ -5157,7 +5187,7 @@ impl ProcessHandler for Proc {
             && !self.preview_live
             && !self.aud_pv_any
         {
-            return Control::Continue; // nothing connected, nothing playing: idle
+            return; // nothing connected, nothing playing: idle
         }
 
         // --- transport position for this block ------------------------------
@@ -5547,10 +5577,10 @@ impl ProcessHandler for Proc {
         let mut nin = 0usize;
         for s in 0..MAX_SLOTS {
             if in_mask & (1u64 << s) != 0 {
-                let p = self.ports.ins[s];
-                if !p.is_null() {
-                    in_bufs[nin] =
-                        unsafe { j::jack_port_get_buffer(p, ps.n_frames()) } as *const f32;
+                // Null = slot has no buffer this cycle (old: null port).
+                let bp = io.in_buf(s);
+                if !bp.is_null() {
+                    in_bufs[nin] = bp;
                     nin += 1;
                 }
             }
@@ -5569,11 +5599,11 @@ impl ProcessHandler for Proc {
             if !(l || r) {
                 continue;
             }
-            let p = self.ports.outs[s];
-            if p.is_null() {
+            // Null = slot has no buffer this cycle (old: null port).
+            let b = io.out_buf(s);
+            if b.is_null() {
                 continue;
             }
-            let b = unsafe { j::jack_port_get_buffer(p, ps.n_frames()) as *mut f32 };
             match (l, r) {
                 (true, false) => {
                     out_bufs_l[nl] = b;
@@ -6206,7 +6236,56 @@ impl ProcessHandler for Proc {
         );
         self.peak.store(peak_val, Ordering::Relaxed);
 
+    }
+}
+
+/// JACK shim (WINDOWS-PORT W4): the ONLY job left here is JACK plumbing —
+/// frame count, materializing borrowed MIDI events into the owned scratch,
+/// and the slot-buffer addresses. All mix/transport/take logic lives in
+/// `Proc::process_block`; WASAPI (W5) builds its own shim against the same
+/// entry point and `crate::backend::BlockIo`.
+impl ProcessHandler for Proc {
+    fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
+        // The borrowed `RawMidi`s die with this loop; the engine sees owned
+        // events (same one-`Vec`-per-event allocation count as before W4).
+        let mut evs = std::mem::take(&mut self.midi_ev_scratch);
+        evs.clear();
+        for e in self.midi_in.iter(ps) {
+            evs.push((e.time, e.bytes.to_vec()));
+        }
+        let n = ps.n_frames() as usize;
+        let io = JackIo { ports: self.ports, ps };
+        self.process_block(n, &mut evs, &io);
+        self.midi_ev_scratch = evs;
         Control::Continue
+    }
+}
+
+/// `BlockIo` over the fixed JACK port pool + this cycle's `ProcessScope`.
+/// A null return means "no buffer for this slot" — the same signal the old
+/// in-function null-port check produced. `jack_port_get_buffer` never
+/// allocates per call (JACK API), so this stays RT-safe.
+struct JackIo<'ps> {
+    ports: RawPorts,
+    ps: &'ps ProcessScope,
+}
+
+impl crate::backend::BlockIo for JackIo<'_> {
+    fn in_buf(&self, slot: usize) -> *const f32 {
+        let p = self.ports.ins[slot];
+        if p.is_null() {
+            std::ptr::null()
+        } else {
+            (unsafe { j::jack_port_get_buffer(p, self.ps.n_frames()) }) as *const f32
+        }
+    }
+    fn out_buf(&self, slot: usize) -> *mut f32 {
+        let p = self.ports.outs[slot];
+        if p.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { j::jack_port_get_buffer(p, self.ps.n_frames()) as *mut f32 }
+        }
     }
 }
 
@@ -7658,5 +7737,96 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         assert!(out2[0].abs() < 1e-9, "muted source contributes nothing");
         v48_tap(&out2, 500, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// WINDOWS-PORT W4 contract pins: the RT core (`Proc::process_block`) must
+/// stay backend-neutral, the jack shim must stay ~pure plumbing, and the
+/// seam (`crate::backend::BlockIo`) must stay wired. These are source-text
+/// consistency pins (the W3 pattern): they run on every OS including
+/// Windows CI, and they went red under a sabotage of each seam.
+#[cfg(test)]
+mod w4_tests {
+    /// Extract one indented `fn` body: from `needle` to the first line that
+    /// is exactly `    }` (the fn's closing brace — body lines are >= 8).
+    fn extract_fn(src: &str, needle: &str) -> String {
+        let start = src.find(needle).expect("fn not found");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n    }\n")
+            .expect("closing brace not found — body layout changed?");
+        rest[..end + "\n    }\n".len()].to_string()
+    }
+
+    #[test]
+    fn w4_rt_core_is_backend_neutral() {
+        let src = include_str!("audio.rs");
+        let body = extract_fn(src, "pub fn process_block(");
+        // Full-body sanity: the playhead/peak publish must be inside.
+        assert!(body.contains("self.peak.store(peak_val"), "body truncated");
+        // No JACK-specific identifier may appear in the engine core again.
+        for banned in
+            ["j::", "jack_port", "ProcessScope", "self.ports", "self.midi_in", "Control::", "n_frames()"]
+        {
+            assert!(
+                !body.contains(banned),
+                "process_block must be backend-neutral, found `{banned}`"
+            );
+        }
+    }
+
+    #[test]
+    fn w4_backend_contract_wired() {
+        let be = include_str!("backend.rs");
+        for shape in [
+            "pub trait BlockIo",
+            "fn in_buf(&self, slot: usize) -> *const f32;",
+            "fn out_buf(&self, slot: usize) -> *mut f32;",
+        ] {
+            assert!(be.contains(shape), "backend.rs lost `{shape}`");
+        }
+        assert!(
+            include_str!("lib.rs").contains("pub mod backend;"),
+            "backend module not declared"
+        );
+        let src = include_str!("audio.rs");
+        assert!(
+            src.contains("impl crate::backend::BlockIo for JackIo"),
+            "jack BlockIo impl missing"
+        );
+        // (needle split so this pin's own source does not count as a hit)
+        let needle = concat!("self.process_", "block(n, &mut evs, &io);");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "exactly one process_block call site (the shim)"
+        );
+    }
+
+    #[test]
+    fn w4_jack_shim_is_pure_plumbing() {
+        let src = include_str!("audio.rs");
+        let start = src
+            .find("impl ProcessHandler for Proc {")
+            .expect("shim missing");
+        let end = src[start..]
+            .find("struct JackIo")
+            .expect("JackIo missing");
+        let shim = &src[start..start + end];
+        // The shim owns mix/transport state: none of its vocabulary.
+        for banned in ["clip", "transport", "peak", "meter", "engine.", "gain"] {
+            assert!(
+                !shim.contains(banned),
+                "jack shim must be pure plumbing, found `{banned}`"
+            );
+        }
+        // The event scratch round-trip (take -> fill -> hand off -> store).
+        for shape in [
+            "std::mem::take(&mut self.midi_ev_scratch)",
+            "evs.clear();",
+            "self.midi_ev_scratch = evs;",
+        ] {
+            assert!(shim.contains(shape), "shim lost `{shape}`");
+        }
     }
 }

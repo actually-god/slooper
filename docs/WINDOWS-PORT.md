@@ -7,8 +7,9 @@
 > any existing pin. Every Windows change is additive behind `cfg` seams.
 
 STATUS: W1 DONE 2026-11-06 (session 1). W2 DONE 2026-11-08 (session 2).
-W3 DONE 2026-11-08 (session 3). NEXT: W4 (neutralize the RT core — jack
-`ProcessHandler` shim around `Proc::process_block`).
+W3 DONE 2026-11-08 (session 3). W4 DONE 2026-11-09 (session 4).
+NEXT: W5 (WASAPI backend — build its shim against `Proc::process_block` +
+`crate::backend::BlockIo`, then cfg the jack crate out on Windows).
 
 ## Ground rules (apply to every task)
 
@@ -157,7 +158,7 @@ Acceptance: Windows check passes for these modules; Linux suite green.
   from fx/synth/paths. `→` glyph caught before shipping in the hint (font
   tofu list). Gates (Linux): see DONE log.
 
-### W4 — Neutralize the RT core (biggest-risk task, Linux-only refactor)
+### W4 — Neutralize the RT core (biggest-risk task, Linux-only refactor) — **DONE 2026-11-09 (session 4)**
 Extract `Proc::process` body → `Proc::process_block(ins, outs, midi_in,
 n_frames)`; the jack ProcessHandler shim becomes ~30 lines calling it. Define
 `backend` module describing the manager-thread contract (Cmd + state types
@@ -165,6 +166,35 @@ unchanged → ui.rs untouched). NO behavior change; bit-true audio verified via
 dsp-audio-probe baseline + full suite + e2e on real JACK.
 Acceptance: Linux green incl. e2e; process_block documented as THE engine
 entry every backend must call.
+- [x] `Proc::process_block(n, midi, io)` — the 1370-line body moved verbatim;
+      five touchpoints swapped: `n` param, `midi.drain(..)` (owned events),
+      `io.in_buf(s)`/`io.out_buf(s)` (null = slot excluded), `return;`
+- [x] `src/backend.rs`: `BlockIo` trait + full contract doc (per-block rules,
+      manager-thread `Cmd`/`Evt` invariance, RT rules, NO_START ethos)
+- [x] jack shim = 20 lines: collect frames + owned MIDI into a reused
+      `midi_ev_scratch` (same one-`Vec`-per-event count as the old inline
+      `to_vec`; name avoids the older `midi_scratch` synth buffer) + `JackIo`
+      (`RawPorts` is now `Copy`)
+- [x] pins `w4_*` x3 (source-consistency, sabotage-verified): RT core free of
+      `j::`/`ProcessScope`/`self.ports`/`self.midi_in`/`Control::`/
+      `n_frames()`; seam wired (`impl BlockIo for JackIo`, exactly one
+      process_block call site); shim stays pure plumbing (no mix vocabulary)
+- [x] bit-true gate: `scripts/porting/w4capture.rs` drives the LIVE
+      PipeWire-JACK RT path with a deterministic 2-clip project, aligns on a
+      correlation marker (corr 1.000000) and hashes 190 000 stereo pairs —
+      HEAD twice ⇒ `951dce12…` identical (harness is deterministic), new
+      binary twice ⇒ same `951dce12…` (refactor is bit-true), a 1 % master-
+      gain sabotage ⇒ different hash (harness is falsifiable)
+DONE note: the only behavior delta is UB-cleanup — a slot whose
+  `jack_port_get_buffer` would have returned null (OOM) is now skipped
+  instead of dereferenced. MIDI-event ordering/late-block consumption and the
+  idle-return semantics are preserved exactly (verified by capture + e2e).
+  Gates (Linux): e2e 32/32 live; release lib 506/507 (389 monolith + 117
+  isolated, the 1 = known-boot `v36_script_fx_editor_resizes` abort class);
+  clippy-zero; windows-gnullvm `cargo check --lib` stays at EXACTLY the 19
+  W1-triaged errors (zero from `audio.rs`/`backend.rs`). Run the capture
+  harness from `scripts/porting/` (copy to `tests/`, `W4_TAG=… cargo test
+  --release --test w4capture -- --nocapture`).
 
 ### W5 — WASAPI backend (Windows transport)
 `audio_backend` split: `audio/jack.rs` (existing) + `audio/wasapi.rs`
@@ -251,3 +281,13 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   windows-gnullvm check still exactly the 19 W1 errors (zero from fx/synth/paths);
   Linux release lib 503/504 (only known-boot v36_script_fx_editor_resizes; rest
   34 isolated 33 PASS + that known FAIL), clippy-zero, e2e 32/32.
+- **2026-11-09 session 4 — W4**: RT core neutralized — `Proc::process_block(n,
+  midi, io)` is THE engine entry (1370-line body verbatim; `j::`/`ps`/
+  `self.ports`/`self.midi_in`/`Control::` only in the 20-line jack shim +
+  `JackIo: BlockIo`); `src/backend.rs` carries the backend contract; pins
+  `w4_*` x3 sabotage-green; bit-true LIVE capture (deterministic 2-clip
+  project, corr 1.000000): HEAD×2 == refactor×2 == sha `951dce12…` over
+  190 000 stereo pairs, 1 % gain sabotage flips it; harness kept at
+  `scripts/porting/w4capture.rs`. Gates: e2e 32/32 live, release lib 506/507
+  (known-boot v36 abort only), clippy-zero, gnullvm still exactly the 19 W1
+  errors.
