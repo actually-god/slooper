@@ -1,3 +1,13 @@
+// WINDOWS-PORT W10: the jack crate is `cfg(not(windows))` in this tree, so
+// this JACK diagnostic example compiles to an inert stub on Windows (the
+// `cargo check --all-targets` compile guard builds every example).
+#[cfg(windows)]
+fn main() {
+    eprintln!("sinco_emu: Linux-only example (JACK backend); no-op on Windows.");
+}
+
+#[cfg(not(windows))]
+mod app {
 //! sinco_emu — emulate the "SINCO MIDI 1" controller for testing slooper's
 //! MIDI binding capture without touching the hardware.
 //!
@@ -48,7 +58,7 @@ impl ProcessHandler for Src {
     }
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let target = args
         .iter()
@@ -118,4 +128,10 @@ fn main() {
     }
 
     let _ = active;
+}
+}
+
+#[cfg(not(windows))]
+fn main() {
+    app::main();
 }
