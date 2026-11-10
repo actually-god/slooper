@@ -204,6 +204,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // Linux XDG/HOME folder semantics (Windows twin: windows_folder_shapes)
     #[test]
     fn w2_paths_xdg_beats_home_fallback() {
         let _sb = EnvSandbox::new(&["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]);
@@ -227,6 +228,7 @@ mod tests {
         assert_eq!(default_projects_dir(), PathBuf::from("/home/zoinks/slooper-projects"));
     }
 
+    #[cfg(unix)] // Linux XDG/HOME folder semantics (Windows twin: windows_folder_shapes)
     #[test]
     fn w2_paths_empty_env_vars_count_as_unset() {
         let _sb = EnvSandbox::new(&[]);
@@ -252,6 +254,7 @@ mod tests {
         assert_eq!(impulses_dir(), PathBuf::from("/sandbox/data/impulses"));
     }
 
+    #[cfg(unix)] // Linux XDG/HOME folder semantics (Windows twin: windows_folder_shapes)
     #[test]
     fn w2_paths_resolution_is_live_not_memoized() {
         // The test suite swaps HOME/XDG mid-suite (test_app); a memoized
@@ -266,6 +269,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(unix)] // Linux XDG/HOME folder semantics (Windows twin: windows_folder_shapes)
     #[test]
     fn w2_paths_config_json_lives_in_config_dir() {
         let _sb = EnvSandbox::new(&["XDG_CONFIG_HOME"]);
@@ -276,6 +280,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)] // Linux XDG/HOME folder semantics (Windows twin: windows_folder_shapes)
     #[test]
     fn w2_paths_effect_and_synth_dirs_follow_data_dir() {
         let _sb = EnvSandbox::new(&["XDG_DATA_HOME", "SLOOPER_SYNTHS_DIR"]);

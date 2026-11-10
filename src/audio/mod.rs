@@ -7357,8 +7357,11 @@ mod w4_tests {
     #[test]
     fn w4_rt_core_is_backend_neutral() {
         // W5 split: the engine core lives in mod.rs; the jack shim in jack.rs.
-        let src = include_str!("mod.rs");
-        let body = extract_fn(src, "pub fn process_block(");
+        // CRLF-normalized: Windows CI checkouts may carry CRLF (git
+        // core.autocrlf), which would hide the "\n    }\n" closing-brace
+        // anchor. .gitattributes pins eol=lf; this is defense in depth.
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let body = extract_fn(&src, "pub fn process_block(");
         // Full-body sanity: the playhead/peak publish must be inside.
         assert!(body.contains("self.peak.store(peak_val"), "body truncated");
         // No JACK-specific identifier may appear in the engine core again.

@@ -1,0 +1,19 @@
+# WINDOWS-PORT W10: Windows CI runners with core.autocrlf=true silently
+# re-write .rs checkouts to CRLF, which breaks the raw-source scan pins
+# (w4/w5/w6/w7/w8 read their own files and anchor on multi-line patterns).
+# Pin LF for all text in the working tree on every OS; binary fixtures are
+# unaffected (git auto-detects blobs already stored binary).
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.desktop text eol=lf
+VENDOR-NOTES text eol=lf
+LICENSE text eol=lf

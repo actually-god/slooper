@@ -152,6 +152,7 @@ mod seam_tests {
     /// gate is DISPLAY-env-only (never opens a probe display next to the
     /// GUI thread's connections); on Windows the Win32 window station is
     /// simply there.
+    #[cfg(unix)] // DISPLAY-only gate is the LINUX truth (win32 stub answers always-on)
     #[test]
     fn w8_linux_backend_gate() {
         let want = std::env::var_os("DISPLAY").is_some();
