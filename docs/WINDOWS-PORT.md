@@ -14,13 +14,19 @@ ones execute at W10 CI).
 W7 DONE 2026-11-10 (session 7, `w7_*` pins; Windows probes now re-exec
 `slooper --slooper-probe <kind> <path>`; one new `#[cfg(windows)]` pin
 joins the W6/W2 set at W10 CI).
-W8a DONE 2026-11-10 (session 8, `w8_*` pins): vstedit is an OS seam
+W8a DONE 2026-11-10 (session 8, `9642a03`): vstedit is an OS seam
 (`src/vstedit/{mod,x11,win32}.rs`), the Win32 top-level editor container
 builds, and the gnullvm check is at ZERO errors for lib + bins + tests.
-NEXT: W8b (child-HWND docking under the winit window — the remaining half
-of the W8 task entry), then W9 (Windows MIDI) or W10 (CI) — W10 is now
-cheap (full `--tests` cross-compile is already green) and protects
-everything, so prefer W10 next.
+W10 IN PROGRESS 2026-11-10 (session 9): `.github/workflows/ci.yml` =
+linux (release build + citest lib suite + clippy-zero) / windows-cross
+(gnullvm `--all-targets` check, llvm-mingw 20261104 pinned, linker via env
+override) / windows-native (MSVC: exe build → `w2_..w8_` port pins →
+release build proof → report-only full lib suite). Tests ride a new
+`[profile.citest]` (release minus fat LTO — `cargo test --release` would
+compile tests through profile.bench's LTO inheritance). DONE note lands
+with the first green run.
+NEXT: W8b (child-HWND docking under the winit HWND — the remaining half
+of the W8 task entry), then W9 (Windows MIDI) once the CI matrix is green.
 
 ## Ground rules (apply to every task)
 

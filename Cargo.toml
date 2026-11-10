@@ -109,6 +109,15 @@ strip = true
 # main.rs installs a hook that prints and aborts on every panic.
 panic = "unwind"
 
+# W10 (WINDOWS-PORT) CI test profile: release codegen WITHOUT the shipping
+# fat-LTO/1-CGU. `cargo test --release` resolves to profile.bench which
+# inherits release — compiling the ~530-test lib suite through LTO on every
+# CI push wastes the entire run window. Codegen semantics stay release.
+[profile.citest]
+inherits = "release"
+lto = false
+codegen-units = 32
+
 # tier-5 forensics (2026-11-06 v2): release codegen + debuginfo for ASAN runs
 [profile.asanrel]
 inherits = "release"

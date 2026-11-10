@@ -1,0 +1,101 @@
+# W10 (docs/WINDOWS-PORT.md): CI matrix = the compile-guard for the Windows
+# port + Linux regression gate.
+#
+#   linux           Linux truth: shipping release build, full headless lib
+#                   suite (SLOOPER_NULL_AUDIO — e2e.rs needs a live JACK
+#                   server and is NOT run here), clippy-zero.
+#   windows-cross   The gnullvm cross-check that gated every W-task locally
+#                   (llvm-mingw UCRT 20261104, same build as the dev host).
+#                   Catches Linux-side regressions that break Windows.
+#   windows-native  Real test execution on Windows: the #[cfg(windows)] pin
+#                   set (W2/W3/W6/W7/W8) that cross-checks can never run,
+#                   plus a report-only full-suite triage pass to grow the
+#                   green list from.
+#
+# Test builds use the `citest` profile (Cargo.toml): release codegen without
+# fat LTO — `cargo test --release` would compile tests through LTO because
+# profile.bench inherits from release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (lib suite + clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libjack-jackd2-dev libx11-dev libxcursor-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+      - name: Build (shipping profile)
+        run: cargo build --release --locked
+      - name: Lib suite (headless, citest profile)
+        run: cargo test --profile citest --lib --locked
+      - name: Clippy zero
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --locked 2>&1 | tee clippy.log
+          ! grep -qE '^warning: |^error' clippy.log
+
+  windows-cross:
+    name: Cross-check (x86_64-pc-windows-gnullvm)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: gnullvm
+      - name: Install llvm-mingw (pinned 20261104 UCRT build)
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fLo mm.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar xf mm.tar.xz
+          # env var overrides the dev-host linker path in .cargo/config.toml
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=$RUNNER_TEMP/llvm-mingw-20261104-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-gcc" >> "$GITHUB_ENV"
+      - name: Add rustup target
+        run: rustup target add x86_64-pc-windows-gnullvm
+      - name: cargo check --all-targets
+        run: cargo check --target x86_64-pc-windows-gnullvm --all-targets --locked
+
+  windows-native:
+    name: Windows (MSVC build + port pins)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      SLOOPER_NULL_AUDIO: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: win-msvc
+      # The exe build is what the W7 probe pins re-exec (build.rs bakes
+      # target/citest/slooper.exe as SLOOPER_EXE_PATH); build it before the
+      # test steps so the pins ride real isolation, not inline fallback.
+      - name: Build exe (probe helper for W7/W6 pins)
+        run: cargo build --profile citest --locked
+      - name: Compile lib tests
+        run: cargo test --profile citest --lib --no-run --locked
+      - name: Port pins w2..w8 (incl. the #[cfg(windows)] set)
+        run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_
+      - name: Release build proof (shipping profile)
+        run: cargo build --release --locked
+      - name: Full lib suite (report-only triage, grow the green list)
+        continue-on-error: true
+        run: cargo test --profile citest --lib --locked --no-fail-fast
