@@ -327,7 +327,7 @@ thread — never the UI thread), W8b child-HWND under the winit HWND for dock
 integration (reuse v36/v41 size-guard designs).
 Acceptance: builds + non-X11 codepaths pinned where possible; manual smoke
 checklist for user hardware.
-- [x] **W8a DONE 2026-11-10 (session 8, `6a6eff3`)** — top-level container
+- [x] **W8a DONE 2026-11-10 (session 8, `9642a03`)** — top-level container
   per plugin on Win32 (details: DONE log entry below)
 - [ ] W8b: child-HWND embedding under the winit HWND (in-window editor
   dock; today Windows editors are separate top-level windows — the same
