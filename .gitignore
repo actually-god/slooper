@@ -8,3 +8,4 @@
 /src/*.tar.gz
 /*.tar.gz
 effects/.build/
+tests/fixtures/gnull-home/
