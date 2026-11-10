@@ -311,6 +311,11 @@ const MIDI_CHANNELS: [vst3_host::midi::MidiChannel; 16] = [
 /// Default VST search folders (the usual Linux conventions), existing ones
 /// only. Users may add their own folders in the VST window.
 pub fn default_vst_dirs() -> Vec<PathBuf> {
+    // W6: Windows has its own convention set (see `windows_vst_dirs`); the
+    // Linux list below is byte-identical to its pre-W6 form.
+    if cfg!(windows) {
+        return windows_vst_dirs();
+    }
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(PathBuf::from(&home).join(".vst3"));
@@ -358,6 +363,89 @@ pub fn default_vst_dirs() -> Vec<PathBuf> {
     }
     dirs.retain(|d| d.is_dir());
     dirs
+}
+
+/// W6: the standard Windows plugin folders (existing ones only). VST2 has
+/// no official directory — this is the de-facto set installers actually
+/// write to; VST3 (`Common Files\\VST3`) and CLAP (`%COMMONPROGRAMFILES%\\CLAP`
+/// system, `%LOCALAPPDATA%\\CLAP` user) follow their SDK defaults. `VST_PATH`
+/// / `CLAP_PATH` work on both OSes; the `;` path-list separator is handled
+/// by [`std::env::split_paths`].
+fn windows_vst_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let add = |dirs: &mut Vec<PathBuf>, p: PathBuf| {
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        for sub in [
+            r"Steinberg\VstPlugins",
+            r"Common Files\VST",
+            r"Common Files\VSTPlugins",
+            r"Common Files\Steinberg\vstplugins",
+            r"Common Files\VST3",
+            r"VSTPlugins",
+        ] {
+            add(&mut dirs, PathBuf::from(&pf).join(sub));
+        }
+    }
+    if let Ok(cf) = std::env::var("COMMONPROGRAMFILES") {
+        add(&mut dirs, PathBuf::from(cf).join("CLAP"));
+    }
+    if let Ok(la) = std::env::var("LOCALAPPDATA") {
+        add(&mut dirs, PathBuf::from(la).join("CLAP"));
+    }
+    for var in ["VST_PATH", "CLAP_PATH"] {
+        if let Ok(extra) = std::env::var(var) {
+            for p in std::env::split_paths(&extra) {
+                if !p.as_os_str().is_empty() {
+                    add(&mut dirs, p);
+                }
+            }
+        }
+    }
+    dirs.retain(|d| d.is_dir());
+    dirs
+}
+
+/// W6: which path to hand the VST3 probe for a `.vst3` entry. Linux: the
+/// entry itself — `vst3_host::discovery::get_plugin_info` resolves
+/// `Contents/x86_64-linux/*.so` bundles internally, exactly as before.
+/// Windows: real bundles ship the module as `Contents/<arch>-win/<name>.vst3dll`,
+/// which that resolver (looking for `*.vst3` only) would miss, so resolve a
+/// concrete module file here; anything else passes through unchanged.
+fn vst3_probe_target(p: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if p.is_dir() {
+        if let Some(bin) = windows_vst3_binary(p) {
+            return bin;
+        }
+    }
+    p.to_path_buf()
+}
+
+/// The loadable module inside a Windows VST3 bundle, preferring this
+/// architecture's folder and the canonical `.vst3dll` extension (the SDK
+/// convention that avoids Windows treating the module as a plain DLL).
+#[cfg(windows)]
+fn windows_vst3_binary(dir: &Path) -> Option<PathBuf> {
+    let contents = dir.join("Contents");
+    for folder in ["x86_64-win", "arm64ec-win", "arm64x-win", "arm64-win"] {
+        let Ok(entries) = std::fs::read_dir(contents.join(folder)) else {
+            continue;
+        };
+        let files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        for ext in ["vst3dll", "vst3"] {
+            if let Some(hit) = files
+                .iter()
+                .find(|q| q.is_file() && q.extension().map(|x| x == ext).unwrap_or(false))
+            {
+                return Some(hit.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Scan the given folders for VST2/VST3 plugins. Each folder is searched
@@ -412,6 +500,17 @@ fn scan_inner(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                     continue;
                 }
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // W6: Windows file systems are case-insensitive and real
+                // plugins end in `.dll`/`.DLL`/anything — match extensions on
+                // a lowercased copy there. Linux keeps the byte-exact name
+                // (an uppercase `.SO` stays invisible, as always).
+                let lower;
+                let match_name: &str = if cfg!(windows) {
+                    lower = name.to_ascii_lowercase();
+                    lower.as_str()
+                } else {
+                    name
+                };
                 // v17: an already-instantiated, unchanged file is NOT probed
                 // again — creating (and worse, dropping) a second instance of
                 // a live library tears down the toolkit singletons the live
@@ -424,7 +523,10 @@ fn scan_inner(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                 // yabridge wrappers dlopen straight into a Wine-host probe;
                 // when the Wine side cannot come up, yabridge's chainloader
                 // calls abort() INSIDE this process — unrecoverable.
-                if skip_bridged
+                // W6: a Linux-only concept (yabridge does not exist on
+                // Windows, where `.dll` names are the plugins themselves).
+                if cfg!(unix)
+                    && skip_bridged
                     && (name.contains(".dll.") || dir.to_string_lossy().contains("/yabridge/"))
                 {
                     continue;
@@ -455,20 +557,27 @@ fn scan_inner(dirs: &[PathBuf], skip_bridged: bool) -> Vec<VstEntry> {
                 // one crash-prone file (see `scan_with`) must cost one
                 // greyed row, never the whole registry.
                 let target: Option<(PathBuf, VstKind)> =
-                    if crate::claphost::is_clap_file(name) && !p.is_dir() {
+                    if crate::claphost::is_clap_file(match_name) && !p.is_dir() {
                         // One entry PER plugin descriptor (a .clap can host
                         // several). Probe never instantiates, so unlike VST2
                         // this is safe on any file, but keep the same
                         // error-as-greyed-row contract.
                         Some((p.clone(), VstKind::Clap))
-                    } else if name.ends_with(".vst3") {
-                        Some((p.clone(), VstKind::V3))
-                    } else if name.ends_with(".vst") && p.is_dir() {
+                    } else if match_name.ends_with(".vst3") {
+                        // W6: on Windows this resolves the real bundle module
+                        // (`vst3_probe_target`); Linux passes through.
+                        Some((vst3_probe_target(&p), VstKind::V3))
+                    } else if match_name.ends_with(".vst") && p.is_dir() {
                         // VST2 bundle layout (`Foo.vst/Contents/<arch>.so`) —
                         // what yabridge writes for Windows plugins and what
                         // many Linux packs ship. Probe the real library inside.
                         bundle_so(&p).map(|so| (so, VstKind::V2))
-                    } else if name.ends_with(".so") && !p.is_dir() {
+                    } else if match_name.ends_with(".so") && !p.is_dir() {
+                        Some((p.clone(), VstKind::V2))
+                    } else if cfg!(windows) && match_name.ends_with(".dll") && !p.is_dir() {
+                        // W6: native Windows VST2 — the `.so` of this OS.
+                        // (On Linux raw `.dll`s stay never-probed: they are
+                        // yabridge companions, not loadables — v10/w6 pins.)
                         Some((p.clone(), VstKind::V2))
                     } else {
                         None
@@ -509,6 +618,11 @@ fn bundle_so(dir: &Path) -> Option<PathBuf> {
 
 /// True when the yabridge control tool is installed (Windows VST support).
 pub fn yabridge_available() -> bool {
+    // W6: yabridge is the Linux Wine bridge — on Windows plugins are native,
+    // so the UI must never offer it.
+    if cfg!(windows) {
+        return false;
+    }
     yabridgectl_path().is_some()
 }
 
@@ -531,6 +645,10 @@ fn yabridgectl_path() -> Option<PathBuf> {
 /// when any wrapping happened, `None` when there was nothing to do or
 /// yabridge is not installed. Never fails the caller's native scan.
 pub fn yabridge_sync(roots: &[PathBuf]) -> Option<String> {
+    // W6: no Wine, no yabridge, nothing to sync on Windows.
+    if cfg!(windows) {
+        return None;
+    }
     let exe = yabridgectl_path()?;
     let dll_dirs = dll_source_dirs(roots);
     if dll_dirs.is_empty() {
@@ -741,6 +859,10 @@ fn repair_looped_companion(wrapper: &Path, scan_dirs: &[PathBuf]) -> Option<Path
                 && pe_machine(&cand).is_some()
             {
                 std::fs::remove_file(&link).ok()?;
+                // W6: symlinks are the Unix mechanism and the ONLY compile-level
+                // Unix dependency in this region; on Windows the whole yabridge
+                // repair path is unreachable (`is_wine_bridged` returns false).
+                #[cfg(unix)]
                 std::os::unix::fs::symlink(&cand, &link).ok()?;
                 if std::fs::File::open(&link).is_ok() {
                     eprintln!(
@@ -801,6 +923,11 @@ fn bridge_needs32(p: &Path) -> bool {
 /// True when probing/loading `p` would dlopen a yabridge chainloader —
 /// i.e. drag Wine into THIS process.
 pub fn is_wine_bridged(p: &Path) -> bool {
+    // W6: yabridge is a Linux-only mechanism — on Windows nothing is ever
+    // Wine-bridged, which keeps every bridge path in scan/open inert.
+    if cfg!(windows) {
+        return false;
+    }
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if p.to_string_lossy().contains("/yabridge/") {
         return true;
@@ -1378,6 +1505,11 @@ fn probe_inline(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
 /// Probe one library file/descriptor set in a forked child. Any abnormal
 /// child death, timeout, or unparsable reply becomes a single greyed error
 /// row — the scan ALWAYS completes.
+///
+/// W6: this fork protocol is Unix-only (it is the entirety of vsthost's
+/// libc dependency); Windows gets an inline twin below until W7 replaces
+/// it with a re-exec child (`--slooper-probe` + CreateProcess).
+#[cfg(unix)]
 fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
     // Escape hatch / unit-test path: historical inline probes.
     if std::env::var("SLOOPER_SCAN_INLINE").is_ok() {
@@ -1524,6 +1656,15 @@ fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
         plugin_id: None,
         error: Some(why),
     }]
+}
+
+#[cfg(windows)]
+fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
+    // W6 seam until W7: no fork(2) on Windows, so probes run in-process —
+    // exactly what `SLOOPER_SCAN_INLINE` selects on Linux. `ffiguard` still
+    // catches C++ throws crossing the FFI boundary (the extern "C-unwind"
+    // fix); hard crashes are contained once W7 adds the re-exec child.
+    probe_inline(lib, kind)
 }
 
 // -------------------------------------------------------------- params ---
@@ -3841,6 +3982,7 @@ mod tests {
     /// they are ordinary Linux `.so`s to the loader). scan() must find
     /// every native-loadable form; the raw `.dll` itself is registered
     /// with yabridgectl (yabridge_sync), never dlopen'd.
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v10_scan_finds_yabridge_wrappers_and_dlls() {
         let dir = std::env::temp_dir().join(format!("sp-scan-{}", std::process::id()));
@@ -3908,6 +4050,7 @@ mod tests {
     /// i386 companion `.dll`, plus fake yabridge host binaries and a fake
     /// Wine loader whose BEHAVIOUR is `wine_body` (executed as a /bin/sh
     /// script by the probe). Sets the probe env seams; caller must tear down.
+    #[cfg(unix)] // W6: /bin/sh fake wine loaders are a Linux fixture
     fn v191_bridge_fixture(tag: &str, wine_body: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("sp-bridge-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -3934,6 +4077,7 @@ mod tests {
         root
     }
 
+    #[cfg(unix)] // W6: teardown of the Linux-only bridge fixture
     fn v191_bridge_teardown(root: &Path) {
         std::env::remove_var("SLOOPER_WINE");
         std::env::remove_var("SLOOPER_YABRIDGE_DIR");
@@ -3961,6 +4105,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v191_scan_marks_dead_wine_bridge_without_crash() {
         let root = v191_bridge_fixture(
@@ -3991,6 +4136,7 @@ mod tests {
         v191_bridge_teardown(&root);
     }
 
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v191_scan_passes_bridge_when_wine_probe_passes() {
         // Probe success (the host's own banner) must take the NORMAL load
@@ -4017,6 +4163,7 @@ mod tests {
         v191_bridge_teardown(&root);
     }
 
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v191_open_inner_refuses_bridge_with_dead_wine() {
         let root = v191_bridge_fixture(
@@ -4037,6 +4184,7 @@ mod tests {
     /// once Wine answers again the bridge path proceeds. A permanently cached
     /// failure was the mechanism behind "VST2 plugins fail to initialize
     /// entirely" for the rest of a session.
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v21_bridge_probe_recovers_after_transient_failure() {
         // Fake Wine: first probe dies like a cold/draining wineserver; every
@@ -4299,6 +4447,7 @@ mod tests {
     /// never be handed back as DLL SOURCE — a self-referencing scan made
     /// `X.dll -> .../yabridge/X.dll` loops and every bridge load died with
     /// ELOOP. `dll_source_dirs` skips any `.../yabridge` directory.
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v22_dll_source_dirs_skip_yabridge_output() {
         let root = std::env::temp_dir().join(format!("sp-v22yab-{}", std::process::id()));
@@ -4324,6 +4473,7 @@ mod tests {
     /// v22 pin: the ELOOP companion symlink is re-pointed at the real DLL
     /// (self-heal at scan time — the reported "invalid DLL file format"
     /// for every yabridged plugin); a link that resolves is left alone.
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v22_repair_looped_companion_repoints_to_real_dll() {
         let root = std::env::temp_dir().join(format!("sp-v22rep-{}", std::process::id()));
@@ -4581,6 +4731,7 @@ mod tests {
     /// every CLAP silently vanished from the picker). Every probe is
     /// fork-isolated: the killer becomes ONE greyed row and the rows
     /// scanned before AND after it still arrive.
+    #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
     fn v37_scan_survives_crashing_probe() {
         let Some(fixture) = crate::claphost::tests::fixture_clap() else {
@@ -4633,6 +4784,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)] // W6: builds .so killers with cc; only the v37 unix pin uses it
     fn compile_probe_fixture(dir: &std::path::Path, tag: &str, boom: &str) -> Vec<u8> {
         // A constructor that dies (or never returns) takes dlopen with it —
         // exactly the vendor failure mode the isolation must survive.
@@ -4660,5 +4812,247 @@ mod tests {
             panic!("fixture compile failed for {tag}");
         }
         std::fs::read(&out).unwrap()
+    }
+
+    // ============ WINDOWS-PORT W6 pins: native Windows scan ==============
+    //
+    // Fixtures: tests/fixtures/w6/w6-vst2.{dll,so} (source + build script:
+    // scripts/porting/w6_vst2_fixture.c) — the SAME minimal VST2 effect in
+    // both OS binaries. Linux pins run live TODAY (probe the .so, never the
+    // .dll); the #[cfg(windows)] pins assert the opposite truth on Windows
+    // CI (W10). One fixture, two OSes, each asserts its own semantics.
+
+    fn w6_fixture(name: &str) -> PathBuf {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/w6")
+            .join(name);
+        assert!(p.is_file(), "W6 fixture missing: {} (run scripts/porting/w6_build_fixtures.sh)", p.display());
+        p
+    }
+
+    fn w6_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("w6-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A successfully probed fixture is exactly ONE clean effect row whose
+    /// name/vendor came back through the vendored crate's dispatcher
+    /// opcodes (48/47 — NOT the SDK eff* numbers; see the fixture header).
+    fn w6_assert_clean_effect(entries: &[VstEntry], file: &str) {
+        let hits: Vec<&VstEntry> = entries
+            .iter()
+            .filter(|e| e.path.to_string_lossy().contains(file))
+            .collect();
+        assert_eq!(hits.len(), 1, "expected exactly one entry for {file}: {entries:?}");
+        let e = hits[0];
+        assert!(e.error.is_none(), "probe must be clean, got {:?}", e.error);
+        assert_eq!(e.name, "W6 VST Fixture", "product name via vendored opcode 48");
+        assert_eq!(e.vendor, "slooper W6", "vendor via vendored opcode 47");
+        assert!(!e.instrument, "numInputs=1, flags=0 => effect");
+    }
+
+    /// THE live proof of the whole W6 dispatch chain on Linux: the committed
+    /// fixture `.so` is scanned, fork-probed, and reads back its name.
+    #[test]
+    fn w6_linux_fixture_vst2_probes_clean() {
+        let dir = w6_temp_dir("lin");
+        std::fs::copy(w6_fixture("w6-vst2.so"), dir.join("w6-live.so")).unwrap();
+        let entries = scan_with(std::slice::from_ref(&dir), false);
+        w6_assert_clean_effect(&entries, "w6-live.so");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w6_linux_scan_never_probes_windows_binaries() {
+        let dir = w6_temp_dir("nope");
+        // A REAL mingw PE, a junk `.dll`, and an uppercase `.SO` of the real
+        // fixture: none of the three may be scanned on Linux (v10 covered
+        // the yabridge-shape case; this covers real bytes + case rules).
+        std::fs::copy(w6_fixture("w6-vst2.dll"), dir.join("w6.dll")).unwrap();
+        std::fs::write(dir.join("FAKE.DLL"), b"MZ junk").unwrap();
+        std::fs::copy(w6_fixture("w6-vst2.so"), dir.join("W6UP.SO")).unwrap();
+        let entries = scan_with(std::slice::from_ref(&dir), false);
+        assert!(
+            entries.is_empty(),
+            "Linux must scan neither `.dll`/`.DLL` nor uppercase `.SO`: {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn w6_windows_scan_probes_native_dll() {
+        let dir = w6_temp_dir("win");
+        std::fs::copy(w6_fixture("w6-vst2.dll"), dir.join("w6.dll")).unwrap();
+        std::fs::copy(w6_fixture("w6-vst2.dll"), dir.join("W6UP.DLL")).unwrap();
+        let entries = scan_with(std::slice::from_ref(&dir), false);
+        w6_assert_clean_effect(&entries, "w6.dll");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path.to_string_lossy().to_ascii_lowercase().ends_with("w6up.dll")),
+            "uppercase `.DLL` must scan too (case-insensitive fs): {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn w6_windows_vst3_bundle_resolves_inner_module() {
+        let dir = w6_temp_dir("v3");
+        let bundle = dir.join("W6Bundle.vst3");
+        std::fs::create_dir_all(bundle.join("Contents/x86_64-win")).unwrap();
+        // A VST2-factored module wearing the real-world `.vst3dll` name: the
+        // VST3 probe must FAIL (no GetPluginFactory) yet the entry must
+        // survive greyed — and must point at the RESOLVED module, one entry
+        // for the bundle (never Contents double-counts).
+        std::fs::copy(
+            w6_fixture("w6-vst2.dll"),
+            bundle.join("Contents/x86_64-win/W6Bundle.vst3dll"),
+        )
+        .unwrap();
+        let entries = scan_with(std::slice::from_ref(&dir), false);
+        assert_eq!(entries.len(), 1, "bundle = exactly one row: {entries:?}");
+        let e = &entries[0];
+        assert_eq!(e.kind, VstKind::V3);
+        assert_eq!(
+            e.path.file_name().and_then(|n| n.to_str()),
+            Some("W6Bundle.vst3dll"),
+            "probe target must be the resolved module file"
+        );
+        assert!(e.error.is_some(), "bad module => greyed row, never silent drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn w6_windows_default_dirs_are_native_set() {
+        let root = w6_temp_dir("dirs");
+        let pf = root.join("pf");
+        let cf = root.join("cf");
+        let la = root.join("la");
+        for d in [
+            pf.join(r"Common Files\VST3"),
+            pf.join(r"Common Files\VST"),
+            pf.join(r"VSTPlugins"),
+            cf.join("CLAP"),
+            la.join("CLAP"),
+            pf.join("pl1"),
+            pf.join("pl2"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let keys = ["ProgramFiles", "COMMONPROGRAMFILES", "LOCALAPPDATA", "VST_PATH", "CLAP_PATH"];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        std::env::set_var("ProgramFiles", &pf);
+        std::env::set_var("COMMONPROGRAMFILES", &cf);
+        std::env::set_var("LOCALAPPDATA", &la);
+        std::env::remove_var("VST_PATH");
+        std::env::remove_var("CLAP_PATH");
+        let dirs = default_vst_dirs();
+        for want in [
+            pf.join(r"Common Files\VST3"),
+            pf.join(r"Common Files\VST"),
+            pf.join(r"VSTPlugins"),
+            cf.join("CLAP"),
+            la.join("CLAP"),
+        ] {
+            assert!(dirs.contains(&want), "missing {}: {dirs:?}", want.display());
+        }
+        assert!(
+            dirs.iter().all(|d| !d.to_string_lossy().contains("drive_c")),
+            "Wine-prefix dirs must never appear on Windows: {dirs:?}"
+        );
+        // Path-list splitting via `env::split_paths` (the `;` separator).
+        std::env::set_var(
+            "CLAP_PATH",
+            format!("{};{}", pf.join("pl1").display(), pf.join("pl2").display()),
+        );
+        let dirs = default_vst_dirs();
+        assert!(
+            dirs.contains(&pf.join("pl1")) && dirs.contains(&pf.join("pl2")),
+            "CLAP_PATH ';' entries missing: {dirs:?}"
+        );
+        for (k, v) in saved {
+            match v {
+                Some(x) => std::env::set_var(k, x),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn w6_windows_yabridge_heuristics_inert() {
+        // The exact shapes `is_wine_bridged` flags on Linux (sidecar naming
+        // with a companion `.dll`) must read as plain files on Windows.
+        let dir = w6_temp_dir("ybinert");
+        std::fs::write(dir.join("Monk.vst3"), b"not really").unwrap();
+        std::fs::write(dir.join("Monk.dll.so"), b"MZ fake chainloader bytes").unwrap();
+        std::fs::write(dir.join("Monk.dll"), b"MZ\x90\x00").unwrap();
+        assert!(!is_wine_bridged(&dir.join("Monk.vst3")));
+        assert!(!is_wine_bridged(&dir.join("Monk.dll.so")));
+        assert!(!yabridge_available());
+        assert!(yabridge_sync(std::slice::from_ref(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Source-consistency pin (w5 pattern, comment-stripped so this test's
+    /// own text cannot self-match): every W6 OS seam must stay SEAMED.
+    #[test]
+    fn w6_seams_are_cfg_gated_in_source() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vsthost.rs"))
+            .expect("vsthost.rs readable from a test");
+        let code: String = src
+            .lines()
+            .filter_map(|l| {
+                if l.trim_start().starts_with("//") {
+                    None // comment-only line: gone entirely (no blank-line drift)
+                } else {
+                    Some(match l.find("//") {
+                        Some(i) => &l[..i],
+                        None => l,
+                    })
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = code.split("\n#[cfg(test)]").next().unwrap().to_string();
+        assert!(
+            code.contains("fn default_vst_dirs() -> Vec<PathBuf> {\n    if cfg!(windows) {"),
+            "default_vst_dirs must keep its W6 Windows branch"
+        );
+        assert!(
+            code.contains(r#"cfg!(windows) && match_name.ends_with(".dll")"#),
+            "native `.dll` dispatch must stay Windows-gated"
+        );
+        assert!(
+            code.contains("#[cfg(unix)]\nfn probe_isolated(")
+                && code.contains("#[cfg(windows)]\nfn probe_isolated("),
+            "probe_isolated must keep the W6 unix/windows split (W7 replaces the twin)"
+        );
+        // The fork body is the ONLY libc user in the shipped module, and the
+        // only unix symlink stays behind its cfg attribute.
+        let unix_body = code
+            .split("#[cfg(unix)]\nfn probe_isolated(")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(windows)]\nfn probe_isolated(").next())
+            .expect("unix probe_isolated region");
+        assert!(unix_body.contains("libc::fork"), "unix twin must hold the fork");
+        let rest = code.replace(unix_body, "");
+        assert!(!rest.contains("libc::"), "libc leaked outside the unix fork body");
+        let sym = rest.find("std::os::unix::fs::symlink(").expect("symlink call present");
+        assert!(
+            rest[..sym].contains("#[cfg(unix)]"),
+            "the yabridge repair symlink must stay cfg(unix)-gated"
+        );
     }
 }
