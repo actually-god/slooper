@@ -340,7 +340,13 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   the chain window (`src/ui.rs`), persistence `ChainSave` / `Config::chain`
   (migrates legacy `track_fx` + `track_vst`)
 - VST scanning/editing: `src/vsthost.rs` (`scan`, `default_vst_dirs`),
-  `src/vstedit.rs`
+  `src/vstedit.rs`. Windows port (W6): `default_vst_dirs()` branches to
+  `windows_vst_dirs()` (ProgramFiles/CLAP conventions); `scan_inner`
+  dispatches native `.dll` as VST2 and resolves real VST3 bundles
+  (`Contents/<arch>-win/*.vst3dll`) — both only under `cfg(windows)`,
+  Linux stays byte-exact. All yabridge/Wine heuristics early-return on
+  Windows; the fork-probe is `#[cfg(unix)]` with an inline Windows twin
+  (W7 replaces it). OS-split semantics: `w6_*` pins.
 - Loop region math: `loop_wrap`/`region_end` (`src/audio.rs`); handles +
   modes in the grid toolbar (`src/ui.rs`, `LoopMode`)
 - Project format + migration: `src/project.rs`, `midi::migrate_shortcuts`

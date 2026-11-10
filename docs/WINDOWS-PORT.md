@@ -9,9 +9,11 @@
 STATUS: W1 DONE 2026-11-06 (session 1). W2 DONE 2026-11-08 (session 2).
 W3 DONE 2026-11-08 (session 3). W4 DONE 2026-11-09 (session 4).
 W5 DONE 2026-11-09 (session 5, a8c878e).
-NEXT: W6 (native plugin scan on Windows — `default_vst_dirs()` cfg branch,
-yabridge/wine heuristics inert under cfg(windows), native `.dll` VST2
-dispatch in `scan_inner`, MZ/VST2 fixture DLLs compiled by llvm-mingw).
+W6 DONE 2026-11-09 (session 6, `w6_*` pins; the five `#[cfg(windows)]`
+ones execute at W10 CI).
+NEXT: W7 (probe child processes on Windows — the inline `probe_isolated`
+twin W6 left is the exact seam W7 replaces with `--slooper-probe`
+re-exec + CreateProcess).
 
 ## Ground rules (apply to every task)
 
@@ -207,20 +209,108 @@ Acceptance: Linux gates; Windows release build links; CI smoke boots
 SLOOPER_NULL_AUDIO lib suite. Functional proof on real hardware = user task
 (documented checklist in docs/INSTALL.md Windows section).
 
-### W6 — Native plugin scan on Windows (VST2/VST3/CLAP files)
-cfg windows: skip yabridge/wine heuristics; scan `%ProgramFiles%\[Steinberg\
-\Common Files\VST], …\Common Files\VST3`, `%COMMONPROGRAMFILES%\CLAP`; reuse
-the existing `.dll` awareness as the native path; VST3 via vst3-host Windows
-support (already in crate); CLAP extension rules.
-Acceptance: synthetic-fixture scan pins run ON WINDOWS CI too (MZ fixture
-DLLs compiled by llvm-mingw, exports stubbed).
+### W6 — Native plugin scan on Windows — **DONE 2026-11-09 (session 6)**
+
+Land the native-plugin truth: Windows `.dll` files ARE plugins; yabridge/
+Wine are Linux-only concepts that must go fully inert on Windows.
+Research findings (all re-verified against this tree before coding):
+
+- `default_vst_dirs()` is Linux/Wine-only: every hardcoded fallback is a
+  Wine prefix path (`.wine/drive_c/…`). W6 = compile-time branch to a
+  `windows_vst_dirs()` twin; Linux list byte-identical.
+- Windows folder set (SDK + de-facto installer reality): VST3
+  `%ProgramFiles%\Common Files\VST3` (always case-insensitive `.vst3`
+  suffix — vst3-host does exactly this); VST2 (no official dir — de-facto)
+  `%ProgramFiles%\Steinberg\VstPlugins`, `Common Files\VST`,
+  `Common Files\VSTPlugins`, `Common Files\Steinberg\vstplugins`,
+  `%ProgramFiles%\VSTPlugins` (all `ProgramFiles (x86)` equivalents are the
+  SAME dir under WOW64 fs-redir — no code); CLAP `%COMMONPROGRAMFILES%\CLAP`
+  + `%LOCALAPPDATA%\CLAP` (clap SDK default). `VST_PATH`/`CLAP_PATH` work
+  both OSes; `std::env::split_paths` natively handles the `;` separator —
+  zero manual parsing.
+- **Case-sensitivity is a real scan bug in disguise**: every VST2 arm in
+  `scan_inner` matches lowercase literals, but real Windows plugins end in
+  `.dll`/`.DLL`/`.Dll`. Fix: lowercased `match_name` copy used for
+  extension tests ONLY under `cfg(windows)`; Linux stays byte-exact (an
+  uppercase `.SO` stays invisible — pinned).
+- Dispatch arms = cfg seams, not rewrites: native `.dll → VST2` behind
+  `cfg!(windows)`; yabridge `bridge_ok` chain gets no Windows twin (its
+  companion probe needs `/bin/sh` + POSIX shebangs); `.vst3` entries route
+  through new `vst3_probe_target()`: Linux passes the entry through
+  UNTOUCHED (the crate resolves `Contents/x86_64-linux/*.so` internally —
+  do not pre-resolve), Windows resolves `Contents/<arch>-win/*.vst3dll`
+  because the crate's resolver globs `*.vst3` ONLY and misses real-world
+  Windows bundles named `.vst3dll`. `build_entry`/cache/error-row shape
+  need zero changes.
+- Vendored VST2 facts (verified against docs.rs vst-0.4.0 — the vendored
+  copy matches): loader = `libloading` → already cross-platform; entry
+  prefers `VST2CMD/main` fallback `VSTPluginMain` — **fixtures must export
+  `VSTPluginMain`**; `AEffect` is repr(C), field-identical Win/Linux.
+  Trap: the crate's *dispatcher* switches on its OWN `OpCode` enum
+  (GetEffect=58, GetVendorVersion=35, GetProductName=48, GetVendorName=47),
+  NOT the SDK `eff*` numbers — a fixture answering eff24=4 would probe
+  nameless on BOTH OSes. Probe path also calls `canRunReplacingLoop()`
+  (=58) and reads `numInputs/numOutputs/flags` → instrument iff
+  numInputs==0 && (flags&1).
+- vst3-host 0.10 Windows support is REAL (`winapi_impl` feature;
+  `LoadLibraryExW` + `GetPluginFactory` + SFX) — no crate work needed.
+- Isolation split (the only architectural decision): keep fork (v19/v27/v37
+  loader-lock discipline is proven) — `probe_isolated` gets
+  `#[cfg(unix)]`/`#[cfg(windows)]` twins; W6's Windows twin = inline
+  (exactly what `SLOOPER_SCAN_INLINE` selects, ffiguard still covers
+  throws), W7 replaces it with re-exec (`--slooper-probe` + CreateProcess,
+  NO job objects by default — a crashing probe must not take the editor
+  down; pipe EOF + waitpid, W64 exit-code&0xFFFFFFFF == signal mapping).
+- yabridge inertness: `is_wine_bridged` + `yabridge_available` +
+  `yabridge_sync` early-return under `cfg(windows)` (covers scan skip,
+  open guard, repair, sync UI); the lone `std::os::unix::fs::symlink`
+  (repair path) gets `#[cfg(unix)]` — unreachable on Windows via the
+  heuristics gate; `skip_bridged` block `cfg!(unix)`-gated.
+Acceptance (met): Linux suite untouched-green + `w6_*` pins; gnullvm
+**lib** check error count 19 → 1 (survivor = `from_x11` = W8's bucket).
+
+Completion log (session 6):
+- Seams exactly as designed above; every branch is compile-time so the
+  Linux binary's behavior is byte-identical by construction (v10/v191/
+  v21/v22/v37 pins + full suite green).
+- `scripts/porting/w6_vst2_fixture.c` (+ build script) → committed
+  `tests/fixtures/w6/w6-vst2.{dll,so}`: minimal VST2 effect exporting
+  `VSTPluginMain`+`main`, static-linked even for libgcov; the DLL export
+  table verified via llvm-readobj (`VSTPluginMain ordinal 1`).
+  Discovered: the vendored crate never sends `effGetParamLabel` — its
+  `get_name()` uses its own opcode numbering (see above); fixture answers
+  BOTH truth sets is impossible, so it answers the crate's (ground truth
+  = what the probe executes).
+- Live Linux pin `w6_linux_fixture_vst2_probes_clean` runs the ENTIRE
+  chain today: scan dir → dispatch → fork probe → dlopen → vendored
+  dispatcher → `VstEntry{name:"W6 VST Fixture", vendor:"slooper W6",
+  instrument:false}`. Second Linux pin: real mingw PE + junk `.DLL` +
+  uppercase `.SO` all stay unscanned. Five `#[cfg(windows)]` pins
+  (native `.dll` probes incl. uppercase; bundle → resolved `*.vst3dll`
+  single greyed row; dir-set shape incl. `;` splitting + no-drive_c;
+  yabridge heuristics inert) execute at W10 CI — fixture DLLs are real
+  mingw builds so they run unmodified there.
+- Source-consistency pin (w5 pattern) proves: default_vst_dirs branch,
+  cfg-gated `.dll` arm, both probe_isolated twins, `libc::` ONLY inside
+  the unix fork body, symlink behind `#[cfg(unix)]`. Comments stripped
+  before asserting so pin text can't self-match (bit during authoring).
+- Existing pins gated `#[cfg(unix)]`: 8 yabridge/Wine/fork-fixture tests
+  + 3 fixture helpers — they build `/bin/sh` fake wines and `.so`s, pure
+  Linux semantics.
+- Sabotage-verified (then reverted): dropping the `.dll` arm reds the
+  Windows scan pins; renaming the repair symlink call without the gate
+  reds the source pin.
 
 ### W7 — Probe child processes on Windows
 fork/pipe/poll/waitpid probes → re-exec self (`--slooper-probe <path>` hidden
 flag, stdout JSON line protocol) on BOTH OSes? NO: keep fork on Linux (proven,
 loader-lock-aware), add CreateProcess path behind the same `spawn_probe()`
-seam on Windows. Exit-status signal checks gated.
-Acceptance: Linux probe pins untouched; Windows CI probe smoke with stub DLL.
+seam on Windows. Exit-status signal checks gated. W6 left a ready-made seam:
+`#[cfg(windows)] fn probe_isolated` currently = `probe_inline` — W7 replaces
+ONLY that body. Start from `docs/WINDOWS-PORT.md` W6 completion log.
+Acceptance: Linux probe pins untouched; Windows CI probe smoke with stub DLL
+(replace the W6 inline twin; `w6_windows_scan_probes_native_dll` must stay
+green THROUGH the new isolation).
 
 ### W8 — Plugin editor windows on Win32 (hardest UI task)
 vstedit OS seam: Linux keeps X11 offscreen blit EXACTLY as is. Windows:
@@ -317,3 +407,21 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   `cargo fmt` here, it buries task diffs; the ui plugin-load test cluster
   (`v20_fx_bridge_*`, `v36_script_fx_*`) heap-aborts under scratch-HOME Geonkick
   config loss — environmental, reproduces at HEAD, skip-list is growing.
+
+- **2026-11-09 session 6 — W6**: native Windows plugin scan — commit
+  0990c67 (seams, fixtures, 7 pins; windows-gnullvm lib 19→1). Follow-up
+  (this commit): gate battery found clippy-zero broken by 7 pre-existing
+  `audio/mod.rs` warnings (v49-merge era) — fixed via `cargo clippy --fix`
+  needless-borrow autopsies (auto-deref no-ops) + 3 documented
+  `too_many_arguments` allows; the w5 seam-shape pin updated to the new
+  call literals (its purpose — guarding the seam CALL — unchanged);
+  vsthost.rs brought rustfmt-clean (1 pre-existing v49 wrap included).
+  Battery: w6 3/3, w5 5/5, v10/v17/v18/v20/v21/v22/v23/v27/v28/v37/v46 +
+  claphost + scan chunks green serial; e2e 32/32 LIVE JACK; clippy-zero;
+  windows-gnullvm lib = exactly 1 error (from_x11 = W8).
+  `chain_window_adds_scanned_plugin_slot` fails deterministically but
+  reproduces IDENTICALLY at baseline 2e16bf6 (worktree build) — the
+  recorded environmental editor-wait family, not W6.
+  Session lore: `git checkout -- <path>` with uncommitted work in it
+  DESTROYED the W6 tree once (recovered by replaying every logged patch);
+  NEVER sabotage-test via checkout — commit first or sed-revert exactly.

@@ -539,6 +539,7 @@ pub enum Evt {
 /// Spawn point of the manager thread — picks the live OS backend
 /// (WINDOWS-PORT W5). Everything past this call is backend-side.
 #[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)] // backend wiring context, passed whole (W5 seam)
 fn run_backend(
     cmd_rx: Receiver<Cmd>,
     evt_tx: SyncSender<Evt>,
@@ -553,6 +554,7 @@ fn run_backend(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // twin of the unix spawn point above
 fn run_backend(
     cmd_rx: Receiver<Cmd>,
     evt_tx: SyncSender<Evt>,
@@ -2235,12 +2237,12 @@ fn manager_loop(
 ) {
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(Cmd::Refresh) => session.refresh(&evt_tx),
+            Ok(Cmd::Refresh) => session.refresh(evt_tx),
             Ok(Cmd::Apply { ins, outs }) => {
-                session.apply(&ins, &outs, &evt_tx);
+                session.apply(&ins, &outs, evt_tx);
             }
             Ok(Cmd::ToggleRecord { i }) => {
-                toggle_record(&engine, i.min(MAX_LOOPS - 1), &evt_tx);
+                toggle_record(engine, i.min(MAX_LOOPS - 1), evt_tx);
             }
             Ok(Cmd::SetTrackOn { i, on }) => {
                 engine.set_track_on(i.min(MAX_LOOPS - 1), on);
@@ -2402,7 +2404,7 @@ fn manager_loop(
                 // what makes bindings work when a device (re)appears on a new
                 // port name — e.g. hardware that gets a fresh ALSA/JACK port
                 // number on every connect instead of a fixed one.
-                session.idle(&evt_tx);
+                session.idle(evt_tx);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -4011,6 +4013,7 @@ struct Proc {
 /// the jack shim wraps the result in its `JackProc` plumbing struct; the
 /// WASAPI shim wraps it the same way with device buffers. `sr` is the
 /// live device rate (already pushed into the engine via set_sample_rate).
+#[allow(clippy::too_many_arguments)] // Proc construction context
 fn new_proc(
     evt_tx: SyncSender<Evt>,
     gain: Arc<AtomicU32>,
@@ -7536,9 +7539,9 @@ mod w5_tests {
             );
         }
         for shape in [
-            "session.refresh(&evt_tx)",
-            "session.apply(&ins, &outs, &evt_tx)",
-            "session.idle(&evt_tx)",
+            "session.refresh(evt_tx)",
+            "session.apply(&ins, &outs, evt_tx)",
+            "session.idle(evt_tx)",
         ] {
             assert!(
                 body.contains(shape),

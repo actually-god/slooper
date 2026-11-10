@@ -2151,9 +2151,7 @@ fn gui_tx() -> &'static std::sync::mpsc::Sender<GuiJob> {
                     // expect a steady effEditIdle; the fast tick only
                     // exists while editors are actually open.
                     let t0 = std::time::Instant::now();
-                    if let Err(e) =
-                        crate::ffiguard::guarded(crate::vstedit::pump_editors)
-                    {
+                    if let Err(e) = crate::ffiguard::guarded(crate::vstedit::pump_editors) {
                         eprintln!("[slooper] editor idle pump threw: {e}");
                     }
                     GUI_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
@@ -4826,7 +4824,11 @@ mod tests {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/w6")
             .join(name);
-        assert!(p.is_file(), "W6 fixture missing: {} (run scripts/porting/w6_build_fixtures.sh)", p.display());
+        assert!(
+            p.is_file(),
+            "W6 fixture missing: {} (run scripts/porting/w6_build_fixtures.sh)",
+            p.display()
+        );
         p
     }
 
@@ -4848,10 +4850,17 @@ mod tests {
             .iter()
             .filter(|e| e.path.to_string_lossy().contains(file))
             .collect();
-        assert_eq!(hits.len(), 1, "expected exactly one entry for {file}: {entries:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one entry for {file}: {entries:?}"
+        );
         let e = hits[0];
         assert!(e.error.is_none(), "probe must be clean, got {:?}", e.error);
-        assert_eq!(e.name, "W6 VST Fixture", "product name via vendored opcode 48");
+        assert_eq!(
+            e.name, "W6 VST Fixture",
+            "product name via vendored opcode 48"
+        );
         assert_eq!(e.vendor, "slooper W6", "vendor via vendored opcode 47");
         assert!(!e.instrument, "numInputs=1, flags=0 => effect");
     }
@@ -4894,9 +4903,11 @@ mod tests {
         let entries = scan_with(std::slice::from_ref(&dir), false);
         w6_assert_clean_effect(&entries, "w6.dll");
         assert!(
-            entries
-                .iter()
-                .any(|e| e.path.to_string_lossy().to_ascii_lowercase().ends_with("w6up.dll")),
+            entries.iter().any(|e| e
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("w6up.dll")),
             "uppercase `.DLL` must scan too (case-insensitive fs): {entries:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4926,7 +4937,10 @@ mod tests {
             Some("W6Bundle.vst3dll"),
             "probe target must be the resolved module file"
         );
-        assert!(e.error.is_some(), "bad module => greyed row, never silent drop");
+        assert!(
+            e.error.is_some(),
+            "bad module => greyed row, never silent drop"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4948,7 +4962,13 @@ mod tests {
         ] {
             std::fs::create_dir_all(d).unwrap();
         }
-        let keys = ["ProgramFiles", "COMMONPROGRAMFILES", "LOCALAPPDATA", "VST_PATH", "CLAP_PATH"];
+        let keys = [
+            "ProgramFiles",
+            "COMMONPROGRAMFILES",
+            "LOCALAPPDATA",
+            "VST_PATH",
+            "CLAP_PATH",
+        ];
         let saved: Vec<(&str, Option<String>)> =
             keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         std::env::set_var("ProgramFiles", &pf);
@@ -4967,7 +4987,8 @@ mod tests {
             assert!(dirs.contains(&want), "missing {}: {dirs:?}", want.display());
         }
         assert!(
-            dirs.iter().all(|d| !d.to_string_lossy().contains("drive_c")),
+            dirs.iter()
+                .all(|d| !d.to_string_lossy().contains("drive_c")),
             "Wine-prefix dirs must never appear on Windows: {dirs:?}"
         );
         // Path-list splitting via `env::split_paths` (the `;` separator).
@@ -5046,10 +5067,18 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("#[cfg(windows)]\nfn probe_isolated(").next())
             .expect("unix probe_isolated region");
-        assert!(unix_body.contains("libc::fork"), "unix twin must hold the fork");
+        assert!(
+            unix_body.contains("libc::fork"),
+            "unix twin must hold the fork"
+        );
         let rest = code.replace(unix_body, "");
-        assert!(!rest.contains("libc::"), "libc leaked outside the unix fork body");
-        let sym = rest.find("std::os::unix::fs::symlink(").expect("symlink call present");
+        assert!(
+            !rest.contains("libc::"),
+            "libc leaked outside the unix fork body"
+        );
+        let sym = rest
+            .find("std::os::unix::fs::symlink(")
+            .expect("symlink call present");
         assert!(
             rest[..sym].contains("#[cfg(unix)]"),
             "the yabridge repair symlink must stay cfg(unix)-gated"
