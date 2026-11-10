@@ -101,6 +101,42 @@ error instead — start your server, then relaunch.
 | `$XDG_CONFIG_HOME/slooper/config.json` (fallback `~/.config/slooper/config.json`) | port selections, MIDI/keyboard bindings, effect parameter values, metronome/quantize settings |
 | `~/.local/share/slooper/effects/` | effect-script folder (created on first run, seeded with `template.rs` + the ABI contract file; the location is user-configurable in the FX window) |
 
+## Windows (development builds)
+
+The Windows build target is `x86_64-pc-windows-gnullvm` (UCRT, Windows
+10+); cross-compile from Linux with llvm-mingw (see
+[WINDOWS-PORT.md](WINDOWS-PORT.md) W1 for the toolchain recipe) or build
+natively with the `windows-gnullvm`/`windows-msvc` Rust target. You also
+want **MSVC Build Tools** (or a full Rust GNU toolchain): effect and synth
+scripts are compiled at runtime with `rustc`, and on Windows `rustc` needs
+a linker. Install layout: config in `%APPDATA%\slooper\config.json`, data
+(effects, synths, cache) under `%LOCALAPPDATA%\slooper`. Audio is WASAPI
+(shared mode, f32): pick the output (and any inputs) in the Ports window —
+like JACK, slooper never steals a device, and no selection means silence.
+
+### On-hardware smoke checklist (report failures as issues)
+
+1. **Boot**: `slooper.exe` starts with no console window; the main window
+   paints; nothing appears in Task Manager as a zombie on exit.
+2. **Audio**: Ports window lists output devices; selecting one drives the
+   master meter (play a sample clip). Event-driven WASAPI: no device, no
+   error spam — the app just stays silent, like `NO_START` on Linux.
+3. **Scripts**: Settings ▸ Effects compiles the template script (this is
+   the MSVC-Build-Tools proof) and a synth loads from the synth folder.
+4. **Scan**: scan finds plugins from `%ProgramFiles%\Steinberg\VstPlugins`
+   / `Common Files\VST` (VST2 `.dll`), `Common Files\VST3` (bundles), and
+   the CLAP folders; a crashing plugin leaves a greyed named row, not a
+   dead app.
+5. **Editors**: for a VST2 and a VST3 each — the editor opens as its own
+   window `slooper — <name>`; knobs click and drag; a fixed-size editor
+   (e.g. an old VST2) is unresizable; the window's X closes cleanly and
+   the chain survives; a broken editor reports "no editor" and leaves the
+   slider panel instead of a blank window.
+6. **Crash guard**: after a plugin ban, removing
+   `%APPDATA%\slooper\banned_editors.txt` restores probing.
+7. **Persistence**: move some knobs inside a plugin GUI, close the editor,
+   save + restart the project — values survive.
+
 ## Uninstalling
 
 - Package installs (`pacman -R slooper`): removes binary, desktop entry, icon.

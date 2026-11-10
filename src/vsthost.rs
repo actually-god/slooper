@@ -2086,7 +2086,7 @@ pub struct RtStageEntry {
     /// button; the slider panel remains the fallback for GUI-less plugins.
     has_editor: bool,
     /// VST2 only: raw `AEffect` dispatcher for editor hosting (see
-    /// `src/vstedit.rs`). VST3 editors host a shadow instance instead —
+    /// `src/vstedit/`). VST3 editors host a shadow instance instead —
     /// [`RtStageEntry::open_vst3_editor`].
     vst2: Option<Vst2Handle>,
     /// v20: the VST3 state chunk this instance was (re)opened from, if any.
@@ -2684,7 +2684,7 @@ pub fn probe_editor(path: &Path, kind: VstKind) -> EditorProbe {
     // libtest harness — spawning it would recursively run the suite.
     let real_app = exe
         .file_name()
-        .is_some_and(|n| matches!(n.to_str(), Some("slooper") | Some("slooper-bin")));
+        .is_some_and(|n| matches!(n.to_str(), Some("slooper") | Some("slooper-bin") | Some("slooper.exe")));
     if !real_app {
         return EditorProbe::Skip;
     }

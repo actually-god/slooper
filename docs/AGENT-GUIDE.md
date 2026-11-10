@@ -83,10 +83,15 @@ src/            application source (Rust 2021 edition)
                   relay via generation counter (VST2 via the patched
                   vendor/vst2 crate, VST3 via vst3-host; plugin libraries
                   are NEVER dlclosed)
-  vstedit.rs      VST2 + VST3 editor hosting (effEditOpen/Idle/GetRect/Close
-                  over an X11 plug/replug container window, idle pump thread;
+  vstedit/        VST2 + VST3 editor hosting, OS seam (W8a): mod.rs wires
+                  cfg(unix)=x11.rs (the shipped X11 plug/replug container,
+                  frozen) and cfg(windows)=win32.rs (top-level container
+                  window per editor: effEditOpen/attached(HWND), message
+                  pump on the vst2-gui thread, WM_CLOSE protocol, sentinel
+                  paint verification, WM_GETMINMAXINFO fixed pin). Both
+                  twins expose one surface (seam pins `w8_*` guard it);
                   VST3 hosts a shadow instance of the plugin since v0.12;
-                  see PLUGINS.md)
+                  see PLUGINS.md
   project.rs      `.slooper` save format (versioned JSON), projects-dir
                   listing, audio re-resolution by file name
   audio_io.rs     import (symphonia: wav/mp3/ogg/flac/m4a/aac/aiff…) +
@@ -340,7 +345,9 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   the chain window (`src/ui.rs`), persistence `ChainSave` / `Config::chain`
   (migrates legacy `track_fx` + `track_vst`)
 - VST scanning/editing: `src/vsthost.rs` (`scan`, `default_vst_dirs`),
-  `src/vstedit.rs`. Windows port (W6): `default_vst_dirs()` branches to
+  `src/vstedit/` (OS twins behind one surface — never edit `x11.rs` from
+  Windows work; the `w8_*` seam pins enforce that).
+  Windows port (W6): `default_vst_dirs()` branches to
   `windows_vst_dirs()` (ProgramFiles/CLAP conventions); `scan_inner`
   dispatches native `.dll` as VST2 and resolves real VST3 bundles
   (`Contents/<arch>-win/*.vst3dll`) — both only under `cfg(windows)`,

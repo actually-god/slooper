@@ -195,7 +195,20 @@ reopens whatever surface the plugin uses. The editor runs in its **own OS
 window** (slooper's main window is GPU-drawn by egui and has no
 child-window support), titled `slooper — <plugin>`.
 
-How it works (`src/vstedit.rs`) — the standard Linux VST2 hosting protocol,
+**Windows development builds** (WINDOWS-PORT W6/W7/W8a): everything in
+this section describes the Linux path, frozen and untouched. On Windows
+there is no yabridge (pointless — plugins are native there): the scan reads
+the de-facto folders (`%ProgramFiles%\Steinberg\VstPlugins`,
+`Common Files\VST`/`VSTPlugins`, `Common Files\VST3` including real bundles
+with `Contents\x86-win*` binaries, `%COMMONPROGRAMFILES%\CLAP`,
+`%LOCALAPPDATA%\CLAP`; `VST_PATH`/`CLAP_PATH` also work, split on `;`),
+`.dll` files load as VST2 directly, scan/editor probes re-exec the app as
+hidden child processes, and editors open as top-level windows with the same
+verified-paint rule (no blank panels — refused editors fall back to
+sliders). The Windows path compiles clean but is **not yet certified on
+hardware** — run the checklist in INSTALL.md and report what breaks.
+
+How it works (`src/vstedit/x11.rs`) — the standard Linux VST2 hosting protocol,
 cross-checked against the VST2.4 SDK (`aeff.h` opcodes), Ardour
 (`linux_vst_gui_support.cc`), Carla, JUCE, LMMS and yabridge:
 

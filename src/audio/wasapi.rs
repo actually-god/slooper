@@ -449,6 +449,9 @@ fn from_f32(v: f32, s: Sample, dst: &mut [u8]) {
 /// rings feeding each slot's input plane.
 struct CapStream {
     id: String,
+    /// Liveness anchor: the capture service is only valid while its
+    /// audio client lives; never called through.
+    #[allow(dead_code)]
     client: SendIf<IAudioClient>,
     svc: SendIf<IAudioCaptureClient>,
     ev: SendIf<HANDLE>,
