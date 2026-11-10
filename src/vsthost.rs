@@ -1495,6 +1495,33 @@ pub fn in_probe_child() -> bool {
     PROBE_CHILD.load(Ordering::Relaxed)
 }
 
+/// W7: hidden re-exec flag of the Windows probe child, matched FIRST ARG
+/// only by `main` (`--slooper-probe <kind> <path>`). Kind is `kind_code`.
+pub const PROBE_FLAG: &str = "--slooper-probe";
+
+/// W7: CHILD side of the re-exec probe protocol (Windows isolation; the
+/// hidden flag is inert on Linux, whose twin keeps fork). Runs THE probe
+/// body (`probe_rows`) in a fresh process, prints the `Vec<ProbeRow>`
+/// reply as one JSON line on stdout, and lets `main` exit immediately —
+/// no atexit runs, no static destructors: the child may hold
+/// half-initialized vendor runtime and that dies with it, exactly like
+/// the unix fork child's `_exit`. Always "succeeds" (0): the reply (or
+/// its absence) is the verdict; a hard crash surfaces to the parent as
+/// the exception exit code instead.
+pub fn probe_child_main(kind: u8, lib: &Path) -> i32 {
+    PROBE_CHILD.store(true, Ordering::Relaxed);
+    let rows = std::panic::catch_unwind(|| probe_rows(lib, kind_of(kind))).unwrap_or_default();
+    let mut line = serde_json::to_vec(&rows).unwrap_or_default();
+    line.push(b'\n');
+    {
+        use std::io::Write;
+        let out = std::io::stdout();
+        let mut out = out.lock();
+        let _ = out.write_all(&line).and_then(|()| out.flush());
+    }
+    0
+}
+
 fn probe_inline(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
     probe_rows(lib, kind)
         .into_iter()
@@ -1507,8 +1534,9 @@ fn probe_inline(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
 /// row — the scan ALWAYS completes.
 ///
 /// W6: this fork protocol is Unix-only (it is the entirety of vsthost's
-/// libc dependency); Windows gets an inline twin below until W7 replaces
-/// it with a re-exec child (`--slooper-probe` + CreateProcess).
+/// libc dependency); Windows runs the W7 re-exec twin below, which shares
+/// this function's exit discipline (lock-free probe body, raw-exiting
+/// child, one greyed error row on death/hang/garbage).
 #[cfg(unix)]
 fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
     // Escape hatch / unit-test path: historical inline probes.
@@ -1660,11 +1688,216 @@ fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
 
 #[cfg(windows)]
 fn probe_isolated(lib: &Path, kind: VstKind) -> Vec<VstEntry> {
-    // W6 seam until W7: no fork(2) on Windows, so probes run in-process —
-    // exactly what `SLOOPER_SCAN_INLINE` selects on Linux. `ffiguard` still
-    // catches C++ throws crossing the FFI boundary (the extern "C-unwind"
-    // fix); hard crashes are contained once W7 adds the re-exec child.
-    probe_inline(lib, kind)
+    // W7: fork(2) has no Windows twin, so the probe re-executes this
+    // executable as `slooper --slooper-probe <kind> <path>` (std Command
+    // == CreateProcessW underneath). Same exit discipline as the unix
+    // fork twin: reply on stdout, greyed row on death/hang/garbage, the
+    // scan always completes. `ffiguard` still catches C++ throws INSIDE
+    // the child as the softer second layer.
+    if std::env::var("SLOOPER_SCAN_INLINE").is_ok() {
+        return probe_inline(lib, kind);
+    }
+    match probe_child::spawn_probe(lib, kind) {
+        probe_child::ProbeOutcome::Rows(rows) => {
+            let entries: Vec<VstEntry> = rows
+                .into_iter()
+                .map(|r| r.into_entry(lib.to_path_buf()))
+                .collect();
+            // Mirror the fork twin: a SUCCESSFUL probe marks the library
+            // instantiated (identity cache — never re-probe it while live).
+            for e in entries.iter() {
+                if e.error.is_none() && e.kind != VstKind::Clap && e.plugin_id.is_none() {
+                    note_instantiated(lib, e.kind, e.name.clone(), e.vendor.clone(), e.instrument);
+                }
+            }
+            entries
+        }
+        probe_child::ProbeOutcome::Failed(reason) => vec![VstEntry {
+            path: lib.to_path_buf(),
+            kind,
+            name: base_label(lib),
+            vendor: String::new(),
+            instrument: false,
+            plugin_id: None,
+            error: Some(reason),
+        }],
+        // The child could not even start (blocked execution policy,
+        // missing exe): degrade to an inline probe rather than losing
+        // the row — exactly what the unix twin does when pipe/fork fail.
+        probe_child::ProbeOutcome::Unspawnable => probe_inline(lib, kind),
+    }
+}
+
+// =================== W7: re-exec probe child (Windows isolation) ==========
+//
+// The parent half of the `--slooper-probe` protocol. Windows builds run it
+// in production (the twin above); every OS compiles it under `cfg(test)`
+// so the Linux pins exercise the exact parent machinery today — spawn,
+// stdout pipe, deadline kill, exit-code labels, JSON parsing — without
+// touching the proven fork path.
+//
+// Deliberate choices:
+// - NO job objects. A child is spawned, awaited, and killed by handle;
+//   no kernel object could make a crashing child *less* fatal, and job
+//   trees would add kill-on-close semantics the editor probes never had.
+// - The child inherits the parent's environment (v45 GL policy included),
+//   so a plugin loading GL sees the same software-GL posture as the DAW.
+// - CREATE_NO_WINDOW (Windows): a scan may spawn dozens of children; none
+//   may flash a console at the user.
+#[cfg(any(windows, test))]
+mod probe_child {
+    use super::{kind_code, ProbeRow, VstKind};
+
+    /// Parent-side verdict of one probe-child run.
+    pub enum ProbeOutcome {
+        /// The child answered with rows (rows may still carry plugin-level
+        /// errors — those are plugin verdicts, not probe deaths).
+        Rows(Vec<ProbeRow>),
+        /// Died / timed out / garbage reply: one greyed row, scan lives.
+        Failed(String),
+        /// The child process could not be spawned at all.
+        Unspawnable,
+    }
+
+    /// Which executable acts as the probe child. `SLOOPER_PROBE_EXE`
+    /// overrides (empty = unset, the W2 env rule). Unit tests link into
+    /// the harness binary, which cannot re-exec itself (libtest would
+    /// reject the hidden flag), so the next preference is the slooper
+    /// executable THIS build produced, baked by build.rs; `current_exe()`
+    /// (the real app at runtime) is the last resort.
+    pub fn probe_child_exe() -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os("SLOOPER_PROBE_EXE") {
+            if !p.is_empty() {
+                return std::path::PathBuf::from(p);
+            }
+        }
+        #[cfg(test)]
+        {
+            let built = std::path::PathBuf::from(env!("SLOOPER_EXE_PATH"));
+            if built.is_file() {
+                return built;
+            }
+        }
+        std::env::current_exe().unwrap_or_default()
+    }
+
+    /// THE spawn shape, factored out so pins can assert it verbatim:
+    /// `--slooper-probe <kind-code> <path>` (path may contain spaces —
+    /// Command/CreateProcess quoting is not our concern).
+    pub fn probe_child_args(kind: VstKind, lib: &std::path::Path) -> Vec<std::ffi::OsString> {
+        vec![
+            std::ffi::OsString::from(super::PROBE_FLAG),
+            std::ffi::OsString::from(kind_code(kind).to_string()),
+            lib.as_os_str().to_os_string(),
+        ]
+    }
+
+    /// Abnormal-exit label. Windows reports crash exits as NTSTATUS
+    /// exception codes (top two severity bits set: 0xC0000005 access
+    /// violation, 0xC0000409 stack-buffer-overrun) — the moral equivalent
+    /// of the unix wait status a *signal* encodes there. std hands them
+    /// back through `ExitStatus::code()` as i32; widen back to the raw
+    /// 32-bit value before labeling.
+    pub fn probe_status_label(raw: u32) -> String {
+        if raw >> 30 != 0 {
+            format!("exception 0x{raw:08X}")
+        } else {
+            format!("code {raw}")
+        }
+    }
+
+    /// stdout bytes -> rows. None = empty/whitespace reply, unparsable
+    /// JSON, or an empty list (a surviving child ALWAYS answers >=1 row —
+    /// the `catch_unwind` in `probe_child_main` guarantees it).
+    pub fn probe_reply_rows(buf: &[u8]) -> Option<Vec<ProbeRow>> {
+        let trimmed = buf.trim_ascii();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_slice::<Vec<ProbeRow>>(trimmed)
+            .ok()
+            .filter(|rows| !rows.is_empty())
+    }
+
+    /// Spawn, await with the shared probe deadline, read stdout to EOF.
+    /// Mirrors the fork twin's parent loop: deadline applies to BOTH the
+    /// read and the reap; past it the child is killed and reaped, so no
+    /// zombie ever outlives the probe.
+    pub fn spawn_probe(lib: &std::path::Path, kind: VstKind) -> ProbeOutcome {
+        let mut cmd = std::process::Command::new(probe_child_exe());
+        cmd.args(probe_child_args(kind, lib))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return ProbeOutcome::Unspawnable,
+        };
+        // Reader thread: the analogue of the fork twin's poll loop. A
+        // dead/hanging child closes (or never fills) the pipe; EOF or
+        // handle death releases the read and the parent decides.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        if let Some(mut pipe) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+                let _ = tx.send(buf);
+            });
+        }
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(super::probe_timeout_secs());
+        let mut buf: Vec<u8> = Vec::new();
+        let mut exited: Option<std::process::ExitStatus> = None;
+        let mut eof = false;
+        while !eof || exited.is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            if exited.is_none() {
+                if let Ok(Some(st)) = child.try_wait() {
+                    exited = Some(st);
+                    // Give the pipe one bounded drain: the bytes a fast
+                    // child wrote are usually still buffered, not lost.
+                    if let Ok(b) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        buf = b;
+                    }
+                    break;
+                }
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(b) => {
+                    buf = b;
+                    eof = true;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => eof = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        if let Some(rows) = probe_reply_rows(&buf) {
+            return ProbeOutcome::Rows(rows);
+        }
+        let why = if buf.is_empty() {
+            let label = match exited {
+                // `as u32` IS the W64 exit & 0xFFFFFFFF the protocol calls
+                // for: it restores the NTSTATUS a signed i32 carried.
+                Some(st) => probe_status_label(st.code().unwrap_or(0) as u32),
+                None => "killed at deadline".to_string(),
+            };
+            format!(
+                "crashed or timed out while loading (isolated probe exit {label}) — file skipped to keep the scan alive"
+            )
+        } else {
+            "probe returned unreadable data".to_string()
+        };
+        ProbeOutcome::Failed(why)
+    }
 }
 
 // -------------------------------------------------------------- params ---
@@ -5083,5 +5316,295 @@ mod tests {
             rest[..sym].contains("#[cfg(unix)]"),
             "the yabridge repair symlink must stay cfg(unix)-gated"
         );
+    }
+
+    // ================= W7: probe child process (re-exec protocol) =========
+    //
+    // The Windows twin re-executes the app as `slooper --slooper-probe
+    // <kind> <path>`; the parent machinery compiles on every OS under
+    // `cfg(test)`, so the Linux pins drive the SAME spawn/pipe/deadline/
+    // parse code Windows ships — without touching the fork path (that
+    // invariance is `w7_fork_path_untouched`).
+
+    const W7_ENV_KEYS: [&str; 3] =
+        ["SLOOPER_PROBE_EXE", "SLOOPER_PROBE_TIMEOUT_SECS", "SLOOPER_SCAN_INLINE"];
+
+    fn w7_save_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        W7_ENV_KEYS
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect()
+    }
+
+    fn w7_restore_env(saved: &[(&str, Option<std::ffi::OsString>)]) {
+        for (k, v) in saved {
+            match v {
+                Some(x) => std::env::set_var(k, x),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn w7_child_protocol_pure() {
+        // THE spawn shape, verbatim (flag, kind code, path-with-spaces).
+        let args =
+            probe_child::probe_child_args(VstKind::V3, std::path::Path::new("/x y/Plug.vst3"));
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], std::ffi::OsString::from(PROBE_FLAG));
+        assert_eq!(args[1], std::ffi::OsString::from("1"));
+        assert_eq!(args[2], std::ffi::OsString::from("/x y/Plug.vst3"));
+        assert_eq!(
+            probe_child::probe_child_args(VstKind::V2, std::path::Path::new("a"))[1],
+            std::ffi::OsString::from("0")
+        );
+        assert_eq!(
+            probe_child::probe_child_args(VstKind::Clap, std::path::Path::new("a"))[1],
+            std::ffi::OsString::from("2")
+        );
+        // Exit labels: raw u32; Windows NTSTATUS exceptions are the
+        // signal equivalent the unix wait status encodes there.
+        assert_eq!(probe_child::probe_status_label(0), "code 0");
+        assert_eq!(probe_child::probe_status_label(1), "code 1");
+        assert_eq!(
+            probe_child::probe_status_label(0xC000_0005),
+            "exception 0xC0000005"
+        );
+        assert_eq!(
+            probe_child::probe_status_label(0xC000_0409),
+            "exception 0xC0000409"
+        );
+        assert_eq!(
+            probe_child::probe_status_label(0x8000_0003),
+            "exception 0x80000003"
+        );
+        // Replies: empty/whitespace/empty-list/garbage all = no verdict;
+        // one valid row parses.
+        assert!(probe_child::probe_reply_rows(b"").is_none());
+        assert!(probe_child::probe_reply_rows(b"  \n ").is_none());
+        assert!(probe_child::probe_reply_rows(b"[]").is_none());
+        assert!(probe_child::probe_reply_rows(b"[{oops").is_none());
+        let good = serde_json::to_vec(&vec![ProbeRow {
+            kind: 0,
+            name: "N".into(),
+            vendor: "V".into(),
+            instrument: false,
+            plugin_id: None,
+            error: None,
+        }])
+        .unwrap();
+        let rows = probe_child::probe_reply_rows(&good).expect("valid one-row reply");
+        assert_eq!((rows.len(), rows[0].name.as_str()), (1, "N"));
+    }
+
+    #[test]
+    fn w7_child_exe_precedence() {
+        let saved = w7_save_env();
+        std::env::set_var("SLOOPER_PROBE_EXE", "/custom/probe");
+        assert_eq!(
+            probe_child::probe_child_exe(),
+            std::path::PathBuf::from("/custom/probe")
+        );
+        // Empty override = UNSET (the W2 env rule), not a spawn attempt
+        // on "".
+        std::env::set_var("SLOOPER_PROBE_EXE", "");
+        let baked = std::path::PathBuf::from(env!("SLOOPER_EXE_PATH"));
+        std::env::remove_var("SLOOPER_PROBE_EXE");
+        let want = if baked.is_file() {
+            baked
+        } else {
+            std::env::current_exe().unwrap()
+        };
+        assert_eq!(probe_child::probe_child_exe(), want);
+        w7_restore_env(&saved);
+    }
+
+    #[test]
+    fn w7_child_spawn_failure() {
+        // Missing helper exe => Unspawnable (the Windows twin degrades to
+        // inline, mirroring pipe/fork failure on unix).
+        let saved = w7_save_env();
+        std::env::set_var(
+            "SLOOPER_PROBE_EXE",
+            if cfg!(windows) {
+                "C:\\nope\\slooper.exe"
+            } else {
+                "/definitely-not-here/slooper"
+            },
+        );
+        let out = probe_child::spawn_probe(std::path::Path::new("/any/where.so"), VstKind::V2);
+        w7_restore_env(&saved);
+        assert!(matches!(out, probe_child::ProbeOutcome::Unspawnable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w7_child_dead_child() {
+        // A helper that dies instantly (exit 1, no stdout) becomes a
+        // greyed-row reason carrying the exit code — promptly, not at the
+        // deadline.
+        let saved = w7_save_env();
+        std::env::set_var("SLOOPER_PROBE_EXE", "/bin/false");
+        std::env::set_var("SLOOPER_PROBE_TIMEOUT_SECS", "15");
+        let t = std::time::Instant::now();
+        let out = probe_child::spawn_probe(std::path::Path::new("/any/where.so"), VstKind::V2);
+        w7_restore_env(&saved);
+        let probe_child::ProbeOutcome::Failed(why) = out else {
+            panic!("dead child => Failed");
+        };
+        assert!(
+            t.elapsed().as_secs() < 10,
+            "dead child must return promptly: {:?}",
+            t.elapsed()
+        );
+        assert!(why.contains("isolated probe exit code 1"), "{why}");
+        assert!(why.contains("file skipped to keep the scan alive"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w7_child_timeout_kills_helper() {
+        // A hung helper is KILLED at the deadline and reaped (exec keeps
+        // it the DIRECT child — no grandchild escapes the kill).
+        let dir = w6_temp_dir("w7hang");
+        let script = dir.join("hang.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let saved = w7_save_env();
+        std::env::set_var("SLOOPER_PROBE_EXE", &script);
+        std::env::set_var("SLOOPER_PROBE_TIMEOUT_SECS", "1");
+        let t = std::time::Instant::now();
+        let out = probe_child::spawn_probe(std::path::Path::new("/any/where.so"), VstKind::V2);
+        w7_restore_env(&saved);
+        let probe_child::ProbeOutcome::Failed(why) = out else {
+            panic!("hung helper => Failed");
+        };
+        let el = t.elapsed();
+        assert!(el.as_millis() >= 900, "deadline honored? {el:?}");
+        assert!(el.as_secs() < 20, "kill at deadline: {el:?}");
+        assert!(why.contains("timed out"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w7_child_real_exe_probes_fixture() {
+        // End-to-end proof of the re-exec protocol against the REAL
+        // binary: `--slooper-probe` interception in main, probe body in a
+        // fresh process, JSON line on stdout — the same child Windows CI
+        // will run against native `.dll` files.
+        let exe = std::path::PathBuf::from(env!("SLOOPER_EXE_PATH"));
+        if !exe.is_file() {
+            eprintln!("skip: {} missing (needs a built binary)", exe.display());
+            return;
+        }
+        let saved = w7_save_env();
+        std::env::remove_var("SLOOPER_PROBE_EXE");
+        std::env::remove_var("SLOOPER_SCAN_INLINE");
+        let out = probe_child::spawn_probe(&w6_fixture("w6-vst2.so"), VstKind::V2);
+        w7_restore_env(&saved);
+        let probe_child::ProbeOutcome::Rows(rows) = out else {
+            panic!("clean fixture => Rows, got non-Rows outcome");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "W6 VST Fixture");
+        assert_eq!(rows[0].vendor, "slooper W6");
+        assert!(!rows[0].instrument);
+        assert!(rows[0].error.is_none(), "{:?}", rows[0].error);
+    }
+
+    /// Source-consistency pin: W7 may have touched ONLY the Windows twin,
+    /// the new module, and main's hidden-flag interception — the unix fork
+    /// protocol (the proven v19/v27/v37 loader-lock family) stays intact,
+    /// and the interception runs before any audio backend can start.
+    #[test]
+    fn w7_fork_path_untouched() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vsthost.rs"))
+                .expect("vsthost.rs readable from a test");
+        let code: String = src
+            .lines()
+            .filter_map(|l| {
+                if l.trim_start().starts_with("//") {
+                    None
+                } else {
+                    Some(match l.find("//") {
+                        Some(i) => &l[..i],
+                        None => l,
+                    })
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let code = code.split("\n#[cfg(test)]").next().unwrap().to_string();
+        let unix_body = code
+            .split("#[cfg(unix)]\nfn probe_isolated(")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(windows)]\nfn probe_isolated(").next())
+            .expect("unix probe_isolated region");
+        for want in [
+            "libc::fork(",
+            "libc::pipe(",
+            "libc::poll(",
+            "libc::waitpid(",
+            "libc::_exit(",
+            "SLOOPER_SCAN_INLINE",
+        ] {
+            assert!(unix_body.contains(want), "fork twin lost {want}");
+        }
+        let win_body = code
+            .split("#[cfg(windows)]\nfn probe_isolated(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[derive(Clone, Debug)]").next())
+            .expect("windows probe_isolated region");
+        assert!(
+            win_body.contains("probe_child::spawn_probe("),
+            "windows twin must use the re-exec child"
+        );
+        assert!(
+            win_body.contains("SLOOPER_SCAN_INLINE"),
+            "escape hatch must survive on Windows too"
+        );
+        assert!(
+            !win_body.contains("libc::"),
+            "libc must never return to the windows twin"
+        );
+        // main.rs: interception exists and precedes the audio backend.
+        let main_src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+                .expect("main.rs readable from a test");
+        let hit = main_src
+            .find("slooper_probe_invocation(")
+            .expect("interception present");
+        let backend = main_src
+            .find("slooper::audio::Backend::start")
+            .expect("backend start present");
+        assert!(hit < backend, "probe child must be intercepted before the backend");
+        assert!(main_src.contains("vsthost::probe_child_main"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn w7_windows_native_dll_probe_survives_isolation() {
+        // THE acceptance line: the W6 fixture chain still probes CLEAN
+        // through the new isolation — and isolation must be REALLY on
+        // (helper = the baked app exe, never the test harness itself).
+        let saved = w7_save_env();
+        std::env::remove_var("SLOOPER_SCAN_INLINE");
+        std::env::remove_var("SLOOPER_PROBE_EXE");
+        let helper = probe_child::probe_child_exe();
+        assert!(helper.is_file(), "baked exe missing: {}", helper.display());
+        assert_ne!(
+            helper,
+            std::env::current_exe().unwrap(),
+            "isolation must be real: helper is the app, not the test harness"
+        );
+        let dir = w6_temp_dir("w7iso");
+        std::fs::copy(w6_fixture("w6-vst2.dll"), dir.join("w6.dll")).unwrap();
+        let entries = scan_with(std::slice::from_ref(&dir), false);
+        w7_restore_env(&saved);
+        w6_assert_clean_effect(&entries, "w6.dll");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

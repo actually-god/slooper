@@ -11,9 +11,11 @@ W3 DONE 2026-11-08 (session 3). W4 DONE 2026-11-09 (session 4).
 W5 DONE 2026-11-09 (session 5, a8c878e).
 W6 DONE 2026-11-09 (session 6, `w6_*` pins; the five `#[cfg(windows)]`
 ones execute at W10 CI).
-NEXT: W7 (probe child processes on Windows — the inline `probe_isolated`
-twin W6 left is the exact seam W7 replaces with `--slooper-probe`
-re-exec + CreateProcess).
+W7 DONE 2026-11-10 (session 7, `w7_*` pins; Windows probes now re-exec
+`slooper --slooper-probe <kind> <path>`; one new `#[cfg(windows)]` pin
+joins the W6/W2 set at W10 CI).
+NEXT: W8 (plugin editor windows on Win32 — vstedit OS seam; the `from_x11`
+at vstedit.rs is the sole remaining gnullvm lib error and W8's own bucket).
 
 ## Ground rules (apply to every task)
 
@@ -425,3 +427,46 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   Session lore: `git checkout -- <path>` with uncommitted work in it
   DESTROYED the W6 tree once (recovered by replaying every logged patch);
   NEVER sabotage-test via checkout — commit first or sed-revert exactly.
+
+- **2026-11-10 session 7 — W7**: probe child processes on Windows — the
+  `#[cfg(windows)]` `probe_isolated` twin now re-execs the app as
+  `slooper --slooper-probe <kind> <path>` instead of probing inline.
+  Design: hidden flag intercepted in `main` BEFORE the audio backend
+  exists (child = one dlopen + one JSON line on stdout + immediate exit,
+  never JACK/GUI/config); parent = std::process::Command (== CreateProcessW;
+  CREATE_NO_WINDOW so a scan never flashes consoles) with a reader thread
+  on the stdout pipe (dead child = EOF), the SHARED `probe_timeout_secs()`
+  deadline covering read AND reap (kill + wait past it — no zombies),
+  `SLOOPER_SCAN_INLINE` honored on Windows too, and spawn failure
+  degrading to inline exactly like pipe/fork failure on unix. NO job
+  objects (documented in the module header). Windows crash exits surface
+  as NTSTATUS (top-2 severity bits) -> `exception 0xC0000005` labels;
+  ordinary exits -> `code N` (the i32->u32 widening IS the
+  exit&0xFFFFFFFF the protocol doc calls for). Error strings byte-mirror
+  the fork twin's greyed rows.
+  Testability (the key trick): the whole parent half lives in a
+  `#[cfg(any(windows, test))] mod probe_child` — Linux compiles it under
+  test and the w7 pins drive the EXACT shipped parent code today:
+  real-exe round trip against the W6 `.so` fixture (`w7_child_real_exe_
+  probes_fixture` reads "W6 VST Fixture" through the intercepted flag),
+  dead-child (`/bin/false` -> `exit code 1` reason, prompt), hang helper
+  (`exec sleep` script, 1 s deadline, killed+reaped), spawn failure
+  (Unspawnable), protocol pure-fns (args shape, labels, reply parsing),
+  helper resolution order `SLOOPER_PROBE_EXE` (empty=unset) > build.rs
+  baked `SLOOPER_EXE_PATH` > current_exe. The baked path matters: unit
+  tests cannot re-exec the libtest harness (unknown flag), so build.rs
+  now emits the built exe path (CARGO_TARGET_DIR/PROFILE/target suffix)
+  — also what Windows CI's w6/w7 scan pins ride for REAL isolation
+  (`w7_windows_native_dll_probe_survives_isolation` asserts the helper
+  is NOT the test binary). `w7_fork_path_untouched` (source pin) guards
+  the untouched unix fork body and main-before-backend ordering.
+  Gate note: raw test-binary chunks MUST re-export RUST_TEST_THREADS=1
+  (cargo's [env] is skipped) — a first runner pass produced the classic
+  env-race wall of false w2-paths reds; with it, identical chunks green.
+  Gates (Linux): w7 8/8 (7 lib + 1 bin), w6+w5+w2..w4 25/25, vsthost
+  37/37, claphost 9/9, v10/v19/v27/v37 40/40, release lib 524/525 (2
+  ignored diag tests, 1 known-boot `v36_script_fx_editor_resizes` abort
+  class), e2e 32/32 LIVE JACK, clippy-zero, windows-gnullvm lib STILL
+  exactly 1 error (`from_x11` = W8's bucket). Manual smoke: valid child
+  JSON, missing-file error row, and malformed forms falling through to
+  the normal GUI launch (pinned).
