@@ -34,6 +34,8 @@ jobs:
     name: Linux (lib suite + clippy)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      SLOOPER_NULL_AUDIO: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: swatinem/rust-cache@v2
@@ -45,8 +47,20 @@ jobs:
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
       - name: Build (shipping profile)
         run: cargo build --release --locked
+      # The script-FX editor pair heap-aborts when run in one process
+      # (slooper-dev: "FX-script heap corruption" — two script editor
+      # instances share cached &'static state; each passes solo), which
+      # SIGABRTs the monolith and loses every later test. Monolith skips
+      # them; each editor test then runs in its own process.
       - name: Lib suite (headless, citest profile)
-        run: cargo test --profile citest --lib --locked
+        run: >
+          cargo test --profile citest --lib --locked --
+          --skip ui::tests::v36_script_fx_editor
+      - name: Script-editor pair in isolated processes
+        run: |
+          for t in v36_script_fx_editor_docks v36_script_fx_editor_resizes; do
+            cargo test --profile citest --lib --locked -- --exact "ui::tests::$t"
+          done
       - name: Clippy zero
         run: |
           set -o pipefail
@@ -86,16 +100,25 @@ jobs:
         with:
           key: win-msvc
       # The exe build is what the W7 probe pins re-exec (build.rs bakes
-      # target/citest/slooper.exe as SLOOPER_EXE_PATH); build it before the
-      # test steps so the pins ride real isolation, not inline fallback.
+      # target/citest/slooper.exe as SLOOPER_EXE_PATH). Stage a copy FIRST:
+      # `cargo test` rebuilds the bin as a libtest harness at the same path,
+      # and re-executing THAT with --slooper-probe dies on libtest's own
+      # option parser ("Unrecognized option"). SLOOPER_PROBE_EXE has top
+      # resolution priority, so the pins ride the staged app exe.
       - name: Build exe (probe helper for W7/W6 pins)
         run: cargo build --profile citest --locked
+      - name: Stage probe helper exe
+        run: Copy-Item target/citest/slooper.exe target/citest/slooper-probe.exe
       - name: Compile lib tests
         run: cargo test --profile citest --lib --no-run --locked
       - name: Port pins w2..w8 (incl. the #[cfg(windows)] set)
+        env:
+          SLOOPER_PROBE_EXE: ${{ github.workspace }}\target\citest\slooper-probe.exe
         run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_
       - name: Release build proof (shipping profile)
         run: cargo build --release --locked
       - name: Full lib suite (report-only triage, grow the green list)
         continue-on-error: true
+        env:
+          SLOOPER_PROBE_EXE: ${{ github.workspace }}\target\citest\slooper-probe.exe
         run: cargo test --profile citest --lib --locked --no-fail-fast

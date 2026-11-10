@@ -401,6 +401,12 @@ pub fn container_is_viewable(handle: u64) -> Option<bool> {
 /// message: post `WM_CLOSE` to an arbitrary container. Our window
 /// procedure records it; the pump tears down in the host's order.
 pub fn request_wm_delete(handle: u64) -> bool {
+    // Real Win32 accepts PostMessageW(NULL) as a thread-message post and
+    // returns TRUE; the X11 twin's honest refusal on an invalid window is
+    // the contract shared call sites rely on (and the w8 pin asserts).
+    if handle == 0 {
+        return false;
+    }
     unsafe {
         PostMessageW(Some(hwnd_of(handle)), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok()
     }

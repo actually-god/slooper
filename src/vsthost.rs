@@ -5100,6 +5100,7 @@ mod tests {
 
     /// THE live proof of the whole W6 dispatch chain on Linux: the committed
     /// fixture `.so` is scanned, fork-probed, and reads back its name.
+    #[cfg(unix)] // loads the Linux .so fixture through the fork probe
     #[test]
     fn w6_linux_fixture_vst2_probes_clean() {
         let dir = w6_temp_dir("lin");
