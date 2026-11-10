@@ -345,8 +345,15 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   dispatches native `.dll` as VST2 and resolves real VST3 bundles
   (`Contents/<arch>-win/*.vst3dll`) — both only under `cfg(windows)`,
   Linux stays byte-exact. All yabridge/Wine heuristics early-return on
-  Windows; the fork-probe is `#[cfg(unix)]` with an inline Windows twin
-  (W7 replaces it). OS-split semantics: `w6_*` pins.
+  Windows. Probe isolation is OS-split (W7): Linux keeps the fork twin
+  untouched; Windows re-execs the app as `slooper --slooper-probe
+  <kind> <path>` (hidden argv[1] flag intercepted in `main` before the
+  audio backend exists; JSON row reply on stdout; exit code 0 == reply
+  delivered, NTSTATUS/`code N` labels the crash; deadline kill shared
+  with fork). Helper exe resolves via `SLOOPER_PROBE_EXE` (tests) then
+  the build.rs-baked `SLOOPER_EXE_PATH`; `SLOOPER_SCAN_INLINE` still
+  forces in-process probes on both OSes. OS-split semantics: `w6_*` /
+  `w7_*` pins.
 - Loop region math: `loop_wrap`/`region_end` (`src/audio.rs`); handles +
   modes in the grid toolbar (`src/ui.rs`, `LoopMode`)
 - Project format + migration: `src/project.rs`, `midi::migrate_shortcuts`

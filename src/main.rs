@@ -50,6 +50,14 @@ fn main() -> eframe::Result {
             spec.to_string_lossy().as_ref(),
         ));
     }
+    // W7: plugin-scan probe child (Windows crash isolation; see
+    // `vsthost::probe_child`). This process loads ONE plugin, prints one
+    // JSON line on stdout, and exits — no audio backend, no eframe, no
+    // config, no window: a probe can never touch JACK or draw anything,
+    // and a hard crash inside the plugin takes only this process down.
+    if let Some((kind, path)) = slooper_probe_invocation(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(slooper::vsthost::probe_child_main(kind, &path));
+    }
     // v41 windowing policy (crash forensics 2026-11, seven SIGABRTs):
     // the main window used to be forced onto X11/XWayland so plugin
     // editors and the app shared one server. That co-located slooper's
@@ -141,6 +149,24 @@ fn gl_force_software(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
         }
         None => true,
     }
+}
+
+/// W7: recognize the hidden probe-child form `slooper --slooper-probe
+/// <kind> <path>` (flag at argv[1] ONLY — probes are always spawned in
+/// exactly this shape, so a stray flag later in a normal command line
+/// can never turn the DAW into a probe child). `kind` is the strict
+/// `vsthost::kind_code` vocabulary: 0 = VST2, 1 = VST3, 2 = CLAP.
+fn slooper_probe_invocation(
+    argv: &[std::ffi::OsString],
+) -> Option<(u8, std::path::PathBuf)> {
+    if argv.get(1)?.as_os_str() != std::ffi::OsStr::new(slooper::vsthost::PROBE_FLAG) {
+        return None;
+    }
+    let kind = argv.get(2)?.to_str()?.trim().parse::<u8>().ok()?;
+    if kind > 2 {
+        return None;
+    }
+    Some((kind, std::path::PathBuf::from(argv.get(3)?)))
 }
 
 /// Decode the bundled icon into raw RGBA for the window title bar.
@@ -238,6 +264,42 @@ mod tests {
         assert!(gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "true")])));
         assert!(!gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "0")])));
         assert!(!gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "false")])));
+    }
+
+    #[test]
+    fn w7_probe_child_invocation_shape() {
+        let argv = |a: &[&str]| -> Vec<std::ffi::OsString> {
+            a.iter().map(std::ffi::OsString::from).collect()
+        };
+        // Normal launches (and slooper's lack of any CLI) must NOT trip.
+        assert!(slooper_probe_invocation(&argv(&["slooper"])).is_none());
+        assert!(slooper_probe_invocation(&argv(&["slooper", "--help"])).is_none());
+        // Flag only counts at argv[1].
+        assert!(slooper_probe_invocation(&argv(&[
+            "slooper",
+            "--foo",
+            "--slooper-probe",
+            "0",
+            "/x"
+        ]))
+        .is_none());
+        // The exact spawn shape, including a path with spaces.
+        let hit = slooper_probe_invocation(&argv(&[
+            "slooper",
+            "--slooper-probe",
+            "1",
+            "/x y/Plug.vst3",
+        ]))
+        .expect("child form must parse");
+        assert_eq!(hit.0, 1);
+        assert_eq!(hit.1.to_string_lossy(), "/x y/Plug.vst3");
+        // Malformed forms fall through to the normal (GUI) path instead
+        // of half-starting a probe: missing parts, non-numeric kind, and
+        // kinds outside the 0..=2 vocabulary.
+        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "0"])).is_none());
+        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "x", "/p"])).is_none());
+        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "3", "/p"])).is_none());
+        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "256", "/p"])).is_none());
     }
 
     #[test]
