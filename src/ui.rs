@@ -1274,7 +1274,7 @@ pub struct App {
     synth_pick: Option<usize>,
     /// Open VST2 custom editor windows, keyed by track. Closing (button,
     /// window manager, or a plugin swap) dispatches `effEditClose` on the
-    /// editor thread before the plugin may be unloaded (`src/vstedit.rs`).
+    /// editor thread before the plugin may be unloaded (`src/vstedit/`).
     vst_editors: std::collections::HashMap<usize, crate::vstedit::EditorWindow>,
     midi_rec: Vec<MidiRecState>,
     /// v0.11 R5: write-automation recorders + open automation manager.

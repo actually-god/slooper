@@ -14,8 +14,13 @@ ones execute at W10 CI).
 W7 DONE 2026-11-10 (session 7, `w7_*` pins; Windows probes now re-exec
 `slooper --slooper-probe <kind> <path>`; one new `#[cfg(windows)]` pin
 joins the W6/W2 set at W10 CI).
-NEXT: W8 (plugin editor windows on Win32 — vstedit OS seam; the `from_x11`
-at vstedit.rs is the sole remaining gnullvm lib error and W8's own bucket).
+W8a DONE 2026-11-10 (session 8, `w8_*` pins): vstedit is an OS seam
+(`src/vstedit/{mod,x11,win32}.rs`), the Win32 top-level editor container
+builds, and the gnullvm check is at ZERO errors for lib + bins + tests.
+NEXT: W8b (child-HWND docking under the winit window — the remaining half
+of the W8 task entry), then W9 (Windows MIDI) or W10 (CI) — W10 is now
+cheap (full `--tests` cross-compile is already green) and protects
+everything, so prefer W10 next.
 
 ## Ground rules (apply to every task)
 
@@ -322,6 +327,11 @@ thread — never the UI thread), W8b child-HWND under the winit HWND for dock
 integration (reuse v36/v41 size-guard designs).
 Acceptance: builds + non-X11 codepaths pinned where possible; manual smoke
 checklist for user hardware.
+- [x] **W8a DONE 2026-11-10 (session 8, `6a6eff3`)** — top-level container
+  per plugin on Win32 (details: DONE log entry below)
+- [ ] W8b: child-HWND embedding under the winit HWND (in-window editor
+  dock; today Windows editors are separate top-level windows — the same
+  model Linux had before the in-window work, fully usable)
 
 ### W9 — Windows MIDI
 `midir` (WinMM) devices feeding the existing MidiMsg pipeline; picker in the
