@@ -8,8 +8,10 @@
 
 STATUS: W1 DONE 2026-11-06 (session 1). W2 DONE 2026-11-08 (session 2).
 W3 DONE 2026-11-08 (session 3). W4 DONE 2026-11-09 (session 4).
-NEXT: W5 (WASAPI backend — build its shim against `Proc::process_block` +
-`crate::backend::BlockIo`, then cfg the jack crate out on Windows).
+W5 DONE 2026-11-09 (session 5, a8c878e).
+NEXT: W6 (native plugin scan on Windows — `default_vst_dirs()` cfg branch,
+yabridge/wine heuristics inert under cfg(windows), native `.dll` VST2
+dispatch in `scan_inner`, MZ/VST2 fixture DLLs compiled by llvm-mingw).
 
 ## Ground rules (apply to every task)
 
