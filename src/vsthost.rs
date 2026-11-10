@@ -5590,12 +5590,17 @@ mod tests {
     fn w7_windows_native_dll_probe_survives_isolation() {
         // THE acceptance line: the W6 fixture chain still probes CLEAN
         // through the new isolation — and isolation must be REALLY on
-        // (helper = the baked app exe, never the test harness itself).
+        // (helper = a real app exe, never the test harness itself).
+        // SLOOPER_PROBE_EXE is HONORED, not removed: CI stages the app exe
+        // there because `cargo test` rebuilds/claims target/<p>/slooper.exe
+        // for the bin harness and may prune it mid-step. The env > baked >
+        // current_exe ORDER is pinned by the protocol pins; the baked-only
+        // fallback gets live proof on Linux (w7_child_real_exe_probes_fixture
+        // drives the same probe_child_exe()).
         let saved = w7_save_env();
         std::env::remove_var("SLOOPER_SCAN_INLINE");
-        std::env::remove_var("SLOOPER_PROBE_EXE");
         let helper = probe_child::probe_child_exe();
-        assert!(helper.is_file(), "baked exe missing: {}", helper.display());
+        assert!(helper.is_file(), "probe helper missing: {}", helper.display());
         assert_ne!(
             helper,
             std::env::current_exe().unwrap(),
