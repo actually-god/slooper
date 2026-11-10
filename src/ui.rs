@@ -6121,8 +6121,14 @@ impl App {
         // Room for a second (spectrum) row under the controls: control band
         // ~140 px + spectrum row ~90 px.
         let tall = ui.available_height() >= 250.0;
+        // v49 R2: the meter column GROWS WITH the room it got — the old
+        // 130 px cap left a huge dead band in tall docks and made the
+        // whole panel look frozen while resizing.
+        // v49 R2: measure the PANEL's room before the row — inside the
+        // row, available_height collapses to the tallest control column.
+        let body_h = ui.available_height();
         let meter_h = if wide || tall {
-            (ui.available_height() - 26.0).clamp(56.0, 130.0)
+            (body_h - 26.0).clamp(56.0, 240.0)
         } else {
             56.0
         };
@@ -6148,20 +6154,26 @@ impl App {
                     Some(ms) => (db_of(ms.l_hold), db_of(ms.r_hold), ms.clip),
                     None => (-120.0, -120.0, false),
                 };
+                // v49 R1: the two peak numbers say WHICH channel they are.
+                ui.label(
+                    RichText::new("peak L / R (dBFS)")
+                        .small()
+                        .weak()
+                        .color(Color32::from_rgb(150, 150, 158)),
+                )
+                .on_hover_text(
+                    "Sample peak hold per channel, post master gain (dBFS). \
+                     Red clip LED lights on any full-scale sample.",
+                );
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("peak").small().weak());
                     ui.label(
                         RichText::new(format!(
-                            "{peak_l:>6.1} {peak_r:>6.1} dBFS",
+                            "L {peak_l:>6.1}  R {peak_r:>6.1}",
                             peak_l = peak_l,
                             peak_r = peak_r
                         ))
                         .monospace()
                         .small(),
-                    )
-                    .on_hover_text(
-                        "Sample peak hold per channel, post master gain \
-                         (dBFS). Red clip LED lights on any full-scale sample.",
                     );
                     if clip {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
@@ -6196,41 +6208,69 @@ impl App {
                 self.meter_state.as_ref().is_some_and(|m| m.clip),
             );
             ui.separator();
-            // ---- live LUFS numbers (the panel's headline readouts) ----
+            // v49 R1: live loudness readouts, ONE label per number, the
+            // unit (LUFS / LU) spelled out where it is used — the bare
+            // M/S/I/LRA letters were unreadable.
             ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("LUFS \u{b7} live master")
+                        .small()
+                        .strong()
+                        .color(Color32::from_rgb(178, 178, 186)),
+                )
+                .on_hover_text(
+                    "BS.1770-4 loudness of the live master output \
+                     (EBU R 128 measurement set).",
+                );
                 let (m, s) = match self.meter_state.as_ref() {
                     Some(ms) => (ms.lufs.momentary(), ms.lufs.short_term()),
                     None => (None, None),
                 };
                 lufs_row(
                     ui,
-                    "M",
+                    "MOMENTARY",
                     m,
+                    "LUFS",
                     "Momentary loudness (BS.1770 400 ms window) — the live reading.",
                 );
                 if !lufs_lean {
-                    lufs_row(ui, "S", s, "Short-term loudness (3 s window).");
+                    lufs_row(
+                        ui,
+                        "SHORT-TERM",
+                        s,
+                        "LUFS",
+                        "Short-term loudness (3 s window).",
+                    );
                 }
                 lufs_row(
                     ui,
-                    "I",
+                    "INTEGRATED",
                     self.meter_i,
-                    "Integrated loudness since reset/start: gated mean (−70 LUFS absolute, \
-                     −10 LU relative). Silence is excluded — EBU R 128 / Tech 3341.",
+                    "LUFS",
+                    "Integrated loudness since reset/start: gated mean (\u{2212}70 LUFS absolute, \
+                     \u{2212}10 LU relative). Silence is excluded \u{2014} EBU R 128 / Tech 3341.",
                 );
                 if !lufs_lean {
                     lufs_row(
                         ui,
                         "LRA",
                         self.meter_lra,
-                        "Loudness range: P95−P10 of the gated short-term series (EBU Tech 3342).",
+                        "LU",
+                        "Loudness range (unit: LU, loudness units): P95\u{2212}P10 of the gated \
+                         short-term series (EBU Tech 3342).",
                     );
                 }
             });
             if wide {
                 ui.separator();
+                // v49 R2: the wide-mode spectrum fills the WHOLE row
+                // height (it used to stop at the meter's old 130 px cap
+                // and leave the panel looking frozen while resizing).
                 let (r2, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width().max(150.0), meter_h),
+                    egui::vec2(
+                        ui.available_width().max(150.0),
+                        body_h.max(meter_h).max(60.0),
+                    ),
                     Sense::hover(),
                 );
                 paint_spectrum(ui, self.meter_state.as_ref(), r2);
@@ -15687,6 +15727,16 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                     // must not be squeezed to zero by its neighbours' old
                     // solo sizes. Each window asks for what it recorded,
                     // capped at its share of what is left.
+                    //
+                    // v49 R4: EVERY nested member gets a live max_size =
+                    // (space still free) − MIN_SHARE per member behind it,
+                    // so dragging one divider can NEVER starve a
+                    // neighbour out of existence: the divider stays a
+                    // visible boundary between two drawn windows in both
+                    // directions. (Starved neighbours used to park the
+                    // handle over foreign widgets, where it lost the hit
+                    // test — "resize works one way but not back".)
+                    const MIN_SHARE: f32 = 56.0;
                     let strip = ui.max_rect().width();
                     let mut alloc = 0.0f32;
                     for (n, i) in ids.iter().enumerate() {
@@ -15702,6 +15752,11 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             let want = if rec > 8.0 { rec } else { def_w(*i) };
                             let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
                             alloc += want.min(cap);
+                            // Live remaining along the strip this frame.
+                            let rem = (ui.max_rect().max.x
+                                - ui.cursor().min.x.max(ui.max_rect().min.x))
+                                .max(0.0);
+                            let max_w = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                             // Id salted by stack depth: egui caches a
                             // resizable panel's size by Id, so when the
                             // stack changes the fair-share default must
@@ -15710,6 +15765,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                                 .resizable(true)
                                 .default_size(want.min(cap).max(48.0))
                                 .min_size(20.0)
+                                .max_size(max_w)
                                 .show(ui, |ui| docked_window(ui, app, *i));
                         }
                     }
@@ -15730,6 +15786,8 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
             wpanel = wpanel.resizable(true).default_size(w).min_size(56.0);
             wpanel.show(ui, |ui| {
                 // v35 R6: fair-share defaults (see bottom-edge note).
+                // v49 R4: live max_size per member (see bottom-edge note).
+                const MIN_SHARE: f32 = 56.0;
                 let strip = ui.max_rect().height();
                 let mut alloc = 0.0f32;
                 for (n, i) in ids.iter().enumerate() {
@@ -15744,22 +15802,25 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                         let want = if rec > 8.0 { rec } else { def_h(*i) };
                         let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
                         alloc += want.min(cap);
-                        // egui sizes top panels to CONTENT desired
-                        // height, which would let one stacked window
-                        // devour the strip; cap the content to the
-                        // window's share in a scroll viewport.
+                        // v49 R4: NO ScrollArea wrap any more. It was a
+                        // pre-v44 hack to stop a top panel sizing to its
+                        // content's DESIRED height; body_clipped now caps
+                        // every docked body to the offered rect. Worse,
+                        // the ScrollArea's own drag sensing sat right on
+                        // the divider seam and ate the resize-handle hit
+                        // — stacked windows then could not be resized AT
+                        // ALL (egui's panel docs call this out by name).
+                        let rem = (ui.max_rect().max.y
+                            - ui.cursor().min.y.max(ui.max_rect().min.y))
+                            .max(0.0);
+                        let max_h = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                         let sz = want.min(cap).max(48.0);
                         egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
                             .resizable(true)
                             .default_size(sz)
                             .min_size(20.0)
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt(("dockstack", *i))
-                                    .auto_shrink([false, false])
-                                    .max_height(sz)
-                                    .show(ui, |ui| docked_window(ui, app, *i));
-                            });
+                            .max_size(max_h)
+                            .show(ui, |ui| docked_window(ui, app, *i));
                     }
                 }
             });
@@ -17254,19 +17315,27 @@ fn db_of(amp: f32) -> f32 {
     }
 }
 
-/// v39: one caption+value row of the MASTER OUT LUFS column.
-fn lufs_row(ui: &mut egui::Ui, cap: &str, val: Option<f64>, tip: &str) {
+/// v39/v49 R1: one caption+value+unit row of the MASTER OUT loudness
+/// column. The caption sits in a fixed-width cell so the monospace
+/// values line up; the unit is spelled out per row (LU vs LUFS differ).
+fn lufs_row(ui: &mut egui::Ui, cap: &str, val: Option<f64>, unit: &str, tip: &str) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{cap:>3}"))
-                .small()
-                .color(Color32::from_rgb(150, 150, 158)),
-        );
+        ui.add_sized(
+            egui::vec2(74.0, 0.0),
+            egui::Label::new(
+                RichText::new(cap)
+                    .small()
+                    .color(Color32::from_rgb(150, 150, 158)),
+            )
+            .selectable(false),
+        )
+        .on_hover_text(tip);
         let txt = match val {
             Some(v) if v > -99.0 => format!("{v:6.1}"),
-            _ => "   —".into(),
+            _ => "   \u{2014}".into(),
         };
-        ui.label(RichText::new(txt).monospace()).on_hover_text(tip);
+        let _vl = ui.label(RichText::new(txt).monospace()).on_hover_text(tip);
+        ui.label(RichText::new(unit).small().weak());
     });
 }
 
@@ -17421,8 +17490,12 @@ fn paint_stereo_meters(
     }
 }
 
-/// v39: real-time spectrum viewer (Ableton-Spectrum style): log
-/// frequency 30 Hz…20 kHz, −120…0 dBFS, per-bin bars with peak caps.
+/// v39/v49 R3: real-time spectrum viewer (Ableton-Spectrum style): log
+/// frequency 30 Hz…20 kHz, −120…0 dBFS. The 4096 analyzer bins are
+/// reduced to ONE column per horizontal pixel (max-hold across the bins
+/// that land in it), so the trace uses every pixel of the panel at any
+/// width — no 1.6 px bar gaps at small sizes, no overlapping mush at
+/// large ones — with decaying peak caps per column and a finer grid.
 fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rect: egui::Rect) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, Color32::from_rgb(24, 24, 29));
@@ -17432,19 +17505,40 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
     let y_of = |db: f32| -> f32 { rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height() };
     let grid = Color32::from_rgb(58, 58, 66);
     let txt = Color32::from_rgb(120, 120, 128);
-    for (f, lab) in [(100.0f32, "100"), (1000.0, "1k"), (10000.0, "10k")] {
+    // v49 R3: minor decade lines always; extra labels when the panel is
+    // wide enough for them to read.
+    for f in [100.0f32, 300.0, 1000.0, 3000.0, 10000.0] {
         let x = x_of(f);
         p.vline(x, rect.y_range(), egui::Stroke::new(1.0, grid));
+    }
+    let labeled: &[(f32, &str)] = if rect.width() >= 260.0 {
+        &[
+            (100.0, "100"),
+            (300.0, "300"),
+            (1000.0, "1k"),
+            (3000.0, "3k"),
+            (10000.0, "10k"),
+        ]
+    } else {
+        &[(100.0, "100"), (1000.0, "1k"), (10000.0, "10k")]
+    };
+    for (f, lab) in labeled {
+        let x = x_of(*f);
         p.text(
             egui::pos2(x + 2.0, rect.min.y + 1.0),
             egui::Align2::LEFT_TOP,
-            lab,
+            *lab,
             egui::FontId::proportional(9.0),
             txt,
         );
     }
-    for db in [-60.0f32, -90.0] {
-        let y = y_of(db);
+    let db_lines: &[f32] = if rect.height() >= 120.0 {
+        &[-30.0f32, -60.0, -90.0]
+    } else {
+        &[-60.0f32, -90.0]
+    };
+    for db in db_lines {
+        let y = y_of(*db);
         p.hline(rect.x_range(), y, egui::Stroke::new(1.0, grid));
         p.text(
             egui::pos2(rect.min.x + 2.0, y + 1.0),
@@ -17466,42 +17560,62 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
         }
         Some(m) => {
             let sp = &m.spectrum;
-            let mut mesh = egui::epaint::Mesh::default();
+            let ncols = (rect.width() as usize).max(1);
+            let mut coldb: Vec<f32> = vec![-240.0; ncols];
+            let mut colpk: Vec<f32> = vec![-240.0; ncols];
             for bin in 1..sp.n_bins() {
                 let f = sp.bin_hz(bin);
                 if f < 30.0 || f > 20000.0 {
                     continue;
                 }
+                let x = x_of(f);
+                if x < rect.min.x || x >= rect.max.x {
+                    continue;
+                }
+                let c = ((x - rect.min.x) as usize).min(ncols - 1);
                 let db = sp.db[bin].max(-120.0);
+                if db > coldb[c] {
+                    coldb[c] = db;
+                }
+                let pk = sp.peak_db[bin].max(-120.0);
+                if pk > colpk[c] {
+                    colpk[c] = pk;
+                }
+            }
+            let mut mesh = egui::epaint::Mesh::default();
+            for (c, &db) in coldb.iter().enumerate() {
                 if db < -118.0 {
                     continue;
                 }
-                let x = x_of(f);
-                if x < rect.min.x || x > rect.max.x {
-                    continue;
-                }
+                let x = rect.min.x + c as f32;
                 let t = ((db + 120.0) / 120.0).clamp(0.0, 1.0);
                 let (a, b, tc) = if t < 0.5 {
                     ((46.0, 130.0, 120.0), (70.0, 220.0, 200.0), t * 2.0)
                 } else {
                     ((70.0, 220.0, 200.0), (240.0, 235.0, 170.0), (t - 0.5) * 2.0)
                 };
-                let col = Color32::from_rgb(
+                let colr = Color32::from_rgb(
                     (a.0 + (b.0 - a.0) * tc) as u8,
                     (a.1 + (b.1 - a.1) * tc) as u8,
                     (a.2 + (b.2 - a.2) * tc) as u8,
                 );
                 let y = y_of(db);
                 mesh.add_colored_rect(
-                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + 1.6, rect.max.y)),
-                    col,
+                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + 1.0, rect.max.y)),
+                    colr,
                 );
-                let yc = y_of(sp.peak_db[bin]);
-                if yc < y - 1.5 {
-                    mesh.add_colored_rect(
-                        egui::Rect::from_min_max(egui::pos2(x, yc - 1.2), egui::pos2(x + 1.6, yc)),
-                        Color32::from_rgb(220, 220, 220),
-                    );
+                let pk = colpk[c];
+                if pk > db + 1.5 {
+                    let yc = y_of(pk);
+                    if yc < y - 1.5 {
+                        mesh.add_colored_rect(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x, yc - 1.2),
+                                egui::pos2(x + 1.0, yc),
+                            ),
+                            Color32::from_rgb(220, 220, 220),
+                        );
+                    }
                 }
             }
             p.add(egui::Shape::mesh(mesh));
@@ -37185,5 +37299,221 @@ mod tests {
         assert!(!app.show_master, "unchecking closed the dynamic window");
     }
 
-}
+    // ==================== v49 pins ====================
 
+    /// Stepped pointer drag: press at `from`, move in ~40 px steps,
+    /// release at `to`. Mirrors how a real resize drag delivers motion.
+    fn drag_steps(app: &mut App, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        let d = to - from;
+        let n = ((d.x.abs().max(d.y.abs())) / 40.0).ceil() as usize;
+        let n = n.max(1);
+        frame(app, ctx, vec![moved(from)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        for k in 1..=n {
+            let p = from + d * (k as f32 / n as f32);
+            frame(app, ctx, vec![moved(p)]);
+        }
+        frame(app, ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..2 {
+            frame(app, ctx, vec![]);
+        }
+    }
+
+    /// v49 R4: two windows docked ADJACENT on the bottom edge — the
+    /// divider between them must resize BOTH ways in BOTH directions,
+    /// even after being dragged far enough to starve the fill-side
+    /// window to a sliver. (Reported: "resize in one direction but not
+    /// back".)
+    #[test]
+    fn v49_bottom_divider_roundtrip_both_ways() {
+        let mut app = headless_app("v49btmdiv");
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let m = app.dock_rects[2]; // monitor: bottom strip, LEFT member
+        let b = app.dock_rects[1]; // binds: bottom strip, fill member
+        assert!(m[2] > 8.0 && b[2] > 8.0 && m[0] < b[0], "{m:?} {b:?}");
+        let y = m[1] + 60.0;
+        // 1) GROW the left member far past the fill member's comfortable
+        //    share (drag the divider ~toward the strip's right edge).
+        let d1 = egui::pos2(m[0] + m[2] + 2.0, y);
+        let vp = ctx.viewport_rect();
+        drag_steps(
+            &mut app,
+            &ctx,
+            d1,
+            egui::pos2(vp.max.x - 60.0, y),
+        );
+        let m2 = app.dock_rects[2];
+        assert!(
+            m2[2] > m[2] + 100.0,
+            "divider must grow the left member: {m:?} -> {m2:?}"
+        );
+        // 2) Drag it BACK — this is the direction the bug locked.
+        let d2 = egui::pos2(m2[0] + m2[2] + 2.0, y);
+        drag_steps(&mut app, &ctx, d2, d2 - egui::vec2(220.0, 0.0));
+        let m3 = app.dock_rects[2];
+        assert!(
+            m3[2] < m2[2] - 150.0,
+            "divider must come back the other way: {m2:?} -> {m3:?}"
+        );
+        let b3 = app.dock_rects[1];
+        assert!(b3[2] > 8.0, "fill member visible again: {b3:?}");
+    }
+
+    /// v49 R4: same round trip for two windows stacked on the RIGHT edge
+    /// (MIXER above MASTER OUT), including from the fully-starved extreme
+    /// and back.
+    #[test]
+    fn v49_right_stack_divider_roundtrip_both_ways() {
+        let mut app = headless_app("v49rtdiv");
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // mixer (prim 3) is the nested resizable member; MASTER OUT (dyn
+        // win 4) is the bottom FILL member of the right-edge stack.
+        let a = app.dock_rects[3]; // mixer header (top member)
+        let g = app.dock_rects[4]; // master header (fill member, below)
+        assert!(a[3] > 8.0 && g[3] > 8.0 && a[1] < g[1], "{a:?} {g:?}");
+        let x = a[0] + a[2] * 0.5;
+        // 1) Starve the bottom member: drag the divider far down.
+        drag_steps(&mut app, &ctx, egui::pos2(x, g[1] - 2.0), egui::pos2(x, g[1] + 500.0));
+        let g2 = app.dock_rects[4];
+        assert!(
+            g2[1] > g[1] + 200.0,
+            "divider must grow the top member (master pushed down): {g:?} -> {g2:?}"
+        );
+        // 2) Drag BACK up: the starved window must regain its share.
+        let g3 = app.dock_rects[4];
+        drag_steps(&mut app, &ctx, egui::pos2(x, g3[1] - 2.0), egui::pos2(x, g3[1] - 260.0));
+        let g4 = app.dock_rects[4];
+        assert!(
+            g4[1] < g3[1] - 150.0,
+            "divider must return (starved window recovered): {g3:?} -> {g4:?}"
+        );
+    }
+
+    #[test]
+    fn v49_master_readouts_are_labeled() {
+        // v49 R1: every loudness number carries a spelled-out caption
+        // in the full-size layout...
+        let mut app = headless_app("v49lbl");
+        let ctx = egui::Context::default();
+        app.show_master = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        for cap in [
+            "LUFS",
+            "MOMENTARY",
+            "SHORT-TERM",
+            "INTEGRATED",
+            "LRA",
+            "peak L / R (dBFS)",
+        ] {
+            assert!(
+                galley_at(&mut app, &ctx, cap).is_some(),
+                "label {cap:?} missing"
+            );
+        }
+        // ...and the same window at its SMALLEST legal footprint folds
+        // the secondary rows, keeping the essentials (v44 rules).
+        let mut app = headless_app("v49lbl2");
+        let ctx = egui::Context::default();
+        app.show_master = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Master)
+            .expect("master registered");
+        app.dyn_wins[mi].dock = [0, 1, 0];
+        app.dyn_wins[mi].rect = [300.0, 200.0, 240.0, 130.0];
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(galley_at(&mut app, &ctx, "MOMENTARY").is_some());
+        assert!(galley_at(&mut app, &ctx, "reset I").is_some());
+        assert!(galley_at(&mut app, &ctx, "LRA").is_none());
+        assert!(galley_at(&mut app, &ctx, "SHORT-TERM").is_none());
+    }
+
+    #[test]
+    fn v49_master_panel_scales_with_window() {
+        // v49 R2: grow the docked master out of its stack (drag the
+        // divider) and BOTH the VU column and the spectrum claim the new
+        // height — pre-v49 the spectrum froze at a 130 px band.
+        let mut app = headless_app("v49scale");
+        let ctx = egui::Context::default();
+        app.show_master = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Master)
+            .expect("master registered");
+        let mwin = 4 + mi;
+        app.side_wins.dock[0] = [1, 1, 1]; // mixer RIGHT order 1
+        app.dyn_wins[mi].dock = [1, 1, 2]; // master RIGHT order 2 (fill)
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let g0 = app.dock_rects[mwin];
+        let spec_in = |app: &mut App, ctx: &egui::Context, g: [f32; 4]| {
+            painted_rects(app, ctx, (24, 24, 29))
+                .into_iter()
+                .filter(|r| {
+                    r.min.x >= g[0] - 2.0
+                        && r.max.x <= g[0] + g[2] + 2.0
+                        && r.min.y >= g[1] - 2.0
+                        && r.max.y <= g[1] + g[3] + 2.0
+                })
+                .map(|r| r.height())
+                .fold(0.0f32, f32::max)
+        };
+        let spec_small = spec_in(&mut app, &ctx, g0);
+        assert!(spec_small > 30.0, "spectrum present: {spec_small}");
+        // Give the master the bulk of the strip: drag the divider up so
+        // the mixer keeps only its header strip.
+        let x = g0[0] + g0[2] - 10.0;
+        let a = app.dock_rects[3];
+        drag_steps(
+            &mut app,
+            &ctx,
+            egui::pos2(x, a[1] + a[3] - 2.0),
+            egui::pos2(x, a[1] + 74.0),
+        );
+        let g1 = app.dock_rects[mwin];
+        assert!(
+            g1[1] < g0[1] + (g0[3] - g1[3]).abs() + 130.0 && g1[3] > g0[3] + 150.0,
+            "master did not grow: {g0:?} -> {g1:?}"
+        );
+        let spec_big = spec_in(&mut app, &ctx, g1);
+        assert!(
+            spec_big > spec_small + 100.0,
+            "spectrum did not scale: {spec_small} -> {spec_big}"
+        );
+        let meter_big = painted_rects(&mut app, &ctx, (30, 30, 34))
+            .into_iter()
+            .filter(|r| {
+                r.min.x >= g1[0] - 2.0
+                    && r.max.x <= g1[0] + g1[2] + 2.0
+                    && r.min.y >= g1[1] - 2.0
+                    && r.max.y <= g1[1] + g1[3] + 2.0
+            })
+            .map(|r| r.height())
+            .fold(0.0f32, f32::max);
+        assert!(meter_big > 180.0, "meter column did not grow: {meter_big}");
+    }
+
+}

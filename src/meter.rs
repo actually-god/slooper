@@ -278,7 +278,12 @@ pub struct Spectrum {
 
 impl Spectrum {
     pub fn new(sr: u32) -> Self {
-        let n = 2048usize;
+        // v49 R3: 8192-sample window (≈171 ms @48 kHz) — 4x finer
+        // frequency resolution than the old 2048 (bin spacing ≈5.9 Hz
+        // instead of ≈23.4 Hz), which is what makes low-frequency tones
+        // and narrow cuts/gains readable on the log axis. One 8192-pt
+        // FFT per UI frame is ~0.1 ms on this host's release build.
+        let n = 8192usize;
         let hann: Vec<f32> = (0..n)
             .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos())
             .collect();
@@ -683,11 +688,12 @@ mod tests {
         let sr = 48_000;
         let mut s = Spectrum::new(sr);
         let mut buf = Vec::new();
-        // One full 2048-sample window of 1 kHz at amplitude 0.1 (≈ −20 dB).
-        write_sine(&mut buf, sr, 1000.0, 0.1, 2048);
+        // v49: full 8192-sample window at EXACTLY bin 800 (4687.5 Hz),
+        // amplitude 0.1 (≈ −20 dB). Hann-normalised coherent reading.
+        write_sine(&mut buf, sr, 4687.5, 0.1, 8192);
         s.push(&buf);
         s.refresh(0.0);
-        let want_bin = (1000.0 * 2048.0 / sr as f32).round() as usize; // ~43
+        let want_bin = (4687.5 * 8192.0 / sr as f32).round() as usize; // 800
         let (mut best, mut best_i) = (-999.0f32, 0usize);
         for i in 1..s.n_bins() {
             if s.db[i] > best {
@@ -699,9 +705,19 @@ mod tests {
             best_i.abs_diff(want_bin) <= 1,
             "peak bin {best_i} want {want_bin}"
         );
-        assert!((best + 20.0).abs() < 1.5, "peak level {best} dB want ≈ -20");
+        assert!((best + 20.0).abs() < 1.0, "peak level {best} dB want ≈ -20");
         // Bins far from the tone sit 30+ dB down.
-        assert!(s.db[300] < best - 30.0);
+        assert!(s.db[1500] < best - 30.0);
+    }
+
+    #[test]
+    fn spectrum_resolution_is_8192_deep() {
+        // v49 R3 pin: bin spacing ≈5.86 Hz @48 kHz (was 23.4 Hz) with a
+        // 4096-bin display — fine enough that narrow EQ moves and low
+        // tones are distinct features, not smeared blobs.
+        let s = Spectrum::new(48_000);
+        assert!((s.bin_hz(1) - 5.859375).abs() < 0.01, "{}", s.bin_hz(1));
+        assert!(s.n_bins() >= 4096, "bins {}", s.n_bins());
     }
 
     #[test]
