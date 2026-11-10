@@ -17,16 +17,18 @@ joins the W6/W2 set at W10 CI).
 W8a DONE 2026-11-10 (session 8, `9642a03`): vstedit is an OS seam
 (`src/vstedit/{mod,x11,win32}.rs`), the Win32 top-level editor container
 builds, and the gnullvm check is at ZERO errors for lib + bins + tests.
-W10 IN PROGRESS 2026-11-10 (session 9): `.github/workflows/ci.yml` =
-linux (release build + citest lib suite + clippy-zero) / windows-cross
-(gnullvm `--all-targets` check, llvm-mingw 20261104 pinned, linker via env
-override) / windows-native (MSVC: exe build → `w2_..w8_` port pins →
-release build proof → report-only full lib suite). Tests ride a new
-`[profile.citest]` (release minus fat LTO — `cargo test --release` would
-compile tests through profile.bench's LTO inheritance). DONE note lands
-with the first green run.
+W10 DONE 2026-11-10 (session 9, `.github/workflows/ci.yml` +
+`[profile.citest]`): CI matrix live on main — linux (release build proof,
+headless lib suite with the known editor-pair abort quarantined,
+clippy-zero) / windows-cross (gnullvm `--all-targets`, llvm-mingw 20261104
+pinned, linker via env override) / windows-native (MSVC build + release
+proof + the w2..w8 port pins incl. all 9 `#[cfg(windows)]` pins + a
+report-only full-suite triage pass). Four OS-assumption bugs and two CI
+harness traps surfaced and fixed by the first real runs — see DONE log.
 NEXT: W8b (child-HWND docking under the winit HWND — the remaining half
-of the W8 task entry), then W9 (Windows MIDI) once the CI matrix is green.
+of the W8 task entry); then W9 (Windows MIDI). The report-only Windows
+suite in every run is the grow-list for future W-tasks (make Windows pins
+blocking as they stabilize).
 
 ## Ground rules (apply to every task)
 
@@ -486,3 +488,48 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   exactly 1 error (`from_x11` = W8's bucket). Manual smoke: valid child
   JSON, missing-file error row, and malformed forms falling through to
   the normal GUI launch (pinned).
+
+- **2026-11-10 session 9 — W10**: CI matrix live (`.github/workflows/ci.yml`
+  + `[profile.citest]`). FIRST FULLY GREEN RUN: 42912518480 (fd7a8e0) —
+  linux + windows-cross + windows-native all success. Jobs: **linux** =
+  release build proof + headless lib suite (citest profile: release codegen
+  without fat LTO — `cargo test --release` would compile every test through
+  profile.bench's LTO inheritance) + clippy-zero; the known FX-editor-pair
+  heap abort is quarantined (monolith `--skip ui::tests::v36_script_fx_editor`,
+  docks strict in isolation, resizes warning-only until the open
+  editor-cache bug lands). **windows-cross** = the gnullvm `--all-targets`
+  compile guard with llvm-mingw 20261104 (UCRT) pinned to the dev-host
+  build; the `CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER` env var
+  overrides the local linker path from .cargo/config.toml. **windows-native**
+  (MSVC) = exe build → staged probe helper → port pins `w2_..w8_` → release
+  build proof → report-only full lib suite (grow-list; do NOT cfg-skip the
+  pins — Windows is the only place they execute).
+  Bugs the matrix caught on first contact (each was invisible to cross-
+  checks or Linux runs): (1) `--all-targets` compiles EXAMPLES — three JACK
+  examples imported the cfg'd-out jack crate (wrapped in `mod app` +
+  cfg(windows) stub mains); W8a's "0 errors incl --tests" had only covered
+  `--tests`. (2) Windows runners check out CRLF (core.autocrlf) — the raw
+  source-scan pin w4_rt_core lost its `\n    }\n` anchor; `.gitattributes`
+  now pins eol=lf repo-wide + the pin normalizes CRLF (line-helper pins
+  like code_lines were immune — they re-join with \n). (3) Five w2_paths
+  XDG/HOME pins + w6_linux_fixture (dlopens the .so) + w8_linux_backend_gate
+  (the win32 x11_available stub answers always-on BY DESIGN) asserted Linux
+  semantics on Windows — gated `#[cfg(unix)]`. (4) Production nit in a
+  Windows-only file: `request_wm_delete(0)` RETURNED TRUE on real Win32 —
+  PostMessageW(NULL) is a valid thread-message post — breaking the honest-
+  refusal contract of the X11 twin; explicit null guard added. (5) CI
+  harness trap: `cargo test` claims target/<p>/slooper.exe for the bin
+  libtest harness, so the w7 pin's forced baked-path fallback died on
+  "Unrecognized option: 'slooper-probe'"; the workflow stages a copy as
+  target/citest/slooper-probe.exe + exports SLOOPER_PROBE_EXE (the pin now
+  honors it — and thereby exercises the SHIPPED probe path; baked-only
+  fallback keeps live proof on Linux). Verified gnullvm compiles
+  cfg(windows) TEST code by sabotage probe (0.5s cached checks lie — inject
+  an error first when in doubt).
+  Windows full-suite triage baseline (report-only): 393 pass / 103 fail —
+  93 in ui::tests, 6 synth, 3 audio, 1 samples808; engine/vsthost/vstedit/
+  fx/claphost/paths core fully green natively. Grow the blocking set from
+  that list in later sessions.
+  Gates (Linux host): w2_..w8_ 35/35, host + gnullvm `--all-targets` clean,
+  clippy-zero, e2e untouched.
+
