@@ -120,7 +120,9 @@ jobs:
       - name: Port pins w2..w8 (incl. the #[cfg(windows)] set)
         env:
           SLOOPER_PROBE_EXE: ${{ github.workspace }}\target\citest\slooper-probe.exe
-        run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_
+        # NOTE: the filter is SUBSTRING-matched — `w8_` does NOT match the
+        # `w8b_*` W8b embed pins, so each new sub-letter series goes here.
+        run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_
       - name: Release build proof (shipping profile)
         run: cargo build --release --locked
       - name: Full lib suite (report-only triage, grow the green list)

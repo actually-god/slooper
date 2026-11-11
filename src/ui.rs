@@ -1276,6 +1276,16 @@ pub struct App {
     /// window manager, or a plugin swap) dispatches `effEditClose` on the
     /// editor thread before the plugin may be unloaded (`src/vstedit/`).
     vst_editors: std::collections::HashMap<usize, crate::vstedit::EditorWindow>,
+    /// W8b (Windows embed mode): the main window's HWND, grabbed from the
+    /// UI thread's window list by `logic` (the thread that owns the winit
+    /// window). None headless and on Linux (`main_thread_hwnd` answers
+    /// None there) — and even when Some, it only ever acts as an embed
+    /// parent when `embed_requested()` is true, which it never is on Linux.
+    embed_hwnd: Option<u64>,
+    /// W8b: last (x, y, w, h) physical rect posted per embed container —
+    /// the coalescer that keeps the per-frame sync off the GUI thread's
+    /// queue unless geometry actually moved.
+    embed_sync: std::collections::HashMap<u64, (i32, i32, i32, i32)>,
     midi_rec: Vec<MidiRecState>,
     /// v0.11 R5: write-automation recorders + open automation manager.
     auto_rec: Vec<AutoRecState>,
@@ -1737,6 +1747,8 @@ impl App {
             os_drops: Vec::new(),
             synth_pick: None,
             vst_editors: std::collections::HashMap::new(),
+            embed_hwnd: None,
+            embed_sync: std::collections::HashMap::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
             rec_src: (0..MAX_LOOPS)
@@ -2528,7 +2540,16 @@ impl App {
         &mut self,
         entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) -> Result<crate::vstedit::EditorWindow, String> {
-        if let Some(h) = entry.vst2_handle() {
+        // W8b: in embed mode (Windows only — `embed_requested()` is false
+        // everywhere else) the container is born as a child of the main
+        // window, BOTH generations alike. The seam is ordered: the GUI
+        // thread reads the parent inside `on_gui_thread`, which this
+        // caller blocks on, so the wrap can only ever cover THIS open.
+        let parent = if crate::vstedit::embed_requested() { self.embed_hwnd } else { None };
+        if let Some(p) = parent {
+            crate::vstedit::set_embed_parent(p);
+        }
+        let opened = if let Some(h) = entry.vst2_handle() {
             let pth = entry.path().to_string_lossy().into_owned();
             // v22: hand the editor the cell mirror + parameter count so
             // its pump can read plugin-GUI edits back into the host
@@ -2539,7 +2560,11 @@ impl App {
             crate::vstedit::open_editor(&h, &pth, entry.name(), cells, n)
         } else {
             entry.open_vst3_editor(self.sample_rate.max(48_000))
+        };
+        if parent.is_some() {
+            crate::vstedit::set_embed_parent(0);
         }
+        opened
     }
 
     // ------------------------------------------------ v23 editor crash guard
@@ -10195,6 +10220,114 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------- W8b embed
+    //
+    // Windows embed mode (opt-in `SLOOPER_WIN_EMBED`, inert on Linux): the
+    // plugin containers are child HWNDs under the main window, so slooper
+    // draws their chrome here — a movable, non-resizable egui window whose
+    // content area the container is pinned to. The plugin still owns its
+    // size exactly like on the top-level path (`editor_size()` drives the
+    // area; plugin-side resizes flow through the existing pumps and the
+    // chrome follows next frame). Closing the chrome goes through the SAME
+    // protocol as a user closing the W8a top-level window —
+    // `request_wm_delete` -> pump teardown -> `reap_vst_editors` harvest —
+    // so state persistence has one path, not two.
+    //
+    // Known p1 limits (p2 = v47 dock integration): chrome is a free float,
+    // not a dock slot; egui popups open UNDER the native child (it paints
+    // over the GL surface); one pixels_per_point app-wide (the container
+    // rect multiplies it in).
+
+    fn embed_editors_pass(&mut self, ctx: &egui::Context) {
+        if !crate::vstedit::embed_requested() || self.embed_hwnd.is_none() {
+            return;
+        }
+        let ppp = ctx.pixels_per_point();
+        let mut live: Vec<u64> = Vec::new();
+        for t in self.vst_editors.keys().copied().collect::<Vec<_>>() {
+            let Some(w) = self.vst_editors.get(&t) else { continue };
+            let (xid, size, painted) = (w.xid(), w.editor_size(), w.painted());
+            let stem = std::path::Path::new(w.path())
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "synth".into());
+            live.push(xid);
+            self.embed_chrome(ctx, format!("SYNTH EDITOR \u{2014} {stem}"), xid, size, painted, ppp);
+        }
+        for k in self.fx_vst_editors.keys().copied().collect::<Vec<_>>() {
+            let Some(w) = self.fx_vst_editors.get(&k) else { continue };
+            let (xid, size, painted) = (w.xid(), w.editor_size(), w.painted());
+            let stem = std::path::Path::new(w.path())
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "fx".into());
+            live.push(xid);
+            self.embed_chrome(
+                ctx,
+                format!("FX EDITOR \u{2014} {stem}"),
+                xid,
+                size,
+                painted,
+                ppp,
+            );
+        }
+        self.embed_sync.retain(|xid, _| live.contains(xid));
+    }
+
+    /// One chrome window + rect sync for one embed container. `xid == 0`
+    /// means the GUI thread has not created the container yet — nothing to
+    /// pin, the pump reports paint verdicts via the existing shared flags.
+    fn embed_chrome(
+        &mut self,
+        ctx: &egui::Context,
+        title: String,
+        xid: u64,
+        size: (i32, i32),
+        painted: bool,
+        ppp: f32,
+    ) {
+        if xid == 0 {
+            return;
+        }
+        let mut open = true;
+        let shown = egui::Window::new(title)
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if !painted {
+                    ui.label("waiting for the plugin to draw\u{2026}");
+                }
+                let want = egui::vec2(size.0.max(8) as f32, size.1.max(8) as f32);
+                // The allocated content rect IS the container's slot: the
+                // plugin owns its size, the chrome only follows.
+                ui.allocate_at_least(want, egui::Sense::hover()).1.rect
+            });
+        if !open {
+            // The chrome's X IS the window-manager close: same WM_CLOSE
+            // protocol as the top-level container, so teardown order and
+            // the reaper's harvest stay identical across modes.
+            crate::vstedit::request_wm_delete(xid);
+            return;
+        }
+        if let Some(rect) = shown.and_then(|ir| ir.inner) {
+            let geo = (
+                (rect.min.x * ppp).round() as i32,
+                (rect.min.y * ppp).round() as i32,
+                (rect.width() * ppp).round().max(8.0) as i32,
+                (rect.height() * ppp).round().max(8.0) as i32,
+            );
+            if self.embed_sync.get(&xid) != Some(&geo) {
+                self.embed_sync.insert(xid, geo);
+                // Containers are owned by the vst2-gui thread; a direct
+                // SetWindowPos from here could block behind plugin code.
+                crate::vsthost::post(move || {
+                    crate::vstedit::set_container_rect(xid, geo.0, geo.1, geo.2, geo.3);
+                });
+            }
+        }
+    }
+
     /// v20 (user report: presets picked inside a plugin's own window did
     /// nothing): a VST3 editor drives a SHADOW instance. Sliders reach the
     /// sound through the cell mirror, but preset/patch changes never
@@ -12077,6 +12210,14 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // W8b (Windows): remember the main window's HWND — this thread
+        // owns the winit window, so the enumeration cannot pick up a
+        // plugin container (they live on the vst2-gui thread). Retry while
+        // None (the window appears asynchronously at startup). Inert on
+        // Linux: `main_thread_hwnd()` answers None there.
+        if self.embed_hwnd.is_none() {
+            self.embed_hwnd = crate::vstedit::main_thread_hwnd();
+        }
         ctx.set_zoom_factor(self.gui_scale);
         // Keep the update loop ticking so backend events (MIDI, port
         // changes, transport) are drained promptly; while the transport
@@ -12164,6 +12305,10 @@ impl eframe::App for App {
         // before the held-drop below, so `effEditClose` always precedes
         // plugin teardown.
         self.reap_vst_editors();
+        // W8b: Windows embed mode — draw the chrome of every embedded
+        // plugin editor and mirror its rect into the child HWND. Early
+        // return on Linux (`embed_requested()` is false there).
+        self.embed_editors_pass(ctx);
         // v22: persist plugin edits while their editors are still open.
         self.tick_plugin_persist();
         // v23: land editor crash-guard probes (open the real window when

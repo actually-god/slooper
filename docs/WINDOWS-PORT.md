@@ -25,8 +25,11 @@ pinned, linker via env override) / windows-native (MSVC build + release
 proof + the w2..w8 port pins incl. all 9 `#[cfg(windows)]` pins + a
 report-only full-suite triage pass). Four OS-assumption bugs and two CI
 harness traps surfaced and fixed by the first real runs — see DONE log.
-NEXT: W8b (child-HWND docking under the winit HWND — the remaining half
-of the W8 task entry); then W9 (Windows MIDI). The report-only Windows
+W8b-p1 DONE 2026-11-10 (session 10): the embed core — opt-in
+`SLOOPER_WIN_EMBED` turns plugin containers into `WS_CHILD`s under the
+winit HWND with slooper-drawn chrome; Linux stays top-level (seam inert,
+pinned both ways). NEXT: W8b-p2 (v47 dock integration — see the W8b
+checklist); W9 (Windows MIDI) can interleave. The report-only Windows
 suite in every run is the grow-list for future W-tasks (make Windows pins
 blocking as they stabilize).
 
@@ -337,9 +340,13 @@ Acceptance: builds + non-X11 codepaths pinned where possible; manual smoke
 checklist for user hardware.
 - [x] **W8a DONE 2026-11-10 (session 8, `9642a03`)** — top-level container
   per plugin on Win32 (details: DONE log entry below)
-- [ ] W8b: child-HWND embedding under the winit HWND (in-window editor
-  dock; today Windows editors are separate top-level windows — the same
-  model Linux had before the in-window work, fully usable)
+- [x] **W8b p1 DONE 2026-11-10 (session 10, see DONE log)** — embed core:
+  opt-in (`SLOOPER_WIN_EMBED`) `WS_CHILD` containers under the winit HWND,
+  egui chrome + rect sync from ui.rs, twin seam + functional pins
+- [ ] **W8b p2 (next)** — v47 dock integration: native editors become
+  dockable members (DynKind or equivalent), tab groups, float <-> embed
+  toggle (SetParent reparent), hide policy under egui popups/menus,
+  per-monitor DPI, Config field replacing the env gate
 
 ### W9 — Windows MIDI
 `midir` (WinMM) devices feeding the existing MidiMsg pipeline; picker in the
@@ -532,4 +539,43 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   that list in later sessions.
   Gates (Linux host): w2_..w8_ 35/35, host + gnullvm `--all-targets` clean,
   clippy-zero, e2e untouched.
+
+- **2026-11-10 session 10 — W8b p1**: Windows embed core — opt-in
+  `SLOOPER_WIN_EMBED` (live env read, empty=unset, parity with
+  SLOOPER_SCAN_INLINE) turns plugin containers into frameless `WS_CHILD`s
+  under the winit main HWND; slooper draws the chrome (a non-resizable egui
+  window whose content rect IS the container slot) and syncs geometry via
+  one embed-aware `create_container` helper shared by BOTH generations
+  (VST2 `make_editor` + VST3 `make_editor3`; the old inline
+  CreateWindowExW blocks are gone — no second creation path to drift).
+  Seam = 4 functions on the twin surface: `embed_requested` (x11: always
+  false — Linux editors stay top-level, frozen), `set_embed_parent`
+  (process-global by design: `on_gui_thread` blocking gives the
+  happens-before edge, the wrap in ui.rs `plugin_window_open` is strictly
+  ordered per open), `set_container_rect` (synchronous, callers off the
+  GUI thread MUST route via `vsthost::post` — the ui.rs pin enforces it),
+  `main_thread_hwnd` (EnumThreadWindows on the UI thread: largest visible,
+  titled, unowned, non-tool window = the main window; containers live on
+  the vst2-gui thread so they can never be picked). Parent client origin ==
+  child window origin (no non-client area: `style_of()` feeds
+  AdjustWindowRect WS_CHILD for embed, frame_style() otherwise). Chrome
+  close = `request_wm_delete` — ONE teardown protocol for both modes
+  (pump + `reap_vst_editors` unchanged). Probe mode still never
+  WS_VISIBLE, in either mode. Known p1 limits (p2 scope): chrome is a free
+  float not a dock slot, egui popups can open UNDER the native child,
+  one app-wide pixels_per_point, env gate (p2: Config field).
+  Pins: `w8b_x11_embed_api_inert` + `w8b_embed_wiring_is_seamed` (Linux,
+  runs in every CI job) + six `cfg(all(test, windows))` functional pins in
+  win32.rs on a real window station (off-screen stand-in parent: child
+  style/parentage/origin, rect sync exact incl. move-only semantics, probe
+  mode unseen, WM_CLOSE protocol on a child, hwnd-finder honesty);
+  `#[cfg(windows)]` gate pin asserts env semantics. CI lore: the
+  port-pins filter is substring-matched — `w8_` does NOT catch `w8b_*`,
+  workflow extended with `w8b_` (comment added at the filter).
+  Gates (Linux host, this session): host check + gnullvm `--all-targets`
+  clean (embed_tests module sabotage-proven to compile on the cross
+  target); port pins w2..w8b 37/37; vstedit chunk 22/22 (needs
+  XAUTHORITY from a DE /proc environ — bare agent shells fail its x11
+  tests with "Authorization required"); clippy-zero. Windows functional
+  truth = the native CI run (w8b_ now blocking).
 

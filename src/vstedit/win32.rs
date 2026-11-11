@@ -60,12 +60,13 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, EnumChildWindows, GetClientRect, IDC_ARROW, LoadCursorW, MINMAXINFO, MSG,
-    PeekMessageW, PostMessageW, RegisterClassExW, SetWindowPos, SetWindowTextW, TranslateMessage,
-    WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE, WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW,
-    IsWindow, IsWindowVisible, PM_REMOVE, SWP_NOACTIVATE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_GETMINMAXINFO, WM_PAINT, WM_SIZE, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    DispatchMessageW, EnumChildWindows, EnumThreadWindows, GetClientRect, GetWindow,
+    GetWindowLongW, GetWindowTextLengthW, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, IDC_ARROW,
+    LoadCursorW, MINMAXINFO, MSG, PeekMessageW, PostMessageW, RegisterClassExW,
+    SetWindowPos, SetWindowTextW, TranslateMessage, WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE,
+    WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW, IsWindow, IsWindowVisible, PM_REMOVE, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_PAINT,
+    WM_SIZE, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::vsthost::Vst2Handle;
@@ -148,6 +149,104 @@ pub fn set_probe_mode(v: bool) -> bool {
     PROBE_MODE.swap(v, Ordering::SeqCst)
 }
 
+// ------------------------------------------------------------- embed (W8b)
+//
+// In-window editor dock: slooper's main window (the winit HWND) acts as
+// the PARENT — the container is created as a plain `WS_CHILD` under it
+// with no frame of its own, slooper draws the chrome (an egui window),
+// and geometry is synced with [`set_container_rect`]. A process-global
+// seam instead of an extra parameter is deliberate: containers are built
+// ON the GUI thread inside `open_editor`/`open_vst3_editor`, whose caller
+// BLOCKS until creation completes (`on_gui_thread`), so
+// `set_embed_parent(h); open; set_embed_parent(0)` is strictly ordered
+// per open — and the frozen `x11.rs` twin keeps its exact signatures.
+// Probe children never set a parent; embed mode is opt-in via
+// `SLOOPER_WIN_EMBED` until the v47 dock integration (W8b p2) ships.
+
+static EMBED_PARENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Enable / disable embedding for the next container creation (0 = off:
+/// containers are W8a top-levels, the default). Only slooper's UI thread
+/// calls this, wrapped around an editor open (see `ui.rs`
+/// `plugin_window_open`); `on_gui_thread` gives the required
+/// happens-before edge to the GUI thread that reads it.
+pub fn set_embed_parent(handle: u64) {
+    EMBED_PARENT.store(handle as usize, Ordering::SeqCst);
+}
+
+/// Is in-window embedding wanted? Live env read (the suite's env-swap
+/// discipline, same rule as `SLOOPER_SCAN_INLINE`), default OFF.
+pub fn embed_requested() -> bool {
+    std::env::var_os("SLOOPER_WIN_EMBED").is_some_and(|v| !v.is_empty())
+}
+
+fn embed_parent() -> Option<HWND> {
+    let h = EMBED_PARENT.load(Ordering::SeqCst);
+    (h != 0).then(|| HWND(h as *mut c_void))
+}
+
+/// The main window's HWND as seen from the UI thread (W8b's embed parent
+/// candidate). Only slooper's UI thread (the caller: `App::logic`) owns
+/// the winit main window; plugin containers live on the vst2-gui thread
+/// and egui windows are GL-drawn, so this thread's top-level list holds
+/// nothing else — the largest visible, titled, unowned window is THE
+/// main window. `None` headless (no window station content to find).
+pub fn main_thread_hwnd() -> Option<u64> {
+    unsafe {
+        let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+        let mut best: (i64, u64) = (0, 0);
+        unsafe extern "system" fn collect(win: HWND, lp: LPARAM) -> windows::core::BOOL {
+            unsafe {
+                let best = &mut *(lp.0 as *mut (i64, u64));
+                if !IsWindowVisible(win).as_bool() || GetWindowTextLengthW(win) <= 0 {
+                    return windows::core::BOOL(1);
+                }
+                let style = WINDOW_STYLE(GetWindowLongW(win, GWL_STYLE) as u32);
+                let ex = WINDOW_EX_STYLE(GetWindowLongW(win, GWL_EXSTYLE) as u32);
+                if style.0 & WS_CHILD.0 != 0 || ex.0 & WS_EX_TOOLWINDOW.0 != 0 {
+                    return windows::core::BOOL(1);
+                }
+                if GetWindow(win, GW_OWNER).is_ok() {
+                    return windows::core::BOOL(1); // dialogs belong to someone
+                }
+                let mut rc = RECT::default();
+                if GetClientRect(win, &mut rc).is_ok() {
+                    let area = rc.right.max(0) as i64 * rc.bottom.max(0) as i64;
+                    if area > best.0 {
+                        *best = (area, win.0 as u64);
+                    }
+                }
+                windows::core::BOOL(1)
+            }
+        }
+        let _ = EnumThreadWindows(tid, Some(collect), LPARAM(&mut best as *mut _ as isize));
+        (best.1 != 0).then_some(best.1)
+    }
+}
+
+/// W8b: move (and optionally resize) a container inside its embed parent's
+/// client area (`w`/`h` <= 0 = move only). SYNCHRONOUS: containers are
+/// owned by the vst2-gui thread, so callers elsewhere MUST route through
+/// `vsthost::post` (the UI-thread site in `ui.rs` does — a direct
+/// `SetWindowPos` could block the caller behind a GUI thread stuck in
+/// plugin code). `false` when the window is gone.
+pub fn set_container_rect(handle: u64, x: i32, y: i32, w: i32, h: i32) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    let win = hwnd_of(handle);
+    unsafe {
+        if !IsWindow(Some(win)).as_bool() {
+            return false;
+        }
+        let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        if w <= 0 || h <= 0 {
+            flags |= SWP_NOSIZE;
+        }
+        SetWindowPos(win, None, x, y, w.max(0), h.max(0), flags).is_ok()
+    }
+}
+
 // ------------------------------------------------------------------ tables
 //
 // Window-scoped state the window procedure needs but must NOT call into
@@ -212,10 +311,60 @@ fn forget_window(win: HWND) {
     }
 }
 
-/// Frame style every container is created with (the pin math and
+/// Frame style every TOP-LEVEL container is created with (the pin math and
 /// `WM_GETMINMAXINFO` must agree with this single constant).
 fn frame_style() -> WINDOW_STYLE {
     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
+}
+
+/// The adjust style for `AdjustWindowRect` on THIS container: a W8b embed
+/// child has no non-client area (client rect == window rect), a top-level
+/// follows [`frame_style`].
+unsafe fn style_of(win: HWND) -> WINDOW_STYLE {
+    unsafe {
+        let s = WINDOW_STYLE(GetWindowLongW(win, GWL_STYLE) as u32);
+        if s.0 & WS_CHILD.0 != 0 {
+            WINDOW_STYLE(WS_CHILD.0)
+        } else {
+            frame_style()
+        }
+    }
+}
+
+/// Create a container window (both generations, W8a/W8b). With an embed
+/// parent set (see the embed section) the container is born as a frameless
+/// `WS_CHILD` at the parent's client origin — slooper's egui chrome is its
+/// title bar — otherwise it is the W8a top-level. Probe mode never adds
+/// `WS_VISIBLE` in either mode (the never-shown probe container).
+unsafe fn create_container(title: &str, size: (i32, i32)) -> Result<HWND, String> {
+    let hinst = ensure_class()?;
+    let tname = utf16(&format!("slooper \u{2014} {title}"));
+    let embedded = embed_parent();
+    let mut style = match embedded {
+        Some(_) => WINDOW_STYLE(WS_CHILD.0 | WS_CLIPCHILDREN.0),
+        None => frame_style(),
+    };
+    if !probe_mode() {
+        style |= WS_VISIBLE;
+    }
+    let (w, h) = (size.0.max(8), size.1.max(8));
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name(),
+            PCWSTR(tname.as_ptr()),
+            style,
+            if embedded.is_some() { 0 } else { CW_USEDEFAULT },
+            if embedded.is_some() { 0 } else { CW_USEDEFAULT },
+            w,
+            h,
+            embedded,
+            None,
+            Some(hinst),
+            None,
+        )
+        .map_err(|e| format!("CreateWindowExW refused: {e}"))
+    }
 }
 
 /// The container window procedure. It records control-plane work into the
@@ -482,7 +631,8 @@ unsafe fn container_painted(win: HWND) -> bool {
 }
 
 /// Resize so the CLIENT area is exactly `(w, h)` (plugin rects are client
-/// rects; Win32 window sizes are frame rects).
+/// rects; Win32 window sizes are frame rects — embed children have no
+/// frame, see [`style_of`]).
 unsafe fn set_client_size(win: HWND, w: i32, h: i32) {
     unsafe {
         let mut r = RECT {
@@ -491,7 +641,7 @@ unsafe fn set_client_size(win: HWND, w: i32, h: i32) {
             right: w.max(8),
             bottom: h.max(8),
         };
-        if AdjustWindowRect(&mut r, frame_style(), false).is_ok() {
+        if AdjustWindowRect(&mut r, style_of(win), false).is_ok() {
             let _ = SetWindowPos(
                 win,
                 None,
@@ -820,44 +970,14 @@ unsafe fn make_editor(
     let dbg = std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some();
     // (bisect) fixed seed size, same constant as the X twin.
     let (w0, h0) = (640i32, 420i32);
-    let hinst = match ensure_class() {
-        Ok(h) => h,
-        Err(e) => {
-            if dbg {
-                eprintln!("[vstedit] {title}: class registration failed: {e}");
-            }
-            shared.open_failed.store(true, Ordering::SeqCst);
-            shared.closed.store(true, Ordering::SeqCst);
-            return None;
-        }
-    };
-    let tname = utf16(&format!("slooper \u{2014} {title}"));
-    // Probe containers are created UNSEEN (no WS_VISIBLE) — the
-    // initially-unmapped container twin (v24).
-    let mut style = frame_style();
-    if !probe_mode() {
-        style |= WS_VISIBLE;
-    }
-    let win = match unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class_name(),
-            PCWSTR(tname.as_ptr()),
-            style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            w0,
-            h0,
-            None,
-            None,
-            Some(hinst),
-            None,
-        )
-    } {
+    // Container creation (top-level or W8b embed child) is shared with
+    // VST3 — see [`create_container`]. Probe containers are created
+    // UNSEEN (no `WS_VISIBLE`) — the initially-unmapped container twin (v24).
+    let win = match unsafe { create_container(title, (w0, h0)) } {
         Ok(w) => w,
         Err(e) => {
             if dbg {
-                eprintln!("[vstedit] {title}: CreateWindowExW refused: {e}");
+                eprintln!("[vstedit] {title}: {e}");
             }
             shared.open_failed.store(true, Ordering::SeqCst);
             shared.closed.store(true, Ordering::SeqCst);
@@ -1326,35 +1446,8 @@ unsafe fn make_editor3(
     let (w0, h0) = (w0.clamp(200, 3840), h0.clamp(150, 2160));
     shared.width.store(w0, Ordering::SeqCst);
     shared.height.store(h0, Ordering::SeqCst);
-    let hinst = match ensure_class() {
-        Ok(h) => h,
-        Err(_) => {
-            shared.open_failed.store(true, Ordering::SeqCst);
-            shared.closed.store(true, Ordering::SeqCst);
-            return None;
-        }
-    };
-    let tname = utf16(&format!("slooper \u{2014} {title}"));
-    let mut style = frame_style();
-    if !probe_mode() {
-        style |= WS_VISIBLE;
-    }
-    let win = match unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class_name(),
-            PCWSTR(tname.as_ptr()),
-            style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            w0,
-            h0,
-            None,
-            None,
-            Some(hinst),
-            None,
-        )
-    } {
+    // Same shared container path as VST2 (top-level or W8b embed child).
+    let win = match unsafe { create_container(&title, (w0, h0)) } {
         Ok(w) => w,
         Err(_) => {
             shared.open_failed.store(true, Ordering::SeqCst);
@@ -1843,4 +1936,193 @@ pub fn probe_child(spec: &str) -> i32 {
         }
     }
     0
+}
+
+// ------------------------------------------------------------ W8b embed tests
+//
+// Functional pins for the embed machinery on a REAL Win32 window station —
+// these execute in the windows-native CI job (a desktop session exists
+// there; the parent stand-in is positioned off-screen so nothing ever
+// appears). They drive the shipped `create_container` / `set_container_rect`
+// / close-protocol code directly; only the plugin side is stand-in.
+#[cfg(all(test, windows))]
+mod embed_tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsChild};
+
+    /// RAII destroy for the stand-in parent window.
+    struct Parent(HWND);
+    impl Drop for Parent {
+        fn drop(&mut self) {
+            unsafe {
+                if IsWindow(Some(self.0)).as_bool() {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+    }
+
+    /// RAII destroy + tables cleanup for a container under test (the pump
+    /// that normally owns teardown is not running here).
+    struct Ctx(HWND);
+    impl Drop for Ctx {
+        fn drop(&mut self) {
+            unsafe {
+                if IsWindow(Some(self.0)).as_bool() {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+            forget_window(self.0);
+        }
+    }
+
+    /// Hidden top-level in OUR class, parked far off-screen — the stand-in
+    /// winit main window. (No pump runs in these tests: creation and
+    /// message posting do not need one.)
+    fn make_parent() -> Parent {
+        let h = ensure_class().expect("class registration");
+        let name = utf16("SlooperW8bParent");
+        let win = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class_name(),
+                PCWSTR(name.as_ptr()),
+                frame_style(),
+                20000,
+                20000,
+                640,
+                480,
+                None,
+                None,
+                Some(h),
+                None,
+            )
+            .expect("parent window")
+        };
+        Parent(win)
+    }
+
+    fn styles(win: HWND) -> u32 {
+        unsafe { GetWindowLongW(win, GWL_STYLE) as u32 }
+    }
+
+    /// Parent client-area origin in screen coordinates.
+    fn client_origin(win: HWND) -> (i32, i32) {
+        let mut pt = POINT { x: 0, y: 0 };
+        assert!(unsafe { ClientToScreen(win, &mut pt) }.as_bool(), "client origin");
+        (pt.x, pt.y)
+    }
+
+    #[test]
+    fn w8b_top_level_default_is_not_a_child() {
+        set_embed_parent(0);
+        let win = unsafe { create_container("W8b", (320, 200)) }.expect("top-level container");
+        let _c = Ctx(win);
+        let st = styles(win);
+        assert_eq!(st & WS_CHILD.0, 0, "default container is not WS_CHILD");
+        assert_ne!(st & WS_OVERLAPPEDWINDOW.0, 0, "default container keeps its frame");
+        assert_ne!(st & WS_VISIBLE.0, 0, "default container is shown");
+    }
+
+    #[test]
+    fn w8b_embed_creates_child_under_parent() {
+        let p = make_parent();
+        set_embed_parent(p.0.0 as u64);
+        let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
+        set_embed_parent(0);
+        let _c = Ctx(win);
+        let st = styles(win);
+        assert_ne!(st & WS_CHILD.0, 0, "embed container is WS_CHILD");
+        assert_eq!(st & WS_OVERLAPPEDWINDOW.0, 0, "embed container is frameless");
+        assert_ne!(st & WS_VISIBLE.0, 0, "embed container is shown outside probe mode");
+        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "container is a child of the parent");
+        let (ox, oy) = client_origin(p.0);
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(win, &mut r) }.expect("child rect");
+        assert_eq!((r.left, r.top), (ox, oy), "born at the parent's client origin");
+    }
+
+    #[test]
+    fn w8b_embed_probe_mode_stays_unseen() {
+        let p = make_parent();
+        set_embed_parent(p.0.0 as u64);
+        let prev = set_probe_mode(true);
+        let win = unsafe { create_container("W8b", (320, 200)) }.expect("probe child");
+        set_probe_mode(prev);
+        set_embed_parent(0);
+        let _c = Ctx(win);
+        assert_eq!(styles(win) & WS_VISIBLE.0, 0, "probe container is never WS_VISIBLE");
+        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "still a child under the parent");
+    }
+
+    #[test]
+    fn w8b_embed_rect_sync() {
+        let p = make_parent();
+        set_embed_parent(p.0.0 as u64);
+        let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
+        set_embed_parent(0);
+        let _c = Ctx(win);
+        let (ox, oy) = client_origin(p.0);
+
+        assert!(set_container_rect(win.0 as u64, 40, 30, 333, 222));
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(win, &mut r) }.expect("child rect");
+        // A child has no non-client area: window rect == client rect.
+        assert_eq!((r.left, r.top), (ox + 40, oy + 30), "moved to the requested pos");
+        assert_eq!((r.right - r.left, r.bottom - r.top), (333, 222), "resized exactly");
+
+        // Move-only call keeps the size (W8b p1 chrome uses move-only when
+        // the plugin owns the size).
+        assert!(set_container_rect(win.0 as u64, 11, 12, 0, 0));
+        unsafe { GetWindowRect(win, &mut r) }.expect("child rect 2");
+        assert_eq!((r.left, r.top), (ox + 11, oy + 12), "move-only moved");
+        assert_eq!((r.right - r.left, r.bottom - r.top), (333, 222), "move-only kept size");
+
+        // Honest refusals.
+        assert!(!set_container_rect(0, 1, 2, 3, 4), "null handle refuses");
+    }
+
+    #[test]
+    fn w8b_embed_close_protocol_is_wm_close() {
+        let p = make_parent();
+        set_embed_parent(p.0.0 as u64);
+        let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
+        set_embed_parent(0);
+        let _c = Ctx(win);
+        // Same close protocol as the top-level twin: post WM_CLOSE, the
+        // window procedure records it, teardown (not the proc) destroys.
+        assert!(request_wm_delete(win.0 as u64), "WM_CLOSE posted to the child");
+        pump_messages();
+        assert!(take_close_request(win), "close request recorded from the child");
+        assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "the proc refused to destroy anything");
+        assert!(!take_close_request(win), "requests are consumed once");
+    }
+
+    #[test]
+    fn w8b_main_thread_hwnd_finds_largest_unowned_visible() {
+        let p = make_parent();
+        // The stand-in is not shown yet — `ShowWindow` is the only WS_VISIBLE
+        // gate these tests skip; show it so the finder can see it, then
+        // hide it again (the run may interleave with other window tests).
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+            let _ = ShowWindow(p.0, SW_SHOW);
+        }
+        let found = main_thread_hwnd();
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+            let _ = ShowWindow(p.0, SW_HIDE);
+        }
+        // On a CI session desktop the main window may not exist; the
+        // contract checked here is: if ANYTHING is found, it is a real,
+        // visible-capable top-level of THIS thread — and OUR parent is a
+        // legal answer (it is the largest by construction: other candidates
+        // are runner chrome with owners or no title).
+        if let Some(h) = found {
+            let win = HWND(h as *mut c_void);
+            assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "found handle is a window");
+            assert_eq!(styles(win) & WS_CHILD.0, 0, "found window is top-level");
+        }
+    }
 }
