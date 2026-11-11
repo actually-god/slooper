@@ -602,3 +602,18 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   w8b_+w2_+w4_ 14/14, config chunk 12/12, clippy-zero. Linux suite +
   Windows native truth = CI run at this commit.
 
+- **2026-11-10 session 11b — W8b native first-contact fix**: Windows pins
+  run 42944046656 = 36 pass / 2 fail, both "container is shown" asserts.
+  MEASURED FACT: on the GitHub Windows runner, `CreateWindowExW` honors
+  every requested style bit EXCEPT that the live style never reports
+  `WS_VISIBLE` (both top-level and child; the `WS_CHILD`/frameless/
+  IsChild/geometry/WM_CLOSE asserts all passed natively). Asserting the
+  OS kept WS_VISIBLE tested the runner, not the code — requested style
+  extracted to pure `container_style(embedded, probe)` +
+  `w8b_container_style_matrix` pins it directly; the two OS-retention
+  asserts dropped (probe-unseen assert kept: stays valid on real desktops
+  and can never false-pass there). Production style logic UNCHANGED
+  (mechanical extract). Runner lore: on native Windows CI, style-presence
+  asserts are only legal for OS-retained bits (`WS_CHILD`, frame bits);
+  show-state needs a real desktop — never test it in CI.
+
