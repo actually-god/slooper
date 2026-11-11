@@ -123,6 +123,11 @@ mod seam_tests {
             // dock integration.
             "set_container_visible",
             "embed_parent_origin",
+            // W8b p2-c: detach/re-dock toggle (win32 = the SetParent dance,
+            // x11 = documented inert; the live window style is the state).
+            "detach_to_toplevel",
+            "redock_to_embed",
+            "container_is_detached",
         ]
         .into_iter()
         .map(String::from)
@@ -207,6 +212,12 @@ mod seam_tests {
         // them never runs on Linux, and even if it did: no-ops).
         assert!(!crate::vstedit::set_container_visible(0x1234, false));
         assert_eq!(crate::vstedit::embed_parent_origin(0x1234), (0, 0));
+        // W8b p2-c: the detach toggle is equally inert — there is no embed
+        // machinery here, so nothing detaches, nothing re-docks, and
+        // nothing ever reads as detached.
+        assert!(!crate::vstedit::detach_to_toplevel(0x1234));
+        assert!(!crate::vstedit::redock_to_embed(0x1234));
+        assert!(!crate::vstedit::container_is_detached(0x1234));
         match had {
             Some(v) => std::env::set_var("SLOOPER_WIN_EMBED", v),
             None => std::env::remove_var("SLOOPER_WIN_EMBED"),
@@ -234,6 +245,11 @@ mod seam_tests {
         // W8b p2-b honest refusals on the null HWND.
         assert!(!crate::vstedit::set_container_visible(0, true));
         assert_eq!(crate::vstedit::embed_parent_origin(0), (0, 0));
+        // W8b p2-c honest refusals on the null HWND (the full round trip
+        // lives in the win32 `w8c_*` functional pins).
+        assert!(!crate::vstedit::detach_to_toplevel(0));
+        assert!(!crate::vstedit::redock_to_embed(0));
+        assert!(!crate::vstedit::container_is_detached(0));
         match had {
             Some(v) => std::env::set_var("SLOOPER_WIN_EMBED", v),
             None => std::env::remove_var("SLOOPER_WIN_EMBED"),
@@ -333,6 +349,54 @@ mod seam_tests {
         assert!(
             ui.contains("egui::Order::Foreground") && ui.contains("free_drag.is_some()"),
             "hide policy must consider open popups and window carries"
+        );
+        // W8b p2-c: the detach toggle. Placeholder body gates on the LIVE
+        // style and posts the re-dock; the slot menu row goes through the
+        // kind filter; the sync pass must keep both hands off detached
+        // containers. As in p2-b, assert CALLS (thread-rule window
+        // included), not patterns a definition could satisfy vacuously.
+        let eb = ui.find("fn embed_body").expect("embed body");
+        let ebw = &ui[eb..(eb + 1800).min(ui.len())];
+        assert!(
+            ebw.contains("crate::vstedit::container_is_detached(xid)"),
+            "embed_body must read the live style for the placeholder"
+        );
+        let rd = ebw.find("redock_to_embed(").expect("placeholder must offer the way back");
+        assert!(
+            ebw[..rd].contains("vsthost::post"),
+            "redock_to_embed must run on the vst2-gui thread via vsthost::post"
+        );
+        assert!(
+            ebw[..rd].contains("dock back into slooper"),
+            "the placeholder must carry its own label"
+        );
+        let sm = ui.find("fn window_slot_menu").expect("slot menu");
+        let smw = &ui[sm..(sm + 3600).min(ui.len())];
+        assert!(
+            smw.contains("native_member_container(app, idx)"),
+            "slot menu must offer detach through the kind filter"
+        );
+        let dt = smw
+            .find("detach_to_toplevel(")
+            .expect("slot menu must detach through the seam");
+        assert!(
+            smw[..dt].contains("vsthost::post"),
+            "detach_to_toplevel must run on the vst2-gui thread via vsthost::post"
+        );
+        assert!(
+            smw.contains("detach to native window"),
+            "the detach row must carry its own label"
+        );
+        let sp = ui.find("fn embed_sync_pass").expect("sync pass");
+        let spw = &ui[sp..(sp + 2600).min(ui.len())];
+        assert!(
+            spw.matches("container_is_detached(").count() >= 2,
+            "sync pass must skip detached containers for BOTH geometry and \
+             visibility (a parent-client coord would teleport a top-level)"
+        );
+        assert!(
+            spw.contains("self.embed_sync.remove(&xid)"),
+            "detaching must drop the geometry-diff entry so re-dock re-lands the slot rect"
         );
     }
 }

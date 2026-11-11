@@ -10261,9 +10261,14 @@ impl App {
     // `request_wm_delete` -> pump teardown -> `reap_vst_editors` harvest —
     // so state persistence has one path, not two. While a menu/popup is
     // open or a window is carried, the hide policy blanks the containers
-    // (native children paint over egui's GL surface). Still open (p2-c /
-    // W12): SetParent toggle to a native top-level window, per-monitor
-    // DPI (one app-wide pixels_per_point, plugin px treated as logical).
+    // (native children paint over egui's GL surface). W8b p2-c added the
+    // detach toggle: the slot menu sends a member to its own top-level
+    // window (the LIVE window style is the state — no second bookkeeping),
+    // the chrome slot becomes a placeholder, and the detached window's own
+    // title-bar right-click menu docks it back. Still open (W12): full
+    // per-monitor DPI battery (one app-wide pixels_per_point, plugin px
+    // treated as logical; fixed-size containers already refuse the
+    // DPI-scaled size — see `dpi_target`).
 
     /// Embedding is asked for by the Settings switch (config-backed) or
     /// forced by `SLOOPER_WIN_EMBED` (power users / CI, live env read).
@@ -10402,6 +10407,35 @@ impl App {
     /// the offer and the plugin clips inside it — growing past the slot
     /// would paint over the neighbour.
     fn embed_body(&mut self, ui: &mut egui::Ui, xid: u64, size: (i32, i32), painted: bool) {
+        // W8b p2-c: a container the user DETACHED (or a native editor that
+        // never lived inside the chrome) is not ours to position or hide —
+        // it is a top-level window with its own frame. The slot becomes a
+        // placeholder offering the way back, and CRUCIALLY records no
+        // slot: the sync pass must never move such a window with
+        // parent-client coordinates. The live style is the truth; the
+        // reverse direction also lives on the native title bar's own
+        // right-click menu (`container_proc`, the class is ours).
+        if xid != 0 && crate::vstedit::container_is_detached(xid) {
+            if ui
+                .button("dock back into slooper")
+                .on_hover_text(
+                    "Re-embed this editor into the dock (its native title bar's right-click \
+                     menu offers the same)",
+                )
+                .clicked()
+            {
+                // Same thread rule as every other window call: containers
+                // belong to the vst2-gui thread.
+                crate::vsthost::post(move || {
+                    crate::vstedit::redock_to_embed(xid);
+                });
+            }
+            ui.label(
+                "the plugin editor is detached: its own native window \u{2014} close it there \
+                 to close the editor",
+            );
+            return;
+        }
         if !painted {
             ui.label("waiting for the plugin to draw\u{2026}");
         }
@@ -10435,6 +10469,10 @@ impl App {
         let rects: Vec<(u64, (i32, i32, i32, i32))> = self
             .embed_slot
             .iter()
+            // W8b p2-c: a container DETACHED after this frame's body drew
+            // its slot must not receive parent-client coordinate syncs —
+            // it is a top-level now and owns its geometry.
+            .filter(|&(xid, _)| !crate::vstedit::container_is_detached(*xid))
             .map(|(xid, r)| {
                 (
                     *xid,
@@ -10463,6 +10501,16 @@ impl App {
         for i in 0..self.embed_live.len() {
             let xid = self.embed_live[i];
             if xid == 0 {
+                continue;
+            }
+            if crate::vstedit::container_is_detached(xid) {
+                // W8b p2-c: a top-level manages its own visibility (the
+                // user minimizes it; the hide policy would fight that).
+                // Drop the geometry-diff entry too: after a re-dock the
+                // window is parked at the parent origin and the slot rect
+                // MUST re-land even if it equals the pre-detach value.
+                self.embed_vis.remove(&xid);
+                self.embed_sync.remove(&xid);
                 continue;
             }
             let want = !busy && self.embed_slot.contains_key(&xid);
@@ -15754,12 +15802,53 @@ fn window_slot_menu(ui: &mut egui::Ui, app: &mut App, idx: usize, done: &mut boo
         *done = true;
         ui.close();
     }
+    // W8b p2-c (Windows embed mode): a native plugin-editor member can
+    // leave the dock system ENTIRELY and become its own top-level window —
+    // past "float out", which stays egui-chrome'd. Re-dock lives on the
+    // detached window's title-bar right-click menu and on the placeholder
+    // chrome (`embed_body`). Structurally Linux-inert: such members are
+    // never registered on Linux, so this row can never materialize there.
+    if let Some(xid) = native_member_container(app, idx) {
+        if ui
+            .button("detach to native window")
+            .on_hover_text(
+                "Give the plugin editor its own top-level window (right-click its title \
+                 bar to dock it back; the dock keeps a placeholder meanwhile)",
+            )
+            .clicked()
+        {
+            // Containers belong to the vst2-gui thread — never touch the
+            // HWND from here.
+            crate::vsthost::post(move || {
+                crate::vstedit::detach_to_toplevel(xid);
+            });
+            *done = true;
+            ui.close();
+        }
+    }
     ui.separator();
     if ui.button("close this window").clicked() {
         set_visible(app, idx, false);
         *done = true;
         ui.close();
     }
+}
+
+/// W8b p2-c: the live container HWND behind a still-EMBEDDED native editor
+/// dock member (`DynKind::Vst`/`VstFx`) — `None` for every other window
+/// kind, for editors whose container is not created yet (xid 0), for
+/// already-detached ones, and ALWAYS `None` on Linux, where these dock
+/// members are never registered (the embed pass early-returns there).
+fn native_member_container(app: &App, idx: usize) -> Option<u64> {
+    if idx < 4 {
+        return None; // primaries are never native editors
+    }
+    let xid = match app.dyn_wins.get(idx - 4)?.kind {
+        DynKind::Vst(t) => app.vst_editors.get(&t)?.xid(),
+        DynKind::VstFx(t, r) => app.fx_vst_editors.get(&(t, r))?.xid(),
+        _ => return None,
+    };
+    (xid != 0 && !crate::vstedit::container_is_detached(xid)).then_some(xid)
 }
 
 /// v47 R3: the COMMAND PALETTE (Ctrl+K) — one search box over everything
