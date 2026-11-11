@@ -75,8 +75,20 @@ reserves `px / live pixels_per_point` via the new pure
 scales). `embed_sync_pass` keeps the LIVE ppp for the pt→physical landing;
 the round trip is px-exact (odd px × 6 scales pinned). Plugin-content
 bitmap rescale stays explicitly deferred (WS_CHILD live-paint).
+W11 DONE 2026-11-11 (session 18, `ede9025` + this ledger commit): release
+machine live — `.github/workflows/release.yml` tag-push PUBLISHES
+`slooper-win64.zip` (MSVC host build; embedded icon + version info proven
+by PE walk of the shipped exe: 5xRT_ICON + RT_GROUP_ICON + RT_VERSION,
+GUI subsystem = no console) + `slooper-<ver>-linux-x86_64.tar.zst` (usr/
+prefix, AUR flow untouched); workflow_dispatch runs the same pipeline as
+a DRAFT — proven live (draft `main` carries both assets). winresource
+icon embed works on EVERY Windows target incl. gnullvm cross (cargo
+reports target_env=gnu there; windres found next to the cross-linker).
+Docs: INSTALL.md Windows section = release front door; PLUGINS.md native
+scan dirs + no-yabridge note. `w11_*` pins x4, ci.yml filter += `w11_`.
 NEXT: W12 remainder (native JACK-on-Windows mode, settings round-trip
-across OSes, minidump story — unpicked) or W11 (releases/packaging).
+across OSes, minidump story — unpicked). The next real version tag
+publishes both assets automatically.
 
 ## Ground rules (apply to every task)
 
@@ -429,11 +441,25 @@ Acceptance: Windows build + API-shape pins; user hardware checklist.
 SLOOPER_NULL_AUDIO; plugin-load/JACK pins cfg-skipped). Full matrix after W6.
 Acceptance: green CI on main.
 
-### W11 — Releases + packaging + docs
+### W11 — Releases + packaging + docs — **DONE 2026-11-11 (session 18, see DONE log)**
 GitHub Release assets: linux tar.zst (existing AUR flow untouched) +
 `slooper-win64.zip` (exe w/ embedded icon via winresource, README), MSVC
 target evaluated, INSTALL.md/PLUGINS.md Windows sections (native VST dirs,
 Build-Tools note, no-yabridge note).
+- [x] `release.yml`: tag v* → published release (generate_release_notes),
+  dispatch → draft; linux tar.zst (usr/ prefix + desktop + icon + docs),
+  `slooper-win64.zip` (exe + README + LICENSE)
+- [x] icon embed: `assets/icon.ico` (256/64/48/32/16 from icon.png) via
+  winresource in build.rs, TARGET-OS gated, catch_unwind best-effort
+- [x] MSVC evaluated: SHIPS from CI's MSVC host (W10 job already proved
+  it green; rc.exe present; same-OS build). gnullvm stays the cross-
+  compile guard only.
+- [x] no-console exe: `#![cfg_attr(target_os = "windows", windows_subsystem
+  = "windows")]` (subsystem=2 verified in the shipped exe)
+- [x] docs: INSTALL.md Windows = release front door; PLUGINS.md Windows
+  native-plugin section (scan-dir set from `windows_vst_dirs`, CLAP
+  conventions, VST_PATH/CLAP_PATH, no-yabridge note)
+- [x] pins `w11_*` x4 (sabotage-proven); ci.yml port filter += `w11_`
 
 ### W12 — Polish battery (each = separate mini-task, pick by pain)
 SetThreadPriority(timeCritical) on RT thread; WASAPI device hot-unplug error
@@ -1019,3 +1045,49 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   (vsthost) + 4 (ui v23) — all `test result: ok`, all exit 0. Windows
   functional truth = the CI run at this commit (Linux-side
   risk surface is the three inert chrome lines + the pure helper).
+
+- 2026-11-11 · session 18 · **W11 releases + packaging + docs**:
+  `build.rs` embeds `assets/icon.ico` (ImageMagick-generated from
+  icon.png: 256/64/48/32/16) via `winresource = 0.1` (unconditional
+  build-dep — a `[target.'cfg(windows)']` build-dep would be gated by
+  the TARGET while build-script `cfg!` is the HOST, so the gate is the
+  runtime check `CARGO_CFG_TARGET_OS == "windows"`). Best-effort by
+  construction: `WindowsResource::new()` probes toolchains and can
+  panic → `catch_unwind` + `cargo:warning`, never a red cross-check.
+  WINRESOURCE LORE: `compile()` returns io::Result (no catch needed
+  there); cargo reports `CARGO_CFG_TARGET_ENV=gnu` EVEN FOR gnullvm,
+  so the GNU/windres path runs on Linux cross-builds too, and 0.1.34
+  locates windres NEXT TO the configured cross-linker — icon embeds
+  proved in the local gnullvm exe AND the CI MSVC exe (PE walk: .rsrc
+  = 5xRT_ICON + RT_GROUP_ICON + RT_VERSION; no RT_MANIFEST — 0.1.34
+  ships none by default, fine: winit sets DPI awareness at runtime).
+  PE-walk offsets if you re-verify: SizeOfOptionalHeader at pe+20,
+  VirtualSize at section+8. `main.rs`:
+  `#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]`
+  — the zip ships console-less (smoke item 1); W7 probe children stay
+  capturable because every spawn site uses `Stdio::piped()` (verified
+  before flipping; the w7 pins pass natively on CI after the change).
+  `release.yml`: three jobs (linux tar.zst usr/-prefix / windows zip /
+  publish); tag v* → published + generated notes, workflow_dispatch →
+  SAME pipeline as draft — run 43117786833 left the DRAFT release
+  `main` with `slooper-win64.zip` (7.1 MB) +
+  `slooper-0.21.0-dev.ede9025-linux-x86_64.tar.zst` (8.6 MB); shipped
+  zip downloaded and resource-walked (subsystem=2, 5xRT_ICON). NOTE:
+  `gh release download` outside the repo dir needs `-R actually-god/
+  slooper`. Docs: INSTALL.md Windows section rewritten as the release
+  front door (zip download, Build-Tools/linker for scripted FX, WASAPI
+  port-picking, MSVC-ships vs gnullvm-guards); PLUGINS.md gains the
+  Windows native-plugin section mirroring `windows_vst_dirs()`.
+  Gates: Linux release build OK, clippy-zero 0; citest monolith 569
+  pass/1 FAIL where the 1 was `chain_window_adds_scanned_plugin_slot`
+  WITHOUT DISPLAY — the cron-shell env class (deterministic 43 s probe
+  timeout headless, passes in 2 s with the documented
+  DISPLAY=:1/WAYLAND_DISPLAY/XAUTHORITY exports; NOT a regression).
+  Isolated pairs 3/3; v36_script_fx_editor_resizes = known open heap
+  class (SIGABRTs even solo). gnullvm `--all-targets` green WITH the
+  new build.rs. CI at `ede9025` (run 43117554371) all three jobs
+  success: linux 570/0 (+isolated 3/3), windows port pins 92/0 (w11_
+  included in the filter), full report-only triage 458 pass/100 fail
+  — baseline was 393/103, grow-list continues. w11_ pins 4/4, each
+  sabotage-proven (gate string, attribute, asset name, ico count byte
+  — every pin reds on its own sabotage only).
