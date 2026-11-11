@@ -24,12 +24,17 @@
 //! * NO_START ethos: no endpoints is `Evt::Unavailable`, an empty patch runs
 //!   no stream (silence), a lost endpoint stops the stream with a Notice and
 //!   the next Apply rebuilds.
-//! * MIDI does not come from this backend (W9 wires WinMM devices into the
-//!   existing MidiMsg pipeline).
+//! * MIDI: WinMM inputs live behind this backend too (W9): midir opens the
+//!   user-selected devices on the manager thread and their per-device
+//!   callback threads push raw events into a `midiin::MidiInQueue`; the RT
+//!   loop drains it into `process_block` each cycle (frame 0 = block start).
+//!   Linux keeps 100% JACK MIDI — none of this compiles there.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
+
+use midir::{MidiInput, MidiInputConnection};
 
 use windows::core::{BSTR, GUID, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
@@ -44,6 +49,8 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
+
+use crate::midiin::{self, MidiInProducer, MidiInQueue};
 
 use super::*;
 
@@ -530,11 +537,13 @@ struct RtCfg {
     in_planes: Vec<Vec<f32>>,
     out_planes: Vec<Vec<f32>>,
     xruns: Arc<AtomicU64>,
+    /// W9: WinMM callbacks push here; drained into `evs` every render cycle.
+    midi: Arc<MidiInQueue>,
 }
 
 impl RtCfg {
     fn run(mut self) {
-        let mut evs: Vec<(u32, Vec<u8>)> = Vec::new(); // W9 will feed WinMM MIDI here
+        let mut evs: Vec<(u32, Vec<u8>)> = Vec::new();
         loop {
             let mut handles: Vec<HANDLE> = vec![self.stop.0, self.render_ev.0];
             handles.extend(self.capture.iter().map(|c| c.ev.0));
@@ -593,6 +602,9 @@ impl RtCfg {
             }
         }
         evs.clear();
+        // W9: raw MIDI that landed since the last cycle (time 0 = applied
+        // at block start; WinMM only offers device-relative ms stamps).
+        self.midi.drain_into(evs);
         let mut ins: [*const f32; MAX_SLOTS] = [std::ptr::null(); MAX_SLOTS];
         let mut outs: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
         for s in 0..MAX_SLOTS {
@@ -710,8 +722,12 @@ pub fn run(
         rt: None,
         rt_stop: None,
         ports_sig: String::new(),
+        midi_q: MidiInQueue::new(),
+        midi_conns: Vec::new(),
+        midi_sig: String::new(),
     };
     session.publish_ports();
+    session.publish_midi();
     let engine = session.engine.clone();
     manager_loop(&cmd_rx, &evt_tx, &engine, sr, &mut session);
     session.teardown();
@@ -733,6 +749,12 @@ struct WasapiSession {
     /// Endpoint-set fingerprint; republish ports only on change so idle
     /// ticks do not churn the UI list.
     ports_sig: String,
+    /// W9: shared MIDI bus (RT drains, WinMM callbacks push).
+    midi_q: Arc<MidiInQueue>,
+    /// Open WinMM devices; their Drop closes the device. Manager thread only.
+    midi_conns: Vec<MidiInputConnection<MidiInProducer>>,
+    /// Label-set fingerprint of the last `Evt::MidiInputs`.
+    midi_sig: String,
 }
 
 impl WasapiSession {
@@ -761,6 +783,45 @@ impl WasapiSession {
         });
     }
 
+    // ---- W9: WinMM MIDI inputs -------------------------------------------
+
+    /// Push the device list to the GUI when it changed (startup, Refresh,
+    /// and idle hot-plug). Opening never happens here — the picker's
+    /// Apply Selection decides that, mirroring the audio port flow.
+    fn publish_midi(&mut self) {
+        if let Ok(labels) = midi_labels() {
+            let sig = labels.join("\u{1}");
+            if sig != self.midi_sig {
+                self.midi_sig = sig;
+                let _ = self.evt_tx.try_send(Evt::MidiInputs(labels));
+            }
+        }
+    }
+
+    /// Open exactly `sel` (closing everything slooper had). The picker's
+    /// own label list rides back so it can stay truthful after Apply.
+    fn apply_midi(&mut self, sel: &[String], tx: &SyncSender<Evt>) {
+        self.midi_conns.clear();
+        let (conns, labels, errs, opened) = open_midi_devices(sel, &self.midi_q, &self.midi_drops);
+        self.midi_conns = conns;
+        for e in errs {
+            let _ = tx.try_send(Evt::Error(e));
+        }
+        // The MONITOR panel counts Evt::MidiSources ("sources feeding my
+        // input") — on Windows the opened WinMM devices ARE that set, so
+        // the panel never lies "nothing is being received" while keys
+        // arrive. On Linux the jack path sends its own auto-link list.
+        let _ = tx.try_send(Evt::MidiSources(opened));
+        match labels {
+            Ok(labels) => {
+                let _ = tx.try_send(Evt::MidiInputs(labels));
+            }
+            Err(e) => {
+                let _ = tx.try_send(Evt::Error(format!("MIDI: {e}")));
+            }
+        }
+    }
+
     fn stop_rt(&mut self) {
         if let Some(h) = self.rt_stop.take() {
             unsafe {
@@ -780,9 +841,78 @@ impl WasapiSession {
     }
 }
 
+/// Deduplicated WinMM device labels in enumeration order (midir's winmm
+/// backend lists devices by index, so a label's POSITION is stable across
+/// enumerations — that is what makes suffixed duplicates like
+/// `"KeyLab [2]"` round-trip through `Cmd::SetMidiInputs` back to one
+/// device).
+fn midi_labels() -> Result<Vec<String>, String> {
+    let mi = MidiInput::new("slooper-midi-enum").map_err(|e| e.to_string())?;
+    let raw: Vec<String> = mi
+        .ports()
+        .iter()
+        .filter_map(|p| mi.port_name(p).ok())
+        .collect();
+    Ok(midiin::dedupe_labels(raw))
+}
+
+/// Open every selected WinMM device (free function so Windows CI pins run
+/// the machinery on the real WinMM stack, which a headless runner simply
+/// reports as zero devices — everything must degrade honestly there).
+/// Returns (connections, labels, per-device errors). One `MidiInput`
+/// instance per opening: midir's `connect` consumes it. Callback threads
+/// push into `q`; ring overflows count into `drops`.
+fn open_midi_devices(
+    sel: &[String],
+    q: &Arc<MidiInQueue>,
+    drops: &Arc<AtomicU64>,
+) -> (
+    Vec<MidiInputConnection<MidiInProducer>>,
+    Result<Vec<String>, String>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let labels = match midi_labels() {
+        Ok(l) => l,
+        Err(e) => return (Vec::new(), Err(e), Vec::new(), Vec::new()),
+    };
+    let mut conns = Vec::new();
+    let mut errs = Vec::new();
+    let mut opened = Vec::new();
+    for label in midiin::open_set(&labels, sel) {
+        let Some(pos) = labels.iter().position(|l| *l == label) else {
+            continue;
+        };
+        let mi = match MidiInput::new("slooper-midi-in") {
+            Ok(mi) => mi,
+            Err(e) => {
+                errs.push(format!("MIDI init failed: {e}"));
+                break;
+            }
+        };
+        let ports = mi.ports();
+        let Some(port) = ports.get(pos) else {
+            errs.push(format!("MIDI device \"{label}\" vanished during open"));
+            continue;
+        };
+        let prod = MidiInProducer::new(q.clone(), drops.clone());
+        match mi.connect(port, "slooper", |_ts, bytes, p| p.on_bytes(bytes), prod) {
+            Ok(conn) => {
+                opened.push(label.clone());
+                conns.push(conn);
+            }
+            Err(_) => errs.push(format!(
+                "could not open MIDI input \"{label}\" (another application may hold it)"
+            )),
+        }
+    }
+    (conns, Ok(labels), errs, opened)
+}
+
 impl ManagerBackend for WasapiSession {
     fn refresh(&mut self, _tx: &SyncSender<Evt>) {
         self.publish_ports();
+        self.publish_midi();
     }
 
     fn apply(&mut self, ins: &[String], outs: &[(String, u8)], tx: &SyncSender<Evt>) {
@@ -971,6 +1101,7 @@ impl ManagerBackend for WasapiSession {
             in_planes,
             out_planes,
             xruns: self.xruns.clone(),
+            midi: self.midi_q.clone(),
         };
         self.rt = Some(
             std::thread::Builder::new()
@@ -992,6 +1123,10 @@ impl ManagerBackend for WasapiSession {
         // hot-plug: republish on endpoint-set change; reap an RT thread that
         // died on its own (device lost) so the next Apply can rebuild.
         self.publish_ports();
+        // W9: keep the MIDI picker truthful when a device appears/disappears.
+        // Newly-appearing SELECTED devices are not opened automatically —
+        // same re-Apply discipline as the audio ports.
+        self.publish_midi();
         if self.rt.as_ref().map(|t| t.is_finished()).unwrap_or(false) {
             self.stop_rt();
             let _ = self
@@ -1000,8 +1135,15 @@ impl ManagerBackend for WasapiSession {
         }
     }
 
+    fn set_midi_inputs(&mut self, sel: &[String], tx: &SyncSender<Evt>) {
+        self.apply_midi(sel, tx);
+    }
+
     fn teardown(&mut self) {
         self.stop_rt();
+        // W9: close WinMM devices before the session's Arcs die (Drop does
+        // midiInReset/Stop/Close on this thread — never the RT thread).
+        self.midi_conns.clear();
         self.en = None; // drops the COM object before CoUninitialize
         if self.com_ok {
             unsafe {
@@ -1010,3 +1152,52 @@ impl ManagerBackend for WasapiSession {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// W9 pins (WINDOWS-PORT): the real WinMM machinery. These run in the
+// windows-native CI job and compile under the gnullvm cross-check. A
+// headless runner has midiInGetNumDevs() == 0 — that is exactly the truth
+// being pinned: every WinMM entry point must degrade honestly.
+#[cfg(all(test, windows))]
+mod w9_midi_tests {
+    use super::*;
+
+    #[test]
+    fn w9_winmm_api_lists_devices_cleanly() {
+        let mi = MidiInput::new("slooper-w9-probe").expect("WinMM must initialize");
+        assert_eq!(mi.port_count(), mi.ports().len());
+        for p in mi.ports() {
+            assert!(
+                !mi.port_name(&p).map(|n| n.is_empty()).unwrap_or(true),
+                "every WinMM port must yield a usable name"
+            );
+        }
+        // The label set the picker round-trips is unique no matter how raw
+        // device names repeat.
+        let labels = midi_labels().expect("enumeration must work with zero devices");
+        for (i, a) in labels.iter().enumerate() {
+            assert!(!labels[i + 1..].contains(a), "labels must be unique: {a}");
+        }
+    }
+
+    #[test]
+    fn w9_winmm_unknown_and_empty_selections_open_nothing() {
+        let q = MidiInQueue::new();
+        let drops = Arc::new(AtomicU64::new(0));
+        // Stale / non-existent selections: no connections, no error rows,
+        // and the fresh label list still rides back.
+        let (conns, labels, errs, opened) =
+            open_midi_devices(&["Device That Does Not Exist".to_string()], &q, &drops);
+        assert!(conns.is_empty() && opened.is_empty());
+        assert!(labels.is_ok(), "the picker list must come back: {labels:?}");
+        assert!(errs.is_empty(), "unknown device must be a no-op, not an error");
+        // Empty selection = close everything; idempotent; nothing counted.
+        let (c2, _, e2, o2) = open_midi_devices(&[], &q, &drops);
+        assert!(c2.is_empty() && e2.is_empty() && o2.is_empty());
+        let (c3, _, _, _) = open_midi_devices(&[], &q, &drops);
+        assert!(c3.is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(q.drops(), 0);
+    }
+}
+

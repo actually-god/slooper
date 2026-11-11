@@ -148,6 +148,15 @@ like JACK, slooper never steals a device, and no selection means silence.
    like the docked chrome's X would. On a high-DPI monitor, a fixed-size
    detached editor keeps its plugin size when the window moves to a
    monitor with different scaling (content rescaling is still W12).
+9. **MIDI (W9)**: Settings ▸ MIDI INPUTS lists your WinMM devices (tick
+   boxes, same shape as the audio port lists). Tick a keyboard, Apply
+   Selection — the MIDI MONITOR panel's status line goes live the moment
+   you press a key, and `Note On/Off` messages reach synths and bindings.
+   Unplug and replug: Refresh re-lists the device and re-Apply re-opens
+   it. Quit while a device is open, then open the same device in another
+   app — it must NOT report "still held by slooper" (Drop closes the
+   WinMM handle). Events apply at audio-block granularity (~1–10 ms of
+   inherent latency jitter; sub-block timing is a W12 item).
 
 ## Uninstalling
 

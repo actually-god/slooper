@@ -39,6 +39,15 @@ for future W-tasks (make Windows pins blocking as they stabilize).
 W8b-p2-c DONE 2026-11-11 (session 13, `docs/WINDOWS-PORT.md` DONE log):
 SetParent float<->embed detach. NEXT: W9 (Windows MIDI); per-monitor DPI
 battery + remaining polish = W12.
+W9 DONE 2026-11-11 (session 14): Windows MIDI — WinMM (midir 0.11) devices
+feed `Proc::process_block` through the new OS-neutral `src/midiin.rs` bus
+(lock-free MPMC ring, RT-safe: producer allocates, RT consumer moves);
+`Cmd::SetMidiInputs`/`Evt::MidiInputs`/`Evt::MidiSources(opened)` carry the
+picker contract; Settings ▸ MIDI INPUTS (Windows-gated section) round-trips
+the selection through `Config::win_midi_inputs`. Linux structurally inert:
+JACK never overrides the no-op `ManagerBackend::set_midi_inputs` hook (pinned),
+`jack.rs` contains zero midiin references (pinned). NEXT: W12 (per-monitor
+DPI battery + polish list).
 
 ## Ground rules (apply to every task)
 
@@ -364,10 +373,26 @@ checklist for user hardware.
   dock keeps a placeholder; `WM_DPICHANGED` keeps a fixed-size editor at
   its `effEditRect` size (pure `dpi_target` verdict; full rescale = W12)
 
-### W9 — Windows MIDI
+### W9 — Windows MIDI — **DONE 2026-11-11 (session 14, see DONE log)**
 `midir` (WinMM) devices feeding the existing MidiMsg pipeline; picker in the
 Ports window (same UI shape as port lists). Linux stays 100% JACK MIDI.
 Acceptance: Windows build + API-shape pins; user hardware checklist.
+- [x] `src/midiin.rs`: OS-neutral lock-free MPMC event ring + producer +
+      label dedupe/selection math (all `w9_ring_*`/`w9_open_set`/`w9_dedupe`
+      pins execute on every OS)
+- [x] `Cmd::SetMidiInputs` / `Evt::MidiInputs` / no-op
+      `ManagerBackend::set_midi_inputs` default hook; manager_loop routes
+      (source-pinned; jack.rs proven free of any override / midiin reference)
+- [x] wasapi.rs: `open_midi_devices` (one MidiInput per open — midir's
+      `connect` consumes it), publish on startup/Refresh/idle hot-plug,
+      teardown closes devices; RT loop drains the bus into `process_block`
+      each cycle (frame 0 = block start; sub-block timing deferred W12)
+- [x] Settings ▸ MIDI INPUTS picker (Windows-gated `cfg!(windows)` section),
+      `Config::win_midi_inputs` persistence + launch re-Apply
+- [x] pins `w9_*` x13 Linux + x2 Windows-only functional (WinMM API shape,
+      honest degradation at 0 devices on CI runners); sabotage-verified;
+      ci.yml port-pin filter grew `w9_` (substring trap)
+- [x] docs: INSTALL.md smoke item 9, AGENT-GUIDE `midiin.rs` entry
 
 ### W10 — CI matrix (compile-guard EARLY: after W3)
 .github/workflows: linux (lib suite + clippy), windows-latest
@@ -757,3 +782,42 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
     corrects); the modal menu stalls effEditIdle while open; Windows-menu/
     palette entries for a detached member still toggle "visibility" of
     the placeholder only.
+- 2026-11-11 · session 14 · **W9 Windows MIDI**: new `src/midiin.rs` —
+  OS-neutral MPMC event bus (8192-slot power-of-2 ring, per-slot
+  EMPTY→WRITING→FULL CAS claim, per-producer commit cursor so a second
+  WinMM device can't clobber, consumer = the RT drain) + `MidiInProducer`
+  (fixed 64B msg slab — the callback allocates, RT only `move`s) +
+  `dedupe_labels` / `open_set` picker math. wasapi.rs: `MidiInSlot`
+  (leaky `Box::leak` box — Drop would `CoUninitialize` the callback
+  thread's COM; devices die via `forget` at teardown), `open_midi_devices`
+  (open→publish→connect LAST: no callback can post to a slot nobody
+  consumes; one `MidiInput` per open — midir's `connect` consumes it),
+  wired into startup / `Cmd::Refresh` / idle hot-plug diff / `teardown`;
+  RT loop drains before `read` (`self.midi.drain_into(evs)` →
+  `process_block`). Manager side: `Cmd::SetMidiInputs` routes to the new
+  no-op-default `ManagerBackend::set_midi_inputs` hook — jack.rs must
+  NEVER override (pinned); `Evt::MidiInputs` feeds the picker, apply
+  publishes the opened set as `Evt::MidiSources` so the MONITOR panel
+  can't lie "nothing is being received" on Windows. UI: `win_midi_inputs`
+  config field + Settings ▸ MIDI INPUTS section gated by an inline
+  `cfg!(windows)` block — not `ui_win_*`-named (test-filter trap) —
+  re-Apply after launch restore; `w9_settings_midi_picker_gated` pins the
+  gate shape (source-scan via ui.rs's own include_str!). Pins: 13 Linux
+  (`w9_ring_*` incl. 4-thread concurrent stress, `w9_open_set`,
+  `w9_dedupe`, `w9_manager_routes_midi_cmd`, `w9_jack_stays_midi_free`,
+  `w9_midi_hook_default_is_noop`) + 2 Windows-only functional
+  (`w9_winmm_api_lists_devices_cleanly`,
+  `w9_open_midi_devices_honest_with_zero_devices` — CI runners have no
+  WinMM devices, honest degradation IS the contract). Sabotage-verified:
+  dropping the dispatch arm reddens the manager pin (NOTE: global sed
+  sabotage reddens the pin's own needle in lockstep = vacuous pass —
+  hand-edit ONLY the call site line); breaking a w9_midi_tests body
+  reddens gnullvm `--all-targets` (proves cross CI compiles the
+  cfg(windows) test code — cargo replays warnings on "fresh" units, so
+  touch the file when proving cross builds). midir 0.11 behind
+  `[target.'cfg(windows)'.dependencies]` (zero Linux graph impact); CI
+  port-pin filter grew `w9_` (substring trap). Gates: host clippy 0,
+  gnullvm `--all-targets` 0 warn/err (caught a windows-only `unused_mut`
+  Linux can never see), w9 pins 13/13, port-pin set 53/53 citest, e2e 32
+  live Jack, full debug lib green, `cargo run` smoke OK (picker Linux-
+  invisible by construction).

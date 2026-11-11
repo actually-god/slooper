@@ -489,6 +489,12 @@ pub enum Cmd {
     PreviewStop {
         id: Option<u32>,
     },
+    /// W9 (Windows): open exactly these MIDI input devices (labels as
+    /// reported by `Evt::MidiInputs`), closing anything else slooper had
+    /// open. On Linux this is a deliberate no-op — JACK MIDI auto-connects
+    /// every remote port (`jack::rescan_midi_sources`) and there is nothing
+    /// to select.
+    SetMidiInputs(Vec<String>),
     Quit,
 }
 
@@ -529,6 +535,10 @@ pub enum Evt {
     /// (auto-connected; refreshed on port/client registration events).
     Midi(RawMidiMsg),
     MidiSources(Vec<String>),
+    /// W9 (Windows): the selectable WinMM MIDI input devices (deduplicated
+    /// labels — this exact list is what `Cmd::SetMidiInputs` accepts back).
+    /// Never sent on Linux; the JACK path reports `Evt::MidiSources`.
+    MidiInputs(Vec<String>),
     /// A non-error status message worth showing in the top bar (e.g. a
     /// finished export).
     Notice(String),
@@ -580,6 +590,9 @@ trait ManagerBackend {
     fn idle(&mut self, tx: &SyncSender<Evt>);
     /// Tear the live device down after the loop exits (Quit/Disconnect).
     fn teardown(&mut self);
+    /// W9: open exactly these WinMM MIDI devices. The JACK backend never
+    /// overrides this — auto-connected JACK MIDI is the Linux contract.
+    fn set_midi_inputs(&mut self, _sel: &[String], _tx: &SyncSender<Evt>) {}
 }
 
 /// Handle kept by the GUI.
@@ -2238,6 +2251,7 @@ fn manager_loop(
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Cmd::Refresh) => session.refresh(evt_tx),
+            Ok(Cmd::SetMidiInputs(sel)) => session.set_midi_inputs(&sel, evt_tx),
             Ok(Cmd::Apply { ins, outs }) => {
                 session.apply(&ins, &outs, evt_tx);
             }
@@ -7551,6 +7565,79 @@ mod w5_tests {
                 "manager_loop lost seam call `{shape}`"
             );
         }
+    }
+
+    // --- W9: the Windows MIDI seam (docs/WINDOWS-PORT.md) ------------------
+    use super::{Evt, ManagerBackend};
+    use std::sync::mpsc::SyncSender;
+
+    #[test]
+    fn w9_manager_routes_midi_cmd_to_the_session_hook() {
+        let src = code(include_str!("mod.rs"));
+        // Assert the CALL (unique-call-site marker, W8b pin lore).
+        assert!(
+            src.contains("Ok(Cmd::SetMidiInputs(sel)) => session.set_midi_inputs(&sel, evt_tx),"),
+            "manager_loop does not route SetMidiInputs to the backend hook"
+        );
+        // The trait default is an empty no-op...
+        assert!(
+            src.contains("fn set_midi_inputs(&mut self, _sel: &[String], _tx: &SyncSender<Evt>) {}"),
+            "the ManagerBackend default hook changed shape"
+        );
+        // ...and JACK does NOT override it: Linux keeps its auto-connect
+        // contract structurally, not just behaviorally.
+        let jack = include_str!("jack.rs");
+        assert!(
+            !jack.contains("fn set_midi_inputs"),
+            "JackSession must not override the no-op MIDI hook (Linux = JACK MIDI only)"
+        );
+        assert!(
+            jack.contains("fn rescan_midi_sources"),
+            "Linux auto-connect machinery vanished"
+        );
+        assert!(!jack.contains("midiin"), "the W9 bus must not touch the JACK path");
+    }
+
+    /// Compile-time proof of the trait default: a session that does not
+    /// implement `set_midi_inputs` must still be constructible — this test
+    /// only fails to COMPILE if the default ever disappears.
+    struct DefaultOnly;
+    impl ManagerBackend for DefaultOnly {
+        fn refresh(&mut self, _tx: &SyncSender<Evt>) {}
+        fn apply(&mut self, _ins: &[String], _outs: &[(String, u8)], _tx: &SyncSender<Evt>) {}
+        fn idle(&mut self, _tx: &SyncSender<Evt>) {}
+        fn teardown(&mut self) {}
+    }
+
+    #[test]
+    fn w9_midi_hook_default_compiles_without_override() {
+        let mut s = DefaultOnly;
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Evt>(1);
+        s.set_midi_inputs(&["anything".into()], &tx); // no-op on every OS
+    }
+
+    #[test]
+    fn w9_wasapi_rt_feeds_midi_before_the_handoff() {
+        let wasapi = include_str!("wasapi.rs");
+        let feed = wasapi
+            .find("self.midi.drain_into(evs);")
+            .expect("RT loop must drain the WinMM bus");
+        let hand = wasapi
+            .find("self.proc.process_block(n, evs, &io);")
+            .expect("RT loop must hand off to the engine");
+        assert!(feed < hand, "the bus must be drained BEFORE process_block");
+        // Shared bus, not owned: RtCfg gets an Arc clone of the session's.
+        assert!(wasapi.contains("midi: self.midi_q.clone(),"));
+        assert!(wasapi.contains("midi_q: MidiInQueue::new(),"));
+        // Windows overrides the hook; teardown closes devices before COM.
+        assert!(wasapi.contains("fn set_midi_inputs(&mut self, sel: &[String], tx: &SyncSender<Evt>) {"));
+        let td = wasapi
+            .find("fn teardown(&mut self) {")
+            .expect("teardown missing");
+        assert!(
+            wasapi[td..].contains("self.midi_conns.clear()"),
+            "WinMM devices must be closed on teardown"
+        );
     }
 
     #[test]

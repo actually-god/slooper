@@ -606,6 +606,11 @@ pub struct Config {
     /// (power users / CI).
     #[serde(default)]
     pub win_editor_embed: bool,
+    /// W9 (Windows): the WinMM MIDI input devices to open at launch
+    /// (exact labels from `Evt::MidiInputs`; the Ports picker writes it).
+    /// Linux never reads it — JACK MIDI auto-connects everything.
+    #[serde(default)]
+    pub win_midi_inputs: Vec<String>,
 }
 
 impl Default for Config {
@@ -678,6 +683,7 @@ impl Default for Config {
             theme: default_theme(),
             mpe: false,
             win_editor_embed: false,
+            win_midi_inputs: Vec::new(),
         }
     }
 }
@@ -874,6 +880,27 @@ mod tests {
         assert!(!legacy.win_editor_embed, "old configs parse with the flag off");
         let on: Config = serde_json::from_str(r#"{"win_editor_embed": true}"#).unwrap();
         assert!(on.win_editor_embed);
+    }
+
+    #[test]
+    fn w9_win_midi_inputs_defaults_empty_and_roundtrips() {
+        // W9: additive-safe like the W8b flag; the selection is a label
+        // list that must survive save/load verbatim (labels carry " [2]"
+        // suffixes — a mangling round trip opens the wrong device).
+        assert!(Config::default().win_midi_inputs.is_empty());
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            legacy.win_midi_inputs.is_empty(),
+            "old configs parse with nothing selected"
+        );
+        let json = r#"{"win_midi_inputs": ["KeyStage 61", "KeyStage 61 [2]"]}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.win_midi_inputs,
+            vec!["KeyStage 61".to_string(), "KeyStage 61 [2]".to_string()]
+        );
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.win_midi_inputs, cfg.win_midi_inputs, "round-trips verbatim");
     }
 
     #[test]
