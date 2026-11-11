@@ -7745,8 +7745,9 @@ mod w12a_tests {
             src.matches("self.fault.store(f.code, Ordering::SeqCst);").count(),
             2
         );
-        // ...from the one-HRESULT classifier.
-        assert!(src.contains("e.code() == AUDCLNT_E_DEVICE_INVALIDATED"));
+        // ...from the one-HRESULT classifier (exact call-site shape: a bare
+        // substring check sabotage-PASSES vacuously — proven this session).
+        assert!(src.contains("let code = if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {"));
         // The RT config receives the shared fault slot (Arc clone, w9-style).
         assert_eq!(src.matches("fault: self.fault.clone(),").count(), 1);
     }
