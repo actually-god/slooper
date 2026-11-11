@@ -7625,7 +7625,7 @@ mod w5_tests {
     fn w9_wasapi_rt_feeds_midi_before_the_handoff() {
         let wasapi = include_str!("wasapi.rs");
         let feed = wasapi
-            .find("self.midi.drain_into(evs);")
+            .find("self.midi.drain_into(evs, midi_ts);")
             .expect("RT loop must drain the WinMM bus");
         let hand = wasapi
             .find("self.proc.process_block(n, evs, &io);")
@@ -7643,6 +7643,37 @@ mod w5_tests {
             wasapi[td..].contains("self.midi_conns.clear()"),
             "WinMM devices must be closed on teardown"
         );
+    }
+
+    /// W12b: the stamps must reach the queue AND be converted before the
+    /// engine hand-off (needles are the exact call literals — unique call
+    /// sites, sabotage-verifiable).
+    #[test]
+    fn w12b_wasapi_spreads_stamps_into_the_block() {
+        let wasapi = include_str!("wasapi.rs");
+        // The midir callback forwards its µs timestamp (no more `_ts`).
+        assert!(
+            wasapi.contains("|ts, bytes, p| p.on_bytes(bytes, ts)"),
+            "the WinMM timestamp must ride into the queue"
+        );
+        // Spread runs on the drained batch AFTER the drain and BEFORE the
+        // hand-off, with the STREAM's clock.
+        let feed = wasapi
+            .find("self.midi.drain_into(evs, midi_ts);")
+            .expect("drain call literal moved");
+        let spread = wasapi
+            .find("midiin::spread(evs, midi_ts, self.sr, n as u32);")
+            .expect("RT loop must convert stamps to frame offsets");
+        let hand = wasapi
+            .find("self.proc.process_block(n, evs, &io);")
+            .expect("RT loop must hand off to the engine");
+        assert!(feed < spread && spread < hand, "spread sits between drain and hand-off");
+        // The scratch pair is cleared together — positional pairing by construction.
+        assert!(wasapi.contains("evs.clear();\n        midi_ts.clear();"));
+        // RtCfg gets the stream clock at construction (unique: `Mix.sr` is
+        // passed positionally to Proc, only the RtCfg literal carries the
+        // `sr:` label).
+        assert!(wasapi.contains("sr: rstream.mix.sr,"));
     }
 
     #[test]

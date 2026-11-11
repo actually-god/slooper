@@ -117,10 +117,14 @@ src/            application source (Rust 2021 edition)
   midi.rs         MIDI message parsing, MidiBind matching, MidiAction
                   table, keyboard-shortcut layout migration (v0.1 → v0.2)
   midiin.rs       W9 Windows MIDI bus: lock-free MPMC event ring (WinMM
-                  callback threads push, WASAPI RT loop drains into
-                  process_block, frame 0 = block start) + label dedupe /
-                  selection math. Linux never builds the WinMM side — the
-                  ring itself is OS-neutral so every w9 pin runs everywhere.
+                  callback threads push WITH their µs timestamps, WASAPI
+                  RT loop drains into process_block) + label dedupe /
+                  selection math + W12b spread(): batch-relative stamp ->
+                  sub-block frame offsets (anchor = block start, wrap-safe
+                  u32-ms deltas, honest block-start fallback for unstamped
+                  drivers). Linux never builds the WinMM side — the
+                  ring itself is OS-neutral so every w9/w12b pin runs
+                  everywhere.
   audio/rt_recovery.rs
                   W12a pure recovery table: the WASAPI RT thread classifies
                   its own death (none/stream/device-invalidated), the idle

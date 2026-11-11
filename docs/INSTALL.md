@@ -155,8 +155,12 @@ like JACK, slooper never steals a device, and no selection means silence.
    Unplug and replug: Refresh re-lists the device and re-Apply re-opens
    it. Quit while a device is open, then open the same device in another
    app — it must NOT report "still held by slooper" (Drop closes the
-   WinMM handle). Events apply at audio-block granularity (~1–10 ms of
-   inherent latency jitter; sub-block timing is a W12 item).
+   WinMM handle). Events use WinMM message timestamps (W12b): the first
+   message of each audio block lands at block start and later ones keep
+   their measured spacing inside the block, so strums and fast CC runs
+   play with their real timing (whole-block-start placement only when a
+   driver supplies no timestamps — then everything shifts back to block
+   start, nothing else changes).
 10. **Stream survival (W12a)**: while audio plays, unplug the output
     device. The RT thread dies with a Notice (no crash, no freeze, no
     error spam); replug the SAME device and within a couple of idle ticks

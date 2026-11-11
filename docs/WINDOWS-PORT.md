@@ -57,8 +57,16 @@ survival reset), Notice on a vanished device or exhausted budget. Replug of
 a USB DAC resumes audio with NO click. Also fixed a REAL hot-unplug bug:
 the WAIT_FAILED guard was dead code (`WAIT_FAILED - WAIT_OBJECT_0(0)` is
 never `None`) — a dead-handle wait would busy-spin the RT loop. NEXT: W12
-continues — sub-block MIDI timing, DPI battery, native-JACK mode, settings
-round-trip; W11 (releases/packaging) still queued.
+continues — DPI battery, native-JACK mode, settings round-trip; W11
+(releases/packaging) still queued.
+W12b DONE 2026-11-11 (session 16, see DONE log): sub-block MIDI timing —
+the W9 bus carries WinMM's µs timestamp per event and the WASAPI RT loop
+converts it with the new pure `midiin::spread`: first stamp of each drained
+batch anchors at frame 0 (zero latency added), later events land at their
+measured ms distance × sr, clamped to n-1. Unstamped drivers, sr 0 and
+backwards jumps degrade to the old block-start behavior; the u32-ms clock
+wrap is arithmetically correct. Linux never builds any of it (jack path
+untouched, pinned).
 
 ## Ground rules (apply to every task)
 
@@ -426,8 +434,10 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   auto-recovery (MMCSS/time-critical, classified fault → `rt_recovery`
   table → bounded auto re-Apply; details + the dead WAIT_FAILED guard fix
   in the DONE log)
-- [ ] W12b candidate — sub-block MIDI timing (W9 left everything at frame 0;
-  WinMM offers device-relative ms — convert to per-event frame offsets)
+- [x] **W12b DONE 2026-11-11 (session 16, see DONE log)** — sub-block MIDI
+  timing: µs stamps ride the W9 ring, `midiin::spread` converts them to
+  in-block frame offsets (batch-relative anchor = block start, wrap-safe,
+  honest W9 fallback for unstamped drivers)
 - [ ] W12c candidate — per-monitor DPI battery (chrome-side: `embed_sync_
   pass` must multiply by LIVE `pixels_per_point`; container physical size =
   unscaled plugin px; chrome slot = px/ppp). Full plugin-content rescale =
@@ -893,3 +903,57 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   citest monolith (CI quarantines) + e2e live — exact counts in commit
   notes; jack.rs and the shared engine core untouched (recovery is
   WASAPI-side; Linux never builds rt_recovery's only reader).
+- 2026-11-11 · session 16 · **W12b sub-block MIDI timing**: WinMM's
+  `dwTimestamp` (midir passes it as callback arg 1, µs = ms×1000 — was
+  discarded as `_ts`) now rides the W9 bus end to end. `MidiInQueue` slots
+  carry `(stamp_us, bytes)`; `drain_into` grows a paired `stamps` scratch
+  (frames still land at 0 from the drain — the RT-side conversion is a
+  separate pure step); `MidiInProducer::on_bytes` takes the stamp;
+  `audio/wasapi.rs` RtCfg gains `sr` (from `rstream.mix.sr`) and a reused
+  `midi_ts` scratch, and `render_cycle` calls the new pure
+  `midiin::spread(evs, midi_ts, sr, n)` between drain and hand-off.
+  Design (the clock-alignment decision): WinMM stamps are a per-driver
+  ms clock with no shared origin with the audio clock, so the mapping is
+  batch-RELATIVE — the FIRST meaningful stamp of each drain anchors at
+  frame 0 (zero latency added vs W9) and later events land at their
+  measured ms distance × sr, clamped to n-1. Deltas use u32 ms wrap
+  arithmetic (the clock wraps every 49.7 days — a correct small delta
+  across the wrap is pinned); deltas > 1 h (backwards jumps, or TWO
+  device clocks interleaved into one batch) keep the previous offset and
+  do not advance the anchor — one bad stamp can only collapse events onto
+  the same frame, never reorder (engine stages in arrival order + sorts);
+  all-zero stamps / sr 0 / n 0 degrade to the exact W9 block-start
+  behavior. The engine already honored per-event offsets (JACK has since
+  v32; `process_block` clamps to n-1, v33 carry-over zeroes stale offsets)
+  — ZERO engine changes. Linux: midiin is compiled (OS-neutral) but no
+  Linux path pushes; jack.rs untouched (w9 pins hold). Pins: `w12b_*` x8
+  (ring carries stamps in order; spread space/zero-stamps+degenerate/wrap/
+  backwards/clamp/leading-unstamped; wasapi wiring scan) — wiring pin
+  asserts the exact call literals (`|ts, bytes, p| p.on_bytes(bytes, ts)`,
+  `drain_into(evs, midi_ts)`, `spread(... self.sr, n as u32)` between drain
+  and `process_block`, paired `evs.clear(); midi_ts.clear();`, `sr:
+  rstream.mix.sr`). The w9 round-trip pin extended (stamps vector assert),
+  its wasapi needle + the mod.rs seam pin follow the new call literal.
+  Sabotage battery: drop spread RED, revert `_ts` RED, MAX_SPAN_MS→0
+  reddens 5 delta pins (unstamped pin correctly stays green) — all
+  reverted clean (one test-side error found BY the pins: expected 576
+  frames inside a 256-frame block; widened the block, not the clamp).
+  ci.yml filter needs no change (`w12` bare already covers `w12b_`).
+  Gates (Linux host): host check --all-targets + clippy-zero 0; w9_+w12
+  filters 33/33 debug; port-pin set w2_..w12 **73/73** citest (CI filter);
+  citest monolith DEADLOCKED at `v23_patch_reopen_keeps_params_a_chunk_
+  omits` (known loader-lock × GUI-thread flake — futex-probed, killed by
+  PID) so full lib coverage rode the MANDATORY 3-chunk protocol instead:
+  521 (rest, CI quarantines applied) + 37 (vsthost) + 4 (ui v23) all
+  `test result: ok` exit 0; quarantined strict solo: v20_fx pair +
+  v36_script_fx_editor_docks GREEN, v36_script_fx_editor_resizes = the
+  known `corrupted size vs. prev_size` boot abort (warning-only in CI);
+  e2e **32/32 LIVE JACK**; gnullvm --all-targets clean AND sabotage-proven
+  live (an injected type error in wasapi.rs surfaces in the cross check =
+  the Windows code IS recompiled, not cache-replayed). Windows functional
+  truth = the CI run at this commit. Honest residuals: absolute sub-block
+  placement of the FIRST event is by definition block-start (no host-side
+  clock bridge for dwTimestamp — matching every other WinMM host); ms
+  granularity (the WinMM clock's own unit); multi-device batches spread by
+  a single chain (clock mismatch collapses onto shared frames, never
+  reorders).
