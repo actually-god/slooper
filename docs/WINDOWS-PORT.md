@@ -48,6 +48,17 @@ the selection through `Config::win_midi_inputs`. Linux structurally inert:
 JACK never overrides the no-op `ManagerBackend::set_midi_inputs` hook (pinned),
 `jack.rs` contains zero midiin references (pinned). NEXT: W12 (per-monitor
 DPI battery + polish list).
+W12a DONE 2026-11-11 (session 15, see DONE log): Windows RT scheduling
+(MMCSS "Pro Audio" → TIME_CRITICAL fallback, Drop-reverted) + device-loss
+auto-recovery: the RT thread classifies its death (none/stream/invalidated)
+and the idle hook asks the new pure `src/audio/rt_recovery` table —
+re-Apply the exact patch while the endpoints are present (budget 2, 10 s
+survival reset), Notice on a vanished device or exhausted budget. Replug of
+a USB DAC resumes audio with NO click. Also fixed a REAL hot-unplug bug:
+the WAIT_FAILED guard was dead code (`WAIT_FAILED - WAIT_OBJECT_0(0)` is
+never `None`) — a dead-handle wait would busy-spin the RT loop. NEXT: W12
+continues — sub-block MIDI timing, DPI battery, native-JACK mode, settings
+round-trip; W11 (releases/packaging) still queued.
 
 ## Ground rules (apply to every task)
 
@@ -411,6 +422,18 @@ SetThreadPriority(timeCritical) on RT thread; WASAPI device hot-unplug error
 path; per-monitor DPI; optional native JACK-on-Windows mode via jack crate
 `dynamic_loading` feature (for users who have jackbuilds — zero code on
 Linux); settings round-trip test across OSes; minidump/crash reporting story.
+- [x] **W12a DONE 2026-11-11 (session 15)** — RT scheduling + hot-unplug
+  auto-recovery (MMCSS/time-critical, classified fault → `rt_recovery`
+  table → bounded auto re-Apply; details + the dead WAIT_FAILED guard fix
+  in the DONE log)
+- [ ] W12b candidate — sub-block MIDI timing (W9 left everything at frame 0;
+  WinMM offers device-relative ms — convert to per-event frame offsets)
+- [ ] W12c candidate — per-monitor DPI battery (chrome-side: `embed_sync_
+  pass` must multiply by LIVE `pixels_per_point`; container physical size =
+  unscaled plugin px; chrome slot = px/ppp). Full plugin-content rescale =
+  bitmap-scaling editors — explicitly deferred (WS_CHILD live-paint).
+- [ ] native JACK-on-Windows mode; settings round-trip across OSes;
+  minidump story — unpicked.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
@@ -822,3 +845,51 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   live Jack, debug lib 541/542 (the 1 = chain_window_adds_scanned_plugin_slot,
   KNOWN boot-env class, fails solo on unrelated trees too), `cargo run`
   smoke OK (picker Linux-invisible by construction; JACK active, 0 panic).
+- 2026-11-11 · session 15 · **W12a RT scheduling + hot-unplug recovery**:
+  (1) RT priority: `boost_rt_thread()` at the RT entry — MMCSS
+  `AvSetMmThreadCharacteristicsW("Pro Audio")` (the DAW-correct scheduler
+  class: system-wide priority-inversion protection), falling through to
+  plain `SetThreadPriority(TIME_CRITICAL)` on hosts without the MMCSS
+  service, `Nothing` honestly; the `RtBoost` guard reverts on Drop so no
+  exit path skips cleanup. Manager/UI threads stay at normal priority
+  (pinned: the boost call-site is exactly once, inside `RtCfg::run`).
+  (2) Fault classification: `drain_capture`/`render_cycle` return `RtFault
+  {code,msg}` via `rt_fault(e)` — `AUDCLNT_E_DEVICE_INVALIDATED`
+  (0x88890004) is THE recoverable code; every error break stores the code
+  into a session↔RT `Arc<AtomicU32>` before `Evt::Error`. REAL BUG FOUND
+  while wiring this: the old `let Some(k) = got.0.checked_sub(WAIT_OBJECT_0
+  .0)` "WAIT_FAILED guard" was dead code — `WAIT_OBJECT_0 == 0` so
+  `checked_sub` never returns None; a dead-handle wait (0xFFFFFFFF) fell
+  through to the capture arm, matched nothing, and would busy-spin the RT
+  loop with no fault and no Notice. Now an explicit `got == WAIT_FAILED`
+  check precedes the arithmetic and stores FAULT_DEVICE.
+  (3) Recovery: new OS-neutral `src/audio/rt_recovery.rs` (the W7
+  `cfg(any(windows, test))` pattern — pure table, pinned entirely on
+  Linux): `plan(fault, last_patch, still_present, budget) -> Nothing |
+  Reapply | DeviceGone | GaveUp`; policy: budget 2 per streak, a stream
+  that survived 10 s resets it, a vanished endpoint is never retried.
+  wasapi `idle()`: reap → `fault.swap(NONE)` → survival-reset →
+  `patch_present` (the SAME `resolve()` the Apply path uses, so recovery
+  can only fire on a patch Apply could bring up) → dispatch. `apply()`
+  records `last_patch` after a successful spawn and CLEARS it on an
+  explicit silence-Apply; the budget is deliberately NOT refilled by
+  apply() (recovery-initiated Applies must not loop). Replugging a USB DAC
+  now resumes audio on the next idle tick (250 ms loop) with a "recovering
+  stream" Notice — no click.
+  (4) PINS: `w12a_plan_*` x6 + policy pin (rt_recovery, every OS) + x5
+  wiring scans (boost once, WAIT_FAILED ordering, classifier at every
+  exit, idle dispatch, apply record/silence clear) + x2 Windows CI
+  functional (`w12a_boost_rt_thread_degrades_honestly` — at least one of
+  MMCSS/TIME_CRITICAL must engage, double boost+revert legal; classifier
+  HRESULTs). Sabotage battery S1–S4: boost-call drop RED, idle-reapply
+  drop RED, classifier neuter RED (after hardening — the bare-substring
+  needle passed vacuously under `false &&`, the recorded trap biting
+  live), store-count drop RED — all reverted clean. ci.yml port-pin
+  filter grew `w12` (covers the whole family — comment updated).
+  (5) Gates (Linux host): host check --all-targets + gnullvm
+  --all-targets 0 warn/err (the cross run is the FIRST compile of the new
+  Windows code — it caught a by-ref `map_err` signature and an i32
+  literal), clippy-zero, w12a 12/12, port-pin set w2_..w12 65/65 citest,
+  citest monolith (CI quarantines) + e2e live — exact counts in commit
+  notes; jack.rs and the shared engine core untouched (recovery is
+  WASAPI-side; Linux never builds rt_recovery's only reader).
