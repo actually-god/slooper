@@ -2220,6 +2220,32 @@ unsafe fn root_window(d: *mut Display) -> XWindow {
     XRootWindow(d, XDefaultScreen(d))
 }
 
+// ------------------------------------------------------ W8b embed (inert)
+//
+// The in-window editor embed is Windows-only machinery: plugin containers
+// become child HWNDs under the winit main window and slooper syncs their
+// geometry. On Linux the shipped editors are their own top-level windows
+// and always will be — this twin keeps the seam surface even with honest
+// inert answers (WINDOWS-PORT ground rule: Linux behavior frozen).
+
+/// Linux never embeds: editors stay top-level windows.
+pub fn embed_requested() -> bool {
+    false
+}
+
+/// Inert on Linux (see [`embed_requested`]).
+pub fn set_embed_parent(_handle: u64) {}
+
+/// No embed machinery on X11 — always `false` (see [`embed_requested`]).
+pub fn set_container_rect(_handle: u64, _x: i32, _y: i32, _w: i32, _h: i32) -> bool {
+    false
+}
+
+/// The embed-parent lookup is Windows-only; `None` here, always.
+pub fn main_thread_hwnd() -> Option<u64> {
+    None
+}
+
 // ---------------------------------------------------------------- tests
 #[cfg(test)]
 mod tests {

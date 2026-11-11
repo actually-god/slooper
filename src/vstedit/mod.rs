@@ -15,7 +15,9 @@
 //!   `IPlugView::attached(HWND, kPlatformTypeHWND)`, verified paint (a
 //!   visible sized child OR non-sentinel pixels on the container),
 //!   `WM_CLOSE` as the close-button protocol, a Win32 message pump run on
-//!   the shared vst2-gui thread — never the UI thread.
+//!   the shared vst2-gui thread — never the UI thread. W8b adds EMBED mode
+//!   (`SLOOPER_WIN_EMBED`): the container is a `WS_CHILD` under the winit
+//!   HWND with slooper-drawn chrome; the X11 twin carries the inert seam.
 //!
 //! Everything the rest of the tree touches (`EditorWindow`, `open_editor`,
 //! `pump_editors`, `probe_child`, the shadow-edit test hooks, …) resolves
@@ -112,6 +114,11 @@ mod seam_tests {
             "route_param_edits3",
             "x11_available",
             "probe_child",
+            // W8b embed seam (win32 = machinery, x11 = documented inert).
+            "embed_requested",
+            "set_embed_parent",
+            "set_container_rect",
+            "main_thread_hwnd",
         ]
         .into_iter()
         .map(String::from)
@@ -170,5 +177,85 @@ mod seam_tests {
         assert!(!crate::vstedit::request_wm_delete(0));
         // probe_child with no path env is the "nothing to test" verdict.
         assert_eq!(crate::vstedit::probe_child("V2"), 0);
+    }
+
+    // ------------------------------------------------------------ W8b embed
+    //
+    // The embed seam: Windows grows the machinery, Linux stays the frozen
+    // documented inert — each OS asserts its own truth (standing rule).
+
+    /// Linux: embedding is structurally impossible — every embed entry
+    /// point answers inert, EVEN with the Windows env flag set, so no
+    /// stray environment can ever route the shipped X11 path down a
+    /// half-implemented embed road.
+    #[cfg(unix)]
+    #[test]
+    fn w8b_x11_embed_api_inert() {
+        let had = std::env::var_os("SLOOPER_WIN_EMBED");
+        std::env::set_var("SLOOPER_WIN_EMBED", "1");
+        assert!(!crate::vstedit::embed_requested(), "Linux must never embed");
+        assert_eq!(crate::vstedit::main_thread_hwnd(), None);
+        // Inert calls never panic, always refuse.
+        crate::vstedit::set_embed_parent(0x1234);
+        assert!(!crate::vstedit::set_container_rect(0x1234, 0, 0, 10, 10));
+        crate::vstedit::set_embed_parent(0);
+        match had {
+            Some(v) => std::env::set_var("SLOOPER_WIN_EMBED", v),
+            None => std::env::remove_var("SLOOPER_WIN_EMBED"),
+        }
+    }
+
+    /// Windows: the env gate reads live (empty = unset, the paths rule),
+    /// and the null handle still answers honestly.
+    #[cfg(windows)]
+    #[test]
+    fn w8b_windows_embed_gate_reads_env() {
+        let had = std::env::var_os("SLOOPER_WIN_EMBED");
+        std::env::remove_var("SLOOPER_WIN_EMBED");
+        assert!(!crate::vstedit::embed_requested());
+        std::env::set_var("SLOOPER_WIN_EMBED", "");
+        assert!(!crate::vstedit::embed_requested(), "empty = unset");
+        std::env::set_var("SLOOPER_WIN_EMBED", "1");
+        assert!(crate::vstedit::embed_requested());
+        std::env::set_var("SLOOPER_WIN_EMBED", "0");
+        assert!(
+            crate::vstedit::embed_requested(),
+            "any non-empty value enables (parity with SLOOPER_SCAN_INLINE)"
+        );
+        assert!(!crate::vstedit::set_container_rect(0, 1, 2, 3, 4));
+        match had {
+            Some(v) => std::env::set_var("SLOOPER_WIN_EMBED", v),
+            None => std::env::remove_var("SLOOPER_WIN_EMBED"),
+        }
+    }
+
+    /// Source pins for the embed wiring:
+    /// * win32 creates containers through the ONE embed-aware helper, in
+    ///   BOTH generations, and its child mode really uses `WS_CHILD`;
+    /// * ui.rs gates the pass on `embed_requested`, grabs the parent via
+    ///   `main_thread_hwnd`, wraps opens with `set_embed_parent`, and
+    ///   NEVER calls `set_container_rect` outside a `vsthost::post`
+    ///   closure (direct cross-thread `SetWindowPos` is the deadlock the
+    ///   module docs forbid).
+    #[test]
+    fn w8b_embed_wiring_is_seamed() {
+        let w = code_lines(&twin_path("win32"));
+        assert!(w.contains("fn create_container"), "win32 lost create_container");
+        assert!(w.contains("WS_CHILD"), "child mode lost WS_CHILD");
+        assert!(
+            w.matches("create_container(").count() >= 3,
+            "create_container must serve both generations + its definition"
+        );
+
+        let ui = code_lines(&format!("{}/src/ui.rs", env!("CARGO_MANIFEST_DIR")));
+        assert!(ui.contains("embed_requested()"), "ui embed pass lost its gate");
+        assert!(ui.contains("main_thread_hwnd()"), "ui lost the embed parent grab");
+        assert!(ui.contains("set_embed_parent(p)"), "ui lost the open wrap");
+        let pos = ui.find("set_container_rect(").expect("ui must sync embed rects");
+        let window = &ui[pos.saturating_sub(240)..pos];
+        assert!(
+            window.contains("vsthost::post"),
+            "set_container_rect must run on the vst2-gui thread via vsthost::post"
+        );
     }
 }
