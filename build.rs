@@ -25,8 +25,9 @@ fn main() {
         "cargo:rustc-env=SLOOPER_EXE_PATH={target}/{profile}/slooper{sfx}"
     );
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        // W11: embed the app icon (+ version info; the MSVC rc path also
-        // adds the Common-Controls v6 manifest) into slooper.exe. Gated on
+        // W11: embed the app icon (+ version info; winresource 0.1.34 adds
+        // no manifest by default on either path — proved: RT_MANIFEST 0 in
+        // both built exes) into every Windows-targeted exe. Gated on
         // the TARGET OS, not cfg! — a build script's cfg! is the HOST.
         // cargo reports CARGO_CFG_TARGET_ENV=gnu for gnullvm, so winresource
         // takes its GNU/windres path there too and locates windres NEXT TO
