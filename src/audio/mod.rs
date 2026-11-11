@@ -40,6 +40,11 @@ use std::sync::Arc;
 mod jack;
 #[cfg(windows)]
 mod wasapi;
+// W12a: pure lost-stream recovery table (pinned on every OS; only the
+// WASAPI backend reads it — the W7 `any(windows, test)` pattern keeps it
+// compiling for the Linux pins without a dead module in Linux builds).
+#[cfg(any(windows, test))]
+mod rt_recovery;
 
 use crate::arrange::Arrangement;
 
@@ -7682,5 +7687,108 @@ mod w5_tests {
             e2e.contains("#![cfg(not(windows))]"),
             "the live-JACK e2e suite must be cfg'd out on Windows"
         );
+    }
+}
+
+/// W12a pins (WINDOWS-PORT): RT scheduling + device-loss auto-recovery in
+/// the Windows backend. The pure decision table is pinned in `rt_recovery`
+/// itself; these are source-wiring scans (the w5 pattern — every OS runs
+/// them, red under sabotage of each seam).
+#[cfg(test)]
+mod w12a_tests {
+    fn wasapi() -> String {
+        include_str!("wasapi.rs").replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn w12a_rt_thread_boost_is_wired_once() {
+        let src = wasapi();
+        // Unique call-site marker (W8b pin lore): exactly one boost, at the
+        // RT entry; both scheduling classes and the revert must be present.
+        assert_eq!(src.matches("let _boost = boost_rt_thread();").count(), 1);
+        for shape in [
+            "AvSetMmThreadCharacteristicsW(w!(\"Pro Audio\")",
+            "SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)",
+            "AvRevertMmThreadCharacteristics(*h)",
+        ] {
+            assert!(src.contains(shape), "boost machinery lost `{shape}`");
+        }
+    }
+
+    #[test]
+    fn w12a_wait_failed_guard_precedes_index_math() {
+        // The pre-W12a bug: WAIT_FAILED - WAIT_OBJECT_0(0) is never None,
+        // so a dead-handle wait busy-spun the RT loop and stored no fault.
+        let src = wasapi();
+        let wait = src
+            .find("WaitForMultipleObjects(&handles")
+            .expect("wait loop missing");
+        let guard = src
+            .find("if got == WAIT_FAILED")
+            .expect("W12a: WAIT_FAILED guard missing");
+        let math = src
+            .find("let k = got.0 - WAIT_OBJECT_0.0;")
+            .expect("index math missing");
+        assert!(
+            wait < guard && guard < math,
+            "the dead-handle wait must be checked BEFORE the index arithmetic"
+        );
+        // the guard stores a fault and breaks — never falls through
+        assert!(src[guard..guard + 400].contains("self.fault.store(rt_recovery::FAULT_DEVICE"));
+    }
+
+    #[test]
+    fn w12a_fault_is_classified_at_every_error_exit() {
+        let src = wasapi();
+        // render + capture arms each store the CLASSIFIED code...
+        assert_eq!(
+            src.matches("self.fault.store(f.code, Ordering::SeqCst);").count(),
+            2
+        );
+        // ...from the one-HRESULT classifier.
+        assert!(src.contains("e.code() == AUDCLNT_E_DEVICE_INVALIDATED"));
+        // The RT config receives the shared fault slot (Arc clone, w9-style).
+        assert_eq!(src.matches("fault: self.fault.clone(),").count(), 1);
+    }
+
+    #[test]
+    fn w12a_idle_asks_the_recovery_table() {
+        let src = wasapi();
+        let start = src
+            .find("fn idle(&mut self, tx: &SyncSender<Evt>) {")
+            .expect("idle lost its recovery-aware signature");
+        let end = start + src[start..].find("fn set_midi_inputs").expect("idle region end");
+        let body = &src[start..end];
+        for shape in [
+            "self.fault.swap(rt_recovery::FAULT_NONE, Ordering::SeqCst)",
+            "rt_recovery::plan(fault, self.last_patch.as_ref(), present, self.retry_budget)",
+            "self.retry_budget = rt_recovery::RETRY_BUDGET",
+            "self.retry_budget = self.retry_budget.saturating_sub(1)",
+            "self.apply(&patch.0, &patch.1, tx)",
+        ] {
+            assert!(body.contains(shape), "idle recovery lost `{shape}`");
+        }
+    }
+
+    #[test]
+    fn w12a_apply_records_the_patch_silence_forgets_it() {
+        let src = wasapi();
+        assert_eq!(
+            src.matches("self.last_patch = Some((ins.to_vec(), outs.to_vec()));")
+                .count(),
+            1
+        );
+        assert_eq!(src.matches("self.rt_spawn = Some(std::time::Instant::now());").count(), 1);
+        // The clear lives in the ok_out == 0 branch (before the render
+        // endpoint is resolved), not somewhere the recovery could hit.
+        let silence = src[src.find("fn apply(&mut self").expect("apply missing")..]
+            .split_once("let rid = out_map")
+            .expect("silent path region")
+            .0
+            .to_string();
+        assert!(silence.contains("self.last_patch = None;"));
+        // the module itself is declared (needle split: this pin's text must
+        // not self-match)
+        assert!(include_str!("mod.rs").contains(concat!("mod rt_rec", "overy;")));
     }
 }

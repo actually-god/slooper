@@ -121,6 +121,12 @@ src/            application source (Rust 2021 edition)
                   process_block, frame 0 = block start) + label dedupe /
                   selection math. Linux never builds the WinMM side — the
                   ring itself is OS-neutral so every w9 pin runs everywhere.
+  audio/rt_recovery.rs
+                  W12a pure recovery table: the WASAPI RT thread classifies
+                  its own death (none/stream/device-invalidated), the idle
+                  hook asks plan() whether to auto-re-Apply, announce a
+                  vanished device, or give up (bounded budget). Pure +
+                  OS-neutral so the Linux suite pins the whole table.
   ports.rs        JACK port enumeration helpers
   quantize.rs     metronome grid math, content quantize, silence trim,
                   zero-crossing refinement + seam crossfade
