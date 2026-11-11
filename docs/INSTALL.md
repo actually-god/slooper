@@ -145,9 +145,13 @@ like JACK, slooper never steals a device, and no selection means silence.
    keeps a placeholder. Right-click the DETACHED window's title bar ▸
    "Dock back into slooper" — it lands back in the same slot. Closing the
    detached window (X or its title-bar menu) closes the editor exactly
-   like the docked chrome's X would. On a high-DPI monitor, a fixed-size
-   detached editor keeps its plugin size when the window moves to a
-   monitor with different scaling (content rescaling is still W12).
+   like the docked chrome's X would. DPI (W12c): the plugin's own pixels
+   are the truth — docked, floated or detached, an editor keeps the size
+   it reports 1:1 at 150 %/200 % scaling and across monitors with
+   different scaling (the slooper chrome reserves its slot in screen
+   points around it). The plugin's drawing is never bitmap-rescaled —
+   deliberate: a live-painting child window cannot be rescaled by the
+   host, and stretching would only blur it.
 9. **MIDI (W9)**: Settings ▸ MIDI INPUTS lists your WinMM devices (tick
    boxes, same shape as the audio port lists). Tick a keyboard, Apply
    Selection — the MIDI MONITOR panel's status line goes live the moment

@@ -40,6 +40,26 @@ mod win32;
 #[cfg(windows)]
 pub use win32::*;
 
+// ---------------------------------------------------------------- W12c dpi
+//
+/// The chrome slot of a plugin editor, in egui LOGICAL points.
+///
+/// A plugin's reported editor size (`effEditRect` / VST3 rect) is in
+/// PHYSICAL pixels, and an embedded container keeps those pixels 1:1:
+/// the container's PHYSICAL size is always the plugin's px (plugin
+/// content is never bitmap-scaled — full rescale is explicitly
+/// deferred, WS_CHILD live-paint). The chrome speaks points, so the
+/// slot it reserves is `px / live pixels_per_point`, and the sync pass
+/// lands the slot back in physical with the same live scale — the
+/// pt round trip is px-exact after its `.round()`.
+///
+/// A degenerate scale (0 / negative / NaN — hand-built contexts only)
+/// degrades to 1:1 instead of producing an infinite slot.
+pub fn editor_slot_points(size_px: (i32, i32), ppp: f32) -> (f32, f32) {
+    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    (size_px.0.max(8) as f32 / ppp, size_px.1.max(8) as f32 / ppp)
+}
+
 // ------------------------------------------------------------------ seam
 //
 // Source-consistency pins for the twin split (slooper-dev standing order:
@@ -397,6 +417,92 @@ mod seam_tests {
         assert!(
             spw.contains("self.embed_sync.remove(&xid)"),
             "detaching must drop the geometry-diff entry so re-dock re-lands the slot rect"
+        );
+    }
+
+    // ---------------------------------------------------------------- W12c
+    //
+    // DPI battery, chrome side: a plugin's effEditRect is PHYSICAL px,
+    // the container keeps those px 1:1 at ANY live scale, and only the
+    // chrome slot divides through `pixels_per_point`. The pins split the
+    // contract: pure math here (runs on every OS / every CI job), exact
+    // chrome call literals as a source scan (the W8b idiom — sync-pass
+    // geometry can't be feature-driven on Linux, embed early-returns).
+
+    #[test]
+    fn w12c_slot_points_identity_at_100_percent() {
+        // The historical semantics: at scale 1.0 nothing moves — the
+        // pre-W12c point-equals-px reading is exactly preserved there.
+        assert_eq!(crate::vstedit::editor_slot_points((900, 480), 1.0), (900.0, 480.0));
+        assert_eq!(crate::vstedit::editor_slot_points((8, 8), 1.0), (8.0, 8.0));
+    }
+
+    #[test]
+    fn w12c_slot_points_round_trips_to_plugin_px() {
+        // THE contract of the task: pt = px / ppp (chrome) and physical
+        // = (pt * ppp).round().max(8) (sync pass) is the plugin's px at
+        // every common scale, including odd sizes no scale factor
+        // divides evenly.
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0, 0.75] {
+            for (w, h) in [(900i32, 480), (913, 487), (8, 8), (1920, 1), (37, 1080)] {
+                let (sw, sh) = crate::vstedit::editor_slot_points((w, h), ppp);
+                // Mirrors embed_sync_pass's exact landing arithmetic.
+                let px = |v: f32| (v * ppp).round().max(8.0) as i32;
+                assert_eq!(
+                    (px(sw), px(sh)),
+                    (w.max(8), h.max(8)),
+                    "round trip lost px at ppp {ppp} for {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w12c_slot_points_degrades_honestly() {
+        // A degenerate scale never produces an infinite/NaN slot — it
+        // means 1:1, the honest pre-DPI reading.
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            let got = crate::vstedit::editor_slot_points((900, 480), bad);
+            assert!(got.0.is_finite() && got.1.is_finite(), "slot went non-finite at ppp {bad}");
+            assert_eq!(got, (900.0, 480.0), "degenerate ppp must mean 1:1");
+        }
+        // And the 8 px floor survives the smallest nonsense.
+        assert_eq!(crate::vstedit::editor_slot_points((0, -100), 1.0), (8.0, 8.0));
+    }
+
+    #[test]
+    fn w12c_chrome_treats_plugin_px_as_physical() {
+        let ui = code_lines(&format!("{}/src/ui.rs", env!("CARGO_MANIFEST_DIR")));
+        // The px->pt conversion rides the LIVE scale in the two chrome
+        // places that consume the plugin size. EXACT call literals: a
+        // hand-edited `1.0` or a cached scale at either call site goes
+        // red here (comments are stripped, so pin prose cannot help).
+        assert!(
+            ui.contains("crate::vstedit::editor_slot_points(size, ui.ctx().pixels_per_point())"),
+            "embed_body must reserve the slot as plugin px / LIVE ppp"
+        );
+        assert!(
+            ui.contains("crate::vstedit::editor_slot_points(size, ctx.pixels_per_point())"),
+            "embed_chrome must default-size the float from plugin px / LIVE ppp"
+        );
+        assert_eq!(
+            ui.matches("editor_slot_points(").count(),
+            2,
+            "the conversion lives in exactly the two chrome sites (slot + float default)"
+        );
+        // The sync pass still lands points at the LIVE ppp — the W12c
+        // contract is the ROUND TRIP, so both halves must stay live.
+        let sp = ui.find("fn embed_sync_pass").expect("sync pass");
+        let spw = &ui[sp..(sp + 2600).min(ui.len())];
+        assert!(
+            spw.contains("let ppp = ctx.pixels_per_point();")
+                && spw.contains("(r[2] * ppp).round().max(8.0) as i32"),
+            "embed_sync_pass must multiply the slot by the live pixels_per_point"
+        );
+        // Linux inertness gate untouched (the W8b p1 contract).
+        assert!(
+            ui.contains("fn embed_wanted") && ui.contains("embed_hwnd.is_none()"),
+            "the embed passes must keep their Linux early-return"
         );
     }
 }

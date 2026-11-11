@@ -10279,10 +10279,14 @@ impl App {
     // detach toggle: the slot menu sends a member to its own top-level
     // window (the LIVE window style is the state — no second bookkeeping),
     // the chrome slot becomes a placeholder, and the detached window's own
-    // title-bar right-click menu docks it back. Still open (W12): full
-    // per-monitor DPI battery (one app-wide pixels_per_point, plugin px
-    // treated as logical; fixed-size containers already refuse the
-    // DPI-scaled size — see `dpi_target`).
+    // title-bar right-click menu docks it back. W12c closed the DPI
+    // battery on the chrome side: the plugin's effEditRect px are the
+    // container's PHYSICAL size at any scale, the chrome slot is
+    // px / live pixels_per_point (`editor_slot_points`). Still open,
+    // and deliberately: per-monitor rescaling of the plugin's CONTENT
+    // (bitmap-scaled editors) — a WS_CHILD paints live, we do not
+    // rescale its drawing; fixed-size top-levels already refuse the
+    // DPI-scaled frame — see `dpi_target`.
 
     /// Embedding is asked for by the Settings switch (config-backed) or
     /// forced by `SLOOPER_WIN_EMBED` (power users / CI, live env read).
@@ -10391,8 +10395,11 @@ impl App {
             w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
         } else {
             // No remembered float rect yet: open just big enough to hold
-            // the plugin's own area (chrome borders included).
-            w = w.default_size(egui::vec2(size.0.max(8) as f32 + 16.0, size.1.max(8) as f32 + 30.0));
+            // the plugin's own area (chrome borders included). W12c: the
+            // plugin's area is physical px, the chrome speaks points —
+            // convert through the live scale (borders stay points).
+            let (sw, sh) = crate::vstedit::editor_slot_points(size, ctx.pixels_per_point());
+            w = w.default_size(egui::vec2(sw + 16.0, sh + 30.0));
         }
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
@@ -10454,7 +10461,14 @@ impl App {
             ui.label("waiting for the plugin to draw\u{2026}");
         }
         let offered = ui.available_rect_before_wrap().intersect(ui.max_rect());
-        let want = egui::vec2(size.0.max(8) as f32, size.1.max(8) as f32);
+        // W12c: the plugin's size is PHYSICAL px (its effEditRect) and
+        // the container keeps those px 1:1 — so the chrome reserves the
+        // slot in egui points by dividing through the LIVE scale. The
+        // sync pass lands the slot back at the same live scale, so the
+        // container's physical size is the plugin's px at 100 %, 150 %,
+        // or after a per-monitor DPI change.
+        let (sw, sh) = crate::vstedit::editor_slot_points(size, ui.ctx().pixels_per_point());
+        let want = egui::vec2(sw, sh);
         let rect = ui.allocate_at_least(want, egui::Sense::hover()).1.rect;
         let slot = if offered.is_finite() { rect.intersect(offered) } else { rect };
         if xid != 0 && slot.width() > 4.0 && slot.height() > 4.0 {
