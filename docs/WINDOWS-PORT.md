@@ -67,6 +67,16 @@ measured ms distance × sr, clamped to n-1. Unstamped drivers, sr 0 and
 backwards jumps degrade to the old block-start behavior; the u32-ms clock
 wrap is arithmetically correct. Linux never builds any of it (jack path
 untouched, pinned).
+W12c DONE 2026-11-11 (session 17, `1d50e04` + this ledger commit): DPI
+battery, chrome side — the plugin's `effEditRect` px are the container's
+PHYSICAL size at ANY scale (docked, floated, detached), and the egui chrome
+reserves `px / live pixels_per_point` via the new pure
+`vstedit::editor_slot_points` (identity at 100 %, honest 1:1 on degenerate
+scales). `embed_sync_pass` keeps the LIVE ppp for the pt→physical landing;
+the round trip is px-exact (odd px × 6 scales pinned). Plugin-content
+bitmap rescale stays explicitly deferred (WS_CHILD live-paint).
+NEXT: W12 remainder (native JACK-on-Windows mode, settings round-trip
+across OSes, minidump story — unpicked) or W11 (releases/packaging).
 
 ## Ground rules (apply to every task)
 
@@ -438,10 +448,13 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   timing: µs stamps ride the W9 ring, `midiin::spread` converts them to
   in-block frame offsets (batch-relative anchor = block start, wrap-safe,
   honest W9 fallback for unstamped drivers)
-- [ ] W12c candidate — per-monitor DPI battery (chrome-side: `embed_sync_
-  pass` must multiply by LIVE `pixels_per_point`; container physical size =
-  unscaled plugin px; chrome slot = px/ppp). Full plugin-content rescale =
-  bitmap-scaling editors — explicitly deferred (WS_CHILD live-paint).
+- [x] **W12c DONE 2026-11-11 (session 17, see DONE log)** — per-monitor
+  DPI battery (chrome-side): `embed_sync_pass` multiplies by LIVE
+  `pixels_per_point` (it always did); the BUG was the chrome treating
+  plugin px as logical points — now container physical size = unscaled
+  plugin px and chrome slot = px/ppp (`editor_slot_points`). Full
+  plugin-content rescale = bitmap-scaling editors — explicitly deferred
+  (WS_CHILD live-paint).
 - [ ] native JACK-on-Windows mode; settings round-trip across OSes;
   minidump story — unpicked.
 
@@ -957,3 +970,52 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   granularity (the WinMM clock's own unit); multi-device batches spread by
   a single chain (clock mismatch collapses onto shared frames, never
   reorders).
+- 2026-11-11 · session 17 · **W12c per-monitor DPI battery (chrome side)**:
+  THE bug the ledger half-described: `embed_sync_pass` already multiplied
+  the slot rect by the live ppp, but `embed_body`/`embed_chrome` treated
+  `editor_size()` (the plugin's `effEditRect` in PHYSICAL px) as egui
+  POINTS — net container physical size = px × ppp, so at 150 % a 900×480
+  editor got a 1350×720 child window (sentinel padding / clip against a
+  too-small dock), exact only at 100 %. Fix = one pure OS-neutral helper,
+  `vstedit::editor_slot_points((w,h)_px, ppp) -> points` (mod.rs): floors
+  at 8 px, and a degenerate scale (0/neg/NaN/inf — hand-built contexts
+  only) degrades to 1:1 instead of an infinite slot. Both chrome call
+  sites pass the LIVE scale (`ui.ctx()` in the body, `ctx` in the float);
+  the sync pass is UNCHANGED — the round trip
+  `((px / ppp) * ppp).round()` is px-exact, pinned for odd sizes (913×487,
+  37×1080…) over six common scales. Dock behavior stays "the plugin owns
+  its size, a tight slot clips it": in points the slot is simply smaller
+  at high DPI, and the clip lands at the plugin's own px. What did NOT
+  change (honest residuals): plugin-content bitmap rescale stays
+  explicitly deferred (live-paint child — the host cannot rescale its
+  drawing; INSTALL.md now sells that as the deliberate contract); a
+  remembered FLOAT rect is stored in points, so a rect remembered at one
+  scale sizes the window with stale points after a scale change — the
+  body clips correctly (same machinery as a plugin resuming at a new
+  effEditRect), first-open default sizes are live-correct; embedded
+  top-level DPI behavior remains W8b p2-c's `dpi_target`. PINS `w12c_*`
+  x4 (run on EVERY OS / CI job — pure math + source scan, no new
+  `#[cfg(windows)]` surface): identity at 1.0 (historical semantics
+  preserved), the round-trip contract mirroring the sync pass's exact
+  `(r*ppp).round().max(8.0)` landing arithmetic, honest degradation, and
+  a source pin with EXACT call literals + conversion-count==2 + the sync
+  pass's live-ppp needles. Sabotage battery S1–S3 (hand-edited call sites
+  only): embed_body ppp→1.0 RED, embed_chrome ppp→2.0 RED, sync
+  round→floor RED — all reverted clean. Docs: INSTALL.md smoke item 8
+  rewritten (px-are-truth contract, rescale deferral), AGENT-GUIDE
+  vstedit entry carries the rule. ci.yml UNCHANGED (the bare `w12`
+  substring already covers `w12c_`). Gates (Linux host): clippy-zero 0;
+  host check + gnullvm `--all-targets` exit 0 AND sabotage-proven live
+  (a type error injected into a cfg(test) w12c pin reddens the cross run
+  = the check compiles the new code, not cache replay); w12c 4/4; the CI
+  port-pin filter under citest 77/77 (= W12b's 73 + the 4 new); debug
+  chunks vstedit 26/26, v47 14/14, v43 9/9, v35 16/16; release build
+  proof green (19.8 MB); e2e LIVE JACK 31/32 with `v23_probe_child_dies`
+  PASSING SOLO (the recorded boot-environmental class — failed on HEAD in
+  session 16 too, and untouched code here: zero vsthost/probe changes).
+  Citest monolith DEADLOCKED again (the session-16 class, killed at its
+  1500 s deadline), so full release-mode lib coverage rode the MANDATORY
+  3-chunk protocol with the CI quarantines: 525 (rest, 2 ignored) + 37
+  (vsthost) + 4 (ui v23) — all `test result: ok`, all exit 0. Windows
+  functional truth = the CI run at this commit (Linux-side
+  risk surface is the three inert chrome lines + the pure helper).
