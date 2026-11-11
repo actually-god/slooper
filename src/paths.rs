@@ -348,4 +348,79 @@ mod tests {
             format!("kick-abcd.{}.failed", dylib_ext())
         );
     }
+
+    // ---- W11: Windows release packaging (icon, subsystem, assets) ----
+
+    /// Repo file as ONE string with CRLF normalized — Windows runners were
+    /// proven (W10) to differ in line endings, and source pins must read
+    /// identical on both OSes regardless of `.gitattributes` drift.
+    fn w11_repo_file(rel: &str) -> String {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+            .replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn w11_icon_asset_is_a_multisize_ico() {
+        // The .ico shipped for the winresource embed: ICONDIR header with
+        // type=1, at least one real image per size class, and the 256-px
+        // entry (directory width byte 0 means 256) so Explorer/Taskbar get
+        // a crisp large icon. 16-px entries are width byte 16.
+        let raw = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icon.ico"),
+        )
+        .expect("assets/icon.ico must exist (built from assets/icon.png)");
+        assert!(raw.len() > 6 + 16, "ico too short");
+        assert_eq!((&raw[0..4]), &[0, 0, 1, 0], "not an ICO (magic/type)");
+        let count = u16::from_le_bytes([raw[4], raw[5]]) as usize;
+        assert!(count >= 4, "ico has {count} images, want >= 4 sizes");
+        let mut sizes: Vec<u32> = Vec::new();
+        for i in 0..count {
+            let e = 6 + i * 16;
+            let w = if raw[e] == 0 { 256 } else { raw[e] as u32 };
+            let h = if raw[e + 1] == 0 { 256 } else { raw[e + 1] as u32 };
+            assert_eq!(w, h, "ico entry {i} not square ({w}x{h})");
+            assert!(w >= 16, "ico entry {w}px below 16");
+            sizes.push(w);
+        }
+        assert!(sizes.contains(&256), "ico lacks the 256px entry: {sizes:?}");
+        assert!(sizes.contains(&16), "ico lacks the 16px entry: {sizes:?}");
+    }
+
+    #[test]
+    fn w11_build_rs_embeds_icon_for_target_windows_only() {
+        let src = w11_repo_file("build.rs");
+        // Gate is the TARGET OS env (a build script's cfg! is the HOST —
+        // W11 trap), the icon is winresource's, and the ffiguard skip stays.
+        assert!(
+            src.contains(r#"CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")"#),
+            "icon embed must gate on CARGO_CFG_TARGET_OS, not cfg!"
+        );
+        assert!(src.contains("winresource::WindowsResource::new"));
+        assert!(src.contains(r#""assets/icon.ico""#));
+        assert!(src.contains("catch_unwind"), "toolchain probing must stay best-effort");
+        assert!(src.contains("cargo:rerun-if-changed=assets/icon.ico"));
+    }
+
+    #[test]
+    fn w11_main_rs_is_gui_subsystem_on_windows_only() {
+        let src = w11_repo_file("src/main.rs");
+        assert!(
+            src.contains(r#"#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]"#),
+            "main.rs must drop the console window ONLY on Windows targets"
+        );
+    }
+
+    #[test]
+    fn w11_release_workflow_ships_both_assets() {
+        let wf = w11_repo_file(".github/workflows/release.yml");
+        assert!(wf.contains("slooper-win64.zip"), "Windows asset name is contractual");
+        assert!(wf.contains("--zstd"), "Linux asset must be tar.zst (ledger contract)");
+        assert!(wf.contains("windows-latest"), "Windows ships from a native MSVC host (W10-proven)");
+        assert!(wf.contains("cargo build --release --locked"), "assets ride the shipping profile");
+        // Dispatch runs publish a DRAFT so the pipeline can be proven
+        // without shipping anything.
+        assert!(wf.contains(r#"draft: ${{ github.event_name == 'workflow_dispatch' }}"#));
+    }
 }
