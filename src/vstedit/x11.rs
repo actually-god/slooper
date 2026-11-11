@@ -2246,6 +2246,17 @@ pub fn main_thread_hwnd() -> Option<u64> {
     None
 }
 
+/// No embed machinery on X11 — always `false` (see [`embed_requested`]).
+pub fn set_container_visible(_handle: u64, _show: bool) -> bool {
+    false
+}
+
+/// Inert on Linux (see [`embed_requested`]); `(0, 0)` so the arithmetic
+/// the Windows sync pass performs is a documented no-op here.
+pub fn embed_parent_origin(_handle: u64) -> (i32, i32) {
+    (0, 0)
+}
+
 // ---------------------------------------------------------------- tests
 #[cfg(test)]
 mod tests {

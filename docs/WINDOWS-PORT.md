@@ -30,10 +30,12 @@ W8b-p1 DONE 2026-11-10 (session 10): the embed core — opt-in
 winit HWND with slooper-drawn chrome; Linux stays top-level (seam inert,
 pinned both ways). W8b-p2-a DONE 2026-11-10 (session 11): Config field
 `win_editor_embed` (Settings, Windows-gated) is the real switch; the env
-var stays a force-override. NEXT: W8b-p2-b (v47 dock integration — see the
-W8b checklist); W9 (Windows MIDI) can interleave. The report-only Windows
-suite in every run is the grow-list for future W-tasks (make Windows pins
-blocking as they stabilize).
+var stays a force-override. W8b-p2-b DONE 2026-11-11 (session 12): the
+chrome is a full v47 dock member (tab groups, menus, persistence) with a
+menu/carry hide policy + parent-client coordinate fix. NEXT: W8b-p2-c
+(SetParent native-window detach + DPI check); W9 (Windows MIDI) can
+interleave. The report-only Windows suite in every run is the grow-list
+for future W-tasks (make Windows pins blocking as they stabilize).
 
 ## Ground rules (apply to every task)
 
@@ -348,10 +350,15 @@ checklist for user hardware.
 - [x] **W8b p2-a DONE 2026-11-10 (session 11, see DONE log)** — Config
   field `win_editor_embed` (Settings row, Windows-gated) replaces the env
   gate; `SLOOPER_WIN_EMBED` stays as a force-override for CI/power users
-- [ ] **W8b p2-b (next)** — v47 dock integration: native editors become
-  dockable members (DynKind or equivalent), tab groups, float <-> embed
-  toggle (SetParent reparent), hide policy under egui popups/menus,
-  per-monitor DPI
+- [x] **W8b p2-b DONE 2026-11-11 (session 12, see DONE log)** — v47 dock
+  integration: native editors are dock members (`DynKind::Vst`/`VstFx`),
+  tab groups + slot menus + persistence ride the generic machinery; hide
+  policy blanks containers under open menus/popups and during carries
+- [ ] **W8b p2-c (next)** — SetParent float<->embed toggle: "detach to
+  native top-level" from the chrome slot menu (own-class `container_proc`
+  can host the re-dock `WM_NCRBUTTONUP`/`TrackPopupMenu` since the class
+  is ours) + per-monitor DPI check (WM_DPICHANGED already lands on the
+  container; verify effEditRect rescale) — W12 keeps the full DPI battery
 
 ### W9 — Windows MIDI
 `midir` (WinMM) devices feeding the existing MidiMsg pipeline; picker in the
@@ -625,4 +632,62 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   one-per-process (solo citest pass re-verified on host). Windows native
   GREEN at this commit: port pins 40/40, report-only full suite grew
   393p -> 403p / 103f.
+
+- **2026-11-11 session 12 — W8b p2-b**: v47 dock integration for native
+    editors + popup hide policy + the p1 screen->client coordinate bug.
+    (1) DOCK MEMBERSHIP: two new `DynKind` kinds — `Vst(track)` /
+    `VstFx(track, row)` (config keys "vst:<t>"/"vstfx:<t>:<r>", parse
+    BEFORE the generic splitn so "fx:" can never swallow them; vstfx uses
+    a two-part prefix parse like fx). Registration happens ONLY inside
+    `embed_editors_pass` (early-returns on Linux), so Linux never
+    instantiates the kinds; `dyn_open` = map-entry-alive AND not in
+    `chrome_closing` (close-in-flight suppression — WM_CLOSE teardown is
+    async, without the gate a closed chrome flickers itself back before
+    `reap_vst_editors` lands); `dyn_set(false)` -> `chrome_closing_close`
+    = the SAME request_wm_delete protocol as the chrome X (one teardown
+    path). Dock slots, tab groups (drop-on-header merge, tab strip,
+    drag-out carry), slot menus, dock/float buttons, Windows menu + Ctrl+K
+    entries, and DynDock persistence ALL come free from the generic
+    machinery. One body (`embed_body`) draws in BOTH chrome generations
+    (float owner = drum_window pattern; docked = `dyn_body` dispatch); the
+    slot it allocates = min(plugin size, offered) so a squeezed dock clips
+    the plugin INSIDE its container instead of painting over a neighbour.
+    (2) SYNC: `embed_sync_pass` runs between `side_frames` and
+    `central_panels` (float bodies record in the editors pass, docked
+    bodies record inside side_frames — the sync must see both), diffs per
+    xid, and posts `set_container_rect`/`set_container_visible` to the
+    vst2-gui thread (thread rule unchanged).
+    (3) COORDINATE FIX (p1 latent bug — no real desktop in CI ever
+    measured it): containers are children, SetWindowPos positions them in
+    PARENT CLIENT space, but egui rects are screen points — p1 posted
+    screen*ppp directly, right on a (0,0)-maximised window and visibly
+    off by the window origin otherwise. New twin seam
+    `embed_parent_origin(hwnd)` = ClientToScreen(parent, 0,0) (physical),
+    subtracted in the sync; x11 twin answers (0,0) inert. win32 functional
+    pin `w8b_embed_parent_origin_is_client_to_screen` proves the
+    translation on the off-screen stand-in parent.
+    (4) HIDE POLICY (p1 limitation closed): a WS_CHILD paints OVER egui's
+    GL surface, so containers hide (`set_container_visible` = SW_HIDE /
+    SW_SHOWNA — no activation, no geometry) while ANY menu/popup is open
+    OR a window is carried. egui's `any_popup_open` is pub(crate) — the
+    public equivalent is `ctx.memory(|m| m.layer_ids().any(|l| l.order ==
+    Order::Foreground))` (Popup/Menu containers live on Foreground; plain
+    Window-order dialogs/tooltips do NOT count — value_menu-class popups
+    may still be over-covered by a container, documented).
+    Pins: 2 win32 functional (visibility round trip + origin), seam surface
+    list + x11-inert + win-null extensions, wiring pin extended (ordering
+    asserted BETWEEN side_frames and central_panels; dispatch asserted via
+    the `app.embed_body(...)` CALL, registration via the kind-tuple — a
+    bare "DynKind::Vst(t) =>" contains-check was SABOTAGE-PASSED vacuously
+    because key() carries the same pattern; pin strings must be
+    unique-call-site markers). Sabotage rounds: sync-call drop RED,
+    body-dispatch rename RED, twin drift RED — all reverted clean.
+    Gates (Linux host): host check --all-targets + gnullvm --all-targets
+    clean (1 unused-BOOL fixed with `let _`), clippy-zero, w* 171 green,
+    w8 8/8, v47 14/14, v43 9/9, v35 16/16, config w8b pin green. Windows
+    functional truth = CI run at this commit (w8b_ filter already carries
+    the new pins). Deferred honestly: p2-c = SetParent native-window
+    detach toggle (own class = own wndproc can host the re-dock context
+    menu); per-monitor DPI stays a W12 item (plugin px still treated as
+    logical — exact at 100%).
 

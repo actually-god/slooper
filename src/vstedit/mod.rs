@@ -119,6 +119,10 @@ mod seam_tests {
             "set_embed_parent",
             "set_container_rect",
             "main_thread_hwnd",
+            // W8b p2-b: hide policy + coordinate-origin seam for the v47
+            // dock integration.
+            "set_container_visible",
+            "embed_parent_origin",
         ]
         .into_iter()
         .map(String::from)
@@ -199,6 +203,10 @@ mod seam_tests {
         crate::vstedit::set_embed_parent(0x1234);
         assert!(!crate::vstedit::set_container_rect(0x1234, 0, 0, 10, 10));
         crate::vstedit::set_embed_parent(0);
+        // W8b p2-b additions answer inert too (the sync pass that calls
+        // them never runs on Linux, and even if it did: no-ops).
+        assert!(!crate::vstedit::set_container_visible(0x1234, false));
+        assert_eq!(crate::vstedit::embed_parent_origin(0x1234), (0, 0));
         match had {
             Some(v) => std::env::set_var("SLOOPER_WIN_EMBED", v),
             None => std::env::remove_var("SLOOPER_WIN_EMBED"),
@@ -223,6 +231,9 @@ mod seam_tests {
             "any non-empty value enables (parity with SLOOPER_SCAN_INLINE)"
         );
         assert!(!crate::vstedit::set_container_rect(0, 1, 2, 3, 4));
+        // W8b p2-b honest refusals on the null HWND.
+        assert!(!crate::vstedit::set_container_visible(0, true));
+        assert_eq!(crate::vstedit::embed_parent_origin(0), (0, 0));
         match had {
             Some(v) => std::env::set_var("SLOOPER_WIN_EMBED", v),
             None => std::env::remove_var("SLOOPER_WIN_EMBED"),
@@ -272,6 +283,56 @@ mod seam_tests {
         assert!(
             window.contains("vsthost::post"),
             "set_container_rect must run on the vst2-gui thread via vsthost::post"
+        );
+        // W8b p2-b: dock integration + hide policy wiring.
+        assert!(
+            ui.contains("fn embed_sync_pass"),
+            "the geometry/visibility sync must be its own pass"
+        );
+        let sf = ui.find("side_frames(ui, self);").expect("side_frames call site");
+        let after_sf = &ui[sf..];
+        let cp = after_sf
+            .find("central_panels(ui, self);")
+            .expect("central_panels call site");
+        assert!(
+            after_sf[..cp].contains("embed_sync_pass("),
+            "embed_sync_pass must land between side_frames and central_panels \
+             (docked bodies record their slot in side_frames)"
+        );
+        assert!(ui.contains("embed_parent_origin("), "chrome must subtract the parent client origin");
+        let vis = ui.find("set_container_visible(").expect("hide policy must call set_container_visible");
+        let visw = &ui[vis.saturating_sub(240)..vis];
+        assert!(
+            visw.contains("vsthost::post"),
+            "set_container_visible must run on the vst2-gui thread via vsthost::post"
+        );
+        // Dock membership: BOTH chrome kinds registered as dock members and
+        // dispatched to the shared body. Assert the BODY-CALL marker (not a
+        // bare "DynKind::Vst(t) =>", which the key()/from_key() match arms
+        // also contain and would satisfy the check vacuously).
+        assert!(
+            ui.contains("DynKind::Vst(t),") && ui.contains("DynKind::VstFx(k.0, k.1),"),
+            "embed pass must register Vst/VstFx dock members"
+        );
+        assert!(
+            ui.matches("app.embed_body(ui, xid, size, painted)").count() >= 2,
+            "dyn_body must dispatch both native-editor kinds through embed_body"
+        );
+        // The chrome's own float + close suppression wiring.
+        assert!(
+            ui.contains("self.embed_chrome(ctx, idx, kind, xid, size, painted)")
+                && ui.contains("self.dyn_dock_skip(idx)"),
+            "embed pass must skip the float chrome when docked and draw it otherwise"
+        );
+        assert!(
+            ui.contains("fn chrome_closing_close")
+                && ui.contains("chrome_closing.contains(&xid)"),
+            "close-in-flight suppression must gate both the float and dock paths"
+        );
+        // Hide policy inputs (v1): any open menu/popup area or a carry.
+        assert!(
+            ui.contains("egui::Order::Foreground") && ui.contains("free_drag.is_some()"),
+            "hide policy must consider open popups and window carries"
         );
     }
 }
