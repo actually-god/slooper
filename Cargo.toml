@@ -67,6 +67,7 @@ vst2 = { path = "vendor/vst2" }
 jack = "0.13.5"
 
 [target.'cfg(windows)'.dependencies]
+midir = "0.11"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",

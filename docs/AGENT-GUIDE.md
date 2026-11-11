@@ -116,6 +116,11 @@ src/            application source (Rust 2021 edition)
   fxgui.rs        child editor windows (auto sliders or scripted GUIs)
   midi.rs         MIDI message parsing, MidiBind matching, MidiAction
                   table, keyboard-shortcut layout migration (v0.1 → v0.2)
+  midiin.rs       W9 Windows MIDI bus: lock-free MPMC event ring (WinMM
+                  callback threads push, WASAPI RT loop drains into
+                  process_block, frame 0 = block start) + label dedupe /
+                  selection math. Linux never builds the WinMM side — the
+                  ring itself is OS-neutral so every w9 pin runs everywhere.
   ports.rs        JACK port enumeration helpers
   quantize.rs     metronome grid math, content quantize, silence trim,
                   zero-crossing refinement + seam crossfade

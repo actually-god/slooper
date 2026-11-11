@@ -28,6 +28,7 @@ pub mod fx;
 pub mod fxgui;
 pub mod meter;
 pub mod midi;
+pub mod midiin;
 pub mod midipat;
 pub mod paths;
 pub mod ports;

@@ -1452,6 +1452,14 @@ pub struct App {
     knob_learn: Option<KnobLearn>,
     knob_cal: Vec<Option<MidiAxisCal>>,
     midi_sources: Vec<String>,
+    /// W9 (Windows): WinMM MIDI picker. `win_midi` is the applied selection
+    /// (config-persisted), `avail_midi` comes from `Evt::MidiInputs`,
+    /// `sel_midi` the live checkbox state. All Linux-inert: the JACK path
+    /// never sends `Evt::MidiInputs` and the picker section is gated on
+    /// `cfg!(windows)`.
+    win_midi: Vec<String>,
+    avail_midi: Vec<String>,
+    sel_midi: std::collections::HashSet<String>,
     bind_loop_sel: usize,
 
     // --- export dialog ---
@@ -1668,6 +1676,11 @@ impl App {
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
             mpe_on: cfg.mpe,
             win_embed: cfg.win_editor_embed,
+            // W9: restore the WinMM selection from the config; the picker
+            // re-ticks itself from these on first paint.
+            win_midi: cfg.win_midi_inputs.clone(),
+            avail_midi: Vec::new(),
+            sel_midi: cfg.win_midi_inputs.iter().cloned().collect(),
             theme_was_light: None,
             status_at: std::time::Instant::now(),
             status_seen: "starting…".into(),
@@ -4495,6 +4508,7 @@ impl App {
             theme: if self.light_theme { "light" } else { "dark" }.into(),
             mpe: self.mpe_on,
             win_editor_embed: self.win_embed,
+            win_midi_inputs: self.win_midi.clone(),
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -12102,6 +12116,12 @@ impl App {
                         });
                     }
                 }
+                // W9: the same for the WinMM MIDI selection (no-op on
+                // Linux — the JACK backend ignores SetMidiInputs).
+                if cfg!(windows) && !self.win_midi.is_empty() {
+                    self.backend
+                        .cmd(Cmd::SetMidiInputs(self.win_midi.clone()));
+                }
                 self.push_project();
             }
             Evt::Ports { ins, outs } => {
@@ -12395,6 +12415,10 @@ impl App {
 
             Evt::MidiSources(names) => {
                 self.midi_sources = names;
+            }
+            Evt::MidiInputs(names) => {
+                // W9 (Windows only in practice): refresh the picker list.
+                self.avail_midi = names;
             }
             Evt::Notice(msg) => self.status = msg,
             Evt::Xrun => {}
@@ -22810,6 +22834,60 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 }
             });
             }
+            // ---- MIDI inputs (Windows only) --------------------------------
+            // W9: WinMM device picker, same shape as the audio port lists.
+            // On Linux this section never renders — JACK MIDI auto-connects
+            // every remote port and the monitor panel reports the sources.
+            if cfg!(windows)
+                && settings_sect(
+                    ui,
+                    &app.sett_filter,
+                    "MIDI INPUTS",
+                    "midi inputs devices winmm keyboard apply refresh open",
+                )
+            {
+                any = true;
+                ui.label(
+                    RichText::new(format!("DEVICES  ({})", app.avail_midi.len()))
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "tick devices, then Apply Selection; after hot-plugging, Refresh + re-Apply",
+                    )
+                    .weak()
+                    .small(),
+                );
+                if app.avail_midi.is_empty() {
+                    ui.label(RichText::new("no MIDI input devices found").weak());
+                }
+                for n in &app.avail_midi {
+                    let mut checked = app.sel_midi.contains(n);
+                    if ui.checkbox(&mut checked, n.as_str()).clicked() {
+                        if checked {
+                            app.sel_midi.insert(n.clone());
+                        } else {
+                            app.sel_midi.remove(n);
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Apply Selection").clicked() {
+                        // Sorted for a stable config file; the backend
+                        // opens in enumeration order either way.
+                        let mut sel: Vec<String> =
+                            app.sel_midi.iter().cloned().collect();
+                        sel.sort();
+                        app.win_midi = sel.clone();
+                        app.backend.cmd(Cmd::SetMidiInputs(sel));
+                        app.save_config();
+                        app.status = "midi: selection applied".into();
+                    }
+                    if ui.button("Refresh").clicked() {
+                        app.backend.cmd(Cmd::Refresh);
+                    }
+                });
+            }
             if !any {
                 // v43 R5: an explicit dead end — a query that hits nothing
                 // must say so, not paint an empty panel.
@@ -23396,6 +23474,50 @@ mod tests {
             f0[0].x,
             f1[0].x
         );
+    }
+
+    /// W9: `Evt::MidiInputs` (Windows-only in practice) must land in the
+    /// picker's available-device list. The handler itself is OS-neutral,
+    /// so this half of the seam is pinned on every OS.
+    #[test]
+    fn w9_midi_inputs_evt_feeds_the_picker() {
+        let mut app = headless_app("w9-midi-evt");
+        assert!(app.avail_midi.is_empty(), "no devices before the backend talks");
+        app.handle_evt(crate::audio::Evt::MidiInputs(vec![
+            "KeyStage 61".into(),
+            "KeyStage 61 [2]".into(),
+        ]));
+        assert_eq!(app.avail_midi.len(), 2);
+        assert_eq!(app.avail_midi[1], "KeyStage 61 [2]", "labels ride verbatim");
+        // The applied selection and the checkbox state stay distinct:
+        // receiving a list must not silently apply anything.
+        assert!(app.win_midi.is_empty(), "receiving the list applies nothing");
+    }
+
+    /// W9: the WinMM picker section renders ONLY on Windows — on Linux the
+    /// JACK monitor is the MIDI UI and the section must not exist, even
+    /// when device data is present (the Linux build is byte-inert).
+    #[test]
+    fn w9_midi_picker_section_is_windows_only() {
+        let mut app = headless_app("w9-midi-sect");
+        let ctx = egui::Context::default();
+        app.show_binds = false;
+        app.show_midi = false;
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.avail_midi = vec!["MIDI Keyboard".into()];
+        let mut painted = || galley_centers(&mut app, &ctx, "MIDI INPUTS", true);
+        if cfg!(windows) {
+            assert!(
+                !painted().is_empty(),
+                "Windows must paint the MIDI INPUTS settings section"
+            );
+        } else {
+            assert!(
+                painted().is_empty(),
+                "the WinMM picker must never paint on Linux"
+            );
+        }
     }
 
     /// The full user gesture: press a rack row, drag onto a track's lane
