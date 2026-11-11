@@ -2257,6 +2257,28 @@ pub fn embed_parent_origin(_handle: u64) -> (i32, i32) {
     (0, 0)
 }
 
+// W8b p2-c: the detach/re-dock toggle is Win32 embed machinery. Linux
+// editors are native top-level X windows that never live inside slooper's
+// window, so there is nothing to detach, nothing to re-dock and no embed
+// state to report — all three answer the honest inert, and the chrome pass
+// that consults them never runs here anyway (its `embed_hwnd` gate can
+// never become Some on X11).
+
+/// Inert on Linux — see the detach/re-dock note above.
+pub fn detach_to_toplevel(_handle: u64) -> bool {
+    false
+}
+
+/// Inert on Linux — see the detach/re-dock note above.
+pub fn redock_to_embed(_handle: u64) -> bool {
+    false
+}
+
+/// Inert on Linux — see the detach/re-dock note above.
+pub fn container_is_detached(_handle: u64) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------- tests
 #[cfg(test)]
 mod tests {

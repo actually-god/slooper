@@ -36,6 +36,9 @@ menu/carry hide policy + parent-client coordinate fix. NEXT: W8b-p2-c
 (SetParent native-window detach + DPI check); W9 (Windows MIDI) can
 interleave. The report-only Windows suite in every run is the grow-list
 for future W-tasks (make Windows pins blocking as they stabilize).
+W8b-p2-c DONE 2026-11-11 (session 13, `docs/WINDOWS-PORT.md` DONE log):
+SetParent float<->embed detach. NEXT: W9 (Windows MIDI); per-monitor DPI
+battery + remaining polish = W12.
 
 ## Ground rules (apply to every task)
 
@@ -354,11 +357,12 @@ checklist for user hardware.
   integration: native editors are dock members (`DynKind::Vst`/`VstFx`),
   tab groups + slot menus + persistence ride the generic machinery; hide
   policy blanks containers under open menus/popups and during carries
-- [ ] **W8b p2-c (next)** — SetParent float<->embed toggle: "detach to
-  native top-level" from the chrome slot menu (own-class `container_proc`
-  can host the re-dock `WM_NCRBUTTONUP`/`TrackPopupMenu` since the class
-  is ours) + per-monitor DPI check (WM_DPICHANGED already lands on the
-  container; verify effEditRect rescale) — W12 keeps the full DPI battery
+- [x] **W8b p2-c DONE 2026-11-11 (session 13, see DONE log)** — SetParent
+  float<->embed detach: slot-menu "detach to native window" (posts the
+  style flip to the vst2-gui thread), the detached window's own-class
+  `container_proc` hosts `WM_NCRBUTTONUP`→`TrackPopupMenu` re-dock, the
+  dock keeps a placeholder; `WM_DPICHANGED` keeps a fixed-size editor at
+  its `effEditRect` size (pure `dpi_target` verdict; full rescale = W12)
 
 ### W9 — Windows MIDI
 `midir` (WinMM) devices feeding the existing MidiMsg pipeline; picker in the
@@ -691,3 +695,65 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
     menu); per-monitor DPI stays a W12 item (plugin px still treated as
     logical — exact at 100%).
 
+
+- **2026-11-11 session 13 — W8b p2-c**: SetParent float<->embed detach +
+    the scoped DPI check. (1) TOGGLE DESIGN: NO new state — the LIVE
+    window style IS the state (`container_is_detached` = "no `WS_CHILD`",
+    a style query dispatches nothing so it is safe from the UI thread),
+    both directions are style flips and the chrome pass follows next
+    frame; re-dock from the native window needs no channel back. New twin
+    seams `detach_to_toplevel` / `redock_to_embed` / `container_is_detached`
+    (win32 = the SetParent dance via `container_style()` reuse +
+    `SetWindowLongW`/`SetParent`/`SWP_FRAMECHANGED`; x11 = documented
+    inert — Linux editors were always native top-levels). The embed
+    parent is remembered at creation (`Tables.parent`, cleaned by
+    `forget_window`) and revalidated live — a closed main window makes
+    re-dock an honest `false`. Detach keeps the on-screen position
+    (window rects are screen space for children too); re-dock parks at
+    the parent origin and drops the geometry-diff entry
+    (`embed_sync.remove`) so the slot rect always re-lands.
+    (2) UI WIRING: the shared `window_slot_menu` grows a
+    "detach to native window" row gated by `native_member_container`
+    (kind filter — `None` for every non-native member, xid 0, already-
+    detached, and structurally ALWAYS on Linux where Vst/VstFx members are
+    never registered); `embed_body` becomes a placeholder ("dock back
+    into slooper" + explanation) while detached and records NO slot;
+    `embed_sync_pass` skips detached containers for both geometry and
+    visibility (a parent-client coord would teleport a top-level; the
+    hide policy must not fight user-minimize). Both window calls post to
+    the vst2-gui thread like every other HWND touch.
+    (3) NATIVE RE-DOCK MENU: own-class `container_proc` handles
+    `WM_NCRBUTTONUP` (HTCAPTION only — children have no non-client area,
+    so structurally top-level-only; probe mode refuses) with
+    `TrackPopupMenu(TPM_RETURNCMD)`: "Dock back into slooper" (only while
+    a live parent is remembered) + "Close editor" (the WM_CLOSE twin).
+    Documented trade-off: the modal menu loop keeps DISPATCHING this
+    thread's messages (plugin children stay responsive) but `effEditIdle`
+    pauses while open — user-bounded, like any Windows context menu.
+    (4) DPI CHECK: `WM_DPICHANGED` now routes through the pure
+    `dpi_target(pinned, suggested, frame_style)`: a resizable container
+    follows the suggested rect, a FIXED-SIZE (v36-pinned) container takes
+    the suggested POSITION only — its `effEditRect` did NOT rescale, so
+    the scaled size would only expose the sentinel. Per-monitor rescaling
+    of plugin content itself stays W12.
+    (5) PINS: seam surface list + both OS gates extended (Linux inert ×3,
+    null-HWND honest refusals ×3); wiring pin extended — placeholder
+    gates on the live style, both new calls ride `vsthost::post`, the
+    sync pass skips detached for BOTH passes, geometry-diff drop asserted
+    (sabotage rounds: sync filter+drop RED, redock-post-drop RED,
+    detach-post-drop RED, x11-inert-flip RED — all reverted clean);
+    win32 functional `w8c_*` ×3 (detach round trip incl. position
+    preservation + idempotence + never-embedded refusal, DPI pinned/
+    unpinned via real `SendMessageW(WM_DPICHANGED)`). CI: `w8c_` added to
+    the substring filter (the `w8_` does-not-match-subletter trap again).
+    Smoke item 8 in INSTALL.md covers the flow on user hardware.
+    Gates (Linux host): host check --all-targets + gnullvm --all-targets
+    clean ( sabotage-probe re-verified the gnullvm check actually compiles
+    the cfg(windows) test code — and it CAUGHT a `parent_of` field typo
+    invisible to the Linux build), w2..w8b 40/40, v47 14/14, v43 9/9,
+    v35 16/16, vstedit 22/22, config 12/12, clippy-zero. Windows
+    functional truth = the CI run at this commit. Honest residuals:
+    detach mid-DPI-change transient (style read can lag one frame; self-
+    corrects); the modal menu stalls effEditIdle while open; Windows-menu/
+    palette entries for a detached member still toggle "visibility" of
+    the placeholder only.

@@ -59,15 +59,18 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateSolidBrush, EndPaint, GetDC, GetPixel, ReleaseDC, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, EnumChildWindows, EnumThreadWindows, GetClientRect, GetWindow,
-    GetWindowLongW, GetWindowTextLengthW, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, IDC_ARROW,
-    LoadCursorW, MINMAXINFO, MSG, PeekMessageW, PostMessageW, RegisterClassExW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateMessage, WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE,
-    WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW, IsWindow, IsWindowVisible, PM_REMOVE, SW_HIDE, SW_SHOWNA,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_GETMINMAXINFO, WM_PAINT, WM_SIZE, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    AdjustWindowRect, AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT,
+    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, EnumChildWindows,
+    EnumThreadWindows, GetClientRect, GetCursorPos, GetParent, GetWindow, GetWindowLongW,
+    GetWindowRect, GetWindowTextLengthW, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HTCAPTION, IDC_ARROW,
+    LoadCursorW, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, PeekMessageW, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetParent, SetWindowLongW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TrackPopupMenu, TranslateMessage, WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE,
+    WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW, IsChild, IsWindow, IsWindowVisible, PM_REMOVE, SW_HIDE,
+    SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_NCRBUTTONUP,
+    WM_PAINT, WM_SIZE, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 
 use crate::vsthost::Vst2Handle;
@@ -290,6 +293,118 @@ pub fn embed_parent_origin(handle: u64) -> (i32, i32) {
     (pt.x, pt.y)
 }
 
+// ------------------------------------------------------- detach / re-dock (W8b p2-c)
+//
+// The SetParent toggle between the egui embed chrome and a native top-level
+// window. There is deliberately NO host-side state machine for it: the LIVE
+// WINDOW STYLE is the state (`container_is_detached` = "no `WS_CHILD`"), so
+// the egui side reads the truth every frame and the re-dock coming from the
+// native title-bar menu needs no channel back — both directions are style
+// flips, and the chrome pass follows on the next frame. The window
+// procedures and every `SetWindowPos`/`SetParent` here belong to the
+// vst2-gui thread: UI-thread callers (`ui.rs`) MUST route through
+// `vsthost::post`; `container_is_detached` is the exception — a style
+// query dispatches nothing and is safe cross-thread.
+
+/// Make an embedded container its own top-level window on the desktop,
+/// keeping its current on-screen position (window rects are screen space
+/// for children too). The embed parent is remembered for the re-dock.
+/// `true` when the container IS a top-level afterwards — already-detached
+/// is success (idempotent), which also covers containers born top-level:
+/// W8a-style editors are "detached" by definition and the chrome pass
+/// keeps its hands off them.
+pub fn detach_to_toplevel(handle: u64) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    let win = hwnd_of(handle);
+    unsafe {
+        if !IsWindow(Some(win)).as_bool() {
+            return false;
+        }
+        if WINDOW_STYLE(GetWindowLongW(win, GWL_STYLE) as u32).0 & WS_CHILD.0 == 0 {
+            return true;
+        }
+        // Belt for containers whose parent was never recorded at creation
+        // (there are none today; the toggle must still be able to undo).
+        if let Ok(p) = GetParent(win) {
+            if !p.is_invalid() {
+                note_parent(win, p);
+            }
+        }
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(win, &mut rc);
+        SetWindowLongW(win, GWL_STYLE, container_style(false, probe_mode()).0 as i32);
+        if SetParent(win, None).is_err() {
+            return false;
+        }
+        let _ = SetWindowPos(
+            win,
+            None,
+            rc.left,
+            rc.top,
+            (rc.right - rc.left).max(8),
+            (rc.bottom - rc.top).max(8),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        true
+    }
+}
+
+/// The reverse toggle: pull a detached editor back under its remembered
+/// embed parent (frame off, `WS_CHILD` on). The chrome pass notices the
+/// style flip next frame and resumes chrome, geometry and hide policy.
+/// `false` when the window is gone, was never embedded (no remembered
+/// parent), or the main window it lived in has since been destroyed.
+pub fn redock_to_embed(handle: u64) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    let win = hwnd_of(handle);
+    let Some(parent) = parent_of(win) else {
+        return false;
+    };
+    unsafe {
+        if !IsWindow(Some(win)).as_bool() {
+            return false;
+        }
+        if WINDOW_STYLE(GetWindowLongW(win, GWL_STYLE) as u32).0 & WS_CHILD.0 != 0 {
+            return IsChild(parent, win).as_bool(); // already back
+        }
+        SetWindowLongW(win, GWL_STYLE, container_style(true, probe_mode()).0 as i32);
+        if SetParent(win, Some(parent)).is_err() {
+            return false;
+        }
+        // Park at the parent's client origin keeping the size: the chrome
+        // sync pass lands the slot rect on the next UI frame.
+        let _ = SetWindowPos(
+            win,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        true
+    }
+}
+
+/// Is this live container currently NOT a `WS_CHILD` — i.e. outside the
+/// embed chrome (user-detached, or born native W8a-style)? Reads the live
+/// window style, the single source of truth for the toggle; `false` for a
+/// null or gone handle (an honest "nothing to manage").
+pub fn container_is_detached(handle: u64) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    let win = hwnd_of(handle);
+    unsafe {
+        IsWindow(Some(win)).as_bool()
+            && WINDOW_STYLE(GetWindowLongW(win, GWL_STYLE) as u32).0 & WS_CHILD.0 == 0
+    }
+}
+
 // ------------------------------------------------------------------ tables
 //
 // Window-scoped state the window procedure needs but must NOT call into
@@ -308,6 +423,11 @@ struct Tables {
     /// Newest container client-size report per window (`WM_SIZE`),
     /// consumed by the Live phase — the ConfigureNotify twin.
     resizes: HashMap<isize, (u32, u32)>,
+    /// W8b p2-c: the remembered embed parent of every container born (or
+    /// living) embedded — the re-dock target when the editor got its own
+    /// top-level frame and the user asks for it back from the native
+    /// title-bar menu.
+    parent: HashMap<isize, isize>,
 }
 
 fn tables() -> &'static Mutex<Tables> {
@@ -317,6 +437,7 @@ fn tables() -> &'static Mutex<Tables> {
             closed: HashSet::new(),
             pinned: HashMap::new(),
             resizes: HashMap::new(),
+            parent: HashMap::new(),
         })
     })
 }
@@ -351,7 +472,22 @@ fn forget_window(win: HWND) {
         t.closed.remove(&k);
         t.pinned.remove(&k);
         t.resizes.remove(&k);
+        t.parent.remove(&k);
     }
+}
+
+fn note_parent(win: HWND, parent: HWND) {
+    if let Ok(mut t) = tables().lock() {
+        t.parent.insert(win.0 as isize, parent.0 as isize);
+    }
+}
+
+/// The remembered embed parent — `Some` only while it names a LIVE window
+/// (a closed main window means re-dock is impossible, honestly).
+fn parent_of(win: HWND) -> Option<HWND> {
+    let v = tables().lock().ok()?.parent.get(&(win.0 as isize)).copied()?;
+    let h = HWND(v as *mut c_void);
+    unsafe { IsWindow(Some(h)).as_bool().then_some(h) }
 }
 
 /// Frame style every TOP-LEVEL container is created with (the pin math and
@@ -404,7 +540,7 @@ unsafe fn create_container(title: &str, size: (i32, i32)) -> Result<HWND, String
     let style = container_style(embedded.is_some(), probe_mode());
     let (w, h) = (size.0.max(8), size.1.max(8));
     unsafe {
-        CreateWindowExW(
+        let win = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name(),
             PCWSTR(tname.as_ptr()),
@@ -418,7 +554,14 @@ unsafe fn create_container(title: &str, size: (i32, i32)) -> Result<HWND, String
             Some(hinst),
             None,
         )
-        .map_err(|e| format!("CreateWindowExW refused: {e}"))
+        .map_err(|e| format!("CreateWindowExW refused: {e}"))?;
+        // W8b p2-c: remember WHO the embed parent is — the detach/re-dock
+        // toggle re-embeds into this very window even if the process-global
+        // `EMBED_PARENT` seam has long been cleared again.
+        if let Some(p) = embedded {
+            note_parent(win, p);
+        }
+        Ok(win)
     }
 }
 
@@ -481,21 +624,43 @@ unsafe extern "system" fn container_proc(
             DefWindowProcW(win, msg, wparam, lparam)
         }
         WM_DPICHANGED => {
-            // Apply the suggested rectangle synchronously (SetWindowPos may
+            // Apply the DPI verdict synchronously (SetWindowPos may
             // re-enter messages, so do it before any table lock).
             if lparam.0 != 0 {
-                let r = &*(lparam.0 as *const RECT);
-                let _ = SetWindowPos(
-                    win,
-                    None,
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+                let r = *(lparam.0 as *const RECT);
+                let (x, y, w, h) = dpi_target(pinned_of(win), r, frame_style());
+                let _ = SetWindowPos(win, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             LRESULT(0)
+        }
+        WM_NCRBUTTONUP => {
+            // W8b p2-c: a right-click on the TITLE BAR of a detached
+            // editor. The WNDCLASS is ours, so the re-dock menu lives here
+            // without egui being one bit involved — and it is structurally
+            // top-level-only (a `WS_CHILD` has no non-client area and can
+            // never receive this message). TrackPopupMenu runs its own
+            // modal message loop on this (the vst2-gui) thread: plugin
+            // child windows keep getting their messages dispatched while
+            // the menu is open; `effEditIdle` pauses until it closes — a
+            // user-bounded stall, the same trade-off every Windows context
+            // menu makes. Probe containers are never shown, and probe
+            // mode refuses the menu outright as a pin.
+            if wparam.0 as u32 == HTCAPTION && !probe_mode() {
+                if let Some(cmd) = unsafe { editor_title_menu(win) } {
+                    match cmd {
+                        IDM_REDOCK => {
+                            // Honest no-op when the main window is gone:
+                            // the editor simply stays native.
+                            let _ = redock_to_embed(win.0 as u64);
+                        }
+                        IDM_CLOSE => note_closed(win), // the WM_CLOSE twin
+                        _ => {}
+                    }
+                }
+                LRESULT(0)
+            } else {
+                DefWindowProcW(win, msg, wparam, lparam)
+            }
         }
         WM_PAINT => {
             // Validate the region; the class brush paints the sentinel.
@@ -506,6 +671,71 @@ unsafe extern "system" fn container_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(win, msg, wparam, lparam),
+    }
+}
+
+/// `TrackPopupMenu` return values for the detached title-bar menu.
+const IDM_REDOCK: usize = 0x5101;
+const IDM_CLOSE: usize = 0x5102;
+
+/// Build and track the detached editor's title-bar right-click menu at the
+/// cursor. `TPM_RETURNCMD`: returns the picked command synchronously, `None`
+/// on cancel. The re-dock row only exists while a live embed parent is
+/// remembered — exactly the state `redock_to_embed` would act on.
+unsafe fn editor_title_menu(win: HWND) -> Option<usize> {
+    let menu = CreatePopupMenu().ok()?;
+    let s_redock = utf16("Dock back into slooper");
+    let s_close = utf16("Close editor");
+    if parent_of(win).is_some() {
+        let _ = AppendMenuW(menu, MF_STRING, IDM_REDOCK, PCWSTR(s_redock.as_ptr()));
+    }
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, IDM_CLOSE, PCWSTR(s_close.as_ptr()));
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        pt = POINT { x: 8, y: 8 };
+    }
+    // The classic pairing: foreground the window first, otherwise a click
+    // outside the menu never dismisses it.
+    let _ = SetForegroundWindow(win);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        pt.x,
+        pt.y,
+        None,
+        win,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    (cmd.0 > 0).then(|| cmd.0 as usize)
+}
+
+/// Where a `WM_DPICHANGED` moves the container (the pure verdict the W8b
+/// p2-c DPI check drives): a resizable plugin follows the OS-suggested
+/// (DPI-scaled) rect, but a FIXED-size plugin (refused `effEditCanSize`)
+/// has not rescaled its `effEditRect` — growing the frame would only
+/// expose the sentinel background around content that never asked to grow.
+/// So a pinned container takes the suggested POSITION and keeps the pinned
+/// client size (frame-adjusted); per-monitor rescaling of plugin content
+/// itself stays a W12 battery item.
+fn dpi_target(pinned: Option<(i32, i32)>, r: RECT, frame: WINDOW_STYLE) -> (i32, i32, i32, i32) {
+    let (x, y) = (r.left, r.top);
+    let Some((pw, ph)) = pinned else {
+        return (x, y, (r.right - r.left).max(8), (r.bottom - r.top).max(8));
+    };
+    let mut fr = RECT {
+        left: 0,
+        top: 0,
+        right: pw.max(8),
+        bottom: ph.max(8),
+    };
+    unsafe {
+        if AdjustWindowRect(&mut fr, frame, false).is_ok() {
+            (x, y, (fr.right - fr.left).max(8), (fr.bottom - fr.top).max(8))
+        } else {
+            (x, y, pw.max(8), ph.max(8))
+        }
     }
 }
 
@@ -2004,7 +2234,9 @@ pub fn probe_child(spec: &str) -> i32 {
 mod embed_tests {
     use super::*;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsChild};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, IsChild, SendMessageW, WM_DPICHANGED,
+    };
 
     /// RAII destroy for the stand-in parent window.
     struct Parent(HWND);
@@ -2234,5 +2466,136 @@ mod embed_tests {
             assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "found handle is a window");
             assert_eq!(styles(win) & WS_CHILD.0, 0, "found window is top-level");
         }
+    }
+
+    // ------------------------------------------------------- W8b p2-c pins
+    //
+    // The detach/re-dock toggle drives the REAL seams (the same functions
+    // ui.rs posts to the vst2-gui thread) against the off-screen stand-in
+    // parent, plus the WM_DPICHANGED verdict via a direct SendMessage of
+    // the message the window station would deliver.
+
+    #[test]
+    fn w8c_detach_to_toplevel_round_trip() {
+        let p = make_parent();
+        set_embed_parent(p.0.0 as u64);
+        let win = unsafe { create_container("W8c", (320, 200)) }.expect("embedded container");
+        set_embed_parent(0);
+        let _c = Ctx(win);
+        assert!(!container_is_detached(win.0 as u64), "born embedded");
+
+        // Detach: leaves the parent, gets the W8a frame back, and keeps
+        // its screen position (window rects are screen space for children).
+        let mut before = RECT::default();
+        unsafe { GetWindowRect(win, &mut before) }.expect("child rect");
+        assert!(detach_to_toplevel(win.0 as u64), "detach accepted");
+        assert!(container_is_detached(win.0 as u64), "style flipped to top-level");
+        assert!(!unsafe { IsChild(p.0, win) }.as_bool(), "left the embed parent");
+        let st = styles(win);
+        assert_eq!(st & WS_CHILD.0, 0, "no longer a child");
+        assert_ne!(st & WS_OVERLAPPEDWINDOW.0, 0, "W8a frame restored");
+        let mut after = RECT::default();
+        unsafe { GetWindowRect(win, &mut after) }.expect("top-level rect");
+        assert_eq!(
+            (after.left, after.top),
+            (before.left, before.top),
+            "detach keeps the on-screen position"
+        );
+        // Idempotent, and the window is alive throughout.
+        assert!(detach_to_toplevel(win.0 as u64), "detach is idempotent");
+        assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "detach destroys nothing");
+
+        // Re-dock: back under the REMEMBERED parent (the EMBED_PARENT seam
+        // is long cleared — only the table still knows it), frame off.
+        assert!(redock_to_embed(win.0 as u64), "redock accepted");
+        assert!(!container_is_detached(win.0 as u64), "embedded again");
+        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "back under the parent");
+        let st = styles(win);
+        assert_ne!(st & WS_CHILD.0, 0, "child style restored");
+        assert_eq!(st & WS_OVERLAPPEDWINDOW.0, 0, "frame removed again");
+        assert!(redock_to_embed(win.0 as u64), "redock is idempotent");
+
+        // Honest refusals: null handle, and a container that was never
+        // embedded has no remembered parent to come back to.
+        assert!(!detach_to_toplevel(0), "null handle refuses detach");
+        assert!(!redock_to_embed(0), "null handle refuses redock");
+        assert!(!container_is_detached(0), "null handle is not detached");
+        set_embed_parent(0);
+        let born = unsafe { create_container("W8c", (320, 200)) }.expect("top-level container");
+        let _b = Ctx(born);
+        assert!(container_is_detached(born.0 as u64), "born native reads detached");
+        assert!(!redock_to_embed(born.0 as u64), "never embedded: nowhere to redock");
+        assert!(detach_to_toplevel(born.0 as u64), "already top-level: success");
+    }
+
+    #[test]
+    fn w8c_dpichanged_keeps_a_pinned_editor_size() {
+        // A fixed-size plugin refused effEditCanSize: its effEditRect did
+        // NOT rescale with the monitor, so the frame must follow the
+        // suggested position only — never the DPI-scaled SIZE (that would
+        // just expose the sentinel around unscaled content).
+        set_embed_parent(0);
+        let win = unsafe { create_container("W8c", (320, 200)) }.expect("top-level container");
+        let _c = Ctx(win);
+        lock_wm_size(win, Some((320, 200)));
+        let mut sugg = RECT {
+            left: 12345,
+            top: 12300,
+            right: 12345 + 640,
+            bottom: 12300 + 400,
+        };
+        let dpi = ((144i32) << 16 | 96i32) as usize;
+        unsafe {
+            SendMessageW(
+                win,
+                WM_DPICHANGED,
+                Some(WPARAM(dpi)),
+                Some(LPARAM(&mut sugg as *mut RECT as isize)),
+            );
+        }
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(win, &mut r) }.expect("dpi rect");
+        assert_eq!((r.left, r.top), (12345, 12300), "follows the suggested position");
+        let mut want = RECT {
+            left: 0,
+            top: 0,
+            right: 320,
+            bottom: 200,
+        };
+        unsafe { AdjustWindowRect(&mut want, frame_style(), false) }.expect("adjust");
+        assert_eq!(
+            (r.right - r.left, r.bottom - r.top),
+            (want.right - want.left, want.bottom - want.top),
+            "pinned editor keeps its effEditRect size through a DPI change"
+        );
+    }
+
+    #[test]
+    fn w8c_dpichanged_resizes_an_unpinned_editor() {
+        set_embed_parent(0);
+        let win = unsafe { create_container("W8c", (320, 200)) }.expect("top-level container");
+        let _c = Ctx(win);
+        let mut sugg = RECT {
+            left: 12345,
+            top: 12300,
+            right: 12345 + 800,
+            bottom: 12300 + 500,
+        };
+        let dpi = ((144i32) << 16 | 96i32) as usize;
+        unsafe {
+            SendMessageW(
+                win,
+                WM_DPICHANGED,
+                Some(WPARAM(dpi)),
+                Some(LPARAM(&mut sugg as *mut RECT as isize)),
+            );
+        }
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(win, &mut r) }.expect("dpi rect 2");
+        assert_eq!(
+            (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            (12345, 12300, 800, 500),
+            "a resizable container follows the whole suggested rect"
+        );
     }
 }

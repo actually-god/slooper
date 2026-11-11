@@ -136,6 +136,18 @@ like JACK, slooper never steals a device, and no selection means silence.
    `%APPDATA%\slooper\banned_editors.txt` restores probing.
 7. **Persistence**: move some knobs inside a plugin GUI, close the editor,
    save + restart the project — values survive.
+8. **Embed + detach (W8b)**: with Settings ▸ "PLUGIN EDITOR WINDOWS" on,
+   a plugin editor opens INSIDE the slooper window as a dock member
+   (resize its slot: the plugin clips, never overpaints a neighbour;
+   open any menu: the plugin temporarily vanishes under it and returns).
+   Right-click its header ▸ "detach to native window" — it becomes a
+   normal titled window that remembers its screen position; the dock slot
+   keeps a placeholder. Right-click the DETACHED window's title bar ▸
+   "Dock back into slooper" — it lands back in the same slot. Closing the
+   detached window (X or its title-bar menu) closes the editor exactly
+   like the docked chrome's X would. On a high-DPI monitor, a fixed-size
+   detached editor keeps its plugin size when the window moves to a
+   monitor with different scaling (content rescaling is still W12).
 
 ## Uninstalling
 
