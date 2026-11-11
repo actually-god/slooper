@@ -248,9 +248,25 @@ mod seam_tests {
         );
 
         let ui = code_lines(&format!("{}/src/ui.rs", env!("CARGO_MANIFEST_DIR")));
-        assert!(ui.contains("embed_requested()"), "ui embed pass lost its gate");
+        assert!(ui.contains("embed_wanted()"), "ui lost the embed predicate");
+        assert!(
+            ui.contains("fn embed_wanted") && ui.contains("self.win_embed"),
+            "the predicate must ride the Config-backed switch"
+        );
+        assert!(ui.contains("embed_requested()"), "ui lost the env override");
         assert!(ui.contains("main_thread_hwnd()"), "ui lost the embed parent grab");
         assert!(ui.contains("set_embed_parent(p)"), "ui lost the open wrap");
+        // W8b p2-a: the Config switch is persisted and offered (the
+        // settings row is Windows-gated, but the seam lives cross-OS).
+        assert!(
+            ui.contains("win_editor_embed: self.win_embed"),
+            "the Settings switch must persist into Config"
+        );
+        let cfg = code_lines(&format!("{}/src/config.rs", env!("CARGO_MANIFEST_DIR")));
+        assert!(
+            cfg.contains("pub win_editor_embed: bool"),
+            "Config lost the win_editor_embed field"
+        );
         let pos = ui.find("set_container_rect(").expect("ui must sync embed rects");
         let window = &ui[pos.saturating_sub(240)..pos];
         assert!(

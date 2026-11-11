@@ -598,6 +598,14 @@ pub struct Config {
     /// rigs keep byte-identical behavior.
     #[serde(default)]
     pub mpe: bool,
+    /// W8b (Windows): open plugin editors INSIDE the main window (child
+    /// HWND under the winit window, slooper-drawn chrome) instead of as
+    /// free top-level windows. Ignored on Linux — editors there are always
+    /// their own windows (`x11::embed_requested` is permanently false).
+    /// `SLOOPER_WIN_EMBED` still forces it on without touching the config
+    /// (power users / CI).
+    #[serde(default)]
+    pub win_editor_embed: bool,
 }
 
 impl Default for Config {
@@ -669,6 +677,7 @@ impl Default for Config {
             win_layouts: Vec::new(),
             theme: default_theme(),
             mpe: false,
+            win_editor_embed: false,
         }
     }
 }
@@ -857,9 +866,21 @@ mod tests {
     }
 
     #[test]
+    fn w8b_win_editor_embed_defaults_off_and_parses() {
+        // W8b p2-a: the embed switch must be additive-safe for every
+        // existing config file on disk (missing key = today's behavior).
+        assert!(!Config::default().win_editor_embed);
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.win_editor_embed, "old configs parse with the flag off");
+        let on: Config = serde_json::from_str(r#"{"win_editor_embed": true}"#).unwrap();
+        assert!(on.win_editor_embed);
+    }
+
+    #[test]
     fn config_roundtrip() {
         let cfg = Config {
             mpe: true,
+            win_editor_embed: true,
             auto_snap_on: false,
             auto_snap_sub: 8,
             dir_memo: Default::default(),
@@ -1027,6 +1048,7 @@ mod tests {
         assert_eq!(back.trk_gain, cfg.trk_gain);
         assert_eq!(back.trk_pan, cfg.trk_pan);
         assert!(!back.preview_on, "preview toggle round-trips");
+        assert!(back.win_editor_embed, "W8b embed flag round-trips");
         assert!((back.preview_secs - 2.5).abs() < f32::EPSILON);
         assert_eq!(back.preview_track, Some(3), "preview track round-trips");
         assert!(!back.snap_on, "snap toggle round-trips");
