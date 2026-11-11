@@ -1030,6 +1030,10 @@ pub struct App {
     /// v42/MPE: Settings switch — bend/poly-AT from the port reach
     /// instruments (mirrored into the engine every frame it changes).
     mpe_on: bool,
+    /// W8b (Windows): Settings switch — plugin editors open as embed
+    /// children inside the main window. Always inert on Linux
+    /// (`embed_hwnd` never becomes Some there).
+    win_embed: bool,
     /// v25: last theme actually pushed into the context (apply on change
     /// only, in `logic`).
     theme_was_light: Option<bool>,
@@ -1649,6 +1653,7 @@ impl App {
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
             mpe_on: cfg.mpe,
+            win_embed: cfg.win_editor_embed,
             theme_was_light: None,
             status_at: std::time::Instant::now(),
             status_seen: "starting…".into(),
@@ -2540,12 +2545,12 @@ impl App {
         &mut self,
         entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) -> Result<crate::vstedit::EditorWindow, String> {
-        // W8b: in embed mode (Windows only — `embed_requested()` is false
-        // everywhere else) the container is born as a child of the main
+        // W8b: in embed mode (Windows only — `embed_hwnd` never becomes
+        // Some anywhere else) the container is born as a child of the main
         // window, BOTH generations alike. The seam is ordered: the GUI
         // thread reads the parent inside `on_gui_thread`, which this
         // caller blocks on, so the wrap can only ever cover THIS open.
-        let parent = if crate::vstedit::embed_requested() { self.embed_hwnd } else { None };
+        let parent = if self.embed_wanted() { self.embed_hwnd } else { None };
         if let Some(p) = parent {
             crate::vstedit::set_embed_parent(p);
         }
@@ -4471,6 +4476,7 @@ impl App {
             win_layouts: self.win_layouts.clone(),
             theme: if self.light_theme { "light" } else { "dark" }.into(),
             mpe: self.mpe_on,
+            win_editor_embed: self.win_embed,
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -10238,8 +10244,17 @@ impl App {
     // over the GL surface); one pixels_per_point app-wide (the container
     // rect multiplies it in).
 
+    /// Embedding is asked for by the Settings switch (config-backed) or
+    /// forced by `SLOOPER_WIN_EMBED` (power users / CI, live env read).
+    /// On Linux this predicate may be true yet nothing ever happens:
+    /// `embed_hwnd` stays None there (`x11::main_thread_hwnd` refuses),
+    /// and the win32 side never exists.
+    fn embed_wanted(&self) -> bool {
+        self.win_embed || crate::vstedit::embed_requested()
+    }
+
     fn embed_editors_pass(&mut self, ctx: &egui::Context) {
-        if !crate::vstedit::embed_requested() || self.embed_hwnd.is_none() {
+        if !self.embed_wanted() || self.embed_hwnd.is_none() {
             return;
         }
         let ppp = ctx.pixels_per_point();
@@ -22328,6 +22343,31 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     "MPE off".into()
                 };
             }
+
+            // ---- W8b: plugin editor placement (Windows-only) --------------
+            }
+            if cfg!(windows)
+                && settings_sect(
+                    ui,
+                    &app.sett_filter,
+                    "PLUGIN EDITOR WINDOWS",
+                    "embed inside main window child plugin editor docking win32",
+                )
+            {
+                any = true;
+                if ui
+                    .checkbox(&mut app.win_embed, "Dock plugin editors inside the main window")
+                    .on_hover_text(
+                        "Windows: plugin editor windows open as children of \
+                         the slooper window with slooper-drawn title bars \
+                         (ALT-TAB stays clean). Off: free top-level windows. \
+                         Applies to editors opened from now on.",
+                    )
+                    .changed()
+                {
+                    app.save_config();
+                    app.status = "editor window mode applies to newly opened editors".into();
+                }
 
             // ---- MIDI + keyboard bindings -----------------------------------
             }

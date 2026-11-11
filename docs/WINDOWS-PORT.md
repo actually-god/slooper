@@ -28,8 +28,10 @@ harness traps surfaced and fixed by the first real runs — see DONE log.
 W8b-p1 DONE 2026-11-10 (session 10): the embed core — opt-in
 `SLOOPER_WIN_EMBED` turns plugin containers into `WS_CHILD`s under the
 winit HWND with slooper-drawn chrome; Linux stays top-level (seam inert,
-pinned both ways). NEXT: W8b-p2 (v47 dock integration — see the W8b
-checklist); W9 (Windows MIDI) can interleave. The report-only Windows
+pinned both ways). W8b-p2-a DONE 2026-11-10 (session 11): Config field
+`win_editor_embed` (Settings, Windows-gated) is the real switch; the env
+var stays a force-override. NEXT: W8b-p2-b (v47 dock integration — see the
+W8b checklist); W9 (Windows MIDI) can interleave. The report-only Windows
 suite in every run is the grow-list for future W-tasks (make Windows pins
 blocking as they stabilize).
 
@@ -343,10 +345,13 @@ checklist for user hardware.
 - [x] **W8b p1 DONE 2026-11-10 (session 10, see DONE log)** — embed core:
   opt-in (`SLOOPER_WIN_EMBED`) `WS_CHILD` containers under the winit HWND,
   egui chrome + rect sync from ui.rs, twin seam + functional pins
-- [ ] **W8b p2 (next)** — v47 dock integration: native editors become
+- [x] **W8b p2-a DONE 2026-11-10 (session 11, see DONE log)** — Config
+  field `win_editor_embed` (Settings row, Windows-gated) replaces the env
+  gate; `SLOOPER_WIN_EMBED` stays as a force-override for CI/power users
+- [ ] **W8b p2-b (next)** — v47 dock integration: native editors become
   dockable members (DynKind or equivalent), tab groups, float <-> embed
   toggle (SetParent reparent), hide policy under egui popups/menus,
-  per-monitor DPI, Config field replacing the env gate
+  per-monitor DPI
 
 ### W9 — Windows MIDI
 `midir` (WinMM) devices feeding the existing MidiMsg pipeline; picker in the
@@ -578,4 +583,22 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   XAUTHORITY from a DE /proc environ — bare agent shells fail its x11
   tests with "Authorization required"); clippy-zero. Windows functional
   truth = the native CI run (w8b_ now blocking).
+
+- **2026-11-10 session 11 — W8b p2-a**: embed switch moves to Config —
+  `Config::win_editor_embed` (serde default, additive-safe for existing
+  config files; `w8b_win_editor_embed_defaults_off_and_parses` proves the
+  legacy-JSON path), App mirror `win_embed` + `save_config` round trip,
+  one predicate `App::embed_wanted() = win_embed || embed_requested()`
+  gates BOTH the open-wrap and the per-frame chrome pass. Env stays a
+  force-override (CI + power users; live read, empty=unset). Settings row
+  "PLUGIN EDITOR WINDOWS" is rendered behind `cfg!(windows)` inside the
+  established settings-section rhythm (each section's `}` lives under the
+  NEXT section's marker comment — an extra brace there breaks the whole
+  panel; the section compiles on Linux but never renders). Linux inertness
+  unchanged and structurally stronger: even with the flag ON, embed needs
+  `embed_hwnd == Some` and `x11::main_thread_hwnd()` always says None.
+  Wiring pin extended (predicate + Config field + persistence assertions).
+  Gates (Linux host): host check + gnullvm `--all-targets` clean,
+  w8b_+w2_+w4_ 14/14, config chunk 12/12, clippy-zero. Linux suite +
+  Windows native truth = CI run at this commit.
 
