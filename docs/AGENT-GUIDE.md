@@ -91,7 +91,11 @@ src/            application source (Rust 2021 edition)
                   paint verification, WM_GETMINMAXINFO fixed pin). Both
                   twins expose one surface (seam pins `w8_*` guard it);
                   VST3 hosts a shadow instance of the plugin since v0.12;
-                  see PLUGINS.md
+                  W12c DPI rule: the plugin's effEditRect is PHYSICAL px
+                  kept 1:1 by the container at any scale; the egui chrome
+                  reserves px / live pixels_per_point (pure helper
+                  `editor_slot_points` in mod.rs — never treat plugin px
+                  as logical points); see PLUGINS.md
   project.rs      `.slooper` save format (versioned JSON), projects-dir
                   listing, audio re-resolution by file name
   audio_io.rs     import (symphonia: wav/mp3/ogg/flac/m4a/aac/aiff…) +
