@@ -616,4 +616,13 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   (mechanical extract). Runner lore: on native Windows CI, style-presence
   asserts are only legal for OS-retained bits (`WS_CHILD`, frame bits);
   show-state needs a real desktop — never test it in CI.
+  CI lore 2 (same push's Linux job, run 42946049338): the KNOWN open
+  v20_fx_auto -> v20_fx_bridge heap corruption (skill "FX-script heap
+  corruption") is not editor-only — plain paired script-effect loads
+  SIGABRT the citest monolith too ("corrupted size vs. prev_size" after
+  v20_fx_auto passes, dies AT v20_fx_bridge). Quarantine extended like
+  the v36 pair: monolith `--skip ui::tests::v20_fx` + both run strict
+  one-per-process (solo citest pass re-verified on host). Windows native
+  GREEN at this commit: port pins 40/40, report-only full suite grew
+  393p -> 403p / 103f.
 
