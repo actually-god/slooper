@@ -52,10 +52,15 @@ jobs:
       # instances share cached &'static state; each passes solo), which
       # SIGABRTs the monolith and loses every later test. Monolith skips
       # them; each editor test then runs in its own process.
+      # CI first contact (run 42946049338): the SAME class also kills the
+      # monolith via v20_fx_auto -> v20_fx_bridge (the two script-effect
+      # loads in one process; glibc "corrupted size vs. prev_size"), so
+      # that pair joins the quarantine on the identical recipe.
       - name: Lib suite (headless, citest profile)
         run: >
           cargo test --profile citest --lib --locked --
           --skip ui::tests::v36_script_fx_editor
+          --skip ui::tests::v20_fx
       - name: Script-editor pair in isolated processes
         run: |
           cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_docks
@@ -67,6 +72,13 @@ jobs:
           # tests either.
           cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_resizes \
             || echo "::warning::v36_script_fx_editor_resizes failed in isolation (known open heap-corruption class)"
+      - name: Script-FX pair in isolated processes
+        run: |
+          # Each passes SOLO (proven locally); sharing a process with its
+          # twin is what corrupts the heap (open root-cause bug). Strict:
+          # a real failure here blocks the job.
+          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_auto_slider_rmb_auto
+          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_bridge_slider_rmb_auto
       - name: Clippy zero
         run: |
           set -o pipefail
