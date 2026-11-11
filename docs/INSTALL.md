@@ -157,6 +157,17 @@ like JACK, slooper never steals a device, and no selection means silence.
    app — it must NOT report "still held by slooper" (Drop closes the
    WinMM handle). Events apply at audio-block granularity (~1–10 ms of
    inherent latency jitter; sub-block timing is a W12 item).
+10. **Stream survival (W12a)**: while audio plays, unplug the output
+    device. The RT thread dies with a Notice (no crash, no freeze, no
+    error spam); replug the SAME device and within a couple of idle ticks
+    a second Notice says "recovering stream after device change" and the
+    meter comes back on its own — no Apply click needed (budget: two such
+    recoveries per survival streak). Unplug and DON'T replug: you get
+    "output device vanished; pick a device and re-Apply" instead, and
+    choosing another device in the Ports window works immediately. The
+    RT thread runs in the MMCSS "Pro Audio" scheduler class when your
+    system has it (visible in Resource Monitor → CPU → Priority Boost
+    `Higher` on the audio thread; else the thread is time-critical).
 
 ## Uninstalling
 

@@ -22,8 +22,13 @@
 //!   allows exactly one `process_block` per cycle. Any number of capture
 //!   endpoints may be bound; packets drain into per-slot rings.
 //! * NO_START ethos: no endpoints is `Evt::Unavailable`, an empty patch runs
-//!   no stream (silence), a lost endpoint stops the stream with a Notice and
-//!   the next Apply rebuilds.
+//!   no stream (silence). A stream that DIES is classified by the RT thread
+//!   and run through `super::rt_recovery` by the idle hook (W12a): a
+//!   still-present device re-Applies automatically (bounded budget —
+//!   replugging a USB DAC resumes audio with no click), a vanished one gets
+//!   an honest Notice.
+//! * RT scheduling (W12a): MMCSS "Pro Audio" when the system offers it,
+//!   plain TIME_CRITICAL otherwise; reverted when the thread exits.
 //! * MIDI: WinMM inputs live behind this backend too (W9): midir opens the
 //!   user-selected devices on the manager thread and their per-device
 //!   callback threads push raw events into a `midiin::MidiInQueue`; the RT
@@ -36,20 +41,27 @@ use std::sync::Arc;
 
 use midir::{MidiInput, MidiInputConnection};
 
-use windows::core::{BSTR, GUID, PCWSTR};
+use windows::core::{w, BSTR, GUID, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-    IMMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    IMMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE};
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, GetCurrentThread,
+    SetEvent, SetThreadPriority, WaitForMultipleObjects, THREAD_PRIORITY_TIME_CRITICAL, INFINITE,
+};
 
+use super::rt_recovery::{self, Patch};
 use crate::midiin::{self, MidiInProducer, MidiInQueue};
 
 use super::*;
@@ -471,9 +483,9 @@ struct CapStream {
 }
 
 /// Drain every pending packet of one capture endpoint into its rings.
-fn drain_capture(cap: &mut CapStream) -> Result<(), String> {
+fn drain_capture(cap: &mut CapStream) -> Result<(), RtFault> {
     loop {
-        let need = unsafe { cap.svc.0.GetNextPacketSize() }.map_err(|e| e.to_string())?;
+        let need = unsafe { cap.svc.0.GetNextPacketSize() }.map_err(rt_fault)?;
         if need == 0 {
             return Ok(());
         }
@@ -484,7 +496,7 @@ fn drain_capture(cap: &mut CapStream) -> Result<(), String> {
             cap.svc
                 .0
                 .GetBuffer(&mut ptr, &mut frames, &mut flags, None, None)
-                .map_err(|e| e.to_string())?
+                .map_err(rt_fault)?
         };
         let silent = flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
         let ch = cap.mix.ch as usize;
@@ -514,9 +526,65 @@ fn drain_capture(cap: &mut CapStream) -> Result<(), String> {
             cap.svc
                 .0
                 .ReleaseBuffer(frames as u32)
-                .map_err(|e| e.to_string())?
+                .map_err(rt_fault)?
         };
     }
+}
+
+/// W12a: RT thread scheduling for the lifetime of the stream thread. The
+/// MMCSS "Pro Audio" scheduler class is the DAW-correct choice (system-wide
+/// protection against priority inversion and starvation); plain
+/// TIME_CRITICAL covers hosts without the MMCSS service (e.g. CI runners).
+/// The guard reverts on drop, so no exit path can skip cleanup; `Nothing`
+/// is the honest no-API-succeeded arm (audio runs, merely unscheduled).
+enum RtBoost {
+    Mmcss(HANDLE),
+    TimeCritical,
+    Nothing,
+}
+
+fn boost_rt_thread() -> RtBoost {
+    unsafe {
+        let mut idx = 0u32;
+        if let Ok(h) = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut idx) {
+            return RtBoost::Mmcss(h);
+        }
+        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL).is_ok() {
+            RtBoost::TimeCritical
+        } else {
+            RtBoost::Nothing
+        }
+    }
+}
+
+impl Drop for RtBoost {
+    fn drop(&mut self) {
+        if let RtBoost::Mmcss(h) = self {
+            unsafe {
+                let _ = AvRevertMmThreadCharacteristics(*h);
+            }
+        }
+    }
+}
+
+/// Classified RT-thread death (W12a): `code` is an `rt_recovery::FAULT_*`
+/// value the manager reads once the thread is reaped; `msg` rides the
+/// `Evt::Error`.
+struct RtFault {
+    code: u32,
+    msg: String,
+}
+
+/// Map a WASAPI failure to an `RtFault`: endpoint invalidation (device
+/// unplugged / stream taken down by the OS) is the recoverable case;
+/// everything else is a generic stream error.
+fn rt_fault(e: windows::core::Error) -> RtFault {
+    let code = if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+        rt_recovery::FAULT_DEVICE
+    } else {
+        rt_recovery::FAULT_STREAM
+    };
+    RtFault { code, msg: e.to_string() }
 }
 
 /// Everything the RT thread owns; moved in, dropped at thread exit after the
@@ -539,35 +607,50 @@ struct RtCfg {
     xruns: Arc<AtomicU64>,
     /// W9: WinMM callbacks push here; drained into `evs` every render cycle.
     midi: Arc<MidiInQueue>,
+    /// W12a: classified cause of death, read by the manager after reap.
+    fault: Arc<AtomicU32>,
 }
 
 impl RtCfg {
     fn run(mut self) {
+        // W12a: RT scheduling for this thread's whole life (reverted on
+        // drop — no exit path, including the `break`s below, skips it).
+        let _boost = boost_rt_thread();
         let mut evs: Vec<(u32, Vec<u8>)> = Vec::new();
         loop {
             let mut handles: Vec<HANDLE> = vec![self.stop.0, self.render_ev.0];
             handles.extend(self.capture.iter().map(|c| c.ev.0));
             let got = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-            let Some(k) = got.0.checked_sub(WAIT_OBJECT_0.0) else {
-                break; // WAIT_FAILED: device vanished
-            };
+            if got == WAIT_FAILED {
+                // A handle we own died — count it as device loss. MUST be
+                // checked BEFORE the index arithmetic (W12a): WAIT_FAILED -
+                // WAIT_OBJECT_0 is not None, so the old `checked_sub` guard
+                // was dead code that would busy-spin this loop.
+                self.fault.store(rt_recovery::FAULT_DEVICE, Ordering::SeqCst);
+                break;
+            }
+            let k = got.0 - WAIT_OBJECT_0.0;
             match k {
-                0 => break, // stop event
+                0 => break, // stop event: no fault stored, no recovery
                 1 => {
-                    if let Err(e) = self.render_cycle(&mut evs) {
-                        let _ = self
-                            .tx
-                            .try_send(Evt::Error(format!("WASAPI stream stopped: {e}")));
+                    if let Err(f) = self.render_cycle(&mut evs) {
+                        self.fault.store(f.code, Ordering::SeqCst);
+                        let _ = self.tx.try_send(Evt::Error(format!(
+                            "WASAPI stream stopped: {}",
+                            f.msg
+                        )));
                         break;
                     }
                 }
                 k => {
                     let ci = (k - 2) as usize;
                     if ci < self.capture.len() {
-                        if let Err(e) = drain_capture(&mut self.capture[ci]) {
-                            let _ = self
-                                .tx
-                                .try_send(Evt::Error(format!("WASAPI capture stopped: {e}")));
+                        if let Err(f) = drain_capture(&mut self.capture[ci]) {
+                            self.fault.store(f.code, Ordering::SeqCst);
+                            let _ = self.tx.try_send(Evt::Error(format!(
+                                "WASAPI capture stopped: {}",
+                                f.msg
+                            )));
                             break;
                         }
                     }
@@ -579,8 +662,8 @@ impl RtCfg {
         }
     }
 
-    fn render_cycle(&mut self, evs: &mut Vec<(u32, Vec<u8>)>) -> Result<(), String> {
-        let pad = unsafe { self.render.0.GetCurrentPadding() }.map_err(|e| e.to_string())?;
+    fn render_cycle(&mut self, evs: &mut Vec<(u32, Vec<u8>)>) -> Result<(), RtFault> {
+        let pad = unsafe { self.render.0.GetCurrentPadding() }.map_err(rt_fault)?;
         let ring = self.render_ring as u32;
         if pad >= ring {
             // Full buffer at wake time = we were too late; count and skip.
@@ -626,7 +709,7 @@ impl RtCfg {
                 .render_svc
                 .0
                 .GetBuffer(n as u32)
-                .map_err(|e| e.to_string())?;
+                .map_err(rt_fault)?;
             if !buf.is_null() {
                 let dst = std::slice::from_raw_parts_mut(buf, n * ch * bps);
                 for (slot, chidx) in &self.render_slots {
@@ -644,7 +727,7 @@ impl RtCfg {
             self.render_svc
                 .0
                 .ReleaseBuffer(n as u32, 0)
-                .map_err(|e| e.to_string())?;
+                .map_err(rt_fault)?;
         }
         Ok(())
     }
@@ -725,6 +808,10 @@ pub fn run(
         midi_q: MidiInQueue::new(),
         midi_conns: Vec::new(),
         midi_sig: String::new(),
+        last_patch: None,
+        retry_budget: rt_recovery::RETRY_BUDGET,
+        rt_spawn: None,
+        fault: Arc::new(AtomicU32::new(rt_recovery::FAULT_NONE)),
     };
     session.publish_ports();
     session.publish_midi();
@@ -755,6 +842,15 @@ struct WasapiSession {
     midi_conns: Vec<MidiInputConnection<MidiInProducer>>,
     /// Label-set fingerprint of the last `Evt::MidiInputs`.
     midi_sig: String,
+    /// W12a: the patch the CURRENT (or last) RT thread ran; recovery
+    /// re-Applies it verbatim. Cleared by an explicit silence-Apply.
+    last_patch: Option<Patch>,
+    /// W12a: auto-reapplies remaining (reset when a stream survived).
+    retry_budget: u32,
+    /// W12a: when the current RT thread was spawned (survival math).
+    rt_spawn: Option<std::time::Instant>,
+    /// W12a: RT thread writes its cause of death here before breaking.
+    fault: Arc<AtomicU32>,
 }
 
 impl WasapiSession {
@@ -838,6 +934,19 @@ impl WasapiSession {
                 let _ = t.join();
             }
         }
+    }
+
+    /// W12a: do ALL endpoint labels of a patch resolve in the CURRENT
+    /// enumeration? (Same `resolve` the Apply path uses, so recovery can
+    /// only fire on a patch the Apply path could actually bring up.)
+    fn patch_present(&self, p: &Patch) -> bool {
+        let Some(en) = self.en.as_ref() else {
+            return false;
+        };
+        let ins = enumerate(en, false);
+        let outs = enumerate(en, true);
+        p.0.iter().all(|n| resolve(n, &ins).is_some())
+            && p.1.iter().all(|(n, _)| resolve(n, &outs).is_some())
     }
 }
 
@@ -940,6 +1049,9 @@ impl ManagerBackend for WasapiSession {
 
         if ok_out == 0 {
             // Empty patch (or nothing resolved): silence, per NO_START ethos.
+            // W12a: an explicit silence forgets the recovery patch — there
+            // is nothing the user wants automatically restored.
+            self.last_patch = None;
             if ok_in > 0 {
                 let _ = tx.try_send(Evt::Notice(
                     "WASAPI: no output device applied; inputs idle".into(),
@@ -1102,6 +1214,7 @@ impl ManagerBackend for WasapiSession {
             out_planes,
             xruns: self.xruns.clone(),
             midi: self.midi_q.clone(),
+            fault: self.fault.clone(),
         };
         self.rt = Some(
             std::thread::Builder::new()
@@ -1109,6 +1222,12 @@ impl ManagerBackend for WasapiSession {
                 .spawn(move || cfg.run())
                 .expect("spawn wasapi rt thread"),
         );
+        // W12a: arm recovery for the stream that just came up. The budget
+        // is NOT touched here — recovery-initiated Applies must not refill
+        // it (idle resets it only for a stream that SURVIVED).
+        self.fault.store(rt_recovery::FAULT_NONE, Ordering::SeqCst);
+        self.last_patch = Some((ins.to_vec(), outs.to_vec()));
+        self.rt_spawn = Some(std::time::Instant::now());
         self.engine.set_sample_rate(rstream.mix.sr);
         if !cap_err.is_empty() {
             let _ = tx.try_send(Evt::Error(cap_err));
@@ -1119,9 +1238,10 @@ impl ManagerBackend for WasapiSession {
         });
     }
 
-    fn idle(&mut self, _tx: &SyncSender<Evt>) {
+    fn idle(&mut self, tx: &SyncSender<Evt>) {
         // hot-plug: republish on endpoint-set change; reap an RT thread that
-        // died on its own (device lost) so the next Apply can rebuild.
+        // died on its own (device lost) and let `rt_recovery` decide whether
+        // the stream comes back by itself (W12a).
         self.publish_ports();
         // W9: keep the MIDI picker truthful when a device appears/disappears.
         // Newly-appearing SELECTED devices are not opened automatically —
@@ -1129,9 +1249,48 @@ impl ManagerBackend for WasapiSession {
         self.publish_midi();
         if self.rt.as_ref().map(|t| t.is_finished()).unwrap_or(false) {
             self.stop_rt();
-            let _ = self
-                .evt_tx
-                .try_send(Evt::Notice("WASAPI stream stopped; re-Apply ports".into()));
+            let fault = self.fault.swap(rt_recovery::FAULT_NONE, Ordering::SeqCst);
+            // A stream that held up for a while resets the budget: a death
+            // after survival is a NEW story, not a continuation of one.
+            let survived = self
+                .rt_spawn
+                .map(|t| {
+                    t.elapsed() >= std::time::Duration::from_secs(rt_recovery::SURVIVED_SECS)
+                })
+                .unwrap_or(false);
+            if survived {
+                self.retry_budget = rt_recovery::RETRY_BUDGET;
+            }
+            let present = self
+                .last_patch
+                .as_ref()
+                .map(|p| self.patch_present(p))
+                .unwrap_or(false);
+            match rt_recovery::plan(fault, self.last_patch.as_ref(), present, self.retry_budget) {
+                rt_recovery::IdleRecovery::Nothing => {
+                    let _ = tx.try_send(Evt::Notice(
+                        "WASAPI stream stopped; re-Apply ports".into(),
+                    ));
+                }
+                rt_recovery::IdleRecovery::Reapply(patch) => {
+                    self.retry_budget = self.retry_budget.saturating_sub(1);
+                    let _ = tx.try_send(Evt::Notice(
+                        "WASAPI: recovering stream after device change".into(),
+                    ));
+                    self.apply(&patch.0, &patch.1, tx);
+                }
+                rt_recovery::IdleRecovery::DeviceGone => {
+                    let _ = tx.try_send(Evt::Notice(
+                        "WASAPI output device vanished; pick a device and re-Apply ports".into(),
+                    ));
+                }
+                rt_recovery::IdleRecovery::GaveUp => {
+                    let _ = tx.try_send(Evt::Notice(
+                        "WASAPI stream keeps failing; check the device, then re-Apply ports"
+                            .into(),
+                    ));
+                }
+            }
         }
     }
 
@@ -1198,6 +1357,42 @@ mod w9_midi_tests {
         assert!(c3.is_empty());
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert_eq!(q.drops(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W12a pins (WINDOWS-PORT): RT scheduling + fault classification, on the
+// real Win32 API surface. A headless runner may lack the MMCSS service —
+// honest degradation (fall through to TIME_CRITICAL, never a panic) IS the
+// contract, mirroring the W9 zero-device pins.
+#[cfg(all(test, windows))]
+mod w12a_boost_tests {
+    use super::*;
+
+    #[test]
+    fn w12a_boost_rt_thread_degrades_honestly() {
+        let b1 = boost_rt_thread();
+        // At least ONE scheduling class must engage on any Windows host.
+        assert!(
+            matches!(b1, RtBoost::Mmcss(_) | RtBoost::TimeCritical),
+            "neither MMCSS nor TIME_CRITICAL accepted the RT boost"
+        );
+        drop(b1); // Drop must revert cleanly (Mmcss arm dispatches AvRevert)
+        let b2 = boost_rt_thread(); // second call on the same thread: legal
+        drop(b2);
+    }
+
+    #[test]
+    fn w12a_rt_fault_classifies_device_invalidation() {
+        let e = windows::core::Error::from_hresult(AUDCLNT_E_DEVICE_INVALIDATED);
+        assert_eq!(rt_fault(e).code, rt_recovery::FAULT_DEVICE);
+        let generic = windows::core::HRESULT(0x8000_FFFF_u32 as i32);
+        assert_eq!(rt_fault(windows::core::Error::from_hresult(generic)).code,
+            rt_recovery::FAULT_STREAM);
+        assert!(
+            !rt_fault(windows::core::Error::from_hresult(generic)).msg.is_empty(),
+            "message rides the Evt"
+        );
     }
 }
 
