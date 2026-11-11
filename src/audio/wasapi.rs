@@ -31,8 +31,11 @@
 //!   plain TIME_CRITICAL otherwise; reverted when the thread exits.
 //! * MIDI: WinMM inputs live behind this backend too (W9): midir opens the
 //!   user-selected devices on the manager thread and their per-device
-//!   callback threads push raw events into a `midiin::MidiInQueue`; the RT
-//!   loop drains it into `process_block` each cycle (frame 0 = block start).
+//!   callback threads push raw events (with their WinMM µs timestamps) into
+//!   a `midiin::MidiInQueue`; the RT loop drains it into `process_block`
+//!   each cycle and `midiin::spread` turns the stamps into sub-block frame
+//!   offsets (W12b; anchor = block start, unstamped drivers keep W9's
+//!   block-start behavior).
 //!   Linux keeps 100% JACK MIDI — none of this compiles there.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -607,6 +610,9 @@ struct RtCfg {
     xruns: Arc<AtomicU64>,
     /// W9: WinMM callbacks push here; drained into `evs` every render cycle.
     midi: Arc<MidiInQueue>,
+    /// W12b: the stream's sample rate — the clock `midiin::spread` converts
+    /// WinMM µs stamps into.
+    sr: u32,
     /// W12a: classified cause of death, read by the manager after reap.
     fault: Arc<AtomicU32>,
 }
@@ -617,6 +623,9 @@ impl RtCfg {
         // drop — no exit path, including the `break`s below, skips it).
         let _boost = boost_rt_thread();
         let mut evs: Vec<(u32, Vec<u8>)> = Vec::new();
+        // W12b: per-cycle scratch — the drained events' WinMM µs stamps,
+        // positionally paired with `evs` (both reused, no RT allocation).
+        let mut midi_ts: Vec<u64> = Vec::new();
         loop {
             let mut handles: Vec<HANDLE> = vec![self.stop.0, self.render_ev.0];
             handles.extend(self.capture.iter().map(|c| c.ev.0));
@@ -633,7 +642,7 @@ impl RtCfg {
             match k {
                 0 => break, // stop event: no fault stored, no recovery
                 1 => {
-                    if let Err(f) = self.render_cycle(&mut evs) {
+                    if let Err(f) = self.render_cycle(&mut evs, &mut midi_ts) {
                         self.fault.store(f.code, Ordering::SeqCst);
                         let _ = self.tx.try_send(Evt::Error(format!(
                             "WASAPI stream stopped: {}",
@@ -662,7 +671,7 @@ impl RtCfg {
         }
     }
 
-    fn render_cycle(&mut self, evs: &mut Vec<(u32, Vec<u8>)>) -> Result<(), RtFault> {
+    fn render_cycle(&mut self, evs: &mut Vec<(u32, Vec<u8>)>, midi_ts: &mut Vec<u64>) -> Result<(), RtFault> {
         let pad = unsafe { self.render.0.GetCurrentPadding() }.map_err(rt_fault)?;
         let ring = self.render_ring as u32;
         if pad >= ring {
@@ -685,9 +694,12 @@ impl RtCfg {
             }
         }
         evs.clear();
-        // W9: raw MIDI that landed since the last cycle (time 0 = applied
-        // at block start; WinMM only offers device-relative ms stamps).
-        self.midi.drain_into(evs);
+        midi_ts.clear();
+        // W9/W12b: raw MIDI that landed since the last cycle, with its WinMM
+        // µs stamps; `spread` converts the stamps into sub-block frame
+        // offsets (anchor = block start), reusing `midi_ts` — no RT alloc.
+        self.midi.drain_into(evs, midi_ts);
+        midiin::spread(evs, midi_ts, self.sr, n as u32);
         let mut ins: [*const f32; MAX_SLOTS] = [std::ptr::null(); MAX_SLOTS];
         let mut outs: [*mut f32; MAX_SLOTS] = [std::ptr::null_mut(); MAX_SLOTS];
         for s in 0..MAX_SLOTS {
@@ -1005,7 +1017,7 @@ fn open_midi_devices(
             continue;
         };
         let prod = MidiInProducer::new(q.clone(), drops.clone());
-        match mi.connect(port, "slooper", |_ts, bytes, p| p.on_bytes(bytes), prod) {
+        match mi.connect(port, "slooper", |ts, bytes, p| p.on_bytes(bytes, ts), prod) {
             Ok(conn) => {
                 opened.push(label.clone());
                 conns.push(conn);
@@ -1214,6 +1226,7 @@ impl ManagerBackend for WasapiSession {
             out_planes,
             xruns: self.xruns.clone(),
             midi: self.midi_q.clone(),
+            sr: rstream.mix.sr,
             fault: self.fault.clone(),
         };
         self.rt = Some(
