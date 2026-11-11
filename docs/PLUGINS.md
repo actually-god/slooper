@@ -44,6 +44,26 @@ bridge its **GUI** over X11, so Windows synths/effects appear and behave
 exactly like native ones: sound, sliders, and their custom editor window.
 (Install: AUR `yabridge`, or the release tarball + `./yabridgectl sync`.)
 
+### Windows (native plugins — no yabridge, no Wine)
+
+On Windows the `.dll`s ARE the native format: slooper scans them directly,
+yabridge/Wine never enter the picture (and are not used at all). Folders
+scanned, in order:
+
+- `%ProgramFiles%\Steinberg\VstPlugins`, `%ProgramFiles%\VSTPlugins`
+- `%ProgramFiles%\Common Files\VST`, `...\Common Files\VSTPlugins`,
+  `...\Common Files\Steinberg\vstplugins` (VST2 `.dll` loose or in
+  per-plugin folders), `%COMMONPROGRAMFILES%\VST3` (VST3; bundle
+  directories resolve their `Contents\x86_64-win\*.vst3dll` module),
+- CLAP: `%COMMONPROGRAMFILES%\CLAP` (system) and `%LOCALAPPDATA%\CLAP`
+  (user) — the SDK conventions.
+- Anything you add via `VST_PATH` / `CLAP_PATH` (`;`-separated path
+  lists; both variables work on both OSes) or the `vst_dirs` setting.
+
+Editors are real Win32 child/top-level windows — dock-into-slooper,
+detach, DPI behaviour and the editor crash guard work as documented in
+[INSTALL.md](INSTALL.md)'s Windows smoke checklist (items 5–8).
+
 ## The open-source instrument set on this host
 
 Everything here is a **prebuilt Linux x86-64 plugin with a free license** —

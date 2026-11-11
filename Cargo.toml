@@ -88,6 +88,7 @@ members = ["vendor/vst2"]
 [build-dependencies]
 # v42: compiles the C++ exception-firewall shim (src/ffiguard/ffiguard.cpp).
 cc = "1"
+winresource = "0.1"
 
 # SLOOPER PATCH (v0.11): winit 0.30.13's X11 backend panics (panic=abort ->
 # whole DAW dies) when libX11's input-context focus plumbing reports a stale

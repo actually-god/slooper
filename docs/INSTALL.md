@@ -101,18 +101,30 @@ error instead — start your server, then relaunch.
 | `$XDG_CONFIG_HOME/slooper/config.json` (fallback `~/.config/slooper/config.json`) | port selections, MIDI/keyboard bindings, effect parameter values, metronome/quantize settings |
 | `~/.local/share/slooper/effects/` | effect-script folder (created on first run, seeded with `template.rs` + the ABI contract file; the location is user-configurable in the FX window) |
 
-## Windows (development builds)
+## Windows
 
-The Windows build target is `x86_64-pc-windows-gnullvm` (UCRT, Windows
-10+); cross-compile from Linux with llvm-mingw (see
-[WINDOWS-PORT.md](WINDOWS-PORT.md) W1 for the toolchain recipe) or build
-natively with the `windows-gnullvm`/`windows-msvc` Rust target. You also
-want **MSVC Build Tools** (or a full Rust GNU toolchain): effect and synth
-scripts are compiled at runtime with `rustc`, and on Windows `rustc` needs
-a linker. Install layout: config in `%APPDATA%\slooper\config.json`, data
-(effects, synths, cache) under `%LOCALAPPDATA%\slooper`. Audio is WASAPI
-(shared mode, f32): pick the output (and any inputs) in the Ports window —
-like JACK, slooper never steals a device, and no selection means silence.
+**Download (recommended):** grab `slooper-win64.zip` from
+[the GitHub Releases page](https://github.com/actually-god/slooper/releases)
+— unzip anywhere, run `slooper.exe`. No installer, no admin rights, no
+console window; the app icon is embedded in the exe. Windows 10+ x64.
+Config in `%APPDATA%\slooper\config.json`, data (effects, synths, cache,
+projects) under `%LOCALAPPDATA%\slooper`.
+
+**Scripted effects/synths need a linker:** effects and synth scripts are
+compiled at runtime with `rustc`, and on Windows `rustc` needs a linker —
+install **MSVC Build Tools** (or use a full Rust GNU toolchain). Without
+one slooper still starts and plays audio, samples and plugins; only the
+script features fail, with the compile error shown in the FX window.
+
+**Audio is WASAPI** (shared mode, f32): pick the output (and any inputs)
+in the Ports window — like JACK, slooper never steals a device, and no
+selection means silence.
+
+**Building from source:** releases ship from the MSVC target
+(`x86_64-pc-windows-msvc`, the default Rust toolchain on Windows);
+`x86_64-pc-windows-gnullvm` (UCRT) additionally cross-builds from Linux
+with llvm-mingw — see [WINDOWS-PORT.md](WINDOWS-PORT.md) W1 for the
+toolchain recipe.
 
 ### On-hardware smoke checklist (report failures as issues)
 

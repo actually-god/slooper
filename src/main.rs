@@ -8,9 +8,16 @@
 //! sample pack, `.slooper` projects, per-track effects, MIDI action
 //! mapping plus keyboard shortcuts, live mix passthrough and a MIDI monitor.
 
+// W11 release polish: the shipped Windows exe is a GUI app — no console
+// window on double-click (docs/INSTALL.md Windows smoke item 1). Panics
+// still abort() after printing (visible under a debugger / an attached
+// console); the W7 probe children stay capturable because the harness
+// always pipes their stdout. Linux behavior unchanged (attribute is a
+// no-op for non-Windows targets).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 /// Bundled application icon (placeholder for now — see assets/icon.png).
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
-
 fn main() -> eframe::Result {
     // v42: release now compiles panic = "unwind" because the plugin FFI
     // firewall (src/ffiguard.rs) must be able to UNWIND C++ exceptions to

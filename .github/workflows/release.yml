@@ -1,0 +1,113 @@
+# W11 (docs/WINDOWS-PORT.md): GitHub Release assets, built by CI.
+#
+#   On tag push v*:  publish a release with the two shipping assets —
+#     slooper-<ver>-linux-x86_64.tar.zst   (usr/ prefix: extract into /,
+#                                           mirrors the AUR pkg layout;
+#                                           the AUR source flow is
+#                                           UNTOUCHED by this workflow)
+#     slooper-win64.zip                    (MSVC release exe + README +
+#                                           LICENSE — exe carries the
+#                                           embedded icon via winresource)
+#   workflow_dispatch: the same pipeline against the CURRENT commit, but
+#   as a DRAFT release — validates the packaging path end to end without
+#   publishing anything.
+#
+# Windows ships from CI's MSVC host on purpose: the windows-native CI job
+# already proved the MSVC target green (W10), rc.exe is present there for
+# the icon resource, and users get a same-OS build. The gnullvm cross
+# target stays the compile-guard (windows-cross job); it cannot embed the
+# icon (no supported resource compiler) and is not a shipping vehicle.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux asset (tar.zst)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: release-linux
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libjack-jackd2-dev libx11-dev libxcursor-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev zstd
+      - name: Build (shipping profile)
+        run: cargo build --release --locked
+      - name: Stage + pack
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$VERSION" = "$GITHUB_REF_NAME" ] && VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dev.${GITHUB_SHA::7}"
+          P="slooper-$VERSION-linux-x86_64"
+          mkdir -p "$P/usr/bin" "$P/usr/share/applications" "$P/usr/share/pixmaps"
+          cp target/release/slooper "$P/usr/bin/slooper"
+          cp slooper.desktop "$P/usr/share/applications/slooper.desktop"
+          cp assets/icon.png "$P/usr/share/pixmaps/slooper.png"
+          cp README.md LICENSE docs/INSTALL.md "$P/"
+          tar --zstd -cf "slooper-$VERSION-linux-x86_64.tar.zst" "$P"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-asset
+          path: slooper-*-linux-x86_64.tar.zst
+
+  windows:
+    name: Windows asset (slooper-win64.zip)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: release-win-msvc
+      - name: Build (shipping profile, MSVC)
+        run: cargo build --release --locked
+      - name: Stage + zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory stage | Out-Null
+          Copy-Item target/release/slooper.exe stage/slooper.exe
+          Copy-Item README.md stage/README.md
+          Copy-Item LICENSE stage/LICENSE
+          Compress-Archive -Path stage/* -DestinationPath slooper-win64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-asset
+          path: slooper-win64.zip
+
+  release:
+    name: Publish GitHub Release
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-asset
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-asset
+      - name: Release (tag → published, dispatch → draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: ${{ github.event_name == 'push' }}
+          files: |
+            slooper-*-linux-x86_64.tar.zst
+            slooper-win64.zip
