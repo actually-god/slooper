@@ -331,6 +331,24 @@ unsafe fn style_of(win: HWND) -> WINDOW_STYLE {
     }
 }
 
+/// The style a container is created with (pure — see
+/// [`create_container`]). Split out because the GH runner window station
+/// does NOT persist `WS_VISIBLE` into the live style (native CI first
+/// contact: windows created with it report it absent), so the testable
+/// contract is what we REQUEST plus the OS-retained bits (`WS_CHILD`,
+/// frame absence) — never "the OS kept WS_VISIBLE".
+fn container_style(embedded: bool, probe: bool) -> WINDOW_STYLE {
+    let mut style = if embedded {
+        WINDOW_STYLE(WS_CHILD.0 | WS_CLIPCHILDREN.0)
+    } else {
+        frame_style()
+    };
+    if !probe {
+        style |= WS_VISIBLE;
+    }
+    style
+}
+
 /// Create a container window (both generations, W8a/W8b). With an embed
 /// parent set (see the embed section) the container is born as a frameless
 /// `WS_CHILD` at the parent's client origin — slooper's egui chrome is its
@@ -340,13 +358,7 @@ unsafe fn create_container(title: &str, size: (i32, i32)) -> Result<HWND, String
     let hinst = ensure_class()?;
     let tname = utf16(&format!("slooper \u{2014} {title}"));
     let embedded = embed_parent();
-    let mut style = match embedded {
-        Some(_) => WINDOW_STYLE(WS_CHILD.0 | WS_CLIPCHILDREN.0),
-        None => frame_style(),
-    };
-    if !probe_mode() {
-        style |= WS_VISIBLE;
-    }
+    let style = container_style(embedded.is_some(), probe_mode());
     let (w, h) = (size.0.max(8), size.1.max(8));
     unsafe {
         CreateWindowExW(
@@ -2015,6 +2027,23 @@ mod embed_tests {
     }
 
     #[test]
+    fn w8b_container_style_matrix() {
+        // The requested style is the contract (see [`container_style`]):
+        // the runner station drops WS_VISIBLE at creation, so presence
+        // checks on the LIVE style are reserved for bits the OS retains.
+        let tl = container_style(false, false);
+        assert_ne!(tl.0 & WS_OVERLAPPEDWINDOW.0, 0, "top-level keeps its frame");
+        assert_ne!(tl.0 & WS_VISIBLE.0, 0, "top-level is shown");
+        assert_eq!(tl.0 & WS_CHILD.0, 0);
+        assert_eq!(container_style(false, true).0 & WS_VISIBLE.0, 0, "probe never shown");
+        let ch = container_style(true, false);
+        assert_ne!(ch.0 & WS_CHILD.0, 0, "embed is a child");
+        assert_eq!(ch.0 & WS_OVERLAPPEDWINDOW.0, 0, "embed is frameless");
+        assert_ne!(ch.0 & WS_VISIBLE.0, 0, "embed is shown");
+        assert_eq!(container_style(true, true).0 & WS_VISIBLE.0, 0, "probe child never shown");
+    }
+
+    #[test]
     fn w8b_top_level_default_is_not_a_child() {
         set_embed_parent(0);
         let win = unsafe { create_container("W8b", (320, 200)) }.expect("top-level container");
@@ -2022,7 +2051,6 @@ mod embed_tests {
         let st = styles(win);
         assert_eq!(st & WS_CHILD.0, 0, "default container is not WS_CHILD");
         assert_ne!(st & WS_OVERLAPPEDWINDOW.0, 0, "default container keeps its frame");
-        assert_ne!(st & WS_VISIBLE.0, 0, "default container is shown");
     }
 
     #[test]
@@ -2035,7 +2063,6 @@ mod embed_tests {
         let st = styles(win);
         assert_ne!(st & WS_CHILD.0, 0, "embed container is WS_CHILD");
         assert_eq!(st & WS_OVERLAPPEDWINDOW.0, 0, "embed container is frameless");
-        assert_ne!(st & WS_VISIBLE.0, 0, "embed container is shown outside probe mode");
         assert!(unsafe { IsChild(p.0, win) }.as_bool(), "container is a child of the parent");
         let (ox, oy) = client_origin(p.0);
         let mut r = RECT::default();
