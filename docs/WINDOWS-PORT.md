@@ -819,5 +819,6 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   port-pin filter grew `w9_` (substring trap). Gates: host clippy 0,
   gnullvm `--all-targets` 0 warn/err (caught a windows-only `unused_mut`
   Linux can never see), w9 pins 13/13, port-pin set 53/53 citest, e2e 32
-  live Jack, full debug lib green, `cargo run` smoke OK (picker Linux-
-  invisible by construction).
+  live Jack, debug lib 541/542 (the 1 = chain_window_adds_scanned_plugin_slot,
+  KNOWN boot-env class, fails solo on unrelated trees too), `cargo run`
+  smoke OK (picker Linux-invisible by construction; JACK active, 0 panic).
