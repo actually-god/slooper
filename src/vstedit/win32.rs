@@ -56,17 +56,18 @@ use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, EndPaint, GetDC, GetPixel, ReleaseDC, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, CreateSolidBrush, EndPaint, GetDC, GetPixel, ReleaseDC, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow,
     DispatchMessageW, EnumChildWindows, EnumThreadWindows, GetClientRect, GetWindow,
     GetWindowLongW, GetWindowTextLengthW, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, IDC_ARROW,
-    LoadCursorW, MINMAXINFO, MSG, PeekMessageW, PostMessageW, RegisterClassExW,
-    SetWindowPos, SetWindowTextW, TranslateMessage, WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE,
-    WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW, IsWindow, IsWindowVisible, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_PAINT,
-    WM_SIZE, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    LoadCursorW, MINMAXINFO, MSG, PeekMessageW, PostMessageW, RegisterClassExW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE,
+    WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW, IsWindow, IsWindowVisible, PM_REMOVE, SW_HIDE, SW_SHOWNA,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_GETMINMAXINFO, WM_PAINT, WM_SIZE, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::vsthost::Vst2Handle;
@@ -245,6 +246,48 @@ pub fn set_container_rect(handle: u64, x: i32, y: i32, w: i32, h: i32) -> bool {
         }
         SetWindowPos(win, None, x, y, w.max(0), h.max(0), flags).is_ok()
     }
+}
+
+/// W8b p2-b: show/hide an embed container WITHOUT touching geometry or
+/// activation (`SW_HIDE` / `SW_SHOWNA`). The chrome's hide policy needs
+/// this because a native child window paints OVER egui's GL surface: while
+/// an egui menu/popup is open (or a window is being carried across the
+/// dock), the container must disappear or it would swallow the popup.
+/// `false` when the window is gone.
+pub fn set_container_visible(handle: u64, show: bool) -> bool {
+    if handle == 0 {
+        return false;
+    }
+    let win = hwnd_of(handle);
+    unsafe {
+        if !IsWindow(Some(win)).as_bool() {
+            return false;
+        }
+        // The BOOL return is the PREVIOUS visibility state — deliberately
+        // dropped: the contract is "false only when the window is gone".
+        let _ = ShowWindow(win, if show { SW_SHOWNA } else { SW_HIDE });
+        true
+    }
+}
+
+/// W8b p2-b: the embed parent's client-area origin in PHYSICAL screen
+/// coordinates. The chrome computes container rects from egui's logical
+/// screen points (× pixels_per_point), but [`set_container_rect`] positions
+/// a child in the parent's CLIENT space — the delta between the two worlds
+/// is exactly this origin, so the sync pass subtracts it. `(0, 0)` for a
+/// null/invalid handle (an honest no-op: no embed machinery exists then).
+pub fn embed_parent_origin(handle: u64) -> (i32, i32) {
+    if handle == 0 {
+        return (0, 0);
+    }
+    let win = hwnd_of(handle);
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe {
+        if !IsWindow(Some(win)).as_bool() || !ClientToScreen(win, &mut pt).as_bool() {
+            return (0, 0);
+        }
+    }
+    (pt.x, pt.y)
 }
 
 // ------------------------------------------------------------------ tables
@@ -2108,6 +2151,46 @@ mod embed_tests {
 
         // Honest refusals.
         assert!(!set_container_rect(0, 1, 2, 3, 4), "null handle refuses");
+    }
+
+    #[test]
+    fn w8b_set_container_visible_round_trip() {
+        let p = make_parent();
+        set_embed_parent(p.0.0 as u64);
+        let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
+        set_embed_parent(0);
+        let _c = Ctx(win);
+        // Hide (the policy's busy frames): the window survives, only the
+        // visible flag flips — geometry and parentage must not move.
+        assert!(set_container_visible(win.0 as u64, false), "hide accepted");
+        assert!(!unsafe { IsWindowVisible(win) }.as_bool(), "hidden container is not visible");
+        let mut before = RECT::default();
+        unsafe { GetWindowRect(win, &mut before) }.expect("hidden rect");
+        // Show again (SW_SHOWNA — no activation, no teardown).
+        assert!(set_container_visible(win.0 as u64, true), "show accepted");
+        assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "show keeps the window alive");
+        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "re-show stays under the parent");
+        let mut after = RECT::default();
+        unsafe { GetWindowRect(win, &mut after) }.expect("shown rect");
+        assert_eq!((after.left, after.top, after.right, after.bottom),
+                   (before.left, before.top, before.right, before.bottom),
+                   "visibility flips never move geometry");
+        // Honest refusals (mirrors set_container_rect's contract).
+        assert!(!set_container_visible(0, true), "null handle refuses");
+        assert!(!set_container_visible(0, false), "null handle refuses hide");
+    }
+
+    #[test]
+    fn w8b_embed_parent_origin_is_client_to_screen() {
+        let p = make_parent();
+        let (x, y) = embed_parent_origin(p.0.0 as u64);
+        // The function IS the ClientToScreen answer the sync pass subtracts
+        // — compare against the module's own client-origin source of truth.
+        assert_eq!((x, y), client_origin(p.0), "origin == parent client origin");
+        // The stand-in parent lives off-screen (20000, 20000): a real
+        // translation, never an accidental (0, 0).
+        assert!(x.abs() + y.abs() > 0, "off-screen parent has a non-zero origin");
+        assert_eq!(embed_parent_origin(0), (0, 0), "null handle answers zero");
     }
 
     #[test]

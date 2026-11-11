@@ -1290,6 +1290,20 @@ pub struct App {
     /// the coalescer that keeps the per-frame sync off the GUI thread's
     /// queue unless geometry actually moved.
     embed_sync: std::collections::HashMap<u64, (i32, i32, i32, i32)>,
+    /// W8b p2-b: the chrome body's slot this frame (logical screen rect),
+    /// re-RECORDED every frame by float owner / dock pass; the sync pass
+    /// turns it into the container rect. Absent = body did not draw = hide.
+    embed_slot: std::collections::HashMap<u64, [f32; 4]>,
+    /// W8b p2-b: last visibility command per container (hide-policy
+    /// coalescer — only flips post a `ShowWindow`).
+    embed_vis: std::collections::HashMap<u64, bool>,
+    /// W8b p2-b: every open embed editor's xid this frame (map iteration
+    /// snapshot — the retain() authority for the caches above).
+    embed_live: Vec<u64>,
+    /// W8b p2-b: containers whose chrome asked to close (WM_CLOSE in
+    /// flight). Suppresses the window until `reap_vst_editors` lands, so a
+    /// closed editor can never flicker itself back open.
+    chrome_closing: std::collections::HashSet<u64>,
     midi_rec: Vec<MidiRecState>,
     /// v0.11 R5: write-automation recorders + open automation manager.
     auto_rec: Vec<AutoRecState>,
@@ -1754,6 +1768,10 @@ impl App {
             vst_editors: std::collections::HashMap::new(),
             embed_hwnd: None,
             embed_sync: std::collections::HashMap::new(),
+            embed_slot: std::collections::HashMap::new(),
+            embed_vis: std::collections::HashMap::new(),
+            embed_live: Vec::new(),
+            chrome_closing: std::collections::HashSet::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
             rec_src: (0..MAX_LOOPS)
@@ -10228,21 +10246,24 @@ impl App {
 
     // ------------------------------------------------------------- W8b embed
     //
-    // Windows embed mode (opt-in `SLOOPER_WIN_EMBED`, inert on Linux): the
-    // plugin containers are child HWNDs under the main window, so slooper
-    // draws their chrome here — a movable, non-resizable egui window whose
-    // content area the container is pinned to. The plugin still owns its
-    // size exactly like on the top-level path (`editor_size()` drives the
-    // area; plugin-side resizes flow through the existing pumps and the
-    // chrome follows next frame). Closing the chrome goes through the SAME
-    // protocol as a user closing the W8a top-level window —
+    // Windows embed mode (Settings switch `win_editor_embed` or the
+    // `SLOOPER_WIN_EMBED` force-override, inert on Linux): the plugin
+    // containers are child HWNDs under the main window, so slooper draws
+    // their chrome here. W8b p2-b: the chrome is a FULL v47 dock member —
+    // a `DynKind::Vst`/`VstFx` window with dock slots, tab groups, slot
+    // menus and layout persistence exactly like every other window. One
+    // body (`embed_body`) draws in both chrome generations; the slot it
+    // allocates IS the container's home (the plugin owns its size, the
+    // chrome follows; a too-small slot clips the plugin instead of
+    // overflowing the neighbour), and `embed_sync_pass` lands geometry +
+    // visibility right after `side_frames`. Closing always goes through
+    // the SAME protocol as a user closing the W8a top-level window —
     // `request_wm_delete` -> pump teardown -> `reap_vst_editors` harvest —
-    // so state persistence has one path, not two.
-    //
-    // Known p1 limits (p2 = v47 dock integration): chrome is a free float,
-    // not a dock slot; egui popups open UNDER the native child (it paints
-    // over the GL surface); one pixels_per_point app-wide (the container
-    // rect multiplies it in).
+    // so state persistence has one path, not two. While a menu/popup is
+    // open or a window is carried, the hide policy blanks the containers
+    // (native children paint over egui's GL surface). Still open (p2-c /
+    // W12): SetParent toggle to a native top-level window, per-monitor
+    // DPI (one app-wide pixels_per_point, plugin px treated as logical).
 
     /// Embedding is asked for by the Settings switch (config-backed) or
     /// forced by `SLOOPER_WIN_EMBED` (power users / CI, live env read).
@@ -10253,91 +10274,202 @@ impl App {
         self.win_embed || crate::vstedit::embed_requested()
     }
 
+    /// W8b p2-b: one close entry point for the embedded chrome (the X and
+    /// the dock/`dyn_set` paths): WM_CLOSE protocol on the container, plus
+    /// the in-flight suppression so the window cannot resurrect between
+    /// request and reap. `xid == 0` = container not created yet — nothing
+    /// to close (an open still in flight, the p1 behaviour).
+    fn chrome_closing_close(&mut self, xid: u64) {
+        if xid == 0 {
+            return;
+        }
+        crate::vstedit::request_wm_delete(xid);
+        self.chrome_closing.insert(xid);
+    }
+
     fn embed_editors_pass(&mut self, ctx: &egui::Context) {
         if !self.embed_wanted() || self.embed_hwnd.is_none() {
             return;
         }
-        let ppp = ctx.pixels_per_point();
-        let mut live: Vec<u64> = Vec::new();
+        // Slots are RECORDED every frame by whichever chrome body draws
+        // (this pass for floats, the dock pass for docked members); stale
+        // entries must not keep a container pinned over fresh UI.
+        self.embed_slot.clear();
+        self.embed_live.clear();
+        /// One open native editor: (dock kind, chrome title, container
+        /// handle, plugin-owned editor size, real pixels yet?).
+        type EditorRow = (DynKind, String, u64, (i32, i32), bool);
+        let mut editors: Vec<EditorRow> = Vec::new();
         for t in self.vst_editors.keys().copied().collect::<Vec<_>>() {
             let Some(w) = self.vst_editors.get(&t) else { continue };
-            let (xid, size, painted) = (w.xid(), w.editor_size(), w.painted());
             let stem = std::path::Path::new(w.path())
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "synth".into());
-            live.push(xid);
-            self.embed_chrome(ctx, format!("SYNTH EDITOR \u{2014} {stem}"), xid, size, painted, ppp);
+            editors.push((
+                DynKind::Vst(t),
+                format!("SYNTH EDITOR \u{2014} {stem}"),
+                w.xid(),
+                w.editor_size(),
+                w.painted(),
+            ));
         }
         for k in self.fx_vst_editors.keys().copied().collect::<Vec<_>>() {
             let Some(w) = self.fx_vst_editors.get(&k) else { continue };
-            let (xid, size, painted) = (w.xid(), w.editor_size(), w.painted());
             let stem = std::path::Path::new(w.path())
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "fx".into());
-            live.push(xid);
-            self.embed_chrome(
-                ctx,
+            editors.push((
+                DynKind::VstFx(k.0, k.1),
                 format!("FX EDITOR \u{2014} {stem}"),
-                xid,
-                size,
-                painted,
-                ppp,
-            );
+                w.xid(),
+                w.editor_size(),
+                w.painted(),
+            ));
         }
-        self.embed_sync.retain(|xid, _| live.contains(xid));
+        for (kind, title, xid, size, painted) in editors {
+            self.embed_live.push(xid);
+            // One registry slot per editor: dock state, tab groups, slot
+            // menus and persistence are ALL the v47 machinery now.
+            let idx = self.dyn_reg(kind, title);
+            if self.chrome_closing.contains(&xid) && xid != 0 {
+                continue; // close in flight: no chrome until the reaper lands
+            }
+            if self.dyn_dock_skip(idx) {
+                continue; // docked (not carried): `side_frames` paints the body
+            }
+            self.embed_chrome(ctx, idx, kind, xid, size, painted);
+        }
+        self.chrome_closing.retain(|x| self.embed_live.contains(x));
+        self.embed_sync.retain(|xid, _| self.embed_live.contains(xid));
     }
 
-    /// One chrome window + rect sync for one embed container. `xid == 0`
-    /// means the GUI thread has not created the container yet — nothing to
-    /// pin, the pump reports paint verdicts via the existing shared flags.
+    /// Floating chrome of ONE embedded editor — the owner-drawn float of
+    /// the v35/v47 pattern (drum_window is the template): registry slot,
+    /// carry-aware positioning, rect persistence. When the window is
+    /// DOCKED this fn is not reached; `side_frames` draws the same
+    /// `embed_body` into the slot instead — one body, two chrome.
     fn embed_chrome(
         &mut self,
         ctx: &egui::Context,
-        title: String,
+        idx: usize,
+        kind: DynKind,
         xid: u64,
         size: (i32, i32),
         painted: bool,
-        ppp: f32,
     ) {
-        if xid == 0 {
-            return;
-        }
+        let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
         let mut open = true;
-        let shown = egui::Window::new(title)
+        let mut w = egui::Window::new(win_title(self, idx))
+            .id(egui::Id::new(("embed-chrome", kind.key())))
             .open(&mut open)
-            .resizable(false)
+            .resizable(false) // the plugin owns its size; the chrome follows
             .collapsible(false)
-            .show(ctx, |ui| {
-                if !painted {
-                    ui.label("waiting for the plugin to draw\u{2026}");
-                }
-                let want = egui::vec2(size.0.max(8) as f32, size.1.max(8) as f32);
-                // The allocated content rect IS the container's slot: the
-                // plugin owns its size, the chrome only follows.
-                ui.allocate_at_least(want, egui::Sense::hover()).1.rect
-            });
+            .constrain(false)
+            .fade_in(false);
+        if let Some(r) = self.dyn_rect(idx) {
+            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+        } else {
+            // No remembered float rect yet: open just big enough to hold
+            // the plugin's own area (chrome borders included).
+            w = w.default_size(egui::vec2(size.0.max(8) as f32 + 16.0, size.1.max(8) as f32 + 30.0));
+        }
+        if dragging {
+            w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
+        }
+        let resp = w.show(ctx, |ui| {
+            body_clipped(ui, |ui| self.embed_body(ui, xid, size, painted))
+        });
         if !open {
             // The chrome's X IS the window-manager close: same WM_CLOSE
             // protocol as the top-level container, so teardown order and
             // the reaper's harvest stay identical across modes.
-            crate::vstedit::request_wm_delete(xid);
+            self.chrome_closing_close(xid);
             return;
         }
-        if let Some(rect) = shown.and_then(|ir| ir.inner) {
-            let geo = (
-                (rect.min.x * ppp).round() as i32,
-                (rect.min.y * ppp).round() as i32,
-                (rect.width() * ppp).round().max(8.0) as i32,
-                (rect.height() * ppp).round().max(8.0) as i32,
-            );
+        if let Some(out) = resp.map(|r| r.response.rect) {
+            self.dyn_remember(idx, out);
+        }
+    }
+
+    /// One chrome body, both generations (float owner + dock dispatch):
+    /// allocate the plugin's own area and record it as the container's
+    /// slot. `xid == 0` means the GUI thread has not created the container
+    /// yet — nothing to pin, the pump reports paint verdicts via the
+    /// existing shared flags. If the offered slot is SMALLER than the
+    /// plugin's area (tight dock, squeezed divider), the container takes
+    /// the offer and the plugin clips inside it — growing past the slot
+    /// would paint over the neighbour.
+    fn embed_body(&mut self, ui: &mut egui::Ui, xid: u64, size: (i32, i32), painted: bool) {
+        if !painted {
+            ui.label("waiting for the plugin to draw\u{2026}");
+        }
+        let offered = ui.available_rect_before_wrap().intersect(ui.max_rect());
+        let want = egui::vec2(size.0.max(8) as f32, size.1.max(8) as f32);
+        let rect = ui.allocate_at_least(want, egui::Sense::hover()).1.rect;
+        let slot = if offered.is_finite() { rect.intersect(offered) } else { rect };
+        if xid != 0 && slot.width() > 4.0 && slot.height() > 4.0 {
+            self.embed_slot.insert(xid, [slot.min.x, slot.min.y, slot.width(), slot.height()]);
+        }
+    }
+
+    /// W8b p2-b: land chrome geometry + visibility for every embedded
+    /// container. MUST run right after `side_frames` (float bodies record
+    /// their slot in the pass, docked bodies record HERE) and post every
+    /// window call to the vst2-gui thread — containers are owned there.
+    /// Hide policy (the p1 popup limitation, now closed): a native child
+    /// paints OVER egui's GL surface, so while a menu/popup is open (any
+    /// Foreground-order area — egui popups, menus, ComboBoxes) or a window
+    /// is being carried across the dock, containers vanish instead of
+    /// swallowing the popup.
+    fn embed_sync_pass(&mut self, ctx: &egui::Context) {
+        if !self.embed_wanted() || self.embed_hwnd.is_none() {
+            return;
+        }
+        let ppp = ctx.pixels_per_point();
+        let hwnd = self.embed_hwnd.unwrap_or(0);
+        // egui's logical screen points -> PHYSICAL, minus the parent's
+        // client origin (SetWindowPos on a child is parent-CLIENT space).
+        let (ox, oy) = crate::vstedit::embed_parent_origin(hwnd);
+        let rects: Vec<(u64, (i32, i32, i32, i32))> = self
+            .embed_slot
+            .iter()
+            .map(|(xid, r)| {
+                (
+                    *xid,
+                    (
+                        (r[0] * ppp).round() as i32 - ox,
+                        (r[1] * ppp).round() as i32 - oy,
+                        (r[2] * ppp).round().max(8.0) as i32,
+                        (r[3] * ppp).round().max(8.0) as i32,
+                    ),
+                )
+            })
+            .collect();
+        for (xid, geo) in rects {
             if self.embed_sync.get(&xid) != Some(&geo) {
                 self.embed_sync.insert(xid, geo);
                 // Containers are owned by the vst2-gui thread; a direct
                 // SetWindowPos from here could block behind plugin code.
                 crate::vsthost::post(move || {
                     crate::vstedit::set_container_rect(xid, geo.0, geo.1, geo.2, geo.3);
+                });
+            }
+        }
+        let busy = self.free_drag.is_some()
+            || ctx.memory(|m| m.layer_ids().any(|l| l.order == egui::Order::Foreground));
+        self.embed_vis.retain(|x, _| self.embed_live.contains(x));
+        for i in 0..self.embed_live.len() {
+            let xid = self.embed_live[i];
+            if xid == 0 {
+                continue;
+            }
+            let want = !busy && self.embed_slot.contains_key(&xid);
+            if self.embed_vis.get(&xid) != Some(&want) {
+                self.embed_vis.insert(xid, want);
+                crate::vsthost::post(move || {
+                    crate::vstedit::set_container_visible(xid, want);
                 });
             }
         }
@@ -12833,6 +12965,10 @@ impl App {
         // order first), floats ride on top. Must precede central_panels
         // so docked panels reserve their edge before the grid claims it.
         side_frames(ui, self);
+        // W8b p2-b: land the embed containers' geometry/visibility from
+        // the slots just recorded (floats in the pass above, docked bodies
+        // inside side_frames). No-op unless Windows embed mode is live.
+        self.embed_sync_pass(ui.ctx());
         central_panels(ui, self);
 
         // Watchdog: a scrub/clip/marquee drag that somehow loses its
@@ -14181,7 +14317,7 @@ fn over_side_window(app: &App, pt: egui::Pos2) -> bool {
 /// What a dynamic window is; also its stable registry key (v35 R5).
 /// Every kind is wired: registry slot + `dyn_body` dispatch + an owner
 /// that paints its own floating chrome when the dock does not hold it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum DynKind {
     Params,
     Chain(usize),
@@ -14195,6 +14331,13 @@ pub(crate) enum DynKind {
     Roll,
     Auto,
     Synths(usize),
+    /// W8b p2-b: a NATIVE (embedded Win32) synth-plugin editor for track
+    /// `t` — the egui chrome of the child-HWND container joins the v47
+    /// dock. Registered only while embed mode runs (Windows + switch ON),
+    /// so Linux never instantiates these kinds.
+    Vst(usize),
+    /// W8b p2-b: native FX-plugin editor chrome at (track, chain row).
+    VstFx(usize, usize),
 }
 pub(crate) struct DynWin {
     kind: DynKind,
@@ -14221,6 +14364,8 @@ impl DynKind {
             DynKind::Roll => "roll".into(),
             DynKind::Auto => "auto".into(),
             DynKind::Synths(t) => format!("synths:{t}"),
+            DynKind::Vst(t) => format!("vst:{t}"),
+            DynKind::VstFx(t, r) => format!("vstfx:{t}:{r}"),
         }
     }
     fn from_key(s: &str) -> Option<DynKind> {
@@ -14229,6 +14374,16 @@ impl DynKind {
             let mut it = rest.splitn(2, ':');
             let (t, r) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
             return Some(DynKind::Fx(t, r));
+        }
+        // W8b p2-b: the two native-editor chrome kinds ("vst:<track>",
+        // "vstfx:<track>:<row>") — two-part keys like the FX editor.
+        if let Some(rest) = s.strip_prefix("vstfx:") {
+            let mut it = rest.splitn(2, ':');
+            let (t, r) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+            return Some(DynKind::VstFx(t, r));
+        }
+        if let Some(rest) = s.strip_prefix("vst:") {
+            return Some(DynKind::Vst(rest.parse().ok()?));
         }
         let mut parts = s.splitn(2, ':');
         let head = parts.next()?;
@@ -14280,6 +14435,18 @@ fn dyn_open(app: &App, k: DynKind) -> bool {
         DynKind::Roll => app.piano_roll.is_some(),
         DynKind::Auto => app.auto_edit.is_some(),
         DynKind::Synths(t) => app.synth_pick == Some(t),
+        // W8b p2-b: a native editor is open while its map entry lives —
+        // minus the close-in-flight suppression (the WM_CLOSE protocol
+        // retires the window asynchronously; re-showing the chrome in the
+        // meanwhile would resurrect a window the user just closed).
+        DynKind::Vst(t) => app
+            .vst_editors
+            .get(&t)
+            .is_some_and(|w| !app.chrome_closing.contains(&w.xid())),
+        DynKind::VstFx(t, r) => app
+            .fx_vst_editors
+            .get(&(t, r))
+            .is_some_and(|w| !app.chrome_closing.contains(&w.xid())),
     }
 }
 fn dyn_set(app: &mut App, k: DynKind, v: bool) {
@@ -14299,6 +14466,23 @@ fn dyn_set(app: &mut App, k: DynKind, v: bool) {
         DynKind::Roll => app.piano_roll = if v { app.piano_roll.take() } else { None },
         DynKind::Auto => app.auto_edit = if v { app.auto_edit.take() } else { None },
         DynKind::Synths(_) => app.synth_pick = if v { app.synth_pick } else { None },
+        // W8b p2-b: closing an embedded editor = the SAME teardown protocol
+        // as the chrome's own X (WM_CLOSE -> pump -> reaper). Opening needs
+        // the plugin's live instance, so `true` is a no-op (v36 rule).
+        DynKind::Vst(t) => {
+            if !v {
+                if let Some(xid) = app.vst_editors.get(&t).map(|w| w.xid()) {
+                    app.chrome_closing_close(xid);
+                }
+            }
+        }
+        DynKind::VstFx(t, r) => {
+            if !v {
+                if let Some(xid) = app.fx_vst_editors.get(&(t, r)).map(|w| w.xid()) {
+                    app.chrome_closing_close(xid);
+                }
+            }
+        }
     }
 }
 
@@ -15314,6 +15498,21 @@ fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         DynKind::Master => app.master_out_body(ui),
         DynKind::Synth(t) => app.synth_sliders_body(ui, t),
         DynKind::Fx(t, r) => app.fx_editor_body(ui, t, r),
+        // W8b p2-b: native (embedded Win32) editor chrome — the SAME body
+        // the float owner draws; the container rect is recorded here and
+        // landed by `embed_sync_pass` right after `side_frames`.
+        DynKind::Vst(t) => {
+            if let Some(w) = app.vst_editors.get(&t) {
+                let (xid, size, painted) = (w.xid(), w.editor_size(), w.painted());
+                app.embed_body(ui, xid, size, painted);
+            }
+        }
+        DynKind::VstFx(t, r) => {
+            if let Some(w) = app.fx_vst_editors.get(&(t, r)) {
+                let (xid, size, painted) = (w.xid(), w.editor_size(), w.painted());
+                app.embed_body(ui, xid, size, painted);
+            }
+        }
         DynKind::Params => {
             if let Some(target) = app.params_win {
                 if let Some(entry) = app.target_entry(target) {
@@ -37701,4 +37900,36 @@ mod tests {
         assert!(meter_big > 180.0, "meter column did not grow: {meter_big}");
     }
 
+    /// W8b p2-b: the two native-editor chrome kinds carry stable,
+    /// round-tripping persistence keys and must not collide with the
+    /// existing two-part `fx:` key family.
+    #[test]
+    fn w8b_dynkind_vst_keys_round_trip() {
+        for (k, s) in
+            [(DynKind::Vst(3), "vst:3"), (DynKind::VstFx(1, 2), "vstfx:1:2"), (DynKind::Vst(0), "vst:0")]
+        {
+            assert_eq!(k.key(), s);
+            assert_eq!(DynKind::from_key(s), Some(k));
+        }
+        // Legacy parsing untouched: `fx:` never swallows `vstfx:`, and the
+        // single-arg families still parse.
+        assert_eq!(DynKind::from_key("fx:1:2"), Some(DynKind::Fx(1, 2)));
+        assert_eq!(DynKind::from_key("synth:4"), Some(DynKind::Synth(4)));
+        // Malformed keys refuse, they never guess.
+        assert_eq!(DynKind::from_key("vst:"), None);
+        assert_eq!(DynKind::from_key("vst:a"), None);
+        assert_eq!(DynKind::from_key("vstfx:9"), None);
+        assert_eq!(DynKind::from_key("vstfx:"), None);
+    }
+
+    /// W8b p2-b: a native editor kind is only ever "open" while its map
+    /// entry lives — a fresh app (no editors) answers false for every
+    /// track/row, and the close-suppression set cannot hide a window that
+    /// was never open (it simply never gates anything).
+    #[test]
+    fn w8b_dyn_open_false_without_editors() {
+        let app = headless_app("w8b_dynopen");
+        assert!(!dyn_open(&app, DynKind::Vst(0)), "no editor open on a fresh app");
+        assert!(!dyn_open(&app, DynKind::VstFx(0, 0)));
+    }
 }
