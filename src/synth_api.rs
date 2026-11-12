@@ -72,12 +72,31 @@ pub struct SynthAssetV1 {
 }
 
 /// Host services available to synths at create time.
+///
+/// Host fields are APPEND-ONLY: the ABI marker stays at 1 because scripts
+/// only ever read fields their own `synth_api.rs` copy knows, and the
+/// struct layout prefix is frozen. A script compiled against an older
+/// copy is handed the same (longer) table and never touches the new
+/// fields.
 #[repr(C)]
 pub struct SynthHostV1 {
     pub abi: u32,
     /// Fill `out` with asset `id`; 1 = filled, 0 = unknown id. The pointer
     /// stays valid only until the next load_asset on this thread.
     pub load_asset: extern "C" fn(id: u32, out: *mut SynthAssetV1) -> u8,
+    /// v51: the multi-sample key map of the track whose synth is calling
+    /// (valid synchronously while the host is inside your `process()` or
+    /// `note_on()` — exactly like `load_asset`). Fill `slots[0..n]` with
+    /// the mapped samples, each packed as `(asset_id << 8) | root_note`
+    /// (asset id is a rack id, root note a MIDI number 0..=127), write
+    /// the map mode to `*mode` (low bits: 0 = hard cutoff, switch at the
+    /// midpoint, a note exactly halfway uses the lower sample; 1 =
+    /// crossfade, bend the two nearest samples to the note and mix them
+    /// by inverse distance. Bit 31: this track HAS a key map — with
+    /// n == 0 that means "mapped to nothing", i.e. silence, NOT the
+    /// legacy params), and return n (at most `max`). n == 0 with bit 31
+    /// clear means no map at all — the legacy single-asset params rule.
+    pub load_map: extern "C" fn(slots: *mut u64, max: u32, mode: *mut u32) -> u32,
 }
 
 #[repr(C)]
