@@ -541,7 +541,10 @@ portable asset on the OLDEST distro we support, never the newest.
 - [ ] **W13b — distro smoke matrix.** Containers arch / debian:12 /
   ubuntu:22.04 / fedora:40 install only the RUNTIME libs (libx11-6, libxcb1,
   libjack-jackd2-0 …) and execute the SHIPPED asset (not a rebuild) through
-  the one CLI mode that exists: `slooper --slooper-probe v2 /nonexistent`
+  the one CLI mode that exists: `slooper --slooper-probe 2 /nonexistent`
+  (kind is NUMERIC — 0 VST2 / 1 VST3 / 2 CLAP; the string `v2` is NOT
+  parsed and falls through to a full GUI boot — W13a proven live on the
+  floor artifact: one JSON line + exit 0, no window, no JACK)
   prints one JSON line and exits WITHOUT opening a window or touching JACK
   (W7 interception runs before `Backend::start`) = a real loads-and-runs
   proof per distro, including the libjack-dlopen path.
@@ -1385,3 +1388,12 @@ portable asset on the OLDEST distro we support, never the newest.
   inputs — the runner's libc — are untestable from the lib suite); the
   sabotage run above is the pin-equivalent. W13b (per-distro smoke of the
   shipped artifact) is the runtime-side proof and stays open.
+  VERIFIED BY CI (draft run `43305766408` on `c3dde89`: all three jobs
+  GREEN; the Linux job really ran on the 22.04 image — floor build demands
+  GLIBC 2.35 exactly). THE SHIPPED ARTIFACT ITSELF THEN PASSED BOTH CHECKS
+  (the pdb-era lesson applied to Linux): downloaded `linux-asset` from that
+  run, assert exit 0 on the exe inside the tar.zst, AND ran it on this host
+  — `slooper --slooper-probe 2 /nonexistent` printed one JSON line, exit 0,
+  no window. That live run also caught a ledger error BEFORE W13b inherits
+  it: the probe `kind` is numeric (0/1/2), the written `v2` was never
+  parsed and booted the GUI — ledger corrected.
