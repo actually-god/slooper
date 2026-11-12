@@ -75,12 +75,14 @@ jobs:
         with:
           key: release-win-msvc
       - name: Build (shipping profile, MSVC)
-        run: cargo build --release --locked
+        # W12e: winrel = release WITH symbols so crash minidumps
+        # (src/crash.rs) resolve to function names.
+        run: cargo build --profile winrel --locked
       - name: Stage + zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory stage | Out-Null
-          Copy-Item target/release/slooper.exe stage/slooper.exe
+          Copy-Item target/winrel/slooper.exe stage/slooper.exe
           Copy-Item README.md stage/README.md
           Copy-Item LICENSE stage/LICENSE
           Compress-Archive -Path stage/* -DestinationPath slooper-win64.zip -Force

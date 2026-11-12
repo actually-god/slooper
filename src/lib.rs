@@ -23,6 +23,7 @@ pub mod automation;
 pub mod backend;
 pub mod claphost;
 pub mod config;
+pub mod crash;
 pub mod ffiguard;
 pub mod fx;
 pub mod fxgui;

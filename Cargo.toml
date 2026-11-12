@@ -80,6 +80,12 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
+    # W12e crash story: MiniDumpWriteDump (its cfg gate also needs Kernel +
+    # FileSystem + Memory) and the unhandled-exception filter, in src/crash.rs.
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
 ] }
 
 [workspace]
@@ -119,6 +125,16 @@ panic = "unwind"
 inherits = "release"
 lto = false
 codegen-units = 32
+
+# W12e (WINDOWS-PORT): Windows shipping profile — identical to `release`
+# EXCEPT symbols stay in (strip=false + minimal debuginfo), so the
+# minidumps src/crash.rs writes resolve to module+function names directly
+# (WinDbg/Crashpad need no PDB hunt; the zip stays single-file). Only the
+# release.yml windows job uses it — Linux keeps `release`/strip=true.
+[profile.winrel]
+inherits = "release"
+strip = false
+debug = 1
 
 # tier-5 forensics (2026-11-06 v2): release codegen + debuginfo for ASAN runs
 [profile.asanrel]

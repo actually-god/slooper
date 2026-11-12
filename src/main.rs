@@ -27,6 +27,11 @@ fn main() -> eframe::Result {
     // panicked`). C++ exceptions are not panics — they keep unwinding to
     // the guard.
     std::panic::set_hook(Box::new(|info| {
+        // W12e: a console-less GUI-subsystem Windows exe loses eprintln to
+        // the void — note the panic (text + backtrace) where the user can
+        // find it BEFORE the v42 abort. Structurally inert on Linux.
+        #[cfg(windows)]
+        slooper::crash::note_panic(info);
         eprintln!("[slooper] panic: {info}");
         std::process::abort();
     }));
@@ -87,6 +92,11 @@ fn main() -> eframe::Result {
         std::env::remove_var("WAYLAND_DISPLAY");
         std::env::remove_var("WAYLAND_SOCKET");
     }
+    // W12e: from here on this IS the main process (the probe children
+    // exited above and stay handler-free on purpose) — arm the Windows
+    // fatal-fault story (minidump + note + box; Linux: inert no-op,
+    // coredumpctl territory). See src/crash.rs.
+    slooper::crash::install();
     // Start the JACK/PipeWire-JACK backend thread (NO_START: never auto-starts a server).
     let backend = slooper::audio::Backend::start();
 
