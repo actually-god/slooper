@@ -260,7 +260,7 @@ pub fn note_crash(title: &str, detail: &str) {
     if std::fs::create_dir_all(&dir).is_err() {
         return; // nowhere to be loud about — best effort only
     }
-    write_note_at(&dir, title, detail);
+    write_note_at(&dir, now_secs(), title, detail);
     prune_dir(&dir);
 }
 
@@ -283,11 +283,20 @@ pub fn quiet_suppressed(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> boo
 #[cfg(windows)]
 const PREFIX: &str = "slooper-crash-";
 
-/// One event's text note at `dir`, collision-suffixed. Split from the env
-/// read so the functional pins drive it against a sandbox folder directly.
+/// One event's text note at `dir`, collision-suffixed. `ts` is THE event's
+/// timestamp — the caller passes the one it already used for the dump, and
+/// only for a standalone note calls `now_secs()` itself. A note that grabs
+/// its own clock here can land on the NEXT second while the dump writer is
+/// still busy (measured: MiniDumpWriteDump ~1 s), splitting one crash into
+/// two stems so pruning ages the `.dmp` and the `.txt` separately — a real
+/// bug this caused, pinned by `w12e_windows_self_test_fault_...`.
 #[cfg(windows)]
-fn write_note_at(dir: &std::path::Path, title: &str, detail: &str) -> Option<std::path::PathBuf> {
-    let ts = now_secs();
+fn write_note_at(
+    dir: &std::path::Path,
+    ts: u64,
+    title: &str,
+    detail: &str,
+) -> Option<std::path::PathBuf> {
     let base = crash_stem(ts, title);
     let mut name = format!("{base}.txt");
     let mut n = 1u32;
@@ -379,6 +388,7 @@ unsafe extern "system" fn uef(
     };
     write_note_at(
         &dir,
+        ts,
         &code,
         &format!(
             "unhandled exception code {code} at address {addr:p}; minidump written: {dump_ok}"
@@ -701,6 +711,17 @@ mod tests {
         let i_note = body.find("write_note_at(").expect("note write");
         let i_box = body.find("announce_crash(").expect("user announcement");
         assert!(i_dump < i_note && i_note < i_box, "dump -> note -> box");
+        // …and BOTH writers receive the SAME event timestamp. The note must
+        // never re-read the clock: MiniDumpWriteDump takes ~1 s, so a second
+        // `now_secs()` lands on the NEXT stem and the pair stops aging as one
+        // event — the exact bug the Windows child pin caught in CI.
+        // Whitespace-collapsed so the call may be formatted over lines.
+        let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("write_dump_at(&dir, ts, &code, ptr)")
+                && flat.contains("write_note_at( &dir, ts, &code,"),
+            "one crash = one stem: dump AND note must share `ts` — got {flat}"
+        );
     }
 
     // ---- Windows-only functional (runs on the windows-native CI lane) ----
