@@ -4825,6 +4825,11 @@ impl Proc {
             && !metro_on
             && !self.preview_live
             && !self.aud_pv_any
+            // v50 R3: a pending seek must still run one block even with
+            // nothing connected — else the consumed seek never lands (the
+            // playhead would freeze while stopped) and automation could
+            // never follow it.
+            && seek.is_none()
         {
             return; // nothing connected, nothing playing: idle
         }
@@ -5131,9 +5136,11 @@ impl Proc {
         // land directly on the live instances' atomics.
         // v34 R11: STOPPING keeps the last automation pass — a pause one
         // sample past an automation clip must not snap every automated
-        // knob back. A play/seek elsewhere re-evaluates at the new
-        // position on the next run block.
-        if transport {
+        // knob back. v50 R3: a SEEK runs the pass too even with the
+        // transport stopped — automation follows the playhead at all
+        // times, so scrubbing onto/over/off a curve applies its values
+        // exactly where the (stationary) playhead now sits.
+        if transport || seek.is_some() {
             self.auto_last = self.eval_automation(p0);
             // v35 R1: automation drives REAL controls (see apply_auto_real).
             self.engine.apply_auto_real(&self.auto_last);

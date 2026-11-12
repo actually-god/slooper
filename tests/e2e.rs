@@ -4463,3 +4463,169 @@ fn e2e_tier6_host_sync_live() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- v50 R3: scrubbing the playhead while STOPPED must be silent ----------
+// The reported bug: dragging the playback bar over a clip (transport never
+// started) sounded the clip's audio / fired the pattern's notes. Only the
+// transport may start sound; automation alone follows the playhead.
+#[test]
+fn e2e_scrub_while_stopped_is_silent() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("scrub_stop", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { .. }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "backend did not apply the sink layout"
+    );
+
+    // Default synth so a MIDI clip COULD sound if the gate were open.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(
+        slooper::audio::SynthHandle::Script(inst),
+    ))));
+    let mut pat = slooper::midipat::Pattern::new(120);
+    for (i, note) in [60u8, 64, 67, 72].iter().enumerate() {
+        pat.notes.push(slooper::midipat::Note {
+            ch: 0,
+            note: *note,
+            vel: 110,
+            press: 0,
+            start: (i as u32) * slooper::midipat::PPQ as u32,
+            len: slooper::midipat::PPQ as u32 * 3 / 4,
+        });
+    }
+    pat.sort();
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+
+    // Audio asset 0 (loud constant) plays on track 0; the MIDI pattern is
+    // asset index 1 on track 1 (its table slot is the MIDI table).
+    let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 24_000]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    arr.insert(1, 0, Clip::new(1, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![a0.clone()]),
+        arr: Arc::new(arr),
+        len: sr as u64 * 4,
+    });
+    assert!(!b.engine.transport_on(), "test needs the transport stopped");
+
+    // Scrub the playhead like the user does: a storm of Seeks sweeping the
+    // clips both directions, then park inside the audio clip.
+    for pos in [
+        0u64, 4_000, 9_000, 15_000, 22_000, 23_900, 18_000, 12_000, 6_000, 2_000, 11_000,
+    ] {
+        b.cmd(Cmd::Seek { pos });
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Give the ring a clean window AFTER the last seek.
+    std::thread::sleep(Duration::from_millis(150));
+    let parked = b.engine.pos();
+    assert!(parked > 0, "a seek while stopped did not move the playhead");
+    assert!(
+        ring_peak(&ring, &widx, 9600)
+            .map(|p| p < 0.002)
+            .unwrap_or(false),
+        "scrubbing the stopped transport made sound (audio clip or MIDI notes leaked)"
+    );
+
+    // Gate sanity: the SAME project must be audible once the transport runs.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(4),
+        "transport playing the project",
+    );
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(700));
+    let _ = active;
+}
+
+// ---- v50 R3: automation follows the playhead even while STOPPED -----------
+#[test]
+fn e2e_automation_follows_seek_while_stopped() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let _ = sr;
+
+    // A curve asset (table slot 1) riding track 0's volume: 0.25 flat over
+    // 2 s. NO audio asset at slot 1 — only the automation acts.
+    use slooper::automation::{Automation, Node, TARGET_TRACK_VOL};
+    let auto = Arc::new(Automation {
+        target: TARGET_TRACK_VOL.into(),
+        len_samples: 96_000,
+        nodes: vec![Node { t: 0, v: 0.25, c: 0.0 }, Node { t: 96_000, v: 0.25, c: 0.0 }],
+    });
+    b.cmd(Cmd::SetAutoAssets(Arc::new(vec![None, Some(auto)])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(1, sr as u64)); // auto clip at 1 s
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: sr as u64 * 8,
+    });
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(!b.engine.transport_on());
+
+    let vol0 = || f32::from_bits(b.engine.vol[0].load(Ordering::Relaxed));
+    let manual = vol0();
+    // Park before the clip: untouched manual value.
+    b.cmd(Cmd::Seek { pos: 500 });
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        (vol0() - manual).abs() < 1e-4,
+        "seek BEFORE the curve must leave the manual volume"
+    );
+    // Scrub INSIDE the curve: while STOPPED, the curve value must land on
+    // the real control (this is the "automation follows at all times" fix).
+    b.cmd(Cmd::Seek { pos: 1_500 });
+    wait_until(
+        || (vol0() - 0.25).abs() < 1e-4,
+        Duration::from_secs(2),
+        "curve did not drive track volume while stopped",
+    );
+    // And back off the curve: manual value restored.
+    b.cmd(Cmd::Seek { pos: 7_000 });
+    wait_until(
+        || (vol0() - manual).abs() < 1e-4,
+        Duration::from_secs(2),
+        "leaving the curve must restore the manual volume",
+    );
+}
