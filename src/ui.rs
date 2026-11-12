@@ -10623,7 +10623,7 @@ impl App {
                     egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
                     egui::StrokeKind::Inside,
                 );
-                if note % 12 == 0 {
+                if note.is_multiple_of(12) {
                     ui.painter().text(
                         egui::pos2(x + 2.0, kr.max.y - 4.0),
                         egui::Align2::LEFT_BOTTOM,
@@ -10661,25 +10661,22 @@ impl App {
             let sel = self.smap_sel.filter(|i| *i < n);
             let apply = |me: &mut Self, x: f32| {
                 let note = note_at(x, kr.min.x).clamp(0, 127);
-                match sel {
-                    Some(i) => {
-                        let changed = me
-                            .sampler_maps
-                            .get(t)
-                            .and_then(|o| o.as_ref())
-                            .and_then(|m| m.slots.get(i))
-                            .is_some_and(|s| s.root != note);
-                        if changed {
-                            if let Some(Some(m)) = me.sampler_maps.get_mut(t) {
-                                if let Some(s) = m.slots.get_mut(i) {
-                                    s.root = note;
-                                }
+                if let Some(i) = sel {
+                    let changed = me
+                        .sampler_maps
+                        .get(t)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|m| m.slots.get(i))
+                        .is_some_and(|s| s.root != note);
+                    if changed {
+                        if let Some(Some(m)) = me.sampler_maps.get_mut(t) {
+                            if let Some(s) = m.slots.get_mut(i) {
+                                s.root = note;
                             }
-                            me.push_sampler_map(t);
-                            me.save_config();
                         }
+                        me.push_sampler_map(t);
+                        me.save_config();
                     }
-                    None => {}
                 }
                 me.smap_audition(t, note);
             };
@@ -12313,6 +12310,10 @@ impl App {
             }
         }
         self.assets.remove(k);
+        // v51: asset ids ARE table indices — every live key map's packed
+        // ids shift with this removal. Re-push all maps (paths are the
+        // durable identity; the instance holds ids).
+        self.refresh_sampler_maps();
         self.wave.clear();
         self.sel_asset = None;
         self.sel_clips.clear();
