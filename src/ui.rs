@@ -29618,6 +29618,70 @@ mod tests {
         assert_eq!(app.smap_win, None, "window closes when the sampler unbinds");
     }
 
+    /// v51: "+ add sample" appends a lane (selected asset, root +7) and
+    /// publishes it to the live engine map; "remove ×" drops the selected
+    /// lane again — the map stays the single source of truth.
+    #[test]
+    fn v51_sampler_map_add_remove_slots() {
+        let mut app = headless_app("v51addrem");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        for ev in [
+            vec![moved(kick.center())],
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        for _ in 0..1200 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.synth_registry.desc("sampler").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        app.smap_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.sampler_maps[0].as_ref().unwrap().slots.len(), 1);
+        let add = galley_at(&mut app, &ctx, "+ add sample")
+            .expect("add button")
+            .center();
+        for ev in [
+            vec![moved(add)],
+            vec![moved(add), btn(add, egui::PointerButton::Primary, true)],
+            vec![btn(add, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        let m = app.sampler_maps[0].as_ref().unwrap();
+        assert_eq!(m.slots.len(), 2, "+ add sample appends a lane");
+        assert_eq!(m.slots[1].root, 55, "new lane roots a fifth up");
+        assert_eq!(m.slots[1].asset, m.slots[0].asset, "same selected asset");
+        assert_eq!(app.smap_sel, Some(1), "new lane is selected");
+        let inst = app.track_synth_inst[0].clone().expect("bound");
+        let SynthHandle::Script(si) = inst.as_ref() else {
+            panic!("script instance expected");
+        };
+        assert_eq!(si.map_snapshot().0.len(), 2, "engine map carries both");
+        let rem = galley_at(&mut app, &ctx, "remove \u{d7}").expect("remove button").center();
+        for ev in [
+            vec![moved(rem)],
+            vec![moved(rem), btn(rem, egui::PointerButton::Primary, true)],
+            vec![btn(rem, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(app.sampler_maps[0].as_ref().unwrap().slots.len(), 1);
+        assert_eq!(si.map_snapshot().0.len(), 1, "engine map follows removal");
+        assert_eq!(app.smap_sel, None, "selection cleared after remove");
+    }
+
     /// v51: dragging a lane block to a new key re-roots the slot (state
     /// and the live engine map), and a piano-key click re-roots the
     /// SELECTED slot — the two assignment gestures of the map window.
