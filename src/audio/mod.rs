@@ -7780,8 +7780,16 @@ mod w12a_tests {
             wait < guard && guard < math,
             "the dead-handle wait must be checked BEFORE the index arithmetic"
         );
-        // the guard stores a fault and breaks — never falls through
-        assert!(src[guard..guard + 400].contains("self.fault.store(rt_recovery::FAULT_DEVICE"));
+        // the guard stores a fault and breaks — never falls through.
+        // Whitespace-insensitive: rustfmt may wrap the store call.
+        let win: String = src[guard..guard + 600]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            win.contains("self.fault.store(rt_recovery::FAULT_DEVICE,Ordering::SeqCst);"),
+            "guard must store the device-loss fault"
+        );
     }
 
     #[test]

@@ -1258,10 +1258,7 @@ mod tests {
 
     /// One note through the instance; returns the render for Goertzel.
     fn v51_render(inst: &Arc<Instance>, note: u8) -> Vec<f32> {
-        let mut ev = vec![
-            (0u64, 3u8, 0u8, note, 110u8),
-            (40_000, 0, 0, note, 0),
-        ];
+        let mut ev = vec![(0u64, 3u8, 0u8, note, 110u8), (40_000, 0, 0, note, 0)];
         let mut out = vec![0f32; 8192];
         crate::audio::render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
         out
@@ -1285,7 +1282,8 @@ mod tests {
         assert_eq!(inst.map_snapshot(), (vec![(0u32, 48u8), (1, 54)], 0, true));
         // A mapped sample plays at its ROOT pitch when the note equals the
         // root, so each case measures the TRANSPOSED frequency.
-        let fsh = |base: f64, note: i32, root: i32| base * (2.0f64).powf((note - root) as f64 / 12.0);
+        let fsh =
+            |base: f64, note: i32, root: i32| base * (2.0f64).powf((note - root) as f64 / 12.0);
         let dom = |note: u8, want: f64, off: f64| {
             let x = v51_render(&inst, note);
             let a = tone_power(&x, want, 48000.0, 512, 7680);
@@ -1336,7 +1334,10 @@ mod tests {
         // or power would not be proportional to amplitude squared.
         let plo = line_power(&x, f_lo, 48000.0, 512, 3800);
         let phi = line_power(&x, f_hi, 48000.0, 512, 3800);
-        assert!(plo > 5e4 && phi > 5e4, "both samples must sound: {plo} {phi}");
+        assert!(
+            plo > 5e4 && phi > 5e4,
+            "both samples must sound: {plo} {phi}"
+        );
         // Amplitude ratio 4/7 : 3/7 -> power ratio 16:9 = 1.78.
         let r = plo / phi;
         assert!(
@@ -1357,11 +1358,17 @@ mod tests {
         let x = v51_render(&inst, 45); // exact low root
         let a = tone_power(&x, 200.0, 48000.0, 512, 7680);
         let b = tone_power(&x, 800.0 * (2.0f64).powf(-7.0 / 12.0), 48000.0, 512, 7680);
-        assert!(a > 25.0 * b, "exact root must silence the other side: {a} vs {b}");
+        assert!(
+            a > 25.0 * b,
+            "exact root must silence the other side: {a} vs {b}"
+        );
         let x = v51_render(&inst, 40); // below range -> lowest only
         let a = tone_power(&x, 200.0 * (2.0f64).powf(-5.0 / 12.0), 48000.0, 512, 7680);
         let b = tone_power(&x, 800.0 * (2.0f64).powf(-12.0 / 12.0), 48000.0, 512, 7680);
-        assert!(a > 25.0 * b, "below range must play the lowest sample only: {a} vs {b}");
+        assert!(
+            a > 25.0 * b,
+            "below range must play the lowest sample only: {a} vs {b}"
+        );
     }
 
     #[test]
@@ -1375,7 +1382,10 @@ mod tests {
         let x = v51_render(&inst, 60); // +12 st -> 200 Hz at 400 Hz
         let a = tone_power(&x, 400.0, 48000.0, 512, 7680);
         let b = tone_power(&x, 800.0, 48000.0, 512, 7680);
-        assert!(a > 25.0 * b, "legacy params must rule with no map: {a} vs {b}");
+        assert!(
+            a > 25.0 * b,
+            "legacy params must rule with no map: {a} vs {b}"
+        );
         assert!(!inst.map_snapshot().2, "no map yet -> exists=false");
 
         inst.set_map(&[(1, 60)], 0); // map up -> params ignored
@@ -1400,15 +1410,15 @@ mod tests {
         inst.set_map(&[(0, 48)], 0);
         let x = v51_render(&inst, 48);
         assert!(
-            tone_power(&x, 200.0, 48000.0, 512, 7680) > 25.0
-                * tone_power(&x, 800.0, 48000.0, 512, 7680),
+            tone_power(&x, 200.0, 48000.0, 512, 7680)
+                > 25.0 * tone_power(&x, 800.0, 48000.0, 512, 7680),
             "first map must sound"
         );
         inst.set_map(&[(1, 48)], 0); // swap sample on the fly
         let x = v51_render(&inst, 48);
         assert!(
-            tone_power(&x, 800.0, 48000.0, 512, 7680) > 25.0
-                * tone_power(&x, 200.0, 48000.0, 512, 7680),
+            tone_power(&x, 800.0, 48000.0, 512, 7680)
+                > 25.0 * tone_power(&x, 200.0, 48000.0, 512, 7680),
             "live map edit must change the NEXT render with no rebind"
         );
         // Spawn a fresh copy (audition/offline path) — map + mode ride.
@@ -1422,6 +1432,9 @@ mod tests {
         let x = v51_render(&fresh, 48);
         let plo = line_power(&x, 200.0 * (2.0f64).powf(3.0 / 12.0), 48000.0, 512, 3800);
         let phi = line_power(&x, 800.0 * (2.0f64).powf(-4.0 / 12.0), 48000.0, 512, 3800);
-        assert!(plo > 5e4 && phi > 5e4, "the copy must crossfade like the original");
+        assert!(
+            plo > 5e4 && phi > 5e4,
+            "the copy must crossfade like the original"
+        );
     }
 }
