@@ -478,6 +478,11 @@ pub struct Config {
     /// folder is where recordings are dropped.
     #[serde(default)]
     pub rack_dir_order: Vec<RackDirOrder>,
+    /// v50 R5: explicit recordings target directory (absolute path, any
+    /// rack root or sub-folder). "" = the legacy implicit rule (primary
+    /// folder's top sub-folder). Set from a folder's right-click menu.
+    #[serde(default)]
+    pub record_target: String,
     /// v29: group the rack by sub-folder (true) instead of by asset type
     /// (false, the historical default).
     #[serde(default)]
@@ -654,6 +659,7 @@ impl Default for Config {
             rack_folders: Vec::new(),
             rack_collapsed: Default::default(),
             rack_dir_order: Vec::new(),
+            record_target: String::new(),
             rack_group_by_dir: false,
             rec_src: vec![[true, false, false]; 8],
             rec_prev: Vec::new(),

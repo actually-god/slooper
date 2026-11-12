@@ -156,6 +156,11 @@ pub struct Project {
     /// v30 R1: per-track drum kits (empty entry = the stock kit).
     #[serde(default)]
     pub drum_kits: Vec<Vec<crate::config::DrumPadSave>>,
+    /// v50 R1: per-asset "Edit sample" settings, keyed by asset file
+    /// path; re-rendered over the pristine audio whenever the project
+    /// loads, so the source wavs stay untouched.
+    #[serde(default)]
+    pub sample_edits: std::collections::BTreeMap<String, crate::sample_edit::SampleEdit>,
 }
 
 impl Project {
@@ -285,6 +290,7 @@ mod tests {
             },
             playhead: 12_345,
             dirs: Vec::new(),
+            sample_edits: Default::default(),
             tracks: vec![ProjTrack {
                 h: 0.0,
                 vol: 100,
