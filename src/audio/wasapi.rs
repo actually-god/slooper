@@ -46,14 +46,12 @@ use midir::{MidiInput, MidiInputConnection};
 
 use windows::core::{w, BSTR, GUID, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
     IMMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE,
-    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -61,7 +59,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, GetCurrentThread,
-    SetEvent, SetThreadPriority, WaitForMultipleObjects, THREAD_PRIORITY_TIME_CRITICAL, INFINITE,
+    SetEvent, SetThreadPriority, WaitForMultipleObjects, INFINITE, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
 use super::rt_recovery::{self, Patch};
@@ -525,12 +523,7 @@ fn drain_capture(cap: &mut CapStream) -> Result<(), RtFault> {
                 cap.rings[si].push(&cap.col);
             }
         }
-        unsafe {
-            cap.svc
-                .0
-                .ReleaseBuffer(frames as u32)
-                .map_err(rt_fault)?
-        };
+        unsafe { cap.svc.0.ReleaseBuffer(frames as u32).map_err(rt_fault)? };
     }
 }
 
@@ -587,7 +580,10 @@ fn rt_fault(e: windows::core::Error) -> RtFault {
     } else {
         rt_recovery::FAULT_STREAM
     };
-    RtFault { code, msg: e.to_string() }
+    RtFault {
+        code,
+        msg: e.to_string(),
+    }
 }
 
 /// Everything the RT thread owns; moved in, dropped at thread exit after the
@@ -635,7 +631,8 @@ impl RtCfg {
                 // checked BEFORE the index arithmetic (W12a): WAIT_FAILED -
                 // WAIT_OBJECT_0 is not None, so the old `checked_sub` guard
                 // was dead code that would busy-spin this loop.
-                self.fault.store(rt_recovery::FAULT_DEVICE, Ordering::SeqCst);
+                self.fault
+                    .store(rt_recovery::FAULT_DEVICE, Ordering::SeqCst);
                 break;
             }
             let k = got.0 - WAIT_OBJECT_0.0;
@@ -644,10 +641,9 @@ impl RtCfg {
                 1 => {
                     if let Err(f) = self.render_cycle(&mut evs, &mut midi_ts) {
                         self.fault.store(f.code, Ordering::SeqCst);
-                        let _ = self.tx.try_send(Evt::Error(format!(
-                            "WASAPI stream stopped: {}",
-                            f.msg
-                        )));
+                        let _ = self
+                            .tx
+                            .try_send(Evt::Error(format!("WASAPI stream stopped: {}", f.msg)));
                         break;
                     }
                 }
@@ -656,10 +652,9 @@ impl RtCfg {
                     if ci < self.capture.len() {
                         if let Err(f) = drain_capture(&mut self.capture[ci]) {
                             self.fault.store(f.code, Ordering::SeqCst);
-                            let _ = self.tx.try_send(Evt::Error(format!(
-                                "WASAPI capture stopped: {}",
-                                f.msg
-                            )));
+                            let _ = self
+                                .tx
+                                .try_send(Evt::Error(format!("WASAPI capture stopped: {}", f.msg)));
                             break;
                         }
                     }
@@ -671,7 +666,11 @@ impl RtCfg {
         }
     }
 
-    fn render_cycle(&mut self, evs: &mut Vec<(u32, Vec<u8>)>, midi_ts: &mut Vec<u64>) -> Result<(), RtFault> {
+    fn render_cycle(
+        &mut self,
+        evs: &mut Vec<(u32, Vec<u8>)>,
+        midi_ts: &mut Vec<u64>,
+    ) -> Result<(), RtFault> {
         let pad = unsafe { self.render.0.GetCurrentPadding() }.map_err(rt_fault)?;
         let ring = self.render_ring as u32;
         if pad >= ring {
@@ -717,11 +716,7 @@ impl RtCfg {
         let bps = sample.bytes();
         let ch = self.render_mix.ch as usize;
         unsafe {
-            let buf = self
-                .render_svc
-                .0
-                .GetBuffer(n as u32)
-                .map_err(rt_fault)?;
+            let buf = self.render_svc.0.GetBuffer(n as u32).map_err(rt_fault)?;
             if !buf.is_null() {
                 let dst = std::slice::from_raw_parts_mut(buf, n * ch * bps);
                 for (slot, chidx) in &self.render_slots {
@@ -1267,9 +1262,7 @@ impl ManagerBackend for WasapiSession {
             // after survival is a NEW story, not a continuation of one.
             let survived = self
                 .rt_spawn
-                .map(|t| {
-                    t.elapsed() >= std::time::Duration::from_secs(rt_recovery::SURVIVED_SECS)
-                })
+                .map(|t| t.elapsed() >= std::time::Duration::from_secs(rt_recovery::SURVIVED_SECS))
                 .unwrap_or(false);
             if survived {
                 self.retry_budget = rt_recovery::RETRY_BUDGET;
@@ -1281,9 +1274,8 @@ impl ManagerBackend for WasapiSession {
                 .unwrap_or(false);
             match rt_recovery::plan(fault, self.last_patch.as_ref(), present, self.retry_budget) {
                 rt_recovery::IdleRecovery::Nothing => {
-                    let _ = tx.try_send(Evt::Notice(
-                        "WASAPI stream stopped; re-Apply ports".into(),
-                    ));
+                    let _ =
+                        tx.try_send(Evt::Notice("WASAPI stream stopped; re-Apply ports".into()));
                 }
                 rt_recovery::IdleRecovery::Reapply(patch) => {
                     self.retry_budget = self.retry_budget.saturating_sub(1);
@@ -1299,8 +1291,7 @@ impl ManagerBackend for WasapiSession {
                 }
                 rt_recovery::IdleRecovery::GaveUp => {
                     let _ = tx.try_send(Evt::Notice(
-                        "WASAPI stream keeps failing; check the device, then re-Apply ports"
-                            .into(),
+                        "WASAPI stream keeps failing; check the device, then re-Apply ports".into(),
                     ));
                 }
             }
@@ -1362,7 +1353,10 @@ mod w9_midi_tests {
             open_midi_devices(&["Device That Does Not Exist".to_string()], &q, &drops);
         assert!(conns.is_empty() && opened.is_empty());
         assert!(labels.is_ok(), "the picker list must come back: {labels:?}");
-        assert!(errs.is_empty(), "unknown device must be a no-op, not an error");
+        assert!(
+            errs.is_empty(),
+            "unknown device must be a no-op, not an error"
+        );
         // Empty selection = close everything; idempotent; nothing counted.
         let (c2, _, e2, o2) = open_midi_devices(&[], &q, &drops);
         assert!(c2.is_empty() && e2.is_empty() && o2.is_empty());
@@ -1400,12 +1394,15 @@ mod w12a_boost_tests {
         let e = windows::core::Error::from_hresult(AUDCLNT_E_DEVICE_INVALIDATED);
         assert_eq!(rt_fault(e).code, rt_recovery::FAULT_DEVICE);
         let generic = windows::core::HRESULT(0x8000_FFFF_u32 as i32);
-        assert_eq!(rt_fault(windows::core::Error::from_hresult(generic)).code,
-            rt_recovery::FAULT_STREAM);
+        assert_eq!(
+            rt_fault(windows::core::Error::from_hresult(generic)).code,
+            rt_recovery::FAULT_STREAM
+        );
         assert!(
-            !rt_fault(windows::core::Error::from_hresult(generic)).msg.is_empty(),
+            !rt_fault(windows::core::Error::from_hresult(generic))
+                .msg
+                .is_empty(),
             "message rides the Evt"
         );
     }
 }
-

@@ -2682,9 +2682,12 @@ pub fn probe_editor(path: &Path, kind: VstKind) -> EditorProbe {
     // The probe child re-enters OUR main(); only the real application
     // binary has that dispatch. Under `cargo test` current_exe is the
     // libtest harness — spawning it would recursively run the suite.
-    let real_app = exe
-        .file_name()
-        .is_some_and(|n| matches!(n.to_str(), Some("slooper") | Some("slooper-bin") | Some("slooper.exe")));
+    let real_app = exe.file_name().is_some_and(|n| {
+        matches!(
+            n.to_str(),
+            Some("slooper") | Some("slooper-bin") | Some("slooper.exe")
+        )
+    });
     if !real_app {
         return EditorProbe::Skip;
     }
@@ -5327,8 +5330,11 @@ mod tests {
     // parse code Windows ships — without touching the fork path (that
     // invariance is `w7_fork_path_untouched`).
 
-    const W7_ENV_KEYS: [&str; 3] =
-        ["SLOOPER_PROBE_EXE", "SLOOPER_PROBE_TIMEOUT_SECS", "SLOOPER_SCAN_INLINE"];
+    const W7_ENV_KEYS: [&str; 3] = [
+        "SLOOPER_PROBE_EXE",
+        "SLOOPER_PROBE_TIMEOUT_SECS",
+        "SLOOPER_SCAN_INLINE",
+    ];
 
     fn w7_save_env() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
         W7_ENV_KEYS
@@ -5521,9 +5527,8 @@ mod tests {
     /// and the interception runs before any audio backend can start.
     #[test]
     fn w7_fork_path_untouched() {
-        let src =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vsthost.rs"))
-                .expect("vsthost.rs readable from a test");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vsthost.rs"))
+            .expect("vsthost.rs readable from a test");
         let code: String = src
             .lines()
             .filter_map(|l| {
@@ -5572,16 +5577,18 @@ mod tests {
             "libc must never return to the windows twin"
         );
         // main.rs: interception exists and precedes the audio backend.
-        let main_src =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-                .expect("main.rs readable from a test");
+        let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("main.rs readable from a test");
         let hit = main_src
             .find("slooper_probe_invocation(")
             .expect("interception present");
         let backend = main_src
             .find("slooper::audio::Backend::start")
             .expect("backend start present");
-        assert!(hit < backend, "probe child must be intercepted before the backend");
+        assert!(
+            hit < backend,
+            "probe child must be intercepted before the backend"
+        );
         assert!(main_src.contains("vsthost::probe_child_main"));
     }
 
@@ -5600,7 +5607,11 @@ mod tests {
         let saved = w7_save_env();
         std::env::remove_var("SLOOPER_SCAN_INLINE");
         let helper = probe_child::probe_child_exe();
-        assert!(helper.is_file(), "probe helper missing: {}", helper.display());
+        assert!(
+            helper.is_file(),
+            "probe helper missing: {}",
+            helper.display()
+        );
         assert_ne!(
             helper,
             std::env::current_exe().unwrap(),

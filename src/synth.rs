@@ -827,7 +827,10 @@ mod tests {
             let mut out2 = vec![0.0f32; 4096];
             unsafe { inst.process_into(&mut out2, &p) };
             let tail = out2.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            assert!(tail < 1e-3, "{stem} all_off must stop new sound (tail {tail})");
+            assert!(
+                tail < 1e-3,
+                "{stem} all_off must stop new sound (tail {tail})"
+            );
             tested += 1;
         }
         assert!(tested >= 8, "expected 8 bundled synths, tested {tested}");

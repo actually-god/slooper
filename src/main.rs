@@ -163,9 +163,7 @@ fn gl_force_software(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
 /// exactly this shape, so a stray flag later in a normal command line
 /// can never turn the DAW into a probe child). `kind` is the strict
 /// `vsthost::kind_code` vocabulary: 0 = VST2, 1 = VST3, 2 = CLAP.
-fn slooper_probe_invocation(
-    argv: &[std::ffi::OsString],
-) -> Option<(u8, std::path::PathBuf)> {
+fn slooper_probe_invocation(argv: &[std::ffi::OsString]) -> Option<(u8, std::path::PathBuf)> {
     if argv.get(1)?.as_os_str() != std::ffi::OsStr::new(slooper::vsthost::PROBE_FLAG) {
         return None;
     }
@@ -215,7 +213,10 @@ mod tests {
 
     #[test]
     fn v41_force_x11_optes_back_in() {
-        assert!(x11_world_preferred(envof(&["WAYLAND_DISPLAY", "SLOOPER_FORCE_X11"])));
+        assert!(x11_world_preferred(envof(&[
+            "WAYLAND_DISPLAY",
+            "SLOOPER_FORCE_X11"
+        ])));
         // Legacy override still wins over FORCE_X11, as before.
         assert!(!x11_world_preferred(envof(&[
             "WAYLAND_DISPLAY",
@@ -250,7 +251,10 @@ mod tests {
         // Mesa CS-reject aborts the process (or hangs dri_flush = the
         // "freeze" reports). Bare session and Wayland session both → soft.
         assert!(gl_force_software(envv(&[])));
-        assert!(gl_force_software(envv(&[("WAYLAND_DISPLAY", "1"), ("DISPLAY", ":1")])));
+        assert!(gl_force_software(envv(&[
+            ("WAYLAND_DISPLAY", "1"),
+            ("DISPLAY", ":1")
+        ])));
     }
 
     #[test]
@@ -268,9 +272,15 @@ mod tests {
     fn v45_external_softgl_value_honored_verbatim() {
         // A launcher that already picked a side is respected as-is.
         assert!(gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "1")])));
-        assert!(gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "true")])));
+        assert!(gl_force_software(envv(&[(
+            "LIBGL_ALWAYS_SOFTWARE",
+            "true"
+        )])));
         assert!(!gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "0")])));
-        assert!(!gl_force_software(envv(&[("LIBGL_ALWAYS_SOFTWARE", "false")])));
+        assert!(!gl_force_software(envv(&[(
+            "LIBGL_ALWAYS_SOFTWARE",
+            "false"
+        )])));
     }
 
     #[test]
@@ -304,9 +314,15 @@ mod tests {
         // of half-starting a probe: missing parts, non-numeric kind, and
         // kinds outside the 0..=2 vocabulary.
         assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "0"])).is_none());
-        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "x", "/p"])).is_none());
-        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "3", "/p"])).is_none());
-        assert!(slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "256", "/p"])).is_none());
+        assert!(
+            slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "x", "/p"])).is_none()
+        );
+        assert!(
+            slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "3", "/p"])).is_none()
+        );
+        assert!(
+            slooper_probe_invocation(&argv(&["slooper", "--slooper-probe", "256", "/p"])).is_none()
+        );
     }
 
     #[test]

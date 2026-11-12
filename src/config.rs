@@ -929,7 +929,10 @@ mod tests {
         // existing config file on disk (missing key = today's behavior).
         assert!(!Config::default().win_editor_embed);
         let legacy: Config = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.win_editor_embed, "old configs parse with the flag off");
+        assert!(
+            !legacy.win_editor_embed,
+            "old configs parse with the flag off"
+        );
         let on: Config = serde_json::from_str(r#"{"win_editor_embed": true}"#).unwrap();
         assert!(on.win_editor_embed);
     }
@@ -952,7 +955,10 @@ mod tests {
             vec!["KeyStage 61".to_string(), "KeyStage 61 [2]".to_string()]
         );
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(back.win_midi_inputs, cfg.win_midi_inputs, "round-trips verbatim");
+        assert_eq!(
+            back.win_midi_inputs, cfg.win_midi_inputs,
+            "round-trips verbatim"
+        );
     }
 
     /// Restores `SLOOPER_CONFIG_DIR` and drops the sandbox even when an
@@ -992,7 +998,10 @@ mod tests {
             assert!(!path_is_foreign(r"C:\Users\studio\rack"));
             assert!(!path_is_foreign("C:/Users/studio/rack"));
             assert!(!path_is_foreign(r"\\srv\share\rack"), "UNC is native");
-            assert!(path_is_foreign("/home/studio/rack"), "Unix root = drive junk");
+            assert!(
+                path_is_foreign("/home/studio/rack"),
+                "Unix root = drive junk"
+            );
             assert!(path_is_foreign("  /tmp/x  "), "checked after trim");
         } else {
             assert!(!path_is_foreign("/home/studio/rack"));
@@ -1000,7 +1009,10 @@ mod tests {
             assert!(path_is_foreign(r"C:\Users\studio\rack"), "drive root");
             assert!(path_is_foreign("C:/Users/studio/rack"));
             assert!(path_is_foreign("C:"), "bare drive root");
-            assert!(path_is_foreign(r"\\srv\share\rack"), "UNC cannot exist here");
+            assert!(
+                path_is_foreign(r"\\srv\share\rack"),
+                "UNC cannot exist here"
+            );
         }
     }
 
@@ -1039,9 +1051,15 @@ mod tests {
         // consumer: prepare_effects_dir seeds bundled scripts into it.
         let _sb = ConfigSandbox::new("load");
         let (foreign, local) = if cfg!(windows) {
-            ("/home/studio/rack".to_string(), "C:\\Users\\studio\\rack".to_string())
+            (
+                "/home/studio/rack".to_string(),
+                "C:\\Users\\studio\\rack".to_string(),
+            )
         } else {
-            ("C:\\Users\\studio\\rack".to_string(), "/tmp/w12d-rack".to_string())
+            (
+                "C:\\Users\\studio\\rack".to_string(),
+                "/tmp/w12d-rack".to_string(),
+            )
         };
         let cfg0 = Config {
             project_dir: foreign.clone(),
@@ -1061,7 +1079,10 @@ mod tests {
         cfg0.save().unwrap();
         let cfg = Config::load();
         assert!(cfg.project_dir.is_empty(), "foreign project_dir dropped");
-        assert!(cfg.fx_dir.is_empty(), "fx_dir must NEVER seed into foreign here");
+        assert!(
+            cfg.fx_dir.is_empty(),
+            "fx_dir must NEVER seed into foreign here"
+        );
         assert_eq!(
             cfg.rack_folders,
             vec![local.clone(), "relative-pack".to_string()],
@@ -1076,9 +1097,7 @@ mod tests {
         // Inert view caches stay verbatim (their keys can never hit here,
         // and dropping them would break the round trip back).
         assert!(cfg.editor_probe.contains_key(&foreign));
-        assert!(cfg
-            .rack_collapsed
-            .contains(&format!("{foreign}\u{1}kit-a")));
+        assert!(cfg.rack_collapsed.contains(&format!("{foreign}\u{1}kit-a")));
         // Deterministic across loads (load does not half-persist shapes).
         let again = Config::load();
         assert_eq!(again.rack_folders, cfg.rack_folders);

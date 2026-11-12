@@ -39,7 +39,6 @@ use egui::{Color32, RichText, Sense, Slider};
 
 use crate::arrange::{Arrangement, Clip};
 use crate::assets::{Asset, RackFile, RackFolder};
-use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
     TR_REC,
@@ -50,6 +49,7 @@ use crate::midi::{hex, note_name, scale_axis, MidiAction, MidiBind, MidiMsg};
 use crate::midipat::{Pattern, PPQ};
 use crate::project::{self, ProjAsset, ProjClip, ProjMetro, ProjQuantize, ProjTrack, Project};
 use crate::quantize::{self, snap_start};
+use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::synth;
 
 /// Keys a user may plausibly bind to a shortcut.
@@ -2605,7 +2605,11 @@ impl App {
         // window, BOTH generations alike. The seam is ordered: the GUI
         // thread reads the parent inside `on_gui_thread`, which this
         // caller blocks on, so the wrap can only ever cover THIS open.
-        let parent = if self.embed_wanted() { self.embed_hwnd } else { None };
+        let parent = if self.embed_wanted() {
+            self.embed_hwnd
+        } else {
+            None
+        };
         if let Some(p) = parent {
             crate::vstedit::set_embed_parent(p);
         }
@@ -4201,32 +4205,49 @@ impl App {
                 for e in pat.ccs.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.ccs.push(Cc { at: s_tick(at - base as f64), ..*e });
+                        out.ccs.push(Cc {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
                 for e in pat.press.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.press.push(Press { at: s_tick(at - base as f64), ..*e });
+                        out.press.push(Press {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
                 for e in pat.bends.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.bends.push(Bend { at: s_tick(at - base as f64), ..*e });
+                        out.bends.push(Bend {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
                 for e in pat.polys.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.polys.push(Poly { at: s_tick(at - base as f64), ..*e });
+                        out.polys.push(Poly {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
             }
             out.sort();
             let id = self.assets.len() as u32;
-            self.assets
-                .push(Asset::midi(id, name, std::path::PathBuf::new(), Arc::new(out), true));
+            self.assets.push(Asset::midi(
+                id,
+                name,
+                std::path::PathBuf::new(),
+                Arc::new(out),
+                true,
+            ));
         } else {
             // Audio: sum the laid-out slices, clip gain + fades baked in
             // (exact same windows/fade law the mix render uses).
@@ -4271,7 +4292,8 @@ impl App {
         for (t, k, c) in ids.iter().rev() {
             self.arr.remove_clip(*t, *k, *c);
         }
-        self.arr.insert(ht, hk, crate::arrange::Clip::new(new_id, base));
+        self.arr
+            .insert(ht, hk, crate::arrange::Clip::new(new_id, base));
         let idx = self.arr.tracks[ht].lanes[hk]
             .clips
             .iter()
@@ -4768,10 +4790,9 @@ impl App {
         let rekey = |p: &str| -> Option<String> {
             if p == sp {
                 Some(nps.clone())
-            } else if let Some(t) = p.strip_prefix(&format!("{sp}{sep}")) {
-                Some(format!("{nps}{sep}{t}"))
             } else {
-                None
+                p.strip_prefix(&format!("{sp}{sep}"))
+                    .map(|t| format!("{nps}{sep}{t}"))
             }
         };
         for a in self.assets.iter_mut() {
@@ -4873,8 +4894,10 @@ impl App {
         if let Some(row) = self.rack_dir_order.iter_mut().find(|o| o.folder == folder) {
             row.dirs = dirs;
         } else {
-            self.rack_dir_order
-                .push(crate::config::RackDirOrder { folder: folder.to_string(), dirs });
+            self.rack_dir_order.push(crate::config::RackDirOrder {
+                folder: folder.to_string(),
+                dirs,
+            });
         }
     }
 
@@ -5039,7 +5062,7 @@ impl App {
                         .on_hover_text("linear pitch sweep across the clip (Ableton pitch envelope)");
                 });
                 ui.separator();
-                let mut fade_ui = |ui: &mut egui::Ui, label: &str, ms: &mut f32, c: &mut SeCurve| {
+                let fade_ui = |ui: &mut egui::Ui, label: &str, ms: &mut f32, c: &mut SeCurve| {
                     ui.horizontal(|ui| {
                         ui.label(label);
                         ui.add(
@@ -6528,9 +6551,7 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(&ctx, |ui| {
-            body_clipped(ui, |ui| self.drum_win_body(ui))
-        });
+        let resp = w.show(&ctx, |ui| body_clipped(ui, |ui| self.drum_win_body(ui)));
         self.show_drums = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
@@ -6567,9 +6588,7 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(&ctx, |ui| {
-            body_clipped(ui, |ui| self.master_out_body(ui))
-        });
+        let resp = w.show(&ctx, |ui| body_clipped(ui, |ui| self.master_out_body(ui)));
         self.show_master = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
@@ -7063,17 +7082,17 @@ impl App {
             }
             let resp = w.show(ui.ctx(), |ui| {
                 body_clipped(ui, |ui| {
-                self.auto_inner(
-                    ui,
-                    &mut ed,
-                    &targets,
-                    sr,
-                    bpm,
-                    beats,
-                    beat_s,
-                    bar_s,
-                    &mut action,
-                )
+                    self.auto_inner(
+                        ui,
+                        &mut ed,
+                        &targets,
+                        sr,
+                        bpm,
+                        beats,
+                        beat_s,
+                        bar_s,
+                        &mut action,
+                    )
                 });
             });
             if let Some(out) = resp.map(|r| r.response.rect) {
@@ -8005,13 +8024,7 @@ impl App {
             // v42/MPE: 14-bit bend stored as (LSB, MSB) in d1/d2.
             MidiMsg::PitchBend { channel, value } => {
                 let v = (value + 8192).clamp(0, 16383) as u16;
-                evs.push((
-                    at,
-                    5,
-                    channel,
-                    (v & 0x7F) as u8,
-                    ((v >> 7) & 0x7F) as u8,
-                ));
+                evs.push((at, 5, channel, (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8));
             }
             _ => return, // PC / sysex: not part of the pattern model
         }
@@ -8297,8 +8310,7 @@ impl App {
                 self.backend
                     .engine
                     .play_audition(crate::audio::AUD_PV, ev.into(), inst);
-                self.status =
-                    format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
+                self.status = format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
             }
         }
     }
@@ -8335,10 +8347,8 @@ impl App {
         if !fresh {
             if let Some((ptr, c)) = self.aud_copy.get(t).cloned().flatten() {
                 if ptr == Arc::as_ptr(&live) as usize {
-                    if let (
-                        crate::audio::SynthHandle::Vst(a),
-                        crate::audio::SynthHandle::Vst(b),
-                    ) = (live.as_ref(), c.as_ref())
+                    if let (crate::audio::SynthHandle::Vst(a), crate::audio::SynthHandle::Vst(b)) =
+                        (live.as_ref(), c.as_ref())
                     {
                         let ps = a.params();
                         for k in 0..ps.len() {
@@ -8849,21 +8859,21 @@ impl App {
             }
             resp = w.show(ui, |ui| {
                 body_clipped(ui, |ui| {
-                self.roll_inner(
-                    ui,
-                    &mut roll,
-                    sec_per_beat,
-                    step_sec,
-                    min_len_ticks,
-                    playhead,
-                    sr,
-                    &mut save,
-                    &mut clear,
-                    &mut preview,
-                    &mut stop_preview,
-                    &mut audition,
-                    &mut placed,
-                )
+                    self.roll_inner(
+                        ui,
+                        &mut roll,
+                        sec_per_beat,
+                        step_sec,
+                        min_len_ticks,
+                        playhead,
+                        sr,
+                        &mut save,
+                        &mut clear,
+                        &mut preview,
+                        &mut stop_preview,
+                        &mut audition,
+                        &mut placed,
+                    )
                 });
             });
             if let Some(out) = resp.as_ref().map(|r| r.response.rect) {
@@ -10324,123 +10334,123 @@ impl App {
             .max_height(pad_list_h)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-        for p in 0..kit.len() {
-                let rowr = ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut kit[p].name)
-                                .desired_width(56.0)
-                                .font(egui::TextStyle::Monospace),
-                        )
-                        .changed()
-                    {
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
-                        .on_hover_text("Audition this pad")
-                        .clicked()
-                    {
-                        let k = self
-                            .assets
-                            .iter()
-                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
-                        if let Some(k) = k {
-                            let v = kit[p].vel.max(1);
-                            self.audition_impulse(k, v);
+                for p in 0..kit.len() {
+                    let rowr = ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut kit[p].name)
+                                    .desired_width(56.0)
+                                    .font(egui::TextStyle::Monospace),
+                            )
+                            .changed()
+                        {
+                            kit_changed = true;
                         }
-                    }
-                    let cur_path = kit[p].asset_path.clone();
-                    let label = cur_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("(sound)")
-                        .trim_end_matches(".wav")
-                        .to_string();
-                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
-                        .selected_text(label)
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(cur_path.is_empty(), "(silent)")
-                                .clicked()
-                            {
-                                kit[p].asset_path.clear();
-                                kit[p].asset = None;
-                                kit_changed = true;
+                        if ui
+                            .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                            .on_hover_text("Audition this pad")
+                            .clicked()
+                        {
+                            let k = self
+                                .assets
+                                .iter()
+                                .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
+                            if let Some(k) = k {
+                                let v = kit[p].vel.max(1);
+                                self.audition_impulse(k, v);
                             }
-                            for (path, nm) in &audio_rows {
+                        }
+                        let cur_path = kit[p].asset_path.clone();
+                        let label = cur_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("(sound)")
+                            .trim_end_matches(".wav")
+                            .to_string();
+                        egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                            .selected_text(label)
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
                                 if ui
-                                    .selectable_label(&cur_path == path, nm.as_str())
+                                    .selectable_label(cur_path.is_empty(), "(silent)")
                                     .clicked()
                                 {
-                                    kit[p].asset_path = path.clone();
+                                    kit[p].asset_path.clear();
                                     kit[p].asset = None;
                                     kit_changed = true;
                                 }
-                            }
-                        });
-                    let before_v = kit[p].vel;
-                    let rv = ui
-                        .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
-                        .on_hover_text("Default paint velocity");
-                    if p_changed(&rv, before_v, &mut kit[p].vel) {
-                        kit_changed = true;
+                                for (path, nm) in &audio_rows {
+                                    if ui
+                                        .selectable_label(&cur_path == path, nm.as_str())
+                                        .clicked()
+                                    {
+                                        kit[p].asset_path = path.clone();
+                                        kit[p].asset = None;
+                                        kit_changed = true;
+                                    }
+                                }
+                            });
+                        let before_v = kit[p].vel;
+                        let rv = ui
+                            .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
+                            .on_hover_text("Default paint velocity");
+                        if p_changed(&rv, before_v, &mut kit[p].vel) {
+                            kit_changed = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
+                                    .min_size(egui::vec2(16.0, 18.0)),
+                            )
+                            .on_hover_text("Mute pad")
+                            .clicked()
+                        {
+                            kit[p].muted = !kit[p].muted;
+                            kit_changed = true;
+                        }
+                        if ui
+                            .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                            .on_hover_text("Remove this pad")
+                            .clicked()
+                            && kit.len() > 1
+                        {
+                            remove_pad = Some(p);
+                        }
+                    });
+                    // v34 R5: every pad row is a drop target. IN-APP drags
+                    // (rack rows carry the asset-index payload) land here
+                    // directly; OS files are hit-tested centrally against
+                    // the rect registered just below.
+                    self.kit_drop_rects.push((t, p, rowr.response.rect));
+                    let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                        || ui.input(|i| !i.raw.hovered_files.is_empty());
+                    if armed {
+                        ui.painter().rect_stroke(
+                            rowr.response.rect,
+                            3.0,
+                            egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                            egui::StrokeKind::Inside,
+                        );
                     }
-                    if ui
-                        .add(
-                            egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                                .min_size(egui::vec2(16.0, 18.0)),
-                        )
-                        .on_hover_text("Mute pad")
-                        .clicked()
+                    if let Some(a) = rowr
+                        .response
+                        .interact(egui::Sense::hover())
+                        .dnd_release_payload::<usize>()
+                        .map(|a| *a)
                     {
-                        kit[p].muted = !kit[p].muted;
-                        kit_changed = true;
+                        if let Some(path) = self
+                            .assets
+                            .get(a)
+                            .map(|as_| as_.path.to_string_lossy().into_owned())
+                        {
+                            kit[p].asset_path = path;
+                            kit[p].asset = None;
+                            kit_changed = true;
+                            self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
+                        }
                     }
-                    if ui
-                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
-                        .on_hover_text("Remove this pad")
-                        .clicked()
-                        && kit.len() > 1
-                    {
-                        remove_pad = Some(p);
-                    }
-                });
-                // v34 R5: every pad row is a drop target. IN-APP drags
-                // (rack rows carry the asset-index payload) land here
-                // directly; OS files are hit-tested centrally against
-                // the rect registered just below.
-                self.kit_drop_rects.push((t, p, rowr.response.rect));
-                let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
-                    || ui.input(|i| !i.raw.hovered_files.is_empty());
-                if armed {
-                    ui.painter().rect_stroke(
-                        rowr.response.rect,
-                        3.0,
-                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
-                        egui::StrokeKind::Inside,
-                    );
                 }
-                if let Some(a) = rowr
-                    .response
-                    .interact(egui::Sense::hover())
-                    .dnd_release_payload::<usize>()
-                    .map(|a| *a)
-                {
-                    if let Some(path) = self
-                        .assets
-                        .get(a)
-                        .map(|as_| as_.path.to_string_lossy().into_owned())
-                    {
-                        kit[p].asset_path = path;
-                        kit[p].asset = None;
-                        kit_changed = true;
-                        self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
-                    }
-                }
-            }
-        });
+            });
         ui.horizontal(|ui| {
             let full = kit.len() >= DRUM_MAX_PADS;
             if ui
@@ -10733,7 +10743,9 @@ impl App {
         type EditorRow = (DynKind, String, u64, (i32, i32), bool);
         let mut editors: Vec<EditorRow> = Vec::new();
         for t in self.vst_editors.keys().copied().collect::<Vec<_>>() {
-            let Some(w) = self.vst_editors.get(&t) else { continue };
+            let Some(w) = self.vst_editors.get(&t) else {
+                continue;
+            };
             let stem = std::path::Path::new(w.path())
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -10747,7 +10759,9 @@ impl App {
             ));
         }
         for k in self.fx_vst_editors.keys().copied().collect::<Vec<_>>() {
-            let Some(w) = self.fx_vst_editors.get(&k) else { continue };
+            let Some(w) = self.fx_vst_editors.get(&k) else {
+                continue;
+            };
             let stem = std::path::Path::new(w.path())
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -10774,7 +10788,8 @@ impl App {
             self.embed_chrome(ctx, idx, kind, xid, size, painted);
         }
         self.chrome_closing.retain(|x| self.embed_live.contains(x));
-        self.embed_sync.retain(|xid, _| self.embed_live.contains(xid));
+        self.embed_sync
+            .retain(|xid, _| self.embed_live.contains(xid));
     }
 
     /// Floating chrome of ONE embedded editor — the owner-drawn float of
@@ -10801,7 +10816,10 @@ impl App {
             .constrain(false)
             .fade_in(false);
         if let Some(r) = self.dyn_rect(idx) {
-            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            w = w
+                .default_pos([r[0], r[1]])
+                .default_width(r[2])
+                .default_height(r[3]);
         } else {
             // No remembered float rect yet: open just big enough to hold
             // the plugin's own area (chrome borders included). W12c: the
@@ -10879,9 +10897,14 @@ impl App {
         let (sw, sh) = crate::vstedit::editor_slot_points(size, ui.ctx().pixels_per_point());
         let want = egui::vec2(sw, sh);
         let rect = ui.allocate_at_least(want, egui::Sense::hover()).1.rect;
-        let slot = if offered.is_finite() { rect.intersect(offered) } else { rect };
+        let slot = if offered.is_finite() {
+            rect.intersect(offered)
+        } else {
+            rect
+        };
         if xid != 0 && slot.width() > 4.0 && slot.height() > 4.0 {
-            self.embed_slot.insert(xid, [slot.min.x, slot.min.y, slot.width(), slot.height()]);
+            self.embed_slot
+                .insert(xid, [slot.min.x, slot.min.y, slot.width(), slot.height()]);
         }
     }
 
@@ -11227,7 +11250,10 @@ impl App {
             None => return,
         };
         if !src.audio && !src.preview && !src.loop_rec && !src.midi && !src.auto {
-            self.status = format!("track {}: tick a source (aud / prev / loop / mid / auto) first", i + 1);
+            self.status = format!(
+                "track {}: tick a source (aud / prev / loop / mid / auto) first",
+                i + 1
+            );
             return;
         }
         // v42 "p": the preview take rides the SAME take buffer as the audio
@@ -11245,8 +11271,7 @@ impl App {
             self.backend.engine.set_rec_loop(i, src.loop_rec);
             self.toggle_record(i);
             if src.loop_rec && !self.backend.engine.loop_tl() {
-                self.status =
-                    format!("track {}: loop record needs the LOOP button on", i + 1);
+                self.status = format!("track {}: loop record needs the LOOP button on", i + 1);
             }
         }
         if src.midi {
@@ -11315,7 +11340,11 @@ impl App {
         self.status = format!(
             "track {}: {} · clip in lane {}",
             track + 1,
-            if preview { "preview bounced" } else { "recorded" },
+            if preview {
+                "preview bounced"
+            } else {
+                "recorded"
+            },
             lane + 1
         );
     }
@@ -11347,7 +11376,10 @@ impl App {
         let pat_b = b.pattern.clone();
         let data_a = a.data.clone();
         let data_b = b.data.clone();
-        let merged_pat = pat_a.as_ref().zip(pat_b.as_ref()).map(|(pa, pb)| pa.merged_with(pb));
+        let merged_pat = pat_a
+            .as_ref()
+            .zip(pat_b.as_ref())
+            .map(|(pa, pb)| pa.merged_with(pb));
         if let Some(merged) = merged_pat {
             if dir.as_os_str().is_empty() {
                 self.status = "merge: set a rack folder first".into();
@@ -11382,7 +11414,8 @@ impl App {
                 f.rescan();
             }
             self.push_project();
-            self.status = format!("merged MIDI \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
+            self.status =
+                format!("merged MIDI \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
         } else if pat_a.is_none() && pat_b.is_none() {
             let mixed: Arc<[f32]> =
                 Arc::from(crate::assets::mix_audio(&data_a, &data_b).into_boxed_slice());
@@ -11430,7 +11463,8 @@ impl App {
                 f.rescan();
             }
             self.push_project();
-            self.status = format!("merged audio \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
+            self.status =
+                format!("merged audio \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
         } else {
             self.status = "merge: same kind only (audio+audio or MIDI+MIDI)".into();
         }
@@ -12258,7 +12292,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
-                ui.label(format!("\u{201c}{name}\u{201d} \u{2014} what should be imported?"));
+                ui.label(format!(
+                    "\u{201c}{name}\u{201d} \u{2014} what should be imported?"
+                ));
                 ui.label(
                     egui::RichText::new(
                         "Tracks, clips and assets always load \u{2014} these are the setup slices.",
@@ -12268,7 +12304,10 @@ impl App {
                 );
                 ui.separator();
                 ui.checkbox(&mut sel.instruments, "Main instruments (track synths)");
-                ui.checkbox(&mut sel.synth_setup, "Synth setup (patches + slider values)");
+                ui.checkbox(
+                    &mut sel.synth_setup,
+                    "Synth setup (patches + slider values)",
+                );
                 ui.checkbox(&mut sel.bindings, "MIDI bindings");
                 if nbind > 0 {
                     ui.label(
@@ -12551,8 +12590,7 @@ impl App {
                 // W9: the same for the WinMM MIDI selection (no-op on
                 // Linux — the JACK backend ignores SetMidiInputs).
                 if cfg!(windows) && !self.win_midi.is_empty() {
-                    self.backend
-                        .cmd(Cmd::SetMidiInputs(self.win_midi.clone()));
+                    self.backend.cmd(Cmd::SetMidiInputs(self.win_midi.clone()));
                 }
                 self.push_project();
             }
@@ -12927,8 +12965,7 @@ impl eframe::App for App {
                 eng.stop_preview();
             }
             self.preview_playing = None;
-        } else if eng.transport_on() && !eng.preview_active() && self.preview_playing.is_some()
-        {
+        } else if eng.transport_on() && !eng.preview_active() && self.preview_playing.is_some() {
             // Transport start kills previews engine-side (manager drain) —
             // keep the rack highlight honest with it.
             self.preview_playing = None;
@@ -12990,7 +13027,12 @@ impl eframe::App for App {
         let mut dead: Vec<String> = Vec::new();
         for rows in &self.fx_rows {
             for row in rows.iter() {
-                if let ChainRow::Vst { name, entry: Some(e), .. } = row {
+                if let ChainRow::Vst {
+                    name,
+                    entry: Some(e),
+                    ..
+                } = row
+                {
                     if e.is_dead() {
                         dead.push(name.clone());
                     }
@@ -13876,384 +13918,385 @@ impl App {
 }
 
 fn top_bar(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::top("topbar").exact_size(TOPBAR_H).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            // Hamburger (settings) button: three horizontal bars.
-            let size = egui::vec2(26.0, 18.0);
-            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-            if rect.width() > 4.0 && rect.height() > 4.0 {
-                let p = ui.painter();
-                for k in 0..3u32 {
-                    let y = rect.min.y + 4.0 + k as f32 * 5.0;
-                    p.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.min.x + 3.0, y),
-                            egui::vec2(20.0, 2.0),
-                        ),
-                        1.0,
-                        if app.show_settings {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(200, 200, 205)
-                        },
-                    );
+    egui::Panel::top("topbar")
+        .exact_size(TOPBAR_H)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Hamburger (settings) button: three horizontal bars.
+                let size = egui::vec2(26.0, 18.0);
+                let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                if rect.width() > 4.0 && rect.height() > 4.0 {
+                    let p = ui.painter();
+                    for k in 0..3u32 {
+                        let y = rect.min.y + 4.0 + k as f32 * 5.0;
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x + 3.0, y),
+                                egui::vec2(20.0, 2.0),
+                            ),
+                            1.0,
+                            if app.show_settings {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(200, 200, 205)
+                            },
+                        );
+                    }
                 }
-            }
-            if resp.on_hover_text("Settings").clicked() {
-                app.show_settings = !app.show_settings;
-            }
+                if resp.on_hover_text("Settings").clicked() {
+                    app.show_settings = !app.show_settings;
+                }
 
-            ui.separator();
-            let title = match &app.proj_name {
-                n if n.is_empty() => "slooper · untitled".to_string(),
-                n => format!("slooper · {n}"),
-            };
-            ui.heading(RichText::new(title).strong());
-            // v25: status display rules —
-            //  * fresh message: exactly as written;
-            //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
-            //    dims continuously, and once it is older than 12 s it is
-            //    replaced by a LIVE idle summary (the engine state right
-            //    now); the full text survives in the hover tooltip. A
-            //    "project saved"-type notice therefore always leaves the
-            //    bar on its own instead of posing as current state (the
-            //    old ladder kept the raw text fully lit for a full
-            //    minute, then carried it for TEN minutes behind a "· Nm
-            //    ago" suffix).
-            let age_s = app.status_at.elapsed().as_secs_f64();
-            let idle = match &app.client_name {
-                Some(_) => format!("{} Hz · ready", app.sample_rate),
-                None => "audio engine: offline".to_string(),
-            };
-            const NOTICE_FADE_SECS: f64 = 12.0;
-            let fade = if age_s <= 6.0 {
-                1.0f32
-            } else {
-                (1.0 - ((age_s - 6.0) / (NOTICE_FADE_SECS - 6.0)) as f32 * 0.85).clamp(0.15, 1.0)
-            };
-            let (body, tip) = if age_s > NOTICE_FADE_SECS {
-                (
-                    idle,
-                    format!("last message {}s ago: {}", age_s as u64, app.status),
+                ui.separator();
+                let title = match &app.proj_name {
+                    n if n.is_empty() => "slooper · untitled".to_string(),
+                    n => format!("slooper · {n}"),
+                };
+                ui.heading(RichText::new(title).strong());
+                // v25: status display rules —
+                //  * fresh message: exactly as written;
+                //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
+                //    dims continuously, and once it is older than 12 s it is
+                //    replaced by a LIVE idle summary (the engine state right
+                //    now); the full text survives in the hover tooltip. A
+                //    "project saved"-type notice therefore always leaves the
+                //    bar on its own instead of posing as current state (the
+                //    old ladder kept the raw text fully lit for a full
+                //    minute, then carried it for TEN minutes behind a "· Nm
+                //    ago" suffix).
+                let age_s = app.status_at.elapsed().as_secs_f64();
+                let idle = match &app.client_name {
+                    Some(_) => format!("{} Hz · ready", app.sample_rate),
+                    None => "audio engine: offline".to_string(),
+                };
+                const NOTICE_FADE_SECS: f64 = 12.0;
+                let fade = if age_s <= 6.0 {
+                    1.0f32
+                } else {
+                    (1.0 - ((age_s - 6.0) / (NOTICE_FADE_SECS - 6.0)) as f32 * 0.85)
+                        .clamp(0.15, 1.0)
+                };
+                let (body, tip) = if age_s > NOTICE_FADE_SECS {
+                    (
+                        idle,
+                        format!("last message {}s ago: {}", age_s as u64, app.status),
+                    )
+                } else {
+                    (app.status.clone(), app.status.clone())
+                };
+                let status = match &app.client_name {
+                    Some(_) if age_s > NOTICE_FADE_SECS => body,
+                    Some(_) => format!("{} Hz · {}", app.sample_rate, body),
+                    None => body,
+                };
+                // v18: the status lives in a FIXED-WIDTH, truncating field. It
+                // used to be a bare label in the middle of the bar, so every
+                // longer message (e.g. after creating an automation asset)
+                // shoved the transport, tempo box and everything else rightward
+                // by hundreds of pixels — mid-session the widgets you had just
+                // right-clicked literally moved out from under the cursor, and
+                // on a narrow window they vanished off-screen entirely.
+                let weak_c = ui.visuals().weak_text_color();
+                ui.add_sized(
+                    egui::vec2(300.0, 18.0),
+                    egui::Label::new(RichText::new(status).color(weak_c.linear_multiply(fade)))
+                        .truncate(),
                 )
-            } else {
-                (app.status.clone(), app.status.clone())
-            };
-            let status = match &app.client_name {
-                Some(_) if age_s > NOTICE_FADE_SECS => body,
-                Some(_) => format!("{} Hz · {}", app.sample_rate, body),
-                None => body,
-            };
-            // v18: the status lives in a FIXED-WIDTH, truncating field. It
-            // used to be a bare label in the middle of the bar, so every
-            // longer message (e.g. after creating an automation asset)
-            // shoved the transport, tempo box and everything else rightward
-            // by hundreds of pixels — mid-session the widgets you had just
-            // right-clicked literally moved out from under the cursor, and
-            // on a narrow window they vanished off-screen entirely.
-            let weak_c = ui.visuals().weak_text_color();
-            ui.add_sized(
-                egui::vec2(300.0, 18.0),
-                egui::Label::new(RichText::new(status).color(weak_c.linear_multiply(fade)))
-                    .truncate(),
-            )
-            .on_hover_text(tip);
-            if age_s <= NOTICE_FADE_SECS {
-                if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
-                    // v25: zero is shown by the idle summary instead — after
-                    // "Stop" the bar reads honestly, not "applied: 0 in / 0
-                    // out"; and once the notice behind it has aged out, the
-                    // suffix goes with it.
-                    ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
+                .on_hover_text(tip);
+                if age_s <= NOTICE_FADE_SECS {
+                    if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
+                        // v25: zero is shown by the idle summary instead — after
+                        // "Stop" the bar reads honestly, not "applied: 0 in / 0
+                        // out"; and once the notice behind it has aged out, the
+                        // suffix goes with it.
+                        ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
+                    }
                 }
-            }
-            let xruns = app.backend.xruns.load(Ordering::Relaxed);
-            if xruns > 0 {
-                ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
-            }
+                let xruns = app.backend.xruns.load(Ordering::Relaxed);
+                if xruns > 0 {
+                    ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
+                }
 
-            // ---- transport ----
-            ui.separator();
-            let on = app.backend.engine.transport_on();
-            let play = if on { "STOP" } else { "PLAY" };
-            let play_btn = ui.button(RichText::new(play).strong()).on_hover_text(
-                "Global transport (Space): all sounding tracks play together \
+                // ---- transport ----
+                ui.separator();
+                let on = app.backend.engine.transport_on();
+                let play = if on { "STOP" } else { "PLAY" };
+                let play_btn = ui.button(RichText::new(play).strong()).on_hover_text(
+                    "Global transport (Space): all sounding tracks play together \
                  from the playhead. Stop holds the position.",
-            );
-            if play_btn.clicked() {
-                app.backend
-                    .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
-            }
-            ui.label(RichText::new(pos_label(app)).monospace());
-
-            // ---- metronome / grid tempo ----
-            ui.separator();
-            // Start/stop button (was a checkbox): lights up while the
-            // click runs, like the transport button next to it.
-            let metro_btn = ui
-                .add_sized(
-                    [58.0, 20.0],
-                    egui::Button::selectable(
-                        app.metro_on,
-                        RichText::new(if app.metro_on { "STOP" } else { "METRO" })
-                            .strong()
-                            .small(),
-                    ),
-                )
-                .on_hover_text(
-                    "Metronome start/stop: ticks the grid at the playhead \
-                     without moving it (never recorded). M also toggles it.",
                 );
-            if metro_btn.clicked() {
-                app.metro_on = !app.metro_on;
-                app.send_metro();
-            }
-            ui.label("bpm");
-            // Bound straight to the app state: the old pattern of cloning
-            // into a local EVERY FRAME wiped each keystroke before it could
-            // land, so the box could never be edited (it snapped back to
-            // the saved value). Commit to the engine on Enter / focus-out.
-            let bpm_rt = ui
-                .add(
-                    egui::TextEdit::singleline(&mut app.metro_bpm)
-                        .desired_width(38.0)
-                        .horizontal_align(egui::Align::Center)
-                        .font(egui::TextStyle::Monospace),
-                )
-                .on_hover_text(
-                    "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
-                );
-            app.bpm_rect = Some(bpm_rt.rect);
-            if bpm_rt.lost_focus() {
-                app.send_metro();
-            }
-            ui.label("beat");
-            let num_rt = ui
-                .add(
-                    egui::TextEdit::singleline(&mut app.metro_num)
-                        .desired_width(24.0)
-                        .horizontal_align(egui::Align::Center)
-                        .font(egui::TextStyle::Monospace),
-                )
-                .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
-            if num_rt.lost_focus() {
-                app.send_metro();
-            }
-
-            // File actions; the master volume + peak meter moved to the top
-            // of the mixer dock (`master_strip`).
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Export").clicked() {
-                    app.show_export = true;
+                if play_btn.clicked() {
+                    app.backend
+                        .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
                 }
-                if ui
-                    .button("Meter")
+                ui.label(RichText::new(pos_label(app)).monospace());
+
+                // ---- metronome / grid tempo ----
+                ui.separator();
+                // Start/stop button (was a checkbox): lights up while the
+                // click runs, like the transport button next to it.
+                let metro_btn = ui
+                    .add_sized(
+                        [58.0, 20.0],
+                        egui::Button::selectable(
+                            app.metro_on,
+                            RichText::new(if app.metro_on { "STOP" } else { "METRO" })
+                                .strong()
+                                .small(),
+                        ),
+                    )
                     .on_hover_text(
-                        "MASTER OUT panel: stereo meters + live LUFS \
+                        "Metronome start/stop: ticks the grid at the playhead \
+                     without moving it (never recorded). M also toggles it.",
+                    );
+                if metro_btn.clicked() {
+                    app.metro_on = !app.metro_on;
+                    app.send_metro();
+                }
+                ui.label("bpm");
+                // Bound straight to the app state: the old pattern of cloning
+                // into a local EVERY FRAME wiped each keystroke before it could
+                // land, so the box could never be edited (it snapped back to
+                // the saved value). Commit to the engine on Enter / focus-out.
+                let bpm_rt = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.metro_bpm)
+                            .desired_width(38.0)
+                            .horizontal_align(egui::Align::Center)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .on_hover_text(
+                        "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
+                    );
+                app.bpm_rect = Some(bpm_rt.rect);
+                if bpm_rt.lost_focus() {
+                    app.send_metro();
+                }
+                ui.label("beat");
+                let num_rt = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.metro_num)
+                            .desired_width(24.0)
+                            .horizontal_align(egui::Align::Center)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
+                if num_rt.lost_focus() {
+                    app.send_metro();
+                }
+
+                // File actions; the master volume + peak meter moved to the top
+                // of the mixer dock (`master_strip`).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Export").clicked() {
+                        app.show_export = true;
+                    }
+                    if ui
+                        .button("Meter")
+                        .on_hover_text(
+                            "MASTER OUT panel: stereo meters + live LUFS \
                          (momentary/short-term/integrated + LRA) + spectrum \
                          viewer for the master output. Docks next to the mixer.",
-                    )
-                    .clicked()
-                {
-                    app.show_master = !app.show_master;
-                }
-                if ui
-                    .button("Drums")
-                    .on_hover_text(
-                        "Drum machine / pattern builder (FL-FPC style): pads = \
-                         impulse sounds, grid = velocity per step. Commit \
-                         stamps the pattern into the arrangement.",
-                    )
-                    .clicked()
-                {
-                    app.show_drums = !app.show_drums;
-                }
-                // v43 R4: the window navigation hub. Everything the GUI
-                // shows is listed here with a live checkmark, plus the
-                // layout actions — no more hunting through Settings to
-                // find where a window went (Septabee/Ableton keep one
-                // View/Window menu for exactly this reason).
-                let wresp = ui
-                    .button("Windows")
-                    .on_hover_text("Show / hide / re-dock any window; layout actions.");
-                // v47: CloseOnClickOutside, NOT the menu default — the
-                // layout-name box is a TextEdit, and CloseOnClick would
-                // kill the popup the instant it is focused. Action buttons
-                // close themselves via ui.close(); checkboxes stay usable
-                // so two windows can be toggled in one visit.
-                egui::Popup::menu(&wresp)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                    // v47 R3: the palette is the keyboard path to
-                    // everything in this menu (and every settings
-                    // category) — offer it right where people look.
-                    if ui
-                        .button("search commands (Ctrl+K)\u{2026}")
-                        .on_hover_text(
-                            "one box: windows, layouts, settings categories.",
                         )
                         .clicked()
                     {
-                        app.palette = Some((String::new(), 0));
-                        app.palette_armed = false;
-                        ui.close();
+                        app.show_master = !app.show_master;
                     }
                     if ui
-                        .checkbox(&mut app.show_rack, "asset rack")
-                        .on_hover_text("The asset browser / import panel.")
-                        .changed()
+                        .button("Drums")
+                        .on_hover_text(
+                            "Drum machine / pattern builder (FL-FPC style): pads = \
+                         impulse sounds, grid = velocity per step. Commit \
+                         stamps the pattern into the arrangement.",
+                        )
+                        .clicked()
                     {
-                        app.save_config();
+                        app.show_drums = !app.show_drums;
                     }
-                    if ui
-                        .checkbox(&mut app.show_mixer, "mixer dock")
-                        .on_hover_text("Per-track mixer strips (grid-aligned).")
-                        .changed()
-                    {
-                        app.save_config();
-                    }
-                    if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
-                        app.save_config();
-                    }
-                    if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
-                        app.save_config();
-                    }
-                    if ui
-                        .checkbox(&mut app.show_master, "master out")
-                        .on_hover_text("Master meters + LUFS + spectrum panel.")
-                        .changed()
-                    {
-                        app.save_config();
-                    }
-                    if ui
-                        .checkbox(&mut app.show_drums, "drum machine")
-                        .on_hover_text("Pattern builder (FL-FPC style pads + grid).")
-                        .changed()
-                    {
-                        app.save_config();
-                    }
-                    // v47 R3 C4: the OPEN-WINDOWS roster — every dynamic
-                    // window (plugin params, FX editor, chain, synth,
-                    // roll, automation, …) shows here with a live tick,
-                    // so a window that wandered off is findable by name.
-                    if win_count(app) > 4 {
-                        ui.separator();
-                        for i in 4..win_count(app) {
-                            let mut v = win_visible(app, i);
-                            let t = win_title(app, i);
-                            let cb = ui.checkbox(&mut v, t).on_hover_text(
-                                "uncheck to close it; re-check re-opens the \
-                                 generic windows (plugin editors reopen via \
-                                 their own command)",
-                            );
-                            if cb.changed() {
-                                set_visible(app, i, v);
-                                app.save_config();
-                            }
-                        }
-                    }
-                    ui.separator();
-                    // v47 R2: layout templates — capture this exact view,
-                    // switch back with one click (Ableton view templates).
-                    ui.label(RichText::new("layout templates").weak());
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut app.layout_name)
-                                .hint_text("new layout name\u{2026}")
-                                .desired_width(150.0),
-                        );
-                        if ui
-                            .button("capture")
-                            .on_hover_text(
-                                "Save every window's placement, size, tab \
-                                 group and visibility under this name.",
-                            )
-                            .clicked()
-                        {
-                            let name = if app.layout_name.trim().is_empty() {
-                                format!("layout {}", app.win_layouts.len() + 1)
-                            } else {
-                                app.layout_name.clone()
-                            };
-                            capture_win_layout(app, name);
-                            app.layout_name.clear();
-                            ui.close();
-                        }
-                    });
-                    for n in 0..app.win_layouts.len() {
-                        let name = app.win_layouts[n].name.clone();
-                        ui.horizontal(|ui| {
+                    // v43 R4: the window navigation hub. Everything the GUI
+                    // shows is listed here with a live checkmark, plus the
+                    // layout actions — no more hunting through Settings to
+                    // find where a window went (Septabee/Ableton keep one
+                    // View/Window menu for exactly this reason).
+                    let wresp = ui
+                        .button("Windows")
+                        .on_hover_text("Show / hide / re-dock any window; layout actions.");
+                    // v47: CloseOnClickOutside, NOT the menu default — the
+                    // layout-name box is a TextEdit, and CloseOnClick would
+                    // kill the popup the instant it is focused. Action buttons
+                    // close themselves via ui.close(); checkboxes stay usable
+                    // so two windows can be toggled in one visit.
+                    egui::Popup::menu(&wresp)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            // v47 R3: the palette is the keyboard path to
+                            // everything in this menu (and every settings
+                            // category) — offer it right where people look.
                             if ui
-                                .button(&name)
-                                .on_hover_text("Apply this layout now")
+                                .button("search commands (Ctrl+K)\u{2026}")
+                                .on_hover_text("one box: windows, layouts, settings categories.")
                                 .clicked()
                             {
-                                apply_win_layout(app, &name);
+                                app.palette = Some((String::new(), 0));
+                                app.palette_armed = false;
                                 ui.close();
                             }
                             if ui
-                                .small_button("x")
-                                .on_hover_text("Delete this layout")
-                                .clicked()
+                                .checkbox(&mut app.show_rack, "asset rack")
+                                .on_hover_text("The asset browser / import panel.")
+                                .changed()
                             {
-                                app.win_layouts.remove(n);
                                 app.save_config();
                             }
-                        });
-                    }
-                    ui.separator();
-                    if ui
-                        .button("dock all windows")
-                        .on_hover_text("Snap every visible window back into dock slots.")
-                        .clicked()
-                    {
-                        dock_all_windows(app);
-                        ui.close();
-                    }
-                    if ui
-                        .button("float all windows")
-                        .on_hover_text("Undock every window into free windows.")
-                        .clicked()
-                    {
-                        float_all_windows(app);
-                        ui.close();
-                    }
-                    if ui
-                        .button("reset window layout")
-                        .on_hover_text(
-                            "Restore the stock arrangement: slots, sizes and \
+                            if ui
+                                .checkbox(&mut app.show_mixer, "mixer dock")
+                                .on_hover_text("Per-track mixer strips (grid-aligned).")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
+                                app.save_config();
+                            }
+                            if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
+                                app.save_config();
+                            }
+                            if ui
+                                .checkbox(&mut app.show_master, "master out")
+                                .on_hover_text("Master meters + LUFS + spectrum panel.")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            if ui
+                                .checkbox(&mut app.show_drums, "drum machine")
+                                .on_hover_text("Pattern builder (FL-FPC style pads + grid).")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            // v47 R3 C4: the OPEN-WINDOWS roster — every dynamic
+                            // window (plugin params, FX editor, chain, synth,
+                            // roll, automation, …) shows here with a live tick,
+                            // so a window that wandered off is findable by name.
+                            if win_count(app) > 4 {
+                                ui.separator();
+                                for i in 4..win_count(app) {
+                                    let mut v = win_visible(app, i);
+                                    let t = win_title(app, i);
+                                    let cb = ui.checkbox(&mut v, t).on_hover_text(
+                                        "uncheck to close it; re-check re-opens the \
+                                 generic windows (plugin editors reopen via \
+                                 their own command)",
+                                    );
+                                    if cb.changed() {
+                                        set_visible(app, i, v);
+                                        app.save_config();
+                                    }
+                                }
+                            }
+                            ui.separator();
+                            // v47 R2: layout templates — capture this exact view,
+                            // switch back with one click (Ableton view templates).
+                            ui.label(RichText::new("layout templates").weak());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut app.layout_name)
+                                        .hint_text("new layout name\u{2026}")
+                                        .desired_width(150.0),
+                                );
+                                if ui
+                                    .button("capture")
+                                    .on_hover_text(
+                                        "Save every window's placement, size, tab \
+                                 group and visibility under this name.",
+                                    )
+                                    .clicked()
+                                {
+                                    let name = if app.layout_name.trim().is_empty() {
+                                        format!("layout {}", app.win_layouts.len() + 1)
+                                    } else {
+                                        app.layout_name.clone()
+                                    };
+                                    capture_win_layout(app, name);
+                                    app.layout_name.clear();
+                                    ui.close();
+                                }
+                            });
+                            for n in 0..app.win_layouts.len() {
+                                let name = app.win_layouts[n].name.clone();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(&name)
+                                        .on_hover_text("Apply this layout now")
+                                        .clicked()
+                                    {
+                                        apply_win_layout(app, &name);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .small_button("x")
+                                        .on_hover_text("Delete this layout")
+                                        .clicked()
+                                    {
+                                        app.win_layouts.remove(n);
+                                        app.save_config();
+                                    }
+                                });
+                            }
+                            ui.separator();
+                            if ui
+                                .button("dock all windows")
+                                .on_hover_text("Snap every visible window back into dock slots.")
+                                .clicked()
+                            {
+                                dock_all_windows(app);
+                                ui.close();
+                            }
+                            if ui
+                                .button("float all windows")
+                                .on_hover_text("Undock every window into free windows.")
+                                .clicked()
+                            {
+                                float_all_windows(app);
+                                ui.close();
+                            }
+                            if ui
+                                .button("reset window layout")
+                                .on_hover_text(
+                                    "Restore the stock arrangement: slots, sizes and \
                              un-collapsed headers — as after a fresh install.",
-                        )
+                                )
+                                .clicked()
+                            {
+                                reset_window_layout(app);
+                                ui.close();
+                            }
+                        });
+                    if ui
+                        .button("Load")
+                        .on_hover_text("Browse saved projects")
                         .clicked()
                     {
-                        reset_window_layout(app);
-                        ui.close();
+                        app.show_load = true;
+                    }
+                    if ui
+                        .button("Save as")
+                        .on_hover_text("Save under a new name")
+                        .clicked()
+                    {
+                        app.request_save(true);
+                    }
+                    let save_tip = match &app.proj_name {
+                        n if n.is_empty() => "Save — asks for a project name (Ctrl+S)".to_string(),
+                        n => format!("Save “{n}” (Ctrl+S)"),
+                    };
+                    if ui.button("Save").on_hover_text(save_tip).clicked() {
+                        app.request_save(false);
                     }
                 });
-                if ui
-                    .button("Load")
-                    .on_hover_text("Browse saved projects")
-                    .clicked()
-                {
-                    app.show_load = true;
-                }
-                if ui
-                    .button("Save as")
-                    .on_hover_text("Save under a new name")
-                    .clicked()
-                {
-                    app.request_save(true);
-                }
-                let save_tip = match &app.proj_name {
-                    n if n.is_empty() => "Save — asks for a project name (Ctrl+S)".to_string(),
-                    n => format!("Save “{n}” (Ctrl+S)"),
-                };
-                if ui.button("Save").on_hover_text(save_tip).clicked() {
-                    app.request_save(false);
-                }
             });
         });
-    });
 }
 
 /// Playhead position as `bar.beat` + `m:ss.t`.
@@ -14919,7 +14962,12 @@ fn dyn_seed_for(docks: &[crate::config::DynDock]) -> Vec<(DynKind, [i16; 3], [f3
         .filter_map(|d| DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect, d.tab_act)))
         .collect();
     if !seed.iter().any(|(k, _, _, _)| *k == DynKind::Master) {
-        seed.push((DynKind::Master, [1, 1, 1], [520.0, 46.0, 560.0, 190.0], false));
+        seed.push((
+            DynKind::Master,
+            [1, 1, 1],
+            [520.0, 46.0, 560.0, 190.0],
+            false,
+        ));
     }
     seed
 }
@@ -15022,8 +15070,9 @@ fn win_dock_btn_rect(r: &[f32; 4]) -> egui::Rect {
 /// edge's free tail instead of merging into a stranger's tabs by accident.
 fn dedupe_slot(app: &mut App, idx: usize) {
     let (e, o) = (dock_edge(app, idx), dock_order(app, idx));
-    let clash = (0..win_count(app))
-        .any(|i| i != idx && is_docked(app, i) && dock_edge(app, i) == e && dock_order(app, i) == o);
+    let clash = (0..win_count(app)).any(|i| {
+        i != idx && is_docked(app, i) && dock_edge(app, i) == e && dock_order(app, i) == o
+    });
     if !clash {
         return;
     }
@@ -15233,7 +15282,8 @@ fn detach_tab(app: &mut App, idx: usize) {
 /// `docked_head`). Topmost (last painted) wins.
 fn tab_hit(app: &App, pt: egui::Pos2) -> Option<usize> {
     app.tab_rects.iter().rev().find_map(|(m, q)| {
-        let r = egui::Rect::from_min_max(egui::pos2(q[0], q[1]), egui::pos2(q[0] + q[2], q[1] + q[3]));
+        let r =
+            egui::Rect::from_min_max(egui::pos2(q[0], q[1]), egui::pos2(q[0] + q[2], q[1] + q[3]));
         r.contains(pt).then_some(*m)
     })
 }
@@ -15243,18 +15293,15 @@ fn tab_hit(app: &App, pt: egui::Pos2) -> Option<usize> {
 /// group instead of re-ranking it along the edge.
 fn merge_host_hit(app: &App, pt: egui::Pos2, carried: usize) -> Option<usize> {
     (0..win_count(app)).rev().find(|i| {
-        *i != carried
-            && win_visible(app, *i)
-            && is_docked(app, *i)
-            && {
-                let r = app.dock_rects[*i];
-                r[2] > 8.0
-                    && egui::Rect::from_min_max(
-                        egui::pos2(r[0], r[1]),
-                        egui::pos2(r[0] + r[2], r[1] + WIN_HEAD_H),
-                    )
-                    .contains(pt)
-            }
+        *i != carried && win_visible(app, *i) && is_docked(app, *i) && {
+            let r = app.dock_rects[*i];
+            r[2] > 8.0
+                && egui::Rect::from_min_max(
+                    egui::pos2(r[0], r[1]),
+                    egui::pos2(r[0] + r[2], r[1] + WIN_HEAD_H),
+                )
+                .contains(pt)
+        }
     })
 }
 /// v34 R6: the mixer's vertical-rhythm rule, as one honest function
@@ -15325,12 +15372,17 @@ fn snap_zone(vp: egui::Rect, pt: egui::Pos2) -> Option<i16> {
 fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Rect) -> egui::Rect {
     let n = win_count(app);
     let horiz = edge == 2 || edge == 3; // band runs horizontally (bottom/top)
-    // The live neighbours of the target edge + `idx` itself, packed in the
-    // order `dock_at` would assign (insert by position along the band).
-    // v47 R1: ONE entry per tab group — co-members share the slot, so the
-    // fair-share packing must count the group once, not once per member.
+                                        // The live neighbours of the target edge + `idx` itself, packed in the
+                                        // order `dock_at` would assign (insert by position along the band).
+                                        // v47 R1: ONE entry per tab group — co-members share the slot, so the
+                                        // fair-share packing must count the group once, not once per member.
     let mut ids: Vec<usize> = (0..n)
-        .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge && app.dock_rects[*i][2] > 8.0)
+        .filter(|i| {
+            *i != idx
+                && is_docked(app, *i)
+                && dock_edge(app, *i) == edge
+                && app.dock_rects[*i][2] > 8.0
+        })
         .collect();
     ids.sort_by_key(|i| dock_order(app, *i));
     {
@@ -15371,7 +15423,10 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
             continue;
         }
         let mem = (0..n).filter(|i| {
-            *i != idx && is_docked(app, *i) && dock_edge(app, *i) == e && app.dock_rects[*i][2] > 8.0
+            *i != idx
+                && is_docked(app, *i)
+                && dock_edge(app, *i) == e
+                && app.dock_rects[*i][2] > 8.0
         });
         if e == 0 {
             left += mem.map(|i| app.dock_rects[i][2]).fold(0.0f32, f32::max);
@@ -15388,8 +15443,7 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
     // the SAME orientation (a side window dragged to the bottom has its
     // width/height meaning swapped).
     let same_orient = |i: usize| -> bool {
-        !is_docked(app, i)
-            || (dock_edge(app, i) == 2 || dock_edge(app, i) == 3) == horiz
+        !is_docked(app, i) || (dock_edge(app, i) == 2 || dock_edge(app, i) == 3) == horiz
     };
     let thick_raw = ids
         .iter()
@@ -15432,7 +15486,11 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
                     wr[3]
                 }
             };
-            let want = if same_orient(i) && rec > 8.0 { rec } else { strip_def(i, edge) };
+            let want = if same_orient(i) && rec > 8.0 {
+                rec
+            } else {
+                strip_def(i, edge)
+            };
             let cap = ((strip_len - alloc) / (ids.len() - k) as f32).max(48.0);
             want.min(cap).max(48.0)
         };
@@ -15444,10 +15502,16 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
     }
     if horiz {
         let y0 = if edge == 3 { top } else { bot - thick };
-        egui::Rect::from_min_max(egui::pos2(slot.0, y0), egui::pos2(slot.0 + slot.1, y0 + thick))
+        egui::Rect::from_min_max(
+            egui::pos2(slot.0, y0),
+            egui::pos2(slot.0 + slot.1, y0 + thick),
+        )
     } else {
         let x0 = if edge == 0 { left } else { right - thick };
-        egui::Rect::from_min_max(egui::pos2(x0, slot.0), egui::pos2(x0 + thick, slot.0 + slot.1))
+        egui::Rect::from_min_max(
+            egui::pos2(x0, slot.0),
+            egui::pos2(x0 + thick, slot.0 + slot.1),
+        )
     }
 }
 
@@ -15659,12 +15723,7 @@ fn reopen_dyn(app: &mut App, k: DynKind, on: bool) {
 }
 
 fn apply_win_layout(app: &mut App, name: &str) {
-    let Some(lay) = app
-        .win_layouts
-        .iter()
-        .find(|l| l.name == name)
-        .cloned()
-    else {
+    let Some(lay) = app.win_layouts.iter().find(|l| l.name == name).cloned() else {
         return;
     };
     app.side_wins = lay.side;
@@ -15794,8 +15853,10 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             // egui's triple-click classification can swallow a real
             // double-click when an unrelated click landed within 6 px in the
             // last 0.6 s (count 3, not 2). Both counts mean "toggle me".
-            i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                || i.pointer.button_triple_clicked(egui::PointerButton::Primary),
+            i.pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+                || i.pointer
+                    .button_triple_clicked(egui::PointerButton::Primary),
         )
     });
     // On the press frame `interact_pos` IS the press position.
@@ -15812,7 +15873,9 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
         // A short lockout keeps a mashed third click (which egui may report
         // as another >=2 click) from toggling straight back.
         let now = ui.ctx().input(|i| i.time);
-        if let Some(idx) = pos.and_then(|p| header_hit(app, p, false)).filter(|_| now >= app.dbl_dock_lock)
+        if let Some(idx) = pos
+            .and_then(|p| header_hit(app, p, false))
+            .filter(|_| now >= app.dbl_dock_lock)
         {
             app.dbl_dock_lock = now + 0.35;
             app.free_drag = None;
@@ -15864,31 +15927,31 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
                 app.carry_was_docked = true;
             }
         } else {
-        // Iterate top-down (floats above docked; higher idx above lower)
-        // so the visually topmost header wins the grab.
-        let n = win_count(app);
-        let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
-        order.sort_by_key(|i| is_docked(app, *i));
-        for idx in order.into_iter().rev() {
-            let r = if is_docked(app, idx) {
-                app.dock_rects[idx]
-            } else {
-                win_rect(app, idx)
-            };
-            if r[2] < 8.0 {
-                continue;
+            // Iterate top-down (floats above docked; higher idx above lower)
+            // so the visually topmost header wins the grab.
+            let n = win_count(app);
+            let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
+            order.sort_by_key(|i| is_docked(app, *i));
+            for idx in order.into_iter().rev() {
+                let r = if is_docked(app, idx) {
+                    app.dock_rects[idx]
+                } else {
+                    win_rect(app, idx)
+                };
+                if r[2] < 8.0 {
+                    continue;
+                }
+                let mut head =
+                    egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
+                head.max.x -= WIN_BTN_STRIP + WIN_DOCK_BTN_W + 6.0; // buttons
+                if head.contains(press_pos) {
+                    app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
+                    app.drag_pos = [r[0], r[1]];
+                    app.drag_press_pt = [press_pos.x, press_pos.y];
+                    app.carry_was_docked = is_docked(app, idx);
+                    break;
+                }
             }
-            let mut head =
-                egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
-            head.max.x -= WIN_BTN_STRIP + WIN_DOCK_BTN_W + 6.0; // buttons
-            if head.contains(press_pos) {
-                app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
-                app.drag_pos = [r[0], r[1]];
-                app.drag_press_pt = [press_pos.x, press_pos.y];
-                app.carry_was_docked = is_docked(app, idx);
-                break;
-            }
-        }
         }
     }
     if let Some((idx, grab)) = app.free_drag {
@@ -16135,7 +16198,8 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                         ));
                     let rr = resp.rect;
                     let clicked = resp.clicked();
-                    app.tab_rects.push((m, [rr.min.x, rr.min.y, rr.width(), rr.height()]));
+                    app.tab_rects
+                        .push((m, [rr.min.x, rr.min.y, rr.width(), rr.height()]));
                     resp.context_menu(|ui| {
                         let mut done = false;
                         window_slot_menu(ui, app, m, &mut done);
@@ -16406,7 +16470,11 @@ fn palette_pass(ui: &mut egui::Ui, app: &mut App) {
     if down {
         nsel = (nsel + 1).min(rows.len().saturating_sub(1));
     }
-    let run = if enter && !rows.is_empty() { Some(nsel) } else { None };
+    let run = if enter && !rows.is_empty() {
+        Some(nsel)
+    } else {
+        None
+    };
     if esc {
         app.palette = None;
         app.palette_armed = false;
@@ -16419,48 +16487,43 @@ fn palette_pass(ui: &mut egui::Ui, app: &mut App) {
     let vp = ui.ctx().input(|i| i.viewport_rect());
     let mut open = true;
     let mut click_run: Option<usize> = None;
-    let resp = egui::Window::new(RichText::new(
-        "commands \u{b7} Enter run \u{b7} Esc close",
-    ))
-    .id(egui::Id::new("slooper_palette"))
-    .open(&mut open)
-    .fixed_pos(egui::pos2(((vp.width() - 470.0) * 0.5).max(8.0), 80.0))
-    .collapsible(false)
-    .resizable(false)
-    .show(ui.ctx(), |ui| {
-        ui.set_width(440.0);
-        // The query box keeps keyboard focus for its whole life (modal
-        // search); `rows`/`cmds` were built BEFORE the closure, so the
-        // live edit of app.palette below cannot collide with them.
-        if let Some((q, s)) = app.palette.as_mut() {
-            let te = egui::TextEdit::singleline(q)
-                .hint_text("type to filter commands\u{2026}")
-                .desired_width(430.0);
-            ui.add(te).request_focus();
-            *s = nsel;
-        }
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (n, (label, hint, _)) in rows.iter().enumerate() {
-                    let row = ui.add(
-                        egui::Button::selectable(
-                            n == nsel,
-                            format!("{label}  \u{b7}  {hint}"),
-                        )
-                        .min_size(egui::vec2(ui.available_width(), 0.0)),
-                    );
-                    if row.clicked() {
-                        click_run = Some(n);
+    let resp = egui::Window::new(RichText::new("commands \u{b7} Enter run \u{b7} Esc close"))
+        .id(egui::Id::new("slooper_palette"))
+        .open(&mut open)
+        .fixed_pos(egui::pos2(((vp.width() - 470.0) * 0.5).max(8.0), 80.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_width(440.0);
+            // The query box keeps keyboard focus for its whole life (modal
+            // search); `rows`/`cmds` were built BEFORE the closure, so the
+            // live edit of app.palette below cannot collide with them.
+            if let Some((q, s)) = app.palette.as_mut() {
+                let te = egui::TextEdit::singleline(q)
+                    .hint_text("type to filter commands\u{2026}")
+                    .desired_width(430.0);
+                ui.add(te).request_focus();
+                *s = nsel;
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (n, (label, hint, _)) in rows.iter().enumerate() {
+                        let row = ui.add(
+                            egui::Button::selectable(n == nsel, format!("{label}  \u{b7}  {hint}"))
+                                .min_size(egui::vec2(ui.available_width(), 0.0)),
+                        );
+                        if row.clicked() {
+                            click_run = Some(n);
+                        }
                     }
-                }
-                if rows.is_empty() {
-                    ui.label(RichText::new("no matching command").weak());
-                }
-            });
-    });
+                    if rows.is_empty() {
+                        ui.label(RichText::new("no matching command").weak());
+                    }
+                });
+        });
     if let Some(r) = resp {
         let rect = r.response.rect;
         let click_elsewhere = armed
@@ -16661,7 +16724,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             // Live remaining along the strip this frame.
                             let rem = (ui.max_rect().max.x
                                 - ui.cursor().min.x.max(ui.max_rect().min.x))
-                                .max(0.0);
+                            .max(0.0);
                             let max_w = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                             // Id salted by stack depth: egui caches a
                             // resizable panel's size by Id, so when the
@@ -16718,7 +16781,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                         // ALL (egui's panel docs call this out by name).
                         let rem = (ui.max_rect().max.y
                             - ui.cursor().min.y.max(ui.max_rect().min.y))
-                            .max(0.0);
+                        .max(0.0);
                         let max_h = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                         let sz = want.min(cap).max(48.0);
                         egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
@@ -16892,10 +16955,8 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                         egui::pos2(r[0], r[1]),
                         egui::pos2(r[0] + r[2], r[1] + r[3].max(WIN_HEAD_H)),
                     );
-                    let lid = egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new("dock-zone-hl"),
-                    );
+                    let lid =
+                        egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-zone-hl"));
                     let p = ui.ctx().layer_painter(lid);
                     let ghost = Color32::from_rgb(150, 215, 255);
                     p.rect_filled(g, 3.0, ghost.linear_multiply(0.22));
@@ -16972,12 +17033,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                 )
             };
             p.rect_filled(br, 3.0, fill);
-            p.rect_stroke(
-                br,
-                3.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
+            p.rect_stroke(br, 3.0, stroke, egui::StrokeKind::Inside);
             // Vector icon: a pane docking into the right edge of a frame
             // (arrow/pictogram glyphs outside the bundled fonts render as
             // tofu — shapes only, per the glyph-coverage rule).
@@ -16990,10 +17046,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             );
             let bar_w = ic.width() * 0.32;
             p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(ic.max.x - bar_w, ic.min.y),
-                    ic.max,
-                ),
+                egui::Rect::from_min_max(egui::pos2(ic.max.x - bar_w, ic.min.y), ic.max),
                 0.0,
                 Color32::from_rgb(150, 215, 255),
             );
@@ -17001,9 +17054,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                 let msg = "dock into the last slot";
                 let tw = p.fonts_mut(|f| {
                     let fid = fid.clone();
-                    msg.chars()
-                        .map(|c| f.glyph_width(&fid, c))
-                        .sum::<f32>()
+                    msg.chars().map(|c| f.glyph_width(&fid, c)).sum::<f32>()
                 });
                 let tr = egui::Rect::from_min_size(
                     egui::pos2(br.min.x - 2.0, br.max.y + 6.0),
@@ -17392,13 +17443,15 @@ fn rack_file_row(
                 ui.close();
             }
         }
-        if app.assets.iter().any(|a| {
+        let is_audio = app.assets.iter().any(|a| {
             a.path.to_string_lossy() == fp_disp && a.pattern.is_none() && a.automation.is_none()
-        }) {
-            if ui
-                .button("Edit sample")
-                .on_hover_text("reverse, ping-pong, fades, pitch, bend, time stretch")
-                .clicked()
+        });
+        {
+            if is_audio
+                && ui
+                    .button("Edit sample")
+                    .on_hover_text("reverse, ping-pong, fades, pitch, bend, time stretch")
+                    .clicked()
             {
                 app.sample_edit_win = Some(fp_disp.clone());
                 app.se_name = format!("{name} (edit)");
@@ -17686,9 +17739,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                         // an overlay over the whole row (allocated after
                         // the buttons) stole scan/change/remove clicks.
                         let tres = tname_r.unwrap_or_else(|| {
-                            let (_r, resp) =
-                                ui.allocate_response(egui::Vec2::ZERO, Sense::hover());
-                            resp
+                            ui.allocate_response(egui::Vec2::ZERO, Sense::hover())
                         });
                         if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
                             || egui::DragAndDrop::has_payload_of_type::<FolderDrag>(ui.ctx())
@@ -17824,9 +17875,15 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 // layered OVER the button would capture the
                                 // press and starve clicked()/rmb (the v28
                                 // asset-row lesson).
+                                // v50: the row's y salts the response id —
+                                // in BY-TYPE mode the SAME folder key
+                                // renders once per kind section, and an
+                                // unsalted shared id made every click
+                                // resolve to the last section's instance.
                                 let hg = ui.interact(
                                     hr.rect,
-                                    ui.id().with(("rackdirg", &key)),
+                                    ui.id()
+                                        .with(("rackdirg", &key, hr.rect.min.y as i32)),
                                     Sense::click_and_drag(),
                                 );
                                 if hg.clicked() {
@@ -18295,12 +18352,14 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                             ui.close();
                                         }
                                     }
-                                    if app.assets.iter().any(|a| {
+                                    let is_audio = app.assets.iter().any(|a| {
                                         a.path.to_string_lossy() == apdisp
                                             && a.pattern.is_none()
                                             && a.automation.is_none()
-                                    }) {
-                                        if ui
+                                    });
+                                    {
+                                        if is_audio
+                                            && ui
                                             .button("Edit sample")
                                             .on_hover_text(
                                                 "reverse, ping-pong, fades, pitch, bend, time \
@@ -19160,13 +19219,11 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // still runs through the SAME track effect chain).
         let poly = app.track_poly.get(t).copied().unwrap_or(false);
         let ptxt = if poly { "poly" } else { "mono" };
-        let pbtn = egui::Button::new(
-            RichText::new(ptxt).color(if poly {
-                Color32::from_rgb(150, 220, 150)
-            } else {
-                Color32::from_rgb(150, 150, 150)
-            }),
-        )
+        let pbtn = egui::Button::new(RichText::new(ptxt).color(if poly {
+            Color32::from_rgb(150, 220, 150)
+        } else {
+            Color32::from_rgb(150, 150, 150)
+        }))
         .small()
         .min_size(egui::vec2(38.0, 0.0));
         if ui
@@ -19230,9 +19287,7 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
     }
-    let resp = w.show(ui, |ui| {
-        body_clipped(ui, |ui| synth_pick_body(ui, app, t))
-    });
+    let resp = w.show(ui, |ui| body_clipped(ui, |ui| synth_pick_body(ui, app, t)));
     if !open {
         app.synth_pick = None;
     }
@@ -21473,6 +21528,7 @@ fn grid_context_menu(
 /// silence past the data end stays visually EMPTY (hatched by the caller)
 /// instead of showing content stretched over it. `rect` stays the paint
 /// target for the fill and outline (and may include pads/tails).
+#[allow(clippy::too_many_arguments)]
 fn draw_asset_clip(
     ui: &mut egui::Ui,
     app: &mut App,
@@ -22962,11 +23018,7 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
             .inner_margin(6.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("[{}]", last.ts))
-                            .weak()
-                            .monospace(),
-                    );
+                    ui.label(RichText::new(format!("[{}]", last.ts)).weak().monospace());
                     ui.label(RichText::new(last.type_name).strong().monospace());
                     let name_w = ui.available_width();
                     ui.label(
@@ -24283,7 +24335,10 @@ mod tests {
     #[test]
     fn w9_midi_inputs_evt_feeds_the_picker() {
         let mut app = headless_app("w9-midi-evt");
-        assert!(app.avail_midi.is_empty(), "no devices before the backend talks");
+        assert!(
+            app.avail_midi.is_empty(),
+            "no devices before the backend talks"
+        );
         app.handle_evt(crate::audio::Evt::MidiInputs(vec![
             "KeyStage 61".into(),
             "KeyStage 61 [2]".into(),
@@ -24292,7 +24347,10 @@ mod tests {
         assert_eq!(app.avail_midi[1], "KeyStage 61 [2]", "labels ride verbatim");
         // The applied selection and the checkbox state stay distinct:
         // receiving a list must not silently apply anything.
-        assert!(app.win_midi.is_empty(), "receiving the list applies nothing");
+        assert!(
+            app.win_midi.is_empty(),
+            "receiving the list applies nothing"
+        );
     }
 
     /// W9: the WinMM picker section renders ONLY on Windows — on Linux the
@@ -25098,11 +25156,7 @@ mod tests {
             .position(|w| w.kind == DynKind::Master)
             .expect("master registered");
         let dr = app.dock_rects[mi];
-        let r = if dr[2] > 8.0 {
-            dr
-        } else {
-            win_rect(&app, mi)
-        };
+        let r = if dr[2] > 8.0 { dr } else { win_rect(&app, mi) };
         let z = galley_centers(&mut app, &ctx, "0", true)
             .into_iter()
             .find(|c| {
@@ -26253,9 +26307,7 @@ mod tests {
         let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
         // v46: `None` = v38 legacy LIVE route (the pin checks stop_all's
         // purge, not which instance renders).
-        app.backend
-            .engine
-            .play_audition(0, ev.into(), None);
+        app.backend.engine.play_audition(0, ev.into(), None);
         assert!(app.backend.engine.audition_active());
         frame(&mut app, &ctx, vec![]);
         assert!(
@@ -29028,7 +29080,10 @@ mod tests {
         );
         // Re-click the highlighted row → stop it, clear the highlight.
         app.preview_asset(1);
-        assert!(app.preview_playing.is_none(), "re-click stops the highlight");
+        assert!(
+            app.preview_playing.is_none(),
+            "re-click stops the highlight"
+        );
         // Engine-side: two starts = ONE voice (the v0.10 stack is gone).
         let a = app.assets[0].data.clone();
         let b = app.assets[1].data.clone();
@@ -29072,9 +29127,7 @@ mod tests {
         let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
         // v46: `None` = the v38 legacy LIVE-route (these pins check pool
         // retirement, not which instance renders).
-        app.backend
-            .engine
-            .play_audition(0, ev.into(), None);
+        app.backend.engine.play_audition(0, ev.into(), None);
         app.backend.engine.debug_mark_auditions_drained();
         app.logic(&ctx, &mut f);
         assert!(
@@ -29686,15 +29739,6 @@ mod tests {
             vec![btn(scan.center(), egui::PointerButton::Primary, false)],
         );
         frame(&mut app, &ctx, vec![]);
-        eprintln!(
-            "DBG13 files={:?} status={:?}",
-            app.rack[0]
-                .files
-                .iter()
-                .map(|r| r.name.clone())
-                .collect::<Vec<_>>(),
-            app.status
-        );
         assert!(
             app.rack[0].files.iter().any(|r| r.name == "snare"),
             "scan found snare"
@@ -29826,7 +29870,11 @@ mod tests {
     fn click_exact(app: &mut App, ctx: &egui::Context, needle: &str) {
         let p = galley_centers(app, ctx, needle, true)[0];
         frame(app, ctx, vec![moved(p)]);
-        frame(app, ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
         frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
     }
 
@@ -29839,7 +29887,11 @@ mod tests {
             .unwrap_or_else(|| panic!("galley {needle:?} not painted"));
         let p = r.center();
         frame(app, ctx, vec![moved(p)]);
-        frame(app, ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
         frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
     }
 
@@ -31461,8 +31513,7 @@ mod tests {
         app.add_fx_script(0, "spread");
         app.fx_window = Some(0);
         frame(&mut app, &ctx, vec![]);
-        let name = galley_at(&mut app, &ctx, "stereo spread")
-            .expect("chain row name painted");
+        let name = galley_at(&mut app, &ctx, "stereo spread").expect("chain row name painted");
         let tag = galley_at(&mut app, &ctx, "[fx:st]").expect("stereo badge painted");
         assert!(
             (tag.center().y - name.center().y).abs() < 12.0,
@@ -31478,10 +31529,7 @@ mod tests {
             .map(|d| !d.stereo)
             .unwrap_or(true);
         assert!(comp, "compressor stays a mono (v1) script");
-        assert!(
-            app.fx_rows[0].len() == 2,
-            "both scripts live in the chain"
-        );
+        assert!(app.fx_rows[0].len() == 2, "both scripts live in the chain");
         // Tier 4: the chorus joined the v3 stereo world (per-side tap
         // banks, Hyper Chorus task) — this pin used to assert it was the
         // mono counterexample; the roster in docs/FL-SUITE.md is the
@@ -34689,15 +34737,19 @@ mod tests {
         let mk = |target: &str, track: u32| crate::config::ValueBind {
             target: target.into(),
             track,
-            bind: MidiBind { ty: 1, ch: 0, d1: 5 },
+            bind: MidiBind {
+                ty: 1,
+                ch: 0,
+                d1: 5,
+            },
             kind: 0,
             lo: 0,
             hi: 127,
         };
         pr.value_binds = vec![
-            mk("fx:0:1", 0),    // lands: chain slot 0 param 1 exists
-            mk("fx:9:0", 0),    // phantom: no such chain slot
-            mk("synth:0", 7),   // phantom: track 7 has no instrument
+            mk("fx:0:1", 0),  // lands: chain slot 0 param 1 exists
+            mk("fx:9:0", 0),  // phantom: no such chain slot
+            mk("synth:0", 7), // phantom: track 7 has no instrument
         ];
         let vol0 = app.trk_vol[0];
         let bpm0 = app.metro_bpm.clone();
@@ -34844,7 +34896,10 @@ mod tests {
             app.status
         );
         app.backend.engine.set_rec_loop(0, false);
-        assert!(!app.backend.engine.rec_loop_armed(0), "STOP clears the loop");
+        assert!(
+            !app.backend.engine.rec_loop_armed(0),
+            "STOP clears the loop"
+        );
     }
 
     /// v29: untick EVERYTHING and REC refuses with a hint instead of
@@ -35645,19 +35700,7 @@ mod tests {
             assert_eq!(g.len(), 2, "type view nests too (audio + midi)");
             g[0]
         };
-        eprintln!("DBG30 p3={:?}", p3);
-        frame(&mut app, &ctx, vec![moved(p3)]);
         click_pt(&mut app, &ctx, p3);
-        {
-            frame(&mut app, &ctx, vec![]);
-            for pat in ["- kringel (5)", "+ kringel (5)", "kringel/dry (", "AUDIO", "MIDI"] {
-                eprintln!(
-                    "DBG30 after {:?}: {:?}",
-                    pat,
-                    galley_centers(&mut app, &ctx, pat, false)
-                );
-            }
-        }
         // Collapse state is shared across the sections and both grouping
         // modes — one key, so every copy of the header flips together.
         assert_eq!(
@@ -37380,7 +37423,10 @@ mod tests {
         let mut app = headless_app("v43ghost");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 1, "mixer docked right");
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 1,
+            "mixer docked right"
+        );
         let h = app.dock_rects[3];
         assert!(h[2] > 8.0, "mixer dock header rect recorded");
         let from = egui::pos2(h[0] + 30.0, h[1] + 12.0);
@@ -37400,16 +37446,36 @@ mod tests {
         // Left edge: the slot hugs x=0 at a REAL panel width, starts at the
         // band top (the drop is ABOVE the rack's center), and is a sized
         // slot — a share of the band, not the whole band.
-        assert!(g.min.x < 10.0 && g.width() > 120.0, "left-edge slot geometry: {g:?}");
+        assert!(
+            g.min.x < 10.0 && g.width() > 120.0,
+            "left-edge slot geometry: {g:?}"
+        );
         assert!(g.min.y < 100.0, "slot starts at the band top: {g:?}");
-        assert!(g.height() > 150.0 && g.height() < 520.0, "sized slot, not the band: {g:?}");
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        assert!(
+            g.height() > 150.0 && g.height() < 520.0,
+            "sized slot, not the band: {g:?}"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 0, "released into the left edge");
-        assert_eq!(dock_order(&app, 3), 0, "landed at the drop rank (above the rack)");
-        assert!(ghost_rects(&mut app, &ctx, to).is_empty(), "ghost gone after release");
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 0,
+            "released into the left edge"
+        );
+        assert_eq!(
+            dock_order(&app, 3),
+            0,
+            "landed at the drop rank (above the rack)"
+        );
+        assert!(
+            ghost_rects(&mut app, &ctx, to).is_empty(),
+            "ghost gone after release"
+        );
     }
 
     /// R2: right-clicking the TITLE of a floating primary window opens the
@@ -37435,7 +37501,11 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(app.win_menu.is_some(), "right-press opened the slot menu");
         let item = galley_at(&mut app, &ctx, "dock to the right edge").expect("menu item");
@@ -37466,7 +37536,11 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         let item = match galley_at(&mut app, &ctx, "dock to the bottom edge") {
             Some(r) => r,
@@ -37484,7 +37558,11 @@ mod tests {
                     &ctx,
                     vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
                 );
-                frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![btn(tp, egui::PointerButton::Secondary, false)],
+                );
                 frame(&mut app, &ctx, vec![]);
                 galley_at(&mut app, &ctx, "dock to the bottom edge")
                     .expect("slot menu on the plugin window")
@@ -37517,21 +37595,33 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        let tp = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title").center();
+        let tp = galley_at(&mut app, &ctx, "ASSET RACK")
+            .expect("float title")
+            .center();
         frame(&mut app, &ctx, vec![moved(tp)]);
         frame(
             &mut app,
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        assert!(galley_at(&mut app, &ctx, "close this window").is_some(), "menu open");
+        assert!(
+            galley_at(&mut app, &ctx, "close this window").is_some(),
+            "menu open"
+        );
         // The opening release did NOT dismiss it — now press far away:
         click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
         frame(&mut app, &ctx, vec![]);
         assert!(app.win_menu.is_none(), "click-away dismissed the menu");
-        assert!(galley_at(&mut app, &ctx, "close this window").is_none(), "menu unpainted");
+        assert!(
+            galley_at(&mut app, &ctx, "close this window").is_none(),
+            "menu unpainted"
+        );
     }
 
     /// R3: double-clicking a title bar toggles docked <-> floating, in BOTH
@@ -37552,19 +37642,43 @@ mod tests {
         // outside every snap band (a band release would re-dock first).
         park_window(&mut app, &ctx, "ASSET RACK", egui::vec2(300.0, 250.0));
         frame(&mut app, &ctx, vec![]);
-        let tp = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title").center();
-        assert!(tp.x > 200.0 && tp.x < 1200.0, "title parked off any band: {tp:?}");
+        let tp = galley_at(&mut app, &ctx, "ASSET RACK")
+            .expect("float title")
+            .center();
+        assert!(
+            tp.x > 200.0 && tp.x < 1200.0,
+            "title parked off any band: {tp:?}"
+        );
         // Double-click: press · release · press (same point, same moment).
         frame(&mut app, &ctx, vec![moved(tp)]);
-        frame(&mut app, &ctx, vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Primary, false)]);
-        frame(&mut app, &ctx, vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Primary, false)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
         assert_eq!(app.side_wins.dock[0][0], 1, "double-click docked the float");
-        assert_eq!(app.side_wins.dock[0][1], 0, "… to its remembered edge (left)");
+        assert_eq!(
+            app.side_wins.dock[0][1], 0,
+            "… to its remembered edge (left)"
+        );
         // Let the mash-guard window expire (a real user never re-dbls a
         // title inside 0.35 s).
         for _ in 0..25 {
@@ -37575,14 +37689,33 @@ mod tests {
         assert!(h[2] > 8.0, "docked header rect recorded");
         let dp = egui::pos2(h[0] + 30.0, h[1] + 12.0);
         frame(&mut app, &ctx, vec![moved(dp)]);
-        frame(&mut app, &ctx, vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(dp, egui::PointerButton::Primary, false)]);
-        frame(&mut app, &ctx, vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(dp, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(dp, egui::PointerButton::Primary, false)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(dp, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock[0][0], 0, "double-click floated the docked window");
+        assert_eq!(
+            app.side_wins.dock[0][0], 0,
+            "double-click floated the docked window"
+        );
     }
 
     /// R4: the top-bar Windows menu toggles window visibility with live
@@ -37635,8 +37768,16 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "primaries snapped");
-        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).expect("dyn slot");
+        assert_eq!(
+            app.side_wins.dock,
+            crate::config::default_dock(),
+            "primaries snapped"
+        );
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .expect("dyn slot");
         assert_eq!(drum.dock[0], 1, "dock-all INCLUDED the dynamic window");
         click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
         open_menu(&mut app, &ctx);
@@ -37645,8 +37786,15 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(app.side_wins.dock.iter().all(|d| d[0] == 0), "primaries floated");
-        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).unwrap();
+        assert!(
+            app.side_wins.dock.iter().all(|d| d[0] == 0),
+            "primaries floated"
+        );
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .unwrap();
         assert_eq!(drum.dock[0], 0, "float-all INCLUDED the dynamic window");
         click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
         open_menu(&mut app, &ctx);
@@ -37655,8 +37803,16 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "stock slots restored");
-        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).unwrap();
+        assert_eq!(
+            app.side_wins.dock,
+            crate::config::default_dock(),
+            "stock slots restored"
+        );
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .unwrap();
         assert_eq!(drum.dock[0], 1, "dynamic re-docked");
         assert!(app.dock_collapsed.iter().all(|c| !*c), "nothing collapsed");
     }
@@ -37681,9 +37837,18 @@ mod tests {
         click_pt(&mut app, &ctx, f.center());
         type_into_focused(&mut app, &ctx, "theme");
         frame(&mut app, &ctx, vec![]);
-        assert!(galley_at(&mut app, &ctx, "MONITORING").is_none(), "monitoring filtered out");
-        assert!(galley_at(&mut app, &ctx, "AUDIO PORTS").is_none(), "ports filtered out");
-        assert!(galley_at(&mut app, &ctx, "GUI").is_some(), "GUI survives its keyword 'theme'");
+        assert!(
+            galley_at(&mut app, &ctx, "MONITORING").is_none(),
+            "monitoring filtered out"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "AUDIO PORTS").is_none(),
+            "ports filtered out"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "GUI").is_some(),
+            "GUI survives its keyword 'theme'"
+        );
         assert!(
             galley_at(&mut app, &ctx, "live input monitoring").is_none(),
             "hidden section paints nothing, not even its widgets"
@@ -37722,9 +37887,18 @@ mod tests {
         click_pt(&mut app, &ctx, p.center());
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.sett_filter, "ports", "chip injected its query");
-        assert!(galley_at(&mut app, &ctx, "AUDIO PORTS").is_some(), "ports section shown");
-        assert!(galley_at(&mut app, &ctx, "MONITORING").is_none(), "others hidden");
-        assert!(galley_at(&mut app, &ctx, "PROJECTS").is_none(), "others hidden");
+        assert!(
+            galley_at(&mut app, &ctx, "AUDIO PORTS").is_some(),
+            "ports section shown"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "MONITORING").is_none(),
+            "others hidden"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "PROJECTS").is_none(),
+            "others hidden"
+        );
         let all = galley_centers(&mut app, &ctx, "all", true);
         assert!(!all.is_empty(), "the 'all' chip is an exact label");
         click_pt(&mut app, &ctx, all[0]);
@@ -37813,7 +37987,11 @@ mod tests {
         );
         frame(&mut app, &ctx, vec![moved(mid)]);
         frame(&mut app, &ctx, vec![moved(to)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..4 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -37870,7 +38048,10 @@ mod tests {
             galley_at(&mut app, &ctx, "source(s)").is_some(),
             "the honest status line survives (wrapped is fine)"
         );
-        assert!(galley_at(&mut app, &ctx, "Clear").is_some(), "Clear always offered");
+        assert!(
+            galley_at(&mut app, &ctx, "Clear").is_some(),
+            "Clear always offered"
+        );
         assert!(
             !galley_centers(&mut app, &ctx, "Note On", false).is_empty(),
             "event names survive narrow widths"
@@ -37909,12 +38090,19 @@ mod tests {
             let p = d - egui::vec2(50.0 * k as f32, 0.0);
             frame(&mut app, &ctx, vec![moved(p)]);
         }
-        frame(&mut app, &ctx, vec![btn(d2, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d2, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
         let m2 = app.dock_rects[2];
-        assert!(m2[2] < m[2] - 100.0, "divider narrowed the monitor share: {m:?} -> {m2:?}");
+        assert!(
+            m2[2] < m[2] - 100.0,
+            "divider narrowed the monitor share: {m:?} -> {m2:?}"
+        );
         let rec = app.side_wins.monitor[2];
         assert!(
             (rec - m2[2]).abs() < 40.0,
@@ -37967,7 +38155,11 @@ mod tests {
             g.width() < 700.0 && g.height() < 700.0,
             "slot-sized, never edge-sized: {g:?}"
         );
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
     }
 
     /// R3: carrying a DOCKED window by its title and releasing outside
@@ -37989,11 +38181,18 @@ mod tests {
         let to = egui::pos2(700.0, 400.0); // dead centre: no snap band
         frame(&mut app, &ctx, vec![moved(egui::pos2(500.0, 300.0))]);
         frame(&mut app, &ctx, vec![moved(to)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..2 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 0), "a docked carry released off-band stays docked");
+        assert!(
+            is_docked(&app, 0),
+            "a docked carry released off-band stays docked"
+        );
         assert_eq!(dock_edge(&app, 0), 0, "same edge as before the drag");
     }
 
@@ -38019,12 +38218,22 @@ mod tests {
             &ctx,
             vec![moved(b), btn(b, egui::PointerButton::Primary, true)],
         );
-        assert!(app.free_drag.is_none(), "the dock button press is not a carry");
-        frame(&mut app, &ctx, vec![btn(b, egui::PointerButton::Primary, false)]);
+        assert!(
+            app.free_drag.is_none(),
+            "the dock button press is not a carry"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(b, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..2 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 1), "title-bar button put it back in the dock");
+        assert!(
+            is_docked(&app, 1),
+            "title-bar button put it back in the dock"
+        );
         assert_eq!(dock_edge(&app, 1), 2, "into its LAST used edge (bottom)");
     }
 
@@ -38059,7 +38268,10 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(app.show_mixer && is_docked(&app, 3), "mixer alone and docked");
+        assert!(
+            app.show_mixer && is_docked(&app, 3),
+            "mixer alone and docked"
+        );
         assert!(
             galley_at(&mut app, &ctx, "reset I").is_none(),
             "mixer dock has no master controls (v44 R4)"
@@ -38101,8 +38313,14 @@ mod tests {
             (r[2] - 260.0).abs() < 24.0 && (r[3] - 140.0).abs() < 24.0,
             "small master out stayed small: {r:?}"
         );
-        assert!(galley_at(&mut app, &ctx, "LRA").is_none(), "LRA folded when narrow");
-        assert!(galley_at(&mut app, &ctx, "reset I").is_some(), "controls survive");
+        assert!(
+            galley_at(&mut app, &ctx, "LRA").is_none(),
+            "LRA folded when narrow"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "reset I").is_some(),
+            "controls survive"
+        );
     }
 
     /// v46: merging audio clips sums them AT THEIR POSITIONS — overlap
@@ -38155,7 +38373,14 @@ mod tests {
         let sr = app.backend.engine.sample_rate().max(1) as u64;
         let mk = |app: &mut App, name: &str, note: u8| -> u32 {
             let mut p = Pattern::new(120);
-            p.notes.push(Note { ch: 0, note, vel: 100, press: 0, start: 0, len: PPQ as u32 });
+            p.notes.push(Note {
+                ch: 0,
+                note,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: PPQ as u32,
+            });
             let id = app.assets.len() as u32;
             app.assets.push(Asset::midi(
                 id,
@@ -38215,7 +38440,11 @@ mod tests {
         let before = app.assets.len();
         app.merge_selection();
         assert_eq!(app.assets.len(), before, "nothing was merged");
-        assert!(app.status.contains("audio or all MIDI"), "status: {}", app.status);
+        assert!(
+            app.status.contains("audio or all MIDI"),
+            "status: {}",
+            app.status
+        );
         let n_clips: usize = app.arr.tracks[0].lanes.iter().map(|l| l.clips.len()).sum();
         assert_eq!(n_clips, 2, "the selection survived the refusal");
     }
@@ -38235,7 +38464,12 @@ mod tests {
             .expect("bundled piano must compile and load");
         app.track_synth_inst[0] = Some(std::sync::Arc::new(SynthHandle::Script(inst)));
         let row_len = |app: &App| {
-            app.backend.engine.poly_voices().first().map(|r| r.len()).unwrap_or(0)
+            app.backend
+                .engine
+                .poly_voices()
+                .first()
+                .map(|r| r.len())
+                .unwrap_or(0)
         };
         // MONO (default): nothing published.
         assert_eq!(row_len(&app), 0, "monophonic publishes nothing");
@@ -38355,7 +38589,11 @@ mod tests {
                 && (g.width() - hr[2]).abs() < 2.0,
             "the ghost IS the host slot: ghost {g:?} host {hr:?}"
         );
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
     }
 
     /// R1 A3: clicking a tab switches which member's body the slot shows.
@@ -38435,11 +38673,18 @@ mod tests {
         let to = egui::pos2(60.0, 600.0);
         frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))]);
         frame(&mut app, &ctx, vec![moved(to)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 1) && dock_edge(&app, 1) == 0, "re-docked left");
+        assert!(
+            is_docked(&app, 1) && dock_edge(&app, 1) == 0,
+            "re-docked left"
+        );
         assert_ne!(
             dock_order(&app, 1),
             dock_order(&app, 0),
@@ -38463,14 +38708,26 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
         assert_eq!(tab_group(&app, 1).len(), 2, "bottom pair is a group");
-        drag_title(&mut app, &ctx, egui::pos2(630.0, 132.0), egui::pos2(300.0, 820.0));
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 2, "mixer docked bottom");
+        drag_title(
+            &mut app,
+            &ctx,
+            egui::pos2(630.0, 132.0),
+            egui::pos2(300.0, 820.0),
+        );
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 2,
+            "mixer docked bottom"
+        );
         assert_eq!(
             dock_order(&app, 1),
             dock_order(&app, 2),
             "the tab group kept a SINGLE shared rank"
         );
-        assert_ne!(dock_order(&app, 3), dock_order(&app, 1), "mixer got its own slot");
+        assert_ne!(
+            dock_order(&app, 3),
+            dock_order(&app, 1),
+            "mixer got its own slot"
+        );
         assert_eq!(tab_group(&app, 1).len(), 2, "still two members");
     }
 
@@ -38493,7 +38750,11 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(app.win_menu.is_some(), "float title menu opened");
         let item = galley_at(&mut app, &ctx, "tab with: ASSET RACK")
@@ -38503,7 +38764,11 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
         }
         assert!(is_docked(&app, 1), "the menu docked it");
-        assert_eq!(dock_order(&app, 1), dock_order(&app, 0), "\u{2026} as a tab");
+        assert_eq!(
+            dock_order(&app, 1),
+            dock_order(&app, 0),
+            "\u{2026} as a tab"
+        );
         // (b) right-click the OTHER member's tab \u{2192} detach own slot.
         let tab = galley_at(&mut app, &ctx, "ASSET RACK")
             .expect("rack tab")
@@ -38514,10 +38779,14 @@ mod tests {
             &ctx,
             vec![moved(tab), btn(tab, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tab, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tab, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        let det = galley_at(&mut app, &ctx, "detach into own slot")
-            .expect("detach offered to a member");
+        let det =
+            galley_at(&mut app, &ctx, "detach into own slot").expect("detach offered to a member");
         click_pt(&mut app, &ctx, det.center());
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
@@ -38582,8 +38851,15 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(tab_group(&app, 0).len(), 1, "the stock layout has no groups");
-        assert!(!get_tab_act(&app, 0) && !get_tab_act(&app, 1), "flags cleared");
+        assert_eq!(
+            tab_group(&app, 0).len(),
+            1,
+            "the stock layout has no groups"
+        );
+        assert!(
+            !get_tab_act(&app, 0) && !get_tab_act(&app, 1),
+            "flags cleared"
+        );
         assert!(is_docked(&app, 1), "bindings re-docked (to its stock slot)");
     }
 
@@ -38696,7 +38972,11 @@ mod tests {
                     key_ev(egui::Key::K, egui::Modifiers::COMMAND),
                 ],
             );
-            frame_keys(app, ctx, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+            frame_keys(
+                app,
+                ctx,
+                vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            );
         };
         open(&mut app, &ctx);
         assert!(app.palette.is_some(), "Ctrl+K opened the palette");
@@ -38704,14 +38984,29 @@ mod tests {
         for c in "mixer".chars() {
             frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
         }
-        assert_eq!(app.palette.as_ref().unwrap().0, "mixer", "typing reached the query");
-        frame(&mut app, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
-        assert!(!app.show_mixer, "Enter ran \u{201c}hide window MIXER\u{201d}");
+        assert_eq!(
+            app.palette.as_ref().unwrap().0,
+            "mixer",
+            "typing reached the query"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Enter, Default::default())],
+        );
+        assert!(
+            !app.show_mixer,
+            "Enter ran \u{201c}hide window MIXER\u{201d}"
+        );
         assert!(app.palette.is_none(), "the palette closed on run");
         // reopen, then Esc.
         open(&mut app, &ctx);
         assert!(app.palette.is_some(), "reopened");
-        frame(&mut app, &ctx, vec![key_ev(egui::Key::Escape, Default::default())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Escape, Default::default())],
+        );
         assert!(app.palette.is_none(), "Esc closed it");
         // and Ctrl+K toggles closed again.
         open(&mut app, &ctx);
@@ -38742,9 +39037,16 @@ mod tests {
         for c in "ports".chars() {
             frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
         }
-        frame(&mut app, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Enter, Default::default())],
+        );
         assert!(app.show_settings, "Settings opened");
-        assert_eq!(app.sett_filter, "ports", "\u{2026} straight at the ports category");
+        assert_eq!(
+            app.sett_filter, "ports",
+            "\u{2026} straight at the ports category"
+        );
     }
 
     /// R3 C4: the Windows menu lists registered DYNAMIC windows (plugin
@@ -38812,12 +39114,7 @@ mod tests {
         //    share (drag the divider ~toward the strip's right edge).
         let d1 = egui::pos2(m[0] + m[2] + 2.0, y);
         let vp = ctx.viewport_rect();
-        drag_steps(
-            &mut app,
-            &ctx,
-            d1,
-            egui::pos2(vp.max.x - 60.0, y),
-        );
+        drag_steps(&mut app, &ctx, d1, egui::pos2(vp.max.x - 60.0, y));
         let m2 = app.dock_rects[2];
         assert!(
             m2[2] > m[2] + 100.0,
@@ -38852,7 +39149,12 @@ mod tests {
         assert!(a[3] > 8.0 && g[3] > 8.0 && a[1] < g[1], "{a:?} {g:?}");
         let x = a[0] + a[2] * 0.5;
         // 1) Starve the bottom member: drag the divider far down.
-        drag_steps(&mut app, &ctx, egui::pos2(x, g[1] - 2.0), egui::pos2(x, g[1] + 500.0));
+        drag_steps(
+            &mut app,
+            &ctx,
+            egui::pos2(x, g[1] - 2.0),
+            egui::pos2(x, g[1] + 500.0),
+        );
         let g2 = app.dock_rects[4];
         assert!(
             g2[1] > g[1] + 200.0,
@@ -38860,7 +39162,12 @@ mod tests {
         );
         // 2) Drag BACK up: the starved window must regain its share.
         let g3 = app.dock_rects[4];
-        drag_steps(&mut app, &ctx, egui::pos2(x, g3[1] - 2.0), egui::pos2(x, g3[1] - 260.0));
+        drag_steps(
+            &mut app,
+            &ctx,
+            egui::pos2(x, g3[1] - 2.0),
+            egui::pos2(x, g3[1] - 260.0),
+        );
         let g4 = app.dock_rects[4];
         assert!(
             g4[1] < g3[1] - 150.0,
@@ -38990,9 +39297,11 @@ mod tests {
     /// existing two-part `fx:` key family.
     #[test]
     fn w8b_dynkind_vst_keys_round_trip() {
-        for (k, s) in
-            [(DynKind::Vst(3), "vst:3"), (DynKind::VstFx(1, 2), "vstfx:1:2"), (DynKind::Vst(0), "vst:0")]
-        {
+        for (k, s) in [
+            (DynKind::Vst(3), "vst:3"),
+            (DynKind::VstFx(1, 2), "vstfx:1:2"),
+            (DynKind::Vst(0), "vst:0"),
+        ] {
             assert_eq!(k.key(), s);
             assert_eq!(DynKind::from_key(s), Some(k));
         }
@@ -39014,7 +39323,10 @@ mod tests {
     #[test]
     fn w8b_dyn_open_false_without_editors() {
         let app = headless_app("w8b_dynopen");
-        assert!(!dyn_open(&app, DynKind::Vst(0)), "no editor open on a fresh app");
+        assert!(
+            !dyn_open(&app, DynKind::Vst(0)),
+            "no editor open on a fresh app"
+        );
         assert!(!dyn_open(&app, DynKind::VstFx(0, 0)));
     }
     // ---- v50 R1: "Edit sample" (FL Studio sample window) -------------------
@@ -39035,7 +39347,10 @@ mod tests {
         rmb(&mut app, &ctx, h);
         let it = galley_centers(&mut app, &ctx, "Edit sample", true)[0];
         click_pt(&mut app, &ctx, it);
-        let key = samples.join("kit-a/revme.wav").to_string_lossy().into_owned();
+        let key = samples
+            .join("kit-a/revme.wav")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             app.sample_edit_win.as_deref(),
             Some(key.as_str()),
@@ -39043,21 +39358,40 @@ mod tests {
         );
         // Reverse: playback data mirrors, source file stays pristine.
         let before = app.assets[0].data.to_vec();
-        app.sample_edits
-            .insert(key.clone(), SampleEdit { reverse: true, ..Default::default() });
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
         app.se_apply(&key);
         let mut want = before.clone();
         want.reverse();
-        assert_eq!(app.assets[0].data.to_vec(), want, "asset data is the mirror");
-        assert!(!app.assets[0].dirty, "the wav on disk must not be rewritten");
+        assert_eq!(
+            app.assets[0].data.to_vec(),
+            want,
+            "asset data is the mirror"
+        );
+        assert!(
+            !app.assets[0].dirty,
+            "the wav on disk must not be rewritten"
+        );
         // Saved into the project and rebuilt over fresh assets on load.
         let pr = app.build_project("ed".into());
-        assert!(pr.sample_edits.contains_key(&key), "edits ride with the project");
+        assert!(
+            pr.sample_edits.contains_key(&key),
+            "edits ride with the project"
+        );
         let mut app2 = headless_app("v50edit2");
         app2.rack[0].path = samples.display().to_string();
         let _ = app2.ensure_asset(&samples.join("kit-a/revme.wav"));
         app2.restore_sample_edits(&pr.sample_edits);
-        assert_eq!(app2.assets[0].data.to_vec(), want, "reload re-renders the edit");
+        assert_eq!(
+            app2.assets[0].data.to_vec(),
+            want,
+            "reload re-renders the edit"
+        );
     }
 
     #[test]
@@ -39071,12 +39405,24 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
         let _ = app.ensure_asset(&samples.join("kit-a/kick.wav"));
-        let key = samples.join("kit-a/kick.wav").to_string_lossy().into_owned();
+        let key = samples
+            .join("kit-a/kick.wav")
+            .to_string_lossy()
+            .into_owned();
         let n = app.assets[0].data.len();
-        app.sample_edits
-            .insert(key.clone(), SampleEdit { pingpong: true, ..Default::default() });
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
         app.se_apply(&key);
-        assert_eq!(app.assets[0].data.len(), n * 2, "ping-pong doubles playback data");
+        assert_eq!(
+            app.assets[0].data.len(),
+            n * 2,
+            "ping-pong doubles playback data"
+        );
         app.record_target = samples.join("kit-a").display().to_string();
         app.se_save_as(&key, "kickpp");
         assert!(
@@ -39176,8 +39522,14 @@ mod tests {
             .filter(|(pts, c)| wave(*c) && pts.first().is_some_and(|p| p.x < mid - 2.0))
             .count();
         assert!(in_data > 8, "waveform painted in the DATA half");
-        let in_tail = lines.iter().filter(|(pts, c)| wave(*c) && pts.first().is_some_and(|p| p.x > mid + 2.0)).count();
-        assert_eq!(in_tail, 0, "no waveform column is painted past the data end");
+        let in_tail = lines
+            .iter()
+            .filter(|(pts, c)| wave(*c) && pts.first().is_some_and(|p| p.x > mid + 2.0))
+            .count();
+        assert_eq!(
+            in_tail, 0,
+            "no waveform column is painted past the data end"
+        );
         // The tail is the silence hatch: dark (10,10,14) rect ending at the
         // clip's right edge, starting (near) the data end.
         let hatch = painted_rects(&mut app, &ctx, (10, 10, 14))
@@ -39209,8 +39561,13 @@ mod tests {
             len: 480,
         });
         let id = app.assets.len() as u32;
-        app.assets
-            .push(Asset::midi(id, "pat".into(), std::path::PathBuf::new(), Arc::new(pat), true));
+        app.assets.push(Asset::midi(
+            id,
+            "pat".into(),
+            std::path::PathBuf::new(),
+            Arc::new(pat),
+            true,
+        ));
         let alen = app.asset_len(id);
         app.arr.insert(
             0,
@@ -39254,8 +39611,16 @@ mod tests {
             target: TARGET_TRACK_VOL.into(),
             len_samples: 48_000,
             nodes: vec![
-                Node { t: 0, v: 0.2, c: 0.0 },
-                Node { t: 48_000, v: 0.8, c: 0.0 },
+                Node {
+                    t: 0,
+                    v: 0.2,
+                    c: 0.0,
+                },
+                Node {
+                    t: 48_000,
+                    v: 0.8,
+                    c: 0.0,
+                },
             ],
         };
         let id = app.assets.len() as u32;
@@ -39296,7 +39661,7 @@ mod tests {
         let lines = painted_lines(&mut app, &ctx);
         let curve = |c: egui::Color32| {
             let (r, g, b, _) = c.to_tuple();
-            r >= 220 && g >= 115 && g <= 125 && b >= 115 && b <= 125
+            r >= 220 && (115..=125).contains(&g) && (115..=125).contains(&b)
         };
         let tail: Vec<f32> = lines
             .iter()
@@ -39306,7 +39671,12 @@ mod tests {
         assert!(tail.len() >= 4, "curve continues into the extension tail");
         let lo = tail.iter().cloned().fold(f32::MAX, f32::min);
         let hi = tail.iter().cloned().fold(f32::MIN, f32::max);
-        assert!(hi - lo < 1.5, "extension holds a CONSTANT line ({}..{})", lo, hi);
+        assert!(
+            hi - lo < 1.5,
+            "extension holds a CONSTANT line ({}..{})",
+            lo,
+            hi
+        );
     }
 
     // ================= v50 R4: rack drag-move =================
@@ -39325,7 +39695,11 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let kb = galley_centers(&mut app, &ctx, "kit-b", false)[0];
         frame(&mut app, &ctx, vec![moved(kb)]);
-        frame(&mut app, &ctx, vec![btn(kb, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kb, egui::PointerButton::Primary, true)],
+        );
         frame(&mut app, &ctx, vec![moved(kb + egui::vec2(40.0, 0.0))]);
         assert!(
             egui::DragAndDrop::has_payload_of_type::<FolderDrag>(&ctx),
@@ -39333,13 +39707,20 @@ mod tests {
         );
         let ka = galley_centers(&mut app, &ctx, "kit-a", false)[0];
         frame(&mut app, &ctx, vec![moved(ka)]);
-        frame(&mut app, &ctx, vec![btn(ka, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(ka, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(
             samples.join("kit-a/kit-b/deep.wav").exists(),
             "the whole kit-b subtree must nest under kit-a"
         );
-        assert!(!samples.join("kit-b/deep.wav").exists(), "old path must be gone");
+        assert!(
+            !samples.join("kit-b/deep.wav").exists(),
+            "old path must be gone"
+        );
         let pref = app
             .rack_dir_order
             .iter()
@@ -39366,14 +39747,25 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let h = galley_centers(&mut app, &ctx, "kit-a/dry", false)[0];
         frame(&mut app, &ctx, vec![moved(h)]);
-        frame(&mut app, &ctx, vec![btn(h, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(h, egui::PointerButton::Primary, true)],
+        );
         frame(&mut app, &ctx, vec![moved(h + egui::vec2(40.0, 0.0))]);
         assert!(egui::DragAndDrop::has_payload_of_type::<FolderDrag>(&ctx));
         let t = galley_centers(&mut app, &ctx, "samples [primary]", true)[0];
         frame(&mut app, &ctx, vec![moved(t)]);
-        frame(&mut app, &ctx, vec![btn(t, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(t, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        assert!(samples.join("dry/one.wav").exists(), "kit-a/dry must land at the root");
+        assert!(
+            samples.join("dry/one.wav").exists(),
+            "kit-a/dry must land at the root"
+        );
         assert!(!samples.join("kit-a/dry").exists());
     }
 
@@ -39392,14 +39784,25 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let hat = galley_centers(&mut app, &ctx, "hat", true)[0];
         frame(&mut app, &ctx, vec![moved(hat)]);
-        frame(&mut app, &ctx, vec![btn(hat, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(hat, egui::PointerButton::Primary, true)],
+        );
         frame(&mut app, &ctx, vec![moved(hat + egui::vec2(40.0, 0.0))]);
         assert!(egui::DragAndDrop::has_payload_of_type::<usize>(&ctx));
         let t = galley_centers(&mut app, &ctx, "samples [primary]", true)[0];
         frame(&mut app, &ctx, vec![moved(t)]);
-        frame(&mut app, &ctx, vec![btn(t, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(t, egui::PointerButton::Primary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        assert!(samples.join("hat.wav").exists(), "the drop must lift hat out of kit-b");
+        assert!(
+            samples.join("hat.wav").exists(),
+            "the drop must lift hat out of kit-b"
+        );
         assert!(!samples.join("kit-b/hat.wav").exists());
     }
 
@@ -39421,7 +39824,11 @@ mod tests {
         let kb = galley_centers(&mut app, &ctx, "kit-b", false)[0];
         rmb(&mut app, &ctx, kb);
         click_label(&mut app, &ctx, "use for recordings");
-        assert_eq!(app.record_dir(), samples.join("kit-b"), "menu must set the target");
+        assert_eq!(
+            app.record_dir(),
+            samples.join("kit-b"),
+            "menu must set the target"
+        );
         // The chosen folder carries a marker while it is the target.
         frame(&mut app, &ctx, vec![]);
         assert!(
@@ -39431,7 +39838,10 @@ mod tests {
         // Persisted across a config reload.
         app.save_config();
         let cfg = crate::config::Config::load();
-        assert_eq!(cfg.record_target, samples.join("kit-b").display().to_string());
+        assert_eq!(
+            cfg.record_target,
+            samples.join("kit-b").display().to_string()
+        );
         // Clearing via the folder TITLE row menu (a fresh anchor: egui
         // 0.36 popups keyed on a ui.interact response do not reliably
         // re-arm on that same response within one session — every other
@@ -39477,9 +39887,15 @@ mod tests {
         // Confirming opens the existing slice chooser, then imports.
         click_exact(&mut app, &ctx, "demo");
         click_last(&mut app, &ctx, "Load");
-        assert!(app.show_load_opts && app.pending_proj.is_some(), "confirm -> slice chooser");
+        assert!(
+            app.show_load_opts && app.pending_proj.is_some(),
+            "confirm -> slice chooser"
+        );
         assert!(app.proj_confirm.is_none());
         click_last(&mut app, &ctx, "Import");
-        assert_eq!(app.proj_name, "demo", "import must go through the existing pipeline");
+        assert_eq!(
+            app.proj_name, "demo",
+            "import must go through the existing pipeline"
+        );
     }
 }
