@@ -819,6 +819,18 @@ impl Config {
             cfg.vol_scale_v2 = true;
             cfg.save().ok();
         }
+        // W12d (WINDOWS-PORT): a config written on the other OS may carry
+        // absolute paths that are legal *relative* junk here (C:\… on Linux,
+        // /home/… on Windows) — create-or-seed consumers would write into
+        // them. Drop those shapes and fall back to this OS's defaults; the
+        // next normal save persists the cleaned config (the other OS's
+        // folders are unrecoverable by syntax anyway — its pickers refill).
+        let foreign = cfg.drop_foreign_paths();
+        if foreign > 0 {
+            eprintln!(
+                "[slooper] config: dropped {foreign} path(s) of the other OS — this OS's defaults apply"
+            );
+        }
         cfg
     }
 
@@ -848,6 +860,40 @@ impl Config {
             .iter()
             .find(|b| b.action == a)
             .and_then(|b| b.bind)
+    }
+
+    /// W12d (WINDOWS-PORT): drop every user path whose syntax belongs to
+    /// the *other* OS — see [`crate::paths::path_is_foreign`] for why such
+    /// strings are legal junk on the receiving OS. `Config::load` calls
+    /// this on every launch; a same-OS config never matches (return 0).
+    ///
+    /// Fields that feed create-or-seed consumers get cleaned:
+    /// `project_dir`/`fx_dir` are blanked (⇒ per-OS defaults),
+    /// `rack_folders`/`vst_dirs` lose the foreign entries (an emptied rack
+    /// list falls back to the samples root like a first launch would),
+    /// and `dir_memo` forgets folders this OS cannot open. The inert
+    /// view caches (`editor_probe`, `rack_collapsed`, `rack_dir_order`)
+    /// are deliberately NOT touched — their stale keys can never hit and
+    /// dropping them would break the round trip back to the owning OS.
+    /// Returns the number of dropped/blanked entries.
+    pub fn drop_foreign_paths(&mut self) -> usize {
+        let mut n = 0usize;
+        for f in [&mut self.project_dir, &mut self.fx_dir] {
+            if crate::paths::path_is_foreign(f) {
+                f.clear();
+                n += 1;
+            }
+        }
+        for v in [&mut self.rack_folders, &mut self.vst_dirs] {
+            let before = v.len();
+            v.retain(|p| !crate::paths::path_is_foreign(p));
+            n += before - v.len();
+        }
+        let before = self.dir_memo.len();
+        self.dir_memo
+            .retain(|_, v| !crate::paths::path_is_foreign(v));
+        n += before - self.dir_memo.len();
+        n
     }
 }
 
@@ -901,6 +947,135 @@ mod tests {
         );
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.win_midi_inputs, cfg.win_midi_inputs, "round-trips verbatim");
+    }
+
+    /// Restores `SLOOPER_CONFIG_DIR` and drops the sandbox even when an
+    /// assertion panics mid-test (leaked config dirs poison every later
+    /// test that calls `Config::load`).
+    struct ConfigSandbox(PathBuf);
+
+    impl ConfigSandbox {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("sp-w12d-{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_var("SLOOPER_CONFIG_DIR", &dir);
+            ConfigSandbox(dir)
+        }
+    }
+
+    impl Drop for ConfigSandbox {
+        fn drop(&mut self) {
+            std::env::remove_var("SLOOPER_CONFIG_DIR");
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn w12d_path_shape_foreign_rules() {
+        // W12d: the syntax detector behind the config round trip. Every OS
+        // asserts its own truth (runs in both CI lanes).
+        use crate::paths::path_is_foreign;
+        // Never foreign: empty/blank, relative names of every kind, and
+        // this OS's absolute paths.
+        assert!(!path_is_foreign(""));
+        assert!(!path_is_foreign("   "));
+        assert!(!path_is_foreign("relative/dir"));
+        assert!(!path_is_foreign("C:foo"), "drive-RELATIVE is not claimed");
+        if cfg!(windows) {
+            assert!(!path_is_foreign(r"C:\Users\studio\rack"));
+            assert!(!path_is_foreign("C:/Users/studio/rack"));
+            assert!(!path_is_foreign(r"\\srv\share\rack"), "UNC is native");
+            assert!(path_is_foreign("/home/studio/rack"), "Unix root = drive junk");
+            assert!(path_is_foreign("  /tmp/x  "), "checked after trim");
+        } else {
+            assert!(!path_is_foreign("/home/studio/rack"));
+            assert!(!path_is_foreign(r"back\slash-name"), "legal POSIX name");
+            assert!(path_is_foreign(r"C:\Users\studio\rack"), "drive root");
+            assert!(path_is_foreign("C:/Users/studio/rack"));
+            assert!(path_is_foreign("C:"), "bare drive root");
+            assert!(path_is_foreign(r"\\srv\share\rack"), "UNC cannot exist here");
+        }
+    }
+
+    #[test]
+    fn w12d_verbatim_other_os_json_parses_then_filters() {
+        // The JSON layer itself is OS-neutral: a Windows-written config
+        // parses losslessly ANYWHERE (paths untouched until the load-level
+        // filter). Escaping matches what serde on Windows actually writes.
+        let win = r#"{"project_dir":"C:\\Users\\studio\\proj","fx_dir":"C:\\Users\\studio\\fx","rack_folders":["C:\\rack","D:\\takes"],"vst_dirs":["D:\\VST2"],"dir_memo":{"export":"C:\\out"},"metro_bpm":96,"win_midi_inputs":["KeyStage 61"]}"#;
+        let cfg: Config = serde_json::from_str(win).expect("other-OS config must parse");
+        assert_eq!(cfg.fx_dir, r"C:\Users\studio\fx", "parse is verbatim");
+        assert_eq!(cfg.rack_folders.len(), 2);
+        let mut cfg = cfg;
+        let dropped = cfg.drop_foreign_paths();
+        if cfg!(windows) {
+            assert_eq!(dropped, 0, "a Windows config is native on Windows");
+            assert_eq!(cfg.fx_dir, r"C:\Users\studio\fx");
+            assert_eq!(cfg.rack_folders.len(), 2);
+        } else {
+            // project_dir + fx_dir + 2 rack folders + 1 vst dir + 1 memo
+            assert_eq!(dropped, 6, "every drive path counted");
+            assert!(cfg.project_dir.is_empty() && cfg.fx_dir.is_empty());
+            assert!(cfg.rack_folders.is_empty() && cfg.vst_dirs.is_empty());
+            assert!(!cfg.dir_memo.contains_key("export"));
+            assert_eq!(cfg.metro_bpm, 96, "non-path fields untouched");
+            assert_eq!(cfg.win_midi_inputs, ["KeyStage 61"]);
+        }
+    }
+
+    #[test]
+    fn w12d_load_end_to_end_keeps_local_drops_foreign() {
+        // The real entry point: a config file on disk (written from the
+        // other OS, carrying BOTH path shapes as values) loads with
+        // exactly the foreign ones gone and ours — including relative
+        // entries — intact. The fx_dir assert guards the worst junk-write
+        // consumer: prepare_effects_dir seeds bundled scripts into it.
+        let _sb = ConfigSandbox::new("load");
+        let (foreign, local) = if cfg!(windows) {
+            ("/home/studio/rack".to_string(), "C:\\Users\\studio\\rack".to_string())
+        } else {
+            ("C:\\Users\\studio\\rack".to_string(), "/tmp/w12d-rack".to_string())
+        };
+        let cfg0 = Config {
+            project_dir: foreign.clone(),
+            fx_dir: foreign.clone(),
+            rack_folders: vec![foreign.clone(), local.clone(), "relative-pack".into()],
+            vst_dirs: vec![foreign.clone()],
+            dir_memo: [
+                ("export".to_string(), foreign.clone()),
+                ("rack".to_string(), local.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            editor_probe: [(foreign.clone(), (1234, true))].into_iter().collect(),
+            rack_collapsed: [format!("{foreign}\u{1}kit-a")].into_iter().collect(),
+            ..Config::default()
+        };
+        cfg0.save().unwrap();
+        let cfg = Config::load();
+        assert!(cfg.project_dir.is_empty(), "foreign project_dir dropped");
+        assert!(cfg.fx_dir.is_empty(), "fx_dir must NEVER seed into foreign here");
+        assert_eq!(
+            cfg.rack_folders,
+            vec![local.clone(), "relative-pack".to_string()],
+            "local + relative rack folders survive"
+        );
+        assert!(cfg.vst_dirs.is_empty());
+        assert_eq!(
+            cfg.dir_memo.get("rack").map(String::as_str),
+            Some(local.as_str())
+        );
+        assert!(!cfg.dir_memo.contains_key("export"));
+        // Inert view caches stay verbatim (their keys can never hit here,
+        // and dropping them would break the round trip back).
+        assert!(cfg.editor_probe.contains_key(&foreign));
+        assert!(cfg
+            .rack_collapsed
+            .contains(&format!("{foreign}\u{1}kit-a")));
+        // Deterministic across loads (load does not half-persist shapes).
+        let again = Config::load();
+        assert_eq!(again.rack_folders, cfg.rack_folders);
     }
 
     #[test]

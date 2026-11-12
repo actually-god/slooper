@@ -11760,7 +11760,13 @@ impl App {
     fn finish_load(&mut self, pr: &project::Project, skipped_binds: usize, missing: usize) {
         self.proj_name = pr.name.clone();
         // v34 R8: the project remembers where its pickers were.
+        // W12d: a project file carried from the other OS can name folders
+        // in that OS's path syntax — legal relative junk here, so foreign
+        // entries never enter the memo (config would persist them).
         for (k, v) in &pr.dirs {
+            if crate::paths::path_is_foreign(v) {
+                continue;
+            }
             self.dir_memo.insert(k.clone(), v.clone());
         }
         self.show_load = false;
@@ -24957,6 +24963,35 @@ mod tests {
         assert_eq!(app.selected, 7, "never past the configured last track");
         app.fire_midi_action(crate::midi::MidiAction::SelectPrev);
         assert_eq!(app.selected, 6);
+    }
+
+    #[test]
+    fn w12d_foreign_project_dir_memo_never_loads() {
+        // W12d: a `.slooper` file carried from the other OS must not
+        // smuggle that OS's absolute-path syntax into the picker memo —
+        // the memo is saved into config and drives dialog start folders.
+        let mut app = headless_app("w12dmemo");
+        let (foreign, local) = if cfg!(windows) {
+            ("/home/studio/export", "C:\\Users\\studio\\export")
+        } else {
+            ("C:\\Users\\studio\\export", "/tmp/w12d-local")
+        };
+        let mut pr = app.build_project("w12d".into());
+        pr.dirs = vec![
+            ("export".to_string(), foreign.to_string()),
+            ("rack".to_string(), local.to_string()),
+        ];
+        let path = crate::project::project_path(&app.projects_dir(), "w12d");
+        crate::project::save(&path, &pr).unwrap();
+        app.dir_memo.remove("export");
+        app.dir_memo.remove("rack");
+        app.do_load(&path);
+        assert_eq!(app.proj_name, "w12d", "finish_load actually ran");
+        assert_eq!(app.dir_memo.get("rack").map(String::as_str), Some(local));
+        assert!(
+            !app.dir_memo.contains_key("export"),
+            "the other OS's folder must not enter the memo"
+        );
     }
 
     #[test]
