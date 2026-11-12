@@ -29506,6 +29506,97 @@ mod tests {
         );
     }
 
+    /// v51: the sampler key-map window paints once per frame, and its
+    /// first open materializes the legacy single-asset params as slot 0
+    /// at the track's current root (the map becomes the single truth).
+    #[test]
+    fn v51_sampler_map_window_paints_and_seeds_legacy() {
+        let mut app = headless_app("v51map");
+        let ctx = egui::Context::default();
+        // The rack folder scan is async (drum-machine test idiom) — the
+        // seed needs the kick asset to have landed before the bind.
+        for _ in 0..800 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.assets.iter().any(|a| a.name == "kick") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.set_track_synth_stem(0, "sampler");
+        frame(&mut app, &ctx, vec![]);
+        // Give the sampler a real legacy patch first (rack click, v13
+        // recipe) so the seed has an asset to materialize.
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        frame(&mut app, &ctx, vec![moved(kick.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        );
+        app.synth_win = None;
+        frame(&mut app, &ctx, vec![]);
+        // No map yet (never opened) — the engine still runs legacy params.
+        assert!(app.sampler_maps[0].is_none(), "unopened track has no map");
+        app.smap_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let seeded = app.sampler_maps[0].clone().expect("open seeds a map");
+        assert_eq!(seeded.mode, 0, "default mode is hard cutoff");
+        assert_eq!(seeded.slots.len(), 1, "legacy params seed one slot");
+        assert_eq!(seeded.slots[0].root, 48, "root follows the old param");
+        // The window chrome + header paint exactly once (no ghost twin).
+        let texts = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let g: Vec<String> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        return Some(t.galley.text().trim().to_string());
+                    }
+                    None
+                })
+                .collect();
+            out.textures_delta.clear();
+            g
+        };
+        let g = texts(&mut app, &ctx);
+        for needle in [
+            "hard cutoff",
+            "crossfade",
+            "+ add sample",
+            "1 mapped",
+            "C2",
+            "C6",
+        ] {
+            assert_eq!(
+                g.iter().filter(|s| s.as_str() == needle).count(),
+                1,
+                "map window must paint {needle:?} exactly once, got: {g:?}"
+            );
+        }
+        // Guard: a NON-sampler track can't keep the window open.
+        app.set_track_synth_stem(0, "piano");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.smap_win, None, "window closes when the sampler unbinds");
+    }
+
     /// v0.9: bare S splits the selected clip at the playhead; the clip
     /// property strip (gain / fade in / fade out) paints for exactly one
     /// selection and hides otherwise.
