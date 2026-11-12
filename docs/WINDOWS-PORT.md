@@ -96,8 +96,19 @@ scripts into whatever the config names), `project_dir`, `rack_folders`,
 same way (`.slooper` files travel too). Inert view caches
 (`editor_probe`/`rack_collapsed`/`rack_dir_order`) stay verbatim for the
 trip back. `w12d_*` pins x4 (bare `w12` CI filter already covers).
-NEXT: W12 remainder (native JACK-on-Windows mode, minidump story —
-unpicked). The next real version tag publishes both assets automatically.
+W12e DONE 2026-11-12 (session 20, see DONE log): the Windows
+fatal-crash story — `src/crash.rs`: the unhandled-exception filter writes a
+REAL minidump + a text note + a message box (`SLOOPER_CRASH_QUIET=1`
+silences it) into `paths::crash_dir()` (`SLOOPER_CRASH_DIR` override; the
+newest 10 EVENTS survive, a dump and its note age on one stem), a Rust panic
+gets a note with a backtrace and no box, and `SLOOPER_CRASH_ME=panic|fault`
+is the startup self-test switch that two CI CHILD pins drive against the
+staged app exe. The shipping Windows exe builds from `[profile.winrel]`
+(release + symbols) so dumps resolve to function names — release.yml AND the
+ci.yml release-proof step now use that profile. Linux stays fully inert
+(bare no-op twins, pinned). NEXT = the last W12 item (native JACK-on-Windows
+mode) plus whatever the Windows report-only suite surfaces. The next real
+version tag publishes both assets automatically.
 
 ## Ground rules (apply to every task)
 
@@ -494,7 +505,13 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   round-trip across OSes: foreign-syntax absolute paths dropped at
   `Config::load` (create-or-seed fields only; view caches untouched),
   project dir-memo merge guarded alike
-- [ ] native JACK-on-Windows mode; minidump story — unpicked.
+- [x] **W12e DONE 2026-11-12 (session 20, see DONE log)** — minidump /
+  crash-reporting story: UEF handler → real `.dmp` + note + box
+  (`SLOOPER_CRASH_QUIET`), panic → note only, `paths::crash_dir()`
+  (`SLOOPER_CRASH_DIR`), newest-10-EVENT pruning, the `winrel` shipping
+  profile keeps symbols, and `SLOOPER_CRASH_ME=panic|fault` as the
+  self-test switch two CI child pins drive. Linux inert, pinned both ways.
+- [ ] native JACK-on-Windows mode — the last unpicked W12 item.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
@@ -1175,3 +1192,72 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   rest 533 + vsthost 37 + ui-v23 4, all exit 0; clippy-zero; gnullvm
   `--all-targets` green. Windows truth = CI re-run at this commit
   (`v34_dir_memos...` expected back in the fixed column).
+- **2026-11-12 session 20 — W12e**: the Windows fatal-crash story. New
+  `src/crash.rs` (OS seam: `install`/`note_panic`/`note_crash`/`self_test`
+  all have BARE no-op Linux twins):
+  (a) HARD FAULT — a `SetUnhandledExceptionFilter` filter (last resort: the
+  ffiguard firewall and any plugin `__try` keep first refusal) writes
+  `MiniDumpWriteDump(MiniDumpNormal | MiniDumpWithIndirectlyReferencedMemory)`
+  with the real `EXCEPTION_POINTERS` (WinDbg opens on the faulting frame),
+  then a text note (exception-code hex, `ExceptionAddress`,
+  `minidump written: …`), prunes, then `MessageBoxW` naming the folder unless
+  `SLOOPER_CRASH_QUIET`, and returns `EXCEPTION_EXECUTE_HANDLER` — never
+  CONTINUE_SEARCH (that would stack WER's dialog on ours). Re-entrancy = an
+  AtomicBool guard: a fault inside the writer falls straight through.
+  (b) PANIC — main's v42 hook calls `note_panic` BEFORE its eprintln+abort:
+  note ONLY (message + location + `Backtrace::force_capture`), no dump (the
+  interesting stack is already gone) and NO box — a panic inside a probe
+  child or an automation run must never pop a modal on a runner.
+  (c) FILES — `paths::crash_dir()` = `<data_dir>/crashes`
+  (`%LOCALAPPDATA%\slooper\crashes`; `SLOOPER_CRASH_DIR` override = the W12d
+  bleed rule extended to crash artifacts), created ONLY by a writer. One
+  event = one stem `slooper-crash-<fixed-width epoch>-<code>`, so a
+  lexicographic walk IS chronological; `prune_plan` keeps the newest
+  `CRASH_KEEP`=10 stems and drops older ones WHOLE (`.dmp`+`.txt` share the
+  stem) and never touches a foreign name. UTC stamp = days-from-civil
+  arithmetic (no chrono, no new API in a crash path).
+  (d) SHIPPING SYMBOLS — `[profile.winrel]` (inherits release, strip=false,
+  debug=1): release.yml's windows job AND ci.yml's windows-native "release
+  build proof" now both build it, so the profile that ships is the profile
+  that is compile-proven; that is what lets a dump resolve to
+  module+function with no PDB hunt. Linux keeps `release`/strip=true.
+  (e) SELF-TEST — `SLOOPER_CRASH_ME=panic|fault`, armed by `install()` AFTER
+  the filter is set. A process-level filter cannot be exercised in-process,
+  so this switch is the only way to prove the chain end to end; the WORDS are
+  parsed OS-neutrally (`crash_me_mode`, pinned on Linux; any other value =
+  inert, so a typo cannot kill a user's DAW) and only the Windows `self_test`
+  acts (`read_volatile(null)` — volatile so optimization can't fold the
+  fault away). Probe children never install the guard (main dispatches them
+  first), so a crash-testing probe spams no dumps.
+  Pins `w12e_*` x14 (9 Linux-executable + 5 `#[cfg(windows)]` = CI-only).
+  THE SABOTAGE PASS CAUGHT A REAL PIN HOLE: `w12e_main_wires_the_guard_early`
+  was a plain `contains` — commenting the `note_panic` call out kept it GREEN
+  (the needle survives inside the comment). Fixed with an `active_call`
+  helper that skips `//`/`///` lines; both sabotages (comment-out, and
+  `EXCEPTION_CONTINUE_SEARCH` for `_EXECUTE_HANDLER`) then went RED together
+  and GREEN on revert. The Windows-only CHILD pins spawn the CI-STAGED app
+  exe (`SLOOPER_PROBE_EXE`) and deliberately NOT the build.rs-baked
+  `SLOOPER_EXE_PATH`: under `cargo test` that path holds the libtest harness,
+  and execing it would run the suite (recursion) instead of the app.
+  `=panic` → exactly one `-panic.txt`, backtrace inside, NO `.dmp`, and the
+  child's stderr carries the tripwire message (identity check); `=fault` →
+  `-c0000005.dmp` (MDMP magic, >4 KB) + same-stem `.txt` saying
+  `minidump written: true`. The wait is BOUNDED (90 s then kill + FAIL): a
+  guard that never fires must fail the job, not hang it.
+  Gates: citest `crash::` 9/9; clippy-zero 0 (one real `single_match` in
+  `prune_plan` fixed); gnullvm `--all-targets` ZERO errors — and PROVEN to
+  compile the windows-only TEST fns (a type error planted inside a
+  `#[cfg(windows)]` pin surfaced as `error[E0308]` there), which is the only
+  reason its 1-second "Finished" cache runs are trustworthy; 3-chunk lib
+  protocol rest 540/541 + vsthost 37/37 + ui-v23 4/4, the single fail
+  `chain_window_adds_scanned_plugin_slot` RE-PASSED SOLO (8.05 s) with
+  `DISPLAY=:1 WAYLAND_DISPLAY=wayland-1
+  XAUTHORITY=/run/user/1000/xauth_AvdKci` exported = the boot-known
+  agent-shell-has-no-X class, not a regression;
+  `cargo check --profile winrel --target x86_64-pc-windows-gnullvm
+  --all-targets` green (33 s) = the new shipping profile type-checks
+  Windows-side. e2e NOT RUN: no JACK server on this boot and NO_START means
+  no server gets started for a test; nothing here touches the RT path
+  (`install()` sits before `Backend::start`, Linux twin empty). Windows
+  truth = the CI windows-native run at this commit (the 4 new pins get real
+  execution there, and `winrel` gets its MSVC build proof).

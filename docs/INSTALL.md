@@ -188,6 +188,38 @@ toolchain recipe.
     RT thread runs in the MMCSS "Pro Audio" scheduler class when your
     system has it (visible in Resource Monitor → CPU → Priority Boost
     `Higher` on the audio thread; else the thread is time-critical).
+11. **Crash receipts (W12e)**: `set SLOOPER_CRASH_DIR=%TEMP%\slooper-crashes`
+    and `set SLOOPER_CRASH_ME=fault`, then start slooper — it dies at once, a
+    dialog names the folder, and that folder holds
+    `slooper-crash-<epoch>-c0000005.dmp` (first four bytes `MDMP`; WinDbg
+    opens it on the faulting frame) plus the matching `.txt`. Repeat with
+    `SLOOPER_CRASH_ME=panic`: a `-panic.txt` note with the panic message and a
+    backtrace, no `.dmp`, no dialog. `set SLOOPER_CRASH_ME=` when done.
+
+### If slooper crashes (W12e)
+
+`slooper.exe` is a windowed app with no console, so a fatal error used to mean
+a silent disappearance. Now it leaves receipts in
+`%LOCALAPPDATA%\slooper\crashes\` (set `SLOOPER_CRASH_DIR` to move them):
+
+- **Hard fault** (access violation, or a plugin's C++ throw that escapes every
+  guard): `slooper-crash-<epoch>-<ntstatus>.dmp` — a real Windows minidump that
+  opens in WinDbg on the faulting frame — plus its `.txt` note (exception code,
+  faulting address, whether the dump was written). A dialog names the folder
+  before the process exits; `SLOOPER_CRASH_QUIET=1` silences the dialog for
+  unattended runs.
+- **Rust panic**: a `.txt` note only — panic message, location and a captured
+  backtrace — and no dialog (a stray panic inside a probe child or an
+  automation run must never pop a modal). The process still aborts by design.
+
+The ten newest events are kept and an event's `.dmp` + `.txt` disappear
+together. Nothing leaves your machine unless you attach it to a bug report:
+for a crash, include the `.txt` (plus the `.dmp` for hard faults) and the
+project file. The shipped exe keeps its symbols (the `winrel` build profile,
+`release.yml`) so dumps resolve to module + function names with no PDB hunt.
+
+Linux is untouched by all of this: the handler is Windows-only and Linux
+forensics stay `coredumpctl`.
 
 ## Uninstalling
 
