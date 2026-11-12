@@ -106,9 +106,17 @@ is the startup self-test switch that two CI CHILD pins drive against the
 staged app exe. The shipping Windows exe builds from `[profile.winrel]`
 (release + symbols) so dumps resolve to function names — release.yml AND the
 ci.yml release-proof step now use that profile. Linux stays fully inert
-(bare no-op twins, pinned). NEXT = the last W12 item (native JACK-on-Windows
-mode) plus whatever the Windows report-only suite surfaces. The next real
-version tag publishes both assets automatically.
+(bare no-op twins, pinned).
+W13a DONE 2026-11-12 (session 21, see DONE log): the linux release asset
+now BUILDS on the floor distro (release.yml linux job: ubuntu-22.04, glibc
+2.35) and a CI step asserts max GLIBC_*/GLIBCXX_*/CXXABI_* demand of the
+BUILT exe against floors 2.35/3.4.30/1.9.15. Measured (local ubuntu:22.04
+docker build): floor build demands GLIBC exactly 2.35; C++ demand only
+GLIBCXX_3.4/CXXABI_1.3. The Arch binary (GLIBC_2.43) fails the same
+assert — sabotage-proved. NEXT = W13b (distro smoke matrix), the last W12
+item (native JACK-on-Windows mode), or whatever the Windows report-only
+suite surfaces. The next real version tag publishes both assets
+automatically.
 
 ## Ground rules (apply to every task)
 
@@ -527,14 +535,9 @@ Today the linux tar.zst is built on ubuntu-24.04 (glibc 2.39) and the AUR pkg
 on Arch (2.43+): neither runs on the older tier. Fix direction = build the
 portable asset on the OLDEST distro we support, never the newest.
 
-- [ ] **W13a — pick the floor and build the asset there.** Propose glibc ≥
-  2.35 (Ubuntu 22.04 / Debian 12 / Fedora 38). Build the release linux asset
-  in an `ubuntu:22.04` container job (apt deps = the ci.yml list) and add a
-  CI assertion that the max `GLIBC_*` the exe requires (`objdump -T … |
-  grep -o 'GLIBC_[0-9.]+' | sort -uV | tail -1`) is ≤ the floor — plus the
-  same check for `GLIBCXX_*`/`CXXABI_*` (the ffiguard C++ shim links
-  libstdc++; a static-libstdc++ link is the fallback if the baseline can't
-  be met otherwise).
+- [x] **W13a DONE 2026-11-12 (session 21, see DONE log)** — floor picked
+  (glibc ≥ 2.35), release linux asset built on ubuntu-22.04, CI asserts the
+  exe's GLIBC/GLIBCXX/CXXABI demand against the floors (sabotage-proved).
 - [ ] **W13b — distro smoke matrix.** Containers arch / debian:12 /
   ubuntu:22.04 / fedora:40 install only the RUNTIME libs (libx11-6, libxcb1,
   libjack-jackd2-0 …) and execute the SHIPPED asset (not a rebuild) through
@@ -1348,3 +1351,37 @@ portable asset on the OLDEST distro we support, never the newest.
   on `a047600` prints all 13 executable `w12e_*` pins `ok`, including
   `w12e_windows_self_test_fault_writes_a_real_minidump` (the one that caught
   it) — dump and note now share one stem on real Windows.
+- **2026-11-12 session 21 — W13a** (Linux-distro portability, first W13
+  task): floor picked = **glibc ≥ 2.35** (Ubuntu 22.04 / Debian 12 /
+  Fedora 38 tier; Debian 12 actually carries 2.36, so 2.35 is a true floor).
+  `release.yml` linux job: `runs-on: ubuntu-24.04` → **`ubuntu-22.04`**
+  (still a supported GitHub runner label as of today's docs check; plus a
+  `rustup update stable` step — the image's preinstalled toolchain can lag)
+  and a new **"Portability floor assert"** step right after Build: for each
+  family in {GLIBC, GLIBCXX, CXXABI} it takes
+  `objdump -T | grep -oE '<fam>_[0-9.]+' | sed | sort -uV | tail -1` off
+  the built exe and FAILS the job if the demand exceeds the job-env floors
+  2.35 / 3.4.30 / 1.9.15 (floors = what the OLDEST supported distro's
+  libc/libstdc++ provides, not what we happen to build), then prints the
+  NEEDED list. Measurement BEFORE choosing constants: a real
+  `ubuntu:22.04` docker build on this host (`git archive HEAD` → tarball →
+  bind-mount, deps = the ci.yml apt list + build-essential, rustup into a
+  volume) — result: floor build demands **GLIBC exactly 2.35** (passes the
+  2.35 floor, zero headroom needed), and only **GLIBCXX_3.4 / CXXABI_1.3**
+  for the C++ side (ffiguard's shim is minimal C++; the 3.4.30/1.9.15
+  floors have enormous headroom — the static-libstdc++ fallback was NOT
+  needed). NEEDED = libX11, libstdc++, libgcc_s, libm, libc — matches the
+  W13 preamble (jack/Wayland/GL stay dlopen'd, so runtime deps = those two
+  packages + their chains on every distro). SABOTAGE-PROOF: the same assert
+  run against the ARCH-built exe fails (`exe requires GLIBC 2.43` ,
+  exit 1) — the compare logic genuinely bites. LESSONS: (1) measure the
+  floor in a local `ubuntu:22.04` docker container first — minutes of
+  CI-free truth, and the container's rustup/registry in a reused volume
+  makes rebuilds cheap; keep the container below host CPUs (`--cpus=6`)
+  when the backend is a local LLM. (2) The versioned-symbol demand of a
+  C++ shim is NOT the compiler's version — minimal C++ demands only base
+  GLIBCXX_3.4/CXXABI_1.3; never size a floor from `gcc --version`.
+  NOT pinned with a Rust test (the assert lives in the workflow, and its
+  inputs — the runner's libc — are untestable from the lib suite); the
+  sabotage run above is the pin-equivalent. W13b (per-distro smoke of the
+  shipped artifact) is the runtime-side proof and stays open.

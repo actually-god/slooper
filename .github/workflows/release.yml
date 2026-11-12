@@ -32,14 +32,31 @@ env:
 
 jobs:
   linux:
-    name: Linux asset (tar.zst)
-    runs-on: ubuntu-24.04
+    # W13a (docs/WINDOWS-PORT.md): this asset MUST be built on the FLOOR
+    # distro — the oldest supported glibc — because a binary carries the
+    # glibc version symbols of its BUILD machine. ubuntu-22.04 = glibc 2.35
+    # = Ubuntu 22.04 / Debian 12 / Fedora 38 tier. Never bump this runner
+    # back up without re-deciding the floor. The floor symbols of the
+    # SHIPPED exe are asserted below, so a silent drift fails the pipeline.
+    name: Linux asset (tar.zst, floor distro)
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      # W13a portability floors: max versioned symbols the exe may require.
+      # Floors = what the OLDEST supported distro's runtime provides:
+      #   glibc 2.35        (Ubuntu 22.04 base; Debian 12 = 2.36)
+      #   GLIBCXX 3.4.30    (libstdc++ GCC 12 = Ubuntu 22.04 / Debian 12)
+      #   CXXABI  1.9.15    (same GCC 12 runtime)
+      GLIBC_FLOOR: "2.35"
+      GLIBCXX_FLOOR: "3.4.30"
+      CXXABI_FLOOR: "1.9.15"
     steps:
       - uses: actions/checkout@v4
       - uses: swatinem/rust-cache@v2
         with:
-          key: release-linux
+          key: release-linux-floor
+      - name: Toolchain (runner image may lag stable)
+        run: rustup update stable && rustup default stable
       - name: System deps
         run: |
           sudo apt-get update
@@ -48,6 +65,33 @@ jobs:
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev zstd
       - name: Build (shipping profile)
         run: cargo build --release --locked
+      # W13a: assert the SHIPPED exe's versioned-symbol demand against the
+      # floor (never trust "it built on 22.04" — measure the artifact).
+      # GLIBC_* comes from the floor distro's libc; GLIBCXX_*/CXXABI_* from
+      # its libstdc++ (the ffiguard C++ shim links it dynamically).
+      - name: Portability floor assert
+        run: |
+          set -euo pipefail
+          B=target/release/slooper
+          fail=0
+          for fam in GLIBC GLIBCXX CXXABI; do
+            floor_var="${fam}_FLOOR"
+            want="${!floor_var}"
+            got="$(objdump -T "$B" | grep -oE "${fam}_[0-9.]+" | sed "s/^${fam}_//" | sort -uV | tail -1)"
+            if [ -z "$got" ]; then
+              echo "::error::no ${fam}_* symbols found — did objdump run at all?"
+              fail=1; continue
+            fi
+            newest="$(printf '%s\n%s\n' "$got" "$want" | sort -V | tail -1)"
+            if [ "$newest" != "$want" ]; then
+              echo "::error::exe requires ${fam} $got but the support floor is $want — the asset would not load on the oldest supported distro"
+              fail=1
+            else
+              echo "OK: max ${fam} requirement $got <= floor $want"
+            fi
+          done
+          objdump -p "$B" | grep NEEDED
+          exit $fail
       - name: Stage + pack
         run: |
           set -euo pipefail
