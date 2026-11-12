@@ -1344,4 +1344,7 @@ portable asset on the OLDEST distro we support, never the newest.
   `w12e_hard_fault_terminates_after_the_dump` now asserts (on the
   whitespace-collapsed handler body) that BOTH writers get the SAME `ts`, and
   re-sabotaging the call back to `now_secs()` turns that pin RED — so the
-  class cannot come back silently.
+  class cannot come back silently. RE-VERIFIED ON WINDOWS: run `43286322759`
+  on `a047600` prints all 13 executable `w12e_*` pins `ok`, including
+  `w12e_windows_self_test_fault_writes_a_real_minidump` (the one that caught
+  it) — dump and note now share one stem on real Windows.
