@@ -1256,8 +1256,8 @@ portable asset on the OLDEST distro we support, never the newest.
   (d) SHIPPING SYMBOLS — `[profile.winrel]` (inherits release, strip=false,
   debug=1): release.yml's windows job AND ci.yml's windows-native "release
   build proof" now both build it, so the profile that ships is the profile
-  that is compile-proven; that is what lets a dump resolve to
-  module+function with no PDB hunt. Linux keeps `release`/strip=true.
+  that is compile-proven. Linux keeps `release`/strip=true. SEE THE
+  CORRIGENDUM BELOW for what that profile actually buys on MSVC.
   (e) SELF-TEST — `SLOOPER_CRASH_ME=panic|fault`, armed by `install()` AFTER
   the filter is set. A process-level filter cannot be exercised in-process,
   so this switch is the only way to prove the chain end to end; the WORDS are
@@ -1296,5 +1296,31 @@ portable asset on the OLDEST distro we support, never the newest.
   Windows-side. e2e NOT RUN: no JACK server on this boot and NO_START means
   no server gets started for a test; nothing here touches the RT path
   (`install()` sits before `Backend::start`, Linux twin empty). Windows
-  truth = the CI windows-native run at this commit (the 4 new pins get real
+  truth = the CI windows-native run at this commit (the 5 new pins get real
   execution there, and `winrel` gets its MSVC build proof).
+  VERIFIED BY CI (same day, run `43270734131` on `50a66bf`): all three jobs
+  GREEN, and the windows-native port-pin log shows every `w12e_*` pin by
+  name — including `w12e_windows_self_test_fault_writes_a_real_minidump` and
+  `w12e_windows_self_test_panic_writes_only_a_note`, i.e. a real child
+  process really died of an access violation and the handler really produced
+  an MDMP-magic dump + same-stem note on Windows.
+  CORRIGENDUM — THE SYMBOL CLAIM WAS WRONG AS SHIPPED, caught by walking the
+  first winrel ARTIFACT (draft-release exe from run `43271527476`, 16.9 MB):
+  subsystem 2 and the icon `.rsrc` (303 KB) are there, and so is a DEBUG
+  directory — but its only content entry is CODEVIEW/RSDS naming
+  `slooper.pdb`; there is NO COFF symbol table (PointerToSymbolTable = 0) and
+  no `.debug$S`/`.debug$T` section, because MSVC `link.exe` moves ALL debug
+  info into the PDB. A dump alone therefore yields module + RVA + the
+  exception stream, and function names need the PDB of the SAME build (the
+  exe records its identity; that artifact's was
+  `5B917628-EB9C-487F-87F1-B7C6A4510B71` age 1, read out of the RSDS block).
+  gnullvm with `strip = false` behaves differently — GNU ld keeps a COFF
+  `.symtab` in the file — which is exactly why "the profile keeps symbols"
+  must be tested per shipping target, not per profile. Same-day fix
+  (`9de9135`): release.yml asserts `target/winrel/slooper.pdb` exists (a
+  profile that ever stops emitting it now FAILS the release job) and
+  publishes it as a third asset `slooper-win64-pdb.zip` (the user-facing zip
+  stays small); crash.rs's module docs and INSTALL.md's crash section now
+  describe what the exe actually contains and how to point WinDbg at the PDB.
+  LESSON: any "the binary carries X" claim gets verified by parsing the
+  SHIPPED artifact — a profile is a wish, the PE is the fact.
