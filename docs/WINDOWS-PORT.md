@@ -1324,3 +1324,24 @@ portable asset on the OLDEST distro we support, never the newest.
   describe what the exe actually contains and how to point WinDbg at the PDB.
   LESSON: any "the binary carries X" claim gets verified by parsing the
   SHIPPED artifact — a profile is a wish, the PE is the fact.
+  THE FIX IS ALSO VERIFIED ON THE ARTIFACT (run `43280362741` on `9de9135`,
+  the first release with the pdb step: GREEN, `slooper-win64-pdb.zip`
+  published = a 38.6 MB `slooper.pdb`): the new exe's RSDS record reads
+  `5FFE2E3F-AFDB-4899-9122-B370018E9EFB` age 1 and that exact 16-byte GUID
+  appears inside the shipped PDB (two stream offsets) — so the symbols in the
+  release really do match the exe in the same release.
+  THE WINDOWS LANE THEN FOUND A REAL BUG IN THE HANDLER (run `43280270807`,
+  `w12e_windows_self_test_fault_writes_a_real_minidump` FAILED): the dump and
+  the note each called `now_secs()`, and `MiniDumpWriteDump` takes ~1 s, so a
+  crash that started at x.9 wrote `.dmp` on stem `…-x-` and `.txt` on
+  `…-(x+1)-` — one event, two stems, so pruning aged the dump and its note
+  separately and the "same stem" assertion the pin added THIS VERY SESSION
+  broke it. No Linux run could ever have shown this (the path is
+  Windows-only) — the clearest argument yet for the CI child pins. Fix:
+  `write_note_at(dir, ts, …)` now TAKES the event's timestamp, the note-only
+  entry point (`note_crash`) is the only caller that reads the clock, and
+  `uef` passes its `ts` to both writers. The bug is pinned on Linux too:
+  `w12e_hard_fault_terminates_after_the_dump` now asserts (on the
+  whitespace-collapsed handler body) that BOTH writers get the SAME `ts`, and
+  re-sabotaging the call back to `now_secs()` turns that pin RED — so the
+  class cannot come back silently.
