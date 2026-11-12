@@ -23144,6 +23144,13 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        // W12d: on Windows `config_dir()` is %APPDATA% and XDG is inert —
+        // without this override every do_save/do_load in the suite would
+        // contaminate the real user config (proven on the CI windows lane:
+        // dir_memo bled from one test's save into the next test's app).
+        // Same path XDG would resolve on Linux, so Linux behavior is
+        // byte-identical.
+        std::env::set_var("SLOOPER_CONFIG_DIR", dir.join("slooper"));
         // v30 R3: ...same for XDG_DATA_HOME — automation shape presets
         // (and anything else data-rooted) must never seed into the real
         // account folder from a test run.
@@ -33481,6 +33488,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("slooper/effects")).unwrap();
         std::fs::write(dir.join("slooper/config.json"), "{}").unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("SLOOPER_CONFIG_DIR", dir.join("slooper")); // W12d
         std::env::set_var("HOME", &dir);
         let mut app = App::new(Backend::start());
         let root = crate::samples808::samples_root();
@@ -34986,6 +34994,7 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("SLOOPER_CONFIG_DIR", dir.join("slooper")); // W12d
         let app = App::new(Backend::start());
         assert_eq!(app.kit(3).len(), 1, "legacy pads seeded track 4's kit");
         assert_eq!(app.kit(3)[0].name, "OldKick");

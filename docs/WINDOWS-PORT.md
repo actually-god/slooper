@@ -1154,3 +1154,24 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   LIVE JACK 32/32 incl. `v23_probe_child_dies` (no config/paths change
   touches the RT path — Linux behavior for same-OS configs is
   structurally unchanged: nothing matches, filter returns 0 silently).
+  CORRIGENDUM (same session, found by the CI windows lane — the grow-list
+  earning its keep): first run surfaced ONE new Windows failure,
+  `v34_dir_memos_travel_with_the_project` ("fresh app remembers nothing").
+  Root cause is a latent TEST-LANE bug my pin merely exposed:
+  `headless_app` sandboxes config via XDG_CONFIG_HOME, but on Windows
+  config_dir() is %APPDATA% and XDG is inert — so every test that saves a
+  config on the Windows lane has been writing the REAL user config, and
+  tests sharing no state silently share %APPDATA%. (My `do_load` pin was
+  the first to save a non-empty dir_memo; the next test read it back.)
+  Fix = the `paths` module's documented test seam: the three harness
+  sites that set XDG_CONFIG_HOME now ALSO set
+  `SLOOPER_CONFIG_DIR=<dir>/slooper` — the override wins on every OS and
+  resolves to the SAME path XDG would on Linux (zero Linux behavior
+  change), while the Windows lane finally sandboxes. Windows-lane data
+  dir (%LOCALAPPDATA%, XDG_DATA_HOME-inert) stays a known, benign CI-only
+  leak (the 808-pack seed is idempotent) — flagged, not fixed. Re-gates:
+  targeted 7/7; citest monolith DEADLOCKED at vsthost again (the known
+  class — do NOT trust monolith runs), mandatory 3-chunk protocol green:
+  rest 533 + vsthost 37 + ui-v23 4, all exit 0; clippy-zero; gnullvm
+  `--all-targets` green. Windows truth = CI re-run at this commit
+  (`v34_dir_memos...` expected back in the fixed column).
