@@ -1341,6 +1341,16 @@ pub struct App {
     /// v30 R1: per-track drum kits (index = track). Every track's synth
     /// module owns its kit, so each synth carries a different patch.
     drum_kits: Vec<Vec<DrumPad>>,
+    /// v51: per-track sampler key maps (index = track). `None` = the
+    /// sampler's legacy single-asset params; `Some` = the multi-sample
+    /// piano-roll map (slots = (asset path, root note) + mode).
+    sampler_maps: Vec<Option<crate::config::SamplerMapSave>>,
+    /// v51: track whose sampler key-map (piano roll) window is open.
+    smap_win: Option<usize>,
+    /// v51: selected slot row inside the open key-map window.
+    smap_sel: Option<usize>,
+    /// v51: note currently held by a key/lane press in the map window.
+    smap_hold: Option<u8>,
     show_drums: bool,
     /// v39: MASTER OUT panel open (dockable, docks next to the MIXER).
     show_master: bool,
@@ -1832,6 +1842,17 @@ impl App {
                 .map(crate::ui::DrumMachine::from_save)
                 .unwrap_or_else(DrumMachine::defaults),
             drum_kits: init_drum_kits(&cfg.drum_kits, cfg.drum.as_ref()),
+            sampler_maps: {
+                let mut m: Vec<Option<crate::config::SamplerMapSave>> =
+                    Vec::with_capacity(MAX_LOOPS);
+                for t in 0..MAX_LOOPS {
+                    m.push(cfg.sampler_maps.get(t).cloned().flatten());
+                }
+                m
+            },
+            smap_win: None,
+            smap_sel: None,
+            smap_hold: None,
             show_drums: cfg.show_drums,
             show_master: cfg.show_master,
             meter_state: None,
@@ -4642,6 +4663,7 @@ impl App {
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
+            sampler_maps: self.sampler_maps.clone(),
             show_drums: self.show_drums,
             show_master: self.show_master,
             fx_dir: self.fx_dir_edit.trim().to_string(),
@@ -5446,6 +5468,8 @@ impl App {
         });
         self.track_synth_inst[t] = inst;
         self.refresh_poly_voices(t);
+        // v51: a fresh instance starts mapless — replay the saved key map.
+        self.push_sampler_map(t);
         true
     }
 
@@ -5832,6 +5856,143 @@ impl App {
                     .iter()
                     .position(|a| a.path.to_string_lossy() == p.asset_path);
             }
+        }
+    }
+
+    /// v51: publish track `t`'s sampler key map onto its live script
+    /// instance. Slot asset PATHS resolve to rack ids like the drum kit
+    /// (`drum_resolve`); an unresolved path drops the slot rather than
+    /// aliasing the wrong sample. `None` clears the map (legacy params).
+    fn push_sampler_map(&mut self, t: usize) {
+        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
+            return;
+        };
+        let SynthHandle::Script(inst) = handle.as_ref() else {
+            return;
+        };
+        // Only the bundled sampler (first param "asset") reads the map;
+        // other scripts must never have map state reported on them.
+        let sampler = self
+            .track_synth
+            .get(t)
+            .cloned()
+            .flatten()
+            .and_then(|stem| {
+                self.synth_registry
+                    .desc(&stem)
+                    .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            })
+            .unwrap_or(false);
+        if !sampler {
+            return;
+        }
+        match self.sampler_maps.get(t).cloned().flatten() {
+            None => inst.clear_map(),
+            Some(m) => {
+                let slots: Vec<(u32, u8)> = m
+                    .slots
+                    .iter()
+                    .filter_map(|s| {
+                        self.assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == s.asset)
+                            .map(|k| (k as u32, s.root))
+                    })
+                    .collect();
+                inst.set_map(&slots, m.mode);
+            }
+        }
+    }
+
+    /// v51: re-push every track's map (asset table changed -> path->id
+    /// resolutions moved; project load; synth rebuilds).
+    fn refresh_sampler_maps(&mut self) {
+        for t in 0..MAX_LOOPS {
+            self.push_sampler_map(t);
+        }
+    }
+
+    /// v51: the single asset a sampler track plays, from the synth
+    /// window's picker / drop zone / OS drop. Param 0 ALWAYS follows
+    /// (legacy fallback + persisted values); when the track has a
+    /// non-empty key map, slot 0 follows too so the map editor shows
+    /// exactly what the engine plays.
+    fn sampler_set_asset(&mut self, t: usize, k: usize) {
+        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
+            return;
+        };
+        let SynthHandle::Script(inst) = handle.as_ref() else {
+            return;
+        };
+        inst.set_param(0, k as f32);
+        if let Some(vals) = self.track_synth_params.get_mut(t) {
+            vals.clear();
+            vals.extend_from_slice(&inst.values());
+        }
+        if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+            if let Some(slot) = m.slots.first_mut() {
+                if let Some(a) = self.assets.get(k) {
+                    slot.asset = a.path.to_string_lossy().into_owned();
+                }
+            }
+        }
+        self.push_sampler_map(t);
+        self.save_config();
+    }
+
+    /// v51: OS/asset drops landing on the open key-map window add a slot
+    /// per audio file (rack-dedup via `ensure_asset`), roots laddering up
+    /// in fifths from the last slot (C3 first).
+    fn sampler_map_files_dropped(&mut self, t: usize, paths: &[std::path::PathBuf]) {
+        let mut added = 0usize;
+        let mut rejected = 0usize;
+        for path in paths {
+            if !crate::assets::is_audio_file(path) {
+                rejected += 1;
+                continue;
+            }
+            let Some(k) = self.ensure_asset(path) else {
+                rejected += 1;
+                continue;
+            };
+            let _ = k;
+            let sp = self.assets[k].path.to_string_lossy().into_owned();
+            if self.sampler_maps[t].is_none() {
+                self.sampler_maps[t] = Some(crate::config::SamplerMapSave {
+                    slots: Vec::new(),
+                    mode: 0,
+                });
+            }
+            let m = self.sampler_maps[t].as_mut().expect("seeded");
+            if m.slots.len() >= crate::synth::MAX_MAP_SLOTS {
+                self.status = "sampler map: full (64 slots)".into();
+                break;
+            }
+            let root = m
+                .slots
+                .last()
+                .map(|s| (s.root as i32 + 7).clamp(24, 96) as u8)
+                .unwrap_or(48);
+            if !m.slots.iter().any(|s| s.asset == sp) {
+                m.slots
+                    .push(crate::config::SamplerSlotSave { asset: sp, root });
+            }
+            added += 1;
+        }
+        if added > 0 || rejected > 0 {
+            self.push_sampler_map(t);
+            self.save_config();
+        }
+        if added > 0 {
+            self.status = format!(
+                "sampler map: {added} sample{} added",
+                if added == 1 { "" } else { "s" }
+            );
+        } else if rejected > 0 {
+            self.status = format!(
+                "sampler map: dropped file{} not audio",
+                if rejected == 1 { "" } else { "s" }
+            );
         }
     }
 
@@ -9998,6 +10159,546 @@ impl App {
         );
     }
 
+    /// v51: route a map-window key press to the track's live synth as a
+    /// held audition voice (release = mouse up, see the watchdog in
+    /// `sampler_map_window`). The copy taken by `audition_copy` carries
+    /// the key map — that IS the map preview.
+    fn smap_audition(&mut self, t: usize, note: u8) {
+        if self.sample_rate == 0 {
+            return;
+        }
+        if self.smap_hold == Some(note) {
+            return;
+        }
+        self.smap_hold = Some(note);
+        self.preview_track = Some(t);
+        self.roll_key_hold(note);
+    }
+
+    /// v51: end a held map-window audition.
+    fn smap_release(&mut self) {
+        if self.smap_hold.take().is_some() {
+            self.roll_key_release();
+        }
+    }
+
+    /// v51: sampler key-map window — a piano-roll mapping editor for the
+    /// bundled sampler on track `t`. One lane per mapped sample; drag a
+    /// lane's block onto any key (or click a key with the lane selected)
+    /// to bind its ROOT NOTE. Hard-cutoff zones switch at the midpoints
+    /// (ties round down); crossfade blends the two nearest samples by
+    /// inverse distance. OS/asset drops while this window is open add
+    /// samples (routed centrally at the top of `ui_root`).
+    fn sampler_map_window(&mut self, ui: &mut egui::Ui, t: usize) {
+        // Guard: the window only exists while track t runs the sampler.
+        let Some(stem) = self.track_synth.get(t).cloned().flatten() else {
+            self.smap_win = None;
+            self.smap_release();
+            return;
+        };
+        let is_sampler = self
+            .synth_registry
+            .desc(&stem)
+            .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            .unwrap_or(false);
+        if !is_sampler {
+            self.smap_win = None;
+            self.smap_release();
+            return;
+        }
+        // Release watchdog: a held map key must die with the mouse button
+        // (the piano roll's own watchdog only runs while the ROLL is open).
+        if self.smap_hold.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.smap_release();
+        }
+        // Legacy seed: the first open on a track that only ever used the
+        // single-asset params materializes them as slot 0 — the map
+        // becomes the single source of truth without changing the sound.
+        if self
+            .sampler_maps
+            .get(t)
+            .map(|o| o.is_none())
+            .unwrap_or(true)
+        {
+            let vals = self
+                .track_synth_inst
+                .get(t)
+                .cloned()
+                .flatten()
+                .map(|h| match h.as_ref() {
+                    SynthHandle::Script(i) => i.values(),
+                    SynthHandle::Vst(_) => Vec::new(),
+                })
+                .unwrap_or_default();
+            let mut slots = Vec::new();
+            let a = vals.first().copied().unwrap_or(0.0).round() as usize;
+            if a < self.assets.len() && self.assets[a].pattern.is_none() {
+                slots.push(crate::config::SamplerSlotSave {
+                    asset: self.assets[a].path.to_string_lossy().into_owned(),
+                    root: vals
+                        .get(1)
+                        .copied()
+                        .unwrap_or(48.0)
+                        .round()
+                        .clamp(0.0, 127.0) as u8,
+                });
+            }
+            self.sampler_maps[t] = Some(crate::config::SamplerMapSave { slots, mode: 0 });
+            self.push_sampler_map(t);
+            self.save_config();
+        }
+        let mut open = true;
+        let resp = egui::Window::new(format!("\u{266a} sampler map \u{b7} track {}", t + 1))
+            .id(egui::Id::new(("smapwin", t)))
+            .open(&mut open)
+            .default_size([1080.0, 320.0])
+            .min_width(700.0)
+            .min_height(150.0)
+            .show(ui, |ui| {
+                body_clipped(ui, |ui| self.smap_body(ui, t));
+            });
+        let _ = resp;
+        if !open {
+            self.smap_win = None;
+            self.smap_release();
+        }
+    }
+
+    /// The key-map window's body: header (mode/add/remove) + one lane row
+    /// per slot + the piano keyboard strip. Fixed note range C2..C6 —
+    /// wide enough for any sane map, and rows stay pixel-aligned without
+    /// a scroll container fighting the drag geometry.
+    fn smap_body(&mut self, ui: &mut egui::Ui, t: usize) {
+        const N0: u8 = 36; // C2
+        const NW: usize = 49; // C2..C6
+        const KW: f32 = 18.0;
+        const LANE_H: f32 = 24.0;
+        const KEY_H: f32 = 22.0;
+        const HDR_W: f32 = 190.0;
+        let roll_w = NW as f32 * KW;
+        let palette = [
+            egui::Color32::from_rgb(90, 140, 220),
+            egui::Color32::from_rgb(220, 120, 90),
+            egui::Color32::from_rgb(110, 190, 120),
+            egui::Color32::from_rgb(200, 160, 90),
+            egui::Color32::from_rgb(160, 110, 200),
+            egui::Color32::from_rgb(90, 180, 190),
+        ];
+        let note_at = |x: f32, lr_min: f32| -> u8 {
+            (((x - lr_min) / KW).floor().clamp(0.0, NW as f32 - 1.0) as i32 + N0 as i32) as u8
+        };
+        // Snapshot the rack's audio assets (picker source) + slot info.
+        let audio_assets: Vec<(usize, String)> = self
+            .assets
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.pattern.is_none())
+            .map(|(k, a)| (k, a.name.clone()))
+            .collect();
+        // ---- header: mode + add/remove ----
+        let mode = self.sampler_maps[t].as_ref().map(|m| m.mode).unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("mode \u{b7}").weak().small());
+            if ui
+                .selectable_label(mode == 0, RichText::new("hard cutoff").small())
+                .clicked()
+                && mode != 0
+            {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    m.mode = 0;
+                    self.push_sampler_map(t);
+                    self.save_config();
+                }
+            }
+            if ui
+                .selectable_label(mode == 1, RichText::new("crossfade").small())
+                .clicked()
+                && mode != 1
+            {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    m.mode = 1;
+                    self.push_sampler_map(t);
+                    self.save_config();
+                }
+            }
+            ui.separator();
+            if ui.button(RichText::new("+ add sample").small()).clicked() {
+                let pick = self
+                    .sel_asset
+                    .filter(|k| audio_assets.iter().any(|(a, _)| a == k))
+                    .or_else(|| audio_assets.first().map(|(k, _)| *k));
+                match pick {
+                    Some(k) => {
+                        let sp = self.assets[k].path.to_string_lossy().into_owned();
+                        if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                            if m.slots.len() >= crate::synth::MAX_MAP_SLOTS {
+                                self.status = "sampler map: full (64 slots)".into();
+                            } else {
+                                let root = m
+                                    .slots
+                                    .last()
+                                    .map(|s| (s.root as i32 + 7).clamp(24, 96) as u8)
+                                    .unwrap_or(48);
+                                m.slots.push(crate::config::SamplerSlotSave {
+                                    asset: sp.clone(),
+                                    root,
+                                });
+                                self.smap_sel = Some(m.slots.len() - 1);
+                                self.push_sampler_map(t);
+                                self.save_config();
+                            }
+                        }
+                    }
+                    None => {
+                        self.status = "sampler map: no audio assets \u{2014} drop one here".into()
+                    }
+                }
+            }
+            let sel = self.smap_sel;
+            let n_now = self.sampler_maps[t]
+                .as_ref()
+                .map(|m| m.slots.len())
+                .unwrap_or(0);
+            if ui
+                .add_enabled(
+                    sel.is_some() && n_now > 0,
+                    egui::Button::new(RichText::new("remove \u{d7}").small()),
+                )
+                .clicked()
+            {
+                if let (Some(Some(m)), Some(i)) = (self.sampler_maps.get_mut(t), sel) {
+                    if i < m.slots.len() {
+                        m.slots.remove(i);
+                        self.smap_sel = None;
+                        self.push_sampler_map(t);
+                        self.save_config();
+                    }
+                }
+            }
+            ui.label(RichText::new(format!("{n_now} mapped")).weak().small());
+        });
+        ui.label(
+            RichText::new(
+                "drag a lane block onto a piano key \u{b7} or select a lane and click a key \
+                 \u{b7} cutoff: zones switch at the midpoint, ties go DOWN \u{b7} crossfade: \
+                 the two nearest samples mix by inverse distance",
+            )
+            .weak()
+            .small(),
+        );
+        let mode = self.sampler_maps[t].as_ref().map(|m| m.mode).unwrap_or(0);
+        // Slot snapshot for painting (name/root/resolved), sorted roots for
+        // the zone-boundary overlay.
+        let infos: Vec<(String, u8, bool)> = self
+            .sampler_maps
+            .get(t)
+            .and_then(|o| o.as_ref())
+            .map(|m| {
+                m.slots
+                    .iter()
+                    .map(|s| {
+                        let name = self
+                            .assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == s.asset)
+                            .map(|k| self.assets[k].name.clone())
+                            .unwrap_or_else(|| {
+                                std::path::Path::new(&s.asset)
+                                    .file_stem()
+                                    .map(|x| x.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "?".into())
+                            });
+                        let resolved = self
+                            .assets
+                            .iter()
+                            .any(|a| a.path.to_string_lossy() == s.asset);
+                        (name, s.root, resolved)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let n = infos.len();
+        let mut roots: Vec<u8> = infos.iter().map(|(_, r, _)| *r).collect();
+        roots.sort_unstable();
+        let mut dirty_order = false; // per-frame pushes are cheap; saves wait
+                                     // ---- lane rows ----
+        for i in 0..n {
+            let (name, root, resolved) = infos[i].clone();
+            let sel = self.smap_sel == Some(i);
+            let mut new_asset: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(HDR_W, LANE_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let cur = format!("#{} {}", i + 1, name);
+                        egui::ComboBox::from_id_salt(("smapcombo", t, i))
+                            .width(HDR_W - 40.0)
+                            .selected_text(RichText::new(cur).small())
+                            .show_ui(ui, |ui| {
+                                for (k, nm) in &audio_assets {
+                                    if ui.selectable_label(false, format!("#{k} {nm}")).clicked() {
+                                        new_asset = Some(
+                                            self.assets[*k].path.to_string_lossy().into_owned(),
+                                        );
+                                    }
+                                }
+                            });
+                        if ui
+                            .add_sized(
+                                [18.0, 18.0],
+                                egui::Button::new(RichText::new("\u{d7}").small()),
+                            )
+                            .clicked()
+                        {
+                            if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                                if i < m.slots.len() {
+                                    m.slots.remove(i);
+                                    self.smap_sel = None;
+                                    self.push_sampler_map(t);
+                                    self.save_config();
+                                }
+                            }
+                        }
+                    },
+                );
+                let (lr, _) =
+                    ui.allocate_exact_size(egui::vec2(roll_w, LANE_H), egui::Sense::hover());
+                // Lane background (selection highlight + click-to-select
+                // FIRST, so the block drag allocated later wins hit tests
+                // over its own rect — v50 interact-order rule).
+                let lresp = ui.interact(lr, ui.id().with(("smlane", t, i)), egui::Sense::click());
+                if lresp.clicked() {
+                    self.smap_sel = Some(i);
+                }
+                let base = if mode == 1 {
+                    egui::Color32::from_rgb(28, 30, 38)
+                } else {
+                    egui::Color32::from_rgb(24, 26, 32)
+                };
+                ui.painter().rect_filled(
+                    lr,
+                    2.0,
+                    if sel {
+                        egui::Color32::from_rgb(46, 52, 72)
+                    } else {
+                        base
+                    },
+                );
+                // Zone overlay: cutoff draws the switch points (midpoints),
+                // crossfade draws each root (blend anchors).
+                if n > 1 {
+                    for w2 in roots.windows(2) {
+                        let x = if mode == 1 {
+                            (w2[1] as i32 - N0 as i32) as f32 * KW
+                        } else {
+                            ((w2[0] + w2[1]) as f32 / 2.0 - N0 as f32) * KW
+                        };
+                        let px = lr.min.x + x * 1.0 + KW / 2.0;
+                        if x >= 0.0 {
+                            ui.painter().line_segment(
+                                [egui::pos2(px, lr.min.y), egui::pos2(px, lr.max.y)],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                            );
+                        }
+                    }
+                }
+                // The draggable block = this slot's root key.
+                let clamped = root.clamp(N0, N0 + (NW as u8 - 1));
+                let bx = lr.min.x + (clamped - N0) as f32 * KW;
+                let block = egui::Rect::from_min_max(
+                    egui::pos2(bx, lr.min.y + 2.0),
+                    egui::pos2(bx + KW, lr.max.y - 2.0),
+                );
+                let col = if resolved {
+                    palette[i % palette.len()]
+                } else {
+                    egui::Color32::from_gray(90)
+                };
+                ui.painter().rect_filled(
+                    block,
+                    3.0,
+                    col.gamma_multiply(if sel { 1.0 } else { 0.8 }),
+                );
+                ui.painter().text(
+                    egui::pos2(block.max.x + 6.0, lr.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{}{}", name, if resolved { "" } else { " (missing)" }),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_gray(170),
+                );
+                let bresp = ui.interact(
+                    block.expand(4.0),
+                    ui.id().with(("smblock", t, i)),
+                    egui::Sense::drag(),
+                );
+                if bresp.drag_started() {
+                    self.smap_sel = Some(i);
+                    self.smap_audition(t, root);
+                }
+                if bresp.dragged() {
+                    if let Some(pt) = bresp.interact_pointer_pos() {
+                        let note = note_at(pt.x, lr.min.x).clamp(0, 127);
+                        let cur = self
+                            .sampler_maps
+                            .get(t)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|m| m.slots.get(i))
+                            .map(|s| s.root);
+                        if cur == Some(note) {
+                            self.smap_audition(t, note);
+                        } else {
+                            if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                                if let Some(s) = m.slots.get_mut(i) {
+                                    s.root = note;
+                                }
+                            }
+                            self.push_sampler_map(t);
+                            dirty_order = true;
+                            self.smap_audition(t, note);
+                        }
+                    }
+                }
+                if bresp.drag_stopped()
+                    || (bresp.dragged() && !ui.ctx().input(|i| i.pointer.any_down()))
+                {
+                    self.smap_release();
+                    if dirty_order {
+                        self.save_config();
+                        dirty_order = false;
+                    }
+                }
+            });
+            if let Some(sp) = new_asset {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    if let Some(s) = m.slots.get_mut(i) {
+                        s.asset = sp;
+                        self.push_sampler_map(t);
+                        self.save_config();
+                    }
+                }
+            }
+        }
+        if n == 0 {
+            ui.label(
+                RichText::new(
+                    "no samples mapped \u{2014} click \u{201c}+ add sample\u{201d} or drop \
+                     WAV files onto this window",
+                )
+                .weak()
+                .small(),
+            );
+        }
+        // ---- piano keyboard strip ----
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(HDR_W, KEY_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let note = self
+                        .smap_sel
+                        .and_then(|i| infos.get(i))
+                        .map(|(_, r, _)| note_name(*r))
+                        .unwrap_or_else(|| "\u{2014}".into());
+                    ui.label(RichText::new(format!("selected: {note}")).small());
+                },
+            );
+            let (kr, kresp) =
+                ui.allocate_exact_size(egui::vec2(roll_w, KEY_H), egui::Sense::click_and_drag());
+            // White keys, then black keys, then C labels.
+            let is_black = |n: u8| matches!(n % 12, 1 | 3 | 6 | 8 | 10);
+            for k in 0..NW {
+                let note = N0 + k as u8;
+                if is_black(note) {
+                    continue;
+                }
+                let x = kr.min.x + k as f32 * KW;
+                let r =
+                    egui::Rect::from_min_max(egui::pos2(x, kr.min.y), egui::pos2(x + KW, kr.max.y));
+                ui.painter()
+                    .rect_filled(r, 1.0, egui::Color32::from_gray(210));
+                ui.painter().rect_stroke(
+                    r,
+                    1.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                    egui::StrokeKind::Inside,
+                );
+                if note % 12 == 0 {
+                    ui.painter().text(
+                        egui::pos2(x + 2.0, kr.max.y - 4.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        note_name(note),
+                        egui::FontId::proportional(8.0),
+                        egui::Color32::from_gray(60),
+                    );
+                }
+            }
+            for k in 0..NW {
+                let note = N0 + k as u8;
+                if !is_black(note) {
+                    continue;
+                }
+                let x = kr.min.x + (k + 1) as f32 * KW - KW * 0.32;
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(x, kr.min.y),
+                    egui::pos2(x + KW * 0.64, kr.min.y + KEY_H * 0.6),
+                );
+                ui.painter()
+                    .rect_filled(r, 1.0, egui::Color32::from_gray(28));
+            }
+            // Selected slot's root marker.
+            if let Some(i) = self.smap_sel.filter(|i| *i < n) {
+                let root = infos[i].1;
+                if root >= N0 && root <= N0 + NW as u8 {
+                    let px = kr.min.x + (root - N0) as f32 * KW + KW / 2.0;
+                    ui.painter().circle_filled(
+                        egui::pos2(px, kr.min.y + 3.0),
+                        3.0,
+                        egui::Color32::from_rgb(255, 190, 60),
+                    );
+                }
+            }
+            let sel = self.smap_sel.filter(|i| *i < n);
+            let apply = |me: &mut Self, x: f32| {
+                let note = note_at(x, kr.min.x).clamp(0, 127);
+                match sel {
+                    Some(i) => {
+                        let changed = me
+                            .sampler_maps
+                            .get(t)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|m| m.slots.get(i))
+                            .is_some_and(|s| s.root != note);
+                        if changed {
+                            if let Some(Some(m)) = me.sampler_maps.get_mut(t) {
+                                if let Some(s) = m.slots.get_mut(i) {
+                                    s.root = note;
+                                }
+                            }
+                            me.push_sampler_map(t);
+                            me.save_config();
+                        }
+                    }
+                    None => {}
+                }
+                me.smap_audition(t, note);
+            };
+            if kresp.drag_started() || kresp.clicked() {
+                if let Some(pt) = kresp.interact_pointer_pos() {
+                    apply(self, pt.x);
+                }
+            }
+            if kresp.dragged() {
+                if let Some(pt) = kresp.interact_pointer_pos() {
+                    apply(self, pt.x);
+                }
+            }
+            if kresp.drag_stopped() {
+                self.smap_release();
+            }
+        });
+    }
+
     /// The synth slider window doubles as a SAMPLER editor when the
     /// bound script's first parameter is the asset picker.
     fn sampler_editor_open(&self) -> Option<usize> {
@@ -10024,10 +10725,9 @@ impl App {
         let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
             return;
         };
-        let inst = match handle.as_ref() {
-            SynthHandle::Script(i) => i.clone(),
-            SynthHandle::Vst(_) => return,
-        };
+        if !matches!(handle.as_ref(), SynthHandle::Script(_)) {
+            return;
+        }
         let mut swapped: Option<usize> = None;
         let mut rejected = 0usize;
         for path in paths {
@@ -10036,12 +10736,7 @@ impl App {
                 continue; // midi/auto/unknown: not a sample
             }
             if let Some(k) = self.ensure_asset(path) {
-                inst.set_param(0, k as f32);
-                if let Some(vals) = self.track_synth_params.get_mut(t) {
-                    vals.clear();
-                    vals.extend_from_slice(&inst.values());
-                }
-                self.save_config();
+                self.sampler_set_asset(t, k);
                 swapped = Some(k);
             }
         }
@@ -10197,8 +10892,7 @@ impl App {
                     }
                 });
             if let Some(k) = picked {
-                inst.set_param(0, k as f32);
-                dirty = true;
+                self.sampler_set_asset(t, k);
             }
             ui.label(
                 RichText::new(
@@ -10238,8 +10932,7 @@ impl App {
             );
             if let Some(a) = dresp.dnd_release_payload::<usize>().map(|a| *a) {
                 if audio_assets.iter().any(|(k, _)| *k == a) {
-                    inst.set_param(0, a as f32);
-                    dirty = true;
+                    self.sampler_set_asset(t, a);
                     self.status = format!(
                         "track {} sampler: {}",
                         t + 1,
@@ -10250,6 +10943,12 @@ impl App {
                             .unwrap_or_default()
                     );
                 }
+            }
+            // v51: the map editor for this track — a piano roll of lanes,
+            // drag each sample's block onto the key that is its root.
+            if ui.button("piano map \u{2026}").clicked() {
+                self.smap_win = Some(t);
+                self.smap_sel = None;
             }
             // v18: OS-level file drops (file manager → app while
             // this window is open) are claimed CENTRALLY at the
@@ -11810,6 +12509,7 @@ impl App {
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
+            sampler_maps: self.sampler_maps.clone(),
             sample_edits: self.sample_edits.clone(),
         }
     }
@@ -12114,6 +12814,8 @@ impl App {
             if !sel.synth_setup {
                 continue;
             }
+            // v51: sampler key maps are synth setup too.
+            self.sampler_maps[t] = pr.sampler_maps.get(t).cloned().flatten();
             self.track_synth_params[t] = pr.track_synth_params.get(t).cloned().unwrap_or_default();
             // v22: patches are REAL project state — decode the chunk the
             // project carried (the v20 "session-only" rule here is what
@@ -13219,7 +13921,12 @@ impl App {
             }
         }
         if !self.os_drops.is_empty() {
-            if let Some(t) = self.sampler_editor_open() {
+            if let Some(t) = self.smap_win {
+                // v51: the open KEY-MAP window owns drops: every audio
+                // file becomes a mapped slot (rack-dedup).
+                let paths = std::mem::take(&mut self.os_drops);
+                self.sampler_map_files_dropped(t, &paths);
+            } else if let Some(t) = self.sampler_editor_open() {
                 let paths = std::mem::take(&mut self.os_drops);
                 self.sampler_files_dropped(t, &paths);
             } else if let Some(t) = self.synth_win {
@@ -13565,6 +14272,11 @@ impl App {
         let sw = self.synth_win;
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
+        }
+        // v51: sampler key-map (piano roll) window.
+        let sm = self.smap_win;
+        if let Some(t) = sm {
+            self.sampler_map_window(ui, t);
         }
         let sp = self.synth_pick;
         if let Some(t) = sp {

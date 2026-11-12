@@ -156,6 +156,9 @@ pub struct Project {
     /// v30 R1: per-track drum kits (empty entry = the stock kit).
     #[serde(default)]
     pub drum_kits: Vec<Vec<crate::config::DrumPadSave>>,
+    /// v51: per-track sampler key maps (None = legacy sampler params).
+    #[serde(default)]
+    pub sampler_maps: Vec<Option<crate::config::SamplerMapSave>>,
     /// v50 R1: per-asset "Edit sample" settings, keyed by asset file
     /// path; re-rendered over the pristine audio whenever the project
     /// loads, so the source wavs stay untouched.
@@ -270,6 +273,7 @@ pub fn resolve_asset(file: &str, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SamplerMapSave;
 
     fn sample() -> Project {
         Project {
@@ -328,6 +332,13 @@ mod tests {
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
+            sampler_maps: vec![Some(SamplerMapSave {
+                slots: vec![crate::config::SamplerSlotSave {
+                    asset: "/x/kick.wav".into(),
+                    root: 48,
+                }],
+                mode: 1,
+            })],
         }
     }
 
@@ -404,6 +415,25 @@ mod tests {
         assert_eq!(back.assets[0].file, "/x/kick.wav");
         assert_eq!(back.n_tracks, Some(16));
         assert_eq!(back.track_synths, vec![Some("piano".into())]);
+        // v51: sampler key maps survive the round trip.
+        assert_eq!(
+            back.sampler_maps,
+            vec![Some(SamplerMapSave {
+                slots: vec![crate::config::SamplerSlotSave {
+                    asset: "/x/kick.wav".into(),
+                    root: 48,
+                }],
+                mode: 1,
+            })]
+        );
+        // v51: files written before the field existed must still load.
+        let older = dir.join("older.slooper");
+        let s = serde_json::to_string(&pr).unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&s).unwrap();
+        j.as_object_mut().unwrap().remove("sampler_maps");
+        std::fs::write(&older, serde_json::to_string(&j).unwrap()).unwrap();
+        let legacy = load(&older).expect("pre-v51 file loads");
+        assert!(legacy.sampler_maps.is_empty());
         // Wrong magic is rejected with a clear message.
         let bad = dir.join("bad.slooper");
         std::fs::write(&bad, r#"{"format":"nope","version":1}"#).unwrap();

@@ -101,6 +101,29 @@ pub fn default_drum_kit() -> Vec<DrumPadSave> {
         .collect()
 }
 
+/// v51: one sampler key-map slot: a rack asset (stored as a PATH like the
+/// drum kit, so projects can re-link after a reload) plus the root note
+/// whose pitch the sample already has.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplerSlotSave {
+    pub asset: String,
+    pub root: u8,
+}
+
+/// v51: one track's multi-sample keyboard map for the bundled sampler.
+/// `mode`: 0 = hard cutoff — zones switch at the halfway point, a note
+/// exactly halfway plays the LOWER sample; 1 = crossfade — the two
+/// nearest samples are bent to the note and mixed by inverse distance.
+/// An empty `slots` on a map that EXISTS means silent (NOT the legacy
+/// single-asset params); no map entry at all keeps the params rule.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SamplerMapSave {
+    #[serde(default)]
+    pub slots: Vec<SamplerSlotSave>,
+    #[serde(default)]
+    pub mode: u8,
+}
+
 /// Axis calibration for one continuous (knob/slider) binding slot: the raw
 /// controller values captured when the user swept the control to its minimum
 /// and maximum. Values between are scaled onto the program's 0..=127 space.
@@ -509,6 +532,11 @@ pub struct Config {
     /// An EMPTY entry = the stock 8-pad kit (never written to disk).
     #[serde(default)]
     pub drum_kits: Vec<Vec<DrumPadSave>>,
+    /// v51: per-track sampler key maps (index = track). `None` = no map
+    /// (the sampler's single-asset params rule); `Some` = the multi-sample
+    /// map, even with zero slots (= silence).
+    #[serde(default)]
+    pub sampler_maps: Vec<Option<SamplerMapSave>>,
     /// v29 R5: was the drum-machine window open?
     #[serde(default)]
     pub show_drums: bool,
@@ -667,6 +695,7 @@ impl Default for Config {
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
+            sampler_maps: Vec::new(),
             show_drums: false,
             show_master: true,
             fx_dir: String::new(),
