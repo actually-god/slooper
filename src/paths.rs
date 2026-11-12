@@ -148,6 +148,44 @@ pub fn dylib_ext() -> &'static str {
     }
 }
 
+/// Does this path string carry the *other* OS's absolute-path syntax?
+/// (WINDOWS-PORT W12d — config round-trip.)
+///
+/// A config file carried between OSes holds absolute paths the receiving OS
+/// can never host — and they are NOT syntactically invalid there: Windows
+/// `C:\Users\x\rack` is a perfectly legal *relative* directory name on
+/// Linux, and Linux `/home/x/rack` is a legal drive-rooted path on Windows.
+/// Consumers that create-or-seed folders ([`crate::fx::prepare_effects_dir`],
+/// project save, rack recording) would happily WRITE into such junk trees,
+/// so `Config::load` drops these shapes and per-OS defaults come back.
+///
+/// Rules (checked on the trimmed string):
+/// * Windows: foreign ⟺ starts with `/` (Unix-root syntax). Native shapes
+///   stay: drive paths `X:\`/`X:/`, UNC `\\server\share` (backslashes!),
+///   and relative paths of any kind.
+/// * Unix: foreign ⟺ drive-letter root — `X:` alone or `X:` immediately
+///   followed by `/` or `\` — or the UNC prefix `\\`. Backslashes inside
+///   an otherwise relative name are legal POSIX filename characters and
+///   stay untouched; drive-relative `C:foo` is deliberately NOT matched
+///   (no picker ever writes it, and on Linux it is only a weird relative
+///   name — harmless if it survives).
+pub fn path_is_foreign(s: &str) -> bool {
+    let s = s.trim();
+    if cfg!(windows) {
+        s.starts_with('/')
+    } else {
+        if s.starts_with("\\\\") {
+            return true;
+        }
+        let b = s.as_bytes();
+        if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+            return false;
+        }
+        // Drive-letter root: `X:` alone, or `X:` + separator.
+        b.len() == 2 || b[2] == b'/' || b[2] == b'\\'
+    }
+}
+
 /// A file next to `artifact` carrying `tag`:
 /// `kick.so` → `kick.so.tmp` / `kick.so.failed`. Both compile loaders use
 /// this for their staging and poison-marker files so those names follow
