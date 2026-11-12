@@ -137,8 +137,12 @@ jobs:
         # series goes here. (`w9_` = W9 Windows MIDI; `w12` intentionally
         # covers the whole W12 polish family: w12a_, w12b_, …)
         run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12
-      - name: Release build proof (shipping profile)
-        run: cargo build --release --locked
+      - name: Release build proof (shipping profile = winrel, W12e)
+        # `winrel` IS what ships (release.yml builds the zip with it):
+        # release minus strip, plus minimal debuginfo, so the minidumps
+        # src/crash.rs writes resolve to module+function names. Prove the
+        # real profile builds, not a look-alike.
+        run: cargo build --profile winrel --locked
       - name: Full lib suite (report-only triage, grow the green list)
         continue-on-error: true
         env:

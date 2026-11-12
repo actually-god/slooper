@@ -194,6 +194,23 @@ pub fn build_sidecar(artifact: &Path, tag: &str) -> PathBuf {
     artifact.with_extension(format!("{}.{}", dylib_ext(), tag))
 }
 
+/// Env var: full replacement for [`crash_dir`] (W12e). Headless harnesses
+/// and the functional pins set this so a crash never writes the real user
+/// folder — the W12d `%APPDATA%` bleed rule, extended to crash artifacts.
+pub const CRASH_DIR_ENV: &str = "SLOOPER_CRASH_DIR";
+
+/// Where fatal-crash artifacts (minidumps + text notes) are written.
+/// `SLOOPER_CRASH_DIR` override; else `<data_dir>/crashes` — i.e.
+/// `%LOCALAPPDATA%\slooper\crashes` on Windows, `~/.local/share/slooper/crashes`
+/// on Linux (where nothing writes them: the handler is Windows-only and
+/// Linux keeps coredumpctl forensics — see `crash.rs`).
+///
+/// NOT created by resolution — only the writers create it, so merely
+/// calling this has no side effect on any OS.
+pub fn crash_dir() -> PathBuf {
+    env_path(CRASH_DIR_ENV).unwrap_or_else(|| data_dir().join("crashes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
