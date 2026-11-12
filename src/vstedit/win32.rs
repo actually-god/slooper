@@ -54,23 +54,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateSolidBrush, EndPaint, GetDC, GetPixel, ReleaseDC, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, AppendMenuW, CreatePopupMenu, CreateWindowExW, CW_USEDEFAULT,
-    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, EnumChildWindows,
-    EnumThreadWindows, GetClientRect, GetCursorPos, GetParent, GetWindow, GetWindowLongW,
-    GetWindowRect, GetWindowTextLengthW, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HTCAPTION, IDC_ARROW,
-    LoadCursorW, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, PeekMessageW, PostMessageW,
-    RegisterClassExW, SetForegroundWindow, SetParent, SetWindowLongW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TrackPopupMenu, TranslateMessage, WNDCLASSEXW, WNDCLASS_STYLES, WINDOW_EX_STYLE,
-    WINDOW_STYLE, CS_HREDRAW, CS_VREDRAW, IsChild, IsWindow, IsWindowVisible, PM_REMOVE, SW_HIDE,
-    SW_SHOWNA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_NCRBUTTONUP,
-    WM_PAINT, WM_SIZE, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    AdjustWindowRect, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, EnumChildWindows, EnumThreadWindows, GetClientRect,
+    GetCursorPos, GetParent, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    IsChild, IsWindow, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
+    SetForegroundWindow, SetParent, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_EXSTYLE,
+    GWL_STYLE, GW_OWNER, HTCAPTION, IDC_ARROW, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, PM_REMOVE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_GETMINMAXINFO, WM_NCRBUTTONUP, WM_PAINT, WM_SIZE, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::vsthost::Vst2Handle;
@@ -334,7 +333,11 @@ pub fn detach_to_toplevel(handle: u64) -> bool {
         }
         let mut rc = RECT::default();
         let _ = GetWindowRect(win, &mut rc);
-        SetWindowLongW(win, GWL_STYLE, container_style(false, probe_mode()).0 as i32);
+        SetWindowLongW(
+            win,
+            GWL_STYLE,
+            container_style(false, probe_mode()).0 as i32,
+        );
         if SetParent(win, None).is_err() {
             return false;
         }
@@ -456,7 +459,10 @@ fn take_close_request(win: HWND) -> bool {
 }
 
 fn pinned_of(win: HWND) -> Option<(i32, i32)> {
-    tables().lock().ok().and_then(|t| t.pinned.get(&(win.0 as isize)).copied())
+    tables()
+        .lock()
+        .ok()
+        .and_then(|t| t.pinned.get(&(win.0 as isize)).copied())
 }
 
 fn take_resize(win: HWND) -> Option<(u32, u32)> {
@@ -485,7 +491,12 @@ fn note_parent(win: HWND, parent: HWND) {
 /// The remembered embed parent — `Some` only while it names a LIVE window
 /// (a closed main window means re-dock is impossible, honestly).
 fn parent_of(win: HWND) -> Option<HWND> {
-    let v = tables().lock().ok()?.parent.get(&(win.0 as isize)).copied()?;
+    let v = tables()
+        .lock()
+        .ok()?
+        .parent
+        .get(&(win.0 as isize))
+        .copied()?;
     let h = HWND(v as *mut c_void);
     unsafe { IsWindow(Some(h)).as_bool().then_some(h) }
 }
@@ -732,7 +743,12 @@ fn dpi_target(pinned: Option<(i32, i32)>, r: RECT, frame: WINDOW_STYLE) -> (i32,
     };
     unsafe {
         if AdjustWindowRect(&mut fr, frame, false).is_ok() {
-            (x, y, (fr.right - fr.left).max(8), (fr.bottom - fr.top).max(8))
+            (
+                x,
+                y,
+                (fr.right - fr.left).max(8),
+                (fr.bottom - fr.top).max(8),
+            )
         } else {
             (x, y, pw.max(8), ph.max(8))
         }
@@ -747,7 +763,10 @@ fn utf16(s: &str) -> Vec<u16> {
 
 fn class_name() -> PCWSTR {
     static CL: OnceLock<Vec<u16>> = OnceLock::new();
-    PCWSTR(CL.get_or_init(|| utf16("SlooperVstEditorContainer")).as_ptr())
+    PCWSTR(
+        CL.get_or_init(|| utf16("SlooperVstEditorContainer"))
+            .as_ptr(),
+    )
 }
 
 /// Register the container class once per process. The background brush is
@@ -759,8 +778,9 @@ fn ensure_class() -> Result<HINSTANCE, String> {
     static INST: OnceLock<Result<isize, String>> = OnceLock::new();
     let h = INST
         .get_or_init(|| {
-            let h = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null()) }
-                .map_err(|e| e.to_string())?;
+            let h =
+                unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null()) }
+                    .map_err(|e| e.to_string())?;
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: WNDCLASS_STYLES(CS_HREDRAW.0 | CS_VREDRAW.0),
@@ -841,9 +861,7 @@ pub fn request_wm_delete(handle: u64) -> bool {
     if handle == 0 {
         return false;
     }
-    unsafe {
-        PostMessageW(Some(hwnd_of(handle)), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok()
-    }
+    unsafe { PostMessageW(Some(hwnd_of(handle)), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 unsafe fn child_windows(win: HWND) -> Vec<(HWND, u32, u32, bool)> {
@@ -860,7 +878,11 @@ unsafe fn child_windows(win: HWND) -> Vec<(HWND, u32, u32, bool)> {
             v.push((h, w, hh, IsWindowVisible(h).as_bool()));
             windows::core::BOOL(1)
         }
-        let _ = EnumChildWindows(Some(win), Some(collect), LPARAM(&mut out as *mut _ as isize));
+        let _ = EnumChildWindows(
+            Some(win),
+            Some(collect),
+            LPARAM(&mut out as *mut _ as isize),
+        );
         out
     }
 }
@@ -1272,7 +1294,10 @@ unsafe fn make_editor(
     shared.hwnd.store(win.0 as usize, Ordering::SeqCst);
     let opened = handle.dispatch(EFF_EDIT_OPEN, 0, 0, win.0, 0.0);
     if dbg {
-        eprintln!("[vstedit] {title}: effEditOpen -> {opened} (hwnd {:?}, gui thread)", win.0);
+        eprintln!(
+            "[vstedit] {title}: effEditOpen -> {opened} (hwnd {:?}, gui thread)",
+            win.0
+        );
     }
     // The VST2 spec says 0 == success, but plenty of toolkits return a
     // "true" flag (1) for a SUCCESSFUL open — the verification below is
@@ -1718,7 +1743,9 @@ unsafe fn make_editor3(
     if let Some(bytes) = &state {
         if let Err(e) = plugin.load_state(bytes) {
             if dbg {
-                eprintln!("[vstedit3] {title}: shadow load_state refused ({e}) — cell priming only");
+                eprintln!(
+                    "[vstedit3] {title}: shadow load_state refused ({e}) — cell priming only"
+                );
             }
         }
     }
@@ -1749,9 +1776,7 @@ unsafe fn make_editor3(
         let _loader = crate::vsthost::vst_loader_lock();
         // SAFETY: `win` is a live HWND that outlives the attach —
         // teardown detaches (close_editor) before destroying it.
-        if let Err(e) =
-            plugin.open_editor(unsafe { vst3_host::WindowHandle::from_hwnd(win.0) })
-        {
+        if let Err(e) = plugin.open_editor(unsafe { vst3_host::WindowHandle::from_hwnd(win.0) }) {
             if std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some() {
                 eprintln!("[vstedit3] {title}: open_editor refused: {e}");
             }
@@ -1764,7 +1789,10 @@ unsafe fn make_editor3(
     }
     let dbg = std::env::var_os("SLOOPER_VSTEDIT_DEBUG").is_some();
     if dbg {
-        eprintln!("[vstedit3] {title}: view attached to {:?} ({w0}x{h0})", win.0);
+        eprintln!(
+            "[vstedit3] {title}: view attached to {:?} ({w0}x{h0})",
+            win.0
+        );
     }
     EDITORS_ACTIVE.fetch_add(1, Ordering::Relaxed);
     Some(Editor3 {
@@ -2297,7 +2325,10 @@ mod embed_tests {
     /// Parent client-area origin in screen coordinates.
     fn client_origin(win: HWND) -> (i32, i32) {
         let mut pt = POINT { x: 0, y: 0 };
-        assert!(unsafe { ClientToScreen(win, &mut pt) }.as_bool(), "client origin");
+        assert!(
+            unsafe { ClientToScreen(win, &mut pt) }.as_bool(),
+            "client origin"
+        );
         (pt.x, pt.y)
     }
 
@@ -2310,12 +2341,20 @@ mod embed_tests {
         assert_ne!(tl.0 & WS_OVERLAPPEDWINDOW.0, 0, "top-level keeps its frame");
         assert_ne!(tl.0 & WS_VISIBLE.0, 0, "top-level is shown");
         assert_eq!(tl.0 & WS_CHILD.0, 0);
-        assert_eq!(container_style(false, true).0 & WS_VISIBLE.0, 0, "probe never shown");
+        assert_eq!(
+            container_style(false, true).0 & WS_VISIBLE.0,
+            0,
+            "probe never shown"
+        );
         let ch = container_style(true, false);
         assert_ne!(ch.0 & WS_CHILD.0, 0, "embed is a child");
         assert_eq!(ch.0 & WS_OVERLAPPEDWINDOW.0, 0, "embed is frameless");
         assert_ne!(ch.0 & WS_VISIBLE.0, 0, "embed is shown");
-        assert_eq!(container_style(true, true).0 & WS_VISIBLE.0, 0, "probe child never shown");
+        assert_eq!(
+            container_style(true, true).0 & WS_VISIBLE.0,
+            0,
+            "probe child never shown"
+        );
     }
 
     #[test]
@@ -2325,43 +2364,65 @@ mod embed_tests {
         let _c = Ctx(win);
         let st = styles(win);
         assert_eq!(st & WS_CHILD.0, 0, "default container is not WS_CHILD");
-        assert_ne!(st & WS_OVERLAPPEDWINDOW.0, 0, "default container keeps its frame");
+        assert_ne!(
+            st & WS_OVERLAPPEDWINDOW.0,
+            0,
+            "default container keeps its frame"
+        );
     }
 
     #[test]
     fn w8b_embed_creates_child_under_parent() {
         let p = make_parent();
-        set_embed_parent(p.0.0 as u64);
+        set_embed_parent(p.0 .0 as u64);
         let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
         set_embed_parent(0);
         let _c = Ctx(win);
         let st = styles(win);
         assert_ne!(st & WS_CHILD.0, 0, "embed container is WS_CHILD");
-        assert_eq!(st & WS_OVERLAPPEDWINDOW.0, 0, "embed container is frameless");
-        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "container is a child of the parent");
+        assert_eq!(
+            st & WS_OVERLAPPEDWINDOW.0,
+            0,
+            "embed container is frameless"
+        );
+        assert!(
+            unsafe { IsChild(p.0, win) }.as_bool(),
+            "container is a child of the parent"
+        );
         let (ox, oy) = client_origin(p.0);
         let mut r = RECT::default();
         unsafe { GetWindowRect(win, &mut r) }.expect("child rect");
-        assert_eq!((r.left, r.top), (ox, oy), "born at the parent's client origin");
+        assert_eq!(
+            (r.left, r.top),
+            (ox, oy),
+            "born at the parent's client origin"
+        );
     }
 
     #[test]
     fn w8b_embed_probe_mode_stays_unseen() {
         let p = make_parent();
-        set_embed_parent(p.0.0 as u64);
+        set_embed_parent(p.0 .0 as u64);
         let prev = set_probe_mode(true);
         let win = unsafe { create_container("W8b", (320, 200)) }.expect("probe child");
         set_probe_mode(prev);
         set_embed_parent(0);
         let _c = Ctx(win);
-        assert_eq!(styles(win) & WS_VISIBLE.0, 0, "probe container is never WS_VISIBLE");
-        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "still a child under the parent");
+        assert_eq!(
+            styles(win) & WS_VISIBLE.0,
+            0,
+            "probe container is never WS_VISIBLE"
+        );
+        assert!(
+            unsafe { IsChild(p.0, win) }.as_bool(),
+            "still a child under the parent"
+        );
     }
 
     #[test]
     fn w8b_embed_rect_sync() {
         let p = make_parent();
-        set_embed_parent(p.0.0 as u64);
+        set_embed_parent(p.0 .0 as u64);
         let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
         set_embed_parent(0);
         let _c = Ctx(win);
@@ -2371,15 +2432,27 @@ mod embed_tests {
         let mut r = RECT::default();
         unsafe { GetWindowRect(win, &mut r) }.expect("child rect");
         // A child has no non-client area: window rect == client rect.
-        assert_eq!((r.left, r.top), (ox + 40, oy + 30), "moved to the requested pos");
-        assert_eq!((r.right - r.left, r.bottom - r.top), (333, 222), "resized exactly");
+        assert_eq!(
+            (r.left, r.top),
+            (ox + 40, oy + 30),
+            "moved to the requested pos"
+        );
+        assert_eq!(
+            (r.right - r.left, r.bottom - r.top),
+            (333, 222),
+            "resized exactly"
+        );
 
         // Move-only call keeps the size (W8b p1 chrome uses move-only when
         // the plugin owns the size).
         assert!(set_container_rect(win.0 as u64, 11, 12, 0, 0));
         unsafe { GetWindowRect(win, &mut r) }.expect("child rect 2");
         assert_eq!((r.left, r.top), (ox + 11, oy + 12), "move-only moved");
-        assert_eq!((r.right - r.left, r.bottom - r.top), (333, 222), "move-only kept size");
+        assert_eq!(
+            (r.right - r.left, r.bottom - r.top),
+            (333, 222),
+            "move-only kept size"
+        );
 
         // Honest refusals.
         assert!(!set_container_rect(0, 1, 2, 3, 4), "null handle refuses");
@@ -2388,25 +2461,36 @@ mod embed_tests {
     #[test]
     fn w8b_set_container_visible_round_trip() {
         let p = make_parent();
-        set_embed_parent(p.0.0 as u64);
+        set_embed_parent(p.0 .0 as u64);
         let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
         set_embed_parent(0);
         let _c = Ctx(win);
         // Hide (the policy's busy frames): the window survives, only the
         // visible flag flips — geometry and parentage must not move.
         assert!(set_container_visible(win.0 as u64, false), "hide accepted");
-        assert!(!unsafe { IsWindowVisible(win) }.as_bool(), "hidden container is not visible");
+        assert!(
+            !unsafe { IsWindowVisible(win) }.as_bool(),
+            "hidden container is not visible"
+        );
         let mut before = RECT::default();
         unsafe { GetWindowRect(win, &mut before) }.expect("hidden rect");
         // Show again (SW_SHOWNA — no activation, no teardown).
         assert!(set_container_visible(win.0 as u64, true), "show accepted");
-        assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "show keeps the window alive");
-        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "re-show stays under the parent");
+        assert!(
+            unsafe { IsWindow(Some(win)) }.as_bool(),
+            "show keeps the window alive"
+        );
+        assert!(
+            unsafe { IsChild(p.0, win) }.as_bool(),
+            "re-show stays under the parent"
+        );
         let mut after = RECT::default();
         unsafe { GetWindowRect(win, &mut after) }.expect("shown rect");
-        assert_eq!((after.left, after.top, after.right, after.bottom),
-                   (before.left, before.top, before.right, before.bottom),
-                   "visibility flips never move geometry");
+        assert_eq!(
+            (after.left, after.top, after.right, after.bottom),
+            (before.left, before.top, before.right, before.bottom),
+            "visibility flips never move geometry"
+        );
         // Honest refusals (mirrors set_container_rect's contract).
         assert!(!set_container_visible(0, true), "null handle refuses");
         assert!(!set_container_visible(0, false), "null handle refuses hide");
@@ -2415,29 +2499,41 @@ mod embed_tests {
     #[test]
     fn w8b_embed_parent_origin_is_client_to_screen() {
         let p = make_parent();
-        let (x, y) = embed_parent_origin(p.0.0 as u64);
+        let (x, y) = embed_parent_origin(p.0 .0 as u64);
         // The function IS the ClientToScreen answer the sync pass subtracts
         // — compare against the module's own client-origin source of truth.
         assert_eq!((x, y), client_origin(p.0), "origin == parent client origin");
         // The stand-in parent lives off-screen (20000, 20000): a real
         // translation, never an accidental (0, 0).
-        assert!(x.abs() + y.abs() > 0, "off-screen parent has a non-zero origin");
+        assert!(
+            x.abs() + y.abs() > 0,
+            "off-screen parent has a non-zero origin"
+        );
         assert_eq!(embed_parent_origin(0), (0, 0), "null handle answers zero");
     }
 
     #[test]
     fn w8b_embed_close_protocol_is_wm_close() {
         let p = make_parent();
-        set_embed_parent(p.0.0 as u64);
+        set_embed_parent(p.0 .0 as u64);
         let win = unsafe { create_container("W8b", (320, 200)) }.expect("embedded container");
         set_embed_parent(0);
         let _c = Ctx(win);
         // Same close protocol as the top-level twin: post WM_CLOSE, the
         // window procedure records it, teardown (not the proc) destroys.
-        assert!(request_wm_delete(win.0 as u64), "WM_CLOSE posted to the child");
+        assert!(
+            request_wm_delete(win.0 as u64),
+            "WM_CLOSE posted to the child"
+        );
         pump_messages();
-        assert!(take_close_request(win), "close request recorded from the child");
-        assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "the proc refused to destroy anything");
+        assert!(
+            take_close_request(win),
+            "close request recorded from the child"
+        );
+        assert!(
+            unsafe { IsWindow(Some(win)) }.as_bool(),
+            "the proc refused to destroy anything"
+        );
         assert!(!take_close_request(win), "requests are consumed once");
     }
 
@@ -2463,7 +2559,10 @@ mod embed_tests {
         // are runner chrome with owners or no title).
         if let Some(h) = found {
             let win = HWND(h as *mut c_void);
-            assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "found handle is a window");
+            assert!(
+                unsafe { IsWindow(Some(win)) }.as_bool(),
+                "found handle is a window"
+            );
             assert_eq!(styles(win) & WS_CHILD.0, 0, "found window is top-level");
         }
     }
@@ -2478,7 +2577,7 @@ mod embed_tests {
     #[test]
     fn w8c_detach_to_toplevel_round_trip() {
         let p = make_parent();
-        set_embed_parent(p.0.0 as u64);
+        set_embed_parent(p.0 .0 as u64);
         let win = unsafe { create_container("W8c", (320, 200)) }.expect("embedded container");
         set_embed_parent(0);
         let _c = Ctx(win);
@@ -2489,8 +2588,14 @@ mod embed_tests {
         let mut before = RECT::default();
         unsafe { GetWindowRect(win, &mut before) }.expect("child rect");
         assert!(detach_to_toplevel(win.0 as u64), "detach accepted");
-        assert!(container_is_detached(win.0 as u64), "style flipped to top-level");
-        assert!(!unsafe { IsChild(p.0, win) }.as_bool(), "left the embed parent");
+        assert!(
+            container_is_detached(win.0 as u64),
+            "style flipped to top-level"
+        );
+        assert!(
+            !unsafe { IsChild(p.0, win) }.as_bool(),
+            "left the embed parent"
+        );
         let st = styles(win);
         assert_eq!(st & WS_CHILD.0, 0, "no longer a child");
         assert_ne!(st & WS_OVERLAPPEDWINDOW.0, 0, "W8a frame restored");
@@ -2503,13 +2608,19 @@ mod embed_tests {
         );
         // Idempotent, and the window is alive throughout.
         assert!(detach_to_toplevel(win.0 as u64), "detach is idempotent");
-        assert!(unsafe { IsWindow(Some(win)) }.as_bool(), "detach destroys nothing");
+        assert!(
+            unsafe { IsWindow(Some(win)) }.as_bool(),
+            "detach destroys nothing"
+        );
 
         // Re-dock: back under the REMEMBERED parent (the EMBED_PARENT seam
         // is long cleared — only the table still knows it), frame off.
         assert!(redock_to_embed(win.0 as u64), "redock accepted");
         assert!(!container_is_detached(win.0 as u64), "embedded again");
-        assert!(unsafe { IsChild(p.0, win) }.as_bool(), "back under the parent");
+        assert!(
+            unsafe { IsChild(p.0, win) }.as_bool(),
+            "back under the parent"
+        );
         let st = styles(win);
         assert_ne!(st & WS_CHILD.0, 0, "child style restored");
         assert_eq!(st & WS_OVERLAPPEDWINDOW.0, 0, "frame removed again");
@@ -2523,9 +2634,18 @@ mod embed_tests {
         set_embed_parent(0);
         let born = unsafe { create_container("W8c", (320, 200)) }.expect("top-level container");
         let _b = Ctx(born);
-        assert!(container_is_detached(born.0 as u64), "born native reads detached");
-        assert!(!redock_to_embed(born.0 as u64), "never embedded: nowhere to redock");
-        assert!(detach_to_toplevel(born.0 as u64), "already top-level: success");
+        assert!(
+            container_is_detached(born.0 as u64),
+            "born native reads detached"
+        );
+        assert!(
+            !redock_to_embed(born.0 as u64),
+            "never embedded: nowhere to redock"
+        );
+        assert!(
+            detach_to_toplevel(born.0 as u64),
+            "already top-level: success"
+        );
     }
 
     #[test]
@@ -2555,7 +2675,11 @@ mod embed_tests {
         }
         let mut r = RECT::default();
         unsafe { GetWindowRect(win, &mut r) }.expect("dpi rect");
-        assert_eq!((r.left, r.top), (12345, 12300), "follows the suggested position");
+        assert_eq!(
+            (r.left, r.top),
+            (12345, 12300),
+            "follows the suggested position"
+        );
         let mut want = RECT {
             left: 0,
             top: 0,
