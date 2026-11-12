@@ -86,9 +86,18 @@ icon embed works on EVERY Windows target incl. gnullvm cross (cargo
 reports target_env=gnu there; windres found next to the cross-linker).
 Docs: INSTALL.md Windows section = release front door; PLUGINS.md native
 scan dirs + no-yabridge note. `w11_*` pins x4, ci.yml filter += `w11_`.
-NEXT: W12 remainder (native JACK-on-Windows mode, settings round-trip
-across OSes, minidump story — unpicked). The next real version tag
-publishes both assets automatically.
+W12d DONE 2026-11-11 (session 19, see DONE log): settings round-trip
+across OSes — the OTHER OS's absolute paths are legal relative junk
+here, so `Config::load` now drops those shapes (`paths::path_is_foreign`:
+drive/UNC roots on Unix, `/` roots on Windows) from the create-or-seed
+fields — `fx_dir` (worst consumer: `prepare_effects_dir` seeds bundled
+scripts into whatever the config names), `project_dir`, `rack_folders`,
+`vst_dirs`, `dir_memo` — and the project-load dir-memo merge guards the
+same way (`.slooper` files travel too). Inert view caches
+(`editor_probe`/`rack_collapsed`/`rack_dir_order`) stay verbatim for the
+trip back. `w12d_*` pins x4 (bare `w12` CI filter already covers).
+NEXT: W12 remainder (native JACK-on-Windows mode, minidump story —
+unpicked). The next real version tag publishes both assets automatically.
 
 ## Ground rules (apply to every task)
 
@@ -481,8 +490,11 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   plugin px and chrome slot = px/ppp (`editor_slot_points`). Full
   plugin-content rescale = bitmap-scaling editors — explicitly deferred
   (WS_CHILD live-paint).
-- [ ] native JACK-on-Windows mode; settings round-trip across OSes;
-  minidump story — unpicked.
+- [x] **W12d DONE 2026-11-11 (session 19, see DONE log)** — settings
+  round-trip across OSes: foreign-syntax absolute paths dropped at
+  `Config::load` (create-or-seed fields only; view caches untouched),
+  project dir-memo merge guarded alike
+- [ ] native JACK-on-Windows mode; minidump story — unpicked.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
@@ -1091,3 +1103,54 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   — baseline was 393/103, grow-list continues. w11_ pins 4/4, each
   sabotage-proven (gate string, attribute, asset name, ico count byte
   — every pin reds on its own sabotage only).
+
+- 2026-11-11 · session 19 · **W12d settings round-trip across OSes**:
+  the risk was never the JSON layer (serde escapes backslashes correctly
+  — a Windows config parses losslessly anywhere); it was that an
+  other-OS absolute path is NOT invalid syntax on the receiving OS:
+  `C:\Users\x\fx` is a legal RELATIVE directory name on Linux and
+  `/home/x/fx` a drive-rooted one on Windows. Create-or-seed consumers
+  would then WRITE junk trees — worst is `fx::prepare_effects_dir`,
+  which `create_dir_all`s `fx_dir` AND seeds every bundled effect
+  script + factory preset into it; `projects_dir` is created on save;
+  rack recording writes under the primary folder. Fix = one pure
+  detector + one sanitizer: `paths::path_is_foreign` (Unix: drive-letter
+  ROOT `X:`/`X:/`/`X:\` or UNC `\\` — drive-RELATIVE `C:foo` deliberately
+  NOT claimed, backslashes inside relative names are legal POSIX
+  characters; Windows: `/`-root only, `C:\`/`C:/`/UNC stay native) and
+  `Config::drop_foreign_paths` applied UNCONDITIONALLY in `Config::load`
+  to the five create-or-seed fields (fx_dir/project_dir blanked ⇒ this
+  OS's defaults; rack/vst lists filtered — an emptied rack list falls
+  back to the samples root like a first launch; dir_memo forgets). The
+  inert view caches (`editor_probe`, `rack_collapsed`, `rack_dir_order`)
+  are deliberately KEPT verbatim: their keys can never hit cross-OS,
+  and dropping them would break the fidelity of the trip BACK. Save is
+  untouched (a same-OS round trip stays byte-familiar); the cleaned set
+  persists with the next normal save. Project files travel too, so the
+  `finish_load` dir-memo merge skips foreign values (a project from the
+  other OS loads with every picker falling back by rfd's own missing-dir
+  behavior instead of poisoning the memo → config).
+  TRAPS: config tests that swap `SLOOPER_CONFIG_DIR` MUST Drop-guard it
+  — a leaked override poisons every later `Config::load` in the same
+  1-thread process (`ConfigSandbox` pattern in config.rs tests; temp
+  dirs outside the repo per the W6 lesson).
+  Pins `w12d_*` x4: shape rules (each OS asserts its own truth — the
+  Windows branch gets REAL execution only at CI windows-native, first
+  time this series), verbatim other-OS JSON parses + filter counts 6,
+  end-to-end `Config::load` through a sandbox (local + relative
+  survive, foreign drop, inert caches stay, deterministic across two
+  loads), and a ui pin driving the REAL flow (build_project →
+  project::save → `do_load` → asserts `proj_name` proves finish_load
+  ran before asserting the memo). Sabotage PROOF: three layers dead at
+  once (detector → always false, load glue, ui filter) = 4/4 pins RED,
+  revert = 4/4 GREEN.
+  Gates: debug w12d 4/4; citest monolith 571 pass + the 3 vstedit x11
+  fails re-passed solo with a FRESH XAUTHORITY (this boot's file is
+  still /run/user/1000/xauth_AvdKci — same continuous DE session);
+  isolated quarantines 3/3, v36_script_fx_editor_resizes = known open
+  heap class (SIGABRT solo, unchanged); clippy-zero 0; gnullvm
+  `--all-targets` ZERO errors (both cfg! branches type-check on both
+  targets — cfg! is runtime, no compile-time exclusion to prove); e2e
+  LIVE JACK 32/32 incl. `v23_probe_child_dies` (no config/paths change
+  touches the RT path — Linux behavior for same-OS configs is
+  structurally unchanged: nothing matches, filter returns 0 silently).
