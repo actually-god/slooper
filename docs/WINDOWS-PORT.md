@@ -513,6 +513,43 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   self-test switch two CI child pins drive. Linux inert, pinned both ways.
 - [ ] native JACK-on-Windows mode — the last unpicked W12 item.
 
+### W13 — Linux distro portability battery (opened 2026-11-12; same protocol)
+
+The program's goal is Windows **and** all major Linux distros. Measured today
+on the Arch dev host (glibc 2.44): `objdump -T target/release/slooper`
+requires up to **GLIBC_2.43**, and the exe links `libX11/libxcb/libXau/
+libXdmcp` + `libstdc++/libgcc_s` directly — libjack, Wayland, GL and EGL are
+dlopen'd, so they are NOT load-time dependencies (that is why the AUR
+`depends=(libjack.so)` is complete). Consequence: a binary built on a NEW
+distro fails to load on an older one (`version 'GLIBC_2.43' not found`) —
+exactly the report a Debian 12 (2.36) or Ubuntu 22.04 (2.35) user would file.
+Today the linux tar.zst is built on ubuntu-24.04 (glibc 2.39) and the AUR pkg
+on Arch (2.43+): neither runs on the older tier. Fix direction = build the
+portable asset on the OLDEST distro we support, never the newest.
+
+- [ ] **W13a — pick the floor and build the asset there.** Propose glibc ≥
+  2.35 (Ubuntu 22.04 / Debian 12 / Fedora 38). Build the release linux asset
+  in an `ubuntu:22.04` container job (apt deps = the ci.yml list) and add a
+  CI assertion that the max `GLIBC_*` the exe requires (`objdump -T … |
+  grep -o 'GLIBC_[0-9.]+' | sort -uV | tail -1`) is ≤ the floor — plus the
+  same check for `GLIBCXX_*`/`CXXABI_*` (the ffiguard C++ shim links
+  libstdc++; a static-libstdc++ link is the fallback if the baseline can't
+  be met otherwise).
+- [ ] **W13b — distro smoke matrix.** Containers arch / debian:12 /
+  ubuntu:22.04 / fedora:40 install only the RUNTIME libs (libx11-6, libxcb1,
+  libjack-jackd2-0 …) and execute the SHIPPED asset (not a rebuild) through
+  the one CLI mode that exists: `slooper --slooper-probe v2 /nonexistent`
+  prints one JSON line and exits WITHOUT opening a window or touching JACK
+  (W7 interception runs before `Backend::start`) = a real loads-and-runs
+  proof per distro, including the libjack-dlopen path.
+- [ ] **W13c — dependency contract in docs.** INSTALL.md gets the
+  links-vs-dlopens table, a per-distro install line, and the rule "the single
+  tar.zst runs everywhere only if it was built on the floor distro"; AUR flow
+  stays untouched.
+- [ ] **W13d — optional `.deb`.** The tar.zst already carries an FHS `usr/`
+  layout, so Debian/Ubuntu packaging is mostly a control file + the runtime
+  dep list from W13b. Lowest priority.
+
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
 - No yabridge on Windows (native plugins instead — it IS Windows).

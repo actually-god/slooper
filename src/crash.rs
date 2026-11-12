@@ -37,9 +37,14 @@
 //! [`install`] — main dispatches them before it — so a deliberately
 //! crash-testing probe loads no handler and spams no dumps.
 //!
-//! Symbolization: the shipping exe keeps symbols (release.yml `winrel`
-//! profile, W12e) so dumps resolve module+symbol without a PDB search.
-//! Docs: docs/INSTALL.md (Windows crash section).
+//! Symbolization: the shipping exe is built with the `winrel` profile
+//! (release.yml), whose debug info lands in `slooper.pdb` — the release
+//! ships it as a SEPARATE asset (`slooper-win64-pdb.zip`), because the PE
+//! itself carries only a CODEVIEW/RSDS record pointing at that PDB. Put the
+//! PDB next to the exe (or point WinDbg's `.sympath` at it) and a dump opens
+//! with function names; without it a dump still gives module + RVA + the
+//! exception record, which is where the text note picks up. Docs:
+//! docs/INSTALL.md (Windows crash section).
 
 use std::path::PathBuf;
 

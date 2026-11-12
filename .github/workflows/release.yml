@@ -86,10 +86,31 @@ jobs:
           Copy-Item README.md stage/README.md
           Copy-Item LICENSE stage/LICENSE
           Compress-Archive -Path stage/* -DestinationPath slooper-win64.zip -Force
+      # W12e follow-up (PE walk of the first winrel artifact): the MSVC exe
+      # carries a CODEVIEW/RSDS record naming `slooper.pdb` but NO debug
+      # sections of its own — link.exe moves them into the PDB. So the
+      # symbols a minidump needs live in that file, and a dump from a user
+      # is only symbolizable if we keep the PDB of the exact build. Shipped
+      # as a SEPARATE asset so the user-facing zip stays small; the GUID+age
+      # in the exe's RSDS record is the match test. Fails loudly if the
+      # profile ever stops emitting it.
+      - name: Zip the debug symbols (separate asset)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/winrel/slooper.pdb)) {
+            Write-Error "winrel produced no slooper.pdb — minidumps would be symbol-less"
+            exit 1
+          }
+          Compress-Archive -Path target/winrel/slooper.pdb `
+            -DestinationPath slooper-win64-pdb.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: windows-asset
           path: slooper-win64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-pdb
+          path: slooper-win64-pdb.zip
 
   release:
     name: Publish GitHub Release
@@ -104,6 +125,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-asset
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-pdb
       - name: Release (tag → published, dispatch → draft)
         uses: softprops/action-gh-release@v2
         with:
@@ -113,3 +137,4 @@ jobs:
           files: |
             slooper-*-linux-x86_64.tar.zst
             slooper-win64.zip
+            slooper-win64-pdb.zip

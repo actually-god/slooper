@@ -215,11 +215,19 @@ a silent disappearance. Now it leaves receipts in
 The ten newest events are kept and an event's `.dmp` + `.txt` disappear
 together. Nothing leaves your machine unless you attach it to a bug report:
 for a crash, include the `.txt` (plus the `.dmp` for hard faults) and the
-project file. The shipped exe keeps its symbols (the `winrel` build profile,
-`release.yml`) so dumps resolve to module + function names with no PDB hunt.
+project file.
 
-Linux is untouched by all of this: the handler is Windows-only and Linux
-forensics stay `coredumpctl`.
+To read a dump with function names you need the matching debug file: the
+release also ships **`slooper-win64-pdb.zip`** (one file, `slooper.pdb`).
+The exe itself carries only a pointer to it (a CODEVIEW record), so unpack
+the PDB next to `slooper.exe` — or point WinDbg at the folder
+(`.sympath+ C:\path\to\pdb` then `.reload`) — and the dump opens on the
+faulting frame BY NAME. The PDB must be the one from the same release: the
+exe records its identity (GUID + age) and WinDbg refuses a mismatch. Without
+the PDB a dump still shows the module, the RVA and the exception record, and
+the `.txt` note already names the code address — usually enough to file a
+useful report. Linux is untouched by all of this: the handler is Windows-only
+and Linux forensics stay `coredumpctl`.
 
 ## Uninstalling
 
