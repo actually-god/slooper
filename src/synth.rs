@@ -136,6 +136,25 @@ static HOST_TABLE: RwLock<Option<(Arc<Vec<crate::assets::AssetData>>, u32)>> = R
 thread_local! {
     static HOST_KEEP: std::cell::RefCell<Option<Arc<Vec<crate::assets::AssetData>>>> =
         const { std::cell::RefCell::new(None) };
+    // The instance the host is currently INSIDE (set by the entry guards on
+    // Instance). host_load_map reads it: the map is per track, and this is
+    // the only way a bare fn-pointer host call can find "its" instance.
+    static CUR_INST: std::cell::Cell<*const Instance> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// RAII: marks `inst` as the host-caller for as long as the guard lives
+/// (nesting-safe: the previous value is restored on drop).
+struct InstGuard(Option<*const Instance>);
+impl InstGuard {
+    fn enter(inst: &Instance) -> Self {
+        let prev = CUR_INST.with(|c| c.replace(inst));
+        InstGuard(if prev.is_null() { None } else { Some(prev) })
+    }
+}
+impl Drop for InstGuard {
+    fn drop(&mut self) {
+        CUR_INST.with(|c| c.set(self.0.unwrap_or(std::ptr::null())));
+    }
 }
 
 pub fn set_host_assets(assets: Arc<Vec<crate::assets::AssetData>>, rate: u32) {
@@ -170,7 +189,28 @@ extern "C" fn host_load_asset(id: u32, out: *mut SynthAssetV1) -> u8 {
 pub static HOST: SynthHostV1 = SynthHostV1 {
     abi: SLOOPER_SYNTH_ABI,
     load_asset: host_load_asset,
+    load_map: host_load_map,
 };
+
+/// v51: hard cap of one track's multi-sample key map (the GUI enforces it
+/// too; the bundled sampler keeps a stack array of this size).
+pub const MAX_MAP_SLOTS: usize = 64;
+/// `mode` bit 31 of the host `load_map` reply: this track HAS a key map
+/// (empty map + this bit = silence, without it = legacy params).
+pub const MAP_EXISTS: u32 = 0x8000_0000;
+
+/// Copy the calling instance's key map out to a script (see the ABI doc).
+/// Slots are packed `(asset_id << 8) | root_note`, slot 0..n dense.
+extern "C" fn host_load_map(slots: *mut u64, max: u32, mode: *mut u32) -> u32 {
+    let inst = CUR_INST.with(|c| c.get());
+    if inst.is_null() {
+        if !mode.is_null() {
+            unsafe { *mode = 0 };
+        }
+        return 0;
+    }
+    unsafe { (*inst).load_map_into(slots, max, mode) }
+}
 
 // ---------------------------------------------------------------------------
 // Descriptors & instances
@@ -226,6 +266,16 @@ pub struct Instance {
     n_params: usize,
     params: Box<[AtomicU32; MAX_PARAMS]>,
     param_gen: AtomicU64,
+    /// v51: multi-sample key map (the bundled sampler's piano-roll state).
+    /// `map[0..map_n]` holds packed `(asset_id << 8) | root_note`; the GUI
+    /// writes slots BEFORE bumping the count so a reader that sees the new
+    /// count also sees the data. `map_mode` carries the mode in the low
+    /// bits plus bit-31 "a map EXISTS" (mode 0 = hard cutoff, 1 =
+    /// crossfade; exists+n==0 = deliberately silent, vs "no map" = the
+    /// legacy single-asset params).
+    map: [AtomicU64; MAX_MAP_SLOTS],
+    map_n: AtomicU32,
+    map_mode: AtomicU32,
     _lib: Arc<LibHandle>,
 }
 unsafe impl Send for Instance {}
@@ -253,6 +303,9 @@ impl Instance {
                 AtomicU32::new(values.get(k).copied().unwrap_or(d).to_bits())
             })),
             param_gen: AtomicU64::new(1),
+            map: core::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            map_n: AtomicU32::new(0),
+            map_mode: AtomicU32::new(0),
             _lib: lib,
         });
         Some(inst)
@@ -277,7 +330,18 @@ impl Instance {
                 })
                 .collect(),
         };
-        Self::new(self.fns, self._lib.clone(), &desc, self.sample_rate, &vals)
+        let fresh = Self::new(self.fns, self._lib.clone(), &desc, self.sample_rate, &vals)?;
+        // v51: audition/preview respawns ride this path — the key map must
+        // ride with them or the sampled map preview would play only params.
+        let n = (self.map_n.load(Ordering::Acquire) as usize).min(MAX_MAP_SLOTS);
+        let slots: Vec<(u32, u8)> = (0..n)
+            .map(|i| {
+                let p = self.map[i].load(Ordering::Acquire);
+                ((p >> 8) as u32, (p & 0xFF) as u8)
+            })
+            .collect();
+        fresh.set_map_raw(&slots, self.map_mode.load(Ordering::Relaxed));
+        Some(fresh)
     }
 
     pub fn set_param(&self, k: usize, v: f32) {
@@ -285,6 +349,62 @@ impl Instance {
             self.params[k].store(v.to_bits(), Ordering::Relaxed);
             self.param_gen.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// v51: publish this instance's multi-sample key map. Slots beyond
+    /// `slots.len()` are erased. Calling this marks the instance as
+    /// HAVING a map (even with zero slots = deliberately silent);
+    /// instances that never had one fall back to the legacy single-asset
+    /// params. The GUI thread owns the map; the audio thread only ever
+    /// reads it (through `host_load_map`).
+    pub fn set_map(&self, slots: &[(u32, u8)], mode: u8) {
+        self.set_map_raw(slots, (mode as u32) | MAP_EXISTS)
+    }
+
+    /// "No key map" — legacy params rule again (rebinding a fresh synth
+    /// without a saved map lands here).
+    pub fn clear_map(&self) {
+        self.set_map_raw(&[], 0);
+    }
+
+    fn set_map_raw(&self, slots: &[(u32, u8)], mode_bits: u32) {
+        let n = slots.len().min(MAX_MAP_SLOTS);
+        for (i, s) in slots.iter().take(n).enumerate() {
+            self.map[i].store(((s.0 as u64) << 8) | s.1 as u64, Ordering::Release);
+        }
+        for slot in self.map.iter().skip(n) {
+            slot.store(u64::MAX, Ordering::Relaxed);
+        }
+        // Count LAST: a script that sees n never reads stale slots.
+        self.map_n.store(n as u32, Ordering::Release);
+        self.map_mode.store(mode_bits, Ordering::Relaxed);
+    }
+
+    /// Readback of the published map (pins + the map editor mirror).
+    /// `mode` is the low-bits mode; `exists` = a map was published.
+    pub fn map_snapshot(&self) -> (Vec<(u32, u8)>, u8, bool) {
+        let n = (self.map_n.load(Ordering::Acquire) as usize).min(MAX_MAP_SLOTS);
+        let bits = self.map_mode.load(Ordering::Relaxed);
+        let slots = (0..n)
+            .map(|i| {
+                let p = self.map[i].load(Ordering::Acquire);
+                ((p >> 8) as u32, (p & 0xFF) as u8)
+            })
+            .collect();
+        (slots, (bits & 0xFF) as u8, bits & MAP_EXISTS != 0)
+    }
+
+    /// The `host.load_map` worker: copy the packed slots out for the script.
+    unsafe fn load_map_into(&self, slots: *mut u64, max: u32, mode: *mut u32) -> u32 {
+        let n = (self.map_n.load(Ordering::Acquire) as usize).min(MAX_MAP_SLOTS);
+        let out = n.min(max as usize);
+        for i in 0..out {
+            *slots.add(i) = self.map[i].load(Ordering::Acquire);
+        }
+        if !mode.is_null() {
+            *mode = self.map_mode.load(Ordering::Relaxed);
+        }
+        out as u32
     }
 
     pub fn param_gen(&self) -> u64 {
@@ -304,18 +424,23 @@ impl Instance {
     }
 
     pub fn note_on(&self, ch: u8, note: u8, vel: u8) {
+        let _g = InstGuard::enter(self);
         (self.fns.note_on)(self.state, ch, note, vel)
     }
     pub fn note_off(&self, ch: u8, note: u8) {
+        let _g = InstGuard::enter(self);
         (self.fns.note_off)(self.state, ch, note)
     }
     pub fn all_off(&self) {
+        let _g = InstGuard::enter(self);
         (self.fns.all_off)(self.state)
     }
     pub fn cc(&self, ch: u8, num: u8, val: u8) {
+        let _g = InstGuard::enter(self);
         (self.fns.cc)(self.state, ch, num, val)
     }
     pub fn press(&self, ch: u8, val: u8) {
+        let _g = InstGuard::enter(self);
         (self.fns.press)(self.state, ch, val)
     }
 
@@ -325,6 +450,7 @@ impl Instance {
     /// # Safety
     /// Only ever called from one thread at a time for this instance.
     pub unsafe fn process_into(&self, out: &mut [f32], params: &[f32; MAX_PARAMS]) {
+        let _g = InstGuard::enter(self);
         (self.fns.process)(self.state, out.as_mut_ptr(), out.len(), params.as_ptr())
     }
 }
@@ -1097,5 +1223,205 @@ mod tests {
         assert!(crate::paths::build_sidecar(&out, "failed").is_file());
         assert!(!out.is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================== v51 acceptance pins (engine side) =====================
+    //
+    // Multi-sample key map: the host publishes per-instance slots
+    // (asset id + root note) + a mode through SynthHostV1::load_map, and
+    // the bundled sampler picks/weights/mixes them live. These pins render
+    // the REAL script (compile + audio) — behavior specs, not mocks.
+
+    /// Shared registry: the v51 pins all exercise the same bundled
+    /// sampler, so they share one seed dir (built once per binary run —
+    /// the compile cache keys on mtime, see needs_build).
+    fn v51_registry() -> Registry {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let dir = std::env::temp_dir().join("sp-synth-v51");
+        ONCE.call_once(|| {
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+        std::env::set_var("SLOOPER_SYNTHS_DIR", &dir);
+        Registry::open(dir.clone())
+    }
+
+    /// Asset 0 = a 200 Hz sine, asset 1 = an 800 Hz sine (100 ms), both at
+    /// the instance rate so a note at its root plays the raw frequency.
+    fn v51_tones() {
+        let mk = |f: f64| -> Arc<[f32]> {
+            (0..4800)
+                .map(|i| (i as f64 * std::f64::consts::TAU * f / 48000.0).sin() as f32 * 0.5)
+                .collect()
+        };
+        set_host_assets(Arc::new(vec![mk(200.0), mk(800.0)]), 48_000);
+    }
+
+    /// One note through the instance; returns the render for Goertzel.
+    fn v51_render(inst: &Arc<Instance>, note: u8) -> Vec<f32> {
+        let mut ev = vec![
+            (0u64, 3u8, 0u8, note, 110u8),
+            (40_000, 0, 0, note, 0),
+        ];
+        let mut out = vec![0f32; 8192];
+        crate::audio::render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    /// The sampler instance with unity gain and no map (legacy params).
+    fn v51_sampler(reg: &Registry) -> Arc<Instance> {
+        reg.create_instance("sampler", 48_000.0, &[0.0, 48.0, 1.0])
+            .expect("sampler instance")
+    }
+
+    #[test]
+    fn v51_sampler_map_cutoff_nearest_and_tie_down() {
+        // AC3+AC4: roots 48 (200 Hz) and 54 (800 Hz). Closest wins; the
+        // exact midpoint (51) plays the LOWER sample (round down); notes
+        // outside the range play the extreme sample, never wrap.
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 48), (1, 54)], 0);
+        assert_eq!(inst.map_snapshot(), (vec![(0u32, 48u8), (1, 54)], 0, true));
+        // A mapped sample plays at its ROOT pitch when the note equals the
+        // root, so each case measures the TRANSPOSED frequency.
+        let fsh = |base: f64, note: i32, root: i32| base * (2.0f64).powf((note - root) as f64 / 12.0);
+        let dom = |note: u8, want: f64, off: f64| {
+            let x = v51_render(&inst, note);
+            let a = tone_power(&x, want, 48000.0, 512, 7680);
+            let b = tone_power(&x, off, 48000.0, 512, 7680);
+            assert!(
+                a > 25.0 * b,
+                "note {note}: wanted {want:.1} Hz (p {a}), off-freq {off:.1} leaked (p {b})"
+            );
+        };
+        let n = |x: u8| x as i32;
+        dom(48, fsh(200.0, n(48), 48), fsh(800.0, n(48), 54)); // at the low root
+        dom(50, fsh(200.0, n(50), 48), fsh(800.0, n(50), 54)); // 2 vs 4 -> lower
+        dom(52, fsh(800.0, n(52), 54), fsh(200.0, n(52), 48)); // 4 vs 2 -> upper
+        dom(51, fsh(200.0, n(51), 48), fsh(800.0, n(51), 54)); // midpoint -> LOWER
+        dom(40, fsh(200.0, n(40), 48), fsh(800.0, n(40), 54)); // below range
+        dom(60, fsh(800.0, n(60), 54), fsh(200.0, n(60), 48)); // above range
+    }
+
+    #[test]
+    fn v51_sampler_map_cutoff_equal_roots_first_wins() {
+        // Two slots on the SAME root: the first-listed one wins
+        // (deterministic, documented in the script).
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 48), (1, 48)], 0);
+        let x = v51_render(&inst, 48);
+        let a = tone_power(&x, 200.0, 48000.0, 512, 7680);
+        let b = tone_power(&x, 800.0, 48000.0, 512, 7680);
+        assert!(a > 25.0 * b, "first slot must win a root tie: {a} vs {b}");
+    }
+
+    #[test]
+    fn v51_sampler_map_crossfade_inverse_distance_mix() {
+        // AC5 (the user's exact example): samples on A2 (45) and E3 (52),
+        // note C3 (48) = 3 st above A2 and 4 below E3 -> A2 gets 4/7 of
+        // the volume, E3 gets 3/7. Both are BENT to the note first:
+        // A2's 200 Hz plays at 200*2^(3/12), E3's 800 Hz at 800*2^(-4/12).
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 45), (1, 52)], 1);
+        let x = v51_render(&inst, 48);
+        let f_lo = 200.0 * (2.0f64).powf(3.0 / 12.0);
+        let f_hi = 800.0 * (2.0f64).powf(-4.0 / 12.0);
+        // Measure while BOTH shifted reads still sound (the +3 st sample
+        // runs out first, at ~4030 frames) — equal window length for both,
+        // or power would not be proportional to amplitude squared.
+        let plo = line_power(&x, f_lo, 48000.0, 512, 3800);
+        let phi = line_power(&x, f_hi, 48000.0, 512, 3800);
+        assert!(plo > 5e4 && phi > 5e4, "both samples must sound: {plo} {phi}");
+        // Amplitude ratio 4/7 : 3/7 -> power ratio 16:9 = 1.78.
+        let r = plo / phi;
+        assert!(
+            (r - 16.0 / 9.0).abs() < 0.5,
+            "crossfade mix ratio off: power(lo/hi) {r}, wanted ~1.78 (4/7 vs 3/7)"
+        );
+    }
+
+    #[test]
+    fn v51_sampler_map_crossfade_exact_root_and_out_of_range() {
+        // A note exactly on a root plays ONLY that sample; a note outside
+        // the map range plays the single extreme sample (no phantom other
+        // side to blend with).
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 45), (1, 52)], 1);
+        let x = v51_render(&inst, 45); // exact low root
+        let a = tone_power(&x, 200.0, 48000.0, 512, 7680);
+        let b = tone_power(&x, 800.0 * (2.0f64).powf(-7.0 / 12.0), 48000.0, 512, 7680);
+        assert!(a > 25.0 * b, "exact root must silence the other side: {a} vs {b}");
+        let x = v51_render(&inst, 40); // below range -> lowest only
+        let a = tone_power(&x, 200.0 * (2.0f64).powf(-5.0 / 12.0), 48000.0, 512, 7680);
+        let b = tone_power(&x, 800.0 * (2.0f64).powf(-12.0 / 12.0), 48000.0, 512, 7680);
+        assert!(a > 25.0 * b, "below range must play the lowest sample only: {a} vs {b}");
+    }
+
+    #[test]
+    fn v51_sampler_map_empty_falls_back_legacy_params_then_clear_is_silent() {
+        // No map published -> legacy asset/root params rule (unchanged
+        // v0.8/v0.10 behavior). After a map is published and then emptied,
+        // the track is deliberately SILENT, not ghosted onto the params.
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg); // params: asset 0, root 48
+        let x = v51_render(&inst, 60); // +12 st -> 200 Hz at 400 Hz
+        let a = tone_power(&x, 400.0, 48000.0, 512, 7680);
+        let b = tone_power(&x, 800.0, 48000.0, 512, 7680);
+        assert!(a > 25.0 * b, "legacy params must rule with no map: {a} vs {b}");
+        assert!(!inst.map_snapshot().2, "no map yet -> exists=false");
+
+        inst.set_map(&[(1, 60)], 0); // map up -> params ignored
+        let x = v51_render(&inst, 60);
+        let a = tone_power(&x, 800.0, 48000.0, 512, 7680);
+        let b = tone_power(&x, 400.0, 48000.0, 512, 7680);
+        assert!(a > 25.0 * b, "map must override the params: {a} vs {b}");
+
+        inst.set_map(&[], 0); // map exists, zero slots -> silence
+        let x = v51_render(&inst, 60);
+        let peak = x.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 1e-5, "cleared map must be silent, peak {peak}");
+    }
+
+    #[test]
+    fn v51_sampler_map_live_edit_and_spawn_fresh_carries() {
+        // AC7: a map edit lands on the SAME running instance (no rebind),
+        // and a spawn_fresh (the audition path) carries the map+mode.
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 48)], 0);
+        let x = v51_render(&inst, 48);
+        assert!(
+            tone_power(&x, 200.0, 48000.0, 512, 7680) > 25.0
+                * tone_power(&x, 800.0, 48000.0, 512, 7680),
+            "first map must sound"
+        );
+        inst.set_map(&[(1, 48)], 0); // swap sample on the fly
+        let x = v51_render(&inst, 48);
+        assert!(
+            tone_power(&x, 800.0, 48000.0, 512, 7680) > 25.0
+                * tone_power(&x, 200.0, 48000.0, 512, 7680),
+            "live map edit must change the NEXT render with no rebind"
+        );
+        // Spawn a fresh copy (audition/offline path) — map + mode ride.
+        inst.set_map(&[(0, 45), (1, 52)], 1);
+        let fresh = inst.spawn_fresh().expect("spawn_fresh");
+        assert_eq!(
+            fresh.map_snapshot(),
+            (vec![(0u32, 45u8), (1, 52)], 1, true),
+            "spawn_fresh must carry the map + crossfade mode"
+        );
+        let x = v51_render(&fresh, 48);
+        let plo = line_power(&x, 200.0 * (2.0f64).powf(3.0 / 12.0), 48000.0, 512, 3800);
+        let phi = line_power(&x, 800.0 * (2.0f64).powf(-4.0 / 12.0), 48000.0, 512, 3800);
+        assert!(plo > 5e4 && phi > 5e4, "the copy must crossfade like the original");
     }
 }
