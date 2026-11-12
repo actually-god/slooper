@@ -1347,6 +1347,11 @@ pub struct App {
     sampler_maps: Vec<Option<crate::config::SamplerMapSave>>,
     /// v51: track whose sampler key-map (piano roll) window is open.
     smap_win: Option<usize>,
+    /// Harness hook: the last (keyboard-strip rect, lane-strip min-x) the
+    /// map window painted this frame, so tests can drive real drags/clicks
+    /// without color archaeology. Written every painted frame; read-only
+    /// cost for the app.
+    smap_probe: Option<(f32, f32, f32, f32, f32)>,
     /// v51: selected slot row inside the open key-map window.
     smap_sel: Option<usize>,
     /// v51: note currently held by a key/lane press in the map window.
@@ -1851,6 +1856,7 @@ impl App {
                 m
             },
             smap_win: None,
+            smap_probe: None,
             smap_sel: None,
             smap_hold: None,
             show_drums: cfg.show_drums,
@@ -10251,8 +10257,14 @@ impl App {
         let resp = egui::Window::new(format!("\u{266a} sampler map \u{b7} track {}", t + 1))
             .id(egui::Id::new(("smapwin", t)))
             .open(&mut open)
-            .default_size([1080.0, 320.0])
-            .min_width(700.0)
+            // Open wide enough that the lane rows never wrap (header cell +
+            // 49 keys); like the piano roll, size follows the viewport.
+            .default_pos(egui::pos2(60.0, 80.0))
+            .default_size({
+                let screen = ui.ctx().viewport_rect();
+                [(screen.width() - 80.0).clamp(760.0, 1180.0), 320.0_f32]
+            })
+            .min_width(300.0)
             .min_height(150.0)
             .show(ui, |ui| {
                 body_clipped(ui, |ui| self.smap_body(ui, t));
@@ -10421,7 +10433,8 @@ impl App {
         let mut roots: Vec<u8> = infos.iter().map(|(_, r, _)| *r).collect();
         roots.sort_unstable();
         let mut dirty_order = false; // per-frame pushes are cheap; saves wait
-                                     // ---- lane rows ----
+        let mut probe_lane: Option<(f32, f32)> = None;
+        // ---- lane rows ----
         for i in 0..n {
             let (name, root, resolved) = infos[i].clone();
             let sel = self.smap_sel == Some(i);
@@ -10464,6 +10477,9 @@ impl App {
                 );
                 let (lr, _) =
                     ui.allocate_exact_size(egui::vec2(roll_w, LANE_H), egui::Sense::hover());
+                if i == 0 {
+                    probe_lane = Some((lr.min.x, lr.min.y));
+                }
                 // Lane background (selection highlight + click-to-select
                 // FIRST, so the block drag allocated later wins hit tests
                 // over its own rect — v50 interact-order rule).
@@ -10590,6 +10606,7 @@ impl App {
             );
         }
         // ---- piano keyboard strip ----
+        let mut probe_kr: Option<egui::Rect> = None;
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(HDR_W, KEY_H),
@@ -10605,6 +10622,7 @@ impl App {
             );
             let (kr, kresp) =
                 ui.allocate_exact_size(egui::vec2(roll_w, KEY_H), egui::Sense::click_and_drag());
+            probe_kr = Some(kr);
             // White keys, then black keys, then C labels.
             let is_black = |n: u8| matches!(n % 12, 1 | 3 | 6 | 8 | 10);
             for k in 0..NW {
@@ -10657,6 +10675,9 @@ impl App {
                         egui::Color32::from_rgb(255, 190, 60),
                     );
                 }
+            }
+            if let (Some(lr0), Some(kr)) = (probe_lane, probe_kr) {
+                self.smap_probe = Some((kr.min.x, kr.min.y, lr0.0, lr0.1, roll_w));
             }
             let sel = self.smap_sel.filter(|i| *i < n);
             let apply = |me: &mut Self, x: f32| {
@@ -29595,6 +29616,117 @@ mod tests {
         app.set_track_synth_stem(0, "piano");
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.smap_win, None, "window closes when the sampler unbinds");
+    }
+
+    /// v51: dragging a lane block to a new key re-roots the slot (state
+    /// and the live engine map), and a piano-key click re-roots the
+    /// SELECTED slot — the two assignment gestures of the map window.
+    #[test]
+    fn v51_sampler_map_drag_and_keyclick_assign_roots() {
+        let mut app = headless_app("v51drag");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        // Land the kick patch through the rack (v13 recipe) — this also
+        // survives the late project load that replaces pre-load assets.
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        frame(&mut app, &ctx, vec![moved(kick.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        );
+        // The script synth compiles async — the window guard refuses it
+        // until the registry is warm, so wait for the descriptor.
+        for _ in 0..1200 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.synth_registry.desc("sampler").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        app.smap_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let seeded = app.sampler_maps[0].clone().expect("open seeds");
+        assert_eq!((seeded.slots.len(), seeded.slots[0].root), (1, 48));
+        // Geometry straight from the harness probe: (kr.min.x, kr.min.y,
+        // lane-0 strip min-x/min-y, roll width). Deterministic, no colors.
+        let (kx, ky, lx, ly, _roll_w) = app.smap_probe.expect("window painted");
+        // Slot 0's block sits in lane 0 at C3(48).
+        let bx = lx + (48 - 36) as f32 * 18.0 + 9.0;
+        let by = ly + 12.0;
+        // Drag C3 -> G3(55): press, move held (no button events while
+        // held — the repo's proven drag recipe), release.
+        let tx = lx + (55 - 36) as f32 * 18.0 + 9.0;
+        let mid = lx + (51 - 36) as f32 * 18.0 + 9.0;
+        frame(&mut app, &ctx, vec![moved(egui::pos2(bx, by))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(bx, by)),
+                btn(egui::pos2(bx, by), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(mid, by))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(tx, by))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(egui::pos2(tx, by), egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.sampler_maps[0].as_ref().unwrap().slots[0].root,
+            55,
+            "dragging the block must re-root the slot"
+        );
+        // Key click at E2(40): the selected (just-dragged) slot follows.
+        let ex = kx + (40 - 36) as f32 * 18.0 + 9.0;
+        frame(&mut app, &ctx, vec![moved(egui::pos2(ex, ky + 10.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(
+                egui::pos2(ex, ky + 10.0),
+                egui::PointerButton::Primary,
+                true,
+            )],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(
+                egui::pos2(ex, ky + 10.0),
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        assert_eq!(
+            app.sampler_maps[0].as_ref().unwrap().slots[0].root,
+            40,
+            "clicking a key re-roots the selected lane"
+        );
+        // The LIVE instance received the map (no rebind happened).
+        let inst = app.track_synth_inst[0].clone().expect("bound instance");
+        let SynthHandle::Script(si) = inst.as_ref() else {
+            panic!("script instance expected");
+        };
+        let (slots, _mode, exists) = si.map_snapshot();
+        assert!(exists, "map published");
+        let kick = app.assets.iter().position(|a| a.name == "kick").unwrap() as u32;
+        assert!(
+            slots.iter().any(|(a, r)| *a == kick && *r == 40),
+            "engine map must carry kick@40, got {slots:?}"
+        );
     }
 
     /// v0.9: bare S splits the selected clip at the playhead; the clip

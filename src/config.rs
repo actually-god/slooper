@@ -1389,6 +1389,27 @@ mod tests {
     /// v22 pin: plugin state chunks ride base64 through the JSON saves —
     /// xattr storage vanished silently on vfat/external drives, which is
     /// how plugin edits "went back to default" after closing the GUI.
+    /// v51: sampler key maps ride the config session and survive old
+    /// files (missing field = empty, legacy rules).
+    #[test]
+    fn v51_sampler_maps_config_roundtrip() {
+        let c = Config {
+            sampler_maps: vec![Some(SamplerMapSave {
+                slots: vec![SamplerSlotSave {
+                    asset: "/x/kick.wav".into(),
+                    root: 48,
+                }],
+                mode: 1,
+            })],
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        let m = back.sampler_maps[0].as_ref().expect("map survives");
+        assert_eq!((m.mode, m.slots.len(), m.slots[0].root), (1, 1, 48));
+        assert_eq!(m.slots[0].asset, "/x/kick.wav");
+    }
+
     #[test]
     fn v22_b64_state_roundtrip() {
         let raw: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
