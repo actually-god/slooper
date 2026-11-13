@@ -621,10 +621,7 @@ fn stamped_artifact(build: &Path, stem: &str, src: &Path) -> Result<PathBuf, Str
     stem.hash(&mut h);
     bytes.hash(&mut h);
     let stamp = h.finish();
-    Ok(build.join(format!(
-        "{stem}-{stamp:016x}.{}",
-        crate::paths::dylib_ext()
-    )))
+    Ok(build.join(format!("{stem}-{stamp:016x}.{}", crate::paths::dylib_ext())))
 }
 
 /// Delete older artifacts of the same stem — extra stamps from edits and
@@ -1386,7 +1383,10 @@ mod tests {
             "edited script must rebuild and load: errors {:?}",
             reg.errors()
         );
-        assert!(second.is_file(), "the fresh artifact must exist after rescan");
+        assert!(
+            second.is_file(),
+            "the fresh artifact must exist after rescan"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1403,7 +1403,9 @@ mod tests {
             .join("\n");
         let between = |a: &str, b: &str| -> String {
             let i = code.find(a).unwrap_or_else(|| panic!("anchor {a} gone"));
-            let j = code[i..].find(b).unwrap_or_else(|| panic!("end anchor {b} gone"));
+            let j = code[i..]
+                .find(b)
+                .unwrap_or_else(|| panic!("end anchor {b} gone"));
             code[i..i + j].to_string()
         };
         let rescan = between("pub fn rescan", "fn stamped_artifact");
@@ -1411,8 +1413,14 @@ mod tests {
         let nb = ["needs", "_build"].concat();
         assert!(rescan.contains(&st_a), "rescan must resolve via the stamp");
         assert!(!rescan.contains(&nb), "mtime-based rebuild is back");
-        assert!(rescan.contains("if !lib.is_file()"), "artifact reuse is gone");
-        assert!(rescan.contains("prune_stale(&build, &stem, &lib)"), "stale artifact prune is gone");
+        assert!(
+            rescan.contains("if !lib.is_file()"),
+            "artifact reuse is gone"
+        );
+        assert!(
+            rescan.contains("prune_stale(&build, &stem, &lib)"),
+            "stale artifact prune is gone"
+        );
         let fallback = ["if !out.is", "_file()"].concat();
         for (start, end) in [
             ("fn compile_synth", "unsafe fn load_one"),
@@ -1431,8 +1439,14 @@ mod tests {
                 let j = fxc[i..].find(end).expect("fx end gone");
                 fxc[i..i + j].to_string()
             };
-            assert!(s.contains("if let Err(e) = std::fs::rename(&tmp, out)"), "{start}: rename must be fallible-checked");
-            assert!(s.contains(&fallback), "{start}: exists-fallback gone (W14 concurrent-build)");
+            assert!(
+                s.contains("if let Err(e) = std::fs::rename(&tmp, out)"),
+                "{start}: rename must be fallible-checked"
+            );
+            assert!(
+                s.contains(&fallback),
+                "{start}: exists-fallback gone (W14 concurrent-build)"
+            );
         }
     }
 

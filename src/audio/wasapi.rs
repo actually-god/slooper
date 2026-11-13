@@ -70,8 +70,8 @@ use super::*;
 /// KSDATAFORMAT subtypes (mmreg; pinned literally — same values as
 /// `KSDATAFORMAT_SUBTYPE_{IEEE_FLOAT,PCM}`, which not every windows-rs
 /// feature set exports).
-const KSSUBTYPE_FLOAT: GUID = GUID::from_u128(0x0000_0003_0000_0010_8000_00AA00389B71);
-const KSSUBTYPE_PCM: GUID = GUID::from_u128(0x0000_0001_0000_0010_8000_00AA00389B71);
+const KSSUBTYPE_FLOAT: GUID = GUID::from_u128(0x0000_0003_0000_0010_8000_00AA_0038_9B71);
+const KSSUBTYPE_PCM: GUID = GUID::from_u128(0x0000_0001_0000_0010_8000_00AA_0038_9B71);
 /// `CLSID_MMDeviceEnumerator` from mmdeviceapi.h — windows-rs generates no
 /// CLSIDs for plain COM classes, so it is pinned here (verified against
 /// the SDK header).
@@ -415,13 +415,12 @@ impl Ring {
     /// Consume `n` frames into `dst` (zero-padded when short).
     fn pop_into(&mut self, n: usize, dst: &mut [f32]) {
         let take = n.min(self.len).min(dst.len());
-        for o in 0..take {
-            dst[o] = self.buf[self.r];
+        for d in &mut dst[..take] {
+            *d = self.buf[self.r];
             self.r = (self.r + 1) % self.cap;
         }
-        for o in take..n.min(dst.len()) {
-            dst[o] = 0.0;
-        }
+        let end = n.min(dst.len());
+        dst[take..end].fill(0.0);
         self.len -= take;
     }
 }
@@ -523,7 +522,7 @@ fn drain_capture(cap: &mut CapStream) -> Result<(), RtFault> {
                 cap.rings[si].push(&cap.col);
             }
         }
-        unsafe { cap.svc.0.ReleaseBuffer(frames as u32).map_err(rt_fault)? };
+        unsafe { cap.svc.0.ReleaseBuffer(frames).map_err(rt_fault)? };
     }
 }
 
@@ -983,16 +982,16 @@ fn midi_labels() -> Result<Vec<String>, String> {
 /// Returns (connections, labels, per-device errors). One `MidiInput`
 /// instance per opening: midir's `connect` consumes it. Callback threads
 /// push into `q`; ring overflows count into `drops`.
-fn open_midi_devices(
-    sel: &[String],
-    q: &Arc<MidiInQueue>,
-    drops: &Arc<AtomicU64>,
-) -> (
+/// What `open_midi_devices` yields: connections, enumerate result,
+/// selected labels, opened labels (alias for the clippy "complex type").
+type MidiOpen = (
     Vec<MidiInputConnection<MidiInProducer>>,
     Result<Vec<String>, String>,
     Vec<String>,
     Vec<String>,
-) {
+);
+
+fn open_midi_devices(sel: &[String], q: &Arc<MidiInQueue>, drops: &Arc<AtomicU64>) -> MidiOpen {
     let labels = match midi_labels() {
         Ok(l) => l,
         Err(e) => return (Vec::new(), Err(e), Vec::new(), Vec::new()),

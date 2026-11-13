@@ -25218,9 +25218,17 @@ mod tests {
         let vals = |v: &str, f: bool| -> Vec<&'static str> {
             backend_options(v, f).iter().map(|(k, _)| *k).collect()
         };
-        assert_eq!(vals("auto", false), ["auto", "wasapi"], "no DLL, no JACK option");
+        assert_eq!(
+            vals("auto", false),
+            ["auto", "wasapi"],
+            "no DLL, no JACK option"
+        );
         assert_eq!(vals("auto", true), ["auto", "wasapi", "jack"]);
-        assert_eq!(vals("jack", false), ["auto", "wasapi", "jack"], "stale choice escapable");
+        assert_eq!(
+            vals("jack", false),
+            ["auto", "wasapi", "jack"],
+            "stale choice escapable"
+        );
         // Linux discovery is a no-op — the stub must agree (selector and
         // backend resolution read the same probe).
         #[cfg(not(windows))]
@@ -25244,9 +25252,15 @@ mod tests {
         app.win_backend = "jack".into();
         let mut painted = || galley_centers(&mut app, &ctx, "AUDIO BACKEND", true);
         if cfg!(windows) {
-            assert!(!painted().is_empty(), "Windows must paint the AUDIO BACKEND section");
+            assert!(
+                !painted().is_empty(),
+                "Windows must paint the AUDIO BACKEND section"
+            );
         } else {
-            assert!(painted().is_empty(), "the backend picker must never paint on Linux");
+            assert!(
+                painted().is_empty(),
+                "the backend picker must never paint on Linux"
+            );
         }
     }
 
@@ -25281,7 +25295,10 @@ mod tests {
         let row = label_center(&mut app, &ctx, "WASAPI").expect("popup lists WASAPI");
         click_pt(&mut app, &ctx, row);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.win_backend, "wasapi", "the pick lands in the App mirror");
+        assert_eq!(
+            app.win_backend, "wasapi",
+            "the pick lands in the App mirror"
+        );
         assert!(
             app.status.contains("wasapi") && app.status.contains("switched live"),
             "status must promise the live switch: {:?}",
@@ -29870,7 +29887,9 @@ mod tests {
             panic!("script instance expected");
         };
         assert_eq!(si.map_snapshot().0.len(), 2, "engine map carries both");
-        let rem = galley_at(&mut app, &ctx, "remove \u{d7}").expect("remove button").center();
+        let rem = galley_at(&mut app, &ctx, "remove \u{d7}")
+            .expect("remove button")
+            .center();
         for ev in [
             vec![moved(rem)],
             vec![moved(rem), btn(rem, egui::PointerButton::Primary, true)],
@@ -35589,7 +35608,8 @@ mod tests {
             pa.to_string_lossy()
                 .replace('\\', "/")
                 .contains("kit-a/kick")
-                && pb.to_string_lossy()
+                && pb
+                    .to_string_lossy()
                     .replace('\\', "/")
                     .contains("kit-b/kick"),
             "{pa:?} vs {pb:?}"

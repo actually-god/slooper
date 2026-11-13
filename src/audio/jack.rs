@@ -797,7 +797,10 @@ pub mod dll {
                 if ok {
                     std::mem::forget(lib);
                 } else {
-                    eprintln!("[slooper] {} does not export jack_client_open", path.display());
+                    eprintln!(
+                        "[slooper] {} does not export jack_client_open",
+                        path.display()
+                    );
                 }
                 ok
             }
@@ -828,10 +831,10 @@ pub mod dll {
         };
         let dir_s = dir.display().to_string();
         let old = std::env::var("PATH").unwrap_or_default();
-        if !old
-            .split(';')
-            .any(|d| d.trim_end_matches('\\').eq_ignore_ascii_case(dir_s.trim_end_matches('\\')))
-        {
+        if !old.split(';').any(|d| {
+            d.trim_end_matches('\\')
+                .eq_ignore_ascii_case(dir_s.trim_end_matches('\\'))
+        }) {
             std::env::set_var("PATH", format!("{dir_s};{old}"));
         }
     }
@@ -852,7 +855,10 @@ pub mod dll {
         }
         let hit = pick(override_file.map(Path::new), &dirs, name)?;
         if !validate(&hit) {
-            eprintln!("[slooper] {} found but is not a usable JACK library", hit.display());
+            eprintln!(
+                "[slooper] {} found but is not a usable JACK library",
+                hit.display()
+            );
             return None;
         }
         eprintln!("[slooper] native JACK: {}", hit.display());
