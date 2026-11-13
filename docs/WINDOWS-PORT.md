@@ -139,9 +139,10 @@ windows-native full suite is green, then flips it blocking). W12g DONE
 2026-11-13 (session 27, see DONE log): hot backend swap — a Settings
 pick re-dispatches the live manager thread (ManagerExit verdicts,
 NullSession park), no restart. The next real version tag publishes all
-assets automatically. The ONLY open item left in the whole program is
-the v20_fx script-FX heap-corruption ASan session (see the W14 OPEN
-RISK block).
+assets automatically. Session 28 CLOSED the program's last open item
+(v20_fx script-FX heap corruption = FxEditor field-drop-order UAF;
+valgrind-root-caused, fixed, CI un-quarantined). NOTHING is open in
+this program: W1->W14 + W12g all DONE.
 
 ## Ground rules (apply to every task)
 
@@ -686,6 +687,21 @@ main again. CLOSED same session: f658ac5 windows-native = **589 pass /
 and the v20-bridge solo step joined the v36-resizes warning-only
 pattern with the surfacing note — the ASan session stays open as the
 follow-up for the corruption itself.
+
+CLOSED 2026-11-13 (session 28) — ROOT CAUSE: an FxEditor FIELD-DROP-ORDER
+USE-AFTER-FREE (fix + pins + CI un-quarantine this session; see DONE log
+"session 28"). All of the abort fingerprints above are explained: the
+write-after-free happens on EVERY custom-GUI editor teardown but writes
+into the script's OWN freed instance-state block, so it is silent until
+some layout (pair-in-one-process, W14 content-stamp shift, the runner's
+glibc 2.39 vs our 2.44) makes glibc trip on the poisoned metadata.
+Detection lore that mattered: nightly ASan was GREEN 21/21 (sanitizer
+reshuffles the very layout the bug needs, and the writing code lives in
+a script .so it cannot instrument) — VALGRIND on a docker ubuntu-24.04
+(docker.io image + rustup + the CI apt deps; repo mounted ro,
+CARGO_TARGET_DIR on a volume) hit it DETERMINISTICALLY on round 1.
+Rule: for glibc-metadata corruption classes, reproduce on the FAILING
+distro's image and memcheck, not with ASan on a different host.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
@@ -1729,3 +1745,38 @@ follow-up for the corruption itself.
   removal → source pin red (after the vacuous fix); jack null→park →
   verdict pin red; resolve in Linux body → both w12f and w12g inertness
   pins red.
+- **2026-11-13 session 28 — v20_fx heap corruption ROOT-CAUSED + FIXED**
+  (the last open program item; closes the session-26 OPEN RISK): the
+  whole "FX-script heap corruption" family (v20_fx pair aborts, v36
+  script-editor aborts, the runner-dependent solo aborts) is ONE bug:
+  `FxEditor` declared `inst: Arc<Instance>` BEFORE `custom:
+  Option<Custom>`, and Rust drops fields in declaration order — so the
+  last Arc release ran the script's `fns.destroy(state)` (glibc free)
+  ~24 bytes of call-site distance before the Custom guard's Drop ran
+  `gui_destroy(gs)`, which by ABI contract may touch the live instance
+  state (`fx::EffectGuiRef::destroy` documents "The instance must still
+  be alive"). The write-after-free is silent whenever the freed block's
+  metadata is untouched; pair-in-one-process / W14's content-stamp
+  dlopen shift / the runner's glibc 2.39 turn it into
+  "corrupted size vs. prev_size" SIGABRTs. Detection lore: nightly ASan
+  (--profile asandbg, build-std) was GREEN 21/21 — ASan's allocator
+  erases the layout the bug needs AND cannot instrument the script .so
+  that hosts the writing frame. VALGRIND on docker ubuntu-24.04
+  (matching the runners; image = CI apt deps + stable + nightly; repo
+  ro-mount, CARGO_TARGET_DIR volume) hit it deterministically round 1:
+  Invalid write of size 4 in `fx_space_echo::gui_destroy`, 1,872 bytes
+  inside a 1,880 block freed by the host 2 call-frames earlier (alloc'd
+  in `create`). Fix = declaration order (custom above inst) + truth-
+  ful comments (the old Custom::drop comment ASSERTED the wrong thing).
+  Pins: `fxgui::drop_order_tests::v20_fx_editor_drop_order_is_pinned`
+  (source-order tripwire; sabotage = swap fields -> red, verified) +
+  `ui::tests::v20_fx_pair_teardown_survives_heap_churn` (the exact
+  chorus->space_echo pair + malloc churn). Verdict on the repro rig:
+  valgrind clean 2/2 (was always-hit); combined v20_fx+v36_script_fx
+  in one process 10/10 exit-0 (was 3/10 abort). ci.yml: monolith
+  quarantine SKIPS REMOVED (pair runs in the monolith now), both
+  isolated steps fully BLOCKING (warning-only `|| echo` dead), churn
+  test added to the isolated step. NOTE: the pre-fix full citest run
+  this session failed 1/605 (test name lost to output truncation —
+  do not read anything into it); the post-fix unskipped monolith run
+  is the authoritative verdict.
