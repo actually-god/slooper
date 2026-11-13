@@ -40645,9 +40645,16 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let _ = app.ensure_asset(&samples.join("kit-a/revme.wav"));
         frame(&mut app, &ctx, vec![]);
-        let h = galley_centers(&mut app, &ctx, "revme", true)[0];
+        let hs = galley_centers(&mut app, &ctx, "revme", true);
+        eprintln!("DIAG revme hits={:?}", hs);
+        eprintln!("DIAG assets: {:?}", app.assets.iter().map(|a| (a.path.to_string_lossy().into_owned(), a.pattern.is_some(), a.automation.is_some())).collect::<Vec<_>>());
+        eprintln!("DIAG rackfiles: {:?}", app.rack[0].files.iter().map(|f| f.path.to_string_lossy().into_owned()).collect::<Vec<_>>());
+        let h = hs[0];
         rmb(&mut app, &ctx, h);
-        let it = galley_centers(&mut app, &ctx, "Edit sample", true)[0];
+        let its = galley_centers(&mut app, &ctx, "Edit sample", true);
+        eprintln!("DIAG status={:?} sample_rate={}", app.status, app.sample_rate);
+        eprintln!("DIAG menu hits={:?}", its);
+        let it = its[0];
         click_pt(&mut app, &ctx, it);
         let key = samples
             .join("kit-a/revme.wav")
