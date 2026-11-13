@@ -109,6 +109,17 @@ pub fn default_drum_kit() -> Vec<DrumPadSave> {
 pub struct SamplerSlotSave {
     pub asset: String,
     pub root: u8,
+    /// v52 R2: the velocity this layer answers. Several slots may share a
+    /// root — they become VELOCITY LAYERS: hard cutoff switches to the
+    /// highest layer at/below the note velocity, crossfade blends the
+    /// bracketing layers. 127 (the serde default) plays at ANY velocity,
+    /// so single-slot maps saved before v52 behave exactly as before.
+    #[serde(default = "default_sampler_vel")]
+    pub vel: u8,
+}
+
+fn default_sampler_vel() -> u8 {
+    127
 }
 
 /// v51: one track's multi-sample keyboard map for the bundled sampler.
@@ -1437,6 +1448,7 @@ mod tests {
                 slots: vec![SamplerSlotSave {
                     asset: "/x/kick.wav".into(),
                     root: 48,
+                    vel: 127,
                 }],
                 mode: 1,
             })],
