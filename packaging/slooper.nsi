@@ -15,12 +15,11 @@ Unicode true
 !ifndef SLOOPER_VER
   !define SLOOPER_VER "0.0.0"
 !endif
+; NOTE: makensis resolves relative paths against the SCRIPT's folder
+; (this file lives in packaging\), not the caller's CWD.
 !ifndef SLOOPER_SRC
   !define SLOOPER_SRC "..\stage"
 !endif
-; NSIS resolves relative paths against the SCRIPT's folder (packaging\),
-; so everything repo-relative hangs off ..\
-!define SLOOPER_ROOT ".." 
 
 Name "slooper ${SLOOPER_VER}"
 OutFile "slooper-${SLOOPER_VER}-win64-setup.exe"
@@ -32,8 +31,8 @@ ShowUnInstDetails show
 SetCompressor /SOLID lzma
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "${SLOOPER_ROOT}\assets\icon.ico"
-!define MUI_UNICON "${SLOOPER_ROOT}\assets\icon.ico"
+!define MUI_ICON "..\assets\icon.ico"
+!define MUI_UNICON "..\assets\icon.ico"
 
 !insertmacro MUI_PAGE_LICENSE "${SLOOPER_SRC}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
