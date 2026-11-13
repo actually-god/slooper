@@ -8,8 +8,10 @@ root `AGENTS.md`, this is it.)
 
 ## What this is
 
-- **slooper**: a small clip-based **DAW** for Linux — Rust, egui/eframe
-  GUI, JACK audio (works against PipeWire's JACK shim or jack2).
+- **slooper**: a small clip-based **DAW** for **Linux + Windows** — Rust,
+  egui/eframe GUI; Linux audio over JACK (PipeWire's JACK shim or jack2),
+  Windows audio over native **WASAPI** (no bridge). One crate, OS seams
+  behind `paths.rs` / `audio/` / `vstedit/`; CI builds + tests both OSes.
 - 16 tracks (count is a setting) on one global, draggable playhead over a
   metronome-defined bar grid; asset-rack drag & drop; additive child lanes;
   audio takes **and MIDI takes (MREC)** → asset + auto-placed clip; clip
@@ -18,7 +20,10 @@ root `AGENTS.md`, this is it.)
   one **mixer chain** per track mixing runtime-compiled Rust effect scripts
   with binary **VST2/VST3 plugins**; group editing + clipboard;
   metronome-based quantize/trim; `.slooper` project files; MIDI + keyboard
-  binding; WAV/FLAC/MP3/OGG export incl. current-selection export.
+  binding; WAV/FLAC/MP3/OGG export incl. current-selection export;
+  23 bundled stereo-aware effect scripts (docs/EFFECT-SUITE.md); MPE;
+  automation sources; preview bounce + loop record; dock/float window
+  system with layout templates; MASTER OUT meters + LUFS + spectrum.
   (v0.1's loop-pedal model — per-loop buffers, overdub,
   independent/dependent modes — was replaced in v0.2.)
 - License: **MIT** ([../LICENSE](../LICENSE)). Upstream:
@@ -46,14 +51,16 @@ require an X11 display (XWayland counts).
 src/            application source (Rust 2021 edition)
   main.rs         entry point, window setup
   lib.rs          crate root (pub mods)
-  audio.rs        JACK shim + backend-neutral realtime DAW engine
-                  (Cmd/Evt channels); the RT core is Proc::process_block
-                  (W4) — every audio backend calls exactly that per block
-                  (jack: today, WASAPI: W5);
-                  clip-lane mixing, take recording (Evt::Take handshake),
-                  global transport/seek/loop-wrap, metronome, per-track
-                  synth + chain playback, stereo buses with per-track
-                  equal-power pan + per-output L/R routing, offline renders
+  audio/mod.rs    backend-neutral realtime DAW engine (Cmd/Evt channels);
+                  the RT core is Proc::process_block (W4) — every audio
+                  backend calls exactly that per block (jack: Linux,
+                  wasapi: Windows); clip-lane mixing, take recording
+                  (Evt::Take handshake), global transport/seek/loop-wrap,
+                  metronome, per-track synth + chain playback, stereo buses
+                  with per-track equal-power pan + per-output L/R routing,
+                  offline renders
+  audio/jack.rs   Linux shim: JACK/PipeWire-JACK client (NO_START)
+  audio/wasapi.rs Windows shim: WASAPI shared-mode, event-driven
   arrange.rs      arrangement model: tracks → lanes → clips
                   (asset id + start sample + `cut` trim offset + `play_len`
                   — `play_len > avail` renders a silent extension);
@@ -83,6 +90,16 @@ src/            application source (Rust 2021 edition)
                   relay via generation counter (VST2 via the patched
                   vendor/vst2 crate, VST3 via vst3-host; plugin libraries
                   are NEVER dlclosed)
+  claphost.rs     CLAP 1.2 hosting (v34): hand-written binding to the
+                  vendored headers in vendor/clap-headers; same never-dlclose
+                  + shared-GUI-thread rules as the VST hosts
+  automation.rs   automation sources (LFO / step / curve) bound to any
+                  plugin param, synth param, mixer or FX control
+  sample_edit.rs  "Edit sample" backend (v50): reverse/ping-pong/fades/
+                  pitch/bend/stretch as non-destructive per-asset edits
+  meter.rs        peak/RMS meters + BS.1770-4 loudness + STFT spectrum
+                  (feeds the MASTER OUT window)
+  crash.rs        Windows crash reporting: minidump + in-app report window
   vstedit/        VST2 + VST3 editor hosting, OS seam (W8a): mod.rs wires
                   cfg(unix)=x11.rs (the shipped X11 plug/replug container,
                   frozen) and cfg(windows)=win32.rs (top-level container
@@ -148,7 +165,8 @@ src/            application source (Rust 2021 edition)
                   (strips, MIXER CHAIN window, synth bindings, VST plugin
                   picker), group selection + clipboard, piano-roll window,
                   settings, project prompt/browser, export, MIDI monitor)
-synths/         bundled synth scripts (piano.rs, sampler.rs) + synth_api.rs
+synths/         bundled synth scripts (piano.rs, sampler.rs, drums, pad)
+                + synth_api.rs
                 + THIRD-PARTY-NOTICES.md (piano model credits)
 effects/        effect-script authoring kit: template.rs (start here),
                 effect_api.rs (ABI) + the bundled native suite
@@ -160,7 +178,9 @@ tests/e2e.rs    end-to-end tests that drive a LIVE JACK server
 tests/packaging.sh  packaging regression test (needs a PKGBUILD; see below)
 assets/icon.png 256x256 app icon (placeholder artwork)
 slooper.desktop  freedesktop menu entry
-docs/           INSTALL.md, USAGE.md, PLUGINS.md (human docs), this file
+docs/           INSTALL.md, USAGE.md, PLUGINS.md, EFFECT-SUITE.md,
+                SIDECHAIN.md (human docs), WINDOWS-PORT.md (the W-series
+                port log), this file. Tutorials live in the GitHub wiki
 ```
 
 ## Build & test commands
@@ -168,7 +188,7 @@ docs/           INSTALL.md, USAGE.md, PLUGINS.md (human docs), this file
 | Command | Notes |
 | --- | --- |
 | `cargo build --release` | release profile: LTO + panic=abort; ~13–15 MB binary |
-| `cargo test -- --test-threads=1` | full suite (128 lib + 1 bin + 8 e2e); e2e tests **self-skip** without a live JACK server |
+| `cargo test -- --test-threads=1` | full suite (~640 lib pins + ~60 e2e); e2e tests **self-skip** without a live audio backend |
 | `cargo test --release` | the release suite is the clean reference — the DEBUG lib suite has a known intermittent glibc `corrupted size vs. prev_size` abort inside dlopen (~15–30 % of runs) unrelated to correctness; verify with `--release` before chasing |
 | `cargo clippy --all-targets` | repo standard: zero warnings (check with `... 2>&1 | grep -cE "^warning: \|^error"` = 0 — grepping just `^error` false-passes) |
 | `PKGBUILD_PATH=/path/to/aur/checkout/PKGBUILD ./tests/packaging.sh` | packaging checks (the PKGBUILD now lives in the AUR package repo) |

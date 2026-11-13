@@ -6805,8 +6805,8 @@ impl App {
                 if ui
                     .small_button("reset I")
                     .on_hover_text(
-                        "Reset integrated loudness + LRA (like Youlean/Ozone \
-                         reset) — start a fresh measurement pass.",
+                        "Reset integrated loudness + LRA — start a fresh \
+                         measurement pass.",
                     )
                     .clicked()
                 {
