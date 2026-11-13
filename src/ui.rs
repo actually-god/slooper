@@ -1461,9 +1461,9 @@ pub struct App {
     avail_midi: Vec<String>,
     sel_midi: std::collections::HashSet<String>,
     /// W12f (Windows): host backend choice ("auto"|"wasapi"|"jack"), the
-    /// mirror of `Config::win_audio_backend`. Applied when the manager
-    /// thread starts — changing it saves the config and asks for a
-    /// restart. Linux never shows the section (JACK is THE backend).
+    /// mirror of `Config::win_audio_backend`. W12g: a pick is applied to
+    /// the LIVE manager thread (`Backend::switch_backend`) and saved —
+    /// no restart. Linux never shows the section (JACK is THE backend).
     win_backend: String,
     bind_loop_sel: usize,
 
@@ -22882,10 +22882,12 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             // W12f: native JACK on Windows. When the jack-sys loader can
             // find a real libjack DLL (PATH / %PROGRAMFILES%\Jack* /
             // SLOOPER_JACK_DLL) the selector grows the "JACK (native)"
-            // option; the choice persists to the config and the manager
-            // thread reads it at startup — applying = restarting slooper
-            // (v1 is deliberately restart-to-apply; a hot backend swap
-            // would need whole new respawn machinery). Linux-inert.
+            // option; the choice persists to the config. W12g applies a
+            // pick to the LIVE manager thread (Cmd::SwitchBackend): the
+            // thread tears its session down and re-dispatches the other
+            // host API over the same channels/engine — no restart, and
+            // the project/synths/transport survive the swap. Linux-inert
+            // (section never paints there; switch_backend sends nothing).
             if cfg!(windows)
                 && settings_sect(
                     ui,
@@ -22913,8 +22915,16 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     if let Some((v, _)) = opts.iter().find(|(_, l)| *l == chosen) {
                         app.win_backend = (*v).to_string();
                         app.save_config();
+                        // W12g: hot-swap the live manager thread. The
+                        // resolution inside switch_backend mirrors the
+                        // startup dispatch exactly; a jack pick without
+                        // the DLL honestly reports and PARKS, so a
+                        // re-pick back to WASAPI recovers audio with no
+                        // restart (the old restart-to-apply v1 wording
+                        // is gone — pins assert the new one).
+                        app.backend.switch_backend(&app.win_backend);
                         app.status = format!(
-                            "audio backend: {} — restart slooper to apply",
+                            "audio backend: {} — switched live",
                             app.win_backend
                         );
                     }
@@ -23672,6 +23682,70 @@ mod tests {
         } else {
             assert!(painted().is_empty(), "the backend picker must never paint on Linux");
         }
+    }
+
+    /// W12g: on Windows a backend pick applies LIVE — config follows the
+    /// picker and the status promises a live switch (the v1 restart-to-
+    /// apply wording is DEAD; w12g_pick_handler_wires_the_live_switch
+    /// kills its resurrection).
+    /// The pick itself is driven through the real combo; Linux only proves
+    /// the picker never paints, so there is nothing to pick there.
+    #[test]
+    fn w12g_backend_pick_applies_live() {
+        let mut app = headless_app("w12g-backend-live");
+        let ctx = egui::Context::default();
+        app.show_binds = false;
+        app.show_midi = false;
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.sett_filter = "audio backend".into();
+        frame(&mut app, &ctx, vec![]);
+        if !cfg!(windows) {
+            assert!(
+                galley_centers(&mut app, &ctx, "AUDIO BACKEND", true).is_empty(),
+                "Linux never paints the picker (nothing may switch there)"
+            );
+            return;
+        }
+        // Default choice "auto" paints as the Auto label inside the combo.
+        let btn = label_center(&mut app, &ctx, "Auto (JACK if found, else WASAPI)")
+            .expect("combo shows the saved auto choice");
+        click_pt(&mut app, &ctx, btn);
+        frame(&mut app, &ctx, vec![]); // popup opens
+        let row = label_center(&mut app, &ctx, "WASAPI").expect("popup lists WASAPI");
+        click_pt(&mut app, &ctx, row);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.win_backend, "wasapi", "the pick lands in the App mirror");
+        assert!(
+            app.status.contains("wasapi") && app.status.contains("switched live"),
+            "status must promise the live switch: {:?}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("restart"),
+            "restart-to-apply wording must never come back: {:?}",
+            app.status
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.win_backend, "wasapi", "state holds across frames");
+    }
+
+    /// W12g source pin (runs on BOTH OSes — Linux CI included, where the
+    /// picker never paints so the behavior test above can only prove
+    /// absence): the pick handler must wire `switch_backend` and the v1
+    /// restart promise must stay dead. The needles are split so this
+    /// file's own comments can never satisfy them.
+    #[test]
+    fn w12g_pick_handler_wires_the_live_switch() {
+        let src = include_str!("ui.rs");
+        assert!(
+            src.contains(concat!("app.backend.switch_backend(&app.win", "_backend")),
+            "Settings pick must apply to the live manager thread"
+        );
+        assert!(
+            !src.contains(concat!("restart slooper to appl", "y")),
+            "the v1 restart-to-apply status text is a dead API"
+        );
     }
 
     /// The full user gesture: press a rack row, drag onto a track's lane

@@ -23,18 +23,23 @@ pub const CLIENT_NAME: &str = "slooper";
 const MIDI_PORT_SHORT: &str = "midi_in";
 
 // one bundle per RT thread: command/event channels, master gain, transport
-// mirrors and the v39 meter taps — every handle `run` owns for its lifetime
+// mirrors and the v39 meter taps — every handle `run` owns for its lifetime.
+// W12g: the channel ends come by reference (the Windows switch loop may call
+// run again with the same ones); the Arcs are re-cloned per dispatch. The
+// verdict tells that loop to park (`Unavailable` after an honest report),
+// re-dispatch (`Switch`), or leave (`Quit` — also the null-audio path, so
+// headless tests see the identical thread-death they always did).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    cmd_rx: Receiver<Cmd>,
-    evt_tx: SyncSender<Evt>,
+    cmd_rx: &Receiver<Cmd>,
+    evt_tx: &SyncSender<Evt>,
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
     meter: Arc<crate::meter::MeterRing>,
     xruns: Arc<AtomicU64>,
     midi_drops: Arc<AtomicU64>,
     engine: Arc<Engine>,
-) {
+) -> ManagerExit {
     // Test-only kill switch: headless GUI tests must not open PipeWire-JACK
     // clients at all. Spawning and closing dozens of clients per suite races
     // libpipewire's own callback threads during teardown (UAF inside the
@@ -43,7 +48,7 @@ pub fn run(
     // "no JACK server" path below.
     if std::env::var("SLOOPER_NULL_AUDIO").is_ok() {
         let _ = evt_tx.send(Evt::Unavailable("null audio (SLOOPER_NULL_AUDIO)".into()));
-        return;
+        return ManagerExit::Quit;
     }
     // W12f: on Windows EVERY entry into jack-sys triggers its dlopen, and
     // the lazy loader PANICS when the bare name (JACK_LIB) fails to
@@ -61,7 +66,7 @@ pub fn run(
         );
         eprintln!("[slooper] {msg}");
         let _ = evt_tx.send(Evt::Unavailable(msg));
-        return;
+        return ManagerExit::Unavailable;
     }
     let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
         Ok(c) => c,
@@ -72,7 +77,7 @@ pub fn run(
             );
             eprintln!("[slooper] {}", msg);
             let _ = evt_tx.send(Evt::Unavailable(msg));
-            return;
+            return ManagerExit::Unavailable;
         }
     };
     if status.contains(ClientStatus::NAME_NOT_UNIQUE) {
@@ -92,7 +97,7 @@ pub fn run(
                     "failed to register input slot in{i}: {}",
                     describe_err(e)
                 )));
-                return;
+                return ManagerExit::Unavailable;
             }
         }
         match client.register_port(&format!("out{i}"), AudioOut::default()) {
@@ -102,7 +107,7 @@ pub fn run(
                     "failed to register output slot out{i}: {}",
                     describe_err(e)
                 )));
-                return;
+                return ManagerExit::Unavailable;
             }
         }
     }
@@ -114,7 +119,7 @@ pub fn run(
                 "failed to create MIDI input port: {}",
                 describe_err(e)
             )));
-            return;
+            return ManagerExit::Unavailable;
         }
     };
 
@@ -158,7 +163,7 @@ pub fn run(
                 "failed to activate JACK client: {}",
                 describe_err(e)
             )));
-            return;
+            return ManagerExit::Unavailable;
         }
     };
 
@@ -192,8 +197,9 @@ pub fn run(
         mask_out_r,
         midi_sources,
     };
-    super::manager_loop(&cmd_rx, &evt_tx, &engine, sample_rate, &mut session);
+    let exit = super::manager_loop(cmd_rx, evt_tx, &engine, sample_rate, &mut session);
     session.teardown();
+    exit
 }
 
 /// Connect with retries: PipeWire-JACK does not accept connections on a
