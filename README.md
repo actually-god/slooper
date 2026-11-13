@@ -408,7 +408,19 @@ src/
   pushes the region whenever the handles move; area handles drag on the ruler
   with snap, mirrored live from the RT position stream so dragging keeps up.
 
-## Packaging (Arch / AUR)
+## Packaging (releases, distro packages, AUR)
+
+Every **tag push** runs the release pipeline
+([`.github/workflows/release.yml`](.github/workflows/release.yml)) and
+publishes a GitHub Release with the full asset set: the Linux `tar.zst`
+(built on the glibc-2.35 floor distro, smoke-tested in Arch / Debian 12 /
+Ubuntu 22.04 / Fedora 40 containers), a **`.deb`**, an **`.rpm`**
+(packaged from the same floor artifact in a Fedora container), the Windows
+**`.exe` installer** (NSIS) plus portable zip and debug-symbol zip.
+Release notes come from the top section of
+[CHANGELOG.md](CHANGELOG.md). Packaging scripts live in `scripts/porting/`
+and `packaging/`; the installer and rpm scripts are unit-runnable against
+any staged tree.
 
 The Arch `PKGBUILD` **does not live in this repository** (AUR convention: the
 packaging recipe is maintained in its own AUR package repo, `slooper`,
