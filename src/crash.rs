@@ -190,11 +190,9 @@ pub fn crash_me_mode(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option
 pub fn self_test(env: impl Fn(&str) -> Option<std::ffi::OsString>) {
     match crash_me_mode(env) {
         Some("panic") => panic!("SLOOPER_CRASH_ME=panic — self-test of the panic note path"),
-        Some(_) => {
-            unsafe {
-                std::ptr::read_volatile(std::ptr::null::<u8>());
-            }
-        }
+        Some(_) => unsafe {
+            std::ptr::read_volatile(std::ptr::null::<u8>());
+        },
         None => {}
     }
 }
@@ -271,9 +269,7 @@ pub fn note_crash(_title: &str, _detail: &str) {}
 /// Whether the hard-fault message box must be suppressed (unattended /
 /// CI runs set the env var).
 pub fn quiet_suppressed(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    env(CRASH_QUIET_ENV)
-        .filter(|v| !v.is_empty())
-        .is_some()
+    env(CRASH_QUIET_ENV).filter(|v| !v.is_empty()).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -417,8 +413,8 @@ fn write_dump_at(
     use std::os::windows::io::AsRawHandle;
     use windows::core::BOOL;
     use windows::Win32::System::Diagnostics::Debug::{
-        MiniDumpWriteDump, MiniDumpNormal, MiniDumpWithIndirectlyReferencedMemory,
-        MINIDUMP_EXCEPTION_INFORMATION, EXCEPTION_POINTERS,
+        MiniDumpNormal, MiniDumpWithIndirectlyReferencedMemory, MiniDumpWriteDump,
+        EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
@@ -513,8 +509,7 @@ mod tests {
 
     fn read_src(p: &str) -> String {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p);
-        std::fs::read_to_string(&root)
-            .unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
+        std::fs::read_to_string(&root).unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
     }
 
     // ---- pure logic (every OS asserts its own truth) ---------------------
@@ -575,11 +570,13 @@ mod tests {
 
     #[test]
     fn w12e_crash_me_mode_accepts_only_the_two_words() {
-        let env_with = |v: &'static str| move |k: &str| {
-            if k == CRASH_ME_ENV {
-                Some(std::ffi::OsString::from(v))
-            } else {
-                None
+        let env_with = |v: &'static str| {
+            move |k: &str| {
+                if k == CRASH_ME_ENV {
+                    Some(std::ffi::OsString::from(v))
+                } else {
+                    None
+                }
             }
         };
         assert_eq!(crash_me_mode(env_with("panic")), Some("panic"));
@@ -771,9 +768,13 @@ mod tests {
             child.wait_with_output().expect("collect stderr")
         } else {
             let _ = child.kill();
+            let _ = child.wait(); // reap before asserting (clippy::zombie_processes)
             panic!("self-test child never died ({mode}) — the guard did not fire");
         };
-        (!out.status.success(), String::from_utf8_lossy(&out.stderr).to_string())
+        (
+            !out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
     }
 
     #[cfg(windows)]
@@ -835,7 +836,10 @@ mod tests {
             panic!("no .txt note written: {names:?}");
         };
         // A real access violation = STATUS_ACCESS_VIOLATION in the stem…
-        assert!(dmp.contains("c0000005"), "stem must carry the NTSTATUS: {dmp}");
+        assert!(
+            dmp.contains("c0000005"),
+            "stem must carry the NTSTATUS: {dmp}"
+        );
         // …and one EVENT: dump and note share the stem, so they age together.
         assert_eq!(
             dmp.trim_end_matches(".dmp"),
@@ -843,7 +847,11 @@ mod tests {
             "{dmp} vs {txt}"
         );
         let bytes = std::fs::read(dir.join(dmp)).unwrap();
-        assert!(bytes.len() > 4096, "minidump suspiciously small: {}", bytes.len());
+        assert!(
+            bytes.len() > 4096,
+            "minidump suspiciously small: {}",
+            bytes.len()
+        );
         assert_eq!(&bytes[..4], b"MDMP", "not a minidump");
         let body = std::fs::read_to_string(dir.join(txt)).unwrap();
         assert!(
@@ -885,7 +893,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_dump_at(&dir, 1_700_000_000, "c0000005", std::ptr::null()).expect("dump");
         let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.len() > 1024, "minidump suspiciously small: {}", bytes.len());
+        assert!(
+            bytes.len() > 1024,
+            "minidump suspiciously small: {}",
+            bytes.len()
+        );
         assert_eq!(&bytes[..4], b"MDMP");
         assert!(path
             .file_name()

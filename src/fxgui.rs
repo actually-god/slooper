@@ -1137,7 +1137,9 @@ mod drop_order_tests {
     #[test]
     fn v20_fx_editor_drop_order_is_pinned() {
         let src = include_str!("fxgui.rs");
-        let s = src.find("pub struct FxEditor {").expect("FxEditor struct gone");
+        let s = src
+            .find("pub struct FxEditor {")
+            .expect("FxEditor struct gone");
         let body = &src[s..s + src[s..].find("\n}").unwrap()];
         let c = body
             .find(concat!("custom: Option<", "Custom>"))

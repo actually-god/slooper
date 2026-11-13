@@ -598,14 +598,7 @@ fn run_backend(
     // `SwitchBackend`, and the thread exits exactly when `jack::run`
     // returns, byte-for-byte the pre-W12g lifecycle.
     let _ = jack::run(
-        &cmd_rx,
-        &evt_tx,
-        gain,
-        peak,
-        meter,
-        xruns,
-        midi_drops,
-        engine,
+        &cmd_rx, &evt_tx, gain, peak, meter, xruns, midi_drops, engine,
     );
 }
 
@@ -700,8 +693,7 @@ fn run_backend(
                     BackendKind::Jack => "jack",
                 };
                 eprintln!("[slooper] audio backend switched: {word}");
-                let _ = evt_tx
-                    .try_send(Evt::Notice(format!("audio backend: {word} — live")));
+                let _ = evt_tx.try_send(Evt::Notice(format!("audio backend: {word} — live")));
             }
             ManagerExit::Unavailable => {
                 // Parked: keep the GUI served (commands/takes/engine) with
@@ -7684,8 +7676,7 @@ mod w5_tests {
             .next()
             .unwrap();
         assert!(
-            lin.contains("[target.'cfg(not(windows))'.dependencies]")
-                && live_key(lin, "jack"),
+            lin.contains("[target.'cfg(not(windows))'.dependencies]") && live_key(lin, "jack"),
             "jack must stay in the cfg(not(windows)) target table"
         );
         assert!(
@@ -7704,10 +7695,7 @@ mod w5_tests {
         // never linked (jack-sys dlopens at runtime; the exe must show no
         // libjack import — proven by the W13b-style PE/NEEDED discipline).
         assert!(
-            live_key(
-                win.split("[build-dependencies]").next().unwrap(),
-                "jack"
-            ),
+            live_key(win.split("[build-dependencies]").next().unwrap(), "jack"),
             "W12f: native JACK-on-Windows needs jack in the windows table"
         );
         assert!(win
@@ -7742,7 +7730,10 @@ mod w5_tests {
         }
         // and the OS modules are cfg-declared: wasapi Windows-only, jack
         // compiling on BOTH since W12f (runtime dlopen keeps it free)
-        assert!(src.contains("\npub mod jack;"), "jack mod must compile on both OSes (W12f)");
+        assert!(
+            src.contains("\npub mod jack;"),
+            "jack mod must compile on both OSes (W12f)"
+        );
         assert!(
             src.contains("#[cfg(windows)]\nmod wasapi;"),
             "wasapi mod not cfg-gated"
@@ -8118,21 +8109,32 @@ mod w12f_tests {
         );
         // Override wins even while dirs also carry the DLL.
         assert_eq!(
-            pick(Some(ov.join("libjack64.dll").as_path()), std::slice::from_ref(&a), "libjack64.dll")
-                .as_deref(),
+            pick(
+                Some(ov.join("libjack64.dll").as_path()),
+                std::slice::from_ref(&a),
+                "libjack64.dll"
+            )
+            .as_deref(),
             Some(ov.join("libjack64.dll").as_path())
         );
         // A WRONG-NAME override is rejected (jack-sys dlopens the bare
         // JACK_LIB name; an odd file name could never resolve back) and
         // the scan proceeds normally...
         assert_eq!(
-            pick(Some(ov.join("jack.dll").as_path()), std::slice::from_ref(&a), "libjack64.dll")
-                .as_deref(),
+            pick(
+                Some(ov.join("jack.dll").as_path()),
+                std::slice::from_ref(&a),
+                "libjack64.dll"
+            )
+            .as_deref(),
             Some(a.join("libjack64.dll").as_path()),
             "wrong-named override must not hijack the scan"
         );
         // ...which with no candidate dirs yields nothing.
-        assert_eq!(pick(Some(ov.join("jack.dll").as_path()), &[], "libjack64.dll"), None);
+        assert_eq!(
+            pick(Some(ov.join("jack.dll").as_path()), &[], "libjack64.dll"),
+            None
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -8166,22 +8168,41 @@ mod w12f_tests {
         // Windows twin resolves first and can reach BOTH backends.
         assert_eq!(src.matches(concat!("fn run_", "backend")).count(), 2);
         let first = src.find(concat!("fn run_", "backend")).unwrap();
-        let second = src[first + 1..].find(concat!("fn run_", "backend")).unwrap() + first + 1;
+        let second = src[first + 1..]
+            .find(concat!("fn run_", "backend"))
+            .unwrap()
+            + first
+            + 1;
         let body_at = |from: usize| {
             let rest = &src[from..];
             &rest[..rest.find("\n}").unwrap() + 2]
         };
         let lin = body_at(first);
-        assert!(lin.contains(concat!("jack::", "run")), "Linux still dispatches jack directly");
-        assert!(!lin.contains("resolve_backend"), "Linux resolves nothing (byte-inert)");
+        assert!(
+            lin.contains(concat!("jack::", "run")),
+            "Linux still dispatches jack directly"
+        );
+        assert!(
+            !lin.contains("resolve_backend"),
+            "Linux resolves nothing (byte-inert)"
+        );
         assert!(
             !lin.contains(concat!("dll::fou", "nd")),
             "Linux never consults DLL discovery"
         );
         let win = body_at(second);
-        assert!(win.contains("resolve_backend("), "Windows resolves the backend");
-        assert!(win.contains("SLOOPER_AUDIO_BACKEND"), "env override wired at spawn");
-        assert!(win.contains(concat!("jack::dll::", "found")), "discovery feeds the choice");
+        assert!(
+            win.contains("resolve_backend("),
+            "Windows resolves the backend"
+        );
+        assert!(
+            win.contains("SLOOPER_AUDIO_BACKEND"),
+            "env override wired at spawn"
+        );
+        assert!(
+            win.contains(concat!("jack::dll::", "found")),
+            "discovery feeds the choice"
+        );
         assert!(win.contains(concat!("jack::", "run")) && win.contains("wasapi::run"));
     }
 
@@ -8198,8 +8219,14 @@ mod w12f_tests {
         let open = jack.find("Client::new(").expect("Client::new missing");
         assert!(guard < open, "guard must precede the FIRST jack-sys entry");
         let seg = &jack[guard..open];
-        assert!(seg.contains("Evt::Unavailable"), "missing DLL reports honestly, never panics");
-        assert!(seg.contains("SLOOPER_JACK_DLL"), "the hint names the override switch");
+        assert!(
+            seg.contains("Evt::Unavailable"),
+            "missing DLL reports honestly, never panics"
+        );
+        assert!(
+            seg.contains("SLOOPER_JACK_DLL"),
+            "the hint names the override switch"
+        );
     }
 
     /// The jack-sys lazy loader panics when the bare name fails to load,
@@ -8210,7 +8237,10 @@ mod w12f_tests {
     fn w12f_discovery_never_calls_into_jack_sys() {
         let jack = code(include_str!("jack.rs"));
         let dll = &jack[jack.find("pub mod dll {").expect("dll module missing")..];
-        assert!(!dll.contains("Client::new"), "discovery must not open JACK clients");
+        assert!(
+            !dll.contains("Client::new"),
+            "discovery must not open JACK clients"
+        );
         assert!(
             !dll.contains("jack_client_open("),
             "discovery must not CALL jack symbols, only look them up"
@@ -8334,11 +8364,17 @@ mod w12g_tests {
         let src = code(include_str!("mod.rs"));
         let start = src.find("fn manager_loop(").expect("manager_loop missing");
         let body = &src[start..start + src[start..].find("fn clamp_loop_region(").unwrap()];
-        assert!(body.contains("-> ManagerExit"), "manager_loop lost its verdict");
+        assert!(
+            body.contains("-> ManagerExit"),
+            "manager_loop lost its verdict"
+        );
         assert!(body.contains("Cmd::SwitchBackend(kind)"));
         assert!(body.contains("ManagerExit::Switch(kind)"));
 
-        let sites: Vec<usize> = src.match_indices("fn run_backend").map(|(i, _)| i).collect();
+        let sites: Vec<usize> = src
+            .match_indices("fn run_backend")
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(sites.len(), 2, "still exactly two run_backend twins");
         let body_at = |from: usize| {
             let rest = &src[from..];
@@ -8395,7 +8431,10 @@ mod w12g_tests {
             .find("null audio (SLOOPER_NULL_AUDIO)")
             .expect("null-audio path gone");
         assert!(was[nul..nul + 120].contains("return ManagerExit::Quit"));
-        assert!(was.contains("return ManagerExit::Unavailable"), "COM failure must park");
+        assert!(
+            was.contains("return ManagerExit::Unavailable"),
+            "COM failure must park"
+        );
     }
 
     /// The GUI-facing helper: resolves exactly like startup dispatch
@@ -8408,7 +8447,10 @@ mod w12g_tests {
             .expect("switch_backend helper gone")..];
         let sw = &sw[..sw.find("\n    }").unwrap() + 2];
         assert!(sw.contains("cfg!(windows)"), "Linux must stay send-inert");
-        assert!(sw.contains("resolve_backend("), "must mirror startup resolution");
+        assert!(
+            sw.contains("resolve_backend("),
+            "must mirror startup resolution"
+        );
         assert!(sw.contains("SLOOPER_AUDIO_BACKEND"));
         assert!(sw.contains("jack::dll::found()"));
         assert!(sw.contains("Cmd::SwitchBackend(kind)"));

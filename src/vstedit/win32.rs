@@ -185,7 +185,7 @@ pub fn embed_requested() -> bool {
 
 fn embed_parent() -> Option<HWND> {
     let h = EMBED_PARENT.load(Ordering::SeqCst);
-    (h != 0).then(|| HWND(h as *mut c_void))
+    (h != 0).then_some(HWND(h as *mut c_void))
 }
 
 /// The main window's HWND as seen from the UI thread (W8b's embed parent
@@ -719,7 +719,7 @@ unsafe fn editor_title_menu(win: HWND) -> Option<usize> {
         None,
     );
     let _ = DestroyMenu(menu);
-    (cmd.0 > 0).then(|| cmd.0 as usize)
+    (cmd.0 > 0).then_some(cmd.0 as usize)
 }
 
 /// Where a `WM_DPICHANGED` moves the container (the pure verdict the W8b
