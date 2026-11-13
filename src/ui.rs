@@ -1352,6 +1352,15 @@ pub struct App {
     /// without color archaeology. Written every painted frame; read-only
     /// cost for the app.
     smap_probe: Option<(f32, f32, f32, f32, f32)>,
+    /// v52 R3: harness probe — every drum-grid cell rect painted this frame
+    /// as (pad, step, rect); tests drive real clicks without color
+    /// archaeology (same pattern as `smap_probe`). Written every painted frame.
+    drum_probe: Vec<(usize, usize, egui::Rect)>,
+    /// v52 R3: set when "commit to track" pressed with nothing stampable.
+    /// The status line was far too easy to miss — a live user concluded the
+    /// button "doesn't work at all" after pressing it on an empty pattern.
+    /// The popup is the honest, impossible-to-miss answer.
+    drum_commit_note: Option<String>,
     /// v51: selected slot row inside the open key-map window.
     smap_sel: Option<usize>,
     /// v51: note currently held by a key/lane press in the map window.
@@ -1864,6 +1873,8 @@ impl App {
             },
             smap_win: None,
             smap_probe: None,
+            drum_probe: Vec::new(),
+            drum_commit_note: None,
             smap_sel: None,
             smap_hold: None,
             show_drums: cfg.show_drums,
@@ -6050,8 +6061,14 @@ impl App {
             self.kit(t).iter().map(|p| (p.asset, p.muted)).collect();
         let nl0 = self.arr.tracks[t].lanes.len();
         let mut n = 0usize;
+        // v52 R3: hits that could NOT stamp (pad silent/muted) must be
+        // counted and explained, not dropped in silence.
+        let mut silent_hits = 0usize;
+        let mut new_ids: Vec<(usize, usize, usize)> = Vec::new();
         for (pi, (aid, muted)) in pads.iter().enumerate() {
-            if *muted {
+            let hits = grid.get(pi).map(|r| r.iter().filter(|&&v| v > 0).count()).unwrap_or(0);
+            if *muted || aid.is_none() {
+                silent_hits += hits;
                 continue;
             }
             let Some(id) = aid else { continue };
@@ -6068,19 +6085,45 @@ impl App {
                 let mut cl = Clip::new(id32, base + si as u64 * step);
                 cl.gain = (*v as f32 / 127.0).powi(2).max(0.01);
                 self.arr.insert(t, pi, cl);
+                new_ids.push((t, pi, self.arr.tracks[t].lanes[pi].clips.len() - 1));
                 n += 1;
             }
         }
         if n == 0 {
-            self.status = "drums: nothing to commit (pick pad sounds and paint hits)".into();
+            let painted: usize = grid.iter().flatten().filter(|&&v| v > 0).count();
+            self.status = "drums: nothing to commit".into();
+            self.drum_commit_note = Some(if painted == 0 {
+                "Nothing to commit — the pattern is empty.\n\
+                 Click grid cells to build a beat (click toggles a hit, hover \
+                 + mouse wheel paints its velocity), then press commit again."
+                    .to_string()
+            } else {
+                format!(
+                    "{painted} hit(s) sit on pads with no sound assigned (or muted).\n\
+                     Pick the pad sounds in this track's SYNTHS window \
+                     (drum kit), then press commit again."
+                )
+            });
             return;
         }
+        self.drum_commit_note = None;
         self.grow_for_lanes(t, nl0);
         self.push_project();
-        self.status = format!(
+        // v52 R3: make the result impossible to miss — the target track
+        // becomes the selected track and every freshly stamped clip is
+        // outlined (the historic complaint was "commit does nothing", but
+        // clips at an offscreen playhead with no feedback read as nothing).
+        self.selected = t;
+        self.last_click_track = Some(t);
+        self.sel_clips = new_ids;
+        let mut msg = format!(
             "drums: {n} hits committed to track {} (one lane per pad)",
             t + 1
         );
+        if silent_hits > 0 {
+            msg.push_str(&format!(" \u{2014} {silent_hits} hit(s) skipped: pad silent/muted"));
+        }
+        self.status = msg;
     }
 
     /// v29 R7: apply a value in the TARGET's own domain (the units
@@ -6960,6 +7003,7 @@ impl App {
         let mut dirty = false;
         let mut commit_now = false;
         let ctx = ui.ctx().clone();
+        self.drum_probe.clear();
         // v30 R1: ONE grid = ONE bar of the chosen subdivision
         // (steps per bar = metronome beats x steps per beat).
         let want = (self.beats().max(1) as usize * self.drum.sub.max(1) as usize).clamp(2, 256);
@@ -7132,6 +7176,7 @@ impl App {
                             p + 1,
                             s + 1
                         ));
+                        self.drum_probe.push((p, s, resp.rect));
                         if resp.clicked() {
                             let dv = pad.vel.max(1);
                             let now = self.drum.grid[p][s];
@@ -7185,6 +7230,21 @@ impl App {
         if commit_now {
             self.drum_commit();
             dirty = true;
+        }
+        // v52 R3: an empty/silent commit gets a popup, not a whisper: the
+        // one-line status at the bottom of a fullscreen DAW was missed, and
+        // the button "seemed to do nothing at all".
+        if let Some(note) = self.drum_commit_note.clone() {
+            egui::Window::new("drums: commit to track")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(&ctx, |ui| {
+                    ui.label(note);
+                    if ui.button("OK").clicked() {
+                        self.drum_commit_note = None;
+                    }
+                });
         }
         if dirty {
             self.save_config();
@@ -22226,6 +22286,28 @@ fn grid_context_menu(
             && ui.button("Edit automation curve").clicked()
         {
             app.open_auto_editor(Some(clips[ci].0.asset as usize));
+            ui.close();
+        }
+        // v52 R1: "Edit sample" reaches an audio clip from the ARRANGEMENT
+        // too (was rack-only). Same key = the asset path, so the editor
+        // edits THAT specific asset live, exactly like the rack entry —
+        // and "save as new asset" in the editor still mints a copy.
+        if app
+            .assets
+            .get(clips[ci].0.asset as usize)
+            .is_some_and(|a| !a.is_midi() && !a.is_auto())
+            && ui
+                .button("Edit sample")
+                .on_hover_text("reverse, ping-pong, fades, pitch, bend, time stretch \u{b7} \
+                     edits apply to this asset across the project; save-as keeps the original")
+                .clicked()
+        {
+            if let Some(a) = app.assets.get(clips[ci].0.asset as usize) {
+                let key = a.path.to_string_lossy().into_owned();
+                let nm = a.name.clone();
+                app.sample_edit_win = Some(key);
+                app.se_name = format!("{nm} (edit)");
+            }
             ui.close();
         }
         ui.separator();
@@ -41213,6 +41295,242 @@ mod tests {
         assert_eq!(
             app.proj_name, "demo",
             "import must go through the existing pipeline"
+        );
+    }
+
+    // ---- v52 R1: "Edit sample" on ARRANGEMENT audio clips ---------------
+
+    /// The grid clip menu carries "Edit sample" for an audio clip and the
+    /// click opens the sample editor keyed to THAT clip's asset path.
+    #[test]
+    fn v52_track_edit_sample_opens() {
+        let mut app = headless_app("v52se1");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        let es = galley_centers(&mut app, &ctx, "Edit sample", true);
+        assert!(!es.is_empty(), "audio clip menu offers Edit sample");
+        click_pt(&mut app, &ctx, es[0]);
+        frame(&mut app, &ctx, vec![]);
+        let key = app.assets[a as usize].path.to_string_lossy().into_owned();
+        assert_eq!(
+            app.sample_edit_win.as_deref(),
+            Some(key.as_str()),
+            "editor opened for the CLIP's asset"
+        );
+        assert_eq!(
+            app.se_name,
+            format!("{} (edit)", app.assets[a as usize].name),
+            "save-as default name pre-filled"
+        );
+    }
+
+    /// MIDI and automation clips must NOT offer the sample editor.
+    #[test]
+    fn v52_track_edit_sample_hidden_for_midi() {
+        use crate::assets::Asset;
+        use crate::midipat::{Note, Pattern, PPQ};
+        let mut app = headless_app("v52se2");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let mut pat = Pattern::new(120);
+        pat.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: PPQ as u32,
+        });
+        let m = app.assets.len() as u32;
+        app.assets.push(Asset::midi(
+            m,
+            "patone".into(),
+            std::path::PathBuf::new(),
+            std::sync::Arc::new(pat),
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(m, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        assert!(
+            galley_centers(&mut app, &ctx, "Edit sample", true).is_empty(),
+            "MIDI clip menu must not offer Edit sample"
+        );
+    }
+
+    // ---- v52 R3: drum window "commit to track" ---------------------------
+
+    /// Click-driven: with a rack sound on a pad and hits painted, clicking
+    /// "commit to track" IN THE WINDOW stamps one clip per hit (the model
+    /// call was pinned since v29 — this pins the button path itself).
+    #[test]
+    fn v52_drum_commit_button_stamps() {
+        let mut app = headless_app("v52drum");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap();
+        // Assign the sound to pad 0 of track 0's kit (combobox equivalent)
+        // and paint three hits on its row.
+        app.kit_mut(0)[0].asset_path = kick.to_string_lossy().into_owned();
+        app.drum_resolve();
+        assert_eq!(app.kit(0)[0].asset, Some(a), "pad 0 resolves the rack asset");
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.drum.grid.len() >= 1 && app.drum.grid[0].len() >= 9);
+        app.drum.grid[0][0] = 110;
+        app.drum.grid[0][2] = 90;
+        app.drum.grid[0][8] = 70;
+        frame(&mut app, &ctx, vec![]);
+        let before = clip_ids(&app).len();
+        click_exact(&mut app, &ctx, "commit to track");
+        frame(&mut app, &ctx, vec![]);
+        let after = clip_ids(&app);
+        assert!(
+            after.len() >= before + 3,
+            "commit must stamp 3 clips: before={before} after={after:?}"
+        );
+        assert!(
+            after.iter().any(|(t, _, _, _)| *t == app.drum.track),
+            "clips land on the drum window's target track: {after:?}"
+        );
+        assert!(
+            app.status.contains("committed"),
+            "the click must answer: {}",
+            app.status
+        );
+        // v52 R3: the result announces itself — stamped clips selected, and
+        // the target track becomes the selected track.
+        assert!(
+            !app.sel_clips.is_empty()
+                && app.sel_clips.iter().all(|(t, _, _)| *t == app.drum.track),
+            "stamped clips must be selected: {:?}",
+            app.sel_clips
+        );
+        assert_eq!(app.selected, app.drum.track, "target track selected");
+    }
+
+    /// A commit pressed on an EMPTY pattern must answer with a popup, not
+    /// just the (historically missed) status line — and OK dismisses it.
+    #[test]
+    fn v52_drum_commit_empty_shows_popup() {
+        let mut app = headless_app("v52dpop");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.drum.grid.iter().flatten().filter(|&&v| v > 0).count(),
+            0,
+            "fresh app must start with an empty pattern"
+        );
+        click_exact(&mut app, &ctx, "commit to track");
+        assert!(
+            app.drum_commit_note.is_some(),
+            "an empty commit must not pass silently"
+        );
+        let note = app.drum_commit_note.clone().unwrap();
+        assert!(note.contains("pattern is empty"), "explains itself: {note}");
+        click_last(&mut app, &ctx, "OK");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.drum_commit_note.is_none(), "OK dismisses the popup");
+    }
+
+    /// Hits on SILENT pads must be counted and explained, never dropped in
+    /// silence (the pad had no sound at commit time).
+    #[test]
+    fn v52_drum_commit_silent_pads_explained() {
+        let mut app = headless_app("v52dsil");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        app.drum.grid[0][0] = 100;
+        app.drum.grid[0][4] = 80;
+        // pad 0 deliberately has NO asset_path -> both hits are silent.
+        click_exact(&mut app, &ctx, "commit to track");
+        assert!(
+            clip_ids(&app).is_empty(),
+            "silent hits must not stamp clips"
+        );
+        let note = app.drum_commit_note.clone().unwrap_or_default();
+        assert!(
+            note.contains("2 hit(s)") && note.contains("no sound"),
+            "the popup must count the dropped hits: {note}"
+        );
+    }
+
+    /// A REAL click on a grid cell toggles the hit AND the pattern lands in
+    /// config.json — the whole paint -> dirty -> save chain, end to end.
+    /// (The historic grid in the user's config held zero hits across every
+    /// backup: nothing ever proved a painted hit survives.)
+    #[test]
+    fn v52_drum_paint_click_persists() {
+        let mut app = headless_app("v52dpnt");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let cell = app
+            .drum_probe
+            .iter()
+            .find(|(p, s, _)| *p == 0 && *s == 3)
+            .map(|(_, _, r)| *r);
+        let r = cell.expect("grid cell (0,3) must be painted with a probe rect");
+        click_pt(&mut app, &ctx, r.center());
+        assert!(app.drum.grid[0][3] > 0, "clicking a cell paints a hit");
+        let cfg_path = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("slooper")
+            .join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert!(
+            cfg["drum"]["grid"][0][3].as_i64().unwrap_or(0) > 0,
+            "the painted hit must reach config.json: {}",
+            &cfg["drum"]["grid"][0]
+        );
+        // Toggle off, then the persisted copy must follow.
+        let r2 = app
+            .drum_probe
+            .iter()
+            .find(|(p, s, _)| *p == 0 && *s == 3)
+            .map(|(_, _, r)| *r)
+            .expect("cell repaints");
+        click_pt(&mut app, &ctx, r2.center());
+        assert_eq!(app.drum.grid[0][3], 0, "click again clears the hit");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            cfg["drum"]["grid"][0][3].as_i64(),
+            Some(0),
+            "the cleared hit must follow in config.json"
         );
     }
 }
