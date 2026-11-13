@@ -130,7 +130,7 @@ jobs:
       - name: Build .deb (W13d)
         run: bash scripts/porting/w13d_make_deb.sh slooper-*/ "$SLOOPER_VERSION"
       - name: .deb smoke (W13d)
-        run: bash scripts/porting/w13d_deb_smoke.sh slooper_*_amd64.deb
+        run: bash scripts/porting/w13d_deb_smoke.sh slooper-*_amd64.deb
       - uses: actions/upload-artifact@v4
         with:
           name: linux-asset
@@ -138,7 +138,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: deb-asset
-          path: slooper_*_amd64.deb
+          path: slooper-*_amd64.deb
 
   windows:
     name: Windows asset (slooper-win64.zip)
