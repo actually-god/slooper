@@ -1440,3 +1440,7 @@ portable asset on the OLDEST distro we support, never the newest.
   untestable from the lib suite; the sabotage pair is the pin-equivalent,
   same ruling as W13a's floor assert). No Rust code touched — Linux
   behavior unchanged by construction.
+  VERIFIED BY CI: draft run `43335092221` on `b84b4a9` — all three jobs
+  GREEN and the step log shows the matrix against the STAGED exe (sha256
+  head `1d8d275a…` = byte-identical to the artifact smoke-tested locally,
+  demand GLIBC 2.35): `MATRIX: all 4 distros PASS` (~36 s on the runner).
