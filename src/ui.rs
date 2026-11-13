@@ -33570,6 +33570,7 @@ mod tests {
             app.assets[k]
                 .path
                 .to_string_lossy()
+                .replace('\\', "/")
                 .contains("kit-b/snare.wav"),
             "{}",
             app.assets[k].path.display()
@@ -33598,8 +33599,12 @@ mod tests {
         let pa = app.assets[a].path.clone();
         let pb = app.assets[b].path.clone();
         assert!(
-            pa.to_string_lossy().contains("kit-a/kick")
-                && pb.to_string_lossy().contains("kit-b/kick"),
+            pa.to_string_lossy()
+                .replace('\\', "/")
+                .contains("kit-a/kick")
+                && pb.to_string_lossy()
+                    .replace('\\', "/")
+                    .contains("kit-b/kick"),
             "{pa:?} vs {pb:?}"
         );
     }
