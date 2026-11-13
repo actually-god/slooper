@@ -2,8 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A minimalist clip-based audio DAW built in Rust for Linux (JACK /
-PipeWire-JACK). Up to sixteen tracks on one global, draggable playhead: drop
+A minimalist clip-based audio DAW built in Rust for **Linux** (JACK /
+PipeWire-JACK) and **Windows** (fully native: WASAPI audio, VST
+hosting, scripted plugins — no Wine, no bridge). Up to sixteen tracks on one global, draggable playhead: drop
 audio from the **asset rack** onto a metronome-defined bar grid, record audio
 takes and MIDI takes that turn themselves into clips, play software
 instruments from the built-in piano to hosted VSTi, draw notes in a piano
@@ -12,11 +13,28 @@ projects to disk — with MIDI binding, keyboard shortcuts, per-track effect +
 plugin chains, and clean export.
 
 **Docs:** [install guide](docs/INSTALL.md) · [user guide](docs/USAGE.md) ·
-[plugins & synths](docs/PLUGINS.md) · [agent/automation
-guide](docs/AGENT-GUIDE.md)
+[plugins & synths](docs/PLUGINS.md) ·
+[the bundled effect suite](docs/EFFECT-SUITE.md) · [agent/automation
+guide](docs/AGENT-GUIDE.md) — and the
+[project wiki](https://github.com/actually-god/slooper/wiki) for
+step-by-step tutorials.
 
 ## Features
 
+- **Two platforms, one codebase** — on Linux slooper speaks JACK
+  (PipeWire-JACK or jack2); on Windows it is a native app on the WASAPI
+  shared-mode stream with native VST2/VST3 editors and runtime-compiled
+  effect scripts — every feature, including the plugin bridge, is the
+  same code path and runs in CI on both OSes.
+- **23 bundled studio effects** — EQ, dynamics, delay/reverb, modulation,
+  distortion, pitch and spectral tools, all runtime-compiled Rust
+  scripts, all stereo-aware, live in playback *and* export
+  ([docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md)). You can write, drop in
+  and hot-reload your own with the same ABI.
+- **Dock-and-float everything** — every panel and tool window docks to
+  any screen edge, floats free, or tab-groups with another; named
+  **layout templates** capture the whole arrangement, **Ctrl+K** is a
+  command palette over every window and setting.
 - **Resizable tracks** — drag the separation bar under any track; only that
   track changes, its lanes always share the height equally, and a new child
   lane grows the track instead of shrinking its siblings. **Ctrl + wheel**
@@ -64,7 +82,9 @@ guide](docs/AGENT-GUIDE.md)
   TimGM6mb soundfont; generator in `tools/`, credit in `synths/`), the
   **sampler**
   script (plays any rack asset pitched around a root note shown as `C3`-style
-  note names), or **any scanned VSTi**. Parameters open in a sliders window;
+  note names — its **key map** slots route up to 8 rack samples across the
+  keyboard for drums and multisampling), the bundled **drums** kit and
+  **pad** synth, or **any scanned VSTi**. Parameters open in a sliders window;
   VST2 instruments can open their native editor window (see
   [docs/PLUGINS.md](docs/PLUGINS.md)).
 - **Clip polish** — one click on a clip opens its property row: per-clip
@@ -114,8 +134,8 @@ guide](docs/AGENT-GUIDE.md)
 - **One chain per track — scripts *and* plugins** — each track's mixer
   chain is a single ordered list mixing runtime-compiled **Rust effect
   scripts** (hot-compiled with rustc, per-effect sliders, scripted custom
-  GUIs, user presets) and binary **VST2 / VST3 plugins** (parameter sliders,
-  native plugin editor windows for both generations). **Plugins used as
+  GUIs, user presets) and binary **VST2 / VST3 / CLAP plugins** (parameter sliders,
+  native plugin editor windows). **Plugins used as
   instruments** can be bound
   as the track's synth and played by its MIDI clips. Live and in export
   renders.
@@ -173,13 +193,19 @@ server for you — if none is running it shows an error and stays idle.
 
 ## Install
 
-**Arch Linux** — once published, from the AUR:
+**Prebuilt** — every release on
+[the releases page](https://github.com/actually-god/slooper/releases) ships
+an **`.exe` installer** (Windows), **`.deb`** (Debian/Ubuntu), **`.rpm`**
+(Fedora/openSUSE), and a tarball that installs on any x86_64 Linux; each
+package carries the binary, desktop entry, icon and bundled samples.
+
+**Arch Linux** — the AUR package:
 
 ```sh
 yay -S slooper        # or paru -S slooper
 ```
 
-**Any distro** — build from source (prereqs per distro in
+**Build from source** (prereqs per distro in
 [docs/INSTALL.md](docs/INSTALL.md)):
 
 ```sh
@@ -232,9 +258,11 @@ Writing an effect: copy `template.rs`, rename, edit — one standalone Rust
 file that `include!`s `effect_api.rs` and provides `create` / `process` /
 `destroy`, a description block (name required, up to 32 parameters), and
 optionally a scripted custom GUI. Compiled with
-`rustc --edition 2021 --crate-type cdylib`. Working examples in `effects/`:
-`parametric_eq.rs` (6-band EQ, live spectrum, draggable log-axis handles)
-and `space_echo.rs` (echo + reverb with tone voicing and factory presets).
+`rustc --edition 2021 --crate-type cdylib`. The `effects/` folder is the
+working reference: **23 shipped effects** — from a 6-band parametric EQ with
+live spectrum to stereo ping-pong delay, a 3-band maximiser and an
+18-band vocoder — are the same ordinary scripts the folder seeds with
+([docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md)).
 Scripted **synths** work the same way — `synths/synth_api.rs` plus the
 bundled `piano.rs` / `sampler.rs` are the reference.
 
@@ -289,48 +317,60 @@ Quantization always follows the **metronome** — set BPM / beats-per-measure
 
 ```
 src/
-├── main.rs    entry point, eframe window setup
-├── lib.rs     crate root: pub mods
-├── audio.rs   JACK backend + DAW engine: manager thread, Cmd/Evt channels,
-│              RT process handler (clip mixing, takes, metronome, transport,
-│              per-track synth + chain playback, offline renders)
-├── arrange.rs arrangement model: tracks → lanes → clips (asset id, start
-│              sample, trim offset, play length), placement/snap/lane-overlap
-│              rules, edge-trim math, serialization
-├── assets.rs  asset rack: folder scan (audio + .mid), recordings into
-│              the primary folder, take save/resolve
-├── midipat.rs SMF format-0 MIDI pattern model (PPQ 480; notes, CC,
-│              channel pressure; read + write; length survives via meta)
-├── synth.rs   scripted synth plugins: rust-script compile-on-load, own ABI
-│              + host vtable, compile cache, bundled piano/sampler seeded
-│              into the synths folder
-├── vsthost.rs VST2/VST3 plugin hosting: folder scan, block-based processing,
-│              parameter relay (VST2 via the patched vendor/vst2 crate,
-│              VST3 via vst3-host)
-├── vstedit.rs VST2 editor hosting (effEditOpen/Idle/GetRect/Close over an
-│              X11 plug/replug container window)
-├── project.rs .slooper save format (versioned JSON), projects dir
-│              listing, asset re-resolution by name
-├── audio_io.rs import decoding (symphonia) + export (WAV/FLAC native,
-│              MP3/OGG via ffmpeg, resampled with rubato)
-├── config.rs  JSON config: $XDG_CONFIG_HOME/slooper/config.json
-├── samples808.rs  bundled TR-808 pack: embedded WAVs + startup seeding
-│              into $XDG_DATA_HOME/slooper/samples/808 (default rack folder)
-├── fx.rs      effects framework: scan/compile/cache/load effect scripts,
-│              ABI validation, per-track chains, RT-safe parameter relay
-├── fxgui.rs   per-effect editor windows: auto sliders or scripted GUIs
+├── main.rs        entry point, eframe window setup
+├── lib.rs         crate root: pub mods
+├── backend.rs     audio-backend contract: what a platform layer must
+│                  provide (BlockIo + manager-thread shape) so the engine
+│                  core never learns what a device is
+├── audio/
+│   ├── mod.rs     DAW engine core: RT-safe Proc::process_block (clip mix,
+│   │              chains, synths, takes, transport, meters), the
+│   │              backend-agnostic manager thread (Cmd/Evt channels),
+│   │              offline renders
+│   ├── jack.rs    Linux shim: JACK/PipeWire-JACK client (NO_START)
+│   ├── wasapi.rs  Windows shim: WASAPI shared-mode event-driven stream
+│   └── rt_recovery.rs  xrun/recover policy shared by both shims
+├── arrange.rs     arrangement model: tracks → lanes → clips (asset id, start
+│                  sample, trim offset, play length), placement/snap/lane-overlap
+│                  rules, edge-trim math, serialization
+├── assets.rs      asset rack: folder scan (audio + .mid), recordings into
+│                  the primary folder, take save/resolve
+├── sample_edit.rs sample editor backend: fades/silence trim, render
+│                  previews, in-place asset rewrites (with backups)
+├── midipat.rs     SMF format-0 MIDI pattern model (notes, CC, bends,
+│                  per-note pressure; read + write)
+├── synth.rs       scripted synth plugins: rustc compile-on-load, own ABI
+│                  + host vtable, compile cache, bundled piano/sampler/
+│                  drums/pad seeded into the synths folder
+├── claphost.rs    CLAP 1.2 hosting (hand-written C ABI binding)
+├── vstedit/       native plugin editor hosting: X11 plug/replug (Linux),
+│                  HWND child windows (Windows); VST2 + VST3
+├── automation.rs  automation assets: LFO/step/curve sources bound to any
+│                  plugin param, synth param, mixer control or FX param
+├── meter.rs       peak/RMS meters + spectrum analyzer (STFT) feeds
+├── project.rs     .slooper save format (versioned JSON), projects dir
+│                  listing, asset re-resolution by name, load-what-to-import
+├── audio_io.rs    import decoding (symphonia) + export (WAV/FLAC native,
+│                  MP3/OGG via ffmpeg, resampled with rubato)
+├── config.rs      JSON config: $XDG_CONFIG_HOME/slooper/config.json
+├── paths.rs       platform data/config dirs (XDG on Linux, FOLDERID on
+│                  Windows) — every path in the app resolves through here
+├── crash.rs       Windows crash reporting: minidump + in-app report window
+├── fx.rs          effects framework: scan/compile/cache/load effect scripts,
+│                  ABI v1/v2/v3 validation, per-track chains, RT-safe
+│                  parameter relay, factory presets + seeding
+├── fxgui.rs       per-effect editor windows: auto sliders or scripted GUIs
 ├── effect_api.rs  the effect ABI contract (source of truth; also written
-│              into every effects folder for scripts to `include!`)
-├── midi.rs    MIDI parsing/formatting, MidiBind matching, MidiAction table,
-│              keyboard-shortcut layout migration
-├── quantize.rs  metronome grids, content quantize, silence trim,
-│                zero-crossing refinement + seam crossfade
-└── ui.rs      egui app: top bar (transport/project buttons), asset rack,
-               grid toolbar (quantize/snap, loop, ♫ Piano roll, zoom),
-               timeline lanes + playhead drag, Mixer dock (strips, chain
-               window, synth bindings), piano roll window, settings,
-               MIDI monitor, export window
-```
+│                  into every effects folder for scripts to `include!`)
+├── midi.rs        MIDI parsing/formatting, MidiBind matching, MidiAction
+│                  table, MPE routing
+├── midiin.rs      MIDI device input (ALSA seq / WinMM), hot-plug aware
+├── quantize.rs    metronome grids, content quantize, silence trim,
+│                  zero-crossing refinement + seam crossfade
+└── ui.rs          egui app: top bar, asset rack, timeline, Mixer dock,
+                   chain/synth/piano-roll/master-out/sample-editor
+                   windows, docking + layout templates, settings,
+                   MIDI monitor, export```
 
 (`vendor/vst2/` holds the patched, in-tree VST2 crate — see its
 `VENDOR-NOTES.md`.)
@@ -401,15 +441,15 @@ makepkg's default `$srcdir=$PWD/src` collides with Rust's own `src/`.
 cargo test -- --test-threads=1
 ```
 
-Unit tests (128 + 1 bin) cover MIDI parsing/binding and shortcut-table
+Unit tests (640+) cover MIDI parsing/binding and shortcut-table
 migration, the SMF pattern round-trip, synth script loading/rendering,
 quantize/silence-trim math, the arrangement model (placement, snapping,
 edge trimming, child-lane creation on overlap, removal rules), chain
 persistence, the asset store, the `.slooper` project format, engine
 render/mixing, and the egui layer driven headlessly (clicks and drags
 through the real UI, incl. the v0.6/v0.7 acceptance pins for group editing,
-clip trimming, the piano roll, and the chain window). The e2e suite (8
-tests) drives a real JACK client pair in real time: MIDI monitor, audio
+clip trimming, the piano roll, and the chain window). The e2e suite (~60
+tests) drives a real audio backend in real time: MIDI monitor, audio
 mixing/routing, the global transport (play/stop anywhere, seek, loop wrap),
 the metronome grid, the record → take → clip pipeline, MIDI capture, VST
 processing in export, and export. Tests self-skip when no
@@ -437,5 +477,17 @@ included, as long as the copyright notice travels with substantial copies.
 - [x] Clip edge trimming (cut/extend, silent extension, sample-exact override)
 - [x] MIDI instruments: per-track synths (scripted + VSTi), piano roll,
       MIDI recording (MREC)
-- [x] VST2/VST3 hosting: one chain per track, params, native VST2 editors
+- [x] VST2/VST3/CLAP hosting: one chain per track, params, native editor
+      windows on both OSes
 - [x] Clip-level fades, split-at-playhead, per-clip gain (property row)
+- [x] Full-dock window system: edge docks, tab groups, layout templates,
+      command palette
+- [x] Preview bounce, loop record, MIDI FX (per-note transposition),
+      automation sources → any parameter
+- [x] Master out window: master fader, peak/RMS meters, BS.1770-4 loudness
+      (LUFS + LRA), real-time spectrum viewer
+- [x] Sampler key map (8 slots across the keyboard) · sample editor
+      (fade/trim/normalize, in place)
+- [x] Windows 10/11 native: WASAPI backend, native plugin editors, CI
+      matrix on both OSes
+- [ ] macOS backend

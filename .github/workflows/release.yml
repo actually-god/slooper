@@ -8,9 +8,18 @@
 #     slooper-<debver>_amd64.deb            (W13d: same staged tree +
 #                                           control file, smoke-gated on
 #                                           the debian tier)
+#     slooper-<nvr>.x86_64.rpm             (w14: same staged tree, rpm
+#                                           spec, packaged in a fedora
+#                                           container from the floor exe)
 #     slooper-win64.zip                    (MSVC release exe + README +
 #                                           LICENSE — exe carries the
 #                                           embedded icon via winresource)
+#     slooper-<ver>-win64-setup.exe        (NSIS installer: machine-wide,
+#                                           uninstall entry, Start menu,
+#                                           optional desktop shortcut)
+#   Release NOTES: the top section of CHANGELOG.md + the AUR line from
+#   the repo variable AUR_URL (Settings ▸ Secrets and variables ▸ Actions
+#   ▸ Variables — set it once the AUR package is published).
 #   workflow_dispatch: the same pipeline against the CURRENT commit, but
 #   as a DRAFT release — validates the packaging path end to end without
 #   publishing anything.
@@ -178,6 +187,21 @@ jobs:
           }
           Compress-Archive -Path target/winrel/slooper.pdb `
             -DestinationPath slooper-win64-pdb.zip -Force
+      - name: Build .exe installer (NSIS)
+        # windows-latest ships NSIS in the runner image; packaging/
+        # slooper.nsi packages the SAME staged tree the zip carries.
+        shell: pwsh
+        run: |
+          $makensis = Join-Path ${env:ProgramFiles(x86)} NSIS\makensis.exe
+          if (-not (Test-Path $makensis)) { Write-Error "NSIS not on the runner"; exit 1 }
+          $ver = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME.TrimStart('v') }
+                 else { (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value + "-dev." + $env:GITHUB_SHA.Substring(0,7) }
+          & $makensis -V2 "-DSLOOPER_VER=$ver" "-DSLOOPER_SRC=stage" packaging\slooper.nsi
+          if (-not (Test-Path "slooper-$ver-win64-setup.exe")) { Write-Error "makensis produced no installer"; exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: slooper-*-win64-setup.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows-asset
@@ -187,9 +211,37 @@ jobs:
           name: windows-pdb
           path: slooper-win64-pdb.zip
 
+  rpm:
+    # w14: .rpm packaged FROM the floor-distro artifact (the linux job's
+    # staged tar.zst) — the fedora container is a packager, never a
+    # builder (W13b: package the artifact, not the build).
+    name: Linux asset (.rpm, packaged from the floor build)
+    needs: linux
+    runs-on: ubuntu-24.04
+    container: fedora:40
+    timeout-minutes: 20
+    steps:
+      - name: Container deps
+        run: dnf install -y -q git rpm-build zstd >/dev/null
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-asset
+      - name: Build .rpm (w14)
+        run: |
+          set -euo pipefail
+          tar --zstd -xf slooper-*-linux-x86_64.tar.zst
+          P="$(ls -d slooper-*-linux-x86_64)"
+          V="${P#slooper-}"; V="${V%-linux-x86_64}"
+          bash scripts/porting/w14_make_rpm.sh "$P" "$V"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-asset
+          path: slooper-*.x86_64.rpm
+
   release:
     name: Publish GitHub Release
-    needs: [linux, windows]
+    needs: [linux, windows, rpm]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -206,14 +258,39 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: deb-asset
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-asset
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+      - name: Release notes (top CHANGELOG section + AUR line)
+        env:
+          AUR_URL: ${{ vars.AUR_URL }}
+        run: |
+          set -euo pipefail
+          awk '/^## \[/{c++} c==1{print} c==2{exit}' CHANGELOG.md > RELEASE_BODY.md
+          {
+            echo
+            if [ -n "$AUR_URL" ]; then
+              echo "**Arch Linux (AUR):** \`yay -S slooper\` — $AUR_URL"
+            else
+              echo "**Arch Linux (AUR):** package pending publication — see docs/INSTALL.md."
+            fi
+            echo
+            echo "Verify any asset: every file is built once in CI from the tagged commit — Linux from the glibc-2.35 floor build, Windows from CI's MSVC host."
+          } >> RELEASE_BODY.md
       - name: Release (tag → published, dispatch → draft)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           draft: ${{ github.event_name == 'workflow_dispatch' }}
-          generate_release_notes: ${{ github.event_name == 'push' }}
+          name: slooper ${{ github.ref_name }}
+          body_path: RELEASE_BODY.md
           files: |
             slooper-*-linux-x86_64.tar.zst
             slooper-*_amd64.deb
+            slooper-*.x86_64.rpm
             slooper-win64.zip
             slooper-win64-pdb.zip
+            slooper-*-win64-setup.exe

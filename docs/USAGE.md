@@ -24,6 +24,7 @@ run live and in export.
 - [Metronome & grid](#metronome--grid)
 - [Quantize & trim](#quantize--trim)
 - [Projects: save & load](#projects-save--load)
+- [Master out & loudness](#master-out--loudness)
 - [Export](#export)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [MIDI control](#midi-control)
@@ -301,6 +302,15 @@ Each track plays its MIDI clips through its own **synth binding** (the
   asset rack *or straight from your file manager*: the file is decoded,
   joins the rack, and replaces the live patch immediately, even while the
   track plays and MIDI streams in (no restart, no re-selection).
+- **sampler key map** — click **map** on a sampler-bound track to spread
+  **up to 8 rack samples across the keyboard**: each slot gets a root key
+  (the draggable block on the mini-keyboard, or the click-a-key editor) and
+  every note plays the nearest-rooted sample pitched to fit. Two modes:
+  **chromatic** (one sample across the whole range, pitched) or
+  **split** (each slot owns the keys up to the next slot's root — a drum
+  kit / multisample in minutes). Maps save with the synth setup, and the
+  key map itself plays when you preview or draw notes — what you click is
+  what you hear.
 - **other script synths** — plain Rust files in
   `~/.local/share/slooper/synths`, compiled on first load (⟳ re-scans);
   they share the preset/param machinery of effect scripts.
@@ -357,6 +367,16 @@ strictly inside the clip; fades stay with the left half, and the halves
 keep the selection so repeated `S` walks a long clip into pieces. This
 is the standard way to place a crossfade: overlap two faded clips on
 child lanes, or fade the halves around a cut.
+
+## Editing samples
+
+Select one clip (or an asset in the rack) and press **Edit sample** — a
+sample-properties window for that asset: **reverse**, **ping-pong**,
+**fade in / fade out**, **pitch** and **bend**, and **time stretch**.
+Edits apply live, are saved with the project, and **never touch the
+source file** — every other clip of the same asset keeps its own view,
+and the original can always be re-dropped clean. (Destructive
+render-to-file stays available via export + re-import.)
 
 ## Piano roll
 
@@ -509,6 +529,25 @@ windowing lives on the clip — see [Clip trimming](#clip-trimming).)
   re-found by file name inside the project's audio folder or the rack
   folders when loading.
 
+## Master out & loudness
+
+The **MASTER OUT** window (top bar ▸ Windows ▸ *Master out*, or `Ctrl+K`
+→ "master") is the one place for the session's master section — the mixer
+dock deliberately carries no master controls of its own:
+
+- **master volume** (−∞…+6 dB) with a **reset I** button that restarts the
+  integrated-loudness measurement pass;
+- **peak L / R** meters in dBFS with sample-peak hold and a red clip LED
+  that lights on any full-scale sample;
+- **BS.1770-4 loudness** readouts — momentary, short-term, integrated
+  **LUFS** plus **LRA** — the same measurement basis as dedicated loudness
+  meters, so you can check a mix against a streaming target before export;
+- a **real-time spectrum viewer** (log-frequency, post-master-gain) for
+  spotting build-up and holey EQ at a glance.
+
+The window docks (right edge by default), floats, and tabs like every
+other window, and it folds its meter column gracefully when shrunk.
+
 ## Export
 
 **Export** (top bar, `E`): render **one track** (its clips mixed, then
@@ -611,10 +650,15 @@ the list = first in the signal path). Open it with the strip's **FX** chip:
 - **+ effect** adds a scripted effect; **+ VST plugin** adds a scanned
   binary plugin. **Effects folder** / **Rescan effects** manage script
   location (default `~/.local/share/slooper/effects`, seeded with
-  `template.rs` + the ABI contract + the stock effects — parametric EQ,
-  space echo (delay+reverb), **compressor**, **chorus** — on first run;
-  stock files are updated/added automatically on app updates, user files
-  are never touched); **Plugin folders**
+  `template.rs`, the ABI contract, and the **23 bundled studio effects**
+  (EQ, compressor, limiter, multiband dynamics, transient designer, delay,
+  echo+reverb, convolution reverb, chorus, flanger, phaser, auto pan, gater,
+  overdrive, wave shaper, crusher, filter, enhancer, pitch shifter,
+  frequency shifter, stereo spread, vocoder, sidechain compressor — the
+  full roster with every parameter is [EFFECT-SUITE.md](EFFECT-SUITE.md))
+  on first run; stock files are updated/added automatically on app updates
+  (with a `.bak` of the overwritten stock copy), user files are never
+  touched); **Plugin folders**
   (Add / ×) + **Rescan Plugins** manage VST scanning (`~/.vst`, `~/.vst3`,
   system dirs, plus your own).
 - **Editors**: effect scripts show their **scripted custom GUI** or
