@@ -200,7 +200,9 @@ pub const MAX_MAP_SLOTS: usize = 64;
 pub const MAP_EXISTS: u32 = 0x8000_0000;
 
 /// Copy the calling instance's key map out to a script (see the ABI doc).
-/// Slots are packed `(asset_id << 8) | root_note`, slot 0..n dense.
+/// Slots are packed `(asset_id << 16) | (velocity << 8) | root_note`,
+/// slot 0..n dense (v52 R2: the velocity byte enables per-slot VELOCITY
+/// LAYERS on a shared root; 127 answers every velocity).
 extern "C" fn host_load_map(slots: *mut u64, max: u32, mode: *mut u32) -> u32 {
     let inst = CUR_INST.with(|c| c.get());
     if inst.is_null() {
@@ -334,10 +336,10 @@ impl Instance {
         // v51: audition/preview respawns ride this path — the key map must
         // ride with them or the sampled map preview would play only params.
         let n = (self.map_n.load(Ordering::Acquire) as usize).min(MAX_MAP_SLOTS);
-        let slots: Vec<(u32, u8)> = (0..n)
+        let slots: Vec<(u32, u8, u8)> = (0..n)
             .map(|i| {
                 let p = self.map[i].load(Ordering::Acquire);
-                ((p >> 8) as u32, (p & 0xFF) as u8)
+                ((p >> 16) as u32, (p & 0xFF) as u8, ((p >> 8) & 0xFF) as u8)
             })
             .collect();
         fresh.set_map_raw(&slots, self.map_mode.load(Ordering::Relaxed));
@@ -357,7 +359,7 @@ impl Instance {
     /// instances that never had one fall back to the legacy single-asset
     /// params. The GUI thread owns the map; the audio thread only ever
     /// reads it (through `host_load_map`).
-    pub fn set_map(&self, slots: &[(u32, u8)], mode: u8) {
+    pub fn set_map(&self, slots: &[(u32, u8, u8)], mode: u8) {
         self.set_map_raw(slots, (mode as u32) | MAP_EXISTS)
     }
 
@@ -367,10 +369,13 @@ impl Instance {
         self.set_map_raw(&[], 0);
     }
 
-    fn set_map_raw(&self, slots: &[(u32, u8)], mode_bits: u32) {
+    fn set_map_raw(&self, slots: &[(u32, u8, u8)], mode_bits: u32) {
         let n = slots.len().min(MAX_MAP_SLOTS);
         for (i, s) in slots.iter().take(n).enumerate() {
-            self.map[i].store(((s.0 as u64) << 8) | s.1 as u64, Ordering::Release);
+            self.map[i].store(
+                ((s.0 as u64) << 16) | ((s.2 as u64) << 8) | s.1 as u64,
+                Ordering::Release,
+            );
         }
         for slot in self.map.iter().skip(n) {
             slot.store(u64::MAX, Ordering::Relaxed);
@@ -382,13 +387,13 @@ impl Instance {
 
     /// Readback of the published map (pins + the map editor mirror).
     /// `mode` is the low-bits mode; `exists` = a map was published.
-    pub fn map_snapshot(&self) -> (Vec<(u32, u8)>, u8, bool) {
+    pub fn map_snapshot(&self) -> (Vec<(u32, u8, u8)>, u8, bool) {
         let n = (self.map_n.load(Ordering::Acquire) as usize).min(MAX_MAP_SLOTS);
         let bits = self.map_mode.load(Ordering::Relaxed);
         let slots = (0..n)
             .map(|i| {
                 let p = self.map[i].load(Ordering::Acquire);
-                ((p >> 8) as u32, (p & 0xFF) as u8)
+                ((p >> 16) as u32, (p & 0xFF) as u8, ((p >> 8) & 0xFF) as u8)
             })
             .collect();
         (slots, (bits & 0xFF) as u8, bits & MAP_EXISTS != 0)
@@ -1503,8 +1508,8 @@ mod tests {
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 48), (1, 54)], 0);
-        assert_eq!(inst.map_snapshot(), (vec![(0u32, 48u8), (1, 54)], 0, true));
+        inst.set_map(&[(0, 48, 127), (1, 54, 127)], 0);
+        assert_eq!(inst.map_snapshot(), (vec![(0u32, 48u8, 127u8), (1, 54, 127)], 0, true));
         // A mapped sample plays at its ROOT pitch when the note equals the
         // root, so each case measures the TRANSPOSED frequency.
         let fsh =
@@ -1534,7 +1539,7 @@ mod tests {
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 48), (1, 48)], 0);
+        inst.set_map(&[(0, 48, 127), (1, 48, 127)], 0);
         let x = v51_render(&inst, 48);
         let a = tone_power(&x, 200.0, 48000.0, 512, 7680);
         let b = tone_power(&x, 800.0, 48000.0, 512, 7680);
@@ -1550,7 +1555,7 @@ mod tests {
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 45), (1, 52)], 1);
+        inst.set_map(&[(0, 45, 127), (1, 52, 127)], 1);
         let x = v51_render(&inst, 48);
         let f_lo = 200.0 * (2.0f64).powf(3.0 / 12.0);
         let f_hi = 800.0 * (2.0f64).powf(-4.0 / 12.0);
@@ -1579,7 +1584,7 @@ mod tests {
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 45), (1, 52)], 1);
+        inst.set_map(&[(0, 45, 127), (1, 52, 127)], 1);
         let x = v51_render(&inst, 45); // exact low root
         let a = tone_power(&x, 200.0, 48000.0, 512, 7680);
         let b = tone_power(&x, 800.0 * (2.0f64).powf(-7.0 / 12.0), 48000.0, 512, 7680);
@@ -1613,7 +1618,7 @@ mod tests {
         );
         assert!(!inst.map_snapshot().2, "no map yet -> exists=false");
 
-        inst.set_map(&[(1, 60)], 0); // map up -> params ignored
+        inst.set_map(&[(1, 60, 127)], 0); // map up -> params ignored
         let x = v51_render(&inst, 60);
         let a = tone_power(&x, 800.0, 48000.0, 512, 7680);
         let b = tone_power(&x, 400.0, 48000.0, 512, 7680);
@@ -1632,14 +1637,14 @@ mod tests {
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 48)], 0);
+        inst.set_map(&[(0, 48, 127)], 0);
         let x = v51_render(&inst, 48);
         assert!(
             tone_power(&x, 200.0, 48000.0, 512, 7680)
                 > 25.0 * tone_power(&x, 800.0, 48000.0, 512, 7680),
             "first map must sound"
         );
-        inst.set_map(&[(1, 48)], 0); // swap sample on the fly
+        inst.set_map(&[(1, 48, 127)], 0); // swap sample on the fly
         let x = v51_render(&inst, 48);
         assert!(
             tone_power(&x, 800.0, 48000.0, 512, 7680)
@@ -1647,11 +1652,11 @@ mod tests {
             "live map edit must change the NEXT render with no rebind"
         );
         // Spawn a fresh copy (audition/offline path) — map + mode ride.
-        inst.set_map(&[(0, 45), (1, 52)], 1);
+        inst.set_map(&[(0, 45, 127), (1, 52, 127)], 1);
         let fresh = inst.spawn_fresh().expect("spawn_fresh");
         assert_eq!(
             fresh.map_snapshot(),
-            (vec![(0u32, 45u8), (1, 52)], 1, true),
+            (vec![(0u32, 45u8, 127u8), (1, 52, 127)], 1, true),
             "spawn_fresh must carry the map + crossfade mode"
         );
         let x = v51_render(&fresh, 48);
@@ -1661,5 +1666,55 @@ mod tests {
             plo > 5e4 && phi > 5e4,
             "the copy must crossfade like the original"
         );
+    }
+
+    // ---- v52 R2: velocity LAYERS (several slots on one root) ----
+
+    /// One note at a GIVEN velocity (v51_render is fixed at 110).
+    fn v52_render(inst: &Arc<Instance>, note: u8, vel: u8) -> Vec<f32> {
+        let mut ev = vec![(0u64, 3u8, 0u8, note, vel), (40_000, 0, 0, note, 0)];
+        let mut out = vec![0f32; 8192];
+        crate::audio::render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    #[test]
+    fn v52_sampler_velocity_layers_cutoff_switches() {
+        // Two layers on ONE root: asset 0 (200 Hz) answers at v<=40,
+        // asset 1 (800 Hz) at v<=100. Cutoff SWITCHES on the velocity
+        // axis; a note under every layer falls back to the lowest.
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(1, 48, 100), (0, 48, 40)], 0); // unsorted on purpose
+        let dom = |x: &[f32], want: f64, off: f64| {
+            let a = tone_power(x, want, 48000.0, 512, 7680);
+            let b = tone_power(x, off, 48000.0, 512, 7680);
+            assert!(a > 25.0 * b, "wanted {want:.0} Hz: {a} vs {b}");
+        };
+        dom(&v52_render(&inst, 48, 30), 200.0, 800.0); // under both -> lowest
+        dom(&v52_render(&inst, 48, 60), 200.0, 800.0); // highest floor 40
+        dom(&v52_render(&inst, 48, 110), 800.0, 200.0); // highest floor 100
+    }
+
+    #[test]
+    fn v52_sampler_velocity_layers_crossfade_blends() {
+        // Layers 40 and 100 on one root: note v=70 sits EXACTLY halfway,
+        // so both layers sound with equal weight (pitch axis untouched —
+        // exact root hit). Note v=20 is under every layer -> lowest only.
+        let reg = v51_registry();
+        v51_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 48, 40), (1, 48, 100)], 1);
+        let x = v52_render(&inst, 48, 70);
+        let p0 = tone_power(&x, 200.0, 48000.0, 512, 3800);
+        let p1 = tone_power(&x, 800.0, 48000.0, 512, 3800);
+        assert!(p0 > 5e4 && p1 > 5e4, "both layers must sound: {p0} {p1}");
+        let r = p0 / p1;
+        assert!((r - 1.0).abs() < 0.5, "equal blend expected, power ratio {r}");
+        let x = v52_render(&inst, 48, 20);
+        let p0 = tone_power(&x, 200.0, 48000.0, 512, 7680);
+        let p1 = tone_power(&x, 800.0, 48000.0, 512, 7680);
+        assert!(p0 > 25.0 * p1, "under all layers -> lowest only: {p0} {p1}");
     }
 }

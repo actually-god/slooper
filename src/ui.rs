@@ -1356,12 +1356,15 @@ pub struct App {
     /// piano-roll map (slots = (asset path, root note) + mode).
     sampler_maps: Vec<Option<crate::config::SamplerMapSave>>,
     /// v51: track whose sampler key-map (piano roll) window is open.
-    smap_win: Option<usize>,
+
     /// Harness hook: the last (keyboard-strip rect, lane-strip min-x) the
     /// map window painted this frame, so tests can drive real drags/clicks
     /// without color archaeology. Written every painted frame; read-only
     /// cost for the app.
     smap_probe: Option<(f32, f32, f32, f32, f32)>,
+    /// v52 R2: rect of the FIRST PAINTED BLACK KEY (note 37) — pins that
+    /// the painted black key sits in the same column its click binds.
+    smap_black_probe: Option<egui::Rect>,
     /// v52 R3: harness probe — every drum-grid cell rect painted this frame
     /// as (pad, step, rect); tests drive real clicks without color
     /// archaeology (same pattern as `smap_probe`). Written every painted frame.
@@ -1883,8 +1886,9 @@ impl App {
                 }
                 m
             },
-            smap_win: None,
+
             smap_probe: None,
+            smap_black_probe: None,
             drum_probe: Vec::new(),
             drum_commit_note: None,
             smap_sel: None,
@@ -5927,14 +5931,14 @@ impl App {
         match self.sampler_maps.get(t).cloned().flatten() {
             None => inst.clear_map(),
             Some(m) => {
-                let slots: Vec<(u32, u8)> = m
+                let slots: Vec<(u32, u8, u8)> = m
                     .slots
                     .iter()
                     .filter_map(|s| {
                         self.assets
                             .iter()
                             .position(|a| a.path.to_string_lossy() == s.asset)
-                            .map(|k| (k as u32, s.root))
+                            .map(|k| (k as u32, s.root, s.vel.max(1)))
                     })
                     .collect();
                 inst.set_map(&slots, m.mode);
@@ -6013,7 +6017,11 @@ impl App {
                 .unwrap_or(48);
             if !m.slots.iter().any(|s| s.asset == sp) {
                 m.slots
-                    .push(crate::config::SamplerSlotSave { asset: sp, root });
+                    .push(crate::config::SamplerSlotSave {
+                    asset: sp,
+                    root,
+                    vel: 127,
+                    });
             }
             added += 1;
         }
@@ -10276,23 +10284,7 @@ impl App {
     /// (ties round down); crossfade blends the two nearest samples by
     /// inverse distance. OS/asset drops while this window is open add
     /// samples (routed centrally at the top of `ui_root`).
-    fn sampler_map_window(&mut self, ui: &mut egui::Ui, t: usize) {
-        // Guard: the window only exists while track t runs the sampler.
-        let Some(stem) = self.track_synth.get(t).cloned().flatten() else {
-            self.smap_win = None;
-            self.smap_release();
-            return;
-        };
-        let is_sampler = self
-            .synth_registry
-            .desc(&stem)
-            .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
-            .unwrap_or(false);
-        if !is_sampler {
-            self.smap_win = None;
-            self.smap_release();
-            return;
-        }
+    fn sampler_map_inline(&mut self, ui: &mut egui::Ui, t: usize) {
         // Release watchdog: a held map key must die with the mouse button
         // (the piano roll's own watchdog only runs while the ROLL is open).
         if self.smap_hold.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
@@ -10320,7 +10312,7 @@ impl App {
             let mut slots = Vec::new();
             let a = vals.first().copied().unwrap_or(0.0).round() as usize;
             if a < self.assets.len() && self.assets[a].pattern.is_none() {
-                slots.push(crate::config::SamplerSlotSave {
+                slots.push(crate::config::SamplerSlotSave { vel: 127,
                     asset: self.assets[a].path.to_string_lossy().into_owned(),
                     root: vals
                         .get(1)
@@ -10334,27 +10326,18 @@ impl App {
             self.push_sampler_map(t);
             self.save_config();
         }
-        let mut open = true;
-        let resp = egui::Window::new(format!("\u{266a} sampler map \u{b7} track {}", t + 1))
-            .id(egui::Id::new(("smapwin", t)))
-            .open(&mut open)
-            // Open wide enough that the lane rows never wrap (header cell +
-            // 49 keys); like the piano roll, size follows the viewport.
-            .default_pos(egui::pos2(60.0, 80.0))
-            .default_size({
-                let screen = ui.ctx().viewport_rect();
-                [(screen.width() - 80.0).clamp(760.0, 1180.0), 320.0_f32]
-            })
-            .min_width(300.0)
-            .min_height(150.0)
-            .show(ui, |ui| {
-                body_clipped(ui, |ui| self.smap_body(ui, t));
-            });
-        let _ = resp;
-        if !open {
-            self.smap_win = None;
-            self.smap_release();
-        }
+        // v52 R2: the map paints HERE, inside the sampler's own window —
+        // no separate popup. The fixed C2..C6 range is wider than any
+        // window, so the roll sits in a horizontal scroll; every drag
+        // reads the live (scrolled) lane/key rects, so geometry follows.
+        ui.label(
+            RichText::new("\u{266a} KEY MAP \u{b7} drag a lane block to its root key")
+                .strong()
+                .small(),
+        );
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.smap_body(ui, t));
     }
 
     /// The key-map window's body: header (mode/add/remove) + one lane row
@@ -10433,6 +10416,7 @@ impl App {
                                     .map(|s| (s.root as i32 + 7).clamp(24, 96) as u8)
                                     .unwrap_or(48);
                                 m.slots.push(crate::config::SamplerSlotSave {
+                                    vel: 127,
                                     asset: sp.clone(),
                                     root,
                                 });
@@ -10474,7 +10458,8 @@ impl App {
             RichText::new(
                 "drag a lane block onto a piano key \u{b7} or select a lane and click a key \
                  \u{b7} cutoff: zones switch at the midpoint, ties go DOWN \u{b7} crossfade: \
-                 the two nearest samples mix by inverse distance",
+                 the two nearest samples mix by inverse distance \u{b7} several lanes on ONE \
+                 key = velocity layers (the v value): cutoff switches, crossfade blends",
             )
             .weak()
             .small(),
@@ -10519,7 +10504,15 @@ impl App {
         for i in 0..n {
             let (name, root, resolved) = infos[i].clone();
             let sel = self.smap_sel == Some(i);
+            let cur_vel = self
+                .sampler_maps
+                .get(t)
+                .and_then(|o| o.as_ref())
+                .and_then(|m| m.slots.get(i))
+                .map(|s| s.vel)
+                .unwrap_or(127);
             let mut new_asset: Option<String> = None;
+            let mut new_vel: Option<u8> = None;
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(HDR_W, LANE_H),
@@ -10527,7 +10520,7 @@ impl App {
                     |ui| {
                         let cur = format!("#{} {}", i + 1, name);
                         egui::ComboBox::from_id_salt(("smapcombo", t, i))
-                            .width(HDR_W - 40.0)
+                            .width(HDR_W - 96.0)
                             .selected_text(RichText::new(cur).small())
                             .show_ui(ui, |ui| {
                                 for (k, nm) in &audio_assets {
@@ -10538,6 +10531,23 @@ impl App {
                                     }
                                 }
                             });
+                        // v52 R2: this slot's LAYER velocity. Several slots
+                        // on one key answer different velocity ranges.
+                        let mut vv = cur_vel as i32;
+                        let vr = ui.add_sized(
+                            [64.0, 18.0],
+                            egui::DragValue::new(&mut vv)
+                                .range(1..=127)
+                                .speed(2)
+                                .prefix("v\u{2009}")
+                                .suffix(" \u{2669}"),
+                        );
+                        if vr.changed() {
+                            new_vel = Some(vv.clamp(1, 127) as u8);
+                        }
+                        if vr.hovered() {
+                            ui.ctx().request_repaint();
+                        }
                         if ui
                             .add_sized(
                                 [18.0, 18.0],
@@ -10675,6 +10685,17 @@ impl App {
                     }
                 }
             }
+            if let Some(v) = new_vel {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    if let Some(s) = m.slots.get_mut(i) {
+                        if s.vel != v {
+                            s.vel = v;
+                            self.push_sampler_map(t);
+                            self.save_config();
+                        }
+                    }
+                }
+            }
         }
         if n == 0 {
             ui.label(
@@ -10737,13 +10758,20 @@ impl App {
                 if !is_black(note) {
                     continue;
                 }
-                let x = kr.min.x + (k + 1) as f32 * KW - KW * 0.32;
+                // v52 R2: the black key sits CENTERED in its own column —
+                // the same column the lane block and note_at() use. (It
+                // used to straddle the next boundary, so selecting a key
+                // bound a note half a key away from what was painted.)
+                let x = kr.min.x + k as f32 * KW + KW * 0.18;
                 let r = egui::Rect::from_min_max(
                     egui::pos2(x, kr.min.y),
                     egui::pos2(x + KW * 0.64, kr.min.y + KEY_H * 0.6),
                 );
                 ui.painter()
                     .rect_filled(r, 1.0, egui::Color32::from_gray(28));
+                if note == 37 {
+                    self.smap_black_probe = Some(r);
+                }
             }
             // Selected slot's root marker.
             if let Some(i) = self.smap_sel.filter(|i| *i < n) {
@@ -10868,11 +10896,24 @@ impl App {
             return;
         }
         let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+        // v52 R2: the sampler's window now hosts the KEY MAP inline, so
+        // a FRESH sampler window opens wide enough for the C2..C6 roll
+        // (tracks the user resized keep their own rect and the roll
+        // scrolls inside them).
+        let is_sampler = self
+            .synth_registry
+            .desc(&stem)
+            .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            .unwrap_or(false);
         let mut open = true;
         let mut w = egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
             .id(egui::Id::new(("synthwin", t)))
             .open(&mut open)
-            .default_size([420.0, 430.0])
+            .default_size(if is_sampler {
+                [1150.0, 520.0]
+            } else {
+                [420.0, 430.0]
+            })
             .min_width(80.0)
             .min_height(70.0);
         if let Some(r) = self.dyn_rect(idx) {
@@ -11043,12 +11084,7 @@ impl App {
                     );
                 }
             }
-            // v51: the map editor for this track — a piano roll of lanes,
-            // drag each sample's block onto the key that is its root.
-            if ui.button("piano map \u{2026}").clicked() {
-                self.smap_win = Some(t);
-                self.smap_sel = None;
-            }
+
             // v18: OS-level file drops (file manager → app while
             // this window is open) are claimed CENTRALLY at the
             // top of `ui_root` (one drain per frame, then the
@@ -11085,6 +11121,12 @@ impl App {
                 dirty = true;
             }
         }
+        // v52 R2: the key map is part of the SAMPLER's main GUI, and the
+        // drum kit is NOT — it only shows for non-sampler plugins.
+        if sampler {
+            self.sampler_map_inline(ui, t);
+        }
+        if !sampler {
         // --- v30-batch-2: drum kit lives IN the plugin GUI ---------
         // (moved out of the synth picker; the pattern builder fires THESE pads).
         // The pattern builder ("Drums") fires THESE pads. The kit is
@@ -11285,6 +11327,7 @@ impl App {
             self.drum.ensure_rows(self.kit(t).len());
             self.save_config();
         }
+        } // v52 R2: end of the !sampler (drum kit) section
         if dirty {
             self.track_synth_params[t] = inst.values();
             self.save_config();
@@ -14024,14 +14067,12 @@ impl App {
             }
         }
         if !self.os_drops.is_empty() {
-            if let Some(t) = self.smap_win {
-                // v51: the open KEY-MAP window owns drops: every audio
-                // file becomes a mapped slot (rack-dedup).
+            if let Some(t) = self.sampler_editor_open() {
+                // v52 R2: the open SAMPLER window (now the one sampler
+                // GUI) owns drops: every audio file becomes a mapped
+                // slot (rack-dedup).
                 let paths = std::mem::take(&mut self.os_drops);
                 self.sampler_map_files_dropped(t, &paths);
-            } else if let Some(t) = self.sampler_editor_open() {
-                let paths = std::mem::take(&mut self.os_drops);
-                self.sampler_files_dropped(t, &paths);
             } else if let Some(t) = self.synth_win {
                 // v34 R5: the open SYNTHS window's drum kit pad rows are
                 // OS-drop targets too — the pad under the pointer adopts
@@ -14376,11 +14417,16 @@ impl App {
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
         }
-        // v51: sampler key-map (piano roll) window.
-        let sm = self.smap_win;
-        if let Some(t) = sm {
-            self.sampler_map_window(ui, t);
+        // v52 R2: the key map lives in the sampler window now — when no
+        // sampler window is open its drag probe and any still-held
+        // audition note must die with it.
+        if self.sampler_editor_open().is_none() {
+            if self.smap_probe.is_some() || self.smap_hold.is_some() {
+                self.smap_release();
+                self.smap_probe = None;
+            }
         }
+
         let sp = self.synth_pick;
         if let Some(t) = sp {
             synth_pick_window(ui, self, t);
@@ -30019,7 +30065,7 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         // No map yet (never opened) — the engine still runs legacy params.
         assert!(app.sampler_maps[0].is_none(), "unopened track has no map");
-        app.smap_win = Some(0);
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
         let seeded = app.sampler_maps[0].clone().expect("open seeds a map");
         assert_eq!(seeded.mode, 0, "default mode is hard cutoff");
@@ -30064,10 +30110,13 @@ mod tests {
                 "map window must paint {needle:?} exactly once, got: {g:?}"
             );
         }
-        // Guard: a NON-sampler track can't keep the window open.
+        // Guard: a NON-sampler track can't keep the map editor alive.
         app.set_track_synth_stem(0, "piano");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.smap_win, None, "window closes when the sampler unbinds");
+        assert!(
+            app.smap_probe.is_none(),
+            "map editor is gone when the sampler unbinds"
+        );
     }
 
     /// v51: "+ add sample" appends a lane (selected asset, root +7) and
@@ -30098,7 +30147,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        app.smap_win = Some(0);
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.sampler_maps[0].as_ref().unwrap().slots.len(), 1);
         let add = galley_at(&mut app, &ctx, "+ add sample")
@@ -30172,7 +30221,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        app.smap_win = Some(0);
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
         let seeded = app.sampler_maps[0].clone().expect("open seeds");
         assert_eq!((seeded.slots.len(), seeded.slots[0].root), (1, 48));
@@ -30242,7 +30291,7 @@ mod tests {
         assert!(exists, "map published");
         let kick = app.assets.iter().position(|a| a.name == "kick").unwrap() as u32;
         assert!(
-            slots.iter().any(|(a, r)| *a == kick && *r == 40),
+            slots.iter().any(|(a, r, _v)| *a == kick && *r == 40),
             "engine map must carry kick@40, got {slots:?}"
         );
     }
@@ -41873,6 +41922,148 @@ mod tests {
         assert!(
             (pitch_free - (96.0 + TRACK_SEP_HIT)).abs() < 2.0,
             "independent strips are uniform: pitch {pitch_free}"
+        );
+    }
+
+    /// v52 R2: the key map is BUILT INTO the sampler window (no popup
+    /// title anywhere), the DRUM KIT does not show for the sampler but
+    /// still does for other plugins, clicking a BLACK KEY's painted
+    /// center binds that black key (the alignment fix), and a slot's
+    /// velocity reaches the live engine map.
+    #[test]
+    fn v52_sampler_inline_map_kit_gating_blackkey_velocity() {
+        let mut app = headless_app("v52map");
+        let ctx = egui::Context::default();
+        for _ in 0..800 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.assets.iter().any(|a| a.name == "kick") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.set_track_synth_stem(0, "sampler");
+        frame(&mut app, &ctx, vec![]);
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        for ev in [
+            vec![moved(kick.center())],
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        for _ in 0..1200 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.synth_registry.desc("sampler").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        app.synth_win.expect("window open");
+        let galleys = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let g: Vec<String> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        return Some(t.galley.text().to_string());
+                    }
+                    None
+                })
+                .collect();
+            out.textures_delta.clear();
+            g
+        };
+        let g = galleys(&mut app, &ctx);
+        assert!(
+            g.iter().any(|s| s.contains("KEY MAP")),
+            "the inline KEY MAP section must paint, got {g:?}"
+        );
+        assert!(
+            !g.iter().any(|s| s.contains("sampler map")),
+            "the separate sampler-map popup must be gone, got {g:?}"
+        );
+        assert!(
+            !g.iter().any(|s| s.contains("DRUM KIT")),
+            "the drum kit must NOT be part of the sampler, got {g:?}"
+        );
+        assert!(
+            g.iter().any(|s| s.contains("127")),
+            "the default slot must show its velocity layer value, got {g:?}"
+        );
+        // The PAINTED black key (first = C#2/37) must sit centered in
+        // its own column — the exact column note_at() binds — else the
+        // selection visibly trails the keys by half a key (the bug).
+        let (kx, _ky, lx, ly, _rw) = app.smap_probe.expect("map painted");
+        let bk = app.smap_black_probe.expect("black key painted");
+        let want_c = kx + (37 - 36) as f32 * 18.0 + 9.0;
+        assert!(
+            (bk.center().x - want_c).abs() < 1.0,
+            "black key must be centered in its note column: {} vs {want_c}",
+            bk.center().x
+        );
+        // Black-key click: C#3 = 49 (is_black), click its painted CENTER
+        // (column center — where the fixed black key now sits).
+        // Select lane 0 via its background strip.
+        let sel_pt = egui::pos2(lx + 5.0, ly + 12.0);
+        for ev in [
+            vec![moved(sel_pt)],
+            vec![moved(sel_pt), btn(sel_pt, egui::PointerButton::Primary, true)],
+            vec![btn(sel_pt, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(app.smap_sel, Some(0), "lane strip click selects");
+        let kp = egui::pos2(kx + (49 - 36) as f32 * 18.0 + 9.0, _ky + 10.0);
+        for ev in [
+            vec![moved(kp)],
+            vec![moved(kp), btn(kp, egui::PointerButton::Primary, true)],
+            vec![btn(kp, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(
+            app.sampler_maps[0].as_ref().unwrap().slots[0].root,
+            49,
+            "clicking a black key's painted center must bind THAT key"
+        );
+        // Velocity rides to the live engine map.
+        app.sampler_maps[0].as_mut().expect("map present").slots[0].vel = 45;
+        app.push_sampler_map(0);
+        let inst = app.track_synth_inst[0].clone().expect("bound instance");
+        let SynthHandle::Script(si) = inst.as_ref() else {
+            panic!("script handle expected");
+        };
+        let (slots, _mode, exists) = si.map_snapshot();
+        assert!(exists);
+        assert!(
+            slots.iter().any(|(_a, r, v)| *r == 49 && *v == 45),
+            "engine map must carry root 49 @ vel 45, got {slots:?}"
+        );
+        // A NON-sampler plugin keeps its drum kit.
+        app.set_track_synth_stem(1, "piano");
+        frame(&mut app, &ctx, vec![]);
+        app.synth_win = Some(1);
+        frame(&mut app, &ctx, vec![]);
+        let g = galleys(&mut app, &ctx);
+        assert!(
+            g.iter().any(|s| s.contains("DRUM KIT")),
+            "non-sampler plugins keep the drum kit, got {g:?}"
         );
     }
 }
