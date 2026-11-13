@@ -1,7 +1,8 @@
 # Installing slooper
 
-slooper is a Linux desktop application (x86_64). It talks to a **JACK**
-audio server, so everything below assumes you have — or will install — either
+slooper ships for **Linux** and **Windows** (both x86_64). On Linux it
+talks to a **JACK** audio server, so the Linux sections below assume you
+have — or will install — either
 **PipeWire** (recommended; its `pipewire-jack` shim exposes the JACK API) or
 classic **jack2**. The app connects with `NO_START`: it **never spawns an
 audio server itself**; if none is running it reports the error and stays idle.
@@ -37,6 +38,63 @@ Notes about that PKGBUILD:
   implementation on you.
 - `optdepends`: `rust` (only needed to compile user effect scripts at runtime)
   and `ffmpeg` (only for MP3/OGG export). The app runs fine without both.
+
+## Any Linux distro — prebuilt binary
+
+Grab `slooper-<version>-linux-x86_64.tar.zst` from
+[the GitHub Releases page](https://github.com/actually-god/slooper/releases).
+It carries an FHS `usr/` tree (same layout as the Arch package), so one
+command installs binary + desktop entry + icon on any x86_64 distro:
+
+```sh
+sudo tar -C / --zstd -xf slooper-<version>-linux-x86_64.tar.zst
+# uninstall again:
+sudo rm /usr/bin/slooper /usr/share/applications/slooper.desktop \
+        /usr/share/pixmaps/slooper.png
+```
+
+Per-distro runtime packages (see the contract below; Arch users should
+just use the AUR package above, which pulls everything):
+
+```sh
+# Debian 12 / Ubuntu 22.04+:
+sudo apt-get install -y libx11-6 libstdc++6 pipewire-jack
+# Fedora:
+sudo dnf install libX11 libstdc++ pipewire-jack
+```
+
+### The dependency contract (why one binary runs on every distro)
+
+A Linux binary permanently carries the **versioned symbols of its build
+machine's libc**: a slooper built on Arch today demands `GLIBC_2.43` and
+dies on Debian 12 at exec with `version 'GLIBC_2.43' not found`. So the
+single tar.zst runs everywhere **only because it is built on the floor
+distro** — the oldest glibc we support (Ubuntu 22.04, glibc 2.35; Debian
+12 ships 2.36, every newer distro more). CI enforces this twice per
+release: the shipped exe's symbol demand is asserted against the floor,
+then the packaged exe is load-and-probe smoke-tested in Arch, Debian 12,
+Ubuntu 22.04 and Fedora containers (`WINDOWS-PORT.md` W13a/W13b). If you
+rebuild from source, your binary demands *your* distro's glibc — build on
+the oldest machine it must run on, or just use the release asset.
+
+What the release binary actually loads at exec (measured from the shipped
+artifact's `NEEDED` set), and the packages that satisfy it:
+
+| Load-time library | Satisfied by (Debian/Ubuntu · Fedora · Arch) |
+| --- | --- |
+| `libc`, `libm` (GLIBC ≥ 2.35) | base system, always present |
+| `libstdc++`, `libgcc_s` (plain `GLIBCXX_3.4` demand) | `libstdc++6` · `libstdc++` · base |
+| `libX11` | `libx11-6` · `libX11` · `libx11` |
+
+Everything else is **dlopen'd at runtime**, never a load-time dependency —
+the binary loads (and the smoke containers prove it with none of these
+installed):
+
+| dlopen'd | Needed for |
+| --- | --- |
+| `libjack.so` (the JACK API) | audio, in practice: install `pipewire-jack` or `jack2` — slooper never spawns a server itself |
+| Wayland client libs | native Wayland; without them the GUI uses X11/XWayland |
+| GL / EGL drivers | any display at all (software `llvmpipe` works — see `SLOOPER_GPU_GL`) |
 
 ## Any Linux distro — build from source
 
