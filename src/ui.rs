@@ -1327,6 +1327,12 @@ pub struct App {
     auto_rec: Vec<AutoRecState>,
     /// v29: per-track sources armed by the single REC button.
     rec_src: Vec<RecSrc>,
+    /// v52 R4: tracks joined to the RECORD GROUP, in JOIN ORDER (front =
+    /// oldest). The top-bar "REC GROUP" master arms/stops every member at
+    /// once; the loop ("l") selector is LINKED across members (a joining
+    /// track inherits the oldest member's value, a toggle mirrors to all),
+    /// every other selector stays per-track.
+    rec_group: Vec<usize>,
     /// v29 R7: per-project MIDI-to-value bindings (automation manager
     /// side rack). Session copy lives in config; the project file wins.
     value_binds: Vec<crate::config::ValueBind>,
@@ -1854,6 +1860,7 @@ impl App {
                     }
                 })
                 .collect(),
+            rec_group: Vec::new(),
             value_binds: cfg.value_binds.clone(),
             value_learning: None,
             vb_target: None,
@@ -14831,6 +14838,53 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     app.backend
                         .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
                 }
+                // v52 R4: RECORD GROUP master — one click arms every grouped
+                // track with its OWN ticked sources; while any member is
+                // recording it becomes STOP GROUP and bounces them together.
+                {
+                    let mem: Vec<usize> = app.rec_group.clone();
+                    let any_rec = mem
+                        .iter()
+                        .copied()
+                        .any(|j| rec_group_member_active(app, j));
+                    let glbl = if any_rec { "STOP GROUP" } else { "REC GROUP" };
+                    let g_btn = egui::Button::new(
+                        RichText::new(glbl)
+                            .color(if mem.is_empty() {
+                                Color32::from_gray(110)
+                            } else if any_rec {
+                                Color32::from_rgb(255, 90, 90)
+                            } else {
+                                Color32::from_rgb(220, 180, 120)
+                            })
+                            .strong()
+                            .small(),
+                    )
+                    .min_size(egui::vec2(84.0, 0.0));
+                    let g_resp = ui.add(g_btn).on_hover_text(format!(
+                        "Record group: {} track(s) joined (select them with \
+                         'grp' on their strips). Click arms every member at \
+                         once, each with its own ticked sources; while any \
+                         member records, this STOPs them all together.",
+                        mem.len()
+                    ));
+                    if g_resp.clicked() && !mem.is_empty() {
+                        for &j in mem.iter() {
+                            // Stop pass: only bounce the members that ARE
+                            // recording; an idle member must not get armed
+                            // by a STOP click.
+                            if any_rec && !rec_group_member_active(app, j) {
+                                continue;
+                            }
+                            app.toggle_record_all(j);
+                        }
+                        app.status = format!(
+                            "record group: {} track(s) {}",
+                            mem.len(),
+                            if any_rec { "stopped" } else { "armed" }
+                        );
+                    }
+                }
                 ui.label(RichText::new(pos_label(app)).monospace());
 
                 // ---- metronome / grid tempo ----
@@ -16114,6 +16168,13 @@ fn merge_host_hit(app: &App, pt: egui::Pos2, carried: usize) -> Option<usize> {
 /// main GUI.
 fn mixer_independent(app: &App) -> bool {
     !is_docked(app, 3) || dock_edge(app, 3) == 2
+}
+/// v52 R4: is ANY record source live on track `j` (audio take / MIDI take /
+/// write automation)? Shared by the record-group master's label + pass.
+fn rec_group_member_active(app: &App, j: usize) -> bool {
+    app.backend.engine.rec_state_of(j) == TR_REC
+        || app.midi_rec[j].armed
+        || app.auto_rec[j].armed
 }
 fn def_w(idx: usize) -> f32 {
     match idx {
@@ -19809,6 +19870,41 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         {
             app.toggle_record_all(t);
         }
+        // v52 R4: RECORD GROUP membership. Joined tracks are armed/stopped
+        // together by the top-bar master; the loop ("l") selector is LINKED
+        // across members — joining inherits the oldest member's value, a
+        // toggle on any member mirrors to all. The other selectors stay
+        // independent.
+        let mut grp = app.rec_group.contains(&t);
+        let grp_resp = ui
+            .checkbox(&mut grp, "grp")
+            .on_hover_text(
+                "Record group: joined tracks arm and stop TOGETHER from the \
+                 top-bar 'REC GROUP' button. The loop ('l') selector is shared \
+                 across members: joining inherits it from the first member, \
+                 toggling it mirrors to all. The other source selectors stay \
+                 per-track.",
+            );
+        if grp_resp.changed() {
+            if grp {
+                if let Some(old) = app.rec_group.first().copied() {
+                    app.rec_src[t].loop_rec = app.rec_src[old].loop_rec;
+                }
+                app.rec_group.push(t);
+                app.status = format!(
+                    "record group: track {} joins — {} track(s) selected",
+                    t + 1,
+                    app.rec_group.len()
+                );
+            } else {
+                app.rec_group.retain(|&j| j != t);
+                app.status = format!(
+                    "record group: track {} leaves — {} track(s) selected",
+                    t + 1,
+                    app.rec_group.len()
+                );
+            }
+        }
         let mut src = app.rec_src[t];
         let ac = ui
             .checkbox(&mut src.audio, "a")
@@ -19851,6 +19947,15 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             );
         if ac.changed() || pc.changed() || lc.changed() || mc.changed() || xc.changed() {
             app.rec_src[t] = src;
+            // v52 R4: loop ("l") is the LINKED selector — while several
+            // tracks are grouped, toggling it on one member sets it on all.
+            if lc.changed() && app.rec_group.len() > 1 && app.rec_group.contains(&t) {
+                for &j in app.rec_group.iter() {
+                    if j != t {
+                        app.rec_src[j].loop_rec = src.loop_rec;
+                    }
+                }
+            }
             app.save_config();
         }
         // v32: reserved slot — "on"↔"mute" must not move the strip.
@@ -41532,5 +41637,108 @@ mod tests {
             Some(0),
             "the cleared hit must follow in config.json"
         );
+    }
+
+    // ---- v52 R4: multi-track recording ----------------------------------
+
+    /// Two strips joined via real "grp" clicks; the top-bar "REC GROUP"
+    /// master arms BOTH members at once and flips to "STOP GROUP", which
+    /// bounces them together. (The audio take itself arms engine-side —
+    /// pinned in audio/mod.rs; NULL audio never drains the Cmd queue.)
+    #[test]
+    fn v52_rec_multi_select_master() {
+        let mut app = headless_app("v52rec1");
+        let ctx = egui::Context::default();
+        app.sample_rate = 48_000; // null audio never sends Evt::Ready
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.rec_src[0] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: true,
+            auto: false,
+        };
+        app.rec_src[1] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: true,
+            auto: false,
+        };
+        // Join tracks 1 and 2 with real strip clicks.
+        let g = galley_centers(&mut app, &ctx, "grp", true);
+        assert!(g.len() >= 2, "every strip carries a group checkbox");
+        click_pt(&mut app, &ctx, g[0]);
+        let g = galley_centers(&mut app, &ctx, "grp", true);
+        click_pt(&mut app, &ctx, g[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rec_group, vec![0, 1], "two tracks selected for recording");
+        // The master arms both at once.
+        click_last(&mut app, &ctx, "REC GROUP");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.midi_rec[0].armed && app.midi_rec[1].armed,
+            "one click must arm every member"
+        );
+        assert!(app.status.contains("armed"), "{}", app.status);
+        // While a member records, the master is STOP GROUP and stops all.
+        let s = galley_centers(&mut app, &ctx, "STOP GROUP", true);
+        assert!(!s.is_empty(), "master flips to STOP GROUP while recording");
+        click_pt(&mut app, &ctx, s[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.midi_rec[0].armed && !app.midi_rec[1].armed,
+            "one click must stop every member"
+        );
+    }
+
+    /// The loop ("l") selector is LINKED across members: joining inherits
+    /// the oldest member's value, and a toggle on any member mirrors to
+    /// all — while tracks OUTSIDE the group stay independent.
+    #[test]
+    fn v52_rec_loop_link_inherit() {
+        let mut app = headless_app("v52reclink");
+        let ctx = egui::Context::default();
+        app.sample_rate = 48_000;
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.rec_src[0].loop_rec = true;
+        let g = galley_centers(&mut app, &ctx, "grp", true);
+        click_pt(&mut app, &ctx, g[0]);
+        let g = galley_centers(&mut app, &ctx, "grp", true);
+        click_pt(&mut app, &ctx, g[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.rec_src[1].loop_rec,
+            "joining inherits the oldest member's loop value"
+        );
+        assert!(
+            !app.rec_src[2].loop_rec,
+            "a track outside the group never follows"
+        );
+        // Untick loop on the SECOND member -> mirrors to the first.
+        let ls = galley_centers(&mut app, &ctx, "l", true);
+        assert!(ls.len() >= 3, "one loop checkbox per strip");
+        click_pt(&mut app, &ctx, ls[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.rec_src[1].loop_rec, "unticked on the member itself");
+        assert!(!app.rec_src[0].loop_rec, "mirrored to every member");
+        // Re-tick from the OTHER member -> mirrors again.
+        let ls = galley_centers(&mut app, &ctx, "l", true);
+        click_pt(&mut app, &ctx, ls[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.rec_src[0].loop_rec && app.rec_src[1].loop_rec,
+            "loop re-ticked from one member mirrors to all"
+        );
+        // An independent selector (audio 'a') must NOT mirror: default mix
+        // is audio-ON, so unticking it on one member leaves the other ON.
+        assert!(app.rec_src[0].audio && app.rec_src[1].audio, "default mix: audio on");
+        let as_ = galley_centers(&mut app, &ctx, "a", true);
+        click_pt(&mut app, &ctx, as_[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.rec_src[0].audio, "member 0 keeps its audio tick");
+        assert!(!app.rec_src[1].audio, "audio is NOT the linked selector");
     }
 }
