@@ -23620,6 +23620,46 @@ mod tests {
         }
     }
 
+    /// W12f: pure option rule from the W12 spec — the "JACK (native)"
+    /// entry exists ONLY when the DLL was discovered (or is the already
+    /// saved choice, so a user can always navigate away from a stale one).
+    #[test]
+    fn w12f_backend_options_gate_the_jack_entry() {
+        let vals = |v: &str, f: bool| -> Vec<&'static str> {
+            backend_options(v, f).iter().map(|(k, _)| *k).collect()
+        };
+        assert_eq!(vals("auto", false), ["auto", "wasapi"], "no DLL, no JACK option");
+        assert_eq!(vals("auto", true), ["auto", "wasapi", "jack"]);
+        assert_eq!(vals("jack", false), ["auto", "wasapi", "jack"], "stale choice escapable");
+        // Linux discovery is a no-op — the stub must agree (selector and
+        // backend resolution read the same probe).
+        #[cfg(not(windows))]
+        assert!(
+            crate::audio::jack::dll::found().is_none(),
+            "Linux never discovers a jack DLL"
+        );
+    }
+
+    /// W12f (mirror of the W9 windows-only rule): the AUDIO BACKEND
+    /// section paints on Windows and NEVER on Linux — not even when the
+    /// saved choice says "jack" (the config value is Linux-inert).
+    #[test]
+    fn w12f_backend_section_is_windows_only() {
+        let mut app = headless_app("w12f-backend-sect");
+        let ctx = egui::Context::default();
+        app.show_binds = false;
+        app.show_midi = false;
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.win_backend = "jack".into();
+        let mut painted = || galley_centers(&mut app, &ctx, "AUDIO BACKEND", true);
+        if cfg!(windows) {
+            assert!(!painted().is_empty(), "Windows must paint the AUDIO BACKEND section");
+        } else {
+            assert!(painted().is_empty(), "the backend picker must never paint on Linux");
+        }
+    }
+
     /// The full user gesture: press a rack row, drag onto a track's lane
     /// strip, release -> a clip lands on that track (and Delete-selection
     /// is set). Then a right-click on the track header clears it again.

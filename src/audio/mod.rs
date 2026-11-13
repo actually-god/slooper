@@ -7528,13 +7528,23 @@ mod w5_tests {
     #[test]
     fn w5_backend_deps_are_cfg_gated() {
         let t = cargo_toml();
+        // Line-based truth: a `jack = ` SUBLITERAL also matches a COMMENTED
+        // `#jack = ` line — substring containment here is vacuously true
+        // (sabotage-proved). Require an actual, uncommented key line.
+        let live_key = |section: &str, key: &str| {
+            section
+                .lines()
+                .map(|l| l.trim())
+                .any(|l| l.starts_with(&format!("{key} =")) && !l.starts_with('#'))
+        };
         let lin = t
             .split("[target.'cfg(windows)'.dependencies]")
             .next()
             .unwrap();
         assert!(
-            lin.contains("[target.'cfg(not(windows))'.dependencies]") && lin.contains("jack = "),
-            "jack must live under the cfg(not(windows)) target table only"
+            lin.contains("[target.'cfg(not(windows))'.dependencies]")
+                && live_key(lin, "jack"),
+            "jack must stay in the cfg(not(windows)) target table"
         );
         assert!(
             !lin.contains("windows = {"),
@@ -7547,6 +7557,16 @@ mod w5_tests {
         assert!(
             win.contains("windows = {"),
             "windows crate missing from cfg(windows) table"
+        );
+        // W12f: jack is ALSO a Windows target dep — same crate/version,
+        // never linked (jack-sys dlopens at runtime; the exe must show no
+        // libjack import — proven by the W13b-style PE/NEEDED discipline).
+        assert!(
+            live_key(
+                win.split("[build-dependencies]").next().unwrap(),
+                "jack"
+            ),
+            "W12f: native JACK-on-Windows needs jack in the windows table"
         );
         assert!(win
             .split("[build-dependencies]")
@@ -7564,11 +7584,12 @@ mod w5_tests {
     #[test]
     fn w5_shared_module_has_no_backend_vocabulary() {
         let src = code(include_str!("mod.rs"));
-        // `jack::run` appears ONLY inside the cfg(not(windows)) run_backend.
+        // `jack::run` appears once per OS spawn point (W12f made the jack
+        // backend selectable on Windows too); wasapi stays Windows-only.
         assert_eq!(
             src.matches("jack::run").count(),
-            1,
-            "exactly one jack:: entry call (run_backend)"
+            2,
+            "one jack:: entry call per OS spawn point"
         );
         assert_eq!(src.matches("wasapi::run").count(), 1);
         for banned in ["use jack::", "jack_sys", "ProcessScope", "j::"] {
@@ -7577,11 +7598,9 @@ mod w5_tests {
                 "backend vocabulary `{banned}` migrated into mod.rs"
             );
         }
-        // and the OS modules are cfg-declared
-        assert!(
-            src.contains("#[cfg(not(windows))]\nmod jack;"),
-            "jack mod not cfg-gated"
-        );
+        // and the OS modules are cfg-declared: wasapi Windows-only, jack
+        // compiling on BOTH since W12f (runtime dlopen keeps it free)
+        assert!(src.contains("\npub mod jack;"), "jack mod must compile on both OSes (W12f)");
         assert!(
             src.contains("#[cfg(windows)]\nmod wasapi;"),
             "wasapi mod not cfg-gated"
@@ -7871,5 +7890,194 @@ mod w12a_tests {
         // the module itself is declared (needle split: this pin's text must
         // not self-match)
         assert!(include_str!("mod.rs").contains(concat!("mod rt_rec", "overy;")));
+    }
+}
+
+/// W12f structural + logic pins (WINDOWS-PORT): native JACK on Windows.
+/// Pure decision cores (backend resolution, DLL discovery path logic) run
+/// on EVERY OS; OS-gated pins run where they apply; source scans lock the
+/// dispatch shapes (same style as the w5 family).
+#[cfg(test)]
+mod w12f_tests {
+    fn code(src: &str) -> String {
+        let cut = src.find("\n#[cfg(test)]").unwrap_or(src.len());
+        src[..cut]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn w12f_resolve_backend_matrix() {
+        use super::resolve_backend;
+        use super::BackendKind::*;
+        // auto: native JACK iff discovered; else the shipped WASAPI.
+        assert_eq!(resolve_backend(None, "auto", true), Jack);
+        assert_eq!(resolve_backend(None, "auto", false), Wasapi);
+        // Explicit words win over discovery. Explicit "jack" WITHOUT a DLL
+        // stays Jack on purpose — jack::run then reports the missing DLL
+        // (Evt::Unavailable) instead of silently switching backends.
+        assert_eq!(resolve_backend(None, "jack", false), Jack);
+        assert_eq!(resolve_backend(None, "wasapi", true), Wasapi);
+        // Junk/empty cfg words behave like auto; case/whitespace tolerant.
+        assert_eq!(resolve_backend(None, "", true), Jack);
+        assert_eq!(resolve_backend(None, "nonsense", false), Wasapi);
+        assert_eq!(resolve_backend(None, " WASAPI ", false), Wasapi);
+        // Env beats config; a BLANK env means "not set", not "auto".
+        assert_eq!(resolve_backend(Some("wasapi"), "jack", true), Wasapi);
+        assert_eq!(resolve_backend(Some("JACK"), "wasapi", false), Jack);
+        assert_eq!(resolve_backend(Some("  "), "wasapi", true), Wasapi);
+    }
+
+    #[test]
+    fn w12f_dll_pick_prefers_override_then_dirs_then_requires_exact_name() {
+        use super::jack::dll::pick;
+        let root = std::env::temp_dir().join(format!("sp-w12f-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b, ov) = (root.join("pathA"), root.join("pathB"), root.join("custom"));
+        for d in [&a, &b, &ov] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(a.join("libjack64.dll"), b"x").unwrap();
+        std::fs::write(b.join("libjack64.dll"), b"x").unwrap();
+        std::fs::write(ov.join("libjack64.dll"), b"x").unwrap();
+        std::fs::write(ov.join("jack.dll"), b"x").unwrap();
+
+        // No override: first DIRECTORY in search order wins.
+        assert_eq!(
+            pick(None, &[a.clone(), b.clone()], "libjack64.dll").as_deref(),
+            Some(a.join("libjack64.dll").as_path())
+        );
+        // Override wins even while dirs also carry the DLL.
+        assert_eq!(
+            pick(Some(ov.join("libjack64.dll").as_path()), std::slice::from_ref(&a), "libjack64.dll")
+                .as_deref(),
+            Some(ov.join("libjack64.dll").as_path())
+        );
+        // A WRONG-NAME override is rejected (jack-sys dlopens the bare
+        // JACK_LIB name; an odd file name could never resolve back) and
+        // the scan proceeds normally...
+        assert_eq!(
+            pick(Some(ov.join("jack.dll").as_path()), std::slice::from_ref(&a), "libjack64.dll")
+                .as_deref(),
+            Some(a.join("libjack64.dll").as_path()),
+            "wrong-named override must not hijack the scan"
+        );
+        // ...which with no candidate dirs yields nothing.
+        assert_eq!(pick(Some(ov.join("jack.dll").as_path()), &[], "libjack64.dll"), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn w12f_jack_dirs_covers_installer_layouts_sorted() {
+        use super::jack::dll::jack_dirs_in;
+        let root = std::env::temp_dir().join(format!("sp-w12f-pf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["Jack", "Jack2", "jacktools", "NotJack"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("jackfile"), b"x").unwrap(); // jack*-NAMED FILE: not a dir
+
+        let dirs = jack_dirs_in(&root);
+        // Every Jack* DIR contributes itself + lib64 + bin + lib.
+        assert_eq!(dirs.len(), 4 * 3, "3 Jack* dirs x 4 candidates");
+        assert!(dirs.contains(&root.join("Jack").join("lib64")));
+        assert!(dirs.contains(&root.join("Jack2").join("bin")));
+        assert!(dirs.contains(&root.join("jacktools").join("lib")));
+        assert!(!dirs.iter().any(|d| d.starts_with(root.join("NotJack"))));
+        assert!(!dirs.iter().any(|d| d == &root.join("jackfile")));
+        // Deterministic: roots sorted (b before lower-case).
+        assert_eq!(dirs[0], root.join("Jack"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn w12f_backend_choice_shape_is_pinned_in_the_spawn_point() {
+        let src = code(include_str!("mod.rs"));
+        // Exactly two spawn points: Linux dispatches jack directly; the
+        // Windows twin resolves first and can reach BOTH backends.
+        assert_eq!(src.matches(concat!("fn run_", "backend")).count(), 2);
+        let first = src.find(concat!("fn run_", "backend")).unwrap();
+        let second = src[first + 1..].find(concat!("fn run_", "backend")).unwrap() + first + 1;
+        let body_at = |from: usize| {
+            let rest = &src[from..];
+            &rest[..rest.find("\n}").unwrap() + 2]
+        };
+        let lin = body_at(first);
+        assert!(lin.contains(concat!("jack::", "run")), "Linux still dispatches jack directly");
+        assert!(!lin.contains("resolve_backend"), "Linux resolves nothing (byte-inert)");
+        assert!(
+            !lin.contains(concat!("dll::fou", "nd")),
+            "Linux never consults DLL discovery"
+        );
+        let win = body_at(second);
+        assert!(win.contains("resolve_backend("), "Windows resolves the backend");
+        assert!(win.contains("SLOOPER_AUDIO_BACKEND"), "env override wired at spawn");
+        assert!(win.contains(concat!("jack::dll::", "found")), "discovery feeds the choice");
+        assert!(win.contains(concat!("jack::", "run")) && win.contains("wasapi::run"));
+    }
+
+    #[test]
+    fn w12f_windows_jack_run_guards_missing_dll_before_any_call() {
+        let jack = code(include_str!("jack.rs"));
+        let guard = jack
+            .find(concat!("if dll::found().is_none", "()"))
+            .expect("W12f missing-DLL guard absent from jack::run");
+        assert!(
+            jack[..guard].trim_end().ends_with("#[cfg(windows)]"),
+            "the guard must be Windows-only (Linux path byte-identical)"
+        );
+        let open = jack.find("Client::new(").expect("Client::new missing");
+        assert!(guard < open, "guard must precede the FIRST jack-sys entry");
+        let seg = &jack[guard..open];
+        assert!(seg.contains("Evt::Unavailable"), "missing DLL reports honestly, never panics");
+        assert!(seg.contains("SLOOPER_JACK_DLL"), "the hint names the override switch");
+    }
+
+    /// The jack-sys lazy loader panics when the bare name fails to load,
+    /// so discovery (NOT jack-sys) must be the first thing to touch the
+    /// DLL — pinned by construction: nothing in `dll` calls into the jack
+    /// crate except the `JACK_LIB` name constant.
+    #[test]
+    fn w12f_discovery_never_calls_into_jack_sys() {
+        let jack = code(include_str!("jack.rs"));
+        let dll = &jack[jack.find("pub mod dll {").expect("dll module missing")..];
+        assert!(!dll.contains("Client::new"), "discovery must not open JACK clients");
+        assert!(
+            !dll.contains("jack_client_open("),
+            "discovery must not CALL jack symbols, only look them up"
+        );
+    }
+
+    /// W12f (Windows CI): a file named like the jack lib that is not a PE
+    /// must fail validation and the discovery scan — the runner has no
+    /// jack, so the honest outcome is "no native JACK", WASAPI stays.
+    #[cfg(windows)]
+    #[test]
+    fn w12f_garbage_dll_is_rejected_not_loaded() {
+        use super::jack::dll::{discover, validate};
+        let root = std::env::temp_dir().join(format!("sp-w12f-junk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let junk = root.join(super::jack::dll::dll_name());
+        std::fs::write(&junk, b"not a PE image, certainly not jack").unwrap();
+        assert!(!validate(&junk), "a text file must not pass as a JACK lib");
+        assert!(
+            discover(Some(junk.as_os_str())).is_none(),
+            "an explicit garbage override must not be forced through"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Linux inertness: discovery is a no-op (JACK is THE backend), and
+    /// the Linux suite's `found()` stub agrees with the selector.
+    #[cfg(not(windows))]
+    #[test]
+    fn w12f_linux_discovery_is_a_noop() {
+        assert!(
+            super::jack::dll::found().is_none(),
+            "Linux never discovers anything — JACK is THE backend"
+        );
     }
 }

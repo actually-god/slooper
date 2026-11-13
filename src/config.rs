@@ -962,6 +962,24 @@ mod tests {
         assert_eq!(back.win_midi_inputs, cfg.win_midi_inputs, "round-trips verbatim");
     }
 
+    /// W12f: `win_audio_backend` is additive-safe — old configs default to
+    /// "auto" (native JACK when a DLL is found, else the shipped WASAPI),
+    /// and an explicit value round-trips verbatim (the picker writes exact
+    /// words; a mangling round trip would silently re-switch backends).
+    #[test]
+    fn w12f_win_audio_backend_defaults_auto_and_roundtrips() {
+        assert_eq!(Config::default().win_audio_backend, "auto");
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            legacy.win_audio_backend, "auto",
+            "old configs default to auto"
+        );
+        let cfg: Config = serde_json::from_str(r#"{"win_audio_backend":"jack"}"#).unwrap();
+        assert_eq!(cfg.win_audio_backend, "jack");
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.win_audio_backend, "jack", "round-trips verbatim");
+    }
+
     /// Restores `SLOOPER_CONFIG_DIR` and drops the sandbox even when an
     /// assertion panics mid-test (leaked config dirs poison every later
     /// test that calls `Config::load`).
