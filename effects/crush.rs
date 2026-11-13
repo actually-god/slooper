@@ -1,6 +1,6 @@
 // ============================================================ slooper ==
-// crush.rs — bit depth + sample-rate destruction. Covers FL Studio's
-// Fruity Squeeze (lo-fi digital distortion). See docs/FL-SUITE.md.
+// crush.rs — bit depth + sample-rate destruction (lo-fi digital
+// distortion).
 //
 // Signal: optional pre drive -> downsample (sample & hold) -> bit
 // quantize -> smoothing (recon filter approx) -> mix -> trim.

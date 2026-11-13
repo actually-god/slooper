@@ -316,7 +316,7 @@ impl Spectrum {
         }
     }
 
-    /// Feed interleaved stereo; keeps (L+R)/2 (Ableton-Spectrum "mono"
+    /// Feed interleaved stereo; keeps (L+R)/2 (the analyzer "mono"
     /// input) as the analyzer signal.
     pub fn push(&mut self, data: &[f32]) {
         for pair in data.as_chunks::<2>().0 {

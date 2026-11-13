@@ -1,12 +1,11 @@
 // ============================================================ slooper ==
-// phaser.rs — classic sweeping phaser. Covers FL Studio's Fruity Phaser
-// and the Vintage Phaser. See docs/FL-SUITE.md.
+// phaser.rs — classic sweeping phaser.
 //
 // N first-order all-pass sections cascaded, their corner frequencies
 // swept by one LFO; feedback from the output re-enters the chain, which
 // turns the notches into resonant peaks (the "6-stage" sound).
 //
-// TIER-5 (ABI v3): dual-path stereo phaser (the Vintage-Phaser job). The
+// TIER-5 (ABI v3): dual-path stereo phaser (the wide-sweep job). The
 // cascade runs TWICE over a shared-mid input; the R path's LFO is phase-
 // offset by `spread` (0..1 of a sweep cycle) so the two sides' notches
 // travel in opposite directions — a centre source decorrelates across
@@ -180,7 +179,7 @@ static PARAMS: [EffectParamV1; NPARAMS] = [
 ];
 
 const DESC_TEXT: &core::ffi::CStr =
-    c"All-pass sweep phaser, 1-12 stages, bipolar feedback for resonant peaks. The Fruity/Vintage Phaser role. ABI v3: dual-path stereo sweep (spread offsets the R path's LFO).";
+    c"All-pass sweep phaser, 1-12 stages, bipolar feedback for resonant peaks. ABI v3: dual-path stereo sweep (spread offsets the R path's LFO).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,

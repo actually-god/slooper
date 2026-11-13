@@ -1,15 +1,14 @@
 // ============================================================ slooper ==
-// vocoder.rs — 18-band vocoder. Covers FL Studio's Fruity Vocoder and
-// Vocodex (consolidated). See docs/FL-SUITE.md.
+// vocoder.rs — 18-band vocoder (the voice / robot-vocal classic).
 //
 // ABI v2 showcase: the audio THIS plugin sits on is the CARRIER (the
 // sound you hear), the track's sidechain feed is the MODULATOR (the
 // articulation — put the voice on another track and route it via the
 // mixer "sidechain in"). Each band's modulator envelope rides the same
 // band on the carrier; the band-sum is reshaped by `peakiness` — the
-// classic Vocodex "peak" knob.
+// the classic "peak" knob.
 //
-// ABI v3 (tier 5b): carrier decorrelation, the Vocodex stereo role. ONE
+// ABI v3 (tier 5b): carrier decorrelation, the stereo role. ONE
 // shared modulator envelope per band (so the articulation can never
 // wobble the image); the CARRIER runs a per-side biquad per band and
 // the two rails interleave the bands with opposite signs — L weights

@@ -1,7 +1,6 @@
 // ============================================================ slooper ==
-// limiter.rs — one box for the Fruity Limiter duties: single-band
-// compressor, transparent brickwall limiter, and noise gate. Also covers
-// the Emphasis mastering-limiter role. See docs/FL-SUITE.md.
+// limiter.rs — one box for the classic limiter duties: single-band
+// compressor, transparent brickwall limiter, and noise gate.
 //
 // mode 0 = compressor, 1 = limiter (hard, fast, soft-knee ceiling),
 // mode 2 = noise gate. Same envelope machinery drives all three.

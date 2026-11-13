@@ -1,9 +1,8 @@
 // ============================================================ slooper ==
-// spread.rs — stereo widener / image processor. Covers the FL Suite
-// stereo-image task: Fruity Stereo Shaper, Stereo Enhancer, Spreader and
-// the width half of PanOMatic live in one skeleton — a mid/side spreader
-// fed by a decorrelating delay (Haas), because every source upstream of a
-// slooper chain is MONO: "width" must be MANUFACTURED, not preserved.
+// spread.rs — stereo widener / image processor: a mid/side spreader
+// fed by a decorrelating delay (Haas), because every source upstream
+// of a slooper chain is MONO: "width" must be MANUFACTURED, not
+// preserved.
 // ABI v3 (first stock scripts — see effect_api.rs §ABI v3): the host
 // hands process_st a real pair and carries the emitted pair to the
 // track pan.
@@ -269,7 +268,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     name: c"stereo spread".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Haas-comb stereo widener with image rotation (Stereo Shaper / Stereo Enhancer / Spreader task). ABI v3: real L/R to the track pan.".as_ptr(),
+        c"Haas-comb stereo widener with image rotation. ABI v3: real L/R to the track pan.".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -282,7 +281,7 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     name: c"stereo spread".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Haas-comb stereo widener with image rotation (Stereo Shaper / Stereo Enhancer / Spreader task). ABI v3: real L/R to the track pan.".as_ptr(),
+        c"Haas-comb stereo widener with image rotation. ABI v3: real L/R to the track pan.".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -296,7 +295,7 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     name: c"stereo spread".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Haas-comb stereo widener with image rotation (Stereo Shaper / Stereo Enhancer / Spreader task). ABI v3: real L/R to the track pan.".as_ptr(),
+        c"Haas-comb stereo widener with image rotation. ABI v3: real L/R to the track pan.".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,

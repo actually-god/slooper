@@ -1,7 +1,6 @@
 // ============================================================ slooper ==
-// transient.rs — transient / sustain shaper. Covers FL Studio's Transient
-// Processor (and the spirit of the 2026 Transmitter split). See
-// docs/FL-SUITE.md.
+// transient.rs — transient / sustain shaper (attack punch vs body,
+// after the fact).
 //
 // A fast envelope vs a slow envelope tells onsets (transients) from body
 // (sustain); each side gets its own gain, crossfaded click-free. Boost

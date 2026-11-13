@@ -2,8 +2,8 @@
 // slooper-synth-version: 6
 // pluck.rs — Karplus-Strong plucked strings.
 //
-// Covers the FL Suite pluck task: Plucked! and Sakura are physical-
-// modeling string instruments; the classic extended Karplus-Strong loop
+// Physical-modeled string instruments reduce to the classic extended
+// Karplus-Strong loop
 // (fractional delay + loop damping + pick-position comb + body resonator)
 // gets you harp, guitar, koto and bass-pluck from six sliders. Strings
 // KEEP RINGING after note-off (real string behavior); all_off kills them.
@@ -237,7 +237,7 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
     name: c"pluck".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Karplus-Strong plucked strings (Plucked! / Sakura task): fractional delay loop, pick comb, body resonance. Strings ring through note-off.".as_ptr(),
+        c"Karplus-Strong plucked strings: fractional delay loop, pick comb, body resonance. Strings ring through note-off.".as_ptr(),
     n_params: 6,
     params: PARAMS.as_ptr(),
     create,

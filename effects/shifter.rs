@@ -1,6 +1,5 @@
 // ============================================================ slooper ==
-// shifter.rs — single-sideband frequency shifter. Covers FL Studio's
-// Frequency Shifter. See docs/FL-SUITE.md.
+// shifter.rs — single-sideband frequency shifter.
 //
 // Hilbert-transform SSB: two wideband all-pass chains give a 0/-90 degree
 // quadrature pair, complex-rotated by an internal oscillator. Unlike ring
@@ -8,8 +7,8 @@
 // inharmonic = the metallic/vinyl-vibrato character). Best tracking above
 // ~100 Hz — the classic trade of a 12th-order Hilbert.
 //
-// ABI v3 (tier 5b): TRUE STEREO per-side shifters, the FL Frequency
-// Shifter role. L runs `shift`, R runs `shift × (1 + spread)` with a
+// ABI v3 (tier 5b): TRUE STEREO per-side shifters. L runs `shift`,
+// R runs `shift × (1 + spread)` with a
 // fully independent Hilbert pair, oscillator and feedback loop — one
 // clock-less circuit per side, so a hard-panned input NEVER crosses to
 // the other rail. spread 0 makes the sides exact copies (bit-exact) and

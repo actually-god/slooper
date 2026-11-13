@@ -1,7 +1,6 @@
 // ============================================================ slooper ==
-// vfilter.rs — resonant state-variable filter with envelope "auto-wah".
-// Covers Fruity Filter (automation-optimized VCF), the single-filter core
-// of Fruity Love Philter, and Fruity Wah. See docs/FL-SUITE.md.
+// vfilter.rs — resonant state-variable filter with envelope "auto-wah"
+// (the automation-optimized VCF + wah role in one box).
 //
 // Chamberlin state-variable filter: one pole pair (12 dB/oct) or two in
 // cascade (24). LP / BP / HP / notch picked by mode. An envelope follower
@@ -214,7 +213,7 @@ static META: [ParamMetaV1; NPARAMS] = [
 ];
 
 static DESC_TXT: &core::ffi::CStr =
-    c"State-variable resonant filter: LP/BP/HP/notch, 12 or 24 dB/oct, drive, and an envelope follower for auto-wah. The Fruity Filter / Wah role.";
+    c"State-variable resonant filter: LP/BP/HP/notch, 12 or 24 dB/oct, drive, and an envelope follower for auto-wah.";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,

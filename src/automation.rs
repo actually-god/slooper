@@ -49,7 +49,7 @@ pub struct Node {
     pub t: i64,
     pub v: f32,
     /// v27: CURVATURE of the segment LEADING INTO this node (from the
-    /// previous one), one continuous value in −1..=1 like FL Studio's
+    /// previous one), one continuous value in −1..=1 — a continuous
     /// curvature dial instead of a mode menu:
     /// * `0`  — straight line,
     /// * `+`  — fast away from the previous node, SOFT ARRIVAL here

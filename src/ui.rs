@@ -238,7 +238,7 @@ struct MidiRecState {
     evs: Vec<(u64, u8, u8, u8, u8)>,
 }
 
-/// v0.11 R5: per-track write-automation recorder (FL's "write" mode).
+/// v0.11 R5: per-track write-automation recorder (the "write" mode).
 /// Arming one starts the transport; from then on, every move of a control
 /// is captured as curve nodes — the FIRST control moved owns the take, so
 /// one asset always automates exactly one target.
@@ -491,8 +491,8 @@ struct PianoRoll {
     /// Canvas rect painted last frame (screen space) — the wheel router
     /// claims ctrl/alt-wheel gestures only while the pointer is over it.
     canvas_rect: Option<egui::Rect>,
-    /// Velocity the next drawn note gets (FL carries a velocity knob in
-    /// the roll toolbar instead of hard-coding one).
+    /// Velocity the next drawn note gets (a carry-along knob in the
+    /// roll toolbar instead of a hard-coded one).
     new_vel: u8,
     /// Selected note indices into `pat.notes`. The vec is only ever
     /// REBUILT on selection gestures — `pat.sort()` runs at save only, so
@@ -791,7 +791,7 @@ pub fn target_search_box(ui: &mut egui::Ui, placeholder: &str) -> String {
 }
 
 /// One row of a track's mixer chain (ordered audio path). Scripted effects
-/// and hosted plugins are the same kind of slot — FL Studio's mixer model —
+/// and hosted plugins are the same kind of slot — the classic mixer-chain model —
 /// so a plugin can sit anywhere in the chain and a track can host as many
 /// as the user likes.
 pub enum ChainRow {
@@ -1010,7 +1010,7 @@ pub struct App {
     /// v47 R1: tab rects painted by `docked_head` THIS frame as
     /// `(window idx, rect)`. The carry/tap/double-click passes map a
     /// pointer over a tab strip onto the exact member (dragging a tab
-    /// pulls THAT window out, VSCode/FL muscle memory), because a tab
+    /// pulls THAT window out, the docked-editor muscle memory), because a tab
     /// group's shared header rect cannot tell its members apart.
     tab_rects: Vec<(usize, [f32; 4])>,
     /// v47 R2: named window-layout templates (persisted) and the
@@ -1179,7 +1179,7 @@ pub struct App {
     rack_group_by_dir: bool,
     /// v29: rename dialog: (asset file path, draft stem, focus-once).
     rack_rename: Option<(String, String, bool)>,
-    /// v50 R1: per-asset "Edit sample" settings (FL sample-window style),
+    /// v50 R1: per-asset "Edit sample" settings (sample-window style),
     /// keyed by asset file path, saved with the project.
     sample_edits: std::collections::BTreeMap<String, SampleEdit>,
     /// Pristine (pre-edit) audio per edited asset path; the render always
@@ -2614,7 +2614,7 @@ impl App {
     }
 
     /// Append a script effect to track `i`'s chain (duplicates allowed —
-    /// FL lets the same effect sit in two slots).
+    /// the host lets the same effect sit in two slots).
     fn add_fx_script(&mut self, i: usize, stem: &str) {
         self.fx_rows[i].push(ChainRow::Script {
             stem: stem.to_string(),
@@ -5056,7 +5056,7 @@ impl App {
                 ui.label("Edits apply live, are saved with the project, and never touch the source file.");
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut ed.reverse, "reverse")
-                        .on_hover_text("FL Studio: reverse sample");
+                        .on_hover_text("play the sample backwards");
                     ui.checkbox(&mut ed.pingpong, "ping-pong")
                         .on_hover_text("play forward, then the mirror, back-to-back");
                 });
@@ -5069,7 +5069,7 @@ impl App {
                             .speed(5.0)
                             .suffix(" ct"),
                     )
-                        .on_hover_text("coarse+fine pitch in cents (Simpler: pitch)");
+                        .on_hover_text("coarse+fine pitch in cents");
                     ui.label("stretch");
                     ui.add(
                         egui::Slider::new(&mut ed.stretch, 0.25..=4.0)
@@ -5078,7 +5078,7 @@ impl App {
                             .custom_formatter(|v, _| format!("{v:.2}")),
                     );
                     ui.checkbox(&mut ed.preserve_pitch, "keep pitch")
-                        .on_hover_text("on: WSOLA time stretch (FL hardware stretch); off: resample (pitch rides)");
+                        .on_hover_text("on: WSOLA time stretch (pitch preserved); off: resample (pitch rides)");
                 });
                 ui.horizontal(|ui| {
                     ui.label("bend start");
@@ -5095,7 +5095,7 @@ impl App {
                             .speed(5.0)
                             .suffix(" ct"),
                     )
-                        .on_hover_text("linear pitch sweep across the clip (Ableton pitch envelope)");
+                        .on_hover_text("linear pitch sweep across the clip (pitch-bend envelope)");
                 });
                 ui.separator();
                 let fade_ui = |ui: &mut egui::Ui, label: &str, ms: &mut f32, c: &mut SeCurve| {
@@ -6036,8 +6036,8 @@ impl App {
     }
 
     /// v29 R5: stamp the pattern into the arrangement at the playhead:
-    /// one-shot clips per hit, one lane per pad (like FPC bouncing a
-    /// beat). Clip gain carries the per-hit velocity. v30 R1: the pad
+    /// one-shot clips per hit, one lane per pad (bouncing a beat to
+    /// the arrangement). Clip gain carries the per-hit velocity. v30 R1: the pad
     /// SOUNDS come from the target track's kit.
     fn drum_commit(&mut self) {
         self.drum_resolve();
@@ -6734,7 +6734,7 @@ impl App {
     }
 
     /// v39: MASTER OUT — the pro master section, mirroring the meter
-    /// strips of FL Studio / Ableton Live's master chain: master volume
+    /// strips of a pro master chain: master volume
     /// control, vertical L/R meters with peak hold + clip LED, live
     /// BS.1770-4 loudness numbers (M/S/I/LRA), and a spectrum viewer.
     /// A dynamic (dockable) window; default docks right next to the MIXER.
@@ -6852,7 +6852,7 @@ impl App {
                 });
             });
             ui.separator();
-            // ---- vertical stereo meters (FL/Ableton master-strip look) ----
+            // ---- vertical stereo meters (console master-strip look) ----
             let (mrect, _) = ui.allocate_exact_size(egui::vec2(58.0, meter_h), Sense::hover());
             let (l_amp, r_amp) = match self.meter_state.as_ref() {
                 Some(ms) => (ms.l_peak, ms.r_peak),
@@ -7518,7 +7518,7 @@ impl App {
             egui::Stroke::new(1.0, Color32::from_gray(60)),
             egui::StrokeKind::Inside,
         );
-        // grid with ABSOLUTE value labels (the FL difference)
+        // grid with ABSOLUTE value labels (the absolute-mode difference)
         if bars_mode {
             // v26: metronome grid \u{b7} minor line per beat, major
             // line + 1-based bar number per bar. Sub-beat spacing
@@ -7820,7 +7820,7 @@ impl App {
                     ed.changed = true;
                 }
                 // v27: one CONTINUOUS curvature for the segment
-                // arriving at this node (FL Studio's dial) replaces
+                // arriving at this node replaces
                 // the old four-mode dropdown.
                 let mut cc = n.c;
                 let before = cc;
@@ -8935,7 +8935,7 @@ impl App {
             // vertical = two rows per notch (pitch scroll).
             roll.scroll_sec = (roll.scroll_sec - wheel_dx as f64 * 0.25 * sec_per_beat).max(0.0);
         }
-        // v38 R5: wheel over a NOTE is a FL-style velocity trim (handled
+        // v38 R5: wheel over a NOTE is a velocity trim (handled
         // above; it consumes the wheel). Geometry mirrors roll_inner's
         // (scrollbar 10 px, key strip 58 px) — the row/second math must
         // stay identical to the hit test a PRESS uses.
@@ -9240,7 +9240,7 @@ impl App {
     ) {
         // ---- toolbar ----
         ui.horizontal(|ui| {
-                    // FL-style routing: pick the TRACK whose instrument AND
+                    // DAW-style routing: pick the TRACK whose instrument AND
                     // mixer chain previews this pattern.
                     ui.label("preview:");
                     let cur_label = match self.preview_track {
@@ -9740,7 +9740,7 @@ impl App {
                                 nm = note_name(roll.pat.notes[idx].note)
                             );
                         } else {
-                            // Body press: FL selection semantics.
+                            // Body press: classic selection semantics.
                             if mods.command {
                                 match roll.sel_notes.iter().position(|x| *x == idx) {
                                     Some(p) => {
@@ -9861,7 +9861,7 @@ impl App {
                             let row = (row_at(pt.y).clamp(0, 127)) as u8;
                             if fresh {
                                 // Fresh draw: the tail follows the
-                                // pointer (FL stretch-draw).
+                                // pointer (stretch-draw).
                                 let note = &mut roll.pat.notes[idx];
                                 let tail = tick_of(snap_up(sec));
                                 note.len = tail.saturating_sub(note.start).max(min_len_ticks);
@@ -14847,7 +14847,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     if ui
                         .button("Drums")
                         .on_hover_text(
-                            "Drum machine / pattern builder (FL-FPC style): pads = \
+                            "Drum machine / pattern builder: pads = \
                          impulse sounds, grid = velocity per step. Commit \
                          stamps the pattern into the arrangement.",
                         )
@@ -14858,8 +14858,8 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     // v43 R4: the window navigation hub. Everything the GUI
                     // shows is listed here with a live checkmark, plus the
                     // layout actions — no more hunting through Settings to
-                    // find where a window went (Septabee/Ableton keep one
-                    // View/Window menu for exactly this reason).
+                    // find where a window went (a single
+                    // View/Window menu exists for exactly this reason).
                     let wresp = ui
                         .button("Windows")
                         .on_hover_text("Show / hide / re-dock any window; layout actions.");
@@ -14912,7 +14912,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             }
                             if ui
                                 .checkbox(&mut app.show_drums, "drum machine")
-                                .on_hover_text("Pattern builder (FL-FPC style pads + grid).")
+                                .on_hover_text("Pattern builder (pads + velocity grid).")
                                 .changed()
                             {
                                 app.save_config();
@@ -14939,7 +14939,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             }
                             ui.separator();
                             // v47 R2: layout templates — capture this exact view,
-                            // switch back with one click (Ableton view templates).
+                            // switch back with one click (view templates).
                             ui.label(RichText::new("layout templates").weak());
                             ui.horizontal(|ui| {
                                 ui.add(
@@ -15930,7 +15930,7 @@ fn dock_order(app: &App, idx: usize) -> i16 {
 
 // ---- v47 R1: tab groups ---------------------------------------------------
 // Docked windows sharing (edge, order) form ONE tab group: a single slot
-// with a tab strip in its header (FL-Studio-21 / VSCode model). Exactly one
+// with a tab strip in its header (the docked-editor model). Exactly one
 // member keeps the persisted active flag — its body is the one painted.
 fn get_tab_act(app: &App, idx: usize) -> bool {
     if idx < 4 {
@@ -16416,7 +16416,7 @@ fn reset_window_layout(app: &mut App) {
 // ---- v47 R2: named window-layout templates --------------------------------
 /// Capture the ENTIRE arrangement — all float rects, dock slots, tab
 /// groups and visibility (primaries live inside `side_wins`) — into a
-/// named template (Ableton "view template"). Re-capturing a name replaces.
+/// named view template. Re-capturing a name replaces.
 fn capture_win_layout(app: &mut App, name: String) {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -16544,7 +16544,7 @@ fn undock_to(app: &mut App, idx: usize, at: [f32; 2]) {
 /// two click-gestures the header answers with besides dragging:
 /// RIGHT-press opens the slot menu (floating windows — docked headers
 /// already carry an egui context menu on their title), and a DOUBLE-click
-/// toggles docked <-> floating (the VSCode/Ableton muscle memory).
+/// toggles docked <-> floating (the standard docked-editor muscle memory).
 fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
     /// The title-bar band of a visible window (docked or floating), if
     /// `pt` is on it. Top-down so the visually topmost header wins.
@@ -19367,7 +19367,7 @@ fn master_volume_controls(ui: &mut egui::Ui, app: &mut App) {
     }
 }
 
-/// v39: vertical L/R master meters in the FL/Ableton idiom — dB scale
+/// v39: vertical L/R master meters in the console idiom — dB scale
 /// −60…+6, green/yellow/red bands, white peak-hold lines, red clip LED.
 fn paint_stereo_meters(
     ui: &mut egui::Ui,
@@ -19454,7 +19454,7 @@ fn paint_stereo_meters(
     }
 }
 
-/// v39/v49 R3: real-time spectrum viewer (Ableton-Spectrum style): log
+/// v39/v49 R3: real-time spectrum viewer: log
 /// frequency 30 Hz…20 kHz, −120…0 dBFS. The 4096 analyzer bins are
 /// reduced to ONE column per horizontal pixel (max-hold across the bins
 /// that land in it), so the trace uses every pixel of the panel at any
@@ -20771,7 +20771,7 @@ const RULER_HANDLE_HIT: f32 = 8.0;
 /// or drag anywhere here to move the global playhead. Pinned above the track
 /// scroll so it is always visible; shares its x window with the lane strips.
 /// v35 R3: skip-to-start / skip-to-end button with a vector glyph (a bar
-/// plus a filled triangle, FL-style). No font-glyph dependency — the skip
+/// plus a filled triangle). No font-glyph dependency — the skip
 /// characters tofu in the default font.
 fn skip_button(ui: &mut egui::Ui, to_start: bool) -> egui::Response {
     let (r, resp) = ui.allocate_at_least(egui::vec2(22.0, 19.0), egui::Sense::click());
@@ -22283,7 +22283,7 @@ fn draw_asset_clip(
 ) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, fill.linear_multiply(0.45));
-    // MIDI clips preview as an approximate piano roll (FL-style): every
+    // MIDI clips preview as an approximate piano roll: every
     // note is a small bar; pitch maps to the clip's vertical extent.
     if let Some(pat) = app
         .assets
@@ -23144,7 +23144,7 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
 }
 
 /// The unified per-track mixer chain window. Scripted effects and hosted
-/// VST plugins are one ordered slot list (FL Studio's mixer model): a
+/// VST plugins are one ordered slot list (the mixer-chain model): a
 /// plugin can sit anywhere in the chain, in any number. Each row opens its
 /// own controls; "Add" popups pull from the script folder and the plugin
 /// scan; rejected scripts and the plugin folder manager sit below.
@@ -26988,7 +26988,7 @@ mod tests {
         );
         let n_notes = app.piano_roll.as_ref().unwrap().pat.notes.len();
         assert_eq!(n_notes, 1, "drag draws exactly one note");
-        // Fresh draw stretches the note to the pointer (FL-style).
+        // Fresh draw stretches the note to the pointer.
         assert!(
             app.piano_roll.as_ref().unwrap().pat.notes[0].len > 0,
             "drawn note has length"
@@ -27281,7 +27281,7 @@ mod tests {
         );
     }
 
-    /// v38 R5: wheel over a note trims its velocity (FL-style, no
+    /// v38 R5: wheel over a note trims its velocity (no
     /// modifier), the selected group together, and the status confirms.
     #[test]
     fn v38_roll_wheel_over_note_trims_velocity() {
@@ -29387,7 +29387,7 @@ mod tests {
         );
         // v38: RELEASE ⌘ before the group drag. egui keeps modifiers set
         // by events until told otherwise, and the v38 press-edge gate
-        // (correctly) treats a HELD ⌘ on press as the FL deselect
+        // (correctly) treats a HELD ⌘ on press as the classic deselect
         // toggle — once per press, not once per frame like the old
         // level-gated one. A real user lifts the key between Ctrl+A and
         // the drag; the harness must too.
@@ -32716,10 +32716,10 @@ mod tests {
         assert_eq!(ed.host, Some(0));
     }
 
-    /// FL-suite tier 3: the chain window badges an ABI-v3 stereo script
+    /// Native-suite tier 3: the chain window badges an ABI-v3 stereo script
     /// ("fx:st"), and it instantiates through the stock scripted-add path.
     #[test]
-    fn flsuite_chain_window_tags_stereo_script() {
+    fn suite_chain_window_tags_stereo_script() {
         let mut app = headless_app("v40sttag");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
@@ -32751,8 +32751,8 @@ mod tests {
         assert!(comp, "compressor stays a mono (v1) script");
         assert!(app.fx_rows[0].len() == 2, "both scripts live in the chain");
         // Tier 4: the chorus joined the v3 stereo world (per-side tap
-        // banks, Hyper Chorus task) — this pin used to assert it was the
-        // mono counterexample; the roster in docs/FL-SUITE.md is the
+        // banks, wide-ensemble task) — this pin used to assert it was the
+        // mono counterexample; the roster in docs/EFFECT-SUITE.md is the
         // authority for who carries (ST).
         app.add_fx_script(0, "chorus");
         frame(&mut app, &ctx, vec![]);
@@ -40631,7 +40631,7 @@ mod tests {
         assert_eq!(crate::paths::data_dir(), want);
     }
 
-    // ---- v50 R1: "Edit sample" (FL Studio sample window) -------------------
+    // ---- v50 R1: "Edit sample" (sample properties window) ----------------
 
     #[test]
     fn v50_edit_sample_menu_render_and_persist() {

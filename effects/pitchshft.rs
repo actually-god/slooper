@@ -1,7 +1,5 @@
 // ============================================================ slooper ==
 // pitchshft.rs — pitch shifter, chromatic corrector and tuner meter.
-// Covers FL Studio's Pitch Shifter / Pitcher / Tuner tasks. See
-// docs/FL-SUITE.md.
 //
 // Three modes on one engine:
 //   0 SHIFT    — fixed interval shift (semitones + fine cents).
@@ -14,8 +12,8 @@
 // taps a half LFO period apart cross-faded sin^2/cos^2 so the sum stays
 // unity while each tap's read position slides at (ratio-1) samples per
 // sample. A YIN detector (decimated x8, so it costs ~8 MAC/sample)
-// supplies the correction target and the GUI atomics. As in all FL
-// shifters, monophonic sources track best.
+// supplies the correction target and the GUI atomics. As in any
+// pitch shifter, monophonic sources track best.
 //
 // ABI v3 (tier 5b): TWO delay lines, ONE modulation clock. The R rail
 // reads the same saw phase `spread × 0.5` periods further along (one

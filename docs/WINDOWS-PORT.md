@@ -1,6 +1,7 @@
 # WINDOWS-PORT.md — Windows compatibility program
 
-> Living task ledger, one task per cron session. Same protocol as FL-SUITE.md:
+> Living task ledger, one task per cron session. Same protocol as the
+> native-suite ledger:
 > work one task at a time, tick it, append a one-paragraph DONE note with the
 > commit sha, update STATUS. Linux is the PRIMARY OS: no task may regress the
 > Linux build, the JACK engine, yabridge/WINE hosting, the X11 editor path, or

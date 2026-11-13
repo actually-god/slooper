@@ -118,23 +118,23 @@ pub const EXAMPLES: &[(&str, &str)] = &[
         "sidechain_comp.rs",
         include_str!("../effects/sidechain_comp.rs"),
     ),
-    // FL Studio suite tier 1 (docs/FL-SUITE.md), added 2026-11-05.
+    // Native suite tier 1 (docs/EFFECT-SUITE.md), added 2026-11-05.
     ("overdrive.rs", include_str!("../effects/overdrive.rs")),
     ("waveshaper.rs", include_str!("../effects/waveshaper.rs")),
     ("crush.rs", include_str!("../effects/crush.rs")),
-    ("goodizer.rs", include_str!("../effects/goodizer.rs")),
+    ("enhancer.rs", include_str!("../effects/enhancer.rs")),
     ("limiter.rs", include_str!("../effects/limiter.rs")),
     ("multiband.rs", include_str!("../effects/multiband.rs")),
     ("vfilter.rs", include_str!("../effects/vfilter.rs")),
     ("phaser.rs", include_str!("../effects/phaser.rs")),
     ("flanger.rs", include_str!("../effects/flanger.rs")),
     ("gater.rs", include_str!("../effects/gater.rs")),
-    ("echo3.rs", include_str!("../effects/echo3.rs")),
+    ("delay.rs", include_str!("../effects/delay.rs")),
     ("shifter.rs", include_str!("../effects/shifter.rs")),
     ("transient.rs", include_str!("../effects/transient.rs")),
     ("pitchshft.rs", include_str!("../effects/pitchshft.rs")),
     ("spread.rs", include_str!("../effects/spread.rs")),
-    ("panmatic.rs", include_str!("../effects/panmatic.rs")),
+    ("autopan.rs", include_str!("../effects/autopan.rs")),
     ("vocoder.rs", include_str!("../effects/vocoder.rs")),
     ("convolver.rs", include_str!("../effects/convolver.rs")),
 ];
@@ -2086,7 +2086,7 @@ mod tests {
             reg.gui("template").is_none(),
             "template keeps the auto slider window"
         );
-        // FL-suite tier: the waveshaper carries the draggable-curve GUI,
+        // Native-suite tier: the waveshaper carries the draggable-curve GUI,
         // and the vocoder ships the full v1/v2/v3 export quartet (tier-5b
         // stereo). v3 flag semantics (tier-3b): `sidechain` is EXACT-v2
         // only — a v3 script reads the key through the `sc` argument of
@@ -3490,8 +3490,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
 
     #[test]
     fn bundled_effects_produce_sound() {
-        // Headless "did it actually change audio" gate for the FL-suite
-        // tier (docs/FL-SUITE.md): every bundled effect runs a fixed
+        // Headless "did it actually change audio" gate for the native-suite
+        // tier (docs/EFFECT-SUITE.md): every bundled effect runs a fixed
         // fixture (tone + percussive bursts) through the REAL loader as a
         // private instance at default params. Output must stay finite and
         // in range, and must not be silent — the compile+load tests prove
@@ -3604,18 +3604,18 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         }
         assert!(
             st_checked >= 11,
-            "expected the v3 spread/panmatic/chorus/echo3/space_echo/phaser/flanger/shifter/gater/vocoder/pitchshft to load as stereo, got {st_checked}"
+            "expected the v3 spread/autopan/chorus/delay/space_echo/phaser/flanger/shifter/gater/vocoder/pitchshft to load as stereo, got {st_checked}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Tier-4 regression (docs/FL-SUITE.md rework log): tier-1 echo3 and
+    /// Tier-4 regression (docs/EFFECT-SUITE.md rework log): tier-1 delay and
     /// flanger `read_lin` indexed the ring at ABSOLUTE slots, and the
     /// chorus feedback chased its own filter state — all three compiled,
     /// loaded and passed the non-silence gate while producing NO usable
     /// delay/feedback (an impulse came out as dry + a faint smear; RMS
     /// gates are blind to a starved feedback loop). This pin feeds an
-    /// impulse / noise burst and demands real echo structure: echo3
+    /// impulse / noise burst and demands real echo structure: delay
     /// places discrete echoes with the right decay ratio at its default
     /// 320 ms, the chorus feedback sustains the tail long after the
     /// input is gone, the flanger comb rings, and the ping-pong right
@@ -3634,8 +3634,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let sr = 48000.0f64;
         let n = (sr * 1.25) as usize;
 
-        // ---- echo3: the default 320 ms slider = real decaying echoes ----
-        let inst = reg.create_instance("echo3", sr, &[]).expect("echo3 inst");
+        // ---- delay: the default 320 ms slider = real decaying echoes ----
+        let inst = reg.create_instance("delay", sr, &[]).expect("delay inst");
         let mut y = Vec::with_capacity(n);
         for i in 0..n {
             y.push(inst.process_private(if i == 100 { 1.0 } else { 0.0 }));
@@ -3649,24 +3649,24 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let t = 0.32 * sr; // default time = 320 ms
         let e1 = win_peak(t - 500.0, t + 500.0, &y);
         let e2 = win_peak(2.0 * t - 500.0, 2.0 * t + 500.0, &y);
-        assert!(dry > 0.5, "echo3 dry click missing ({dry})");
+        assert!(dry > 0.5, "delay dry click missing ({dry})");
         assert!(
             e1 > dry * 0.15 && e1 < dry * 0.6,
-            "echo3 echo1 not at the 320 ms default (peak {e1}, dry {dry})"
+            "delay echo1 not at the 320 ms default (peak {e1}, dry {dry})"
         );
         let ratio = e2 / e1.max(1e-6);
         assert!(
             ratio > 0.25 && ratio < 0.85,
-            "echo3 echo2/echo1 ratio {ratio} off the 0.55-feedback decay"
+            "delay echo2/echo1 ratio {ratio} off the 0.55-feedback decay"
         );
         drop(inst);
 
-        // ---- echo3 ping-pong (v3): the R echo lags pp * 320 ms --------
+        // ---- delay ping-pong (v3): the R echo lags pp * 320 ms --------
         let inst = reg
-            .create_instance("echo3", sr, &[])
-            .expect("echo3 st inst");
+            .create_instance("delay", sr, &[])
+            .expect("delay st inst");
         let mut dp = [0.0f32; MAX_PARAMS];
-        for (k, pd) in reg.desc("echo3").unwrap().params.iter().enumerate() {
+        for (k, pd) in reg.desc("delay").unwrap().params.iter().enumerate() {
             dp[k] = pd.default;
         }
         let (mut yl, mut yr) = (Vec::new(), Vec::new());
@@ -3769,8 +3769,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FL Suite tier 5 pins (docs/FL-SUITE.md): space_echo went ABI-v3
-    /// STEREO (Reeverb 2 / LuxeVerb task). Impulse-STRUCTURE shape per the
+    /// Native Suite tier 5 pins (docs/EFFECT-SUITE.md): space_echo went ABI-v3
+    /// STEREO (algorithmic-room task). Impulse-STRUCTURE shape per the
     /// tier-4 rule — energy gates are blind to dead loops, and here they
     /// would ALSO be blind to a fake "stereo" that is just the same mono
     /// tail twice. Asserts (mono feed l == r so every difference is the
@@ -4030,8 +4030,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FL Suite tier 5 candidate #2 (docs/FL-SUITE.md): phaser and flanger
-    /// upgraded to ABI-v3 stereo (Vintage-Phaser dual path / shared comb
+    /// Native Suite tier 5 candidate #2 (docs/EFFECT-SUITE.md): phaser and flanger
+    /// upgraded to ABI-v3 stereo (dual-path vintage sweep / shared comb
     /// with opposite-sweep sides). STRUCTURE pins per the tier-4 rule —
     /// an energy gate cannot tell a real stereo script from one mono
     /// signal played twice:
@@ -4179,7 +4179,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FL Suite tier 5b (docs/FL-SUITE.md): shifter / gater / pitchshft /
+    /// Native Suite tier 5b (docs/EFFECT-SUITE.md): shifter / gater / pitchshft /
     /// vocoder upgraded to ABI-v3 stereo. STRUCTURE pins per the tier-4
     /// rule (energy gates cannot tell a real stereo script from one mono
     /// signal played twice). Measured probe values (2026-11-07): decor
@@ -4488,7 +4488,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FL Suite tier 6 CAPABILITY PIN (docs/FL-SUITE.md: param metadata +
+    /// Native Suite tier 6 CAPABILITY PIN (docs/EFFECT-SUITE.md: param metadata +
     /// host sync): v4 param meta surfaces host-side as enum pickers and
     /// engineering units, and `host = song` locks a script's wheel to the
     /// transport push — sample-exact against BPM, jumping on seeks, held
@@ -4546,8 +4546,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             "graceful process_sc must not read as sidechain"
         );
         assert!(
-            reg.desc("panmatic").unwrap().stereo,
-            "panmatic declares true stereo"
+            reg.desc("autopan").unwrap().stereo,
+            "autopan declares true stereo"
         );
 
         // ---- host = song locks the wheel ----------------------------------
@@ -4633,7 +4633,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FL Suite tier 2 CAPABILITY PIN (docs/FL-SUITE.md: folder file
+    /// Native Suite tier 2 CAPABILITY PIN (docs/EFFECT-SUITE.md: folder file
     /// scan): the convolver must load `.wav` impulses from the impulses
     /// folder and the `ir` slider must select them. A delta IR has to
     /// reproduce its input as a one-hop-delayed single blip with NO tail

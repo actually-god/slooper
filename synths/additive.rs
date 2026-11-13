@@ -2,16 +2,16 @@
 // slooper-synth-version: 6
 // additive.rs — harmonic partial bank with two morphable spectra.
 //
-// Covers the FL Suite additive task: Harmor / Morphine / Ogun / Harmless
-// all live in the same skeleton — a bank of sine partials at integer
-// multiples of the fundamental, a spectral level profile over the bank,
-// and (Morphine's signature) a real-time morph between TWO profiles.
+// The additive/harmonic synth family lives in one skeleton — a bank
+// of sine partials at integer multiples of the fundamental, a spectral
+// level profile over the bank, and a real-time morph between TWO
+// profiles.
 // Profile A and B are parameter-generated — tilt (harmonic rolloff) and
 // even/odd balance each — and the morph slider cross-fades the partial
 // levels continuously while a note plays. A formant bell adds vowel-ish
 // resonances, and a decay tilt makes high partials die faster than low
-// ones — the single biggest "acoustic brightness bloom" cue in Harmor
-// presets (pluck-like at 1, organ-like at 0).
+// ones — the single biggest "acoustic brightness bloom" cue (pluck-
+// like at 1, organ-like at 0).
 //
 // Params:
 //   gain        — output trim
@@ -299,7 +299,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 + profile_at(k, tilt_b, odd_b) * morph as f32;
             if form_amt > 0.001 && form_hz > 1.0 {
                 // Gaussian formant bell; profile-space reference pitch is
-                // A4 so the bell sits at a fixed frequency like Harmor's.
+                // A4 so the bell sits at a fixed reference frequency.
                 let f = k as f64 * 440.0;
                 let w = (form_hz / 3.0).max(40.0);
                 let d = (f - form_hz) / w;
@@ -450,7 +450,7 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
     name: c"additive".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Harmonic partial bank with two morphable spectra, formant bell and per-partial decay tilt (Harmor / Morphine / Ogun / Harmless task). Organ, strings, vocal pads, brass bloom.".as_ptr(),
+        c"Harmonic partial bank with two morphable spectra, formant bell and per-partial decay tilt. Organ, strings, vocal pads, brass bloom.".as_ptr(),
     n_params: 16,
     params: PARAMS.as_ptr(),
     create,

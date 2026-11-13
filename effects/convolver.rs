@@ -1,7 +1,7 @@
 // ============================================================ slooper ==
-// convolver.rs — convolution reverb (FL Studio Fruity Convolver task).
+// convolver.rs — convolution reverb.
 //
-// Capability: fixed-folder impulse scan (docs/FL-SUITE.md capability log).
+// Capability: fixed-folder impulse scan (docs/EFFECT-SUITE.md capability log).
 // Any .wav file dropped into the impulses folder becomes an IR:
 //
 //     $SLOOPER_IMPULSES_DIR   (env override, tests/dev)
@@ -550,7 +550,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     name: c"convolver".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Convolution reverb (Fruity Convolver task). Drop .wav impulses into ~/.local/share/slooper/impulses - index 0 is a built-in hall. Editor lists what loaded.".as_ptr(),
+        c"Convolution reverb. Drop .wav impulses into ~/.local/share/slooper/impulses - index 0 is a built-in hall. Editor lists what loaded.".as_ptr(),
     n_params: 4,
     params: PARAMS.as_ptr(),
     create,

@@ -1,7 +1,6 @@
 // ============================================================ slooper ==
 // overdrive.rs — the drive family: analog-ish overdrive, clipper, folder.
-// Consolidates FL Studio's Fruity Blood Overdrive, Fast Dist and Soft
-// Clipper into one shape-able stage. See docs/FL-SUITE.md.
+// The overdrive / clipper / folder family in one shape-able stage.
 //
 // Signal: DC-block -> pre gain -> curve (4 characters) -> tone (tilt LP/HP)
 // -> presence (harmonic exciter) -> mix -> output trim. All one-pole, all
@@ -62,7 +61,7 @@ fn curve(curve: i32, x: f64) -> f64 {
     match curve {
         // soft analog saturation: tanh keeps fundamentals, rounds peaks.
         0 => x.tanh(),
-        // hard clipper (Fast Dist vibe) with a 0.9 knee so edges stay sane.
+        // hard clipper with a 0.9 knee so edges stay sane.
         1 => {
             if x > 0.9 {
                 0.9 + (x - 0.9).tanh() * 0.1
@@ -83,7 +82,7 @@ fn curve(curve: i32, x: f64) -> f64 {
             }
             y
         }
-        // silky (Soft Clipper): x/(1+|x|) — no nulls, pure compression.
+        // silky soft-clip: x/(1+|x|) — no nulls, pure compression.
         _ => x / (1.0 + x.abs()),
     }
 }

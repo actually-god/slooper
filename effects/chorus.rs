@@ -1,6 +1,5 @@
 // ============================================================ slooper ==
 // chorus.rs — modulated-delay chorus / doubler / ensemble for the chain.
-// Covers Fruity Chorus, Hyper Chorus and Vintage Chorus (docs/FL-SUITE.md).
 //
 // The classic: the input is written into a ring buffer and read back
 // through sine-LFO-modulated taps; the delayed copy is fed back through
@@ -216,7 +215,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     name: c"Chorus Doubler".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Modulated-delay chorus: wide at base 12+ ms, flanger at base 0-5 ms with high feedback. ABI v3: per-side tap banks (Hyper Chorus task).".as_ptr(),
+        c"Modulated-delay chorus: wide at base 12+ ms, flanger at base 0-5 ms with high feedback. ABI v3: per-side tap banks (wide-ensemble spread).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -229,7 +228,7 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     name: c"Chorus Doubler".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Modulated-delay chorus: wide at base 12+ ms, flanger at base 0-5 ms with high feedback. ABI v3: per-side tap banks (Hyper Chorus task).".as_ptr(),
+        c"Modulated-delay chorus: wide at base 12+ ms, flanger at base 0-5 ms with high feedback. ABI v3: per-side tap banks (wide-ensemble spread).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -243,7 +242,7 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     name: c"Chorus Doubler".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Modulated-delay chorus: wide at base 12+ ms, flanger at base 0-5 ms with high feedback. ABI v3: per-side tap banks (Hyper Chorus task).".as_ptr(),
+        c"Modulated-delay chorus: wide at base 12+ ms, flanger at base 0-5 ms with high feedback. ABI v3: per-side tap banks (wide-ensemble spread).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
