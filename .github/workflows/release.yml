@@ -1,10 +1,13 @@
 # W11 (docs/WINDOWS-PORT.md): GitHub Release assets, built by CI.
 #
-#   On tag push v*:  publish a release with the two shipping assets —
+#   On tag push v*:  publish a release with the shipping assets —
 #     slooper-<ver>-linux-x86_64.tar.zst   (usr/ prefix: extract into /,
 #                                           mirrors the AUR pkg layout;
 #                                           the AUR source flow is
 #                                           UNTOUCHED by this workflow)
+#     slooper-<debver>_amd64.deb            (W13d: same staged tree +
+#                                           control file, smoke-gated on
+#                                           the debian tier)
 #     slooper-win64.zip                    (MSVC release exe + README +
 #                                           LICENSE — exe carries the
 #                                           embedded icon via winresource)
@@ -104,6 +107,8 @@ jobs:
           cp assets/icon.png "$P/usr/share/pixmaps/slooper.png"
           cp README.md LICENSE docs/INSTALL.md "$P/"
           tar --zstd -cf "slooper-$VERSION-linux-x86_64.tar.zst" "$P"
+          # W13d: the deb steps below need the same version string
+          echo "SLOOPER_VERSION=$VERSION" >> "$GITHUB_ENV"
       # W13b: distro smoke matrix on the STAGED exe (exact shipped bytes,
       # per the pdb-era lesson "verify the artifact, not the build").
       # scripts/porting/w13b_matrix.sh runs it through
@@ -113,10 +118,27 @@ jobs:
       # this is the same script against any newer-glibc build (see DONE log).
       - name: Distro smoke matrix (W13b)
         run: bash scripts/porting/w13b_matrix.sh slooper-*/usr/bin/slooper
+      # W13d: OPTIONAL .deb for Debian/Ubuntu. The package payload is the
+      # SAME staged usr/ tree the W13b matrix just proved (no second
+      # build), so the smoke below only tests the packaging contract:
+      # apt installs it on the deb tier from Depends alone (jack/Wayland/
+      # GL stay Recommends/Suggests — dlopen'd per W13c), the probe runs
+      # from PATH, and purge is clean. A deb accidentally packed from a
+      # newer-glibc build fails here at the probe ( sabotage pair proven
+      # locally 2026-11-12: an Arch-built payload FAILs both tiers with
+      # the exact GLIBC_2.43 ld.so lines). dpkg-deb ships with the runner.
+      - name: Build .deb (W13d)
+        run: bash scripts/porting/w13d_make_deb.sh slooper-*/ "$SLOOPER_VERSION"
+      - name: .deb smoke (W13d)
+        run: bash scripts/porting/w13d_deb_smoke.sh slooper_*_amd64.deb
       - uses: actions/upload-artifact@v4
         with:
           name: linux-asset
           path: slooper-*-linux-x86_64.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-asset
+          path: slooper_*_amd64.deb
 
   windows:
     name: Windows asset (slooper-win64.zip)
@@ -181,6 +203,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-pdb
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-asset
       - name: Release (tag → published, dispatch → draft)
         uses: softprops/action-gh-release@v2
         with:
@@ -189,5 +214,6 @@ jobs:
           generate_release_notes: ${{ github.event_name == 'push' }}
           files: |
             slooper-*-linux-x86_64.tar.zst
+            slooper-*_amd64.deb
             slooper-win64.zip
             slooper-win64-pdb.zip
