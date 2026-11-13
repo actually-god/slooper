@@ -177,7 +177,7 @@ pub fn run(
         client_name: client_name.clone(),
         sample_rate,
     });
-    send_ports(active.as_client(), &evt_tx);
+    send_ports(active.as_client(), evt_tx);
 
     // Remote MIDI sources currently wired into our midi_in port. Devices often
     // reappear on a fresh port name every connect, so this set is re-derived
