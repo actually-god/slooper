@@ -40636,30 +40636,38 @@ mod tests {
     #[test]
     fn v50_edit_sample_menu_render_and_persist() {
         let mut app = headless_app("v50edit1");
-        let samples = std::env::temp_dir().join("sp-uity-v50edit1/samples");
+        // W14 class: PathBuf::push("a/b") on Windows does NOT re-split the
+        // '/' — display() keeps it, so a slash-joined path is byte-distinct
+        // from the rack scan's entry.path() for the SAME file. Every path
+        // that crosses into app state (ensure_asset, sample_edits keys)
+        // must be built scan-form: chained .join() per component.
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v50edit1")
+            .join("samples");
         let _ = std::fs::remove_dir_all(&samples);
         v28_wav(&samples, "kit-a/revme.wav");
+        let wav = samples.join("kit-a").join("revme.wav");
         app.rack[0].path = samples.display().to_string();
         app.rack[0].rescan();
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        let _ = app.ensure_asset(&samples.join("kit-a/revme.wav"));
+        let _ = app.ensure_asset(&wav);
         frame(&mut app, &ctx, vec![]);
         let hs = galley_centers(&mut app, &ctx, "revme", true);
-        eprintln!("DIAG revme hits={:?}", hs);
-        eprintln!("DIAG assets: {:?}", app.assets.iter().map(|a| (a.path.to_string_lossy().into_owned(), a.pattern.is_some(), a.automation.is_some())).collect::<Vec<_>>());
-        eprintln!("DIAG rackfiles: {:?}", app.rack[0].files.iter().map(|f| f.path.to_string_lossy().into_owned()).collect::<Vec<_>>());
+        assert!(!hs.is_empty(), "revme row must paint");
         let h = hs[0];
         rmb(&mut app, &ctx, h);
         let its = galley_centers(&mut app, &ctx, "Edit sample", true);
-        eprintln!("DIAG status={:?} sample_rate={}", app.status, app.sample_rate);
-        eprintln!("DIAG menu hits={:?}", its);
+        assert!(
+            !its.is_empty(),
+            "Edit sample menu item must show: assets={:?} rackfile={:?} status={:?}",
+            app.assets.iter().map(|a| a.path.clone()).collect::<Vec<_>>(),
+            app.rack[0].files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+            app.status
+        );
         let it = its[0];
         click_pt(&mut app, &ctx, it);
-        let key = samples
-            .join("kit-a/revme.wav")
-            .to_string_lossy()
-            .into_owned();
+        let key = wav.to_string_lossy().into_owned();
         assert_eq!(
             app.sample_edit_win.as_deref(),
             Some(key.as_str()),
@@ -40694,7 +40702,7 @@ mod tests {
         );
         let mut app2 = headless_app("v50edit2");
         app2.rack[0].path = samples.display().to_string();
-        let _ = app2.ensure_asset(&samples.join("kit-a/revme.wav"));
+        let _ = app2.ensure_asset(&wav);
         app2.restore_sample_edits(&pr.sample_edits);
         assert_eq!(
             app2.assets[0].data.to_vec(),
