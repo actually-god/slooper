@@ -602,6 +602,12 @@ pub struct Config {
     pub show_rack: bool,
     #[serde(default = "default_true")]
     pub show_mixer: bool,
+    /// v52 R5: true (default) = today's behavior — while docked left/right
+    /// the mixer mirrors the main GUI's track heights and shares its scroll.
+    /// False: mixer strips keep a UNIFORM height, start at the panel top and
+    /// own their scroll even when docked — the mixer becomes its own view.
+    #[serde(default = "default_true")]
+    pub mixer_follow_tracks: bool,
     #[serde(default = "default_true")]
     pub show_midi: bool,
     /// v30 R4: the project-value-bindings window now belongs to the MAIN
@@ -718,6 +724,7 @@ impl Default for Config {
             track_synth_states: Vec::new(),
             show_rack: true,
             show_mixer: true,
+            mixer_follow_tracks: true,
             show_midi: true,
             show_binds: true,
             side_wins: SideWins::default(),

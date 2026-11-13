@@ -964,6 +964,10 @@ pub struct App {
     /// docks occupy no space and paint no heading.
     show_rack: bool,
     show_mixer: bool,
+    /// v52 R5: while true (default), a LEFT/RIGHT-docked mixer mirrors the
+    /// main GUI's track heights + scroll. Off: strips keep a uniform height,
+    /// start at the panel top and own their scroll even when docked.
+    mixer_follow_tracks: bool,
     /// v30 R3: scratch name for saving an automation shape preset.
     auto_preset_name: String,
     /// v30 R4: the project-value-bindings window is part of the main GUI.
@@ -1703,6 +1707,7 @@ impl App {
             show_settings: false,
             show_rack: cfg.show_rack,
             show_mixer: cfg.show_mixer,
+            mixer_follow_tracks: cfg.mixer_follow_tracks,
             auto_preset_name: String::new(),
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
@@ -4571,6 +4576,7 @@ impl App {
             n_tracks: self.n_tracks,
             show_rack: self.show_rack,
             show_mixer: self.show_mixer,
+            mixer_follow_tracks: self.mixer_follow_tracks,
             show_midi: self.show_midi,
             show_binds: self.show_binds,
             side_wins: self.side_wins,
@@ -15011,6 +15017,24 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             {
                                 app.save_config();
                             }
+                            // v52 R5: mixer dependent/independent of the main
+                            // GUI's tracks (uniform strip height + own scroll).
+                            if ui
+                                .checkbox(
+                                    &mut app.mixer_follow_tracks,
+                                    "mixer follows tracks",
+                                )
+                                .on_hover_text(
+                                    "On (default): while docked left/right the mixer \
+                                     mirrors the main GUI's track heights and scroll. \
+                                     Off: strips keep a uniform height, start at the \
+                                     panel top and scroll on their own — the mixer \
+                                     becomes its own view.",
+                                )
+                                .changed()
+                            {
+                                app.save_config();
+                            }
                             if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
                                 app.save_config();
                             }
@@ -16167,7 +16191,9 @@ fn merge_host_hit(app: &App, pt: egui::Pos2, carried: usize) -> Option<usize> {
 /// tying those placements to the grid is what made it feel welded to the
 /// main GUI.
 fn mixer_independent(app: &App) -> bool {
-    !is_docked(app, 3) || dock_edge(app, 3) == 2
+    // v52 R5: the user can FORCE independence — then the mixer never
+    // mirrors the main GUI's track geometry, whatever the dock placement.
+    !app.mixer_follow_tracks || !is_docked(app, 3) || dock_edge(app, 3) == 2
 }
 /// v52 R4: is ANY record source live on track `j` (audio take / MIDI take /
 /// write automation)? Shared by the record-group master's label + pass.
@@ -19801,7 +19827,15 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
         base.max,
     ));
     for t in 0..app.n_tracks {
-        let th = app.track_h(t);
+        // v52 R5: on the independent path the strips keep a UNIFORM
+        // mixer-owned height — the main GUI's track heights (which follow
+        // lane counts and per-track resizes) are not mirrored. `tied`
+        // preserves the historic grid-aligned behavior exactly.
+        let th = if tied {
+            app.track_h(t)
+        } else {
+            LANE_H.max(TRACK_MIN_H)
+        };
         if y + th >= base.min.y && y <= base.max.y {
             let r =
                 egui::Rect::from_min_size(egui::pos2(base.min.x, y), egui::vec2(base.width(), th));
@@ -24123,6 +24157,19 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.save_config();
                 }
                 if ui.checkbox(&mut app.show_mixer, "mixer dock").changed() {
+                    app.save_config();
+                }
+                // v52 R5: dependent (default) / independent mixer layout.
+                if ui
+                    .checkbox(&mut app.mixer_follow_tracks, "mixer follows tracks")
+                    .on_hover_text(
+                        "On (default): while docked left/right the mixer mirrors \
+                         the main GUI's track heights and scroll. Off: strips keep \
+                         a uniform height and scroll on their own — the mixer \
+                         becomes its own view.",
+                    )
+                    .changed()
+                {
                     app.save_config();
                 }
                 if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
@@ -41740,5 +41787,92 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert!(app.rec_src[0].audio, "member 0 keeps its audio tick");
         assert!(!app.rec_src[1].audio, "audio is NOT the linked selector");
+    }
+
+    // ---- v52 R5: mixer dependent / independent --------------------------
+
+    /// Default = dependent (today's behavior preserved). Toggling
+    /// "mixer follows tracks" OFF makes a LEFT-docked mixer independent —
+    /// and the choice round-trips through config.
+    #[test]
+    fn v52_mixer_follow_default() {
+        let mut app = headless_app("v52mxfl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.mixer_follow_tracks, "default: dependent (current behavior)");
+        // Left-docked + follow ON = tied to the grid (v34 behavior intact).
+        app.side_wins.dock[3] = [1, 0, 0];
+        assert!(!mixer_independent(&app), "left dock + follow = tied");
+        // Flip OFF through the real settings checkbox.
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "mixer follows tracks").expect("R5 checkbox");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.mixer_follow_tracks, "checkbox flips independence");
+        assert!(
+            mixer_independent(&app),
+            "left dock + NO follow = independent layout"
+        );
+        // Persisted.
+        let b = App::new(Backend::start());
+        assert!(!b.mixer_follow_tracks, "independent mixer round-trips config");
+    }
+
+    /// Independent geometry: strips keep a UNIFORM height even when a track
+    /// grew extra child lanes, while follow-ON keeps mirroring the grid.
+    #[test]
+    fn v52_mixer_independent_geometry() {
+        let mut app = headless_app("v52mxgeo");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.side_wins.dock[3] = [1, 0, 0];
+        // Grow track 1 to three child lanes: its grid row (and therefore
+        // a FOLLOWING strip) gets taller — a normal row is one lane tall.
+        let base_h = app.track_h(0);
+        app.arr.add_lane(0);
+        app.arr.add_lane(0);
+        let tall_h = app.track_h(0);
+        assert!(tall_h > base_h, "child lanes grew track 1's row");
+        // HOLD the pointer over the docked mixer (a docked panel that is
+        // NOT hovered is memo-skipped, so strips paint no galleys).
+        let probe = egui::pos2(150.0, 90.0);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![moved(probe)]);
+        }
+        let t1 = galley_centers(&mut app, &ctx, "Track 1", true)
+            .first()
+            .copied()
+            .expect("strip 1 paints");
+        let t2 = galley_centers(&mut app, &ctx, "Track 2", true)
+            .first()
+            .copied()
+            .expect("strip 2 paints");
+        let pitch_tied = t2.y - t1.y;
+        assert!(
+            (pitch_tied - (tall_h + TRACK_SEP_HIT)).abs() < 2.0,
+            "follow ON mirrors the tall grid row: pitch {pitch_tied} vs {}",
+            tall_h + TRACK_SEP_HIT
+        );
+        // Independent: uniform mixer-owned height instead.
+        app.mixer_follow_tracks = false;
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![moved(probe)]);
+        }
+        let t1 = galley_centers(&mut app, &ctx, "Track 1", true)
+            .first()
+            .copied()
+            .expect("strip 1 paints");
+        let t2 = galley_centers(&mut app, &ctx, "Track 2", true)
+            .first()
+            .copied()
+            .expect("strip 2 paints");
+        let pitch_free = t2.y - t1.y;
+        assert!(
+            (pitch_free - (96.0 + TRACK_SEP_HIT)).abs() < 2.0,
+            "independent strips are uniform: pitch {pitch_free}"
+        );
     }
 }
