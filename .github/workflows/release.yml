@@ -209,7 +209,10 @@ jobs:
                  else { (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value + "-dev." + $env:GITHUB_SHA.Substring(0,7) }
           $num = ($ver -split '-')[0]
           & $makensis -V2 "-DSLOOPER_VER=$ver" "-DSLOOPER_VNUM=$num" "-DSLOOPER_SRC=..\stage" packaging\slooper.nsi
-          if (-not (Test-Path "slooper-$ver-win64-setup.exe")) { Write-Error "makensis produced no installer"; exit 1 }
+          # makensis writes OutFile relative to the SCRIPT's folder
+          $setup = "packaging\slooper-$ver-win64-setup.exe"
+          if (-not (Test-Path $setup)) { Write-Error "makensis produced no installer"; exit 1 }
+          Move-Item $setup .
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
