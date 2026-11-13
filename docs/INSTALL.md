@@ -185,6 +185,15 @@ script features fail, with the compile error shown in the FX window.
 in the Ports window — like JACK, slooper never steals a device, and no
 selection means silence.
 
+**Optional native JACK:** if you already run JACK for Windows
+(jackbridge / jack2 — the "jackbuilds" installers), slooper can drive it
+directly. At startup it looks for `libjack64.dll` (PATH, then
+`%PROGRAMFILES%\Jack*`; the full path in `SLOOPER_JACK_DLL` overrides).
+When found, Settings ▸ **AUDIO BACKEND** grows a `JACK (native)` option —
+switching saves the config and takes effect on the next launch
+(`SLOOPER_AUDIO_BACKEND=jack|wasapi|auto` overrides for testing). Without
+the DLL WASAPI stays exactly as above; nothing else changes.
+
 **Building from source:** releases ship from the MSVC target
 (`x86_64-pc-windows-msvc`, the default Rust toolchain on Windows);
 `x86_64-pc-windows-gnullvm` (UCRT) additionally cross-builds from Linux

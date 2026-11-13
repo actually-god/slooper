@@ -122,10 +122,18 @@ log): the dependency contract is documented in INSTALL.md — links-vs-
 dlopens tables, per-distro package lines, the floor rule in user terms.
 W13d DONE same session: optional .deb — the SAME staged tree repacked by
 w13d_make_deb.sh, apt-install-smoke-gated on debian:12/ubuntu:22.04 with
-an Arch-payload sabotage pair. NEXT = the last W12 item (native JACK-on-
-Windows via the jack crate's `dynamic_loading`) or whatever the Windows
-report-only grow-list surfaces. The next real version tag publishes all
-assets automatically.
+an Arch-payload sabotage pair. W12f DONE 2026-11-13 (session 24, see DONE
+log): the LAST W12 item — native JACK-on-Windows. The jack crate ALREADY
+dlopens libjack at runtime on Linux (dynamic_loading is its default
+feature — that is the W13 "jack is not a NEEDED entry" fact); Windows now
+ships the same crate via the windows target table + discovery
+(SLOOPER_JACK_DLL > PATH > %PROGRAMFILES%\Jack*, validated by a leaked
+libloading probe on `jack_client_open`) + resolve_backend (auto/wasapi/jack,
+env SLOOPER_AUDIO_BACKEND overrides) + Settings ▸ AUDIO BACKEND + config
+field win_audio_backend. A jack-less Windows stays 100% WASAPI. NEXT =
+whatever the Windows report-only grow-list surfaces (or a W12g: hot
+backend swap without restart — deliberately NOT built in W12f). The next
+real version tag publishes all assets automatically.
 
 ## Ground rules (apply to every task)
 
@@ -528,21 +536,20 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   (`SLOOPER_CRASH_DIR`), newest-10-EVENT pruning, the `winrel` shipping
   profile keeps symbols, and `SLOOPER_CRASH_ME=panic|fault` as the
   self-test switch two CI child pins drive. Linux inert, pinned both ways.
-- [ ] native JACK-on-Windows mode — the last unpicked W12 item.
-  Spec for the session that picks it: jack crate's `dynamic_loading`
-  feature (W1 inventory #8 verified it exists for jack-sys 0.5.1) makes
-  libjack a RUNTIME dlopen instead of a link dep, so Windows users who
-  have jackbuilds get native JACK with zero Linux churn — Linux keeps
-  its plain linked jack dep (feature is a Windows-target Cargo seam
-  ONLY: `[target.'cfg(windows)'.dependencies]` + `features =
-  ["dynamic_loading"]`, linux side byte-identical). DLL discovery:
-  try `libjack*.dll` on PATH + `%PROGRAMFILES%\\Jack*` + an optional
-  `SLOOPER_JACK_DLL` override; a jack-less Windows stays 100% WASAPI as
-  shipped (the backend selector in Ports grows a `JACK (native)` entry
-  only when the DLL loads at startup). RT core needs NOTHING — W4 made
-  Proc OS-neutral; the jack.rs ManagerBackend wiring is what gets the
-  dlopen seam. Pins: cfg(windows)-gated load/discovery tests + Linux
-  inertness pin; grow-list baseline must not regress.
+- [x] **W12f DONE 2026-11-13 (session 24, see DONE log)** — native
+  JACK-on-Windows. Discovery chain SLOOPER_JACK_DLL > PATH >
+  `%PROGRAMFILES%\Jack*` (exact `JACK_LIB` basename required), validated
+  WITHOUT jack-sys (leaked libloading handle + `jack_client_open` export),
+  made resolvable via SetDllDirectoryW + PATH prepend; `resolve_backend`
+  (env > config > auto; auto = JACK iff discovered); Settings ▸ AUDIO
+  BACKEND selector grows "JACK (native)" only when discovered; jack::run
+  guards an explicit-jack-without-DLL with Evt::Unavailable (jack-sys'
+  lazy loader PANICS on a failed bare-name load — never call blind).
+  Spec deviations (the ledger spec asked for a `features =
+  ["dynamic_loading"]` seam — unnecessary): it is jack 0.13.5's DEFAULT
+  feature — Linux already dlopens, and discovery requires the EXACT
+  arch-correct file name; a jack-less Windows stayed WASAPI
+  byte-identically.
 
 ### W13 — Linux distro portability battery (opened 2026-11-12; same protocol)
 
@@ -1536,3 +1543,55 @@ portable asset on the OLDEST distro we support, never the newest.
   dpkg Version field survives untouched — download patterns should use
   `*_amd64.deb`, never the tilde string. Docker mount gotcha: a `-v`
   source dir missing on the host is auto-created ROOT-owned.
+
+- **2026-11-13 session 24 — W12f** (native JACK-on-Windows, the last W12
+  item): the enabling FACT — the jack crate already dlopens libjack at
+  runtime on EVERY OS (jack-sys' `dynamic_loading` is a DEFAULT feature;
+  `LIB_RESULT = lazy_static { Library::new(JACK_LIB) }`, JACK_LIB =
+  "libjack64.dll" bare-name on x64 Windows). So Windows support = make
+  that bare name resolvable, nothing else: `jack = "0.13.5"` joins the
+  `[target.'cfg(windows)'.dependencies]` table (proven to compile for
+  gnullvm — jack-sys build.rs only unwraps pkg-config on Linux),
+  `audio/jack.rs` now compiles on both OSes (its pactl/pw-cli port filter
+  returns None off-unix), and a discovery module `jack::dll` does: pick
+  (override SLOOPER_JACK_DLL → PATH dirs → `%PROGRAMFILES%\Jack*` with
+  lib64/bin/lib subdirs, sorted) requiring the EXACT JACK_LIB basename
+  (jack-sys loads by bare name — an odd-named override could never
+  resolve back; rejected loudly), then `validate` = libloading dlopen +
+  `jack_client_open` export probe — NEVER via jack-sys, because its
+  lazy `FUNCTIONS` does `library().unwrap()` and PANICS on a failed load
+  (pin `w12f_windows_jack_run_guards_missing_dll_before_any_call` locks
+  the `dll::found().is_none()` early-return ABOVE `Client::new`; pin
+  `w12f_discovery_never_calls_into_jack_sys` locks the probe path).
+  Success leaks the Library (repo never-dlclose rule) and makes the name
+  findable via SetDllDirectoryW + PATH prepend, once (OnceLock) before
+  any jack-sys call. Choice: `resolve_backend(env > config > auto)` in
+  mod.rs (pure, matrix-pinned; explicit "jack" survives a missing DLL —
+  honest Evt::Unavailable, no silent switch), config field
+  `win_audio_backend` (default "auto", W9 pattern, old configs
+  unaffected), Settings ▸ AUDIO BACKEND (windows-only section like W9's
+  MIDI one; `backend_options` pure-pinned: the JACK (native) entry grows
+  ONLY when discovered OR is the stale saved choice, escapable).
+  Restart-to-apply v1 — a hot backend respawn is deliberate W12g scope.
+  LORE: (1) sabotage proof CAUGHT A VACUOUS PIN: `win.contains("jack = ")`
+  passes with the line COMMENTED OUT — a substring check against TOML is
+  comment-blind; the deps pin now scans lines for a live `jack =` key
+  (`live_key` helper) and failed the commented-line sabotage on re-run.
+  Reusable rule: text pins over config/source must be comment-aware or
+  needle-suffixed when the target format has comment chars. (2) The W5
+  pins that encoded "jack is Linux-only" (deps-table-only,
+  `jack::run count == 1`, `#[cfg(not(windows))] mod jack`) were the
+  program's OWN tripwires and are updated to the W12f truth (2 run_backend
+  spawn points, `pub mod jack;`) — when a task intentionally supersedes a
+  port pin, rewrite it in the same commit and re-sabotage. (3) The jack
+  lazy-load PANIC class generalizes: any crate dlopening by fixed name
+  must be pre-probed by OUR code before the first call, and that probe
+  must not import the panic-prone crate beyond a const name. Pins:
+  w12f_ x10 (resolve matrix, pick priority+exact-name, jack_dirs
+  layouts, spawn-point shapes both OSes, guard order, no-jack-sys-in-
+  discovery, cfg(windows) garbage-DLL reject, Linux discovery no-op,
+  options gate, section windows-only paint) + config roundtrip. Linux
+  gates: clippy-zero, citest lib monolith (CI-identical skips) + e2e;
+  gnullvm `--all-targets` green (compiles the cfg(windows) pins CI runs);
+  ci.yml's bare `w12` filter already covers the whole w12f series on the
+  Windows MSVC job.
