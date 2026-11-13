@@ -135,10 +135,13 @@ W14 (opened 2026-11-13: the Windows full-suite grow-list — session 25
 attacked the three systemic classes: mapped-dll script rebuilds, invalid
 JSON test configs (backslash paths), and the inert-XDG data sandbox; the
 next session reads the NEW report-only list and continues until the
-windows-native full suite is green, then flips it blocking). W12g (hot
-backend swap without restart — deliberately NOT built in W12f) stays
-open behind it. The next real version tag publishes all assets
-automatically.
+windows-native full suite is green, then flips it blocking). W12g DONE
+2026-11-13 (session 27, see DONE log): hot backend swap — a Settings
+pick re-dispatches the live manager thread (ManagerExit verdicts,
+NullSession park), no restart. The next real version tag publishes all
+assets automatically. The ONLY open item left in the whole program is
+the v20_fx script-FX heap-corruption ASan session (see the W14 OPEN
+RISK block).
 
 ## Ground rules (apply to every task)
 
@@ -1667,7 +1670,8 @@ follow-up for the corruption itself.
   unaffected), Settings ▸ AUDIO BACKEND (windows-only section like W9's
   MIDI one; `backend_options` pure-pinned: the JACK (native) entry grows
   ONLY when discovered OR is the stale saved choice, escapable).
-  Restart-to-apply v1 — a hot backend respawn is deliberate W12g scope.
+  Restart-to-apply v1 — SUPERSEDED by W12g (session 27): the pick now
+  applies live via Cmd::SwitchBackend; see the DONE log entry.
   LORE: (1) sabotage proof CAUGHT A VACUOUS PIN: `win.contains("jack = ")`
   passes with the line COMMENTED OUT — a substring check against TOML is
   comment-blind; the deps pin now scans lines for a live `jack =` key
@@ -1690,3 +1694,38 @@ follow-up for the corruption itself.
   gnullvm `--all-targets` green (compiles the cfg(windows) pins CI runs);
   ci.yml's bare `w12` filter already covers the whole w12f series on the
   Windows MSVC job.
+- **2026-11-13 session 27 — W12g** (hot backend swap, the last open W12
+  item): a Settings ▸ AUDIO BACKEND pick now applies to the LIVE manager
+  thread — no restart. Design: `manager_loop` gained a verdict
+  (`ManagerExit::{Quit,Unavailable,Switch}`); `Cmd::SwitchBackend(kind)`
+  ends the running loop with `Switch`, and the Windows `run_backend` twin
+  re-dispatches the other backend over the SAME cmd_rx/evt_tx/engine/
+  meter handles — project, synths, transport and takes survive the swap,
+  only the device layer is rebuilt. Honest-failure paths (missing DLL /
+  no jackd / COM failure) return `Unavailable` and the loop PARKS on a
+  device-less `NullSession` (GUI still served, no events, no busy-spin):
+  installing jack or switching back no longer needs a restart either.
+  The null-audio test path still returns `Quit` — headless tests see the
+  identical thread death they always did. `Backend::switch_backend`
+  resolves with the startup rule verbatim (env > explicit > auto+
+  discovery, same `dll::found` OnceLock probe the selector reads), sends
+  only on Windows, so a pick can never "apply" what a fresh launch
+  wouldn't pick. Linux is inert everywhere: the Linux `run_backend` twin
+  discards the verdict (shape-pinned: no resolve/park/switch symbols in
+  its body), the picker never paints there. UI: pick persists config +
+  `switch_backend` + status "switched live" — the v1 restart-to-apply
+  text is pinned DEAD (split-needle source pin, runs on Linux CI too).
+  LORE: (1) the split-needle rule bit AGAIN immediately: the ui source pin
+  first passed saboted because its OWN assert literal contained the
+  needle (`include_str!` self-reference) — every source-pin needle needs
+  the concat split on BOTH polarities, not just the negative one.
+  (2) `patch`/fuzzy edits spanning a `.into()` tail silently dropped it
+  (jack null line — compile caught it; re-read diffs of fuzzy hits).
+  Pins: w12g_ x8 — 3 behavior (park survives idle+switch / ignores
+  device cmds + Quit leaves / verdict lands <200 ms), 5 shape (manager
+  arm + both run_backend twins + backend verdict counts + helper), the
+  windows-native pick behavior pin rides the existing bare `w12` filter.
+  Sabotage proofs: verdict payload swap → behavior+shape red; ui call
+  removal → source pin red (after the vacuous fix); jack null→park →
+  verdict pin red; resolve in Linux body → both w12f and w12g inertness
+  pins red.
