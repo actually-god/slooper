@@ -104,6 +104,15 @@ jobs:
           cp assets/icon.png "$P/usr/share/pixmaps/slooper.png"
           cp README.md LICENSE docs/INSTALL.md "$P/"
           tar --zstd -cf "slooper-$VERSION-linux-x86_64.tar.zst" "$P"
+      # W13b: distro smoke matrix on the STAGED exe (exact shipped bytes,
+      # per the pdb-era lesson "verify the artifact, not the build").
+      # scripts/porting/w13b_matrix.sh runs it through
+      # `--slooper-probe 2 /nonexistent` in arch / debian:12 / ubuntu:22.04
+      # / fedora:40 containers that installed ONLY runtime libs — a real
+      # loads-and-runs proof per distro. The floor-build sabotage pair for
+      # this is the same script against any newer-glibc build (see DONE log).
+      - name: Distro smoke matrix (W13b)
+        run: bash scripts/porting/w13b_matrix.sh slooper-*/usr/bin/slooper
       - uses: actions/upload-artifact@v4
         with:
           name: linux-asset

@@ -113,7 +113,12 @@ now BUILDS on the floor distro (release.yml linux job: ubuntu-22.04, glibc
 BUILT exe against floors 2.35/3.4.30/1.9.15. Measured (local ubuntu:22.04
 docker build): floor build demands GLIBC exactly 2.35; C++ demand only
 GLIBCXX_3.4/CXXABI_1.3. The Arch binary (GLIBC_2.43) fails the same
-assert — sabotage-proved. NEXT = W13b (distro smoke matrix), the last W12
+assert — sabotage-proved. W13b DONE 2026-11-12 (session 22, see DONE log):
+distro smoke matrix (`scripts/porting/w13b_matrix.sh`) — floor artifact runs
+green on arch/debian:12/ubuntu:22.04/fedora:40 containers with only runtime
+libs, and a newer-glibc build is caught by name; release.yml now smokes the
+STAGED exe on every release. NEXT = W13c (dependency contract in INSTALL.md),
+W13d (optional .deb), the last W12
 item (native JACK-on-Windows mode), or whatever the Windows report-only
 suite surfaces. The next real version tag publishes both assets
 automatically.
@@ -538,16 +543,14 @@ portable asset on the OLDEST distro we support, never the newest.
 - [x] **W13a DONE 2026-11-12 (session 21, see DONE log)** — floor picked
   (glibc ≥ 2.35), release linux asset built on ubuntu-22.04, CI asserts the
   exe's GLIBC/GLIBCXX/CXXABI demand against the floors (sabotage-proved).
-- [ ] **W13b — distro smoke matrix.** Containers arch / debian:12 /
-  ubuntu:22.04 / fedora:40 install only the RUNTIME libs (libx11-6, libxcb1,
-  libjack-jackd2-0 …) and execute the SHIPPED asset (not a rebuild) through
-  the one CLI mode that exists: `slooper --slooper-probe 2 /nonexistent`
-  (kind is NUMERIC — 0 VST2 / 1 VST3 / 2 CLAP; the string `v2` is NOT
-  parsed and falls through to a full GUI boot — W13a proven live on the
-  floor artifact: one JSON line + exit 0, no window, no JACK)
-  prints one JSON line and exits WITHOUT opening a window or touching JACK
-  (W7 interception runs before `Backend::start`) = a real loads-and-runs
-  proof per distro, including the libjack-dlopen path.
+- [x] **W13b DONE 2026-11-12 (session 22, see DONE log)** — distro smoke
+  matrix: `scripts/porting/w13b_matrix.sh` runs the SHIPPED exe through
+  `slooper --slooper-probe 2 /nonexistent` in arch / debian:12 /
+  ubuntu:22.04 / fedora:40 containers with ONLY runtime libs installed
+  (libx11/libstdc++ per distro; jack/Wayland/GL deliberately absent).
+  Floor artifact 4/4 PASS; sabotage (Arch GLIBC_2.43 exe) FAILs debian/
+  ubuntu/fedora with the exact ld.so lines. Now a release.yml gate on the
+  STAGED exe.
 - [ ] **W13c — dependency contract in docs.** INSTALL.md gets the
   links-vs-dlopens table, a per-distro install line, and the rule "the single
   tar.zst runs everywhere only if it was built on the floor distro"; AUR flow
@@ -1397,3 +1400,43 @@ portable asset on the OLDEST distro we support, never the newest.
   no window. That live run also caught a ledger error BEFORE W13b inherits
   it: the probe `kind` is numeric (0/1/2), the written `v2` was never
   parsed and booted the GUI — ledger corrected.
+- **2026-11-12 session 22 — W13b** (distro smoke matrix): `scripts/
+  porting/w13b_matrix.sh /path/to/slooper [images...]` runs the binary
+  AS-BUILT (never a rebuild) in `archlinux:latest` / `debian:12` /
+  `ubuntu:22.04` / `fedora:40` containers that install ONLY the runtime
+  libs the exe's NEEDED set actually demands on top of the base image
+  (libx11 / libX11 / libstdc++ — measured from `readelf -d` of the floor
+  artifact: libX11, libstdc++, libgcc_s, libm, libc; the 22.04 build does
+  NOT even NEEDED libxcb/Xau/Xdmcp directly, unlike the Arch one).
+  jack/Wayland/GL are deliberately NOT installed — they are dlopen'd, and
+  their absence in the container is part of the proof (the probe never
+  touches them, so the asset demonstrably loads without them). Per distro:
+  `slooper --slooper-probe 2 /nonexistent` must exit 0 with EXACTLY one
+  stdout line of JSON-array shape naming the target; container stdout/
+  stderr are split to files INSIDE the container so apt/pacman noise can
+  never impersonate a verdict, and the child rc is echoed as a marker
+  line. RESULT on the W13a floor artifact (draft asset
+  `slooper-0.21.0-dev.c3dde89-linux-x86_64.tar.zst`, demand GLIBC 2.35
+  exactly): 4/4 PASS. SABOTAGE PAIR (mandate for any smoke gate): the same
+  script against the local Arch build (demand GLIBC 2.43) → arch PASS
+  (same-machine), debian:12 / ubuntu:22.04 / fedora:40 all FAIL rc=1 with
+  the exact ld.so diagnostics (`version 'GLIBC_2.43' not found` on
+  libm.so.6 — the FIRST failure is in libm, not libc) — the matrix
+  genuinely bites on build-distro drift. fedora:40 (EOL since May 2026)
+  STILL installs from live dnf mirrors — image stays usable for now; if it
+  rots, bump to fedora:41+ in IMAGES (fedora is not the floor tier, the
+  floor is the 2.35 tier the ubuntu-22.04 container represents). Parsed
+  the verdict wrong on the first run (asserted the JSON line ENDS in `}`;
+  it is an ARRAY ending `}]` — the FAIL diag printed a perfectly good
+  verdict, which is the only reason the bug was obvious): any new verdict
+  assertion gets run against a KNOWN-GOOD output first. stderr carries one
+  benign `[slooper] GL: llvmpipe` policy log even on the probe path — the
+  assertion ignores stderr (ld.so deaths are caught by the exit code).
+  VERIFIED AS CI GATE: release.yml linux job runs the script against the
+  STAGED exe (`slooper-*/usr/bin/slooper` — the exact bytes that go into
+  the tar.zst, per the W12e pdb lesson), placed AFTER Stage+pack. GitHub
+  ubuntu-22.04 runners ship docker for the job user; adds ~4–6 min to the
+  release job. NOT pinned as a Rust test (inputs = containers + network,
+  untestable from the lib suite; the sabotage pair is the pin-equivalent,
+  same ruling as W13a's floor assert). No Rust code touched — Linux
+  behavior unchanged by construction.
