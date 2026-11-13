@@ -611,6 +611,13 @@ pub struct Config {
     /// Linux never reads it — JACK MIDI auto-connects everything.
     #[serde(default)]
     pub win_midi_inputs: Vec<String>,
+    /// W12f (Windows): host audio backend preference — "auto" (native JACK
+    /// when its DLL is discoverable, else WASAPI), "wasapi", or "jack".
+    /// Values/precedence resolved by `audio::resolve_backend` (env
+    /// `SLOOPER_AUDIO_BACKEND` wins). Linux never reads it — JACK is THE
+    /// backend there.
+    #[serde(default = "default_audio_backend")]
+    pub win_audio_backend: String,
 }
 
 impl Default for Config {
@@ -684,8 +691,14 @@ impl Default for Config {
             mpe: false,
             win_editor_embed: false,
             win_midi_inputs: Vec::new(),
+            win_audio_backend: default_audio_backend(),
         }
     }
+}
+
+/// W12f: "auto" = native JACK if its DLL is discoverable, else WASAPI.
+fn default_audio_backend() -> String {
+    "auto".into()
 }
 
 fn default_gui_scale() -> f32 {

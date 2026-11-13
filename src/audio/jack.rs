@@ -45,6 +45,24 @@ pub fn run(
         let _ = evt_tx.send(Evt::Unavailable("null audio (SLOOPER_NULL_AUDIO)".into()));
         return;
     }
+    // W12f: on Windows EVERY entry into jack-sys triggers its dlopen, and
+    // the lazy loader PANICS when the bare name (JACK_LIB) fails to
+    // resolve — so an explicit-JACK choice without a discovered DLL must
+    // report, never call. (Auto-selection only routes here after
+    // discovery succeeded, so this is exactly the "user chose JACK and
+    // JACK went away" path.)
+    #[cfg(windows)]
+    if dll::found().is_none() {
+        let msg = format!(
+            "native JACK selected but {} was not found — install jack for Windows \
+             (jackbuilds), set SLOOPER_JACK_DLL, or choose WASAPI in \
+             Settings > AUDIO BACKEND",
+            dll::dll_name()
+        );
+        eprintln!("[slooper] {msg}");
+        let _ = evt_tx.send(Evt::Unavailable(msg));
+        return;
+    }
     let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
         Ok(c) => c,
         Err(e) => {
@@ -438,6 +456,12 @@ fn port_visible(full_name: &str, hidden: Option<&std::collections::HashSet<Strin
 /// spawns, so the result is cached for two seconds (device state rarely
 /// changes, and port lists refresh on registration events anyway).
 fn hidden_clients_cached() -> Option<std::collections::HashSet<String>> {
+    // pactl/pw-cli are PipeWire-on-Linux tools. On Windows (native JACK
+    // mode, W12f) there is no such state to consult — and spawning two
+    // missing processes every 2 s would be rude. Show everything.
+    if !cfg!(unix) {
+        return None;
+    }
     use std::time::{Duration, Instant};
     static CACHE: std::sync::Mutex<Option<(Instant, Option<std::collections::HashSet<String>>)>> =
         std::sync::Mutex::new(None);
@@ -673,4 +697,184 @@ unsafe fn clear_all_callbacks(client: *mut j::jack_client_t) {
 /// Format a JACK error for display.
 fn describe_err(e: ::jack::Error) -> String {
     e.to_string()
+}
+
+// ==========================================================================
+// W12f: native JACK on Windows — DLL discovery.
+//
+// The jack crate loads libjack at RUNTIME on every OS (jack-sys' DEFAULT
+// `dynamic_loading` feature dlopens `JACK_LIB` on first use — that is why
+// the Linux binary never links libjack either, cf. the W13 preamble).
+// Windows has no pkg-config and no rpath, so the only thing needed to make
+// that runtime load work is making the BARE name (`libjack64.dll`)
+// resolvable: find the DLL, prove it is really a JACK library, and point
+// the process DLL search at its directory — all BEFORE the first jack-sys
+// call (its lazy loader panics if the name lookup fails).
+//
+// The path logic is pure (explicit inputs) so Linux pins prove the rules;
+// only the cfg(windows) leaves touch the OS. Linux never calls into here
+// (JACK is THE backend), hence the blanket dead-code allow.
+#[allow(dead_code)] // W12f: the pure core is consumed on Windows + pinned on Linux
+pub mod dll {
+    use std::path::{Path, PathBuf};
+
+    /// The DLL name jack-sys will LoadLibrary (arch-correct: x86 finds
+    /// `libjack.dll`, x86_64 `libjack64.dll`).
+    pub fn dll_name() -> &'static str {
+        ::jack::jack_sys::JACK_LIB
+    }
+
+    /// Pure selection rule: the explicit override file (SLOOPER_JACK_DLL,
+    /// a full path) wins; otherwise the first directory containing a file
+    /// named EXACTLY `dll_name` (search order as given). The override must
+    /// carry the expected file name: jack-sys loads by the BARE `JACK_LIB`
+    /// name, so an override with any other file name could never be
+    /// resolved back by the OS loader — reject it loudly instead of
+    /// half-working.
+    pub fn pick(override_file: Option<&Path>, dirs: &[PathBuf], dll_name: &str) -> Option<PathBuf> {
+        if let Some(p) = override_file {
+            if p.is_file() {
+                if p.file_name().and_then(|n| n.to_str()) == Some(dll_name) {
+                    return Some(p.to_path_buf());
+                }
+                eprintln!(
+                    "[slooper] SLOOPER_JACK_DLL={} ignored: file name must be {dll_name} \
+                     (jack-sys dlopens that bare name)",
+                    p.display()
+                );
+            }
+        }
+        dirs.iter().map(|d| d.join(dll_name)).find(|c| c.is_file())
+    }
+
+    /// Candidate directories under a Program Files root for jack2 /
+    /// jackbridge installs: every top-level `Jack*` dir plus the `lib64`,
+    /// `bin` and `lib` subdirs its installers have historically used,
+    /// sorted for deterministic order across machines.
+    pub fn jack_dirs_in(program_files: &Path) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(program_files) else {
+            return Vec::new();
+        };
+        let mut roots: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_ascii_lowercase().starts_with("jack"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        roots.sort();
+        let mut out = Vec::new();
+        for r in roots {
+            out.push(r.clone());
+            for sub in ["lib64", "bin", "lib"] {
+                out.push(r.join(sub));
+            }
+        }
+        out
+    }
+
+    /// On-disk proof that `path` is a usable JACK library WITHOUT entering
+    /// jack-sys (whose lazy loader would panic on a bad load): dlopen it
+    /// and require the `jack_client_open` export. A good handle is LEAKED
+    /// on purpose (repo rule: foreign audio libraries are never dlclosed).
+    #[cfg(windows)]
+    pub fn validate(path: &Path) -> bool {
+        match unsafe { libloading::Library::new(path) } {
+            Ok(lib) => {
+                let ok = unsafe {
+                    lib.get::<unsafe extern "C" fn()>(b"jack_client_open")
+                        .is_ok()
+                };
+                if ok {
+                    std::mem::forget(lib);
+                } else {
+                    eprintln!("[slooper] {} does not export jack_client_open", path.display());
+                }
+                ok
+            }
+            Err(e) => {
+                eprintln!("[slooper] {} does not load: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// Make the BARE-name `LoadLibraryW(JACK_LIB)` that jack-sys performs
+    /// resolve to `path`: SetDllDirectoryW redirects the process-wide
+    /// search immediately; the PATH prepend is belt-and-braces and carries
+    /// the directory to child processes as well.
+    #[cfg(windows)]
+    fn make_findable(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        let Some(dir) = path.parent() else { return };
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ok = unsafe {
+            windows::Win32::System::LibraryLoader::SetDllDirectoryW(windows::core::PCWSTR(
+                wide.as_ptr(),
+            ))
+        };
+        let dir_s = dir.display().to_string();
+        let old = std::env::var("PATH").unwrap_or_default();
+        if !old
+            .split(';')
+            .any(|d| d.trim_end_matches('\\').eq_ignore_ascii_case(dir_s.trim_end_matches('\\')))
+        {
+            std::env::set_var("PATH", format!("{dir_s};{old}"));
+        }
+    }
+
+    /// Discovery order on Windows: SLOOPER_JACK_DLL, then every PATH dir,
+    /// then `%PROGRAMFILES%\Jack*` install layouts — first hit that
+    /// `validate`s wins. No env reads beyond the caller-provided override
+    /// and PATH/PROGRAMFILES (tests pass synthetic dirs via `pick`).
+    #[cfg(windows)]
+    pub fn discover(override_file: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+        let name = dll_name();
+        let mut dirs: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var("PATH").unwrap_or_default())
+                .filter(|d| !d.as_os_str().is_empty())
+                .collect();
+        if let Some(pf) = std::env::var_os("PROGRAMFILES") {
+            dirs.extend(jack_dirs_in(Path::new(&pf)));
+        }
+        let hit = pick(override_file.map(Path::new), &dirs, name)?;
+        if !validate(&hit) {
+            eprintln!("[slooper] {} found but is not a usable JACK library", hit.display());
+            return None;
+        }
+        eprintln!("[slooper] native JACK: {}", hit.display());
+        Some(hit)
+    }
+
+    /// The one probe behind backend resolution AND the settings selector
+    /// (they must agree). Runs at most once per process; its side effects
+    /// (PATH prepend + leaked handle) happen only on success and only
+    /// before any jack-sys call, which is exactly the contract the loader
+    /// needs.
+    #[cfg(windows)]
+    pub fn found() -> Option<&'static Path> {
+        static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        FOUND
+            .get_or_init(|| {
+                let p = discover(std::env::var_os("SLOOPER_JACK_DLL").as_deref())?;
+                make_findable(&p);
+                Some(p)
+            })
+            .as_deref()
+    }
+
+    /// Linux twin of the probe: discovery is a Windows concept (JACK is
+    /// THE backend here), so it always reports "not found". Exists so the
+    /// OS-neutral selector code compiles and pins identically on both.
+    #[cfg(not(windows))]
+    pub fn found() -> Option<&'static Path> {
+        None
+    }
 }
