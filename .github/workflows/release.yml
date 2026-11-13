@@ -284,7 +284,9 @@ jobs:
           AUR_URL: ${{ vars.AUR_URL }}
         run: |
           set -euo pipefail
-          awk '/^## \[/{c++} c==1{print} c==2{exit}' CHANGELOG.md > RELEASE_BODY.md
+          awk '/^## \[/{c++} c==1{print} c==2{exit}' CHANGELOG.md \
+            | sed -E 's#\((docs/[^)]+)\)#(https://github.com/actually-god/slooper/blob/main/\1)#g' \
+            > RELEASE_BODY.md
           {
             echo
             if [ -n "$AUR_URL" ]; then
