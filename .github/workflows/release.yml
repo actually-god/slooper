@@ -207,7 +207,8 @@ jobs:
           if (-not $makensis) { Write-Error "NSIS not available on the runner"; exit 1 }
           $ver = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME.TrimStart('v') }
                  else { (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value + "-dev." + $env:GITHUB_SHA.Substring(0,7) }
-          & $makensis -V2 "-DSLOOPER_VER=$ver" "-DSLOOPER_SRC=..\stage" packaging\slooper.nsi
+          $num = ($ver -split '-')[0]
+          & $makensis -V2 "-DSLOOPER_VER=$ver" "-DSLOOPER_VNUM=$num" "-DSLOOPER_SRC=..\stage" packaging\slooper.nsi
           if (-not (Test-Path "slooper-$ver-win64-setup.exe")) { Write-Error "makensis produced no installer"; exit 1 }
       - uses: actions/upload-artifact@v4
         with:

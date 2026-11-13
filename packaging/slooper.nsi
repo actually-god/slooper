@@ -52,7 +52,11 @@ VIAddVersionKey /LANG=1033 "FileDescription"    "slooper installer"
 VIAddVersionKey /LANG=1033 "LegalCopyright"     "MIT License"
 VIAddVersionKey /LANG=1033 "ProductVersion"     "${SLOOPER_VER}"
 VIAddVersionKey /LANG=1033 "FileVersion"        "${SLOOPER_VER}"
-VIProductVersion "${SLOOPER_VER}.0"
+; numeric-only 4-part form required; dev suffixes must not reach it
+!ifndef SLOOPER_VNUM
+  !define SLOOPER_VNUM "0.0.0"
+!endif
+VIProductVersion "${SLOOPER_VNUM}.0"
 
 Var HaveDesktopShortcut
 
