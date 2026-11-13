@@ -51,9 +51,20 @@ pub struct FxEditor {
     pub stem: String,
     pub name: String,
     pub desc: EffectDesc,
-    /// Keeps the audio instance (and its library) alive while GUIs draw.
-    pub inst: Arc<fx::Instance>,
+    /// The script's custom child window (None = auto sliders). DROP ORDER
+    /// IS LOAD-BEARING: this field's Drop calls the script's
+    /// `gui_destroy(gs)`, which may legitimately touch the EFFECT INSTANCE
+    /// state (the GUI ABI documents "the instance must still be alive" —
+    /// see `fx::EffectGuiRef::destroy`). Rust drops fields in DECLARATION
+    /// order, so `custom` must stay declared ABOVE `inst`: the old order
+    /// (inst first) ran `fns.destroy(state)` 24 bytes before `gui_destroy`
+    /// wrote into the freed block — the ROOT CAUSE of the v20_fx
+    /// "corrupted size vs. prev_size" abort class (valgrind-proved
+    /// 2026-11-13, see docs/WINDOWS-PORT.md session 28). Do not reorder.
     custom: Option<Custom>,
+    /// Keeps the audio instance (and its library) alive while GUIs draw;
+    /// released only AFTER `custom`'s destroy ran (field drop order).
+    pub inst: Arc<fx::Instance>,
     t0: Instant,
     last: f64,
     frame_no: u64,
@@ -141,9 +152,11 @@ impl FxEditor {
 
 impl Drop for Custom {
     fn drop(&mut self) {
-        // The FxEditor's Arc<Instance> is still alive here (field drop runs
-        // after our drop body), which is exactly the guarantee the GUI ABI
-        // documents for instance-state access.
+        // The FxEditor's Arc<Instance> is still alive HERE — because
+        // `custom` is declared before `inst` in FxEditor (field drop =
+        // declaration order). That ordering is the load-bearing guarantee
+        // the GUI ABI documents for instance-state access; the pinned
+        // doc comment on the struct fields says where to look.
         self.gui.destroy(self.gs);
     }
 }
@@ -1107,5 +1120,41 @@ fn unit_suffix(unit: u32) -> &'static str {
         8 => " smp",
         9 => " s",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod drop_order_tests {
+    /// ROOT-CAUSE PIN for the v20_fx "corrupted size vs. prev_size" abort
+    /// class (valgrind 2026-11-13, ubuntu-24.04): Rust drops struct fields
+    /// in DECLARATION order, and the script's `gui_destroy` legitimately
+    /// touches the effect-instance state (ABI: "the instance must still
+    /// be alive"). So the `custom` guard MUST stay declared above `inst`
+    /// — the old order freed the instance state via `fns.destroy` just
+    /// before `gui_destroy` wrote 4 bytes into it (heap-metadata-safe
+    /// until the layout turns it into a SIGABRT: that is why this class
+    /// surfaced only as CI-runner/layout-dependent aborts). This pin
+    /// kills any field "cleanup reorder".
+    #[test]
+    fn v20_fx_editor_drop_order_is_pinned() {
+        let src = include_str!("fxgui.rs");
+        let s = src.find("pub struct FxEditor {").expect("FxEditor struct gone");
+        let body = &src[s..s + src[s..].find("\n}").unwrap()];
+        let c = body
+            .find(concat!("custom: Option<", "Custom>"))
+            .expect("custom field missing/reordered out of the struct");
+        let i = body
+            .find(concat!("inst: Arc<fx::Ins", "tance>"))
+            .expect("inst field missing/reordered out of the struct");
+        assert!(
+            c < i,
+            "DECLARATION ORDER IS LOAD-BEARING: custom (gui.destroy) must \
+             drop BEFORE inst (fns.destroy) — found custom@{c} vs inst@{i}"
+        );
+        assert!(
+            body.contains("LOAD-BEARING"),
+            "the warning comment must survive (it is the only in-code \
+             explanation of WHY the order matters)"
+        );
     }
 }

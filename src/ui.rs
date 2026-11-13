@@ -30947,6 +30947,66 @@ mod tests {
         assert_eq!(ed.asset, None);
     }
 
+    /// v20_fx heap-corruption class, regression smoke (root cause pinned
+    /// in `fxgui::drop_order_tests`): run BOTH script editors (chorus
+    /// then the custom-GUI space_echo) in one process — the exact pair
+    /// that produced the glibc "corrupted size vs. prev_size" aborts —
+    /// then churn malloc hard (that is what made glibc trip). On a broken
+    /// field drop order the editor teardown writes into the freed
+    /// instance state, and this churn converts that latent write into a
+    /// visible crash on allocation-sensitive glibc builds.
+    #[test]
+    fn v20_fx_pair_teardown_survives_heap_churn() {
+        let ctx = egui::Context::default();
+        {
+            let mut a = headless_app("v20chrousA");
+            clear_canvas(&mut a);
+            if a.fx_registry.desc("chorus").is_none() {
+                let dir = a.fx_registry.dir().to_path_buf();
+                std::fs::write(dir.join("chorus.rs"), include_str!("../effects/chorus.rs"))
+                    .unwrap();
+                a.rescan_fx();
+            }
+            a.add_fx_script(0, "chorus");
+            frame(&mut a, &ctx, vec![]);
+            a.open_fx_editor(0, 0);
+            frame(&mut a, &ctx, vec![]);
+            drop(a); // editor + chorus instance die HERE
+        }
+        {
+            let mut b = headless_app("v20spechoB");
+            clear_canvas(&mut b);
+            if b.fx_registry.desc("space_echo").is_none() {
+                let dir = b.fx_registry.dir().to_path_buf();
+                std::fs::write(
+                    dir.join("space_echo.rs"),
+                    include_str!("../effects/space_echo.rs"),
+                )
+                .unwrap();
+                b.rescan_fx();
+            }
+            b.add_fx_script(0, "space_echo");
+            frame(&mut b, &ctx, vec![]);
+            b.open_fx_editor(0, 0); // custom GUI state = the gui_destroy path
+            frame(&mut b, &ctx, vec![]);
+            drop(b); // gui_destroy + instance destroy run in FIELD order
+        }
+        // Malloc/free churn: the metadata trip-wire that surfaced the
+        // corruption as CI-visible aborts.
+        let mut keep: Vec<Vec<f32>> = Vec::new();
+        for k in 0..600 {
+            let mut v: Vec<f32> = vec![k as f32; 333 + (k % 997)];
+            v[7] = 1.0;
+            if k % 3 == 0 {
+                keep.push(v);
+            }
+            // else: dropped here — reused chunks collide with any
+            // dangling-write target.
+        }
+        let sum: f32 = keep.iter().map(|v| v[7]).sum();
+        assert!(sum > 0.0, "churn ran");
+    }
+
     /// R5: the manager's target combo (a `ComboBox::show_ui` site — the
     /// metro_sub silent-drop family) must actually LAND the pick: clicking
     /// a popup row switches the target and runs the rescale path.
