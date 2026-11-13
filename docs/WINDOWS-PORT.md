@@ -529,6 +529,20 @@ Linux); settings round-trip test across OSes; minidump/crash reporting story.
   profile keeps symbols, and `SLOOPER_CRASH_ME=panic|fault` as the
   self-test switch two CI child pins drive. Linux inert, pinned both ways.
 - [ ] native JACK-on-Windows mode — the last unpicked W12 item.
+  Spec for the session that picks it: jack crate's `dynamic_loading`
+  feature (W1 inventory #8 verified it exists for jack-sys 0.5.1) makes
+  libjack a RUNTIME dlopen instead of a link dep, so Windows users who
+  have jackbuilds get native JACK with zero Linux churn — Linux keeps
+  its plain linked jack dep (feature is a Windows-target Cargo seam
+  ONLY: `[target.'cfg(windows)'.dependencies]` + `features =
+  ["dynamic_loading"]`, linux side byte-identical). DLL discovery:
+  try `libjack*.dll` on PATH + `%PROGRAMFILES%\\Jack*` + an optional
+  `SLOOPER_JACK_DLL` override; a jack-less Windows stays 100% WASAPI as
+  shipped (the backend selector in Ports grows a `JACK (native)` entry
+  only when the DLL loads at startup). RT core needs NOTHING — W4 made
+  Proc OS-neutral; the jack.rs ManagerBackend wiring is what gets the
+  dlopen seam. Pins: cfg(windows)-gated load/discovery tests + Linux
+  inertness pin; grow-list baseline must not regress.
 
 ### W13 — Linux distro portability battery (opened 2026-11-12; same protocol)
 
@@ -1505,3 +1519,20 @@ portable asset on the OLDEST distro we support, never the newest.
   tree), deb-asset artifact → release job publishes it. Smoke NOT pinned
   as a Rust test (containers + network = untestable from the lib suite;
   sabotage pair is the pin-equivalent, same ruling as W13a/W13b).
+
+- **2026-11-12 session 23 — W13d VERIFIED BY CI**: draft run
+  `43339509503` — linux job green incl. `Build .deb` (single-line stdout
+  = artifact path) + `.deb smoke`: `DEBSMOKE: all 2 distros PASS`
+  (debian:12 + ubuntu:22.04, apt install from Depends alone, PATH probe,
+  purge clean) on the deb CI itself built; release job published it.
+  Artifact re-verified from the draft release: sha256 head `5ad03c8b…` =
+  the exact bytes the smoke step logged; `dpkg-deb -I` confirms internal
+  `Version: 0.21.0~dev.3879919` + the Depends/Recommends split. FIRST
+  run (43338617221) caught the glob bug: smoke/upload used `slooper_*`
+  but the artifact is `slooper-<ver>_amd64.deb` — an UNMATCHED GLOB
+  stays literal in bash, so the local test (exact path passed) could not
+  see it; CI-only class, note it. Also measured: GitHub sanitizes `~` to
+  `.` in the asset FILENAME (`slooper-0.21.0.dev.X_amd64.deb`) but the
+  dpkg Version field survives untouched — download patterns should use
+  `*_amd64.deb`, never the tilde string. Docker mount gotcha: a `-v`
+  source dir missing on the host is auto-created ROOT-owned.
