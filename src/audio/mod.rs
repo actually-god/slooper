@@ -5009,6 +5009,11 @@ impl Proc {
             && !metro_on
             && !self.preview_live
             && !self.aud_pv_any
+            // v50 R3: a pending seek must still run one block even with
+            // nothing connected — else the consumed seek never lands (the
+            // playhead would freeze while stopped) and automation could
+            // never follow it.
+            && seek.is_none()
         {
             return; // nothing connected, nothing playing: idle
         }
@@ -5315,9 +5320,11 @@ impl Proc {
         // land directly on the live instances' atomics.
         // v34 R11: STOPPING keeps the last automation pass — a pause one
         // sample past an automation clip must not snap every automated
-        // knob back. A play/seek elsewhere re-evaluates at the new
-        // position on the next run block.
-        if transport {
+        // knob back. v50 R3: a SEEK runs the pass too even with the
+        // transport stopped — automation follows the playhead at all
+        // times, so scrubbing onto/over/off a curve applies its values
+        // exactly where the (stationary) playhead now sits.
+        if transport || seek.is_some() {
             self.auto_last = self.eval_automation(p0);
             // v35 R1: automation drives REAL controls (see apply_auto_real).
             self.engine.apply_auto_real(&self.auto_last);
@@ -7789,7 +7796,9 @@ mod w5_tests {
         );
         // The trait default is an empty no-op...
         assert!(
-            src.contains("fn set_midi_inputs(&mut self, _sel: &[String], _tx: &SyncSender<Evt>) {}"),
+            src.contains(
+                "fn set_midi_inputs(&mut self, _sel: &[String], _tx: &SyncSender<Evt>) {}"
+            ),
             "the ManagerBackend default hook changed shape"
         );
         // ...and JACK does NOT override it: Linux keeps its auto-connect
@@ -7803,7 +7812,10 @@ mod w5_tests {
             jack.contains("fn rescan_midi_sources"),
             "Linux auto-connect machinery vanished"
         );
-        assert!(!jack.contains("midiin"), "the W9 bus must not touch the JACK path");
+        assert!(
+            !jack.contains("midiin"),
+            "the W9 bus must not touch the JACK path"
+        );
     }
 
     /// Compile-time proof of the trait default: a session that does not
@@ -7838,7 +7850,8 @@ mod w5_tests {
         assert!(wasapi.contains("midi: self.midi_q.clone(),"));
         assert!(wasapi.contains("midi_q: MidiInQueue::new(),"));
         // Windows overrides the hook; teardown closes devices before COM.
-        assert!(wasapi.contains("fn set_midi_inputs(&mut self, sel: &[String], tx: &SyncSender<Evt>) {"));
+        assert!(wasapi
+            .contains("fn set_midi_inputs(&mut self, sel: &[String], tx: &SyncSender<Evt>) {"));
         let td = wasapi
             .find("fn teardown(&mut self) {")
             .expect("teardown missing");
@@ -7870,7 +7883,10 @@ mod w5_tests {
         let hand = wasapi
             .find("self.proc.process_block(n, evs, &io);")
             .expect("RT loop must hand off to the engine");
-        assert!(feed < spread && spread < hand, "spread sits between drain and hand-off");
+        assert!(
+            feed < spread && spread < hand,
+            "spread sits between drain and hand-off"
+        );
         // The scratch pair is cleared together — positional pairing by construction.
         assert!(wasapi.contains("evs.clear();\n        midi_ts.clear();"));
         // RtCfg gets the stream clock at construction (unique: `Mix.sr` is
@@ -7967,8 +7983,16 @@ mod w12a_tests {
             wait < guard && guard < math,
             "the dead-handle wait must be checked BEFORE the index arithmetic"
         );
-        // the guard stores a fault and breaks — never falls through
-        assert!(src[guard..guard + 400].contains("self.fault.store(rt_recovery::FAULT_DEVICE"));
+        // the guard stores a fault and breaks — never falls through.
+        // Whitespace-insensitive: rustfmt may wrap the store call.
+        let win: String = src[guard..guard + 600]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            win.contains("self.fault.store(rt_recovery::FAULT_DEVICE,Ordering::SeqCst);"),
+            "guard must store the device-loss fault"
+        );
     }
 
     #[test]
@@ -7976,7 +8000,8 @@ mod w12a_tests {
         let src = wasapi();
         // render + capture arms each store the CLASSIFIED code...
         assert_eq!(
-            src.matches("self.fault.store(f.code, Ordering::SeqCst);").count(),
+            src.matches("self.fault.store(f.code, Ordering::SeqCst);")
+                .count(),
             2
         );
         // ...from the one-HRESULT classifier (exact call-site shape: a bare
@@ -7992,7 +8017,10 @@ mod w12a_tests {
         let start = src
             .find("fn idle(&mut self, tx: &SyncSender<Evt>) {")
             .expect("idle lost its recovery-aware signature");
-        let end = start + src[start..].find("fn set_midi_inputs").expect("idle region end");
+        let end = start
+            + src[start..]
+                .find("fn set_midi_inputs")
+                .expect("idle region end");
         let body = &src[start..end];
         for shape in [
             "self.fault.swap(rt_recovery::FAULT_NONE, Ordering::SeqCst)",
@@ -8013,7 +8041,11 @@ mod w12a_tests {
                 .count(),
             1
         );
-        assert_eq!(src.matches("self.rt_spawn = Some(std::time::Instant::now());").count(), 1);
+        assert_eq!(
+            src.matches("self.rt_spawn = Some(std::time::Instant::now());")
+                .count(),
+            1
+        );
         // The clear lives in the ok_out == 0 branch (before the render
         // endpoint is resolved), not somewhere the recovery could hit.
         let silence = src[src.find("fn apply(&mut self").expect("apply missing")..]

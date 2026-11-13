@@ -76,10 +76,7 @@ mod tests {
     fn patch() -> Patch {
         (
             vec!["Mic (L)".to_string()],
-            vec![
-                ("DAC (L)".to_string(), 0),
-                ("DAC (R)".to_string(), 1),
-            ],
+            vec![("DAC (L)".to_string(), 0), ("DAC (R)".to_string(), 1)],
         )
     }
 
@@ -88,7 +85,10 @@ mod tests {
         // Even with a live patch and budget, a stop-event death (fault 0)
         // must never trigger a re-Apply — the user stopped it, not the wire.
         let p = patch();
-        assert_eq!(plan(FAULT_NONE, Some(&p), true, RETRY_BUDGET), IdleRecovery::Nothing);
+        assert_eq!(
+            plan(FAULT_NONE, Some(&p), true, RETRY_BUDGET),
+            IdleRecovery::Nothing
+        );
     }
 
     #[test]
@@ -122,8 +122,14 @@ mod tests {
         let p = patch();
         // Budget present or not: a gone endpoint is never retried, and the
         // message arm does not depend on the budget.
-        assert_eq!(plan(FAULT_DEVICE, Some(&p), false, RETRY_BUDGET), IdleRecovery::DeviceGone);
-        assert_eq!(plan(FAULT_STREAM, Some(&p), false, 0), IdleRecovery::DeviceGone);
+        assert_eq!(
+            plan(FAULT_DEVICE, Some(&p), false, RETRY_BUDGET),
+            IdleRecovery::DeviceGone
+        );
+        assert_eq!(
+            plan(FAULT_STREAM, Some(&p), false, 0),
+            IdleRecovery::DeviceGone
+        );
     }
 
     #[test]
@@ -136,7 +142,10 @@ mod tests {
     fn w12a_plan_no_history_nothing() {
         // Faulty death without a recorded patch (never applied, or an
         // explicit silence patch) recovers nothing.
-        assert_eq!(plan(FAULT_DEVICE, None, true, RETRY_BUDGET), IdleRecovery::Nothing);
+        assert_eq!(
+            plan(FAULT_DEVICE, None, true, RETRY_BUDGET),
+            IdleRecovery::Nothing
+        );
         assert_eq!(plan(FAULT_STREAM, None, false, 0), IdleRecovery::Nothing);
     }
 

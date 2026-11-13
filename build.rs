@@ -21,9 +21,7 @@ fn main() {
     } else {
         ""
     };
-    println!(
-        "cargo:rustc-env=SLOOPER_EXE_PATH={target}/{profile}/slooper{sfx}"
-    );
+    println!("cargo:rustc-env=SLOOPER_EXE_PATH={target}/{profile}/slooper{sfx}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // W11: embed the app icon (+ version info; winresource 0.1.34 adds
         // no manifest by default on either path — proved: RT_MANIFEST 0 in

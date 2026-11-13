@@ -221,7 +221,11 @@ impl Pattern {
         for b in &self.bends {
             ev.push((
                 b.at,
-                vec![0xE0 | b.ch & 0xF, (b.val & 0x7F) as u8, ((b.val >> 7) & 0x7F) as u8],
+                vec![
+                    0xE0 | b.ch & 0xF,
+                    (b.val & 0x7F) as u8,
+                    ((b.val >> 7) & 0x7F) as u8,
+                ],
             ));
         }
         for p in &self.polys {
@@ -500,12 +504,35 @@ mod tests {
     #[test]
     fn v42_merged_with_layers_every_lane() {
         let mut a = Pattern::new(120);
-        a.notes.push(Note { ch: 0, note: 60, vel: 90, press: 0, start: 0, len: 96 });
-        a.bends.push(Bend { ch: 0, val: 8192, at: 10 });
+        a.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 90,
+            press: 0,
+            start: 0,
+            len: 96,
+        });
+        a.bends.push(Bend {
+            ch: 0,
+            val: 8192,
+            at: 10,
+        });
         let mut b = Pattern::new(120);
         b.len_ticks = 8 * 4 * PPQ as u32;
-        b.notes.push(Note { ch: 1, note: 64, vel: 70, press: 0, start: 24, len: 48 });
-        b.polys.push(Poly { ch: 0, note: 60, val: 33, at: 5 });
+        b.notes.push(Note {
+            ch: 1,
+            note: 64,
+            vel: 70,
+            press: 0,
+            start: 24,
+            len: 48,
+        });
+        b.polys.push(Poly {
+            ch: 0,
+            note: 60,
+            val: 33,
+            at: 5,
+        });
         let m = a.merged_with(&b);
         assert_eq!(m.notes.len(), 2, "both notes keep sounding");
         assert_eq!(m.notes[0].note, 60);
@@ -651,17 +678,18 @@ mod tests {
             val: 8392,
             at: 100,
         });
-        p.bends.push(Bend { ch: 3, val: 0, at: 200 });
+        p.bends.push(Bend {
+            ch: 3,
+            val: 0,
+            at: 200,
+        });
         p.polys.push(Poly {
             ch: 5,
             note: 64,
             val: 77,
             at: 150,
         });
-        let f = std::env::temp_dir().join(format!(
-            "sp-mpe-rt-{}.mid",
-            std::process::id()
-        ));
+        let f = std::env::temp_dir().join(format!("sp-mpe-rt-{}.mid", std::process::id()));
         p.save_mid(&f).unwrap();
         let q = Pattern::load_mid(&f).unwrap();
         assert_eq!(q.bends, p.bends, "bend lane round trip");

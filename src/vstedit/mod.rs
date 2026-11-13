@@ -56,7 +56,11 @@ pub use win32::*;
 /// A degenerate scale (0 / negative / NaN — hand-built contexts only)
 /// degrades to 1:1 instead of producing an infinite slot.
 pub fn editor_slot_points(size_px: (i32, i32), ppp: f32) -> (f32, f32) {
-    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
     (size_px.0.max(8) as f32 / ppp, size_px.1.max(8) as f32 / ppp)
 }
 
@@ -72,8 +76,7 @@ mod seam_tests {
     /// source-scan pin, and cut the `#[cfg(test)]` tail so the pins' OWN
     /// match-strings can never self-satisfy (the w5/w6/w7 pattern).
     fn code_lines(path: &str) -> String {
-        let src = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let body = src.split("\n#[cfg(test)]").next().unwrap_or("");
         body.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -82,11 +85,7 @@ mod seam_tests {
     }
 
     fn twin_path(os: &str) -> String {
-        format!(
-            "{}/src/vstedit/{}.rs",
-            env!("CARGO_MANIFEST_DIR"),
-            os
-        )
+        format!("{}/src/vstedit/{}.rs", env!("CARGO_MANIFEST_DIR"), os)
     }
 
     /// Every `pub`/`pub(crate)` item name the twin exports (top-level fns,
@@ -95,7 +94,13 @@ mod seam_tests {
         let mut out = std::collections::BTreeSet::new();
         for l in code.lines() {
             let t = l.trim_start();
-            for pre in ["pub fn ", "pub(crate) fn ", "pub struct ", "pub enum ", "pub type "] {
+            for pre in [
+                "pub fn ",
+                "pub(crate) fn ",
+                "pub struct ",
+                "pub enum ",
+                "pub type ",
+            ] {
                 if let Some(rest) = t.strip_prefix(pre) {
                     let name: String = rest
                         .chars()
@@ -165,9 +170,15 @@ mod seam_tests {
     #[test]
     fn w8_x11_ffi_sealed_to_the_unix_twin() {
         let w = code_lines(&twin_path("win32"));
-        for forbidden in
-            ["XOpenDisplay", "X11", "from_x11", "libc::", "fork(", "XGetImage", "os::unix"]
-        {
+        for forbidden in [
+            "XOpenDisplay",
+            "X11",
+            "from_x11",
+            "libc::",
+            "fork(",
+            "XGetImage",
+            "os::unix",
+        ] {
             assert!(
                 !w.contains(forbidden),
                 "win32 twin references {forbidden} — X/POSIX leaked across the seam"
@@ -175,11 +186,22 @@ mod seam_tests {
         }
         // mod.rs gates each twin by OS, and the x11 twin keeps the Linux
         // machinery it shipped with (split-day markers).
-        let mc = code_lines(&format!("{}/src/vstedit/mod.rs", env!("CARGO_MANIFEST_DIR")));
+        let mc = code_lines(&format!(
+            "{}/src/vstedit/mod.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ));
         assert!(mc.contains("#[cfg(unix)]\nmod x11;"), "x11 twin ungated!");
-        assert!(mc.contains("#[cfg(windows)]\nmod win32;"), "win32 twin ungated!");
+        assert!(
+            mc.contains("#[cfg(windows)]\nmod win32;"),
+            "win32 twin ungated!"
+        );
         let x = code_lines(&twin_path("x11"));
-        for marker in ["install_x_error_handler", "drain_events", "XGetImage", "from_x11"] {
+        for marker in [
+            "install_x_error_handler",
+            "drain_events",
+            "XGetImage",
+            "from_x11",
+        ] {
             assert!(x.contains(marker), "x11 twin lost {marker}");
         }
     }
@@ -287,7 +309,10 @@ mod seam_tests {
     #[test]
     fn w8b_embed_wiring_is_seamed() {
         let w = code_lines(&twin_path("win32"));
-        assert!(w.contains("fn create_container"), "win32 lost create_container");
+        assert!(
+            w.contains("fn create_container"),
+            "win32 lost create_container"
+        );
         assert!(w.contains("WS_CHILD"), "child mode lost WS_CHILD");
         assert!(
             w.matches("create_container(").count() >= 3,
@@ -301,7 +326,10 @@ mod seam_tests {
             "the predicate must ride the Config-backed switch"
         );
         assert!(ui.contains("embed_requested()"), "ui lost the env override");
-        assert!(ui.contains("main_thread_hwnd()"), "ui lost the embed parent grab");
+        assert!(
+            ui.contains("main_thread_hwnd()"),
+            "ui lost the embed parent grab"
+        );
         assert!(ui.contains("set_embed_parent(p)"), "ui lost the open wrap");
         // W8b p2-a: the Config switch is persisted and offered (the
         // settings row is Windows-gated, but the seam lives cross-OS).
@@ -314,7 +342,9 @@ mod seam_tests {
             cfg.contains("pub win_editor_embed: bool"),
             "Config lost the win_editor_embed field"
         );
-        let pos = ui.find("set_container_rect(").expect("ui must sync embed rects");
+        let pos = ui
+            .find("set_container_rect(")
+            .expect("ui must sync embed rects");
         let window = &ui[pos.saturating_sub(240)..pos];
         assert!(
             window.contains("vsthost::post"),
@@ -325,7 +355,9 @@ mod seam_tests {
             ui.contains("fn embed_sync_pass"),
             "the geometry/visibility sync must be its own pass"
         );
-        let sf = ui.find("side_frames(ui, self);").expect("side_frames call site");
+        let sf = ui
+            .find("side_frames(ui, self);")
+            .expect("side_frames call site");
         let after_sf = &ui[sf..];
         let cp = after_sf
             .find("central_panels(ui, self);")
@@ -335,8 +367,13 @@ mod seam_tests {
             "embed_sync_pass must land between side_frames and central_panels \
              (docked bodies record their slot in side_frames)"
         );
-        assert!(ui.contains("embed_parent_origin("), "chrome must subtract the parent client origin");
-        let vis = ui.find("set_container_visible(").expect("hide policy must call set_container_visible");
+        assert!(
+            ui.contains("embed_parent_origin("),
+            "chrome must subtract the parent client origin"
+        );
+        let vis = ui
+            .find("set_container_visible(")
+            .expect("hide policy must call set_container_visible");
         let visw = &ui[vis.saturating_sub(240)..vis];
         assert!(
             visw.contains("vsthost::post"),
@@ -361,8 +398,7 @@ mod seam_tests {
             "embed pass must skip the float chrome when docked and draw it otherwise"
         );
         assert!(
-            ui.contains("fn chrome_closing_close")
-                && ui.contains("chrome_closing.contains(&xid)"),
+            ui.contains("fn chrome_closing_close") && ui.contains("chrome_closing.contains(&xid)"),
             "close-in-flight suppression must gate both the float and dock paths"
         );
         // Hide policy inputs (v1): any open menu/popup area or a carry.
@@ -381,7 +417,9 @@ mod seam_tests {
             ebw.contains("crate::vstedit::container_is_detached(xid)"),
             "embed_body must read the live style for the placeholder"
         );
-        let rd = ebw.find("redock_to_embed(").expect("placeholder must offer the way back");
+        let rd = ebw
+            .find("redock_to_embed(")
+            .expect("placeholder must offer the way back");
         assert!(
             ebw[..rd].contains("vsthost::post"),
             "redock_to_embed must run on the vst2-gui thread via vsthost::post"
@@ -433,7 +471,10 @@ mod seam_tests {
     fn w12c_slot_points_identity_at_100_percent() {
         // The historical semantics: at scale 1.0 nothing moves — the
         // pre-W12c point-equals-px reading is exactly preserved there.
-        assert_eq!(crate::vstedit::editor_slot_points((900, 480), 1.0), (900.0, 480.0));
+        assert_eq!(
+            crate::vstedit::editor_slot_points((900, 480), 1.0),
+            (900.0, 480.0)
+        );
         assert_eq!(crate::vstedit::editor_slot_points((8, 8), 1.0), (8.0, 8.0));
     }
 
@@ -463,11 +504,17 @@ mod seam_tests {
         // means 1:1, the honest pre-DPI reading.
         for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
             let got = crate::vstedit::editor_slot_points((900, 480), bad);
-            assert!(got.0.is_finite() && got.1.is_finite(), "slot went non-finite at ppp {bad}");
+            assert!(
+                got.0.is_finite() && got.1.is_finite(),
+                "slot went non-finite at ppp {bad}"
+            );
             assert_eq!(got, (900.0, 480.0), "degenerate ppp must mean 1:1");
         }
         // And the 8 px floor survives the smallest nonsense.
-        assert_eq!(crate::vstedit::editor_slot_points((0, -100), 1.0), (8.0, 8.0));
+        assert_eq!(
+            crate::vstedit::editor_slot_points((0, -100), 1.0),
+            (8.0, 8.0)
+        );
     }
 
     #[test]

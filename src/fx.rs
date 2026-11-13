@@ -842,9 +842,7 @@ struct EffectFns {
         ) -> f32,
     >,
     /// Tier-6 ABI v4 block-rate transport push (None for v1..v3 scripts).
-    set_sync: Option<
-        extern "C" fn(state: *mut core::ffi::c_void, sync: *const SyncInfoV1),
-    >,
+    set_sync: Option<extern "C" fn(state: *mut core::ffi::c_void, sync: *const SyncInfoV1)>,
     /// Tier-6 display metadata table (NULL for v1..v3 scripts). Borrows
     /// the script's read-only image, which the leaked LibHandle keeps
     /// mapped for the process lifetime.
@@ -1046,7 +1044,11 @@ impl Instance {
     /// strings borrow script-owned statics and live exactly as long as
     /// this instance.
     pub fn param_meta(&self, k: usize) -> ParamMetaView<'_> {
-        let mut v = ParamMetaView { unit: 0, step: 0.0, labels: Vec::new() };
+        let mut v = ParamMetaView {
+            unit: 0,
+            step: 0.0,
+            labels: Vec::new(),
+        };
         if self.fns.param_meta.is_null() || k >= self.n_params {
             return v;
         }
@@ -1110,11 +1112,11 @@ impl Instance {
         params: &[f32; MAX_PARAMS],
         sc: f32,
     ) -> (f32, f32) {
-                        match self.fns.process_st {
+        match self.fns.process_st {
             Some(f) => {
                 let mut or = 0.0f32;
                 let ol = f(self.state, l, r, params.as_ptr(), sc, &mut or);
-                                (ol, or)
+                (ol, or)
             }
             None => {
                 let y = match self.fns.process_sc {
@@ -1423,10 +1425,10 @@ impl Registry {
             .unwrap_or_default()
             .hash(&mut h);
         let stamp = h.finish();
-        Ok(self.dir.join(".build").join(format!(
-            "{stem}-{stamp:016x}.{}",
-            crate::paths::dylib_ext()
-        )))
+        Ok(self
+            .dir
+            .join(".build")
+            .join(format!("{stem}-{stamp:016x}.{}", crate::paths::dylib_ext())))
     }
 
     /// Delete older artifacts of the same stem (best-effort; deleting a
@@ -1580,64 +1582,64 @@ unsafe fn validate(
                 .unwrap()
         }
         Err(_) => match lib.get(ENTRY_V3) {
-        Ok(s) => {
-            let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV3> = s;
-            let p = s();
-            if p.is_null() {
-                return Err("slooper_effect_info_v3 returned null".into());
+            Ok(s) => {
+                let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV3> = s;
+                let p = s();
+                if p.is_null() {
+                    return Err("slooper_effect_info_v3 returned null".into());
+                }
+                let v3 = &*p;
+                if v3.abi != ABI_VERSION_V3 {
+                    return Err(format!(
+                        "effect ABI v3 version {} (this slooper speaks v3 = {ABI_VERSION_V3})",
+                        v3.abi
+                    ));
+                }
+                process_sc = Some(v3.process_sc);
+                process_st = Some(v3.process_st);
+                std::mem::transmute::<*const EffectInfoV3, *const EffectInfoV1>(v3)
+                    .as_ref()
+                    .unwrap()
             }
-            let v3 = &*p;
-            if v3.abi != ABI_VERSION_V3 {
-                return Err(format!(
-                    "effect ABI v3 version {} (this slooper speaks v3 = {ABI_VERSION_V3})",
-                    v3.abi
-                ));
-            }
-            process_sc = Some(v3.process_sc);
-            process_st = Some(v3.process_st);
-            std::mem::transmute::<*const EffectInfoV3, *const EffectInfoV1>(v3)
-                .as_ref()
-                .unwrap()
-        }
-        Err(_) => match lib.get(ENTRY_V2) {
-        Ok(s) => {
-            let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV2> = s;
-            let p = s();
-            if p.is_null() {
-                return Err("slooper_effect_info_v2 returned null".into());
-            }
-            let v2 = &*p;
-            if v2.abi != ABI_VERSION_V2 {
-                return Err(format!(
-                    "effect ABI v2 version {} (this slooper speaks v2 = {ABI_VERSION_V2})",
-                    v2.abi
-                ));
-            }
-            process_sc = Some(v2.process_sc);
-            std::mem::transmute::<*const EffectInfoV2, *const EffectInfoV1>(v2)
-                .as_ref()
-                .unwrap()
-        }
-        Err(_) => {
-            let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> =
-                lib.get(ENTRY).map_err(|_| {
-                    "missing entry point slooper_effect_info — see template.rs".to_string()
-                })?;
-            let info = sym();
-            if info.is_null() {
-                return Err("slooper_effect_info returned null".into());
-            }
-            let d = &*info;
-            if d.abi != ABI_VERSION {
-                return Err(format!(
-                    "effect ABI version {} (this slooper speaks {ABI_VERSION})",
-                    d.abi
-                ));
-            }
-            d
-            }
-        }
-        }
+            Err(_) => match lib.get(ENTRY_V2) {
+                Ok(s) => {
+                    let s: libloading::Symbol<extern "C" fn() -> *const EffectInfoV2> = s;
+                    let p = s();
+                    if p.is_null() {
+                        return Err("slooper_effect_info_v2 returned null".into());
+                    }
+                    let v2 = &*p;
+                    if v2.abi != ABI_VERSION_V2 {
+                        return Err(format!(
+                            "effect ABI v2 version {} (this slooper speaks v2 = {ABI_VERSION_V2})",
+                            v2.abi
+                        ));
+                    }
+                    process_sc = Some(v2.process_sc);
+                    std::mem::transmute::<*const EffectInfoV2, *const EffectInfoV1>(v2)
+                        .as_ref()
+                        .unwrap()
+                }
+                Err(_) => {
+                    let sym: libloading::Symbol<extern "C" fn() -> *const EffectInfoV1> =
+                        lib.get(ENTRY).map_err(|_| {
+                            "missing entry point slooper_effect_info — see template.rs".to_string()
+                        })?;
+                    let info = sym();
+                    if info.is_null() {
+                        return Err("slooper_effect_info returned null".into());
+                    }
+                    let d = &*info;
+                    if d.abi != ABI_VERSION {
+                        return Err(format!(
+                            "effect ABI version {} (this slooper speaks {ABI_VERSION})",
+                            d.abi
+                        ));
+                    }
+                    d
+                }
+            },
+        },
     };
     let name = read_cstr(d.name).ok_or("effect has no name — DESC.name must be text")?;
     let author = d.author.cast_non_null().and_then(read_cstr);
@@ -3318,7 +3320,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // seeded into the user preset folder).
         let se = builtin_presets("space_echo");
         assert_eq!(se.len(), 5, "five shipped rooms: {se:?}");
-        assert_eq!(se[0].1.len(), 12, "every room sets all twelve params (tier 5 appended width)");
+        assert_eq!(
+            se[0].1.len(),
+            12,
+            "every room sets all twelve params (tier 5 appended width)"
+        );
     }
 
     /// AC5.2: a default preset lands on a REAL compiled EQ instance —
@@ -3536,8 +3542,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // Sidechain path: the v2 entry must run with a live key signal.
         for stem in ["sidechain_comp", "vocoder"] {
             let inst = reg
-                .create_instance(stem, sr, &[]
-                )
+                .create_instance(stem, sr, &[])
                 .unwrap_or_else(|| panic!("{stem}: no instance"));
             for (i, &x) in fixture.iter().take(4410).enumerate() {
                 let sc = if i < 2200 { x } else { 0.0 };
@@ -3571,7 +3576,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             for (i, &x) in fixture.iter().enumerate() {
                 // Left-only feed, with occasional right content too so
                 // internal side-branches (delay lines) see both rails.
-                let (l, r) = if i % 7000 < 3500 { (x, 0.0) } else { (x * 0.5, x) };
+                let (l, r) = if i % 7000 < 3500 {
+                    (x, 0.0)
+                } else {
+                    (x * 0.5, x)
+                };
                 // Tier-5b: feed a LIVE key — a v3 script that wants the
                 // sidechain (vocoder) reads the `sc` arg of process_st,
                 // and sc=0 legitimately mutes it (silent-modulator design),
@@ -3587,7 +3596,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             assert!(peak <= 4.0, "{stem}: st peak {peak} out of range");
             assert!(rms > 1e-5, "{stem}: st path silent (rms {rms})");
             let decor = (depro / n as f64).sqrt();
-            assert!(decor > 1e-3, "{stem}: st path never decorrelated L/R ({decor})");
+            assert!(
+                decor > 1e-3,
+                "{stem}: st path never decorrelated L/R ({decor})"
+            );
             drop(inst);
         }
         assert!(
@@ -3650,14 +3662,17 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         drop(inst);
 
         // ---- echo3 ping-pong (v3): the R echo lags pp * 320 ms --------
-        let inst = reg.create_instance("echo3", sr, &[]).expect("echo3 st inst");
+        let inst = reg
+            .create_instance("echo3", sr, &[])
+            .expect("echo3 st inst");
         let mut dp = [0.0f32; MAX_PARAMS];
         for (k, pd) in reg.desc("echo3").unwrap().params.iter().enumerate() {
             dp[k] = pd.default;
         }
         let (mut yl, mut yr) = (Vec::new(), Vec::new());
         for i in 0..n {
-            let (l, r) = unsafe { inst.call_sample_st(if i == 100 { 1.0 } else { 0.0 }, 0.0, &dp, 0.0) };
+            let (l, r) =
+                unsafe { inst.call_sample_st(if i == 100 { 1.0 } else { 0.0 }, 0.0, &dp, 0.0) };
             yl.push(l);
             yr.push(r);
         }
@@ -3701,7 +3716,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // ---- flanger comb rings with feedback --------------------------
         let burst_rms_fl = |fb: f32| -> f64 {
             let p = [0.22, 0.7, 1.8, fb, 3.0, 0.5, 1.0];
-            let inst = reg.create_instance("flanger", sr, &p).expect("flanger inst");
+            let inst = reg
+                .create_instance("flanger", sr, &p)
+                .expect("flanger inst");
             let mut e = 0.0f64;
             let m = (sr * 1.0) as usize;
             for i in 0..m {
@@ -3797,7 +3814,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         dp[9] = 0.6; // echo
         dp[10] = 0.0; // verb off
         let (yl, yr) = {
-            let inst = reg.create_instance("space_echo", sr, &dp).expect("echo inst");
+            let inst = reg
+                .create_instance("space_echo", sr, &dp)
+                .expect("echo inst");
             let mut p = dp;
             p[11] = 1.0;
             let (mut yl, mut yr) = (Vec::with_capacity(n), Vec::with_capacity(n));
@@ -3883,15 +3902,23 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         };
         let (tl, tr, td) = tail(&yl, &yr);
         let mean_tail = (tl + tr) * 0.5;
-        eprintln!("T5 tail w1: L {tl} R {tr} D {td} ratio {}", td / mean_tail.max(1e-12));
-        assert!(mean_tail > 1e-4, "space_echo room tail died (rms {mean_tail})");
+        eprintln!(
+            "T5 tail w1: L {tl} R {tr} D {td} ratio {}",
+            td / mean_tail.max(1e-12)
+        );
+        assert!(
+            mean_tail > 1e-4,
+            "space_echo room tail died (rms {mean_tail})"
+        );
         assert!(
             td > mean_tail * 0.35,
             "stereo room tail never decorrelated (dif {td} vs tail {mean_tail})"
         );
         // Hard-panned input keeps its side (echo re-opened for this one:
         // a source hard-panned left must ECHO left, not split).
-        let inst = reg.create_instance("space_echo", sr, &dp).expect("pan inst");
+        let inst = reg
+            .create_instance("space_echo", sr, &dp)
+            .expect("pan inst");
         let mut p1 = dp;
         p1[9] = 0.6; // echo on
         p1[10] = 0.0; // verb off
@@ -3901,7 +3928,8 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // the echo must arrive LEFT, with (at width 1) little in R.
         let (w0, w1) = (900usize, (t + 600.0) as usize);
         for i in 0..w1 {
-            let (l, r) = unsafe { inst.call_sample_st(if i == 100 { 1.0 } else { 0.0 }, 0.0, &p1, 0.0) };
+            let (l, r) =
+                unsafe { inst.call_sample_st(if i == 100 { 1.0 } else { 0.0 }, 0.0, &p1, 0.0) };
             if i >= w0 {
                 pl += (l as f64) * (l as f64);
                 pr += (r as f64) * (r as f64);
@@ -3909,14 +3937,23 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         }
         drop(inst);
         eprintln!("T5 pan L-energy {pl} R-energy {pr}");
-        assert!(pr < pl * 0.5, "L-only feed did not stay left in the echo (L {pl} R {pr})");
+        assert!(
+            pr < pl * 0.5,
+            "L-only feed did not stay left in the echo (L {pl} R {pr})"
+        );
 
         // ---- 2b. width = 0 => BIT-IDENTICAL tail (exact mono) -----------
         let (wl, wr) = run_st(0.0);
         let (tl0, tr0, td0) = tail(&wl, &wr);
-        let exact = wl.iter().zip(wr.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
+        let exact = wl
+            .iter()
+            .zip(wr.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
         eprintln!("T5 tail w0: L {tl0} R {tr0} D {td0} bitexact {exact}");
-        assert!(td0 == 0.0 && exact, "width 0 is not an exact mono tail (dif {td0})");
+        assert!(
+            td0 == 0.0 && exact,
+            "width 0 is not an exact mono tail (dif {td0})"
+        );
 
         // ---- 3. v1 fallback == ST path LEFT at default width ------------
         // Self-contained pair of fresh runs (same frozen params) so the
@@ -3936,7 +3973,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             }
             drop(st);
             drop(mono);
-            assert!(exact3, "v1 mono path drifted from the ST path's left channel");
+            assert!(
+                exact3,
+                "v1 mono path drifted from the ST path's left channel"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3977,10 +4017,16 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert_eq!(d.params.len(), 12);
         for (k, (lab, def)) in want.into_iter().enumerate() {
             assert_eq!(d.params[k].label, lab, "param {k} label changed");
-            assert!((d.params[k].default - def).abs() < 1e-6, "param {k} default changed");
+            assert!(
+                (d.params[k].default - def).abs() < 1e-6,
+                "param {k} default changed"
+            );
         }
         assert!(d.stereo, "tier-5 space_echo is an ABI-v3 script");
-        assert!(!d.sidechain, "v3 flag semantics: sidechain is exact-v2-only");
+        assert!(
+            !d.sidechain,
+            "v3 flag semantics: sidechain is exact-v2-only"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4024,7 +4070,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             let d = reg.desc(stem).unwrap_or_else(|| panic!("{stem} missing"));
             assert!(d.stereo, "{stem}: must load as an ABI-v3 stereo script");
             assert!(!d.sidechain, "{stem}: sidechain flag is exact-v2-only");
-            assert_eq!(d.params.len(), 8, "{stem}: seven sticky params + appended spread");
+            assert_eq!(
+                d.params.len(),
+                8,
+                "{stem}: seven sticky params + appended spread"
+            );
             assert_eq!(d.params[7].label, "spread", "param 7 appended as 'spread'");
             assert!(
                 (d.params[7].default - 0.5).abs() < 1e-6,
@@ -4090,7 +4140,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             }
             drop(st);
             drop(mono);
-            assert_eq!(drift, 0, "{stem}: v1 mono path drifted from the ST left channel");
+            assert_eq!(
+                drift, 0,
+                "{stem}: v1 mono path drifted from the ST left channel"
+            );
         }
 
         // 4. Flanger image: hard-panned L — the DRY click stays exactly
@@ -4171,9 +4224,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // ---- shared shape: bit-exact 0, decor floor, hard-pan image,
         // fallback identity — for the three true-rail scripts.
         // (stem, spread idx, decor floor, extra param tweak)
-        for (stem, sidx, min_decor, tweak) in
-            [("shifter", 4usize, 0.6f64, 0.0f32), ("gater", 7, 0.5, 0.0), ("pitchshft", 10, 0.6, 5.0)]
-        {
+        for (stem, sidx, min_decor, tweak) in [
+            ("shifter", 4usize, 0.6f64, 0.0f32),
+            ("gater", 7, 0.5, 0.0),
+            ("pitchshft", 10, 0.6, 5.0),
+        ] {
             let d = reg.desc(stem).unwrap_or_else(|| panic!("{stem} missing"));
             assert!(d.stereo, "{stem}: must load as an ABI-v3 stereo script");
             assert!(!d.sidechain, "{stem}: sidechain flag is exact-v2-only");
@@ -4244,7 +4299,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 ermax = ermax.max(r.abs());
             }
             drop(inst);
-            assert_eq!(ermax, 0.0, "{stem}: hard-panned L leaked {ermax} into the R rail");
+            assert_eq!(
+                ermax, 0.0,
+                "{stem}: hard-panned L leaked {ermax} into the R rail"
+            );
 
             // 4. v1 fallback == ST path LEFT, bit-for-bit.
             let st = reg.create_instance(stem, sr, &dp).expect("st5b");
@@ -4259,7 +4317,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             }
             drop(st);
             drop(mono);
-            assert_eq!(drift, 0, "{stem}: v1 mono path drifted from the ST left channel");
+            assert_eq!(
+                drift, 0,
+                "{stem}: v1 mono path drifted from the ST left channel"
+            );
         }
 
         // ---- vocoder: shared envelopes + antisymmetric band interleave.
@@ -4267,7 +4328,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             let stem = "vocoder";
             let d = reg.desc(stem).unwrap();
             assert!(d.stereo, "vocoder must load through the v3 entry");
-            assert!(!d.sidechain, "vocoder flags stereo, never sidechain (tier-3b semantics)");
+            assert!(
+                !d.sidechain,
+                "vocoder flags stereo, never sidechain (tier-3b semantics)"
+            );
             let dp = defp(stem);
             assert_eq!(dp[8], 0.5, "vocoder spread default 0.5");
             // Carrier AND key ride the same noise stream (envs must open).
@@ -4290,7 +4354,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 .zip(&zr)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            assert_eq!(bad, 0, "vocoder: spread 0 is not an exact-mono output ({bad} differing)");
+            assert_eq!(
+                bad, 0,
+                "vocoder: spread 0 is not an exact-mono output ({bad} differing)"
+            );
 
             let (yl, yr) = run(0.5);
             let (mut el, mut er, mut ed) = (0.0f64, 0.0f64, 0.0f64);
@@ -4302,7 +4369,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             let m = 10000.0;
             let decor = (ed / m).sqrt() / (((el / m).sqrt() + (er / m).sqrt()) * 0.5).max(1e-12);
             eprintln!("T5b vocoder decor {decor}");
-            assert!(decor > 0.25, "vocoder: band interleave never split the sides (D/RMS {decor})");
+            assert!(
+                decor > 0.25,
+                "vocoder: band interleave never split the sides (D/RMS {decor})"
+            );
 
             // Downmix invariance: (L+R)/2 == the v2 mono circuit (a fresh
             // process_sc instance) — the side component must be exactly
@@ -4390,7 +4460,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 ("spread (R lane offset x180deg)", 0.5),
                 ("host", 0.0),
             ];
-            assert_eq!(d.params.len(), want.len(), "gater: 9 params after host append");
+            assert_eq!(
+                d.params.len(),
+                want.len(),
+                "gater: 9 params after host append"
+            );
             for (k, (lab, def)) in want.iter().enumerate() {
                 assert_eq!(&d.params[k].label, lab, "gater: param {k} label changed");
                 assert!(
@@ -4433,8 +4507,13 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         reg.rescan();
 
         // ---- meta surfaces host-side ------------------------------------
-        let g = reg.create_instance("gater", 48000.0, &[]).expect("gater inst");
-        assert_eq!(g.param_meta(1).labels, vec!["sine", "tri", "pulse", "pluck", "rnd"]);
+        let g = reg
+            .create_instance("gater", 48000.0, &[])
+            .expect("gater inst");
+        assert_eq!(
+            g.param_meta(1).labels,
+            vec!["sine", "tri", "pulse", "pluck", "rnd"]
+        );
         assert_eq!(g.param_meta(8).labels, vec!["free", "song"]);
         assert_eq!(g.param_meta(0).unit, SLOOPER_UNIT_HZ);
         assert_eq!(g.param_meta(3).unit, SLOOPER_UNIT_MS);
@@ -4452,13 +4531,24 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert_eq!(g.fmt_param(8, 0.0, 0.0, 1.0), "free");
         assert_eq!(g.fmt_param(8, 1.0, 0.0, 1.0), "song");
         drop(g);
-        let o = reg.create_instance("overdrive", 48000.0, &[]).expect("drive inst");
-        assert_eq!(o.param_meta(1).labels, vec!["soft sat", "hard clip", "fold", "silky"]);
+        let o = reg
+            .create_instance("overdrive", 48000.0, &[])
+            .expect("drive inst");
+        assert_eq!(
+            o.param_meta(1).labels,
+            vec!["soft sat", "hard clip", "fold", "silky"]
+        );
         drop(o);
         let od = reg.desc("overdrive").unwrap();
         assert!(!od.stereo, "v4 declared-mono flag must stick");
-        assert!(!od.sidechain, "graceful process_sc must not read as sidechain");
-        assert!(reg.desc("panmatic").unwrap().stereo, "panmatic declares true stereo");
+        assert!(
+            !od.sidechain,
+            "graceful process_sc must not read as sidechain"
+        );
+        assert!(
+            reg.desc("panmatic").unwrap().stereo,
+            "panmatic declares true stereo"
+        );
 
         // ---- host = song locks the wheel ----------------------------------
         let sr = 48000.0f64;
@@ -4478,7 +4568,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             inst.push_sync(&SyncInfoV1::block(pos, playing, bpm, 4.0, sr));
         };
         let feed = |inst: &Instance, n: usize, p: &[f32; MAX_PARAMS]| -> Vec<f32> {
-            (0..n).map(|_| unsafe { inst.call_sample_st(1.0, 1.0, p, 0.0).0 }).collect()
+            (0..n)
+                .map(|_| unsafe { inst.call_sample_st(1.0, 1.0, p, 0.0).0 })
+                .collect()
         };
         let peak = |y: &[f32]| -> f32 { y.iter().fold(0.0f32, |m, v| m.max(*v)) };
 
@@ -4486,18 +4578,33 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         // second, closed for the second (self-advance inside the block).
         push(&inst, 0.0, true);
         let y = feed(&inst, 48000, &dp);
-        assert!(peak(&y[500..5000]) > 0.9, "song gate never opened ({})", peak(&y[500..5000]));
-        assert!(peak(&y[30000..40000]) < 0.05, "song gate never closed ({})", peak(&y[30000..40000]));
+        assert!(
+            peak(&y[500..5000]) > 0.9,
+            "song gate never opened ({})",
+            peak(&y[500..5000])
+        );
+        assert!(
+            peak(&y[30000..40000]) < 0.05,
+            "song gate never closed ({})",
+            peak(&y[30000..40000])
+        );
 
         // Seek: push a pos inside the closed half → closed immediately.
         push(&inst, 1.0, true); // beat 1 = phase 0.5 = closed edge
         let y = feed(&inst, 2000, &dp);
-        assert!(peak(&y) < 0.05, "seek to beat 1 did not jump the phase ({})", peak(&y));
+        assert!(
+            peak(&y) < 0.05,
+            "seek to beat 1 did not jump the phase ({})",
+            peak(&y)
+        );
 
         // Paused: phase held at beat 0.25 (open) — output stays open.
         push(&inst, 0.25, false);
         let y = feed(&inst, 2000, &dp);
-        assert!(peak(&y[1000..]) > 0.9, "paused push did not hold the open phase");
+        assert!(
+            peak(&y[1000..]) > 0.9,
+            "paused push did not hold the open phase"
+        );
 
         // Block-size agnostic: 1000-sample pushes along the same timeline
         // reproduce the open half / closed half split.
@@ -4507,8 +4614,15 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             split.extend(feed(&inst, 1000, &dp));
             push(&inst, (b + 1) as f64 * (1000.0 * bpm / (60.0 * sr)), true);
         }
-        assert!(peak(&split[500..20000]) > 0.9, "split run lost the open half");
-        assert!(peak(&split[30000..47000]) < 0.05, "split run never closed ({})", peak(&split[30000..47000]));
+        assert!(
+            peak(&split[500..20000]) > 0.9,
+            "split run lost the open half"
+        );
+        assert!(
+            peak(&split[30000..47000]) < 0.05,
+            "split run never closed ({})",
+            peak(&split[30000..47000])
+        );
 
         // Free mode default: the very same instance ignores sync pushes.
         dp[8] = 0.0;
@@ -4584,10 +4698,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let pre = y[..8_000].iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(pre < 1e-6, "convolver leaked before input (pre {pre})");
         let win: &[f32] = &y[8_000 + 1_000..8_000 + 2_100];
-        let (pi, pv) = win
-            .iter()
-            .enumerate()
-            .fold((0, 0.0f32), |a, (i, v)| if v.abs() > a.1 { (i, *v) } else { a });
+        let (pi, pv) =
+            win.iter().enumerate().fold(
+                (0, 0.0f32),
+                |a, (i, v)| if v.abs() > a.1 { (i, *v) } else { a },
+            );
         assert!(pv > 0.3, "delta IR produced no blip (peak {pv})");
         let after = y[8_000 + 1_000 + pi + 40..]
             .iter()
@@ -4595,8 +4710,14 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert!(after < 1e-4, "delta IR must have no tail (tail {after})");
 
         let y = run(0.0); // built-in hall: long tail required
-        let tail_e: f64 = y[8_000 + 4_000..].iter().map(|v| (*v as f64) * (*v as f64)).sum();
-        assert!(tail_e > 1e-4, "built-in hall has no reverb tail (energy {tail_e})");
+        let tail_e: f64 = y[8_000 + 4_000..]
+            .iter()
+            .map(|v| (*v as f64) * (*v as f64))
+            .sum();
+        assert!(
+            tail_e > 1e-4,
+            "built-in hall has no reverb tail (energy {tail_e})"
+        );
         drop(inst);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4613,7 +4734,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         assert_eq!(p.parent().unwrap().file_name().unwrap(), ".build");
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
         assert!(name.starts_with("kick-"), "{name}");
-        assert!(name.ends_with(&format!(".{}", crate::paths::dylib_ext())), "{name}");
+        assert!(
+            name.ends_with(&format!(".{}", crate::paths::dylib_ext())),
+            "{name}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4652,6 +4776,9 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     #[test]
     fn w3_rustc_hint_names_build_tools_on_windows() {
         let h = rustc_install_hint();
-        assert!(h.contains("MSVC Build Tools") && h.contains("rustup"), "{h}");
+        assert!(
+            h.contains("MSVC Build Tools") && h.contains("rustup"),
+            "{h}"
+        );
     }
 }
