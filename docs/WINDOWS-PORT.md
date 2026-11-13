@@ -551,10 +551,11 @@ portable asset on the OLDEST distro we support, never the newest.
   Floor artifact 4/4 PASS; sabotage (Arch GLIBC_2.43 exe) FAILs debian/
   ubuntu/fedora with the exact ld.so lines. Now a release.yml gate on the
   STAGED exe.
-- [ ] **W13c — dependency contract in docs.** INSTALL.md gets the
-  links-vs-dlopens table, a per-distro install line, and the rule "the single
-  tar.zst runs everywhere only if it was built on the floor distro"; AUR flow
-  stays untouched.
+- [x] **W13c DONE 2026-11-12 (session 23, see DONE log)** — dependency
+  contract written into INSTALL.md: prebuilt-binary install line +
+  per-distro runtime packages, links-vs-dlopens tables measured from the
+  shipped NEEDED set, and the floor-distro rule stated in user terms.
+  Docs only; AUR flow untouched.
 - [ ] **W13d — optional `.deb`.** The tar.zst already carries an FHS `usr/`
   layout, so Debian/Ubuntu packaging is mostly a control file + the runtime
   dep list from W13b. Lowest priority.
@@ -1444,3 +1445,22 @@ portable asset on the OLDEST distro we support, never the newest.
   GREEN and the step log shows the matrix against the STAGED exe (sha256
   head `1d8d275a…` = byte-identical to the artifact smoke-tested locally,
   demand GLIBC 2.35): `MATRIX: all 4 distros PASS` (~36 s on the runner).
+
+- **2026-11-12 session 23 — W13c** (dependency contract in docs, the last
+  pure-docs W13 item): INSTALL.md gains a "prebuilt binary" section — the
+  tar.zst FHS install/uninstall line, per-distro runtime package lines
+  (apt/dnf), and "The dependency contract" subsection: WHY a binary
+  carries its BUILD machine's glibc symbols (the Arch→Debian `GLIBC_2.43
+  not found` story in user terms), the floor rule ("the single tar.zst
+  runs everywhere only because it is built on the floor distro" + CI
+  enforces twice per release, pointing at W13a/W13b), and the two measured
+  tables: load-time NEEDED (libc/libm GLIBC≥2.35 · libstdc++/libgcc_s
+  plain GLIBCXX_3.4 · libX11) mapped to distro packages, vs dlopen'd
+  (libjack · Wayland · GL/EGL) with the consequence of absence — the exact
+  split the W13b containers prove by loading the exe with NONE of the
+  dlopen set installed. Lead paragraph fixed ("ships for Linux AND
+  Windows" — the Windows section existed since W11 but the header still
+  said Linux-only). No code, no pins (docs task; W13a/b ruling stands that
+  packaging contracts are pinned by the container gates, not the lib
+  suite). Every claim is copied from the DONE logs' measurements, not
+  re-derived.
