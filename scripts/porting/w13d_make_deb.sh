@@ -55,10 +55,11 @@ Depends: libx11-6, libstdc++6
 Recommends: pipewire-jack | libjack-jackd2-0
 Suggests: rustc, ffmpeg
 Description: clip-based DAW with MIDI and keyboard control (JACK)
- slooper is a lightweight loop/clip-based DAW: record loops onto tracks,
- arrange clips, drive synths and VSTs from the keyboard or MIDI, and
- export stems. Audio runs over JACK (PipeWire's JACK shim works out of
- the box); slooper never spawns the server itself.
+ slooper is a small clip-based DAW: drop audio from the asset rack onto
+ a metronome-defined timeline, record audio and MIDI takes that place
+ themselves, play built-in and hosted instruments (VST2/VST3/CLAP),
+ mix live effect chains, and export. Audio runs over JACK (PipeWire's
+ JACK shim works out of the box); slooper never spawns the server.
  .
  Built against the glibc 2.35 floor, so this package runs on Ubuntu
  22.04+, Debian 12+, and anything newer. See docs/INSTALL.md for the
