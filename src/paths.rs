@@ -278,9 +278,15 @@ mod tests {
         let _sb = EnvSandbox::new(&[]);
         std::env::set_var("HOME", "/home/zoinks");
         assert_eq!(config_dir(), PathBuf::from("/home/zoinks/.config/slooper"));
-        assert_eq!(data_dir(), PathBuf::from("/home/zoinks/.local/share/slooper"));
+        assert_eq!(
+            data_dir(),
+            PathBuf::from("/home/zoinks/.local/share/slooper")
+        );
         assert_eq!(cache_home(), PathBuf::from("/home/zoinks/.cache"));
-        assert_eq!(default_projects_dir(), PathBuf::from("/home/zoinks/slooper-projects"));
+        assert_eq!(
+            default_projects_dir(),
+            PathBuf::from("/home/zoinks/slooper-projects")
+        );
     }
 
     #[cfg(unix)] // Linux XDG/HOME folder semantics (Windows twin: windows_folder_shapes)
@@ -293,7 +299,10 @@ mod tests {
         std::env::set_var(DATA_DIR_ENV, "");
         std::env::set_var(CONFIG_DIR_ENV, "");
         assert_eq!(config_dir(), PathBuf::from("/home/zoinks/.config/slooper"));
-        assert_eq!(data_dir(), PathBuf::from("/home/zoinks/.local/share/slooper"));
+        assert_eq!(
+            data_dir(),
+            PathBuf::from("/home/zoinks/.local/share/slooper")
+        );
     }
 
     #[test]
@@ -340,7 +349,7 @@ mod tests {
     fn w2_paths_effect_and_synth_dirs_follow_data_dir() {
         let _sb = EnvSandbox::new(&["XDG_DATA_HOME", "SLOOPER_SYNTHS_DIR"]);
         std::env::remove_var("SLOOPER_SYNTHS_DIR"); // the seam must NOT win here
-        // Temp root (not /xdg): the effects fallback best-effort-CREATES.
+                                                    // Temp root (not /xdg): the effects fallback best-effort-CREATES.
         let root = std::env::temp_dir().join(format!("w2-eff-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &root);
         assert_eq!(
@@ -422,10 +431,8 @@ mod tests {
         // type=1, at least one real image per size class, and the 256-px
         // entry (directory width byte 0 means 256) so Explorer/Taskbar get
         // a crisp large icon. 16-px entries are width byte 16.
-        let raw = std::fs::read(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icon.ico"),
-        )
-        .expect("assets/icon.ico must exist (built from assets/icon.png)");
+        let raw = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icon.ico"))
+            .expect("assets/icon.ico must exist (built from assets/icon.png)");
         assert!(raw.len() > 6 + 16, "ico too short");
         assert_eq!((&raw[0..4]), &[0, 0, 1, 0], "not an ICO (magic/type)");
         let count = u16::from_le_bytes([raw[4], raw[5]]) as usize;
@@ -434,7 +441,11 @@ mod tests {
         for i in 0..count {
             let e = 6 + i * 16;
             let w = if raw[e] == 0 { 256 } else { raw[e] as u32 };
-            let h = if raw[e + 1] == 0 { 256 } else { raw[e + 1] as u32 };
+            let h = if raw[e + 1] == 0 {
+                256
+            } else {
+                raw[e + 1] as u32
+            };
             assert_eq!(w, h, "ico entry {i} not square ({w}x{h})");
             assert!(w >= 16, "ico entry {w}px below 16");
             sizes.push(w);
@@ -454,7 +465,10 @@ mod tests {
         );
         assert!(src.contains("winresource::WindowsResource::new"));
         assert!(src.contains(r#""assets/icon.ico""#));
-        assert!(src.contains("catch_unwind"), "toolchain probing must stay best-effort");
+        assert!(
+            src.contains("catch_unwind"),
+            "toolchain probing must stay best-effort"
+        );
         assert!(src.contains("cargo:rerun-if-changed=assets/icon.ico"));
     }
 
@@ -470,10 +484,22 @@ mod tests {
     #[test]
     fn w11_release_workflow_ships_both_assets() {
         let wf = w11_repo_file(".github/workflows/release.yml");
-        assert!(wf.contains("slooper-win64.zip"), "Windows asset name is contractual");
-        assert!(wf.contains("--zstd"), "Linux asset must be tar.zst (ledger contract)");
-        assert!(wf.contains("windows-latest"), "Windows ships from a native MSVC host (W10-proven)");
-        assert!(wf.contains("cargo build --release --locked"), "assets ride the shipping profile");
+        assert!(
+            wf.contains("slooper-win64.zip"),
+            "Windows asset name is contractual"
+        );
+        assert!(
+            wf.contains("--zstd"),
+            "Linux asset must be tar.zst (ledger contract)"
+        );
+        assert!(
+            wf.contains("windows-latest"),
+            "Windows ships from a native MSVC host (W10-proven)"
+        );
+        assert!(
+            wf.contains("cargo build --release --locked"),
+            "assets ride the shipping profile"
+        );
         // Dispatch runs publish a DRAFT so the pipeline can be proven
         // without shipping anything.
         assert!(wf.contains(r#"draft: ${{ github.event_name == 'workflow_dispatch' }}"#));

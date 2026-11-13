@@ -101,6 +101,29 @@ pub fn default_drum_kit() -> Vec<DrumPadSave> {
         .collect()
 }
 
+/// v51: one sampler key-map slot: a rack asset (stored as a PATH like the
+/// drum kit, so projects can re-link after a reload) plus the root note
+/// whose pitch the sample already has.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplerSlotSave {
+    pub asset: String,
+    pub root: u8,
+}
+
+/// v51: one track's multi-sample keyboard map for the bundled sampler.
+/// `mode`: 0 = hard cutoff — zones switch at the halfway point, a note
+/// exactly halfway plays the LOWER sample; 1 = crossfade — the two
+/// nearest samples are bent to the note and mixed by inverse distance.
+/// An empty `slots` on a map that EXISTS means silent (NOT the legacy
+/// single-asset params); no map entry at all keeps the params rule.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SamplerMapSave {
+    #[serde(default)]
+    pub slots: Vec<SamplerSlotSave>,
+    #[serde(default)]
+    pub mode: u8,
+}
+
 /// Axis calibration for one continuous (knob/slider) binding slot: the raw
 /// controller values captured when the user swept the control to its minimum
 /// and maximum. Values between are scaled onto the program's 0..=127 space.
@@ -478,6 +501,11 @@ pub struct Config {
     /// folder is where recordings are dropped.
     #[serde(default)]
     pub rack_dir_order: Vec<RackDirOrder>,
+    /// v50 R5: explicit recordings target directory (absolute path, any
+    /// rack root or sub-folder). "" = the legacy implicit rule (primary
+    /// folder's top sub-folder). Set from a folder's right-click menu.
+    #[serde(default)]
+    pub record_target: String,
     /// v29: group the rack by sub-folder (true) instead of by asset type
     /// (false, the historical default).
     #[serde(default)]
@@ -504,6 +532,11 @@ pub struct Config {
     /// An EMPTY entry = the stock 8-pad kit (never written to disk).
     #[serde(default)]
     pub drum_kits: Vec<Vec<DrumPadSave>>,
+    /// v51: per-track sampler key maps (index = track). `None` = no map
+    /// (the sampler's single-asset params rule); `Some` = the multi-sample
+    /// map, even with zero slots (= silence).
+    #[serde(default)]
+    pub sampler_maps: Vec<Option<SamplerMapSave>>,
     /// v29 R5: was the drum-machine window open?
     #[serde(default)]
     pub show_drums: bool,
@@ -661,6 +694,7 @@ impl Default for Config {
             rack_folders: Vec::new(),
             rack_collapsed: Default::default(),
             rack_dir_order: Vec::new(),
+            record_target: String::new(),
             rack_group_by_dir: false,
             rec_src: vec![[true, false, false]; 8],
             rec_prev: Vec::new(),
@@ -668,6 +702,7 @@ impl Default for Config {
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
+            sampler_maps: Vec::new(),
             show_drums: false,
             show_master: true,
             fx_dir: String::new(),
@@ -936,7 +971,10 @@ mod tests {
         // existing config file on disk (missing key = today's behavior).
         assert!(!Config::default().win_editor_embed);
         let legacy: Config = serde_json::from_str("{}").unwrap();
-        assert!(!legacy.win_editor_embed, "old configs parse with the flag off");
+        assert!(
+            !legacy.win_editor_embed,
+            "old configs parse with the flag off"
+        );
         let on: Config = serde_json::from_str(r#"{"win_editor_embed": true}"#).unwrap();
         assert!(on.win_editor_embed);
     }
@@ -959,7 +997,10 @@ mod tests {
             vec!["KeyStage 61".to_string(), "KeyStage 61 [2]".to_string()]
         );
         let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(back.win_midi_inputs, cfg.win_midi_inputs, "round-trips verbatim");
+        assert_eq!(
+            back.win_midi_inputs, cfg.win_midi_inputs,
+            "round-trips verbatim"
+        );
     }
 
     /// W12f: `win_audio_backend` is additive-safe — old configs default to
@@ -1017,7 +1058,10 @@ mod tests {
             assert!(!path_is_foreign(r"C:\Users\studio\rack"));
             assert!(!path_is_foreign("C:/Users/studio/rack"));
             assert!(!path_is_foreign(r"\\srv\share\rack"), "UNC is native");
-            assert!(path_is_foreign("/home/studio/rack"), "Unix root = drive junk");
+            assert!(
+                path_is_foreign("/home/studio/rack"),
+                "Unix root = drive junk"
+            );
             assert!(path_is_foreign("  /tmp/x  "), "checked after trim");
         } else {
             assert!(!path_is_foreign("/home/studio/rack"));
@@ -1025,7 +1069,10 @@ mod tests {
             assert!(path_is_foreign(r"C:\Users\studio\rack"), "drive root");
             assert!(path_is_foreign("C:/Users/studio/rack"));
             assert!(path_is_foreign("C:"), "bare drive root");
-            assert!(path_is_foreign(r"\\srv\share\rack"), "UNC cannot exist here");
+            assert!(
+                path_is_foreign(r"\\srv\share\rack"),
+                "UNC cannot exist here"
+            );
         }
     }
 
@@ -1064,9 +1111,15 @@ mod tests {
         // consumer: prepare_effects_dir seeds bundled scripts into it.
         let _sb = ConfigSandbox::new("load");
         let (foreign, local) = if cfg!(windows) {
-            ("/home/studio/rack".to_string(), "C:\\Users\\studio\\rack".to_string())
+            (
+                "/home/studio/rack".to_string(),
+                "C:\\Users\\studio\\rack".to_string(),
+            )
         } else {
-            ("C:\\Users\\studio\\rack".to_string(), "/tmp/w12d-rack".to_string())
+            (
+                "C:\\Users\\studio\\rack".to_string(),
+                "/tmp/w12d-rack".to_string(),
+            )
         };
         let cfg0 = Config {
             project_dir: foreign.clone(),
@@ -1086,7 +1139,10 @@ mod tests {
         cfg0.save().unwrap();
         let cfg = Config::load();
         assert!(cfg.project_dir.is_empty(), "foreign project_dir dropped");
-        assert!(cfg.fx_dir.is_empty(), "fx_dir must NEVER seed into foreign here");
+        assert!(
+            cfg.fx_dir.is_empty(),
+            "fx_dir must NEVER seed into foreign here"
+        );
         assert_eq!(
             cfg.rack_folders,
             vec![local.clone(), "relative-pack".to_string()],
@@ -1101,9 +1157,7 @@ mod tests {
         // Inert view caches stay verbatim (their keys can never hit here,
         // and dropping them would break the round trip back).
         assert!(cfg.editor_probe.contains_key(&foreign));
-        assert!(cfg
-            .rack_collapsed
-            .contains(&format!("{foreign}\u{1}kit-a")));
+        assert!(cfg.rack_collapsed.contains(&format!("{foreign}\u{1}kit-a")));
         // Deterministic across loads (load does not half-persist shapes).
         let again = Config::load();
         assert_eq!(again.rack_folders, cfg.rack_folders);
@@ -1366,6 +1420,27 @@ mod tests {
     /// v22 pin: plugin state chunks ride base64 through the JSON saves —
     /// xattr storage vanished silently on vfat/external drives, which is
     /// how plugin edits "went back to default" after closing the GUI.
+    /// v51: sampler key maps ride the config session and survive old
+    /// files (missing field = empty, legacy rules).
+    #[test]
+    fn v51_sampler_maps_config_roundtrip() {
+        let c = Config {
+            sampler_maps: vec![Some(SamplerMapSave {
+                slots: vec![SamplerSlotSave {
+                    asset: "/x/kick.wav".into(),
+                    root: 48,
+                }],
+                mode: 1,
+            })],
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        let m = back.sampler_maps[0].as_ref().expect("map survives");
+        assert_eq!((m.mode, m.slots.len(), m.slots[0].root), (1, 1, 48));
+        assert_eq!(m.slots[0].asset, "/x/kick.wav");
+    }
+
     #[test]
     fn v22_b64_state_roundtrip() {
         let raw: Vec<u8> = (0..=255u8).cycle().take(1000).collect();

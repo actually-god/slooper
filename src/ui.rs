@@ -49,6 +49,7 @@ use crate::midi::{hex, note_name, scale_axis, MidiAction, MidiBind, MidiMsg};
 use crate::midipat::{Pattern, PPQ};
 use crate::project::{self, ProjAsset, ProjClip, ProjMetro, ProjQuantize, ProjTrack, Project};
 use crate::quantize::{self, snap_start};
+use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::synth;
 
 /// Keys a user may plausibly bind to a shortcut.
@@ -1167,10 +1168,27 @@ pub struct App {
     rack_collapsed: std::collections::HashSet<String>,
     /// v29: per-folder sub-folder display order.
     rack_dir_order: Vec<crate::config::RackDirOrder>,
+    /// v50 R5: explicit recordings target directory ("" = the implicit
+    /// primary-folder rule). Any rack root or sub-folder can be picked
+    /// from the folder's right-click menu.
+    record_target: String,
+    /// v50 R6: project row clicked in the rack, awaiting the
+    /// overwrite-safety confirmation: (name, file).
+    proj_confirm: Option<(String, PathBuf)>,
     /// v29: group the rack by sub-folder instead of by asset type.
     rack_group_by_dir: bool,
     /// v29: rename dialog: (asset file path, draft stem, focus-once).
     rack_rename: Option<(String, String, bool)>,
+    /// v50 R1: per-asset "Edit sample" settings (FL sample-window style),
+    /// keyed by asset file path, saved with the project.
+    sample_edits: std::collections::BTreeMap<String, SampleEdit>,
+    /// Pristine (pre-edit) audio per edited asset path; the render always
+    /// starts here so repeated edits never compound.
+    se_source: std::collections::BTreeMap<String, std::sync::Arc<[f32]>>,
+    /// Asset path whose sample editor is open.
+    sample_edit_win: Option<String>,
+    /// "save as new asset" name field.
+    se_name: String,
     /// v34 R15: create-subfolder dialog: (rack folder index, draft name).
     rack_newsub: Option<(usize, String)>,
     /// v29: delete-file confirmation target (full path).
@@ -1323,6 +1341,21 @@ pub struct App {
     /// v30 R1: per-track drum kits (index = track). Every track's synth
     /// module owns its kit, so each synth carries a different patch.
     drum_kits: Vec<Vec<DrumPad>>,
+    /// v51: per-track sampler key maps (index = track). `None` = the
+    /// sampler's legacy single-asset params; `Some` = the multi-sample
+    /// piano-roll map (slots = (asset path, root note) + mode).
+    sampler_maps: Vec<Option<crate::config::SamplerMapSave>>,
+    /// v51: track whose sampler key-map (piano roll) window is open.
+    smap_win: Option<usize>,
+    /// Harness hook: the last (keyboard-strip rect, lane-strip min-x) the
+    /// map window painted this frame, so tests can drive real drags/clicks
+    /// without color archaeology. Written every painted frame; read-only
+    /// cost for the app.
+    smap_probe: Option<(f32, f32, f32, f32, f32)>,
+    /// v51: selected slot row inside the open key-map window.
+    smap_sel: Option<usize>,
+    /// v51: note currently held by a key/lane press in the map window.
+    smap_hold: Option<u8>,
     show_drums: bool,
     /// v39: MASTER OUT panel open (dockable, docks next to the MIXER).
     show_master: bool,
@@ -1749,8 +1782,14 @@ impl App {
             rack,
             rack_collapsed: cfg.rack_collapsed.iter().cloned().collect(),
             rack_dir_order: cfg.rack_dir_order.clone(),
+            record_target: cfg.record_target.clone(),
+            proj_confirm: None,
             rack_group_by_dir: cfg.rack_group_by_dir,
             rack_rename: None,
+            sample_edits: Default::default(),
+            se_source: Default::default(),
+            sample_edit_win: None,
+            se_name: String::new(),
             rack_newsub: None,
             rack_confirm_del: None,
             sel_asset: None,
@@ -1815,6 +1854,18 @@ impl App {
                 .map(crate::ui::DrumMachine::from_save)
                 .unwrap_or_else(DrumMachine::defaults),
             drum_kits: init_drum_kits(&cfg.drum_kits, cfg.drum.as_ref()),
+            sampler_maps: {
+                let mut m: Vec<Option<crate::config::SamplerMapSave>> =
+                    Vec::with_capacity(MAX_LOOPS);
+                for t in 0..MAX_LOOPS {
+                    m.push(cfg.sampler_maps.get(t).cloned().flatten());
+                }
+                m
+            },
+            smap_win: None,
+            smap_probe: None,
+            smap_sel: None,
+            smap_hold: None,
             show_drums: cfg.show_drums,
             show_master: cfg.show_master,
             meter_state: None,
@@ -2588,7 +2639,11 @@ impl App {
         // window, BOTH generations alike. The seam is ordered: the GUI
         // thread reads the parent inside `on_gui_thread`, which this
         // caller blocks on, so the wrap can only ever cover THIS open.
-        let parent = if self.embed_wanted() { self.embed_hwnd } else { None };
+        let parent = if self.embed_wanted() {
+            self.embed_hwnd
+        } else {
+            None
+        };
         if let Some(p) = parent {
             crate::vstedit::set_embed_parent(p);
         }
@@ -4184,32 +4239,49 @@ impl App {
                 for e in pat.ccs.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.ccs.push(Cc { at: s_tick(at - base as f64), ..*e });
+                        out.ccs.push(Cc {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
                 for e in pat.press.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.press.push(Press { at: s_tick(at - base as f64), ..*e });
+                        out.press.push(Press {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
                 for e in pat.bends.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.bends.push(Bend { at: s_tick(at - base as f64), ..*e });
+                        out.bends.push(Bend {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
                 for e in pat.polys.iter() {
                     let at = (cl.pos as f64) + tick_s(e.at, pat.bpm);
                     if at >= w0 && at < w1 {
-                        out.polys.push(Poly { at: s_tick(at - base as f64), ..*e });
+                        out.polys.push(Poly {
+                            at: s_tick(at - base as f64),
+                            ..*e
+                        });
                     }
                 }
             }
             out.sort();
             let id = self.assets.len() as u32;
-            self.assets
-                .push(Asset::midi(id, name, std::path::PathBuf::new(), Arc::new(out), true));
+            self.assets.push(Asset::midi(
+                id,
+                name,
+                std::path::PathBuf::new(),
+                Arc::new(out),
+                true,
+            ));
         } else {
             // Audio: sum the laid-out slices, clip gain + fades baked in
             // (exact same windows/fade law the mix render uses).
@@ -4254,7 +4326,8 @@ impl App {
         for (t, k, c) in ids.iter().rev() {
             self.arr.remove_clip(*t, *k, *c);
         }
-        self.arr.insert(ht, hk, crate::arrange::Clip::new(new_id, base));
+        self.arr
+            .insert(ht, hk, crate::arrange::Clip::new(new_id, base));
         let idx = self.arr.tracks[ht].lanes[hk]
             .clips
             .iter()
@@ -4592,6 +4665,7 @@ impl App {
             rack_folders: self.rack.iter().map(|f| f.path.clone()).collect(),
             rack_collapsed: self.rack_collapsed.iter().cloned().collect(),
             rack_dir_order: self.rack_dir_order.clone(),
+            record_target: self.record_target.clone(),
             rack_group_by_dir: self.rack_group_by_dir,
             rec_src: self
                 .rec_src
@@ -4603,6 +4677,7 @@ impl App {
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
+            sampler_maps: self.sampler_maps.clone(),
             show_drums: self.show_drums,
             show_master: self.show_master,
             fx_dir: self.fx_dir_edit.trim().to_string(),
@@ -4679,6 +4754,15 @@ impl App {
     /// exactly `primary_folder()`, the pre-v29 behavior. The directory is
     /// created on demand by the callers' file writes' parents.
     fn record_dir(&self) -> PathBuf {
+        // v50 R5: an explicit target (right-click a folder → "use for
+        // recordings") wins whenever it still exists; a deleted target
+        // silently falls back to the implicit rule below.
+        if !self.record_target.is_empty() {
+            let p = PathBuf::from(&self.record_target);
+            if p.is_dir() {
+                return p;
+            }
+        }
         let root = self.primary_folder();
         let Some(f) = self.rack.first() else {
             return root;
@@ -4695,9 +4779,385 @@ impl App {
         }
     }
 
+    /// v50 R5: set the explicit recordings target (folder right-click →
+    /// "use for recordings"). The path must exist; the picker only ever
+    /// offers real folders. Persisted; takes land here immediately.
+    fn set_record_target(&mut self, dir: &str) -> String {
+        self.record_target = dir.to_string();
+        self.save_config();
+        dir.to_string()
+    }
+
+    /// v50 R4: physically MOVE a rack sub-folder (with its whole subtree)
+    /// into `dest_dir`, following everything: the directory on disk, the
+    /// asset entries' paths, the sub-folder order lists, the collapsed
+    /// set, and the recordings target if it pointed inside. Renaming an
+    /// occupied destination is refused.
+    fn rack_dir_move(&mut self, from_root: &str, from_dir: &str, dest_dir: &Path) {
+        if from_dir.is_empty() {
+            return; // the rack root itself is never moved
+        }
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let src = PathBuf::from(from_root).join(from_dir.replace('/', sep));
+        let name = from_dir.rsplit('/').next().unwrap_or(from_dir);
+        let np = dest_dir.join(name);
+        if np == src || np.starts_with(&src) {
+            return; // already there, or nesting a folder into itself
+        }
+        if !src.exists() {
+            self.status = "move: folder not found on disk".into();
+            return;
+        }
+        if np.exists() {
+            self.status = format!("move: {} already exists", np.display());
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(dest_dir) {
+            self.status = format!("move: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&src, &np) {
+            self.status = format!("move: {e}");
+            return;
+        }
+        // Re-key everything that referenced the old location.
+        let sp = src.to_string_lossy().into_owned();
+        let nps = np.to_string_lossy().into_owned();
+        let rekey = |p: &str| -> Option<String> {
+            if p == sp {
+                Some(nps.clone())
+            } else {
+                p.strip_prefix(&format!("{sp}{sep}"))
+                    .map(|t| format!("{nps}{sep}{t}"))
+            }
+        };
+        for a in self.assets.iter_mut() {
+            let p = a.path.to_string_lossy().into_owned();
+            if let Some(q) = rekey(&p) {
+                a.path = PathBuf::from(q);
+            }
+        }
+        if let Some(q) = rekey(&self.record_target.clone()) {
+            self.record_target = q;
+        }
+        // Which rack root does the destination live in, and what is the
+        // moved folder's NEW root-relative key there?
+        let dest_root = self
+            .rack
+            .iter()
+            .map(|f| f.path.clone())
+            .find(|r| !r.is_empty() && np.starts_with(PathBuf::from(r)))
+            .unwrap_or_default();
+        let new_key = if dest_root.is_empty() {
+            String::new()
+        } else {
+            np.strip_prefix(PathBuf::from(&dest_root))
+                .map(|t| t.to_string_lossy().replace(sep, "/"))
+                .unwrap_or_default()
+        };
+        // Order lists: rewrite keys, keep positions; a move across roots
+        // appends to the destination root's list.
+        let old_prefix = format!("{from_dir}/");
+        let pref = self
+            .rack_dir_order
+            .iter()
+            .find(|o| o.folder == from_root)
+            .map(|o| o.dirs.clone())
+            .unwrap_or_default();
+        let all: Vec<String> = self
+            .rack
+            .iter()
+            .find(|f| f.path == from_root)
+            .map(|f| f.dirs_in_order(&pref))
+            .unwrap_or_default();
+        let inside = |d: &str| d == from_dir || d.starts_with(&old_prefix);
+        let pos = all.iter().position(|d| d == from_dir);
+        let block: Vec<String> = if new_key.is_empty() {
+            Vec::new()
+        } else {
+            all.iter()
+                .filter(|d| inside(d))
+                .map(|d| {
+                    if d == from_dir {
+                        new_key.clone()
+                    } else {
+                        format!("{new_key}/{}", &d[old_prefix.len()..])
+                    }
+                })
+                .collect()
+        };
+        let src_list: Vec<String> = all.iter().filter(|d| !inside(d)).cloned().collect();
+        if dest_root == from_root {
+            let mut l = src_list;
+            let at = pos.unwrap_or(l.len()).min(l.len());
+            l.splice(at..at, block);
+            self.set_rack_dir_order(from_root, l);
+        } else {
+            self.set_rack_dir_order(from_root, src_list);
+            let dpref = self
+                .rack_dir_order
+                .iter()
+                .find(|o| o.folder == dest_root)
+                .map(|o| o.dirs.clone())
+                .unwrap_or_default();
+            let mut dl: Vec<String> = self
+                .rack
+                .iter()
+                .find(|f| f.path == dest_root)
+                .map(|f| f.dirs_in_order(&dpref))
+                .unwrap_or_default();
+            dl.extend(block);
+            self.set_rack_dir_order(&dest_root, dl);
+        }
+        // Drop collapsed entries that referenced the moved subtree (they
+        // come back expanded — a moved group is worth seeing).
+        let ck = format!("{from_root}\u{1}");
+        self.rack_collapsed.retain(|k| {
+            !(k.starts_with(&ck) && {
+                let d = k[ck.len()..].trim_start_matches('#');
+                inside(d)
+            })
+        });
+        for f in self.rack.iter_mut() {
+            f.rescan();
+        }
+        self.save_config();
+        self.push_project();
+        self.status = format!("moved folder \u{201c}{name}\u{201d}");
+    }
+
+    fn set_rack_dir_order(&mut self, folder: &str, dirs: Vec<String>) {
+        if let Some(row) = self.rack_dir_order.iter_mut().find(|o| o.folder == folder) {
+            row.dirs = dirs;
+        } else {
+            self.rack_dir_order.push(crate::config::RackDirOrder {
+                folder: folder.to_string(),
+                dirs,
+            });
+        }
+    }
+
     /// v29: rename an asset file (rack rows and project rows share this).
     /// The file moves, the asset entry follows, ids are UNTOUCHED (asset
     /// ids are table indices — renaming never shifts the table).
+    /// v50 R1: re-render asset `key` (a path string) from its pristine
+    /// source through the stored edit; identity edits restore + forget.
+    fn se_apply(&mut self, key: &str) {
+        let Some(edit) = self.sample_edits.get(key).copied() else {
+            return;
+        };
+        let Some(idx) = self
+            .assets
+            .iter()
+            .position(|a| a.path.to_string_lossy() == key)
+        else {
+            return;
+        };
+        let sr = self.sample_rate.max(48_000);
+        let pristine = self
+            .se_source
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| self.assets[idx].data.clone());
+        if edit.is_identity() {
+            self.assets[idx].data = pristine;
+            self.se_source.remove(key);
+            self.sample_edits.remove(key);
+            self.status = "sample edit reset".into();
+            return;
+        }
+        let out = crate::sample_edit::render(&pristine, sr, &edit);
+        let secs = out.len() as f64 / sr as f64;
+        self.assets[idx].data = std::sync::Arc::from(out);
+        self.se_source.insert(key.to_string(), pristine);
+        self.sample_edits.insert(key.to_string(), edit);
+        self.status = format!("sample edit: {secs:.2} s");
+    }
+
+    /// v50 R1: render the edited sample into a NEW wav in the recordings
+    /// folder (right-click a folder to choose it) and rescan the racks.
+    fn se_save_as(&mut self, key: &str, name: &str) {
+        let Some(idx) = self
+            .assets
+            .iter()
+            .position(|a| a.path.to_string_lossy() == key)
+        else {
+            return;
+        };
+        let pristine = self
+            .se_source
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| self.assets[idx].data.clone());
+        let edit = self.sample_edits.get(key).copied().unwrap_or_default();
+        let sr = self.sample_rate.max(48_000);
+        let out = crate::sample_edit::render(&pristine, sr, &edit);
+        let stem = {
+            let t = name.trim();
+            if t.is_empty() {
+                format!("{} (edit)", self.assets[idx].name)
+            } else {
+                t.to_string()
+            }
+        };
+        let dir = self.record_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("save asset: {e}");
+            return;
+        }
+        let dest = dir.join(format!("{stem}.wav"));
+        match crate::audio_io::export(&dest, sr, &out, crate::audio_io::ExportFormat::Wav) {
+            Ok(()) => {
+                for f in self.rack.iter_mut() {
+                    f.rescan();
+                }
+                self.status = format!("sample edit -> {}", dest.display());
+            }
+            Err(e) => self.status = format!("save asset: {e}"),
+        }
+    }
+
+    /// v50 R1: adopt the project's stored edits and re-render over the
+    /// freshly-loaded (pristine) assets.
+    fn restore_sample_edits(&mut self, edits: &std::collections::BTreeMap<String, SampleEdit>) {
+        self.sample_edits = edits.clone();
+        self.se_source.clear();
+        let keys: Vec<String> = self.sample_edits.keys().cloned().collect();
+        for k in keys {
+            self.se_apply(&k);
+        }
+    }
+
+    fn sample_edit_window(&mut self, ui: &mut egui::Ui) {
+        let Some(key) = self.sample_edit_win.clone() else {
+            return;
+        };
+        let p = PathBuf::from(&key);
+        let Some(ai) = self.assets.iter().position(|a| a.path == p) else {
+            self.sample_edit_win = None;
+            return;
+        };
+        let aname = self.assets[ai].name.clone();
+        let cur = self.sample_edits.get(&key).copied().unwrap_or_default();
+        let mut ed = cur;
+        let mut save_as = false;
+        let mut reset = false;
+        let mut open = true;
+        let src_len = self
+            .se_source
+            .get(&key)
+            .map(|d| d.len())
+            .unwrap_or_else(|| self.assets[ai].data.len());
+        egui::Window::new(format!("Edit sample \u{2014} {aname}"))
+            .id(egui::Id::new(("sewin", key.clone())))
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ui.ctx(), |ui| {
+                ui.label("Edits apply live, are saved with the project, and never touch the source file.");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut ed.reverse, "reverse")
+                        .on_hover_text("FL Studio: reverse sample");
+                    ui.checkbox(&mut ed.pingpong, "ping-pong")
+                        .on_hover_text("play forward, then the mirror, back-to-back");
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("pitch");
+                    ui.add(
+                        egui::DragValue::new(&mut ed.pitch_cents)
+                            .range(-2400.0..=2400.0)
+                            .speed(5.0)
+                            .suffix(" ct"),
+                    )
+                        .on_hover_text("coarse+fine pitch in cents (Simpler: pitch)");
+                    ui.label("stretch");
+                    ui.add(
+                        egui::Slider::new(&mut ed.stretch, 0.25..=4.0)
+                            .logarithmic(true)
+                            .text("\u{d7}")
+                            .custom_formatter(|v, _| format!("{v:.2}")),
+                    );
+                    ui.checkbox(&mut ed.preserve_pitch, "keep pitch")
+                        .on_hover_text("on: WSOLA time stretch (FL hardware stretch); off: resample (pitch rides)");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("bend start");
+                    ui.add(
+                        egui::DragValue::new(&mut ed.bend_start_cents)
+                            .range(-2400.0..=2400.0)
+                            .speed(5.0)
+                            .suffix(" ct"),
+                    );
+                    ui.label("end");
+                    ui.add(
+                        egui::DragValue::new(&mut ed.bend_end_cents)
+                            .range(-2400.0..=2400.0)
+                            .speed(5.0)
+                            .suffix(" ct"),
+                    )
+                        .on_hover_text("linear pitch sweep across the clip (Ableton pitch envelope)");
+                });
+                ui.separator();
+                let fade_ui = |ui: &mut egui::Ui, label: &str, ms: &mut f32, c: &mut SeCurve| {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        ui.add(
+                            egui::DragValue::new(ms)
+                                .range(0.0..=60_000.0)
+                                .speed(1.0)
+                                .suffix(" ms"),
+                        );
+                        egui::ComboBox::from_id_salt(format!("se-curve-{label}"))
+                            .selected_text(c.name())
+                            .show_ui(ui, |ui| {
+                                for k in SeCurve::ALL {
+                                    if ui.selectable_label(*c == k, k.name()).clicked() {
+                                        *c = k;
+                                    }
+                                }
+                            });
+                    });
+                };
+                fade_ui(ui, "fade in", &mut ed.fade_in_ms, &mut ed.fade_in);
+                fade_ui(ui, "fade out", &mut ed.fade_out_ms, &mut ed.fade_out);
+                ui.separator();
+                let est = src_len as f64 * ed.stretch as f64;
+                ui.label(format!(
+                    "source {:.2} s \u{2192} ~{:.2} s",
+                    src_len as f64 / self.sample_rate.max(48_000) as f64,
+                    est / self.sample_rate.max(48_000) as f64
+                ));
+                ui.horizontal(|ui| {
+                    ui.label("save as");
+                    ui.add(egui::TextEdit::singleline(&mut self.se_name).desired_width(140.0));
+                    if ui
+                        .button("save as new asset")
+                        .on_hover_text("render into the recordings folder (right-click a folder to set it)")
+                        .clicked()
+                    {
+                        save_as = true;
+                    }
+                    if ui.button("reset").clicked() {
+                        reset = true;
+                    }
+                });
+            });
+        if !open {
+            self.sample_edit_win = None;
+        }
+        if reset {
+            ed = SampleEdit::default();
+        }
+        if ed != cur {
+            self.sample_edits.insert(key.clone(), ed);
+            self.se_apply(&key);
+        }
+        if save_as {
+            let nm = self.se_name.clone();
+            self.se_save_as(&key, &nm);
+        }
+    }
+
     fn rack_rename(&mut self, old: &str, new_stem: &str) {
         let new_stem = project::sanitize_name(new_stem);
         let oldp = PathBuf::from(old);
@@ -5022,6 +5482,8 @@ impl App {
         });
         self.track_synth_inst[t] = inst;
         self.refresh_poly_voices(t);
+        // v51: a fresh instance starts mapless — replay the saved key map.
+        self.push_sampler_map(t);
         true
     }
 
@@ -5408,6 +5870,143 @@ impl App {
                     .iter()
                     .position(|a| a.path.to_string_lossy() == p.asset_path);
             }
+        }
+    }
+
+    /// v51: publish track `t`'s sampler key map onto its live script
+    /// instance. Slot asset PATHS resolve to rack ids like the drum kit
+    /// (`drum_resolve`); an unresolved path drops the slot rather than
+    /// aliasing the wrong sample. `None` clears the map (legacy params).
+    fn push_sampler_map(&mut self, t: usize) {
+        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
+            return;
+        };
+        let SynthHandle::Script(inst) = handle.as_ref() else {
+            return;
+        };
+        // Only the bundled sampler (first param "asset") reads the map;
+        // other scripts must never have map state reported on them.
+        let sampler = self
+            .track_synth
+            .get(t)
+            .cloned()
+            .flatten()
+            .and_then(|stem| {
+                self.synth_registry
+                    .desc(&stem)
+                    .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            })
+            .unwrap_or(false);
+        if !sampler {
+            return;
+        }
+        match self.sampler_maps.get(t).cloned().flatten() {
+            None => inst.clear_map(),
+            Some(m) => {
+                let slots: Vec<(u32, u8)> = m
+                    .slots
+                    .iter()
+                    .filter_map(|s| {
+                        self.assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == s.asset)
+                            .map(|k| (k as u32, s.root))
+                    })
+                    .collect();
+                inst.set_map(&slots, m.mode);
+            }
+        }
+    }
+
+    /// v51: re-push every track's map (asset table changed -> path->id
+    /// resolutions moved; project load; synth rebuilds).
+    fn refresh_sampler_maps(&mut self) {
+        for t in 0..MAX_LOOPS {
+            self.push_sampler_map(t);
+        }
+    }
+
+    /// v51: the single asset a sampler track plays, from the synth
+    /// window's picker / drop zone / OS drop. Param 0 ALWAYS follows
+    /// (legacy fallback + persisted values); when the track has a
+    /// non-empty key map, slot 0 follows too so the map editor shows
+    /// exactly what the engine plays.
+    fn sampler_set_asset(&mut self, t: usize, k: usize) {
+        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
+            return;
+        };
+        let SynthHandle::Script(inst) = handle.as_ref() else {
+            return;
+        };
+        inst.set_param(0, k as f32);
+        if let Some(vals) = self.track_synth_params.get_mut(t) {
+            vals.clear();
+            vals.extend_from_slice(&inst.values());
+        }
+        if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+            if let Some(slot) = m.slots.first_mut() {
+                if let Some(a) = self.assets.get(k) {
+                    slot.asset = a.path.to_string_lossy().into_owned();
+                }
+            }
+        }
+        self.push_sampler_map(t);
+        self.save_config();
+    }
+
+    /// v51: OS/asset drops landing on the open key-map window add a slot
+    /// per audio file (rack-dedup via `ensure_asset`), roots laddering up
+    /// in fifths from the last slot (C3 first).
+    fn sampler_map_files_dropped(&mut self, t: usize, paths: &[std::path::PathBuf]) {
+        let mut added = 0usize;
+        let mut rejected = 0usize;
+        for path in paths {
+            if !crate::assets::is_audio_file(path) {
+                rejected += 1;
+                continue;
+            }
+            let Some(k) = self.ensure_asset(path) else {
+                rejected += 1;
+                continue;
+            };
+            let _ = k;
+            let sp = self.assets[k].path.to_string_lossy().into_owned();
+            if self.sampler_maps[t].is_none() {
+                self.sampler_maps[t] = Some(crate::config::SamplerMapSave {
+                    slots: Vec::new(),
+                    mode: 0,
+                });
+            }
+            let m = self.sampler_maps[t].as_mut().expect("seeded");
+            if m.slots.len() >= crate::synth::MAX_MAP_SLOTS {
+                self.status = "sampler map: full (64 slots)".into();
+                break;
+            }
+            let root = m
+                .slots
+                .last()
+                .map(|s| (s.root as i32 + 7).clamp(24, 96) as u8)
+                .unwrap_or(48);
+            if !m.slots.iter().any(|s| s.asset == sp) {
+                m.slots
+                    .push(crate::config::SamplerSlotSave { asset: sp, root });
+            }
+            added += 1;
+        }
+        if added > 0 || rejected > 0 {
+            self.push_sampler_map(t);
+            self.save_config();
+        }
+        if added > 0 {
+            self.status = format!(
+                "sampler map: {added} sample{} added",
+                if added == 1 { "" } else { "s" }
+            );
+        } else if rejected > 0 {
+            self.status = format!(
+                "sampler map: dropped file{} not audio",
+                if rejected == 1 { "" } else { "s" }
+            );
         }
     }
 
@@ -6127,9 +6726,7 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(&ctx, |ui| {
-            body_clipped(ui, |ui| self.drum_win_body(ui))
-        });
+        let resp = w.show(&ctx, |ui| body_clipped(ui, |ui| self.drum_win_body(ui)));
         self.show_drums = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
@@ -6166,9 +6763,7 @@ impl App {
         if dragging {
             w = w.current_pos(egui::pos2(self.drag_pos[0], self.drag_pos[1]));
         }
-        let resp = w.show(&ctx, |ui| {
-            body_clipped(ui, |ui| self.master_out_body(ui))
-        });
+        let resp = w.show(&ctx, |ui| body_clipped(ui, |ui| self.master_out_body(ui)));
         self.show_master = open;
         if let Some(out) = resp.map(|r| r.response.rect) {
             self.dyn_remember(idx, out);
@@ -6662,17 +7257,17 @@ impl App {
             }
             let resp = w.show(ui.ctx(), |ui| {
                 body_clipped(ui, |ui| {
-                self.auto_inner(
-                    ui,
-                    &mut ed,
-                    &targets,
-                    sr,
-                    bpm,
-                    beats,
-                    beat_s,
-                    bar_s,
-                    &mut action,
-                )
+                    self.auto_inner(
+                        ui,
+                        &mut ed,
+                        &targets,
+                        sr,
+                        bpm,
+                        beats,
+                        beat_s,
+                        bar_s,
+                        &mut action,
+                    )
                 });
             });
             if let Some(out) = resp.map(|r| r.response.rect) {
@@ -7604,13 +8199,7 @@ impl App {
             // v42/MPE: 14-bit bend stored as (LSB, MSB) in d1/d2.
             MidiMsg::PitchBend { channel, value } => {
                 let v = (value + 8192).clamp(0, 16383) as u16;
-                evs.push((
-                    at,
-                    5,
-                    channel,
-                    (v & 0x7F) as u8,
-                    ((v >> 7) & 0x7F) as u8,
-                ));
+                evs.push((at, 5, channel, (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8));
             }
             _ => return, // PC / sysex: not part of the pattern model
         }
@@ -7896,8 +8485,7 @@ impl App {
                 self.backend
                     .engine
                     .play_audition(crate::audio::AUD_PV, ev.into(), inst);
-                self.status =
-                    format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
+                self.status = format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
             }
         }
     }
@@ -7934,10 +8522,8 @@ impl App {
         if !fresh {
             if let Some((ptr, c)) = self.aud_copy.get(t).cloned().flatten() {
                 if ptr == Arc::as_ptr(&live) as usize {
-                    if let (
-                        crate::audio::SynthHandle::Vst(a),
-                        crate::audio::SynthHandle::Vst(b),
-                    ) = (live.as_ref(), c.as_ref())
+                    if let (crate::audio::SynthHandle::Vst(a), crate::audio::SynthHandle::Vst(b)) =
+                        (live.as_ref(), c.as_ref())
                     {
                         let ps = a.params();
                         for k in 0..ps.len() {
@@ -8448,21 +9034,21 @@ impl App {
             }
             resp = w.show(ui, |ui| {
                 body_clipped(ui, |ui| {
-                self.roll_inner(
-                    ui,
-                    &mut roll,
-                    sec_per_beat,
-                    step_sec,
-                    min_len_ticks,
-                    playhead,
-                    sr,
-                    &mut save,
-                    &mut clear,
-                    &mut preview,
-                    &mut stop_preview,
-                    &mut audition,
-                    &mut placed,
-                )
+                    self.roll_inner(
+                        ui,
+                        &mut roll,
+                        sec_per_beat,
+                        step_sec,
+                        min_len_ticks,
+                        playhead,
+                        sr,
+                        &mut save,
+                        &mut clear,
+                        &mut preview,
+                        &mut stop_preview,
+                        &mut audition,
+                        &mut placed,
+                    )
                 });
             });
             if let Some(out) = resp.as_ref().map(|r| r.response.rect) {
@@ -9587,6 +10173,558 @@ impl App {
         );
     }
 
+    /// v51: route a map-window key press to the track's live synth as a
+    /// held audition voice (release = mouse up, see the watchdog in
+    /// `sampler_map_window`). The copy taken by `audition_copy` carries
+    /// the key map — that IS the map preview.
+    fn smap_audition(&mut self, t: usize, note: u8) {
+        if self.sample_rate == 0 {
+            return;
+        }
+        if self.smap_hold == Some(note) {
+            return;
+        }
+        self.smap_hold = Some(note);
+        self.preview_track = Some(t);
+        self.roll_key_hold(note);
+    }
+
+    /// v51: end a held map-window audition.
+    fn smap_release(&mut self) {
+        if self.smap_hold.take().is_some() {
+            self.roll_key_release();
+        }
+    }
+
+    /// v51: sampler key-map window — a piano-roll mapping editor for the
+    /// bundled sampler on track `t`. One lane per mapped sample; drag a
+    /// lane's block onto any key (or click a key with the lane selected)
+    /// to bind its ROOT NOTE. Hard-cutoff zones switch at the midpoints
+    /// (ties round down); crossfade blends the two nearest samples by
+    /// inverse distance. OS/asset drops while this window is open add
+    /// samples (routed centrally at the top of `ui_root`).
+    fn sampler_map_window(&mut self, ui: &mut egui::Ui, t: usize) {
+        // Guard: the window only exists while track t runs the sampler.
+        let Some(stem) = self.track_synth.get(t).cloned().flatten() else {
+            self.smap_win = None;
+            self.smap_release();
+            return;
+        };
+        let is_sampler = self
+            .synth_registry
+            .desc(&stem)
+            .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            .unwrap_or(false);
+        if !is_sampler {
+            self.smap_win = None;
+            self.smap_release();
+            return;
+        }
+        // Release watchdog: a held map key must die with the mouse button
+        // (the piano roll's own watchdog only runs while the ROLL is open).
+        if self.smap_hold.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
+            self.smap_release();
+        }
+        // Legacy seed: the first open on a track that only ever used the
+        // single-asset params materializes them as slot 0 — the map
+        // becomes the single source of truth without changing the sound.
+        if self
+            .sampler_maps
+            .get(t)
+            .map(|o| o.is_none())
+            .unwrap_or(true)
+        {
+            let vals = self
+                .track_synth_inst
+                .get(t)
+                .cloned()
+                .flatten()
+                .map(|h| match h.as_ref() {
+                    SynthHandle::Script(i) => i.values(),
+                    SynthHandle::Vst(_) => Vec::new(),
+                })
+                .unwrap_or_default();
+            let mut slots = Vec::new();
+            let a = vals.first().copied().unwrap_or(0.0).round() as usize;
+            if a < self.assets.len() && self.assets[a].pattern.is_none() {
+                slots.push(crate::config::SamplerSlotSave {
+                    asset: self.assets[a].path.to_string_lossy().into_owned(),
+                    root: vals
+                        .get(1)
+                        .copied()
+                        .unwrap_or(48.0)
+                        .round()
+                        .clamp(0.0, 127.0) as u8,
+                });
+            }
+            self.sampler_maps[t] = Some(crate::config::SamplerMapSave { slots, mode: 0 });
+            self.push_sampler_map(t);
+            self.save_config();
+        }
+        let mut open = true;
+        let resp = egui::Window::new(format!("\u{266a} sampler map \u{b7} track {}", t + 1))
+            .id(egui::Id::new(("smapwin", t)))
+            .open(&mut open)
+            // Open wide enough that the lane rows never wrap (header cell +
+            // 49 keys); like the piano roll, size follows the viewport.
+            .default_pos(egui::pos2(60.0, 80.0))
+            .default_size({
+                let screen = ui.ctx().viewport_rect();
+                [(screen.width() - 80.0).clamp(760.0, 1180.0), 320.0_f32]
+            })
+            .min_width(300.0)
+            .min_height(150.0)
+            .show(ui, |ui| {
+                body_clipped(ui, |ui| self.smap_body(ui, t));
+            });
+        let _ = resp;
+        if !open {
+            self.smap_win = None;
+            self.smap_release();
+        }
+    }
+
+    /// The key-map window's body: header (mode/add/remove) + one lane row
+    /// per slot + the piano keyboard strip. Fixed note range C2..C6 —
+    /// wide enough for any sane map, and rows stay pixel-aligned without
+    /// a scroll container fighting the drag geometry.
+    fn smap_body(&mut self, ui: &mut egui::Ui, t: usize) {
+        const N0: u8 = 36; // C2
+        const NW: usize = 49; // C2..C6
+        const KW: f32 = 18.0;
+        const LANE_H: f32 = 24.0;
+        const KEY_H: f32 = 22.0;
+        const HDR_W: f32 = 190.0;
+        let roll_w = NW as f32 * KW;
+        let palette = [
+            egui::Color32::from_rgb(90, 140, 220),
+            egui::Color32::from_rgb(220, 120, 90),
+            egui::Color32::from_rgb(110, 190, 120),
+            egui::Color32::from_rgb(200, 160, 90),
+            egui::Color32::from_rgb(160, 110, 200),
+            egui::Color32::from_rgb(90, 180, 190),
+        ];
+        let note_at = |x: f32, lr_min: f32| -> u8 {
+            (((x - lr_min) / KW).floor().clamp(0.0, NW as f32 - 1.0) as i32 + N0 as i32) as u8
+        };
+        // Snapshot the rack's audio assets (picker source) + slot info.
+        let audio_assets: Vec<(usize, String)> = self
+            .assets
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.pattern.is_none())
+            .map(|(k, a)| (k, a.name.clone()))
+            .collect();
+        // ---- header: mode + add/remove ----
+        let mode = self.sampler_maps[t].as_ref().map(|m| m.mode).unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("mode \u{b7}").weak().small());
+            if ui
+                .selectable_label(mode == 0, RichText::new("hard cutoff").small())
+                .clicked()
+                && mode != 0
+            {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    m.mode = 0;
+                    self.push_sampler_map(t);
+                    self.save_config();
+                }
+            }
+            if ui
+                .selectable_label(mode == 1, RichText::new("crossfade").small())
+                .clicked()
+                && mode != 1
+            {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    m.mode = 1;
+                    self.push_sampler_map(t);
+                    self.save_config();
+                }
+            }
+            ui.separator();
+            if ui.button(RichText::new("+ add sample").small()).clicked() {
+                let pick = self
+                    .sel_asset
+                    .filter(|k| audio_assets.iter().any(|(a, _)| a == k))
+                    .or_else(|| audio_assets.first().map(|(k, _)| *k));
+                match pick {
+                    Some(k) => {
+                        let sp = self.assets[k].path.to_string_lossy().into_owned();
+                        if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                            if m.slots.len() >= crate::synth::MAX_MAP_SLOTS {
+                                self.status = "sampler map: full (64 slots)".into();
+                            } else {
+                                let root = m
+                                    .slots
+                                    .last()
+                                    .map(|s| (s.root as i32 + 7).clamp(24, 96) as u8)
+                                    .unwrap_or(48);
+                                m.slots.push(crate::config::SamplerSlotSave {
+                                    asset: sp.clone(),
+                                    root,
+                                });
+                                self.smap_sel = Some(m.slots.len() - 1);
+                                self.push_sampler_map(t);
+                                self.save_config();
+                            }
+                        }
+                    }
+                    None => {
+                        self.status = "sampler map: no audio assets \u{2014} drop one here".into()
+                    }
+                }
+            }
+            let sel = self.smap_sel;
+            let n_now = self.sampler_maps[t]
+                .as_ref()
+                .map(|m| m.slots.len())
+                .unwrap_or(0);
+            if ui
+                .add_enabled(
+                    sel.is_some() && n_now > 0,
+                    egui::Button::new(RichText::new("remove \u{d7}").small()),
+                )
+                .clicked()
+            {
+                if let (Some(Some(m)), Some(i)) = (self.sampler_maps.get_mut(t), sel) {
+                    if i < m.slots.len() {
+                        m.slots.remove(i);
+                        self.smap_sel = None;
+                        self.push_sampler_map(t);
+                        self.save_config();
+                    }
+                }
+            }
+            ui.label(RichText::new(format!("{n_now} mapped")).weak().small());
+        });
+        ui.label(
+            RichText::new(
+                "drag a lane block onto a piano key \u{b7} or select a lane and click a key \
+                 \u{b7} cutoff: zones switch at the midpoint, ties go DOWN \u{b7} crossfade: \
+                 the two nearest samples mix by inverse distance",
+            )
+            .weak()
+            .small(),
+        );
+        let mode = self.sampler_maps[t].as_ref().map(|m| m.mode).unwrap_or(0);
+        // Slot snapshot for painting (name/root/resolved), sorted roots for
+        // the zone-boundary overlay.
+        let infos: Vec<(String, u8, bool)> = self
+            .sampler_maps
+            .get(t)
+            .and_then(|o| o.as_ref())
+            .map(|m| {
+                m.slots
+                    .iter()
+                    .map(|s| {
+                        let name = self
+                            .assets
+                            .iter()
+                            .position(|a| a.path.to_string_lossy() == s.asset)
+                            .map(|k| self.assets[k].name.clone())
+                            .unwrap_or_else(|| {
+                                std::path::Path::new(&s.asset)
+                                    .file_stem()
+                                    .map(|x| x.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "?".into())
+                            });
+                        let resolved = self
+                            .assets
+                            .iter()
+                            .any(|a| a.path.to_string_lossy() == s.asset);
+                        (name, s.root, resolved)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let n = infos.len();
+        let mut roots: Vec<u8> = infos.iter().map(|(_, r, _)| *r).collect();
+        roots.sort_unstable();
+        let mut dirty_order = false; // per-frame pushes are cheap; saves wait
+        let mut probe_lane: Option<(f32, f32)> = None;
+        // ---- lane rows ----
+        for i in 0..n {
+            let (name, root, resolved) = infos[i].clone();
+            let sel = self.smap_sel == Some(i);
+            let mut new_asset: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(HDR_W, LANE_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let cur = format!("#{} {}", i + 1, name);
+                        egui::ComboBox::from_id_salt(("smapcombo", t, i))
+                            .width(HDR_W - 40.0)
+                            .selected_text(RichText::new(cur).small())
+                            .show_ui(ui, |ui| {
+                                for (k, nm) in &audio_assets {
+                                    if ui.selectable_label(false, format!("#{k} {nm}")).clicked() {
+                                        new_asset = Some(
+                                            self.assets[*k].path.to_string_lossy().into_owned(),
+                                        );
+                                    }
+                                }
+                            });
+                        if ui
+                            .add_sized(
+                                [18.0, 18.0],
+                                egui::Button::new(RichText::new("\u{d7}").small()),
+                            )
+                            .clicked()
+                        {
+                            if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                                if i < m.slots.len() {
+                                    m.slots.remove(i);
+                                    self.smap_sel = None;
+                                    self.push_sampler_map(t);
+                                    self.save_config();
+                                }
+                            }
+                        }
+                    },
+                );
+                let (lr, _) =
+                    ui.allocate_exact_size(egui::vec2(roll_w, LANE_H), egui::Sense::hover());
+                if i == 0 {
+                    probe_lane = Some((lr.min.x, lr.min.y));
+                }
+                // Lane background (selection highlight + click-to-select
+                // FIRST, so the block drag allocated later wins hit tests
+                // over its own rect — v50 interact-order rule).
+                let lresp = ui.interact(lr, ui.id().with(("smlane", t, i)), egui::Sense::click());
+                if lresp.clicked() {
+                    self.smap_sel = Some(i);
+                }
+                let base = if mode == 1 {
+                    egui::Color32::from_rgb(28, 30, 38)
+                } else {
+                    egui::Color32::from_rgb(24, 26, 32)
+                };
+                ui.painter().rect_filled(
+                    lr,
+                    2.0,
+                    if sel {
+                        egui::Color32::from_rgb(46, 52, 72)
+                    } else {
+                        base
+                    },
+                );
+                // Zone overlay: cutoff draws the switch points (midpoints),
+                // crossfade draws each root (blend anchors).
+                if n > 1 {
+                    for w2 in roots.windows(2) {
+                        let x = if mode == 1 {
+                            (w2[1] as i32 - N0 as i32) as f32 * KW
+                        } else {
+                            ((w2[0] + w2[1]) as f32 / 2.0 - N0 as f32) * KW
+                        };
+                        let px = lr.min.x + x * 1.0 + KW / 2.0;
+                        if x >= 0.0 {
+                            ui.painter().line_segment(
+                                [egui::pos2(px, lr.min.y), egui::pos2(px, lr.max.y)],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                            );
+                        }
+                    }
+                }
+                // The draggable block = this slot's root key.
+                let clamped = root.clamp(N0, N0 + (NW as u8 - 1));
+                let bx = lr.min.x + (clamped - N0) as f32 * KW;
+                let block = egui::Rect::from_min_max(
+                    egui::pos2(bx, lr.min.y + 2.0),
+                    egui::pos2(bx + KW, lr.max.y - 2.0),
+                );
+                let col = if resolved {
+                    palette[i % palette.len()]
+                } else {
+                    egui::Color32::from_gray(90)
+                };
+                ui.painter().rect_filled(
+                    block,
+                    3.0,
+                    col.gamma_multiply(if sel { 1.0 } else { 0.8 }),
+                );
+                ui.painter().text(
+                    egui::pos2(block.max.x + 6.0, lr.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{}{}", name, if resolved { "" } else { " (missing)" }),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_gray(170),
+                );
+                let bresp = ui.interact(
+                    block.expand(4.0),
+                    ui.id().with(("smblock", t, i)),
+                    egui::Sense::drag(),
+                );
+                if bresp.drag_started() {
+                    self.smap_sel = Some(i);
+                    self.smap_audition(t, root);
+                }
+                if bresp.dragged() {
+                    if let Some(pt) = bresp.interact_pointer_pos() {
+                        let note = note_at(pt.x, lr.min.x).clamp(0, 127);
+                        let cur = self
+                            .sampler_maps
+                            .get(t)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|m| m.slots.get(i))
+                            .map(|s| s.root);
+                        if cur == Some(note) {
+                            self.smap_audition(t, note);
+                        } else {
+                            if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                                if let Some(s) = m.slots.get_mut(i) {
+                                    s.root = note;
+                                }
+                            }
+                            self.push_sampler_map(t);
+                            dirty_order = true;
+                            self.smap_audition(t, note);
+                        }
+                    }
+                }
+                if bresp.drag_stopped()
+                    || (bresp.dragged() && !ui.ctx().input(|i| i.pointer.any_down()))
+                {
+                    self.smap_release();
+                    if dirty_order {
+                        self.save_config();
+                        dirty_order = false;
+                    }
+                }
+            });
+            if let Some(sp) = new_asset {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    if let Some(s) = m.slots.get_mut(i) {
+                        s.asset = sp;
+                        self.push_sampler_map(t);
+                        self.save_config();
+                    }
+                }
+            }
+        }
+        if n == 0 {
+            ui.label(
+                RichText::new(
+                    "no samples mapped \u{2014} click \u{201c}+ add sample\u{201d} or drop \
+                     WAV files onto this window",
+                )
+                .weak()
+                .small(),
+            );
+        }
+        // ---- piano keyboard strip ----
+        let mut probe_kr: Option<egui::Rect> = None;
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(HDR_W, KEY_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let note = self
+                        .smap_sel
+                        .and_then(|i| infos.get(i))
+                        .map(|(_, r, _)| note_name(*r))
+                        .unwrap_or_else(|| "\u{2014}".into());
+                    ui.label(RichText::new(format!("selected: {note}")).small());
+                },
+            );
+            let (kr, kresp) =
+                ui.allocate_exact_size(egui::vec2(roll_w, KEY_H), egui::Sense::click_and_drag());
+            probe_kr = Some(kr);
+            // White keys, then black keys, then C labels.
+            let is_black = |n: u8| matches!(n % 12, 1 | 3 | 6 | 8 | 10);
+            for k in 0..NW {
+                let note = N0 + k as u8;
+                if is_black(note) {
+                    continue;
+                }
+                let x = kr.min.x + k as f32 * KW;
+                let r =
+                    egui::Rect::from_min_max(egui::pos2(x, kr.min.y), egui::pos2(x + KW, kr.max.y));
+                ui.painter()
+                    .rect_filled(r, 1.0, egui::Color32::from_gray(210));
+                ui.painter().rect_stroke(
+                    r,
+                    1.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                    egui::StrokeKind::Inside,
+                );
+                if note.is_multiple_of(12) {
+                    ui.painter().text(
+                        egui::pos2(x + 2.0, kr.max.y - 4.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        note_name(note),
+                        egui::FontId::proportional(8.0),
+                        egui::Color32::from_gray(60),
+                    );
+                }
+            }
+            for k in 0..NW {
+                let note = N0 + k as u8;
+                if !is_black(note) {
+                    continue;
+                }
+                let x = kr.min.x + (k + 1) as f32 * KW - KW * 0.32;
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(x, kr.min.y),
+                    egui::pos2(x + KW * 0.64, kr.min.y + KEY_H * 0.6),
+                );
+                ui.painter()
+                    .rect_filled(r, 1.0, egui::Color32::from_gray(28));
+            }
+            // Selected slot's root marker.
+            if let Some(i) = self.smap_sel.filter(|i| *i < n) {
+                let root = infos[i].1;
+                if root >= N0 && root <= N0 + NW as u8 {
+                    let px = kr.min.x + (root - N0) as f32 * KW + KW / 2.0;
+                    ui.painter().circle_filled(
+                        egui::pos2(px, kr.min.y + 3.0),
+                        3.0,
+                        egui::Color32::from_rgb(255, 190, 60),
+                    );
+                }
+            }
+            if let (Some(lr0), Some(kr)) = (probe_lane, probe_kr) {
+                self.smap_probe = Some((kr.min.x, kr.min.y, lr0.0, lr0.1, roll_w));
+            }
+            let sel = self.smap_sel.filter(|i| *i < n);
+            let apply = |me: &mut Self, x: f32| {
+                let note = note_at(x, kr.min.x).clamp(0, 127);
+                if let Some(i) = sel {
+                    let changed = me
+                        .sampler_maps
+                        .get(t)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|m| m.slots.get(i))
+                        .is_some_and(|s| s.root != note);
+                    if changed {
+                        if let Some(Some(m)) = me.sampler_maps.get_mut(t) {
+                            if let Some(s) = m.slots.get_mut(i) {
+                                s.root = note;
+                            }
+                        }
+                        me.push_sampler_map(t);
+                        me.save_config();
+                    }
+                }
+                me.smap_audition(t, note);
+            };
+            if kresp.drag_started() || kresp.clicked() {
+                if let Some(pt) = kresp.interact_pointer_pos() {
+                    apply(self, pt.x);
+                }
+            }
+            if kresp.dragged() {
+                if let Some(pt) = kresp.interact_pointer_pos() {
+                    apply(self, pt.x);
+                }
+            }
+            if kresp.drag_stopped() {
+                self.smap_release();
+            }
+        });
+    }
+
     /// The synth slider window doubles as a SAMPLER editor when the
     /// bound script's first parameter is the asset picker.
     fn sampler_editor_open(&self) -> Option<usize> {
@@ -9613,10 +10751,9 @@ impl App {
         let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
             return;
         };
-        let inst = match handle.as_ref() {
-            SynthHandle::Script(i) => i.clone(),
-            SynthHandle::Vst(_) => return,
-        };
+        if !matches!(handle.as_ref(), SynthHandle::Script(_)) {
+            return;
+        }
         let mut swapped: Option<usize> = None;
         let mut rejected = 0usize;
         for path in paths {
@@ -9625,12 +10762,7 @@ impl App {
                 continue; // midi/auto/unknown: not a sample
             }
             if let Some(k) = self.ensure_asset(path) {
-                inst.set_param(0, k as f32);
-                if let Some(vals) = self.track_synth_params.get_mut(t) {
-                    vals.clear();
-                    vals.extend_from_slice(&inst.values());
-                }
-                self.save_config();
+                self.sampler_set_asset(t, k);
                 swapped = Some(k);
             }
         }
@@ -9786,8 +10918,7 @@ impl App {
                     }
                 });
             if let Some(k) = picked {
-                inst.set_param(0, k as f32);
-                dirty = true;
+                self.sampler_set_asset(t, k);
             }
             ui.label(
                 RichText::new(
@@ -9827,8 +10958,7 @@ impl App {
             );
             if let Some(a) = dresp.dnd_release_payload::<usize>().map(|a| *a) {
                 if audio_assets.iter().any(|(k, _)| *k == a) {
-                    inst.set_param(0, a as f32);
-                    dirty = true;
+                    self.sampler_set_asset(t, a);
                     self.status = format!(
                         "track {} sampler: {}",
                         t + 1,
@@ -9839,6 +10969,12 @@ impl App {
                             .unwrap_or_default()
                     );
                 }
+            }
+            // v51: the map editor for this track — a piano roll of lanes,
+            // drag each sample's block onto the key that is its root.
+            if ui.button("piano map \u{2026}").clicked() {
+                self.smap_win = Some(t);
+                self.smap_sel = None;
             }
             // v18: OS-level file drops (file manager → app while
             // this window is open) are claimed CENTRALLY at the
@@ -9923,123 +11059,123 @@ impl App {
             .max_height(pad_list_h)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-        for p in 0..kit.len() {
-                let rowr = ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut kit[p].name)
-                                .desired_width(56.0)
-                                .font(egui::TextStyle::Monospace),
-                        )
-                        .changed()
-                    {
-                        kit_changed = true;
-                    }
-                    if ui
-                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
-                        .on_hover_text("Audition this pad")
-                        .clicked()
-                    {
-                        let k = self
-                            .assets
-                            .iter()
-                            .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
-                        if let Some(k) = k {
-                            let v = kit[p].vel.max(1);
-                            self.audition_impulse(k, v);
+                for p in 0..kit.len() {
+                    let rowr = ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut kit[p].name)
+                                    .desired_width(56.0)
+                                    .font(egui::TextStyle::Monospace),
+                            )
+                            .changed()
+                        {
+                            kit_changed = true;
                         }
-                    }
-                    let cur_path = kit[p].asset_path.clone();
-                    let label = cur_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("(sound)")
-                        .trim_end_matches(".wav")
-                        .to_string();
-                    egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
-                        .selected_text(label)
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(cur_path.is_empty(), "(silent)")
-                                .clicked()
-                            {
-                                kit[p].asset_path.clear();
-                                kit[p].asset = None;
-                                kit_changed = true;
+                        if ui
+                            .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                            .on_hover_text("Audition this pad")
+                            .clicked()
+                        {
+                            let k = self
+                                .assets
+                                .iter()
+                                .position(|a| a.path.to_string_lossy() == kit[p].asset_path);
+                            if let Some(k) = k {
+                                let v = kit[p].vel.max(1);
+                                self.audition_impulse(k, v);
                             }
-                            for (path, nm) in &audio_rows {
+                        }
+                        let cur_path = kit[p].asset_path.clone();
+                        let label = cur_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("(sound)")
+                            .trim_end_matches(".wav")
+                            .to_string();
+                        egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                            .selected_text(label)
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
                                 if ui
-                                    .selectable_label(&cur_path == path, nm.as_str())
+                                    .selectable_label(cur_path.is_empty(), "(silent)")
                                     .clicked()
                                 {
-                                    kit[p].asset_path = path.clone();
+                                    kit[p].asset_path.clear();
                                     kit[p].asset = None;
                                     kit_changed = true;
                                 }
-                            }
-                        });
-                    let before_v = kit[p].vel;
-                    let rv = ui
-                        .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
-                        .on_hover_text("Default paint velocity");
-                    if p_changed(&rv, before_v, &mut kit[p].vel) {
-                        kit_changed = true;
+                                for (path, nm) in &audio_rows {
+                                    if ui
+                                        .selectable_label(&cur_path == path, nm.as_str())
+                                        .clicked()
+                                    {
+                                        kit[p].asset_path = path.clone();
+                                        kit[p].asset = None;
+                                        kit_changed = true;
+                                    }
+                                }
+                            });
+                        let before_v = kit[p].vel;
+                        let rv = ui
+                            .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
+                            .on_hover_text("Default paint velocity");
+                        if p_changed(&rv, before_v, &mut kit[p].vel) {
+                            kit_changed = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
+                                    .min_size(egui::vec2(16.0, 18.0)),
+                            )
+                            .on_hover_text("Mute pad")
+                            .clicked()
+                        {
+                            kit[p].muted = !kit[p].muted;
+                            kit_changed = true;
+                        }
+                        if ui
+                            .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                            .on_hover_text("Remove this pad")
+                            .clicked()
+                            && kit.len() > 1
+                        {
+                            remove_pad = Some(p);
+                        }
+                    });
+                    // v34 R5: every pad row is a drop target. IN-APP drags
+                    // (rack rows carry the asset-index payload) land here
+                    // directly; OS files are hit-tested centrally against
+                    // the rect registered just below.
+                    self.kit_drop_rects.push((t, p, rowr.response.rect));
+                    let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                        || ui.input(|i| !i.raw.hovered_files.is_empty());
+                    if armed {
+                        ui.painter().rect_stroke(
+                            rowr.response.rect,
+                            3.0,
+                            egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                            egui::StrokeKind::Inside,
+                        );
                     }
-                    if ui
-                        .add(
-                            egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                                .min_size(egui::vec2(16.0, 18.0)),
-                        )
-                        .on_hover_text("Mute pad")
-                        .clicked()
+                    if let Some(a) = rowr
+                        .response
+                        .interact(egui::Sense::hover())
+                        .dnd_release_payload::<usize>()
+                        .map(|a| *a)
                     {
-                        kit[p].muted = !kit[p].muted;
-                        kit_changed = true;
+                        if let Some(path) = self
+                            .assets
+                            .get(a)
+                            .map(|as_| as_.path.to_string_lossy().into_owned())
+                        {
+                            kit[p].asset_path = path;
+                            kit[p].asset = None;
+                            kit_changed = true;
+                            self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
+                        }
                     }
-                    if ui
-                        .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
-                        .on_hover_text("Remove this pad")
-                        .clicked()
-                        && kit.len() > 1
-                    {
-                        remove_pad = Some(p);
-                    }
-                });
-                // v34 R5: every pad row is a drop target. IN-APP drags
-                // (rack rows carry the asset-index payload) land here
-                // directly; OS files are hit-tested centrally against
-                // the rect registered just below.
-                self.kit_drop_rects.push((t, p, rowr.response.rect));
-                let armed = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
-                    || ui.input(|i| !i.raw.hovered_files.is_empty());
-                if armed {
-                    ui.painter().rect_stroke(
-                        rowr.response.rect,
-                        3.0,
-                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
-                        egui::StrokeKind::Inside,
-                    );
                 }
-                if let Some(a) = rowr
-                    .response
-                    .interact(egui::Sense::hover())
-                    .dnd_release_payload::<usize>()
-                    .map(|a| *a)
-                {
-                    if let Some(path) = self
-                        .assets
-                        .get(a)
-                        .map(|as_| as_.path.to_string_lossy().into_owned())
-                    {
-                        kit[p].asset_path = path;
-                        kit[p].asset = None;
-                        kit_changed = true;
-                        self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
-                    }
-                }
-            }
-        });
+            });
         ui.horizontal(|ui| {
             let full = kit.len() >= DRUM_MAX_PADS;
             if ui
@@ -10332,7 +11468,9 @@ impl App {
         type EditorRow = (DynKind, String, u64, (i32, i32), bool);
         let mut editors: Vec<EditorRow> = Vec::new();
         for t in self.vst_editors.keys().copied().collect::<Vec<_>>() {
-            let Some(w) = self.vst_editors.get(&t) else { continue };
+            let Some(w) = self.vst_editors.get(&t) else {
+                continue;
+            };
             let stem = std::path::Path::new(w.path())
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -10346,7 +11484,9 @@ impl App {
             ));
         }
         for k in self.fx_vst_editors.keys().copied().collect::<Vec<_>>() {
-            let Some(w) = self.fx_vst_editors.get(&k) else { continue };
+            let Some(w) = self.fx_vst_editors.get(&k) else {
+                continue;
+            };
             let stem = std::path::Path::new(w.path())
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -10373,7 +11513,8 @@ impl App {
             self.embed_chrome(ctx, idx, kind, xid, size, painted);
         }
         self.chrome_closing.retain(|x| self.embed_live.contains(x));
-        self.embed_sync.retain(|xid, _| self.embed_live.contains(xid));
+        self.embed_sync
+            .retain(|xid, _| self.embed_live.contains(xid));
     }
 
     /// Floating chrome of ONE embedded editor — the owner-drawn float of
@@ -10400,7 +11541,10 @@ impl App {
             .constrain(false)
             .fade_in(false);
         if let Some(r) = self.dyn_rect(idx) {
-            w = w.default_pos([r[0], r[1]]).default_width(r[2]).default_height(r[3]);
+            w = w
+                .default_pos([r[0], r[1]])
+                .default_width(r[2])
+                .default_height(r[3]);
         } else {
             // No remembered float rect yet: open just big enough to hold
             // the plugin's own area (chrome borders included). W12c: the
@@ -10478,9 +11622,14 @@ impl App {
         let (sw, sh) = crate::vstedit::editor_slot_points(size, ui.ctx().pixels_per_point());
         let want = egui::vec2(sw, sh);
         let rect = ui.allocate_at_least(want, egui::Sense::hover()).1.rect;
-        let slot = if offered.is_finite() { rect.intersect(offered) } else { rect };
+        let slot = if offered.is_finite() {
+            rect.intersect(offered)
+        } else {
+            rect
+        };
         if xid != 0 && slot.width() > 4.0 && slot.height() > 4.0 {
-            self.embed_slot.insert(xid, [slot.min.x, slot.min.y, slot.width(), slot.height()]);
+            self.embed_slot
+                .insert(xid, [slot.min.x, slot.min.y, slot.width(), slot.height()]);
         }
     }
 
@@ -10826,7 +11975,10 @@ impl App {
             None => return,
         };
         if !src.audio && !src.preview && !src.loop_rec && !src.midi && !src.auto {
-            self.status = format!("track {}: tick a source (aud / prev / loop / mid / auto) first", i + 1);
+            self.status = format!(
+                "track {}: tick a source (aud / prev / loop / mid / auto) first",
+                i + 1
+            );
             return;
         }
         // v42 "p": the preview take rides the SAME take buffer as the audio
@@ -10844,8 +11996,7 @@ impl App {
             self.backend.engine.set_rec_loop(i, src.loop_rec);
             self.toggle_record(i);
             if src.loop_rec && !self.backend.engine.loop_tl() {
-                self.status =
-                    format!("track {}: loop record needs the LOOP button on", i + 1);
+                self.status = format!("track {}: loop record needs the LOOP button on", i + 1);
             }
         }
         if src.midi {
@@ -10914,7 +12065,11 @@ impl App {
         self.status = format!(
             "track {}: {} · clip in lane {}",
             track + 1,
-            if preview { "preview bounced" } else { "recorded" },
+            if preview {
+                "preview bounced"
+            } else {
+                "recorded"
+            },
             lane + 1
         );
     }
@@ -10946,7 +12101,10 @@ impl App {
         let pat_b = b.pattern.clone();
         let data_a = a.data.clone();
         let data_b = b.data.clone();
-        let merged_pat = pat_a.as_ref().zip(pat_b.as_ref()).map(|(pa, pb)| pa.merged_with(pb));
+        let merged_pat = pat_a
+            .as_ref()
+            .zip(pat_b.as_ref())
+            .map(|(pa, pb)| pa.merged_with(pb));
         if let Some(merged) = merged_pat {
             if dir.as_os_str().is_empty() {
                 self.status = "merge: set a rack folder first".into();
@@ -10981,7 +12139,8 @@ impl App {
                 f.rescan();
             }
             self.push_project();
-            self.status = format!("merged MIDI \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
+            self.status =
+                format!("merged MIDI \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
         } else if pat_a.is_none() && pat_b.is_none() {
             let mixed: Arc<[f32]> =
                 Arc::from(crate::assets::mix_audio(&data_a, &data_b).into_boxed_slice());
@@ -11029,7 +12188,8 @@ impl App {
                 f.rescan();
             }
             self.push_project();
-            self.status = format!("merged audio \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
+            self.status =
+                format!("merged audio \u{2192} \u{201c}{name}\u{201d} (both originals kept)");
         } else {
             self.status = "merge: same kind only (audio+audio or MIDI+MIDI)".into();
         }
@@ -11179,6 +12339,10 @@ impl App {
             }
         }
         self.assets.remove(k);
+        // v51: asset ids ARE table indices — every live key map's packed
+        // ids shift with this removal. Re-push all maps (paths are the
+        // durable identity; the instance holds ids).
+        self.refresh_sampler_maps();
         self.wave.clear();
         self.sel_asset = None;
         self.sel_clips.clear();
@@ -11375,6 +12539,8 @@ impl App {
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
+            sampler_maps: self.sampler_maps.clone(),
+            sample_edits: self.sample_edits.clone(),
         }
     }
 
@@ -11665,6 +12831,8 @@ impl App {
             self.rebuild_fx(t);
         }
         self.assets = assets;
+        // v50 R1: re-apply this project's per-sample edit settings.
+        self.restore_sample_edits(&pr.sample_edits);
         self.arr = arr;
         // The saved project carries its own configured track count.
         self.n_tracks = pr.n_tracks.unwrap_or(16).clamp(1, MAX_LOOPS);
@@ -11676,6 +12844,8 @@ impl App {
             if !sel.synth_setup {
                 continue;
             }
+            // v51: sampler key maps are synth setup too.
+            self.sampler_maps[t] = pr.sampler_maps.get(t).cloned().flatten();
             self.track_synth_params[t] = pr.track_synth_params.get(t).cloned().unwrap_or_default();
             // v22: patches are REAL project state — decode the chunk the
             // project carried (the v20 "session-only" rule here is what
@@ -11854,7 +13024,9 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
-                ui.label(format!("\u{201c}{name}\u{201d} \u{2014} what should be imported?"));
+                ui.label(format!(
+                    "\u{201c}{name}\u{201d} \u{2014} what should be imported?"
+                ));
                 ui.label(
                     egui::RichText::new(
                         "Tracks, clips and assets always load \u{2014} these are the setup slices.",
@@ -11864,7 +13036,10 @@ impl App {
                 );
                 ui.separator();
                 ui.checkbox(&mut sel.instruments, "Main instruments (track synths)");
-                ui.checkbox(&mut sel.synth_setup, "Synth setup (patches + slider values)");
+                ui.checkbox(
+                    &mut sel.synth_setup,
+                    "Synth setup (patches + slider values)",
+                );
                 ui.checkbox(&mut sel.bindings, "MIDI bindings");
                 if nbind > 0 {
                     ui.label(
@@ -12147,8 +13322,7 @@ impl App {
                 // W9: the same for the WinMM MIDI selection (no-op on
                 // Linux — the JACK backend ignores SetMidiInputs).
                 if cfg!(windows) && !self.win_midi.is_empty() {
-                    self.backend
-                        .cmd(Cmd::SetMidiInputs(self.win_midi.clone()));
+                    self.backend.cmd(Cmd::SetMidiInputs(self.win_midi.clone()));
                 }
                 self.push_project();
             }
@@ -12523,8 +13697,7 @@ impl eframe::App for App {
                 eng.stop_preview();
             }
             self.preview_playing = None;
-        } else if eng.transport_on() && !eng.preview_active() && self.preview_playing.is_some()
-        {
+        } else if eng.transport_on() && !eng.preview_active() && self.preview_playing.is_some() {
             // Transport start kills previews engine-side (manager drain) —
             // keep the rack highlight honest with it.
             self.preview_playing = None;
@@ -12586,7 +13759,12 @@ impl eframe::App for App {
         let mut dead: Vec<String> = Vec::new();
         for rows in &self.fx_rows {
             for row in rows.iter() {
-                if let ChainRow::Vst { name, entry: Some(e), .. } = row {
+                if let ChainRow::Vst {
+                    name,
+                    entry: Some(e),
+                    ..
+                } = row
+                {
                     if e.is_dead() {
                         dead.push(name.clone());
                     }
@@ -12773,7 +13951,12 @@ impl App {
             }
         }
         if !self.os_drops.is_empty() {
-            if let Some(t) = self.sampler_editor_open() {
+            if let Some(t) = self.smap_win {
+                // v51: the open KEY-MAP window owns drops: every audio
+                // file becomes a mapped slot (rack-dedup).
+                let paths = std::mem::take(&mut self.os_drops);
+                self.sampler_map_files_dropped(t, &paths);
+            } else if let Some(t) = self.sampler_editor_open() {
                 let paths = std::mem::take(&mut self.os_drops);
                 self.sampler_files_dropped(t, &paths);
             } else if let Some(t) = self.synth_win {
@@ -13093,7 +14276,9 @@ impl App {
         }
         save_prompt_window(ui, self);
         load_window(ui, self);
+        proj_confirm_window(ui, self);
         self.load_opts_window(ui);
+        self.sample_edit_window(ui);
         knob_learn_window(ui, self);
         if self.fx_window.is_some() {
             effects_window(ui, self);
@@ -13117,6 +14302,11 @@ impl App {
         let sw = self.synth_win;
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
+        }
+        // v51: sampler key-map (piano roll) window.
+        let sm = self.smap_win;
+        if let Some(t) = sm {
+            self.sampler_map_window(ui, t);
         }
         let sp = self.synth_pick;
         if let Some(t) = sp {
@@ -13470,384 +14660,385 @@ impl App {
 }
 
 fn top_bar(ui: &mut egui::Ui, app: &mut App) {
-    egui::Panel::top("topbar").exact_size(TOPBAR_H).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            // Hamburger (settings) button: three horizontal bars.
-            let size = egui::vec2(26.0, 18.0);
-            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-            if rect.width() > 4.0 && rect.height() > 4.0 {
-                let p = ui.painter();
-                for k in 0..3u32 {
-                    let y = rect.min.y + 4.0 + k as f32 * 5.0;
-                    p.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.min.x + 3.0, y),
-                            egui::vec2(20.0, 2.0),
-                        ),
-                        1.0,
-                        if app.show_settings {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(200, 200, 205)
-                        },
-                    );
+    egui::Panel::top("topbar")
+        .exact_size(TOPBAR_H)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Hamburger (settings) button: three horizontal bars.
+                let size = egui::vec2(26.0, 18.0);
+                let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                if rect.width() > 4.0 && rect.height() > 4.0 {
+                    let p = ui.painter();
+                    for k in 0..3u32 {
+                        let y = rect.min.y + 4.0 + k as f32 * 5.0;
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x + 3.0, y),
+                                egui::vec2(20.0, 2.0),
+                            ),
+                            1.0,
+                            if app.show_settings {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(200, 200, 205)
+                            },
+                        );
+                    }
                 }
-            }
-            if resp.on_hover_text("Settings").clicked() {
-                app.show_settings = !app.show_settings;
-            }
+                if resp.on_hover_text("Settings").clicked() {
+                    app.show_settings = !app.show_settings;
+                }
 
-            ui.separator();
-            let title = match &app.proj_name {
-                n if n.is_empty() => "slooper · untitled".to_string(),
-                n => format!("slooper · {n}"),
-            };
-            ui.heading(RichText::new(title).strong());
-            // v25: status display rules —
-            //  * fresh message: exactly as written;
-            //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
-            //    dims continuously, and once it is older than 12 s it is
-            //    replaced by a LIVE idle summary (the engine state right
-            //    now); the full text survives in the hover tooltip. A
-            //    "project saved"-type notice therefore always leaves the
-            //    bar on its own instead of posing as current state (the
-            //    old ladder kept the raw text fully lit for a full
-            //    minute, then carried it for TEN minutes behind a "· Nm
-            //    ago" suffix).
-            let age_s = app.status_at.elapsed().as_secs_f64();
-            let idle = match &app.client_name {
-                Some(_) => format!("{} Hz · ready", app.sample_rate),
-                None => "audio engine: offline".to_string(),
-            };
-            const NOTICE_FADE_SECS: f64 = 12.0;
-            let fade = if age_s <= 6.0 {
-                1.0f32
-            } else {
-                (1.0 - ((age_s - 6.0) / (NOTICE_FADE_SECS - 6.0)) as f32 * 0.85).clamp(0.15, 1.0)
-            };
-            let (body, tip) = if age_s > NOTICE_FADE_SECS {
-                (
-                    idle,
-                    format!("last message {}s ago: {}", age_s as u64, app.status),
+                ui.separator();
+                let title = match &app.proj_name {
+                    n if n.is_empty() => "slooper · untitled".to_string(),
+                    n => format!("slooper · {n}"),
+                };
+                ui.heading(RichText::new(title).strong());
+                // v25: status display rules —
+                //  * fresh message: exactly as written;
+                //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
+                //    dims continuously, and once it is older than 12 s it is
+                //    replaced by a LIVE idle summary (the engine state right
+                //    now); the full text survives in the hover tooltip. A
+                //    "project saved"-type notice therefore always leaves the
+                //    bar on its own instead of posing as current state (the
+                //    old ladder kept the raw text fully lit for a full
+                //    minute, then carried it for TEN minutes behind a "· Nm
+                //    ago" suffix).
+                let age_s = app.status_at.elapsed().as_secs_f64();
+                let idle = match &app.client_name {
+                    Some(_) => format!("{} Hz · ready", app.sample_rate),
+                    None => "audio engine: offline".to_string(),
+                };
+                const NOTICE_FADE_SECS: f64 = 12.0;
+                let fade = if age_s <= 6.0 {
+                    1.0f32
+                } else {
+                    (1.0 - ((age_s - 6.0) / (NOTICE_FADE_SECS - 6.0)) as f32 * 0.85)
+                        .clamp(0.15, 1.0)
+                };
+                let (body, tip) = if age_s > NOTICE_FADE_SECS {
+                    (
+                        idle,
+                        format!("last message {}s ago: {}", age_s as u64, app.status),
+                    )
+                } else {
+                    (app.status.clone(), app.status.clone())
+                };
+                let status = match &app.client_name {
+                    Some(_) if age_s > NOTICE_FADE_SECS => body,
+                    Some(_) => format!("{} Hz · {}", app.sample_rate, body),
+                    None => body,
+                };
+                // v18: the status lives in a FIXED-WIDTH, truncating field. It
+                // used to be a bare label in the middle of the bar, so every
+                // longer message (e.g. after creating an automation asset)
+                // shoved the transport, tempo box and everything else rightward
+                // by hundreds of pixels — mid-session the widgets you had just
+                // right-clicked literally moved out from under the cursor, and
+                // on a narrow window they vanished off-screen entirely.
+                let weak_c = ui.visuals().weak_text_color();
+                ui.add_sized(
+                    egui::vec2(300.0, 18.0),
+                    egui::Label::new(RichText::new(status).color(weak_c.linear_multiply(fade)))
+                        .truncate(),
                 )
-            } else {
-                (app.status.clone(), app.status.clone())
-            };
-            let status = match &app.client_name {
-                Some(_) if age_s > NOTICE_FADE_SECS => body,
-                Some(_) => format!("{} Hz · {}", app.sample_rate, body),
-                None => body,
-            };
-            // v18: the status lives in a FIXED-WIDTH, truncating field. It
-            // used to be a bare label in the middle of the bar, so every
-            // longer message (e.g. after creating an automation asset)
-            // shoved the transport, tempo box and everything else rightward
-            // by hundreds of pixels — mid-session the widgets you had just
-            // right-clicked literally moved out from under the cursor, and
-            // on a narrow window they vanished off-screen entirely.
-            let weak_c = ui.visuals().weak_text_color();
-            ui.add_sized(
-                egui::vec2(300.0, 18.0),
-                egui::Label::new(RichText::new(status).color(weak_c.linear_multiply(fade)))
-                    .truncate(),
-            )
-            .on_hover_text(tip);
-            if age_s <= NOTICE_FADE_SECS {
-                if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
-                    // v25: zero is shown by the idle summary instead — after
-                    // "Stop" the bar reads honestly, not "applied: 0 in / 0
-                    // out"; and once the notice behind it has aged out, the
-                    // suffix goes with it.
-                    ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
+                .on_hover_text(tip);
+                if age_s <= NOTICE_FADE_SECS {
+                    if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
+                        // v25: zero is shown by the idle summary instead — after
+                        // "Stop" the bar reads honestly, not "applied: 0 in / 0
+                        // out"; and once the notice behind it has aged out, the
+                        // suffix goes with it.
+                        ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
+                    }
                 }
-            }
-            let xruns = app.backend.xruns.load(Ordering::Relaxed);
-            if xruns > 0 {
-                ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
-            }
+                let xruns = app.backend.xruns.load(Ordering::Relaxed);
+                if xruns > 0 {
+                    ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
+                }
 
-            // ---- transport ----
-            ui.separator();
-            let on = app.backend.engine.transport_on();
-            let play = if on { "STOP" } else { "PLAY" };
-            let play_btn = ui.button(RichText::new(play).strong()).on_hover_text(
-                "Global transport (Space): all sounding tracks play together \
+                // ---- transport ----
+                ui.separator();
+                let on = app.backend.engine.transport_on();
+                let play = if on { "STOP" } else { "PLAY" };
+                let play_btn = ui.button(RichText::new(play).strong()).on_hover_text(
+                    "Global transport (Space): all sounding tracks play together \
                  from the playhead. Stop holds the position.",
-            );
-            if play_btn.clicked() {
-                app.backend
-                    .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
-            }
-            ui.label(RichText::new(pos_label(app)).monospace());
-
-            // ---- metronome / grid tempo ----
-            ui.separator();
-            // Start/stop button (was a checkbox): lights up while the
-            // click runs, like the transport button next to it.
-            let metro_btn = ui
-                .add_sized(
-                    [58.0, 20.0],
-                    egui::Button::selectable(
-                        app.metro_on,
-                        RichText::new(if app.metro_on { "STOP" } else { "METRO" })
-                            .strong()
-                            .small(),
-                    ),
-                )
-                .on_hover_text(
-                    "Metronome start/stop: ticks the grid at the playhead \
-                     without moving it (never recorded). M also toggles it.",
                 );
-            if metro_btn.clicked() {
-                app.metro_on = !app.metro_on;
-                app.send_metro();
-            }
-            ui.label("bpm");
-            // Bound straight to the app state: the old pattern of cloning
-            // into a local EVERY FRAME wiped each keystroke before it could
-            // land, so the box could never be edited (it snapped back to
-            // the saved value). Commit to the engine on Enter / focus-out.
-            let bpm_rt = ui
-                .add(
-                    egui::TextEdit::singleline(&mut app.metro_bpm)
-                        .desired_width(38.0)
-                        .horizontal_align(egui::Align::Center)
-                        .font(egui::TextStyle::Monospace),
-                )
-                .on_hover_text(
-                    "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
-                );
-            app.bpm_rect = Some(bpm_rt.rect);
-            if bpm_rt.lost_focus() {
-                app.send_metro();
-            }
-            ui.label("beat");
-            let num_rt = ui
-                .add(
-                    egui::TextEdit::singleline(&mut app.metro_num)
-                        .desired_width(24.0)
-                        .horizontal_align(egui::Align::Center)
-                        .font(egui::TextStyle::Monospace),
-                )
-                .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
-            if num_rt.lost_focus() {
-                app.send_metro();
-            }
-
-            // File actions; the master volume + peak meter moved to the top
-            // of the mixer dock (`master_strip`).
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Export").clicked() {
-                    app.show_export = true;
+                if play_btn.clicked() {
+                    app.backend
+                        .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
                 }
-                if ui
-                    .button("Meter")
+                ui.label(RichText::new(pos_label(app)).monospace());
+
+                // ---- metronome / grid tempo ----
+                ui.separator();
+                // Start/stop button (was a checkbox): lights up while the
+                // click runs, like the transport button next to it.
+                let metro_btn = ui
+                    .add_sized(
+                        [58.0, 20.0],
+                        egui::Button::selectable(
+                            app.metro_on,
+                            RichText::new(if app.metro_on { "STOP" } else { "METRO" })
+                                .strong()
+                                .small(),
+                        ),
+                    )
                     .on_hover_text(
-                        "MASTER OUT panel: stereo meters + live LUFS \
+                        "Metronome start/stop: ticks the grid at the playhead \
+                     without moving it (never recorded). M also toggles it.",
+                    );
+                if metro_btn.clicked() {
+                    app.metro_on = !app.metro_on;
+                    app.send_metro();
+                }
+                ui.label("bpm");
+                // Bound straight to the app state: the old pattern of cloning
+                // into a local EVERY FRAME wiped each keystroke before it could
+                // land, so the box could never be edited (it snapped back to
+                // the saved value). Commit to the engine on Enter / focus-out.
+                let bpm_rt = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.metro_bpm)
+                            .desired_width(38.0)
+                            .horizontal_align(egui::Align::Center)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .on_hover_text(
+                        "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
+                    );
+                app.bpm_rect = Some(bpm_rt.rect);
+                if bpm_rt.lost_focus() {
+                    app.send_metro();
+                }
+                ui.label("beat");
+                let num_rt = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut app.metro_num)
+                            .desired_width(24.0)
+                            .horizontal_align(egui::Align::Center)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
+                if num_rt.lost_focus() {
+                    app.send_metro();
+                }
+
+                // File actions; the master volume + peak meter moved to the top
+                // of the mixer dock (`master_strip`).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Export").clicked() {
+                        app.show_export = true;
+                    }
+                    if ui
+                        .button("Meter")
+                        .on_hover_text(
+                            "MASTER OUT panel: stereo meters + live LUFS \
                          (momentary/short-term/integrated + LRA) + spectrum \
                          viewer for the master output. Docks next to the mixer.",
-                    )
-                    .clicked()
-                {
-                    app.show_master = !app.show_master;
-                }
-                if ui
-                    .button("Drums")
-                    .on_hover_text(
-                        "Drum machine / pattern builder (FL-FPC style): pads = \
-                         impulse sounds, grid = velocity per step. Commit \
-                         stamps the pattern into the arrangement.",
-                    )
-                    .clicked()
-                {
-                    app.show_drums = !app.show_drums;
-                }
-                // v43 R4: the window navigation hub. Everything the GUI
-                // shows is listed here with a live checkmark, plus the
-                // layout actions — no more hunting through Settings to
-                // find where a window went (Septabee/Ableton keep one
-                // View/Window menu for exactly this reason).
-                let wresp = ui
-                    .button("Windows")
-                    .on_hover_text("Show / hide / re-dock any window; layout actions.");
-                // v47: CloseOnClickOutside, NOT the menu default — the
-                // layout-name box is a TextEdit, and CloseOnClick would
-                // kill the popup the instant it is focused. Action buttons
-                // close themselves via ui.close(); checkboxes stay usable
-                // so two windows can be toggled in one visit.
-                egui::Popup::menu(&wresp)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                    // v47 R3: the palette is the keyboard path to
-                    // everything in this menu (and every settings
-                    // category) — offer it right where people look.
-                    if ui
-                        .button("search commands (Ctrl+K)\u{2026}")
-                        .on_hover_text(
-                            "one box: windows, layouts, settings categories.",
                         )
                         .clicked()
                     {
-                        app.palette = Some((String::new(), 0));
-                        app.palette_armed = false;
-                        ui.close();
+                        app.show_master = !app.show_master;
                     }
                     if ui
-                        .checkbox(&mut app.show_rack, "asset rack")
-                        .on_hover_text("The asset browser / import panel.")
-                        .changed()
+                        .button("Drums")
+                        .on_hover_text(
+                            "Drum machine / pattern builder (FL-FPC style): pads = \
+                         impulse sounds, grid = velocity per step. Commit \
+                         stamps the pattern into the arrangement.",
+                        )
+                        .clicked()
                     {
-                        app.save_config();
+                        app.show_drums = !app.show_drums;
                     }
-                    if ui
-                        .checkbox(&mut app.show_mixer, "mixer dock")
-                        .on_hover_text("Per-track mixer strips (grid-aligned).")
-                        .changed()
-                    {
-                        app.save_config();
-                    }
-                    if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
-                        app.save_config();
-                    }
-                    if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
-                        app.save_config();
-                    }
-                    if ui
-                        .checkbox(&mut app.show_master, "master out")
-                        .on_hover_text("Master meters + LUFS + spectrum panel.")
-                        .changed()
-                    {
-                        app.save_config();
-                    }
-                    if ui
-                        .checkbox(&mut app.show_drums, "drum machine")
-                        .on_hover_text("Pattern builder (FL-FPC style pads + grid).")
-                        .changed()
-                    {
-                        app.save_config();
-                    }
-                    // v47 R3 C4: the OPEN-WINDOWS roster — every dynamic
-                    // window (plugin params, FX editor, chain, synth,
-                    // roll, automation, …) shows here with a live tick,
-                    // so a window that wandered off is findable by name.
-                    if win_count(app) > 4 {
-                        ui.separator();
-                        for i in 4..win_count(app) {
-                            let mut v = win_visible(app, i);
-                            let t = win_title(app, i);
-                            let cb = ui.checkbox(&mut v, t).on_hover_text(
-                                "uncheck to close it; re-check re-opens the \
-                                 generic windows (plugin editors reopen via \
-                                 their own command)",
-                            );
-                            if cb.changed() {
-                                set_visible(app, i, v);
-                                app.save_config();
-                            }
-                        }
-                    }
-                    ui.separator();
-                    // v47 R2: layout templates — capture this exact view,
-                    // switch back with one click (Ableton view templates).
-                    ui.label(RichText::new("layout templates").weak());
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut app.layout_name)
-                                .hint_text("new layout name\u{2026}")
-                                .desired_width(150.0),
-                        );
-                        if ui
-                            .button("capture")
-                            .on_hover_text(
-                                "Save every window's placement, size, tab \
-                                 group and visibility under this name.",
-                            )
-                            .clicked()
-                        {
-                            let name = if app.layout_name.trim().is_empty() {
-                                format!("layout {}", app.win_layouts.len() + 1)
-                            } else {
-                                app.layout_name.clone()
-                            };
-                            capture_win_layout(app, name);
-                            app.layout_name.clear();
-                            ui.close();
-                        }
-                    });
-                    for n in 0..app.win_layouts.len() {
-                        let name = app.win_layouts[n].name.clone();
-                        ui.horizontal(|ui| {
+                    // v43 R4: the window navigation hub. Everything the GUI
+                    // shows is listed here with a live checkmark, plus the
+                    // layout actions — no more hunting through Settings to
+                    // find where a window went (Septabee/Ableton keep one
+                    // View/Window menu for exactly this reason).
+                    let wresp = ui
+                        .button("Windows")
+                        .on_hover_text("Show / hide / re-dock any window; layout actions.");
+                    // v47: CloseOnClickOutside, NOT the menu default — the
+                    // layout-name box is a TextEdit, and CloseOnClick would
+                    // kill the popup the instant it is focused. Action buttons
+                    // close themselves via ui.close(); checkboxes stay usable
+                    // so two windows can be toggled in one visit.
+                    egui::Popup::menu(&wresp)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            // v47 R3: the palette is the keyboard path to
+                            // everything in this menu (and every settings
+                            // category) — offer it right where people look.
                             if ui
-                                .button(&name)
-                                .on_hover_text("Apply this layout now")
+                                .button("search commands (Ctrl+K)\u{2026}")
+                                .on_hover_text("one box: windows, layouts, settings categories.")
                                 .clicked()
                             {
-                                apply_win_layout(app, &name);
+                                app.palette = Some((String::new(), 0));
+                                app.palette_armed = false;
                                 ui.close();
                             }
                             if ui
-                                .small_button("x")
-                                .on_hover_text("Delete this layout")
-                                .clicked()
+                                .checkbox(&mut app.show_rack, "asset rack")
+                                .on_hover_text("The asset browser / import panel.")
+                                .changed()
                             {
-                                app.win_layouts.remove(n);
                                 app.save_config();
                             }
-                        });
-                    }
-                    ui.separator();
-                    if ui
-                        .button("dock all windows")
-                        .on_hover_text("Snap every visible window back into dock slots.")
-                        .clicked()
-                    {
-                        dock_all_windows(app);
-                        ui.close();
-                    }
-                    if ui
-                        .button("float all windows")
-                        .on_hover_text("Undock every window into free windows.")
-                        .clicked()
-                    {
-                        float_all_windows(app);
-                        ui.close();
-                    }
-                    if ui
-                        .button("reset window layout")
-                        .on_hover_text(
-                            "Restore the stock arrangement: slots, sizes and \
+                            if ui
+                                .checkbox(&mut app.show_mixer, "mixer dock")
+                                .on_hover_text("Per-track mixer strips (grid-aligned).")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
+                                app.save_config();
+                            }
+                            if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
+                                app.save_config();
+                            }
+                            if ui
+                                .checkbox(&mut app.show_master, "master out")
+                                .on_hover_text("Master meters + LUFS + spectrum panel.")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            if ui
+                                .checkbox(&mut app.show_drums, "drum machine")
+                                .on_hover_text("Pattern builder (FL-FPC style pads + grid).")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            // v47 R3 C4: the OPEN-WINDOWS roster — every dynamic
+                            // window (plugin params, FX editor, chain, synth,
+                            // roll, automation, …) shows here with a live tick,
+                            // so a window that wandered off is findable by name.
+                            if win_count(app) > 4 {
+                                ui.separator();
+                                for i in 4..win_count(app) {
+                                    let mut v = win_visible(app, i);
+                                    let t = win_title(app, i);
+                                    let cb = ui.checkbox(&mut v, t).on_hover_text(
+                                        "uncheck to close it; re-check re-opens the \
+                                 generic windows (plugin editors reopen via \
+                                 their own command)",
+                                    );
+                                    if cb.changed() {
+                                        set_visible(app, i, v);
+                                        app.save_config();
+                                    }
+                                }
+                            }
+                            ui.separator();
+                            // v47 R2: layout templates — capture this exact view,
+                            // switch back with one click (Ableton view templates).
+                            ui.label(RichText::new("layout templates").weak());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut app.layout_name)
+                                        .hint_text("new layout name\u{2026}")
+                                        .desired_width(150.0),
+                                );
+                                if ui
+                                    .button("capture")
+                                    .on_hover_text(
+                                        "Save every window's placement, size, tab \
+                                 group and visibility under this name.",
+                                    )
+                                    .clicked()
+                                {
+                                    let name = if app.layout_name.trim().is_empty() {
+                                        format!("layout {}", app.win_layouts.len() + 1)
+                                    } else {
+                                        app.layout_name.clone()
+                                    };
+                                    capture_win_layout(app, name);
+                                    app.layout_name.clear();
+                                    ui.close();
+                                }
+                            });
+                            for n in 0..app.win_layouts.len() {
+                                let name = app.win_layouts[n].name.clone();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(&name)
+                                        .on_hover_text("Apply this layout now")
+                                        .clicked()
+                                    {
+                                        apply_win_layout(app, &name);
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .small_button("x")
+                                        .on_hover_text("Delete this layout")
+                                        .clicked()
+                                    {
+                                        app.win_layouts.remove(n);
+                                        app.save_config();
+                                    }
+                                });
+                            }
+                            ui.separator();
+                            if ui
+                                .button("dock all windows")
+                                .on_hover_text("Snap every visible window back into dock slots.")
+                                .clicked()
+                            {
+                                dock_all_windows(app);
+                                ui.close();
+                            }
+                            if ui
+                                .button("float all windows")
+                                .on_hover_text("Undock every window into free windows.")
+                                .clicked()
+                            {
+                                float_all_windows(app);
+                                ui.close();
+                            }
+                            if ui
+                                .button("reset window layout")
+                                .on_hover_text(
+                                    "Restore the stock arrangement: slots, sizes and \
                              un-collapsed headers — as after a fresh install.",
-                        )
+                                )
+                                .clicked()
+                            {
+                                reset_window_layout(app);
+                                ui.close();
+                            }
+                        });
+                    if ui
+                        .button("Load")
+                        .on_hover_text("Browse saved projects")
                         .clicked()
                     {
-                        reset_window_layout(app);
-                        ui.close();
+                        app.show_load = true;
+                    }
+                    if ui
+                        .button("Save as")
+                        .on_hover_text("Save under a new name")
+                        .clicked()
+                    {
+                        app.request_save(true);
+                    }
+                    let save_tip = match &app.proj_name {
+                        n if n.is_empty() => "Save — asks for a project name (Ctrl+S)".to_string(),
+                        n => format!("Save “{n}” (Ctrl+S)"),
+                    };
+                    if ui.button("Save").on_hover_text(save_tip).clicked() {
+                        app.request_save(false);
                     }
                 });
-                if ui
-                    .button("Load")
-                    .on_hover_text("Browse saved projects")
-                    .clicked()
-                {
-                    app.show_load = true;
-                }
-                if ui
-                    .button("Save as")
-                    .on_hover_text("Save under a new name")
-                    .clicked()
-                {
-                    app.request_save(true);
-                }
-                let save_tip = match &app.proj_name {
-                    n if n.is_empty() => "Save — asks for a project name (Ctrl+S)".to_string(),
-                    n => format!("Save “{n}” (Ctrl+S)"),
-                };
-                if ui.button("Save").on_hover_text(save_tip).clicked() {
-                    app.request_save(false);
-                }
             });
         });
-    });
 }
 
 /// Playhead position as `bar.beat` + `m:ss.t`.
@@ -14513,7 +15704,12 @@ fn dyn_seed_for(docks: &[crate::config::DynDock]) -> Vec<(DynKind, [i16; 3], [f3
         .filter_map(|d| DynKind::from_key(&d.kind).map(|k| (k, d.dock, d.rect, d.tab_act)))
         .collect();
     if !seed.iter().any(|(k, _, _, _)| *k == DynKind::Master) {
-        seed.push((DynKind::Master, [1, 1, 1], [520.0, 46.0, 560.0, 190.0], false));
+        seed.push((
+            DynKind::Master,
+            [1, 1, 1],
+            [520.0, 46.0, 560.0, 190.0],
+            false,
+        ));
     }
     seed
 }
@@ -14616,8 +15812,9 @@ fn win_dock_btn_rect(r: &[f32; 4]) -> egui::Rect {
 /// edge's free tail instead of merging into a stranger's tabs by accident.
 fn dedupe_slot(app: &mut App, idx: usize) {
     let (e, o) = (dock_edge(app, idx), dock_order(app, idx));
-    let clash = (0..win_count(app))
-        .any(|i| i != idx && is_docked(app, i) && dock_edge(app, i) == e && dock_order(app, i) == o);
+    let clash = (0..win_count(app)).any(|i| {
+        i != idx && is_docked(app, i) && dock_edge(app, i) == e && dock_order(app, i) == o
+    });
     if !clash {
         return;
     }
@@ -14827,7 +16024,8 @@ fn detach_tab(app: &mut App, idx: usize) {
 /// `docked_head`). Topmost (last painted) wins.
 fn tab_hit(app: &App, pt: egui::Pos2) -> Option<usize> {
     app.tab_rects.iter().rev().find_map(|(m, q)| {
-        let r = egui::Rect::from_min_max(egui::pos2(q[0], q[1]), egui::pos2(q[0] + q[2], q[1] + q[3]));
+        let r =
+            egui::Rect::from_min_max(egui::pos2(q[0], q[1]), egui::pos2(q[0] + q[2], q[1] + q[3]));
         r.contains(pt).then_some(*m)
     })
 }
@@ -14837,18 +16035,15 @@ fn tab_hit(app: &App, pt: egui::Pos2) -> Option<usize> {
 /// group instead of re-ranking it along the edge.
 fn merge_host_hit(app: &App, pt: egui::Pos2, carried: usize) -> Option<usize> {
     (0..win_count(app)).rev().find(|i| {
-        *i != carried
-            && win_visible(app, *i)
-            && is_docked(app, *i)
-            && {
-                let r = app.dock_rects[*i];
-                r[2] > 8.0
-                    && egui::Rect::from_min_max(
-                        egui::pos2(r[0], r[1]),
-                        egui::pos2(r[0] + r[2], r[1] + WIN_HEAD_H),
-                    )
-                    .contains(pt)
-            }
+        *i != carried && win_visible(app, *i) && is_docked(app, *i) && {
+            let r = app.dock_rects[*i];
+            r[2] > 8.0
+                && egui::Rect::from_min_max(
+                    egui::pos2(r[0], r[1]),
+                    egui::pos2(r[0] + r[2], r[1] + WIN_HEAD_H),
+                )
+                .contains(pt)
+        }
     })
 }
 /// v34 R6: the mixer's vertical-rhythm rule, as one honest function
@@ -14919,12 +16114,17 @@ fn snap_zone(vp: egui::Rect, pt: egui::Pos2) -> Option<i16> {
 fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Rect) -> egui::Rect {
     let n = win_count(app);
     let horiz = edge == 2 || edge == 3; // band runs horizontally (bottom/top)
-    // The live neighbours of the target edge + `idx` itself, packed in the
-    // order `dock_at` would assign (insert by position along the band).
-    // v47 R1: ONE entry per tab group — co-members share the slot, so the
-    // fair-share packing must count the group once, not once per member.
+                                        // The live neighbours of the target edge + `idx` itself, packed in the
+                                        // order `dock_at` would assign (insert by position along the band).
+                                        // v47 R1: ONE entry per tab group — co-members share the slot, so the
+                                        // fair-share packing must count the group once, not once per member.
     let mut ids: Vec<usize> = (0..n)
-        .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge && app.dock_rects[*i][2] > 8.0)
+        .filter(|i| {
+            *i != idx
+                && is_docked(app, *i)
+                && dock_edge(app, *i) == edge
+                && app.dock_rects[*i][2] > 8.0
+        })
         .collect();
     ids.sort_by_key(|i| dock_order(app, *i));
     {
@@ -14965,7 +16165,10 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
             continue;
         }
         let mem = (0..n).filter(|i| {
-            *i != idx && is_docked(app, *i) && dock_edge(app, *i) == e && app.dock_rects[*i][2] > 8.0
+            *i != idx
+                && is_docked(app, *i)
+                && dock_edge(app, *i) == e
+                && app.dock_rects[*i][2] > 8.0
         });
         if e == 0 {
             left += mem.map(|i| app.dock_rects[i][2]).fold(0.0f32, f32::max);
@@ -14982,8 +16185,7 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
     // the SAME orientation (a side window dragged to the bottom has its
     // width/height meaning swapped).
     let same_orient = |i: usize| -> bool {
-        !is_docked(app, i)
-            || (dock_edge(app, i) == 2 || dock_edge(app, i) == 3) == horiz
+        !is_docked(app, i) || (dock_edge(app, i) == 2 || dock_edge(app, i) == 3) == horiz
     };
     let thick_raw = ids
         .iter()
@@ -15026,7 +16228,11 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
                     wr[3]
                 }
             };
-            let want = if same_orient(i) && rec > 8.0 { rec } else { strip_def(i, edge) };
+            let want = if same_orient(i) && rec > 8.0 {
+                rec
+            } else {
+                strip_def(i, edge)
+            };
             let cap = ((strip_len - alloc) / (ids.len() - k) as f32).max(48.0);
             want.min(cap).max(48.0)
         };
@@ -15038,10 +16244,16 @@ fn dock_slot_rect(app: &App, idx: usize, edge: i16, pt: egui::Pos2, vp: egui::Re
     }
     if horiz {
         let y0 = if edge == 3 { top } else { bot - thick };
-        egui::Rect::from_min_max(egui::pos2(slot.0, y0), egui::pos2(slot.0 + slot.1, y0 + thick))
+        egui::Rect::from_min_max(
+            egui::pos2(slot.0, y0),
+            egui::pos2(slot.0 + slot.1, y0 + thick),
+        )
     } else {
         let x0 = if edge == 0 { left } else { right - thick };
-        egui::Rect::from_min_max(egui::pos2(x0, slot.0), egui::pos2(x0 + thick, slot.0 + slot.1))
+        egui::Rect::from_min_max(
+            egui::pos2(x0, slot.0),
+            egui::pos2(x0 + thick, slot.0 + slot.1),
+        )
     }
 }
 
@@ -15253,12 +16465,7 @@ fn reopen_dyn(app: &mut App, k: DynKind, on: bool) {
 }
 
 fn apply_win_layout(app: &mut App, name: &str) {
-    let Some(lay) = app
-        .win_layouts
-        .iter()
-        .find(|l| l.name == name)
-        .cloned()
-    else {
+    let Some(lay) = app.win_layouts.iter().find(|l| l.name == name).cloned() else {
         return;
     };
     app.side_wins = lay.side;
@@ -15388,8 +16595,10 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
             // egui's triple-click classification can swallow a real
             // double-click when an unrelated click landed within 6 px in the
             // last 0.6 s (count 3, not 2). Both counts mean "toggle me".
-            i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                || i.pointer.button_triple_clicked(egui::PointerButton::Primary),
+            i.pointer
+                .button_double_clicked(egui::PointerButton::Primary)
+                || i.pointer
+                    .button_triple_clicked(egui::PointerButton::Primary),
         )
     });
     // On the press frame `interact_pos` IS the press position.
@@ -15406,7 +16615,9 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
         // A short lockout keeps a mashed third click (which egui may report
         // as another >=2 click) from toggling straight back.
         let now = ui.ctx().input(|i| i.time);
-        if let Some(idx) = pos.and_then(|p| header_hit(app, p, false)).filter(|_| now >= app.dbl_dock_lock)
+        if let Some(idx) = pos
+            .and_then(|p| header_hit(app, p, false))
+            .filter(|_| now >= app.dbl_dock_lock)
         {
             app.dbl_dock_lock = now + 0.35;
             app.free_drag = None;
@@ -15458,31 +16669,31 @@ fn free_drag_pass(ui: &mut egui::Ui, app: &mut App) {
                 app.carry_was_docked = true;
             }
         } else {
-        // Iterate top-down (floats above docked; higher idx above lower)
-        // so the visually topmost header wins the grab.
-        let n = win_count(app);
-        let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
-        order.sort_by_key(|i| is_docked(app, *i));
-        for idx in order.into_iter().rev() {
-            let r = if is_docked(app, idx) {
-                app.dock_rects[idx]
-            } else {
-                win_rect(app, idx)
-            };
-            if r[2] < 8.0 {
-                continue;
+            // Iterate top-down (floats above docked; higher idx above lower)
+            // so the visually topmost header wins the grab.
+            let n = win_count(app);
+            let mut order: Vec<usize> = (0..n).filter(|i| win_visible(app, *i)).collect();
+            order.sort_by_key(|i| is_docked(app, *i));
+            for idx in order.into_iter().rev() {
+                let r = if is_docked(app, idx) {
+                    app.dock_rects[idx]
+                } else {
+                    win_rect(app, idx)
+                };
+                if r[2] < 8.0 {
+                    continue;
+                }
+                let mut head =
+                    egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
+                head.max.x -= WIN_BTN_STRIP + WIN_DOCK_BTN_W + 6.0; // buttons
+                if head.contains(press_pos) {
+                    app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
+                    app.drag_pos = [r[0], r[1]];
+                    app.drag_press_pt = [press_pos.x, press_pos.y];
+                    app.carry_was_docked = is_docked(app, idx);
+                    break;
+                }
             }
-            let mut head =
-                egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], WIN_HEAD_H));
-            head.max.x -= WIN_BTN_STRIP + WIN_DOCK_BTN_W + 6.0; // buttons
-            if head.contains(press_pos) {
-                app.free_drag = Some((idx, [press_pos.x - r[0], press_pos.y - r[1]]));
-                app.drag_pos = [r[0], r[1]];
-                app.drag_press_pt = [press_pos.x, press_pos.y];
-                app.carry_was_docked = is_docked(app, idx);
-                break;
-            }
-        }
         }
     }
     if let Some((idx, grab)) = app.free_drag {
@@ -15729,7 +16940,8 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                         ));
                     let rr = resp.rect;
                     let clicked = resp.clicked();
-                    app.tab_rects.push((m, [rr.min.x, rr.min.y, rr.width(), rr.height()]));
+                    app.tab_rects
+                        .push((m, [rr.min.x, rr.min.y, rr.width(), rr.height()]));
                     resp.context_menu(|ui| {
                         let mut done = false;
                         window_slot_menu(ui, app, m, &mut done);
@@ -16000,7 +17212,11 @@ fn palette_pass(ui: &mut egui::Ui, app: &mut App) {
     if down {
         nsel = (nsel + 1).min(rows.len().saturating_sub(1));
     }
-    let run = if enter && !rows.is_empty() { Some(nsel) } else { None };
+    let run = if enter && !rows.is_empty() {
+        Some(nsel)
+    } else {
+        None
+    };
     if esc {
         app.palette = None;
         app.palette_armed = false;
@@ -16013,48 +17229,43 @@ fn palette_pass(ui: &mut egui::Ui, app: &mut App) {
     let vp = ui.ctx().input(|i| i.viewport_rect());
     let mut open = true;
     let mut click_run: Option<usize> = None;
-    let resp = egui::Window::new(RichText::new(
-        "commands \u{b7} Enter run \u{b7} Esc close",
-    ))
-    .id(egui::Id::new("slooper_palette"))
-    .open(&mut open)
-    .fixed_pos(egui::pos2(((vp.width() - 470.0) * 0.5).max(8.0), 80.0))
-    .collapsible(false)
-    .resizable(false)
-    .show(ui.ctx(), |ui| {
-        ui.set_width(440.0);
-        // The query box keeps keyboard focus for its whole life (modal
-        // search); `rows`/`cmds` were built BEFORE the closure, so the
-        // live edit of app.palette below cannot collide with them.
-        if let Some((q, s)) = app.palette.as_mut() {
-            let te = egui::TextEdit::singleline(q)
-                .hint_text("type to filter commands\u{2026}")
-                .desired_width(430.0);
-            ui.add(te).request_focus();
-            *s = nsel;
-        }
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (n, (label, hint, _)) in rows.iter().enumerate() {
-                    let row = ui.add(
-                        egui::Button::selectable(
-                            n == nsel,
-                            format!("{label}  \u{b7}  {hint}"),
-                        )
-                        .min_size(egui::vec2(ui.available_width(), 0.0)),
-                    );
-                    if row.clicked() {
-                        click_run = Some(n);
+    let resp = egui::Window::new(RichText::new("commands \u{b7} Enter run \u{b7} Esc close"))
+        .id(egui::Id::new("slooper_palette"))
+        .open(&mut open)
+        .fixed_pos(egui::pos2(((vp.width() - 470.0) * 0.5).max(8.0), 80.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_width(440.0);
+            // The query box keeps keyboard focus for its whole life (modal
+            // search); `rows`/`cmds` were built BEFORE the closure, so the
+            // live edit of app.palette below cannot collide with them.
+            if let Some((q, s)) = app.palette.as_mut() {
+                let te = egui::TextEdit::singleline(q)
+                    .hint_text("type to filter commands\u{2026}")
+                    .desired_width(430.0);
+                ui.add(te).request_focus();
+                *s = nsel;
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (n, (label, hint, _)) in rows.iter().enumerate() {
+                        let row = ui.add(
+                            egui::Button::selectable(n == nsel, format!("{label}  \u{b7}  {hint}"))
+                                .min_size(egui::vec2(ui.available_width(), 0.0)),
+                        );
+                        if row.clicked() {
+                            click_run = Some(n);
+                        }
                     }
-                }
-                if rows.is_empty() {
-                    ui.label(RichText::new("no matching command").weak());
-                }
-            });
-    });
+                    if rows.is_empty() {
+                        ui.label(RichText::new("no matching command").weak());
+                    }
+                });
+        });
     if let Some(r) = resp {
         let rect = r.response.rect;
         let click_elsewhere = armed
@@ -16255,7 +17466,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             // Live remaining along the strip this frame.
                             let rem = (ui.max_rect().max.x
                                 - ui.cursor().min.x.max(ui.max_rect().min.x))
-                                .max(0.0);
+                            .max(0.0);
                             let max_w = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                             // Id salted by stack depth: egui caches a
                             // resizable panel's size by Id, so when the
@@ -16312,7 +17523,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                         // ALL (egui's panel docs call this out by name).
                         let rem = (ui.max_rect().max.y
                             - ui.cursor().min.y.max(ui.max_rect().min.y))
-                            .max(0.0);
+                        .max(0.0);
                         let max_h = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                         let sz = want.min(cap).max(48.0);
                         egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
@@ -16486,10 +17697,8 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                         egui::pos2(r[0], r[1]),
                         egui::pos2(r[0] + r[2], r[1] + r[3].max(WIN_HEAD_H)),
                     );
-                    let lid = egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new("dock-zone-hl"),
-                    );
+                    let lid =
+                        egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-zone-hl"));
                     let p = ui.ctx().layer_painter(lid);
                     let ghost = Color32::from_rgb(150, 215, 255);
                     p.rect_filled(g, 3.0, ghost.linear_multiply(0.22));
@@ -16566,12 +17775,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                 )
             };
             p.rect_filled(br, 3.0, fill);
-            p.rect_stroke(
-                br,
-                3.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
+            p.rect_stroke(br, 3.0, stroke, egui::StrokeKind::Inside);
             // Vector icon: a pane docking into the right edge of a frame
             // (arrow/pictogram glyphs outside the bundled fonts render as
             // tofu — shapes only, per the glyph-coverage rule).
@@ -16584,10 +17788,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             );
             let bar_w = ic.width() * 0.32;
             p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(ic.max.x - bar_w, ic.min.y),
-                    ic.max,
-                ),
+                egui::Rect::from_min_max(egui::pos2(ic.max.x - bar_w, ic.min.y), ic.max),
                 0.0,
                 Color32::from_rgb(150, 215, 255),
             );
@@ -16595,9 +17796,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                 let msg = "dock into the last slot";
                 let tw = p.fonts_mut(|f| {
                     let fid = fid.clone();
-                    msg.chars()
-                        .map(|c| f.glyph_width(&fid, c))
-                        .sum::<f32>()
+                    msg.chars().map(|c| f.glyph_width(&fid, c)).sum::<f32>()
                 });
                 let tr = egui::Rect::from_min_size(
                     egui::pos2(br.min.x - 2.0, br.max.y + 6.0),
@@ -16854,6 +18053,16 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
 /// dir-then-name sorted —, error).
 type RackRow = (String, Vec<RackFile>, Option<String>);
 
+/// v50 R4: egui drag payload for a sub-folder being dragged inside the
+/// rack: the rack ROOT it lives in plus its root-relative dir key
+/// ("kit" / "kit/dry"). Dropping it on another header (or a title row)
+/// physically moves the directory.
+#[derive(Clone, Debug)]
+struct FolderDrag {
+    root: String,
+    dir: String,
+}
+
 /// One rack file row: click = load + audition, drag = place a clip.
 /// Audio and MIDI entries share it (MIDI decodes via `ensure_asset`).
 /// `indent` > 0 marks a row inside a v28 sub-folder group.
@@ -16976,6 +18185,21 @@ fn rack_file_row(
                 ui.close();
             }
         }
+        let is_audio = app.assets.iter().any(|a| {
+            a.path.to_string_lossy() == fp_disp && a.pattern.is_none() && a.automation.is_none()
+        });
+        {
+            if is_audio
+                && ui
+                    .button("Edit sample")
+                    .on_hover_text("reverse, ping-pong, fades, pitch, bend, time stretch")
+                    .clicked()
+            {
+                app.sample_edit_win = Some(fp_disp.clone());
+                app.se_name = format!("{name} (edit)");
+                ui.close();
+            }
+        }
         if ui.button("rename\u{2026}").clicked() {
             app.rack_rename = Some((fp_disp.clone(), name.to_string(), true));
             ui.close();
@@ -17042,6 +18266,8 @@ fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
     let (txt, col) = match kind {
         1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
         2 => ("AUTO", Color32::from_rgb(255, 120, 120)),
+        // v50 R6: saved project rows in the rack.
+        3 => ("PROJ", Color32::from_rgb(190, 150, 255)),
         _ => ("AUDIO", Color32::from_rgb(210, 175, 120)),
     };
     ui.painter().text(
@@ -17175,22 +18401,50 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                     for (fi, (path, files, err)) in snap.into_iter().enumerate() {
                         ui.add_space(3.0);
                         ui.separator();
-                        ui.horizontal(|ui| {
+                        // v50 R5: the directory that WILL receive recordings
+                        // (explicit target or the implicit rule) — every
+                        // folder row/header wearing '*' is exactly this one.
+                        let rec_now = app.record_dir();
+                        let is_rec = |d: &str| {
+                            let joined = if d.is_empty() {
+                                PathBuf::from(&path)
+                            } else {
+                                PathBuf::from(&path)
+                                    .join(d.replace('/', std::path::MAIN_SEPARATOR_STR))
+                            };
+                            joined == rec_now
+                        };
+                        let root_rec = is_rec("");
+                        let mut tname_r: Option<egui::Response> = None;
+                        let trow = ui.horizontal(|ui| {
                             let tag = if fi == 0 { " [primary]" } else { "" };
-                            ui.label(
-                                RichText::new(format!("{}{}", base_name(&path), tag))
+                            tname_r = Some(
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}{}{}",
+                                        base_name(&path),
+                                        tag,
+                                        if root_rec { " *" } else { "" }
+                                    ))
                                     .strong()
                                     .small(),
-                            )
-                            .on_hover_text(format!(
-                                "{}{}",
-                                path,
-                                if fi == 0 {
-                                    " (primary \u{2014} recordings drop into its top sub-folder)"
-                                } else {
-                                    ""
-                                }
-                            ));
+                                )
+                                .on_hover_text(format!(
+                                    "{}{}{}",
+                                    path,
+                                    if fi == 0 {
+                                        " (primary \u{2014} recordings drop into its top sub-folder)"
+                                    } else {
+                                        ""
+                                    },
+                                    if root_rec {
+                                        " \u{b7} '*' = recordings land here"
+                                    } else {
+                                        ""
+                                    }
+                                ))
+                                .interact(egui::Sense::click_and_drag()),
+                            );
                             if ui.small_button("scan").clicked() {
                                 rescan = Some(fi);
                             }
@@ -17214,6 +18468,75 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 .clicked()
                             {
                                 rm = Some(fi);
+                            }
+                        });
+                        // v50 R4/R5: the folder TITLE row is a drop target
+                        // too: an asset drops into the folder ROOT, a
+                        // dragged sub-folder re-roots here; right-click
+                        // makes this folder the recordings target.
+                        // v50: the folder-drag overlay must NOT cover the
+                        // title-row buttons (an overlay allocated after
+                        // them steals their clicks) — only the name.
+                        // v50: the NAME LABEL owns the row's interaction —
+                        // an overlay over the whole row (allocated after
+                        // the buttons) stole scan/change/remove clicks.
+                        let tres = tname_r.unwrap_or_else(|| {
+                            ui.allocate_response(egui::Vec2::ZERO, Sense::hover())
+                        });
+                        if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                            || egui::DragAndDrop::has_payload_of_type::<FolderDrag>(ui.ctx())
+                        {
+                            ui.painter().rect_stroke(
+                                trow.response.rect,
+                                3.0,
+                                egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        // Same non-destructive release read as the folder
+                        // headers (see the note there).
+                        let rel =
+                            tres.contains_pointer() && ui.input(|i| i.pointer.any_released());
+                        if rel {
+                            if let Some(a) =
+                                egui::DragAndDrop::payload::<usize>(ui.ctx()).map(|a| *a)
+                            {
+                                if let Some(pth) = app
+                                    .assets
+                                    .get(a)
+                                    .map(|x| x.path.to_string_lossy().into_owned())
+                                {
+                                    app.rack_move(&pth, &PathBuf::from(&path));
+                                }
+                            }
+                            if let Some((r, d)) =
+                                egui::DragAndDrop::payload::<FolderDrag>(ui.ctx())
+                                    .map(|x| (x.root.clone(), x.dir.clone()))
+                            {
+                                app.rack_dir_move(&r, &d, &PathBuf::from(&path));
+                            }
+                        }
+                        tres.context_menu(|ui| {
+                            if ui
+                                .button("use for recordings")
+                                .on_hover_text(
+                                    "New takes, MREC files and recorded MIDI land in this folder",
+                                )
+                                .clicked()
+                            {
+                                app.status = format!(
+                                    "recordings \u{2192} {}",
+                                    app.set_record_target(&path)
+                                );
+                                ui.close();
+                            }
+                            if !app.record_target.is_empty()
+                                && ui.button("clear recordings target").clicked()
+                            {
+                                app.record_target.clear();
+                                app.save_config();
+                                app.status = "recordings \u{2192} primary folder (default)".into();
+                                ui.close();
                             }
                         });
                         if let Some(e) = err {
@@ -17247,8 +18570,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                         // subtree; files directly inside the parent get
                         // their own rows under it. The first entry of the
                         // display order is the recordings target and keeps
-                        // the '*' marker.
-                        let first_dir = dirs.first().cloned();
+                        // the '*' marker — v50 R5: the marker now simply
+                        // marks whichever folder `record_dir()` resolves to
+                        // (explicit target included).
                         // Shared tree renderer for both grouping modes;
                         // `filter` picks which files of a group get rows
                         // (folder view: every kind; type view: one kind).
@@ -17284,7 +18608,27 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         .strong(),
                                     ),
                                 );
-                                if hr.clicked() {
+                                // v50 R4: ONE click_and_drag response owns
+                                // the header — click toggles collapse, a
+                                // drag carries this whole group (drop on
+                                // another header or a folder title row
+                                // MOVES the directory on disk), and the
+                                // context menu anchors here too. An overlay
+                                // layered OVER the button would capture the
+                                // press and starve clicked()/rmb (the v28
+                                // asset-row lesson).
+                                // v50: the row's y salts the response id —
+                                // in BY-TYPE mode the SAME folder key
+                                // renders once per kind section, and an
+                                // unsalted shared id made every click
+                                // resolve to the last section's instance.
+                                let hg = ui.interact(
+                                    hr.rect,
+                                    ui.id()
+                                        .with(("rackdirg", &key, hr.rect.min.y as i32)),
+                                    Sense::click_and_drag(),
+                                );
+                                if hg.clicked() {
                                     if open {
                                         app.rack_collapsed.insert(key.clone());
                                     } else {
@@ -17292,10 +18636,20 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                     app.save_config();
                                 }
+                                if hg.drag_started_by(egui::PointerButton::Primary) {
+                                    hg.dnd_set_drag_payload(FolderDrag {
+                                        root: path.clone(),
+                                        dir: fold_dir.clone(),
+                                    });
+                                }
                                 // v34 R15: releasing an in-app asset drag
                                 // on a folder header MOVES the file into
                                 // that folder — dragging beats menu diving.
-                                if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx()) {
+                                if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx())
+                                    || egui::DragAndDrop::has_payload_of_type::<FolderDrag>(
+                                        ui.ctx(),
+                                    )
+                                {
                                     ui.painter().rect_stroke(
                                         hr.rect,
                                         3.0,
@@ -17303,23 +18657,47 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         egui::StrokeKind::Inside,
                                     );
                                 }
-                                if let Some(a) = hr.dnd_release_payload::<usize>().map(|a| *a) {
-                                    if let Some(pth) = app
-                                        .assets
-                                        .get(a)
-                                        .map(|x| x.path.to_string_lossy().into_owned())
+                                // NOTE: read with the NON-destructive
+                                // payload() + our own release gate — egui's
+                                // take_payload() CLEARS the payload even on
+                                // a type mismatch, so checking usize first
+                                // would silently kill folder drops (and
+                                // vice versa).
+                                let rel =
+                                    hr.contains_pointer() && ui.input(|i| i.pointer.any_released());
+                                if rel {
+                                    if let Some(a) =
+                                        egui::DragAndDrop::payload::<usize>(ui.ctx()).map(|a| *a)
+                                    {
+                                        if let Some(pth) = app
+                                            .assets
+                                            .get(a)
+                                            .map(|x| x.path.to_string_lossy().into_owned())
+                                        {
+                                            let dest = PathBuf::from(&path).join(
+                                                fold_dir.replace(
+                                                    '/',
+                                                    std::path::MAIN_SEPARATOR_STR,
+                                                ),
+                                            );
+                                            app.rack_move(&pth, &dest);
+                                        }
+                                    }
+                                    // v50 R4: a dragged sub-folder released on
+                                    // another header NESTS under it (physical
+                                    // move; guards live in rack_dir_move).
+                                    if let Some((r, d)) =
+                                        egui::DragAndDrop::payload::<FolderDrag>(ui.ctx())
+                                            .map(|x| (x.root.clone(), x.dir.clone()))
                                     {
                                         let dest = PathBuf::from(&path).join(
-                                            fold_dir.replace(
-                                                '/',
-                                                std::path::MAIN_SEPARATOR_STR,
-                                            ),
+                                            fold_dir.replace('/', std::path::MAIN_SEPARATOR_STR),
                                         );
-                                        app.rack_move(&pth, &dest);
+                                        app.rack_dir_move(&r, &d, &dest);
                                     }
                                 }
                                 let mut mv = None;
-                                hr.context_menu(|ui| {
+                                hg.context_menu(|ui| {
                                     if ui
                                         .button("up")
                                         .on_hover_text(
@@ -17334,6 +18712,37 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                     if ui.button("down").clicked() {
                                         mv = Some(1);
+                                        ui.close();
+                                    }
+                                    // v50 R5: any sub-folder can become the
+                                    // recordings target (takes land there).
+                                    if ui
+                                        .button("use for recordings")
+                                        .on_hover_text(
+                                            "Takes, MREC files and recorded MIDI land here",
+                                        )
+                                        .clicked()
+                                    {
+                                        let t = PathBuf::from(&path)
+                                            .join(fold_dir.replace(
+                                                '/',
+                                                std::path::MAIN_SEPARATOR_STR,
+                                            ))
+                                            .to_string_lossy()
+                                            .into_owned();
+                                        app.status = format!(
+                                            "recordings \u{2192} {}",
+                                            app.set_record_target(&t)
+                                        );
+                                        ui.close();
+                                    }
+                                    if !app.record_target.is_empty()
+                                        && ui.button("clear recordings target").clicked()
+                                    {
+                                        app.record_target.clear();
+                                        app.save_config();
+                                        app.status =
+                                            "recordings \u{2192} primary folder (default)".into();
                                         ui.close();
                                     }
                                     // v34 R15: remove an (empty) sub-folder
@@ -17357,7 +18766,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 if let Some(m) = mv {
                                     fold = Some((path.clone(), fold_dir, m));
                                 }
-                                hr.on_hover_text(format!(
+                                hg.on_hover_text(format!(
                                     "sub-folder {label} \u{2014} click to {} \u{b7} right-click \
                                      to re-order{}",
                                     if open { "collapse" } else { "expand" },
@@ -17387,7 +18796,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     },
                                     top.clone(),
                                     total,
-                                    fi == 0 && first_dir.as_deref() == Some(top.as_str()),
+                                    is_rec(&top),
                                     false,
                                     top.clone(),
                                 );
@@ -17426,7 +18835,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         kd.clone(),
                                         kd.clone(),
                                         kc,
-                                        fi == 0 && first_dir.as_deref() == Some(kd.as_str()),
+                                        is_rec(&kd),
                                         true,
                                         kd.clone(),
                                     );
@@ -17685,6 +19094,26 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                             ui.close();
                                         }
                                     }
+                                    let is_audio = app.assets.iter().any(|a| {
+                                        a.path.to_string_lossy() == apdisp
+                                            && a.pattern.is_none()
+                                            && a.automation.is_none()
+                                    });
+                                    {
+                                        if is_audio
+                                            && ui
+                                            .button("Edit sample")
+                                            .on_hover_text(
+                                                "reverse, ping-pong, fades, pitch, bend, time \
+                                                 stretch \u{2014} saved with the project",
+                                            )
+                                            .clicked()
+                                        {
+                                            app.sample_edit_win = Some(apdisp.clone());
+                                            app.se_name = format!("{name} (edit)");
+                                            ui.close();
+                                        }
+                                    }
                                     if ui.button("rename\u{2026}").clicked() {
                                         app.rack_rename =
                                             Some((apdisp.clone(), name.clone(), true));
@@ -17737,6 +19166,41 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             row.on_hover_text(
                                 "part of this project (not a rack file) \u{2014} draggable \u{b7} right-click to rename / move / delete",
                             );
+                        }
+                    }
+
+                    // v50 R6: saved PROJECTS live in the rack too — one
+                    // row per project file (newest first). Clicking does
+                    // NOT load directly: it opens the overwrite-safety
+                    // confirmation first, then the v42 slice chooser.
+                    let projs = project::list_projects(&app.projects_dir());
+                    if !projs.is_empty() {
+                        ui.add_space(3.0);
+                        ui.separator();
+                        ui.label(
+                            RichText::new("projects")
+                                .weak()
+                                .small()
+                                .color(Color32::from_rgb(190, 150, 255)),
+                        );
+                        for (name, pth) in projs.iter().take(32) {
+                            let cur = *name == app.proj_name;
+                            let prow = ui.add_sized(
+                                egui::vec2(ui.available_width(), 20.0),
+                                egui::Button::selectable(
+                                    false,
+                                    RichText::new(format!(
+                                        "{}{}",
+                                        name,
+                                        if cur { "  (current)" } else { "" }
+                                    ))
+                                    .small(),
+                                ),
+                            );
+                            rack_kind_badge(ui, prow.rect, 3);
+                            if prow.clicked() {
+                                app.proj_confirm = Some((name.clone(), pth.clone()));
+                            }
                         }
                     }
 
@@ -18497,13 +19961,11 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // still runs through the SAME track effect chain).
         let poly = app.track_poly.get(t).copied().unwrap_or(false);
         let ptxt = if poly { "poly" } else { "mono" };
-        let pbtn = egui::Button::new(
-            RichText::new(ptxt).color(if poly {
-                Color32::from_rgb(150, 220, 150)
-            } else {
-                Color32::from_rgb(150, 150, 150)
-            }),
-        )
+        let pbtn = egui::Button::new(RichText::new(ptxt).color(if poly {
+            Color32::from_rgb(150, 220, 150)
+        } else {
+            Color32::from_rgb(150, 150, 150)
+        }))
         .small()
         .min_size(egui::vec2(38.0, 0.0));
         if ui
@@ -18567,9 +20029,7 @@ fn synth_pick_window(ui: &mut egui::Ui, app: &mut App, t: usize) {
     if dragging {
         w = w.current_pos(egui::pos2(app.drag_pos[0], app.drag_pos[1]));
     }
-    let resp = w.show(ui, |ui| {
-        body_clipped(ui, |ui| synth_pick_body(ui, app, t))
-    });
+    let resp = w.show(ui, |ui| body_clipped(ui, |ui| synth_pick_body(ui, app, t)));
     if !open {
         app.synth_pick = None;
     }
@@ -19718,10 +21178,28 @@ fn lane_row(
                 Color32::from_rgba_premultiplied(10, 10, 14, 160),
             );
         }
-        draw_asset_clip(ui, app, c.asset, (c.cut, vlen), cres_audio, fill, sel);
+        // v50 R2: the DATA region — waveform/note/curve content maps ONLY
+        // here, never into the silence tail: an extended clip reads as
+        // content + silence, not as stretched content. (The tail keeps its
+        // hatch below; an automation curve holds its last value across it,
+        // which is exactly automation's silence.)
+        let dend = x_of(x0, c.data_end(alen), sr, px);
+        let cres_data = egui::Rect::from_min_max(
+            egui::pos2(ax0, cres.min.y),
+            egui::pos2(dend.clamp(cres.min.x, cres.max.x), cres.max.y),
+        );
+        draw_asset_clip(
+            ui,
+            app,
+            c.asset,
+            (c.cut, vlen),
+            cres_audio,
+            cres_data,
+            fill,
+            sel,
+        );
         // Extended-past-data tail: silence, hatched dark so it reads as
         // "clip is longer than its source".
-        let dend = x_of(x0, c.data_end(alen), sr, px);
         if dend < cx1 - 0.5 {
             ui.painter().rect_filled(
                 egui::Rect::from_min_max(egui::pos2(dend.max(cres.min.x), cres.min.y), cres.max),
@@ -20787,13 +22265,19 @@ fn grid_context_menu(
 /// Draw one clip's rectangle with its asset's waveform, normalized by the
 /// asset's own peak so quiet takes stay legible. `win` is the window of
 /// asset data the clip shows — `(cut, samples shown)` — so trims reveal
-/// the right slice; the caller paints any silent extension separately.
+/// the right slice. v50 R2: `body` is the clip region that holds SOURCE
+/// DATA — all waveform/note/curve content maps into it alone, so the
+/// silence past the data end stays visually EMPTY (hatched by the caller)
+/// instead of showing content stretched over it. `rect` stays the paint
+/// target for the fill and outline (and may include pads/tails).
+#[allow(clippy::too_many_arguments)]
 fn draw_asset_clip(
     ui: &mut egui::Ui,
     app: &mut App,
     asset: u32,
     win: (u64, u64),
     rect: egui::Rect,
+    body: egui::Rect,
     fill: Color32,
     sel: bool,
 ) {
@@ -20806,7 +22290,7 @@ fn draw_asset_clip(
         .get(asset as usize)
         .and_then(|a| a.pattern.clone())
     {
-        if rect.width() >= 4.0 {
+        if body.width() >= 4.0 {
             let (cut, wlen) = win;
             let wlen = wlen.max(1);
             let alen = app.asset_len(asset).max(1);
@@ -20825,24 +22309,25 @@ fn draw_asset_clip(
                 }
                 let s0 = note.start as f64 / lt * alen as f64;
                 let s1 = (note.start + note.len.max(1)) as f64 / lt * alen as f64;
-                let x0 = rect.min.x
-                    + ((s0 - cut as f64).max(0.0) / wlen as f64 * rect.width() as f64) as f32;
-                let x1 = rect.min.x
+                let x0 = body.min.x
+                    + ((s0 - cut as f64).max(0.0) / wlen as f64 * body.width() as f64) as f32;
+                let x1 = body.min.x
                     + ((s1.min((cut + wlen) as f64) - cut as f64).max(0.0) / wlen as f64
-                        * rect.width() as f64) as f32;
-                if x1 <= x0 + 0.5 && (x0 < rect.min.x || x0 > rect.max.x) {
+                        * body.width() as f64) as f32;
+                if x1 <= x0 + 0.5 && (x0 < body.min.x || x0 > body.max.x) {
                     continue;
                 }
                 let y = rect.max.y - ((n - lo_n) as f32 / (hi_n - lo_n) as f32) * (h - 2.0) - 1.0;
                 let bar = (h / 28.0).clamp(1.2, 5.0);
-                p.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(x0, y - bar * 0.5),
-                        egui::pos2(x1.max(x0 + 1.0), y + bar * 0.5),
-                    ),
-                    1.0,
-                    col,
-                );
+                let nb = egui::Rect::from_min_max(
+                    egui::pos2(x0, y - bar * 0.5),
+                    egui::pos2(x1.max(x0 + 1.0), y + bar * 0.5),
+                )
+                .intersect(body);
+                if !nb.is_positive() {
+                    continue;
+                }
+                p.rect_filled(nb, 1.0, col);
             }
         }
         let stroke = if sel {
@@ -20860,7 +22345,7 @@ fn draw_asset_clip(
         .get(asset as usize)
         .and_then(|a| a.automation.clone())
     {
-        if rect.width() >= 4.0 {
+        if body.width() >= 4.0 {
             let (cut, wlen) = win;
             let wlen = wlen.max(1);
             let (mut lo, mut hi) = (f32::MAX, f32::MIN);
@@ -20877,14 +22362,14 @@ fn draw_asset_clip(
             } else {
                 Color32::from_rgb(255, 130, 130)
             };
-            let steps = (rect.width() / 2.0).max(2.0) as i64;
+            let steps = (body.width() / 2.0).max(2.0) as i64;
             let h = rect.height().max(6.0);
             let mut prev: Option<egui::Pos2> = None;
             for i in 0..=steps {
                 let frac = i as f64 / steps as f64;
                 let t = (cut as f64 + frac * wlen as f64) as i64;
                 let v = auto.eval(t);
-                let x = rect.min.x + (frac * rect.width() as f64) as f32;
+                let x = body.min.x + (frac * body.width() as f64) as f32;
                 let y = rect.max.y - (v - lo) / (hi - lo) * (h - 3.0) - 1.5;
                 let pt = egui::pos2(x, y);
                 if let Some(q) = prev {
@@ -20901,7 +22386,7 @@ fn draw_asset_clip(
         p.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
         return;
     }
-    if rect.width() >= 4.0 {
+    if body.width() >= 4.0 {
         let alen = app.asset_len(asset).max(1);
         let (cut, wlen) = win;
         let wlen = wlen.min(alen.saturating_sub(cut)).max(1);
@@ -20909,9 +22394,9 @@ fn draw_asset_clip(
         // windows ask for enough full-asset columns to stay crisp when the
         // visible slice is zoomed.
         let cols_req = if cut == 0 && wlen >= alen {
-            rect.width() as usize
+            body.width() as usize
         } else {
-            ((rect.width() * (alen as f32 / wlen as f32)) as usize).clamp(1, 4096)
+            ((body.width() * (alen as f32 / wlen as f32)) as usize).clamp(1, 4096)
         };
         if let Some(data) = asset_wave(app, asset, cols_req) {
             let n = data.len().max(1);
@@ -20926,11 +22411,14 @@ fn draw_asset_clip(
             let f1 = ((cut + wlen) as f32 / alen as f32).max(f0 + 1e-6);
             let i0 = ((f0 * n as f32) as usize).min(n.saturating_sub(1));
             let i1 = ((f1 * n as f32) as usize).clamp(i0 + 1, n);
-            let col_w = rect.width() / ((i1 - i0) as f32).max(1.0);
+            let col_w = body.width() / ((i1 - i0) as f32).max(1.0);
             let stroke = egui::Stroke::new(col_w.clamp(0.8, 3.0), col);
             for (j, i) in (i0..i1).enumerate() {
                 let [lo, hi] = data[i];
-                let x = rect.min.x + (j as f32 + 0.5) * col_w;
+                let x = body.min.x + (j as f32 + 0.5) * col_w;
+                if x > body.max.x + 0.5 {
+                    break;
+                }
                 p.line_segment(
                     [egui::pos2(x, cy - hi * amp), egui::pos2(x, cy - lo * amp)],
                     stroke,
@@ -22288,11 +23776,7 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
             .inner_margin(6.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("[{}]", last.ts))
-                            .weak()
-                            .monospace(),
-                    );
+                    ui.label(RichText::new(format!("[{}]", last.ts)).weak().monospace());
                     ui.label(RichText::new(last.type_name).strong().monospace());
                     let name_w = ui.available_width();
                     ui.label(
@@ -23130,6 +24614,82 @@ fn load_window(ui: &mut egui::Ui, app: &mut App) {
     }
     app.show_load = open;
 }
+
+/// v50 R6: a rack project row was clicked. Loading REPLACES the current
+/// project, so nothing happens before an explicit confirmation here —
+/// with a one-click "save current first" escape hatch. Confirming feeds
+/// the existing v42 slice chooser, so the current work is only replaced
+/// after one more deliberate step.
+fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
+    let Some((name, path)) = app.proj_confirm.clone() else {
+        return;
+    };
+    let mut answer: Option<Option<PathBuf>> = None; // None = still open
+    egui::Window::new("Load project?")
+        .id(egui::Id::new("v50-proj-confirm"))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label(format!("Load project \u{201c}{name}\u{201d}?"));
+            ui.label(
+                egui::RichText::new(format!(
+                    "This replaces the current project\u{201d}s tracks, clips and \
+                     controls{} \u{2014} save it first if you want to keep it.",
+                    if app.proj_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (now \u{201c}{}\u{201d})", app.proj_name)
+                    }
+                ))
+                .weak()
+                .small(),
+            );
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("Load").strong())
+                            .min_size(egui::vec2(90.0, 0.0)),
+                    )
+                    .clicked()
+                {
+                    answer = Some(Some(path.clone()));
+                }
+                if !app.proj_name.is_empty()
+                    && ui
+                        .button("Save current & load")
+                        .on_hover_text(format!("Save as \u{201c}{}\u{201d} first", app.proj_name))
+                        .clicked()
+                {
+                    let n = app.proj_name.clone();
+                    app.do_save(&n);
+                    answer = Some(Some(path.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(None);
+                }
+            });
+        });
+    if let Some(chosen) = answer {
+        app.proj_confirm = None;
+        if let Some(p) = chosen {
+            // Same pipeline the LOAD PROJECT browser uses: parse, then
+            // ask WHICH slices to import before anything changes.
+            match project::load(&p) {
+                Ok(pr) => {
+                    app.pending_proj = Some(pr);
+                    app.pending_proj_dir = p.parent().map(|d| d.to_path_buf());
+                    app.load_sel = LoadSel::all();
+                    app.show_load_opts = true;
+                }
+                Err(e) => app.status = format!("load: {e}"),
+            }
+        } else {
+            app.status = "load cancelled".into();
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23606,7 +25166,10 @@ mod tests {
     #[test]
     fn w9_midi_inputs_evt_feeds_the_picker() {
         let mut app = headless_app("w9-midi-evt");
-        assert!(app.avail_midi.is_empty(), "no devices before the backend talks");
+        assert!(
+            app.avail_midi.is_empty(),
+            "no devices before the backend talks"
+        );
         app.handle_evt(crate::audio::Evt::MidiInputs(vec![
             "KeyStage 61".into(),
             "KeyStage 61 [2]".into(),
@@ -23615,7 +25178,10 @@ mod tests {
         assert_eq!(app.avail_midi[1], "KeyStage 61 [2]", "labels ride verbatim");
         // The applied selection and the checkbox state stay distinct:
         // receiving a list must not silently apply anything.
-        assert!(app.win_midi.is_empty(), "receiving the list applies nothing");
+        assert!(
+            app.win_midi.is_empty(),
+            "receiving the list applies nothing"
+        );
     }
 
     /// W9: the WinMM picker section renders ONLY on Windows — on Linux the
@@ -24525,11 +26091,7 @@ mod tests {
             .position(|w| w.kind == DynKind::Master)
             .expect("master registered");
         let dr = app.dock_rects[mi];
-        let r = if dr[2] > 8.0 {
-            dr
-        } else {
-            win_rect(&app, mi)
-        };
+        let r = if dr[2] > 8.0 { dr } else { win_rect(&app, mi) };
         let z = galley_centers(&mut app, &ctx, "0", true)
             .into_iter()
             .find(|c| {
@@ -25680,9 +27242,7 @@ mod tests {
         let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
         // v46: `None` = v38 legacy LIVE route (the pin checks stop_all's
         // purge, not which instance renders).
-        app.backend
-            .engine
-            .play_audition(0, ev.into(), None);
+        app.backend.engine.play_audition(0, ev.into(), None);
         assert!(app.backend.engine.audition_active());
         frame(&mut app, &ctx, vec![]);
         assert!(
@@ -28168,6 +29728,272 @@ mod tests {
         );
     }
 
+    /// v51: the sampler key-map window paints once per frame, and its
+    /// first open materializes the legacy single-asset params as slot 0
+    /// at the track's current root (the map becomes the single truth).
+    #[test]
+    fn v51_sampler_map_window_paints_and_seeds_legacy() {
+        let mut app = headless_app("v51map");
+        let ctx = egui::Context::default();
+        // The rack folder scan is async (drum-machine test idiom) — the
+        // seed needs the kick asset to have landed before the bind.
+        for _ in 0..800 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.assets.iter().any(|a| a.name == "kick") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.set_track_synth_stem(0, "sampler");
+        frame(&mut app, &ctx, vec![]);
+        // Give the sampler a real legacy patch first (rack click, v13
+        // recipe) so the seed has an asset to materialize.
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        frame(&mut app, &ctx, vec![moved(kick.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        );
+        app.synth_win = None;
+        frame(&mut app, &ctx, vec![]);
+        // No map yet (never opened) — the engine still runs legacy params.
+        assert!(app.sampler_maps[0].is_none(), "unopened track has no map");
+        app.smap_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let seeded = app.sampler_maps[0].clone().expect("open seeds a map");
+        assert_eq!(seeded.mode, 0, "default mode is hard cutoff");
+        assert_eq!(seeded.slots.len(), 1, "legacy params seed one slot");
+        assert_eq!(seeded.slots[0].root, 48, "root follows the old param");
+        // The window chrome + header paint exactly once (no ghost twin).
+        let texts = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let g: Vec<String> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        return Some(t.galley.text().trim().to_string());
+                    }
+                    None
+                })
+                .collect();
+            out.textures_delta.clear();
+            g
+        };
+        let g = texts(&mut app, &ctx);
+        for needle in [
+            "hard cutoff",
+            "crossfade",
+            "+ add sample",
+            "1 mapped",
+            "C2",
+            "C6",
+        ] {
+            assert_eq!(
+                g.iter().filter(|s| s.as_str() == needle).count(),
+                1,
+                "map window must paint {needle:?} exactly once, got: {g:?}"
+            );
+        }
+        // Guard: a NON-sampler track can't keep the window open.
+        app.set_track_synth_stem(0, "piano");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.smap_win, None, "window closes when the sampler unbinds");
+    }
+
+    /// v51: "+ add sample" appends a lane (selected asset, root +7) and
+    /// publishes it to the live engine map; "remove ×" drops the selected
+    /// lane again — the map stays the single source of truth.
+    #[test]
+    fn v51_sampler_map_add_remove_slots() {
+        let mut app = headless_app("v51addrem");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        for ev in [
+            vec![moved(kick.center())],
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        for _ in 0..1200 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.synth_registry.desc("sampler").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        app.smap_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.sampler_maps[0].as_ref().unwrap().slots.len(), 1);
+        let add = galley_at(&mut app, &ctx, "+ add sample")
+            .expect("add button")
+            .center();
+        for ev in [
+            vec![moved(add)],
+            vec![moved(add), btn(add, egui::PointerButton::Primary, true)],
+            vec![btn(add, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        let m = app.sampler_maps[0].as_ref().unwrap();
+        assert_eq!(m.slots.len(), 2, "+ add sample appends a lane");
+        assert_eq!(m.slots[1].root, 55, "new lane roots a fifth up");
+        assert_eq!(m.slots[1].asset, m.slots[0].asset, "same selected asset");
+        assert_eq!(app.smap_sel, Some(1), "new lane is selected");
+        let inst = app.track_synth_inst[0].clone().expect("bound");
+        let SynthHandle::Script(si) = inst.as_ref() else {
+            panic!("script instance expected");
+        };
+        assert_eq!(si.map_snapshot().0.len(), 2, "engine map carries both");
+        let rem = galley_at(&mut app, &ctx, "remove \u{d7}").expect("remove button").center();
+        for ev in [
+            vec![moved(rem)],
+            vec![moved(rem), btn(rem, egui::PointerButton::Primary, true)],
+            vec![btn(rem, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(app.sampler_maps[0].as_ref().unwrap().slots.len(), 1);
+        assert_eq!(si.map_snapshot().0.len(), 1, "engine map follows removal");
+        assert_eq!(app.smap_sel, None, "selection cleared after remove");
+    }
+
+    /// v51: dragging a lane block to a new key re-roots the slot (state
+    /// and the live engine map), and a piano-key click re-roots the
+    /// SELECTED slot — the two assignment gestures of the map window.
+    #[test]
+    fn v51_sampler_map_drag_and_keyclick_assign_roots() {
+        let mut app = headless_app("v51drag");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.set_track_synth_stem(0, "sampler");
+        // Land the kick patch through the rack (v13 recipe) — this also
+        // survives the late project load that replaces pre-load assets.
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        frame(&mut app, &ctx, vec![moved(kick.center())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        );
+        // The script synth compiles async — the window guard refuses it
+        // until the registry is warm, so wait for the descriptor.
+        for _ in 0..1200 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.synth_registry.desc("sampler").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        app.smap_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let seeded = app.sampler_maps[0].clone().expect("open seeds");
+        assert_eq!((seeded.slots.len(), seeded.slots[0].root), (1, 48));
+        // Geometry straight from the harness probe: (kr.min.x, kr.min.y,
+        // lane-0 strip min-x/min-y, roll width). Deterministic, no colors.
+        let (kx, ky, lx, ly, _roll_w) = app.smap_probe.expect("window painted");
+        // Slot 0's block sits in lane 0 at C3(48).
+        let bx = lx + (48 - 36) as f32 * 18.0 + 9.0;
+        let by = ly + 12.0;
+        // Drag C3 -> G3(55): press, move held (no button events while
+        // held — the repo's proven drag recipe), release.
+        let tx = lx + (55 - 36) as f32 * 18.0 + 9.0;
+        let mid = lx + (51 - 36) as f32 * 18.0 + 9.0;
+        frame(&mut app, &ctx, vec![moved(egui::pos2(bx, by))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(egui::pos2(bx, by)),
+                btn(egui::pos2(bx, by), egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(mid, by))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(tx, by))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(egui::pos2(tx, by), egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(
+            app.sampler_maps[0].as_ref().unwrap().slots[0].root,
+            55,
+            "dragging the block must re-root the slot"
+        );
+        // Key click at E2(40): the selected (just-dragged) slot follows.
+        let ex = kx + (40 - 36) as f32 * 18.0 + 9.0;
+        frame(&mut app, &ctx, vec![moved(egui::pos2(ex, ky + 10.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(
+                egui::pos2(ex, ky + 10.0),
+                egui::PointerButton::Primary,
+                true,
+            )],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(
+                egui::pos2(ex, ky + 10.0),
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        assert_eq!(
+            app.sampler_maps[0].as_ref().unwrap().slots[0].root,
+            40,
+            "clicking a key re-roots the selected lane"
+        );
+        // The LIVE instance received the map (no rebind happened).
+        let inst = app.track_synth_inst[0].clone().expect("bound instance");
+        let SynthHandle::Script(si) = inst.as_ref() else {
+            panic!("script instance expected");
+        };
+        let (slots, _mode, exists) = si.map_snapshot();
+        assert!(exists, "map published");
+        let kick = app.assets.iter().position(|a| a.name == "kick").unwrap() as u32;
+        assert!(
+            slots.iter().any(|(a, r)| *a == kick && *r == 40),
+            "engine map must carry kick@40, got {slots:?}"
+        );
+    }
+
     /// v0.9: bare S splits the selected clip at the playhead; the clip
     /// property strip (gain / fade in / fade out) paints for exactly one
     /// selection and hides otherwise.
@@ -28455,7 +30281,10 @@ mod tests {
         );
         // Re-click the highlighted row → stop it, clear the highlight.
         app.preview_asset(1);
-        assert!(app.preview_playing.is_none(), "re-click stops the highlight");
+        assert!(
+            app.preview_playing.is_none(),
+            "re-click stops the highlight"
+        );
         // Engine-side: two starts = ONE voice (the v0.10 stack is gone).
         let a = app.assets[0].data.clone();
         let b = app.assets[1].data.clone();
@@ -28499,9 +30328,7 @@ mod tests {
         let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 100)];
         // v46: `None` = the v38 legacy LIVE-route (these pins check pool
         // retirement, not which instance renders).
-        app.backend
-            .engine
-            .play_audition(0, ev.into(), None);
+        app.backend.engine.play_audition(0, ev.into(), None);
         app.backend.engine.debug_mark_auditions_drained();
         app.logic(&ctx, &mut f);
         assert!(
@@ -29237,6 +31064,36 @@ mod tests {
             ctx,
             vec![moved(p), btn(p, egui::PointerButton::Secondary, false)],
         );
+    }
+
+    /// Left-click a galley whose text EQUALS `needle` (galley_at's
+    /// substring match can hit status-bar echoes of the same word).
+    fn click_exact(app: &mut App, ctx: &egui::Context, needle: &str) {
+        let p = galley_centers(app, ctx, needle, true)[0];
+        frame(app, ctx, vec![moved(p)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+    }
+
+    /// Click the LAST painted galley containing `needle`, read through the
+    /// SAME 1440x853 viewport `frame` clicks in (a `galley_centers` read
+    /// uses a 2600-tall screen — centered-window buttons computed there
+    /// land off-screen when replayed through `frame`). Windows paint last.
+    fn click_last(app: &mut App, ctx: &egui::Context, needle: &str) {
+        let r = galley_at_last(app, ctx, needle)
+            .unwrap_or_else(|| panic!("galley {needle:?} not painted"));
+        let p = r.center();
+        frame(app, ctx, vec![moved(p)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
     }
 
     /// Left-click the painted galley whose text equals `needle`.
@@ -30857,8 +32714,7 @@ mod tests {
         app.add_fx_script(0, "spread");
         app.fx_window = Some(0);
         frame(&mut app, &ctx, vec![]);
-        let name = galley_at(&mut app, &ctx, "stereo spread")
-            .expect("chain row name painted");
+        let name = galley_at(&mut app, &ctx, "stereo spread").expect("chain row name painted");
         let tag = galley_at(&mut app, &ctx, "[fx:st]").expect("stereo badge painted");
         assert!(
             (tag.center().y - name.center().y).abs() < 12.0,
@@ -30874,10 +32730,7 @@ mod tests {
             .map(|d| !d.stereo)
             .unwrap_or(true);
         assert!(comp, "compressor stays a mono (v1) script");
-        assert!(
-            app.fx_rows[0].len() == 2,
-            "both scripts live in the chain"
-        );
+        assert!(app.fx_rows[0].len() == 2, "both scripts live in the chain");
         // Tier 4: the chorus joined the v3 stereo world (per-side tap
         // banks, Hyper Chorus task) — this pin used to assert it was the
         // mono counterexample; the roster in docs/FL-SUITE.md is the
@@ -34151,15 +36004,19 @@ mod tests {
         let mk = |target: &str, track: u32| crate::config::ValueBind {
             target: target.into(),
             track,
-            bind: MidiBind { ty: 1, ch: 0, d1: 5 },
+            bind: MidiBind {
+                ty: 1,
+                ch: 0,
+                d1: 5,
+            },
             kind: 0,
             lo: 0,
             hi: 127,
         };
         pr.value_binds = vec![
-            mk("fx:0:1", 0),    // lands: chain slot 0 param 1 exists
-            mk("fx:9:0", 0),    // phantom: no such chain slot
-            mk("synth:0", 7),   // phantom: track 7 has no instrument
+            mk("fx:0:1", 0),  // lands: chain slot 0 param 1 exists
+            mk("fx:9:0", 0),  // phantom: no such chain slot
+            mk("synth:0", 7), // phantom: track 7 has no instrument
         ];
         let vol0 = app.trk_vol[0];
         let bpm0 = app.metro_bpm.clone();
@@ -34306,7 +36163,10 @@ mod tests {
             app.status
         );
         app.backend.engine.set_rec_loop(0, false);
-        assert!(!app.backend.engine.rec_loop_armed(0), "STOP clears the loop");
+        assert!(
+            !app.backend.engine.rec_loop_armed(0),
+            "STOP clears the loop"
+        );
     }
 
     /// v29: untick EVERYTHING and REC refuses with a hint instead of
@@ -35107,7 +36967,6 @@ mod tests {
             assert_eq!(g.len(), 2, "type view nests too (audio + midi)");
             g[0]
         };
-        frame(&mut app, &ctx, vec![moved(p3)]);
         click_pt(&mut app, &ctx, p3);
         // Collapse state is shared across the sections and both grouping
         // modes — one key, so every copy of the header flips together.
@@ -36831,7 +38690,10 @@ mod tests {
         let mut app = headless_app("v43ghost");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 1, "mixer docked right");
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 1,
+            "mixer docked right"
+        );
         let h = app.dock_rects[3];
         assert!(h[2] > 8.0, "mixer dock header rect recorded");
         let from = egui::pos2(h[0] + 30.0, h[1] + 12.0);
@@ -36851,16 +38713,36 @@ mod tests {
         // Left edge: the slot hugs x=0 at a REAL panel width, starts at the
         // band top (the drop is ABOVE the rack's center), and is a sized
         // slot — a share of the band, not the whole band.
-        assert!(g.min.x < 10.0 && g.width() > 120.0, "left-edge slot geometry: {g:?}");
+        assert!(
+            g.min.x < 10.0 && g.width() > 120.0,
+            "left-edge slot geometry: {g:?}"
+        );
         assert!(g.min.y < 100.0, "slot starts at the band top: {g:?}");
-        assert!(g.height() > 150.0 && g.height() < 520.0, "sized slot, not the band: {g:?}");
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        assert!(
+            g.height() > 150.0 && g.height() < 520.0,
+            "sized slot, not the band: {g:?}"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 0, "released into the left edge");
-        assert_eq!(dock_order(&app, 3), 0, "landed at the drop rank (above the rack)");
-        assert!(ghost_rects(&mut app, &ctx, to).is_empty(), "ghost gone after release");
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 0,
+            "released into the left edge"
+        );
+        assert_eq!(
+            dock_order(&app, 3),
+            0,
+            "landed at the drop rank (above the rack)"
+        );
+        assert!(
+            ghost_rects(&mut app, &ctx, to).is_empty(),
+            "ghost gone after release"
+        );
     }
 
     /// R2: right-clicking the TITLE of a floating primary window opens the
@@ -36886,7 +38768,11 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(app.win_menu.is_some(), "right-press opened the slot menu");
         let item = galley_at(&mut app, &ctx, "dock to the right edge").expect("menu item");
@@ -36917,7 +38803,11 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         let item = match galley_at(&mut app, &ctx, "dock to the bottom edge") {
             Some(r) => r,
@@ -36935,7 +38825,11 @@ mod tests {
                     &ctx,
                     vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
                 );
-                frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![btn(tp, egui::PointerButton::Secondary, false)],
+                );
                 frame(&mut app, &ctx, vec![]);
                 galley_at(&mut app, &ctx, "dock to the bottom edge")
                     .expect("slot menu on the plugin window")
@@ -36968,21 +38862,33 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        let tp = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title").center();
+        let tp = galley_at(&mut app, &ctx, "ASSET RACK")
+            .expect("float title")
+            .center();
         frame(&mut app, &ctx, vec![moved(tp)]);
         frame(
             &mut app,
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        assert!(galley_at(&mut app, &ctx, "close this window").is_some(), "menu open");
+        assert!(
+            galley_at(&mut app, &ctx, "close this window").is_some(),
+            "menu open"
+        );
         // The opening release did NOT dismiss it — now press far away:
         click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
         frame(&mut app, &ctx, vec![]);
         assert!(app.win_menu.is_none(), "click-away dismissed the menu");
-        assert!(galley_at(&mut app, &ctx, "close this window").is_none(), "menu unpainted");
+        assert!(
+            galley_at(&mut app, &ctx, "close this window").is_none(),
+            "menu unpainted"
+        );
     }
 
     /// R3: double-clicking a title bar toggles docked <-> floating, in BOTH
@@ -37003,19 +38909,43 @@ mod tests {
         // outside every snap band (a band release would re-dock first).
         park_window(&mut app, &ctx, "ASSET RACK", egui::vec2(300.0, 250.0));
         frame(&mut app, &ctx, vec![]);
-        let tp = galley_at(&mut app, &ctx, "ASSET RACK").expect("float title").center();
-        assert!(tp.x > 200.0 && tp.x < 1200.0, "title parked off any band: {tp:?}");
+        let tp = galley_at(&mut app, &ctx, "ASSET RACK")
+            .expect("float title")
+            .center();
+        assert!(
+            tp.x > 200.0 && tp.x < 1200.0,
+            "title parked off any band: {tp:?}"
+        );
         // Double-click: press · release · press (same point, same moment).
         frame(&mut app, &ctx, vec![moved(tp)]);
-        frame(&mut app, &ctx, vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Primary, false)]);
-        frame(&mut app, &ctx, vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Primary, false)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(tp), btn(tp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
         assert_eq!(app.side_wins.dock[0][0], 1, "double-click docked the float");
-        assert_eq!(app.side_wins.dock[0][1], 0, "… to its remembered edge (left)");
+        assert_eq!(
+            app.side_wins.dock[0][1], 0,
+            "… to its remembered edge (left)"
+        );
         // Let the mash-guard window expire (a real user never re-dbls a
         // title inside 0.35 s).
         for _ in 0..25 {
@@ -37026,14 +38956,33 @@ mod tests {
         assert!(h[2] > 8.0, "docked header rect recorded");
         let dp = egui::pos2(h[0] + 30.0, h[1] + 12.0);
         frame(&mut app, &ctx, vec![moved(dp)]);
-        frame(&mut app, &ctx, vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(dp, egui::PointerButton::Primary, false)]);
-        frame(&mut app, &ctx, vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)]);
-        frame(&mut app, &ctx, vec![btn(dp, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(dp, egui::PointerButton::Primary, false)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(dp), btn(dp, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(dp, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock[0][0], 0, "double-click floated the docked window");
+        assert_eq!(
+            app.side_wins.dock[0][0], 0,
+            "double-click floated the docked window"
+        );
     }
 
     /// R4: the top-bar Windows menu toggles window visibility with live
@@ -37086,8 +39035,16 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "primaries snapped");
-        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).expect("dyn slot");
+        assert_eq!(
+            app.side_wins.dock,
+            crate::config::default_dock(),
+            "primaries snapped"
+        );
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .expect("dyn slot");
         assert_eq!(drum.dock[0], 1, "dock-all INCLUDED the dynamic window");
         click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
         open_menu(&mut app, &ctx);
@@ -37096,8 +39053,15 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(app.side_wins.dock.iter().all(|d| d[0] == 0), "primaries floated");
-        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).unwrap();
+        assert!(
+            app.side_wins.dock.iter().all(|d| d[0] == 0),
+            "primaries floated"
+        );
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .unwrap();
         assert_eq!(drum.dock[0], 0, "float-all INCLUDED the dynamic window");
         click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
         open_menu(&mut app, &ctx);
@@ -37106,8 +39070,16 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(app.side_wins.dock, crate::config::default_dock(), "stock slots restored");
-        let drum = app.dyn_wins.iter().find(|w| w.kind == DynKind::Drums).unwrap();
+        assert_eq!(
+            app.side_wins.dock,
+            crate::config::default_dock(),
+            "stock slots restored"
+        );
+        let drum = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .unwrap();
         assert_eq!(drum.dock[0], 1, "dynamic re-docked");
         assert!(app.dock_collapsed.iter().all(|c| !*c), "nothing collapsed");
     }
@@ -37132,9 +39104,18 @@ mod tests {
         click_pt(&mut app, &ctx, f.center());
         type_into_focused(&mut app, &ctx, "theme");
         frame(&mut app, &ctx, vec![]);
-        assert!(galley_at(&mut app, &ctx, "MONITORING").is_none(), "monitoring filtered out");
-        assert!(galley_at(&mut app, &ctx, "AUDIO PORTS").is_none(), "ports filtered out");
-        assert!(galley_at(&mut app, &ctx, "GUI").is_some(), "GUI survives its keyword 'theme'");
+        assert!(
+            galley_at(&mut app, &ctx, "MONITORING").is_none(),
+            "monitoring filtered out"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "AUDIO PORTS").is_none(),
+            "ports filtered out"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "GUI").is_some(),
+            "GUI survives its keyword 'theme'"
+        );
         assert!(
             galley_at(&mut app, &ctx, "live input monitoring").is_none(),
             "hidden section paints nothing, not even its widgets"
@@ -37173,9 +39154,18 @@ mod tests {
         click_pt(&mut app, &ctx, p.center());
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.sett_filter, "ports", "chip injected its query");
-        assert!(galley_at(&mut app, &ctx, "AUDIO PORTS").is_some(), "ports section shown");
-        assert!(galley_at(&mut app, &ctx, "MONITORING").is_none(), "others hidden");
-        assert!(galley_at(&mut app, &ctx, "PROJECTS").is_none(), "others hidden");
+        assert!(
+            galley_at(&mut app, &ctx, "AUDIO PORTS").is_some(),
+            "ports section shown"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "MONITORING").is_none(),
+            "others hidden"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "PROJECTS").is_none(),
+            "others hidden"
+        );
         let all = galley_centers(&mut app, &ctx, "all", true);
         assert!(!all.is_empty(), "the 'all' chip is an exact label");
         click_pt(&mut app, &ctx, all[0]);
@@ -37264,7 +39254,11 @@ mod tests {
         );
         frame(&mut app, &ctx, vec![moved(mid)]);
         frame(&mut app, &ctx, vec![moved(to)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..4 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -37321,7 +39315,10 @@ mod tests {
             galley_at(&mut app, &ctx, "source(s)").is_some(),
             "the honest status line survives (wrapped is fine)"
         );
-        assert!(galley_at(&mut app, &ctx, "Clear").is_some(), "Clear always offered");
+        assert!(
+            galley_at(&mut app, &ctx, "Clear").is_some(),
+            "Clear always offered"
+        );
         assert!(
             !galley_centers(&mut app, &ctx, "Note On", false).is_empty(),
             "event names survive narrow widths"
@@ -37360,12 +39357,19 @@ mod tests {
             let p = d - egui::vec2(50.0 * k as f32, 0.0);
             frame(&mut app, &ctx, vec![moved(p)]);
         }
-        frame(&mut app, &ctx, vec![btn(d2, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(d2, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
         let m2 = app.dock_rects[2];
-        assert!(m2[2] < m[2] - 100.0, "divider narrowed the monitor share: {m:?} -> {m2:?}");
+        assert!(
+            m2[2] < m[2] - 100.0,
+            "divider narrowed the monitor share: {m:?} -> {m2:?}"
+        );
         let rec = app.side_wins.monitor[2];
         assert!(
             (rec - m2[2]).abs() < 40.0,
@@ -37418,7 +39422,11 @@ mod tests {
             g.width() < 700.0 && g.height() < 700.0,
             "slot-sized, never edge-sized: {g:?}"
         );
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
     }
 
     /// R3: carrying a DOCKED window by its title and releasing outside
@@ -37440,11 +39448,18 @@ mod tests {
         let to = egui::pos2(700.0, 400.0); // dead centre: no snap band
         frame(&mut app, &ctx, vec![moved(egui::pos2(500.0, 300.0))]);
         frame(&mut app, &ctx, vec![moved(to)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..2 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 0), "a docked carry released off-band stays docked");
+        assert!(
+            is_docked(&app, 0),
+            "a docked carry released off-band stays docked"
+        );
         assert_eq!(dock_edge(&app, 0), 0, "same edge as before the drag");
     }
 
@@ -37470,12 +39485,22 @@ mod tests {
             &ctx,
             vec![moved(b), btn(b, egui::PointerButton::Primary, true)],
         );
-        assert!(app.free_drag.is_none(), "the dock button press is not a carry");
-        frame(&mut app, &ctx, vec![btn(b, egui::PointerButton::Primary, false)]);
+        assert!(
+            app.free_drag.is_none(),
+            "the dock button press is not a carry"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(b, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..2 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 1), "title-bar button put it back in the dock");
+        assert!(
+            is_docked(&app, 1),
+            "title-bar button put it back in the dock"
+        );
         assert_eq!(dock_edge(&app, 1), 2, "into its LAST used edge (bottom)");
     }
 
@@ -37510,7 +39535,10 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(app.show_mixer && is_docked(&app, 3), "mixer alone and docked");
+        assert!(
+            app.show_mixer && is_docked(&app, 3),
+            "mixer alone and docked"
+        );
         assert!(
             galley_at(&mut app, &ctx, "reset I").is_none(),
             "mixer dock has no master controls (v44 R4)"
@@ -37552,8 +39580,14 @@ mod tests {
             (r[2] - 260.0).abs() < 24.0 && (r[3] - 140.0).abs() < 24.0,
             "small master out stayed small: {r:?}"
         );
-        assert!(galley_at(&mut app, &ctx, "LRA").is_none(), "LRA folded when narrow");
-        assert!(galley_at(&mut app, &ctx, "reset I").is_some(), "controls survive");
+        assert!(
+            galley_at(&mut app, &ctx, "LRA").is_none(),
+            "LRA folded when narrow"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "reset I").is_some(),
+            "controls survive"
+        );
     }
 
     /// v46: merging audio clips sums them AT THEIR POSITIONS — overlap
@@ -37606,7 +39640,14 @@ mod tests {
         let sr = app.backend.engine.sample_rate().max(1) as u64;
         let mk = |app: &mut App, name: &str, note: u8| -> u32 {
             let mut p = Pattern::new(120);
-            p.notes.push(Note { ch: 0, note, vel: 100, press: 0, start: 0, len: PPQ as u32 });
+            p.notes.push(Note {
+                ch: 0,
+                note,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: PPQ as u32,
+            });
             let id = app.assets.len() as u32;
             app.assets.push(Asset::midi(
                 id,
@@ -37666,7 +39707,11 @@ mod tests {
         let before = app.assets.len();
         app.merge_selection();
         assert_eq!(app.assets.len(), before, "nothing was merged");
-        assert!(app.status.contains("audio or all MIDI"), "status: {}", app.status);
+        assert!(
+            app.status.contains("audio or all MIDI"),
+            "status: {}",
+            app.status
+        );
         let n_clips: usize = app.arr.tracks[0].lanes.iter().map(|l| l.clips.len()).sum();
         assert_eq!(n_clips, 2, "the selection survived the refusal");
     }
@@ -37686,7 +39731,12 @@ mod tests {
             .expect("bundled piano must compile and load");
         app.track_synth_inst[0] = Some(std::sync::Arc::new(SynthHandle::Script(inst)));
         let row_len = |app: &App| {
-            app.backend.engine.poly_voices().first().map(|r| r.len()).unwrap_or(0)
+            app.backend
+                .engine
+                .poly_voices()
+                .first()
+                .map(|r| r.len())
+                .unwrap_or(0)
         };
         // MONO (default): nothing published.
         assert_eq!(row_len(&app), 0, "monophonic publishes nothing");
@@ -37806,7 +39856,11 @@ mod tests {
                 && (g.width() - hr[2]).abs() < 2.0,
             "the ghost IS the host slot: ghost {g:?} host {hr:?}"
         );
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
     }
 
     /// R1 A3: clicking a tab switches which member's body the slot shows.
@@ -37886,11 +39940,18 @@ mod tests {
         let to = egui::pos2(60.0, 600.0);
         frame(&mut app, &ctx, vec![moved(egui::pos2(120.0, 400.0))]);
         frame(&mut app, &ctx, vec![moved(to)]);
-        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(to, egui::PointerButton::Primary, false)],
+        );
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert!(is_docked(&app, 1) && dock_edge(&app, 1) == 0, "re-docked left");
+        assert!(
+            is_docked(&app, 1) && dock_edge(&app, 1) == 0,
+            "re-docked left"
+        );
         assert_ne!(
             dock_order(&app, 1),
             dock_order(&app, 0),
@@ -37914,14 +39975,26 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
         assert_eq!(tab_group(&app, 1).len(), 2, "bottom pair is a group");
-        drag_title(&mut app, &ctx, egui::pos2(630.0, 132.0), egui::pos2(300.0, 820.0));
-        assert!(is_docked(&app, 3) && dock_edge(&app, 3) == 2, "mixer docked bottom");
+        drag_title(
+            &mut app,
+            &ctx,
+            egui::pos2(630.0, 132.0),
+            egui::pos2(300.0, 820.0),
+        );
+        assert!(
+            is_docked(&app, 3) && dock_edge(&app, 3) == 2,
+            "mixer docked bottom"
+        );
         assert_eq!(
             dock_order(&app, 1),
             dock_order(&app, 2),
             "the tab group kept a SINGLE shared rank"
         );
-        assert_ne!(dock_order(&app, 3), dock_order(&app, 1), "mixer got its own slot");
+        assert_ne!(
+            dock_order(&app, 3),
+            dock_order(&app, 1),
+            "mixer got its own slot"
+        );
         assert_eq!(tab_group(&app, 1).len(), 2, "still two members");
     }
 
@@ -37944,7 +40017,11 @@ mod tests {
             &ctx,
             vec![moved(tp), btn(tp, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tp, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tp, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
         assert!(app.win_menu.is_some(), "float title menu opened");
         let item = galley_at(&mut app, &ctx, "tab with: ASSET RACK")
@@ -37954,7 +40031,11 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
         }
         assert!(is_docked(&app, 1), "the menu docked it");
-        assert_eq!(dock_order(&app, 1), dock_order(&app, 0), "\u{2026} as a tab");
+        assert_eq!(
+            dock_order(&app, 1),
+            dock_order(&app, 0),
+            "\u{2026} as a tab"
+        );
         // (b) right-click the OTHER member's tab \u{2192} detach own slot.
         let tab = galley_at(&mut app, &ctx, "ASSET RACK")
             .expect("rack tab")
@@ -37965,10 +40046,14 @@ mod tests {
             &ctx,
             vec![moved(tab), btn(tab, egui::PointerButton::Secondary, true)],
         );
-        frame(&mut app, &ctx, vec![btn(tab, egui::PointerButton::Secondary, false)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(tab, egui::PointerButton::Secondary, false)],
+        );
         frame(&mut app, &ctx, vec![]);
-        let det = galley_at(&mut app, &ctx, "detach into own slot")
-            .expect("detach offered to a member");
+        let det =
+            galley_at(&mut app, &ctx, "detach into own slot").expect("detach offered to a member");
         click_pt(&mut app, &ctx, det.center());
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
@@ -38033,8 +40118,15 @@ mod tests {
         for _ in 0..3 {
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(tab_group(&app, 0).len(), 1, "the stock layout has no groups");
-        assert!(!get_tab_act(&app, 0) && !get_tab_act(&app, 1), "flags cleared");
+        assert_eq!(
+            tab_group(&app, 0).len(),
+            1,
+            "the stock layout has no groups"
+        );
+        assert!(
+            !get_tab_act(&app, 0) && !get_tab_act(&app, 1),
+            "flags cleared"
+        );
         assert!(is_docked(&app, 1), "bindings re-docked (to its stock slot)");
     }
 
@@ -38147,7 +40239,11 @@ mod tests {
                     key_ev(egui::Key::K, egui::Modifiers::COMMAND),
                 ],
             );
-            frame_keys(app, ctx, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+            frame_keys(
+                app,
+                ctx,
+                vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            );
         };
         open(&mut app, &ctx);
         assert!(app.palette.is_some(), "Ctrl+K opened the palette");
@@ -38155,14 +40251,29 @@ mod tests {
         for c in "mixer".chars() {
             frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
         }
-        assert_eq!(app.palette.as_ref().unwrap().0, "mixer", "typing reached the query");
-        frame(&mut app, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
-        assert!(!app.show_mixer, "Enter ran \u{201c}hide window MIXER\u{201d}");
+        assert_eq!(
+            app.palette.as_ref().unwrap().0,
+            "mixer",
+            "typing reached the query"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Enter, Default::default())],
+        );
+        assert!(
+            !app.show_mixer,
+            "Enter ran \u{201c}hide window MIXER\u{201d}"
+        );
         assert!(app.palette.is_none(), "the palette closed on run");
         // reopen, then Esc.
         open(&mut app, &ctx);
         assert!(app.palette.is_some(), "reopened");
-        frame(&mut app, &ctx, vec![key_ev(egui::Key::Escape, Default::default())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Escape, Default::default())],
+        );
         assert!(app.palette.is_none(), "Esc closed it");
         // and Ctrl+K toggles closed again.
         open(&mut app, &ctx);
@@ -38193,9 +40304,16 @@ mod tests {
         for c in "ports".chars() {
             frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
         }
-        frame(&mut app, &ctx, vec![key_ev(egui::Key::Enter, Default::default())]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::Enter, Default::default())],
+        );
         assert!(app.show_settings, "Settings opened");
-        assert_eq!(app.sett_filter, "ports", "\u{2026} straight at the ports category");
+        assert_eq!(
+            app.sett_filter, "ports",
+            "\u{2026} straight at the ports category"
+        );
     }
 
     /// R3 C4: the Windows menu lists registered DYNAMIC windows (plugin
@@ -38263,12 +40381,7 @@ mod tests {
         //    share (drag the divider ~toward the strip's right edge).
         let d1 = egui::pos2(m[0] + m[2] + 2.0, y);
         let vp = ctx.viewport_rect();
-        drag_steps(
-            &mut app,
-            &ctx,
-            d1,
-            egui::pos2(vp.max.x - 60.0, y),
-        );
+        drag_steps(&mut app, &ctx, d1, egui::pos2(vp.max.x - 60.0, y));
         let m2 = app.dock_rects[2];
         assert!(
             m2[2] > m[2] + 100.0,
@@ -38303,7 +40416,12 @@ mod tests {
         assert!(a[3] > 8.0 && g[3] > 8.0 && a[1] < g[1], "{a:?} {g:?}");
         let x = a[0] + a[2] * 0.5;
         // 1) Starve the bottom member: drag the divider far down.
-        drag_steps(&mut app, &ctx, egui::pos2(x, g[1] - 2.0), egui::pos2(x, g[1] + 500.0));
+        drag_steps(
+            &mut app,
+            &ctx,
+            egui::pos2(x, g[1] - 2.0),
+            egui::pos2(x, g[1] + 500.0),
+        );
         let g2 = app.dock_rects[4];
         assert!(
             g2[1] > g[1] + 200.0,
@@ -38311,7 +40429,12 @@ mod tests {
         );
         // 2) Drag BACK up: the starved window must regain its share.
         let g3 = app.dock_rects[4];
-        drag_steps(&mut app, &ctx, egui::pos2(x, g3[1] - 2.0), egui::pos2(x, g3[1] - 260.0));
+        drag_steps(
+            &mut app,
+            &ctx,
+            egui::pos2(x, g3[1] - 2.0),
+            egui::pos2(x, g3[1] - 260.0),
+        );
         let g4 = app.dock_rects[4];
         assert!(
             g4[1] < g3[1] - 150.0,
@@ -38441,9 +40564,11 @@ mod tests {
     /// existing two-part `fx:` key family.
     #[test]
     fn w8b_dynkind_vst_keys_round_trip() {
-        for (k, s) in
-            [(DynKind::Vst(3), "vst:3"), (DynKind::VstFx(1, 2), "vstfx:1:2"), (DynKind::Vst(0), "vst:0")]
-        {
+        for (k, s) in [
+            (DynKind::Vst(3), "vst:3"),
+            (DynKind::VstFx(1, 2), "vstfx:1:2"),
+            (DynKind::Vst(0), "vst:0"),
+        ] {
             assert_eq!(k.key(), s);
             assert_eq!(DynKind::from_key(s), Some(k));
         }
@@ -38465,7 +40590,10 @@ mod tests {
     #[test]
     fn w8b_dyn_open_false_without_editors() {
         let app = headless_app("w8b_dynopen");
-        assert!(!dyn_open(&app, DynKind::Vst(0)), "no editor open on a fresh app");
+        assert!(
+            !dyn_open(&app, DynKind::Vst(0)),
+            "no editor open on a fresh app"
+        );
         assert!(!dyn_open(&app, DynKind::VstFx(0, 0)));
     }
 
@@ -38481,5 +40609,575 @@ mod tests {
         let _app = headless_app("w14data");
         let want = std::env::temp_dir().join("sp-uity-w14data").join("slooper");
         assert_eq!(crate::paths::data_dir(), want);
+    }
+
+    // ---- v50 R1: "Edit sample" (FL Studio sample window) -------------------
+
+    #[test]
+    fn v50_edit_sample_menu_render_and_persist() {
+        let mut app = headless_app("v50edit1");
+        let samples = std::env::temp_dir().join("sp-uity-v50edit1/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&samples.join("kit-a/revme.wav"));
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "revme", true)[0];
+        rmb(&mut app, &ctx, h);
+        let it = galley_centers(&mut app, &ctx, "Edit sample", true)[0];
+        click_pt(&mut app, &ctx, it);
+        let key = samples
+            .join("kit-a/revme.wav")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            app.sample_edit_win.as_deref(),
+            Some(key.as_str()),
+            "menu opens the editor on that asset"
+        );
+        // Reverse: playback data mirrors, source file stays pristine.
+        let before = app.assets[0].data.to_vec();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        let mut want = before.clone();
+        want.reverse();
+        assert_eq!(
+            app.assets[0].data.to_vec(),
+            want,
+            "asset data is the mirror"
+        );
+        assert!(
+            !app.assets[0].dirty,
+            "the wav on disk must not be rewritten"
+        );
+        // Saved into the project and rebuilt over fresh assets on load.
+        let pr = app.build_project("ed".into());
+        assert!(
+            pr.sample_edits.contains_key(&key),
+            "edits ride with the project"
+        );
+        let mut app2 = headless_app("v50edit2");
+        app2.rack[0].path = samples.display().to_string();
+        let _ = app2.ensure_asset(&samples.join("kit-a/revme.wav"));
+        app2.restore_sample_edits(&pr.sample_edits);
+        assert_eq!(
+            app2.assets[0].data.to_vec(),
+            want,
+            "reload re-renders the edit"
+        );
+    }
+
+    #[test]
+    fn v50_edit_save_as_lands_in_recordings_and_doubles_pingpong() {
+        let mut app = headless_app("v50edit3");
+        let samples = std::env::temp_dir().join("sp-uity-v50edit3/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/kick.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&samples.join("kit-a/kick.wav"));
+        let key = samples
+            .join("kit-a/kick.wav")
+            .to_string_lossy()
+            .into_owned();
+        let n = app.assets[0].data.len();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        assert_eq!(
+            app.assets[0].data.len(),
+            n * 2,
+            "ping-pong doubles playback data"
+        );
+        app.record_target = samples.join("kit-a").display().to_string();
+        app.se_save_as(&key, "kickpp");
+        assert!(
+            samples.join("kit-a/kickpp.wav").exists(),
+            "rendered wav in recordings folder"
+        );
+        assert!(
+            app.rack[0].files.iter().any(|r| r.name == "kickpp"),
+            "rack rescanned and sees the new asset"
+        );
+        // The saved file must match the edited buffer (mirror head).
+        let again = {
+            let mut a2 = headless_app("v50edit4");
+            a2.rack[0].path = samples.display().to_string();
+            let _ = a2.ensure_asset(&samples.join("kit-a/kickpp.wav"));
+            a2.assets[0].data.to_vec()
+        };
+        assert_eq!(again.len(), n * 2, "export kept the ping-pong length");
+        assert!(!app.assets[0].dirty, "original kick.wav still pristine");
+    }
+
+    // ---- v50 R2: clip-extension paints silence, not stretched content ----
+
+    /// One frame with the pointer parked: every painted line segment with
+    /// its stroke color (waveform columns, MIDI-free lines, curves).
+    fn painted_lines(app: &mut App, ctx: &egui::Context) -> Vec<(Vec<egui::Pos2>, egui::Color32)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            events: vec![moved(egui::pos2(20.0, 18.0))],
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let lines: Vec<(Vec<egui::Pos2>, egui::Color32)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::LineSegment { points, stroke } = &cs.shape {
+                    return Some((points.to_vec(), stroke.color));
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        lines
+    }
+
+    /// The base-fill rect of the leftmost grid clip (COL_CLIP × 0.45).
+    fn first_clip_rect(app: &mut App, ctx: &egui::Context) -> egui::Rect {
+        let base = COL_CLIP.linear_multiply(0.45);
+        let (r, g, b, _a) = base.to_tuple();
+        painted_rects(app, ctx, (r, g, b))
+            .into_iter()
+            .next()
+            .expect("a clip fill is painted")
+    }
+
+    #[test]
+    fn v50_extended_tail_has_no_waveform() {
+        let mut app = headless_app("v50tail");
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        let alen = app.asset_len(a);
+        // Double extension: the clip plays the whole asset plus a full
+        // length of silence, so the DATA ends dead-center of the clip.
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: a,
+                pos: 0,
+                cut: 0,
+                pre_pad: 0,
+                play_len: Some(alen * 2),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+        );
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let cres = first_clip_rect(&mut app, &ctx);
+        let mid = (cres.min.x + cres.max.x) / 2.0;
+        // Waveform columns: light blue (210, 225, 250) vertical strokes.
+        let lines = painted_lines(&mut app, &ctx);
+        let wave = |c: egui::Color32| {
+            let (r, g, b, _) = c.to_tuple();
+            r > 195 && r < 225 && g > 210 && g < 240 && b > 235
+        };
+        let in_data = lines
+            .iter()
+            .filter(|(pts, c)| wave(*c) && pts.first().is_some_and(|p| p.x < mid - 2.0))
+            .count();
+        assert!(in_data > 8, "waveform painted in the DATA half");
+        let in_tail = lines
+            .iter()
+            .filter(|(pts, c)| wave(*c) && pts.first().is_some_and(|p| p.x > mid + 2.0))
+            .count();
+        assert_eq!(
+            in_tail, 0,
+            "no waveform column is painted past the data end"
+        );
+        // The tail is the silence hatch: dark (10,10,14) rect ending at the
+        // clip's right edge, starting (near) the data end.
+        let hatch = painted_rects(&mut app, &ctx, (10, 10, 14))
+            .into_iter()
+            .find(|r| (r.min.x - mid).abs() < 3.0 && (r.max.x - cres.max.x).abs() < 2.0);
+        assert!(hatch.is_some(), "silence hatch covers the extension tail");
+    }
+
+    #[test]
+    fn v50_extended_midi_tail_has_no_notes() {
+        use crate::midipat::{Note, Pattern};
+        let mut app = headless_app("v50muitail");
+        let mut pat = Pattern::new(120);
+        pat.len_ticks = 1920;
+        pat.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+        });
+        pat.notes.push(Note {
+            ch: 0,
+            note: 72,
+            vel: 100,
+            press: 0,
+            start: 960,
+            len: 480,
+        });
+        let id = app.assets.len() as u32;
+        app.assets.push(Asset::midi(
+            id,
+            "pat".into(),
+            std::path::PathBuf::new(),
+            Arc::new(pat),
+            true,
+        ));
+        let alen = app.asset_len(id);
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: id,
+                pos: 0,
+                cut: 0,
+                pre_pad: 0,
+                play_len: Some(alen * 2),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+        );
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let cres = first_clip_rect(&mut app, &ctx);
+        let mid = (cres.min.x + cres.max.x) / 2.0;
+        // Note bars: fill rgb (120, 205, 255), unselected.
+        let bars = painted_rects(&mut app, &ctx, (120, 205, 255))
+            .into_iter()
+            .filter(|r| r.max.x > cres.min.x - 5.0 && r.min.x < cres.max.x + 5.0)
+            .collect::<Vec<_>>();
+        assert!(!bars.is_empty(), "note bars painted");
+        for b in &bars {
+            assert!(
+                b.max.x <= mid + 2.0,
+                "note bar at {:?} spills past the pattern end {}",
+                b,
+                mid
+            );
+        }
+    }
+
+    #[test]
+    fn v50_extended_automation_holds_last_value() {
+        use crate::automation::{Automation, Node, TARGET_TRACK_VOL};
+        let mut app = headless_app("v50autail");
+        let auto = Automation {
+            target: TARGET_TRACK_VOL.into(),
+            len_samples: 48_000,
+            nodes: vec![
+                Node {
+                    t: 0,
+                    v: 0.2,
+                    c: 0.0,
+                },
+                Node {
+                    t: 48_000,
+                    v: 0.8,
+                    c: 0.0,
+                },
+            ],
+        };
+        let id = app.assets.len() as u32;
+        app.assets.push(Asset::automation_asset(
+            id,
+            "vol".into(),
+            std::path::PathBuf::new(),
+            Arc::new(auto),
+            true,
+        ));
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: id,
+                pos: 0,
+                cut: 0,
+                pre_pad: 0,
+                play_len: Some(96_000), // double extension
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+            },
+        );
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Automation clips wear the red base fill (170,70,74) × 0.45.
+        let base = Color32::from_rgb(170, 70, 74).linear_multiply(0.45);
+        let (br, bg, bb, _a) = base.to_tuple();
+        let cres = painted_rects(&mut app, &ctx, (br, bg, bb))
+            .into_iter()
+            .next()
+            .expect("the automation clip fill is painted");
+        let mid = (cres.min.x + cres.max.x) / 2.0;
+        // The in-line curve (red, 225,120,120 un-hovered) must KEEP DRAWING
+        // past the data end — as a CONSTANT line (automation's silence =
+        // the last value held).
+        let lines = painted_lines(&mut app, &ctx);
+        let curve = |c: egui::Color32| {
+            let (r, g, b, _) = c.to_tuple();
+            r >= 220 && (115..=125).contains(&g) && (115..=125).contains(&b)
+        };
+        let tail: Vec<f32> = lines
+            .iter()
+            .filter(|(pts, c)| curve(*c) && pts.first().is_some_and(|p| p.x > mid + 2.0))
+            .flat_map(|(pts, _)| pts.iter().map(|p| p.y))
+            .collect();
+        assert!(tail.len() >= 4, "curve continues into the extension tail");
+        let lo = tail.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = tail.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            hi - lo < 1.5,
+            "extension holds a CONSTANT line ({}..{})",
+            lo,
+            hi
+        );
+    }
+
+    // ================= v50 R4: rack drag-move =================
+    #[test]
+    fn v50_folder_drag_nests_dir() {
+        // Dragging one folder header onto another nests the whole subtree
+        // (disk move), rescans the rack, and the remembered order follows.
+        let mut app = headless_app("v50dragnest");
+        let samples = std::env::temp_dir().join("sp-uity-v50dragnest/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/filler.wav");
+        v28_wav(&samples, "kit-b/deep.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let kb = galley_centers(&mut app, &ctx, "kit-b", false)[0];
+        frame(&mut app, &ctx, vec![moved(kb)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(kb, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(kb + egui::vec2(40.0, 0.0))]);
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<FolderDrag>(&ctx),
+            "folder headers must be draggable as folders"
+        );
+        let ka = galley_centers(&mut app, &ctx, "kit-a", false)[0];
+        frame(&mut app, &ctx, vec![moved(ka)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(ka, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            samples.join("kit-a/kit-b/deep.wav").exists(),
+            "the whole kit-b subtree must nest under kit-a"
+        );
+        assert!(
+            !samples.join("kit-b/deep.wav").exists(),
+            "old path must be gone"
+        );
+        let pref = app
+            .rack_dir_order
+            .iter()
+            .find(|o| o.folder == samples.display().to_string())
+            .map(|o| o.dirs.clone())
+            .unwrap_or_default();
+        assert!(
+            pref.iter().any(|d| d == "kit-a/kit-b"),
+            "remembered order must follow the move: {pref:?}"
+        );
+    }
+
+    #[test]
+    fn v50_folder_drag_to_root() {
+        // A nested folder dragged onto the folder TITLE row escapes to the
+        // rack root.
+        let mut app = headless_app("v50dragroot");
+        let samples = std::env::temp_dir().join("sp-uity-v50dragroot/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/dry/one.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "kit-a/dry", false)[0];
+        frame(&mut app, &ctx, vec![moved(h)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(h, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(h + egui::vec2(40.0, 0.0))]);
+        assert!(egui::DragAndDrop::has_payload_of_type::<FolderDrag>(&ctx));
+        let t = galley_centers(&mut app, &ctx, "samples [primary]", true)[0];
+        frame(&mut app, &ctx, vec![moved(t)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(t, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            samples.join("dry/one.wav").exists(),
+            "kit-a/dry must land at the root"
+        );
+        assert!(!samples.join("kit-a/dry").exists());
+    }
+
+    #[test]
+    fn v50_asset_drop_title_row() {
+        // v34 could drop onto folders; dropping onto the title row must
+        // move the file back out to the rack root.
+        let mut app = headless_app("v50dragtitle");
+        let samples = std::env::temp_dir().join("sp-uity-v50dragtitle/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-b/hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        app.ensure_asset(samples.join("kit-b/hat.wav").as_path());
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let hat = galley_centers(&mut app, &ctx, "hat", true)[0];
+        frame(&mut app, &ctx, vec![moved(hat)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(hat, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(hat + egui::vec2(40.0, 0.0))]);
+        assert!(egui::DragAndDrop::has_payload_of_type::<usize>(&ctx));
+        let t = galley_centers(&mut app, &ctx, "samples [primary]", true)[0];
+        frame(&mut app, &ctx, vec![moved(t)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(t, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            samples.join("hat.wav").exists(),
+            "the drop must lift hat out of kit-b"
+        );
+        assert!(!samples.join("kit-b/hat.wav").exists());
+    }
+
+    // ================= v50 R5: recordings target ==================
+    #[test]
+    fn v50_recordings_target_menu_and_fallback() {
+        let mut app = headless_app("v50rectgt");
+        let samples = std::env::temp_dir().join("sp-uity-v50rectgt/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/filler.wav");
+        v28_wav(&samples, "kit-b/deep.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // No explicit target: the first folder in display order takes them.
+        assert_eq!(app.record_dir(), samples.join("kit-a"));
+        // Right-click a folder header -> "use for recordings".
+        let kb = galley_centers(&mut app, &ctx, "kit-b", false)[0];
+        rmb(&mut app, &ctx, kb);
+        click_label(&mut app, &ctx, "use for recordings");
+        assert_eq!(
+            app.record_dir(),
+            samples.join("kit-b"),
+            "menu must set the target"
+        );
+        // The chosen folder carries a marker while it is the target.
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_centers(&mut app, &ctx, "- kit-b (1) *", true).len() == 1,
+            "the target folder header must be marked"
+        );
+        // Persisted across a config reload.
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        assert_eq!(
+            cfg.record_target,
+            samples.join("kit-b").display().to_string()
+        );
+        // Clearing via the folder TITLE row menu (a fresh anchor: egui
+        // 0.36 popups keyed on a ui.interact response do not reliably
+        // re-arm on that same response within one session — every other
+        // menu pin in this suite also opens each anchor once).
+        let t = galley_centers(&mut app, &ctx, "samples [primary]", true)[0];
+        rmb(&mut app, &ctx, t);
+        click_label(&mut app, &ctx, "clear recordings target");
+        assert_eq!(app.record_dir(), samples.join("kit-a"));
+    }
+
+    // ================= v50 R6: projects in the rack ================
+    #[test]
+    fn v50_project_click_gated_by_confirm() {
+        let mut app = headless_app("v50projrack");
+        let pdir = std::env::temp_dir().join("sp-uity-v50projrack/projs");
+        let _ = std::fs::remove_dir_all(&pdir);
+        std::fs::create_dir_all(&pdir).unwrap();
+        app.project_dir = pdir.display().to_string();
+        app.do_save("demo");
+        // Pretend unsaved work lives under another name — clicking a
+        // project may NEVER load over it without an explicit yes.
+        app.proj_name = "other".into();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_centers(&mut app, &ctx, "demo", true).len() == 1,
+            "project files must list in the rack: {:?}",
+            app.projects_dir()
+        );
+        // NB: click by EXACT galley — the status bar reads
+        // `saved project "demo"` and galley_at's substring would land there.
+        click_exact(&mut app, &ctx, "demo");
+        assert_eq!(
+            app.proj_confirm.as_ref().map(|(n, _)| n.as_str()),
+            Some("demo"),
+            "the click must only arm the confirmation"
+        );
+        assert!(!app.show_load_opts, "nothing may load before confirming");
+        assert_eq!(app.proj_name, "other", "a click alone never loads");
+        // Cancel backs out cleanly.
+        click_last(&mut app, &ctx, "Cancel");
+        assert!(app.proj_confirm.is_none() && !app.show_load_opts && app.proj_name == "other");
+        // Confirming opens the existing slice chooser, then imports.
+        click_exact(&mut app, &ctx, "demo");
+        click_last(&mut app, &ctx, "Load");
+        assert!(
+            app.show_load_opts && app.pending_proj.is_some(),
+            "confirm -> slice chooser"
+        );
+        assert!(app.proj_confirm.is_none());
+        click_last(&mut app, &ctx, "Import");
+        assert_eq!(
+            app.proj_name, "demo",
+            "import must go through the existing pipeline"
+        );
     }
 }

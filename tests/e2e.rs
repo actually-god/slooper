@@ -2135,9 +2135,16 @@ fn e2e_preview_replaces_and_drains() {
     // (the old additive pool kept both voices; that stacking is exactly
     // the "preview runs constantly" behavior this batch retired).
     let silent: Arc<[f32]> = Arc::from(vec![0.0f32; sr as usize]);
-    b.cmd(Cmd::PreviewPlay { id: 12, samples: silent });
+    b.cmd(Cmd::PreviewPlay {
+        id: 12,
+        samples: silent,
+    });
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_millis(500),
         "the new start replaced the sine mid-voice (silence took over)",
     );
@@ -3262,9 +3269,7 @@ fn v46_e2e_copy_audition_release_silences() {
     b.engine
         .set_track_synth(0, Some(Arc::new(slooper::audio::SynthHandle::Script(live))));
     let copy = slooper::audio::spawn_synth_copy(
-        &slooper::audio::SynthHandle::Script(
-            reg.create_instance("piano", sr as f64, &[]).unwrap(),
-        ),
+        &slooper::audio::SynthHandle::Script(reg.create_instance("piano", sr as f64, &[]).unwrap()),
         sr,
     )
     .expect("headless copy spawn");
@@ -3472,14 +3477,22 @@ fn v46_e2e_poly_track_renders_per_lane_copies() {
     // Monophonic baseline: the merged render is audible.
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "mono baseline audible",
     );
     b.cmd(Cmd::StopAll);
     std::thread::sleep(Duration::from_millis(700));
     wait_until(
-        || ring_peak(&ring, &widx, 2400).map(|p| p < 0.002).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 2400)
+                .map(|p| p < 0.002)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "silence after StopAll",
     );
@@ -3488,11 +3501,21 @@ fn v46_e2e_poly_track_renders_per_lane_copies() {
     // poly pass were broken (row ignored, copies never fed), the track
     // would go silent — every lane event now routes away from the live
     // instance into the copy row.
-    b.engine
-        .set_track_poly(0, true, vec![slooper::audio::spawn_synth_copy(&master, sr), slooper::audio::spawn_synth_copy(&master, sr)]);
+    b.engine.set_track_poly(
+        0,
+        true,
+        vec![
+            slooper::audio::spawn_synth_copy(&master, sr),
+            slooper::audio::spawn_synth_copy(&master, sr),
+        ],
+    );
     b.cmd(Cmd::PlayAll);
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(5),
         "poly track audible through the lane copies",
     );
@@ -3504,7 +3527,11 @@ fn v46_e2e_poly_track_renders_per_lane_copies() {
     // mid-span) — therefore wait for audible, not a fixed window.
     b.engine.set_track_poly(0, false, Vec::new());
     wait_until(
-        || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
         Duration::from_secs(4),
         "mono fallback audible after the poly row was cleared mid-playback",
     );
@@ -3616,8 +3643,9 @@ fn e2e_tier2_new_bundled_plugins_live() {
 
     // (b) convolver on the live RT thread: tri_osc through the scripted
     // insert, notes firing, master out non-silent while PLAYING.
-    let mut freg =
-        slooper::fx::Registry::open(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("effects"));
+    let mut freg = slooper::fx::Registry::open(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("effects"),
+    );
     freg.rescan(); // compiles scripts (content-hashed cache: instant after first run)
     let conv = freg
         .create_instance("convolver", sr as f64, &[100.0, 50.0, 40.0, 100.0])
@@ -3702,9 +3730,14 @@ impl ProcessHandler for DiffProc {
         let nring = self.ring_sum.len() as u64;
         let mut w = self.widx.load(Ordering::Relaxed);
         for i in 0..n {
-            let (sl, sr) = (l.get(i).copied().unwrap_or(0.0), r.get(i).copied().unwrap_or(0.0));
-            self.ring_sum[(w % nring) as usize].store(((sl + sr) * 0.5).to_bits(), Ordering::Relaxed);
-            self.ring_dif[(w % nring) as usize].store(((sl - sr) * 0.5).to_bits(), Ordering::Relaxed);
+            let (sl, sr) = (
+                l.get(i).copied().unwrap_or(0.0),
+                r.get(i).copied().unwrap_or(0.0),
+            );
+            self.ring_sum[(w % nring) as usize]
+                .store(((sl + sr) * 0.5).to_bits(), Ordering::Relaxed);
+            self.ring_dif[(w % nring) as usize]
+                .store(((sl - sr) * 0.5).to_bits(), Ordering::Relaxed);
             w += 1;
         }
         self.widx.store(w, Ordering::Relaxed);
@@ -3725,10 +3758,7 @@ fn e2e_tier3_stereo_spread_live() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut reg = slooper::fx::Registry::open(dir.clone());
     reg.rescan();
-    let desc = reg
-        .desc("spread")
-        .expect("stock spread present")
-        .clone();
+    let desc = reg.desc("spread").expect("stock spread present").clone();
     assert!(desc.stereo, "spread must load as an ABI-v3 stereo script");
     let inst = reg
         .create_instance("spread", sr as f64, &[])
@@ -3803,8 +3833,13 @@ fn e2e_tier3_stereo_spread_live() {
     std::thread::sleep(Duration::from_millis(150));
 
     let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
-        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
-            .expect("ring");
+        let x = read_ring(
+            ring,
+            &widx,
+            (sr as u64 * 200 / 1000) as usize,
+            Duration::from_millis(800),
+        )
+        .expect("ring");
         (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
     };
 
@@ -3838,7 +3873,10 @@ fn e2e_tier3_stereo_spread_live() {
     let s_off = rms(&ring_sum);
     let d_off = rms(&ring_dif);
     b.cmd(Cmd::StopAll);
-    assert!(s_off > 0.01, "loop still audible after clearing (rms {s_off})");
+    assert!(
+        s_off > 0.01,
+        "loop still audible after clearing (rms {s_off})"
+    );
     assert!(
         d_off < s_off * 1e-3,
         "mono chain must produce bit-identical L/R buses (dif {d_off} vs sum {s_off})"
@@ -3869,8 +3907,12 @@ fn e2e_tier4_stereo_echo_chorus_live() {
     }
     let de = reg.desc("echo3").unwrap().clone();
     let dech = reg.desc("chorus").unwrap().clone();
-    let i_echo = reg.create_instance("echo3", sr as f64, &[]).expect("echo3 compiles");
-    let i_cho = reg.create_instance("chorus", sr as f64, &[]).expect("chorus compiles");
+    let i_echo = reg
+        .create_instance("echo3", sr as f64, &[])
+        .expect("echo3 compiles");
+    let i_cho = reg
+        .create_instance("chorus", sr as f64, &[])
+        .expect("chorus compiles");
 
     let ring_n = 1usize << 19;
     let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
@@ -3941,8 +3983,13 @@ fn e2e_tier4_stereo_echo_chorus_live() {
     std::thread::sleep(Duration::from_millis(150));
 
     let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
-        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
-            .expect("ring");
+        let x = read_ring(
+            ring,
+            &widx,
+            (sr as u64 * 200 / 1000) as usize,
+            Duration::from_millis(800),
+        )
+        .expect("ring");
         (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
     };
 
@@ -3986,7 +4033,9 @@ fn e2e_tier4_stereo_echo_chorus_live() {
     b.cmd(Cmd::StopAll);
     b.cmd(Cmd::SetTrackEffects {
         i: 0,
-        chain: TrackFx { slots: Arc::new(vec![]) },
+        chain: TrackFx {
+            slots: Arc::new(vec![]),
+        },
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4011,7 +4060,9 @@ fn e2e_tier5_stereo_reverb_live() {
     reg.rescan();
     let d = reg.desc("space_echo").expect("space_echo present").clone();
     assert!(d.stereo, "space_echo must load as an ABI-v3 stereo script");
-    let inst = reg.create_instance("space_echo", sr as f64, &[]).expect("compiles");
+    let inst = reg
+        .create_instance("space_echo", sr as f64, &[])
+        .expect("compiles");
 
     let ring_n = 1usize << 19;
     let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
@@ -4082,8 +4133,13 @@ fn e2e_tier5_stereo_reverb_live() {
     std::thread::sleep(Duration::from_millis(150));
 
     let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
-        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
-            .expect("ring");
+        let x = read_ring(
+            ring,
+            &widx,
+            (sr as u64 * 200 / 1000) as usize,
+            Duration::from_millis(800),
+        )
+        .expect("ring");
         (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
     };
 
@@ -4102,7 +4158,10 @@ fn e2e_tier5_stereo_reverb_live() {
 
     let s = rms(&ring_sum);
     let dd = rms(&ring_dif);
-    assert!(s > 0.01, "loop must be audible through the reverb (sum rms {s})");
+    assert!(
+        s > 0.01,
+        "loop must be audible through the reverb (sum rms {s})"
+    );
     assert!(
         dd > s * 0.05,
         "stereo room must put side energy on the master buses (dif {dd} vs sum {s})"
@@ -4111,7 +4170,9 @@ fn e2e_tier5_stereo_reverb_live() {
     b.cmd(Cmd::StopAll);
     b.cmd(Cmd::SetTrackEffects {
         i: 0,
-        chain: TrackFx { slots: Arc::new(vec![]) },
+        chain: TrackFx {
+            slots: Arc::new(vec![]),
+        },
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4208,8 +4269,13 @@ fn e2e_tier5b_stereo_mods_live() {
     b.engine.set_loop_pan(0, 0.5); // dead centre: any L/R split is the effect's
 
     let rms = |ring: &Arc<Vec<AtomicU32>>| -> f32 {
-        let x = read_ring(ring, &widx, (sr as u64 * 200 / 1000) as usize, Duration::from_millis(800))
-            .expect("ring");
+        let x = read_ring(
+            ring,
+            &widx,
+            (sr as u64 * 200 / 1000) as usize,
+            Duration::from_millis(800),
+        )
+        .expect("ring");
         (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
     };
 
@@ -4259,7 +4325,10 @@ fn e2e_tier5b_stereo_mods_live() {
         let s = rms(&ring_sum);
         let dd = rms(&ring_dif);
         eprintln!("T5b {stem}: sum {s:.6} dif {dd:.6} D/S {:.4}", dd / s);
-        assert!(s > 0.01, "{stem}: loop must be audible through the effect (sum rms {s})");
+        assert!(
+            s > 0.01,
+            "{stem}: loop must be audible through the effect (sum rms {s})"
+        );
         assert!(
             dd > s * 0.05,
             "{stem}: stereo script must put side energy on the master buses (dif {dd} vs sum {s})"
@@ -4268,7 +4337,9 @@ fn e2e_tier5b_stereo_mods_live() {
         b.cmd(Cmd::StopAll);
         b.cmd(Cmd::SetTrackEffects {
             i: 0,
-            chain: TrackFx { slots: Arc::new(vec![]) },
+            chain: TrackFx {
+                slots: Arc::new(vec![]),
+            },
         });
         std::thread::sleep(Duration::from_millis(80));
     }
@@ -4431,7 +4502,9 @@ fn e2e_tier6_host_sync_live() {
     };
 
     let p120 = {
-        let inst = reg.create_instance("gater", sr as f64, &dp).expect("gater compiles");
+        let inst = reg
+            .create_instance("gater", sr as f64, &dp)
+            .expect("gater compiles");
         b.cmd(Cmd::SetTrackEffects {
             i: 0,
             chain: TrackFx {
@@ -4442,7 +4515,9 @@ fn e2e_tier6_host_sync_live() {
         measure(120)
     };
     let p60 = {
-        let inst = reg.create_instance("gater", sr as f64, &dp).expect("gater compiles");
+        let inst = reg
+            .create_instance("gater", sr as f64, &dp)
+            .expect("gater compiles");
         b.cmd(Cmd::SetTrackEffects {
             i: 0,
             chain: TrackFx {
@@ -4462,4 +4537,187 @@ fn e2e_tier6_host_sync_live() {
         "song-mode gate at 60 BPM measured {p60:.3} s, expected 2.000 s (0.5 cyc/beat)"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- v50 R3: scrubbing the playhead while STOPPED must be silent ----------
+// The reported bug: dragging the playback bar over a clip (transport never
+// started) sounded the clip's audio / fired the pattern's notes. Only the
+// transport may start sound; automation alone follows the playhead.
+#[test]
+fn e2e_scrub_while_stopped_is_silent() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("scrub_stop", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { .. }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "backend did not apply the sink layout"
+    );
+
+    // Default synth so a MIDI clip COULD sound if the gate were open.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let inst = reg
+        .create_instance("piano", sr as f64, &[])
+        .expect("bundled piano must compile and load");
+    b.cmd(Cmd::SetDefaultSynth(Some(Arc::new(
+        slooper::audio::SynthHandle::Script(inst),
+    ))));
+    let mut pat = slooper::midipat::Pattern::new(120);
+    for (i, note) in [60u8, 64, 67, 72].iter().enumerate() {
+        pat.notes.push(slooper::midipat::Note {
+            ch: 0,
+            note: *note,
+            vel: 110,
+            press: 0,
+            start: (i as u32) * slooper::midipat::PPQ as u32,
+            len: slooper::midipat::PPQ as u32 * 3 / 4,
+        });
+    }
+    pat.sort();
+    b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
+
+    // Audio asset 0 (loud constant) plays on track 0; the MIDI pattern is
+    // asset index 1 on track 1 (its table slot is the MIDI table).
+    let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 24_000]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    arr.insert(1, 0, Clip::new(1, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![a0.clone()]),
+        arr: Arc::new(arr),
+        len: sr as u64 * 4,
+    });
+    assert!(!b.engine.transport_on(), "test needs the transport stopped");
+
+    // Scrub the playhead like the user does: a storm of Seeks sweeping the
+    // clips both directions, then park inside the audio clip.
+    for pos in [
+        0u64, 4_000, 9_000, 15_000, 22_000, 23_900, 18_000, 12_000, 6_000, 2_000, 11_000,
+    ] {
+        b.cmd(Cmd::Seek { pos });
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Give the ring a clean window AFTER the last seek.
+    std::thread::sleep(Duration::from_millis(150));
+    let parked = b.engine.pos();
+    assert!(parked > 0, "a seek while stopped did not move the playhead");
+    assert!(
+        ring_peak(&ring, &widx, 9600)
+            .map(|p| p < 0.002)
+            .unwrap_or(false),
+        "scrubbing the stopped transport made sound (audio clip or MIDI notes leaked)"
+    );
+
+    // Gate sanity: the SAME project must be audible once the transport runs.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.01)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(4),
+        "transport playing the project",
+    );
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(700));
+    let _ = active;
+}
+
+// ---- v50 R3: automation follows the playhead even while STOPPED -----------
+#[test]
+fn e2e_automation_follows_seek_while_stopped() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let _ = sr;
+
+    // A curve asset (table slot 1) riding track 0's volume: 0.25 flat over
+    // 2 s. NO audio asset at slot 1 — only the automation acts.
+    use slooper::automation::{Automation, Node, TARGET_TRACK_VOL};
+    let auto = Arc::new(Automation {
+        target: TARGET_TRACK_VOL.into(),
+        len_samples: 96_000,
+        nodes: vec![
+            Node {
+                t: 0,
+                v: 0.25,
+                c: 0.0,
+            },
+            Node {
+                t: 96_000,
+                v: 0.25,
+                c: 0.0,
+            },
+        ],
+    });
+    b.cmd(Cmd::SetAutoAssets(Arc::new(vec![None, Some(auto)])));
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(1, sr as u64)); // auto clip at 1 s
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![]),
+        arr: Arc::new(arr),
+        len: sr as u64 * 8,
+    });
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(!b.engine.transport_on());
+
+    let vol0 = || b.engine.loop_vol(0);
+    let manual = vol0();
+    // Park before the clip: untouched manual value.
+    b.cmd(Cmd::Seek { pos: 500 });
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        (vol0() - manual).abs() < 1e-4,
+        "seek BEFORE the curve must leave the manual volume"
+    );
+    // Scrub INSIDE the curve: while STOPPED, the curve value must land on
+    // the real control (this is the "automation follows at all times" fix).
+    b.cmd(Cmd::Seek {
+        pos: sr as u64 + 1_500,
+    });
+    wait_until(
+        || (vol0() - 0.25).abs() < 1e-4,
+        Duration::from_secs(2),
+        "curve did not drive track volume while stopped",
+    );
+    // And back off the curve: the engine's documented latch (v34 R11 +
+    // apply_auto_real only writes covered targets) keeps the last curve
+    // value until automation covers the target again — same as playback
+    // semantics, so a seek off the curve must NOT snap the knob back.
+    b.cmd(Cmd::Seek { pos: 7_000 });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        (vol0() - 0.25).abs() < 1e-4,
+        "seeking off the curve must latch the last automation value (v34 R11), got {}",
+        vol0()
+    );
 }

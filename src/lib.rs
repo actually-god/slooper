@@ -35,6 +35,7 @@ pub mod paths;
 pub mod ports;
 pub mod project;
 pub mod quantize;
+pub mod sample_edit;
 pub mod samples808;
 pub mod synth;
 pub mod synth_api;

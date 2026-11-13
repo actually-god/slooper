@@ -1028,8 +1028,7 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 if !p.labels.is_empty() {
                     let n = p.labels.len();
                     let val_of = |i: usize| {
-                        if n <= 1
-                            || p.max.partial_cmp(&p.min) != Some(core::cmp::Ordering::Greater)
+                        if n <= 1 || p.max.partial_cmp(&p.min) != Some(core::cmp::Ordering::Greater)
                         {
                             p.min
                         } else {

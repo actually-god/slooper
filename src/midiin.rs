@@ -148,11 +148,7 @@ impl MidiInQueue {
     /// a slot claimed but not yet stamped ends the drain, unless the same
     /// slot has stalled [`Self::STALL_SKIP`] cycles — then it is skipped as
     /// a dead producer and counted as one drop.
-    pub fn drain_into(
-        &self,
-        out: &mut Vec<(u32, Vec<u8>)>,
-        stamps: &mut Vec<u64>,
-    ) -> usize {
+    pub fn drain_into(&self, out: &mut Vec<(u32, Vec<u8>)>, stamps: &mut Vec<u64>) -> usize {
         let w = self.write.load(Ordering::Acquire);
         let mut r = self.read.load(Ordering::Relaxed);
         let mut n = 0usize;
@@ -195,8 +191,11 @@ impl MidiInQueue {
     /// Events claimed but not yet consumed (approximate; producers are
     /// live). For UI/test introspection, never for logic.
     pub fn pending(&self) -> usize {
-        (self.write.load(Ordering::Relaxed).saturating_sub(self.read.load(Ordering::Relaxed)))
-            .min(CAP as u64) as usize
+        (self
+            .write
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.read.load(Ordering::Relaxed)))
+        .min(CAP as u64) as usize
     }
 
     /// Ring-full / dead-producer drops since start.
@@ -367,9 +366,19 @@ mod tests {
         let mut ts = Vec::new();
         assert_eq!(q.drain_into(&mut evs, &mut ts), CAP);
         assert_eq!(evs.first().unwrap().1, vec![0xB0u8, 0, 1]);
-        assert_eq!(evs.last().unwrap().1, vec![0xB0u8, ((CAP - 1) % 250) as u8, 1]);
-        assert_eq!(evs.iter().filter(|e| e.1[1] == 250).count(), 0, "newest was dropped");
-        assert!(q.push(&[0x90, 1, 1], 0), "flow resumes once the consumer drained");
+        assert_eq!(
+            evs.last().unwrap().1,
+            vec![0xB0u8, ((CAP - 1) % 250) as u8, 1]
+        );
+        assert_eq!(
+            evs.iter().filter(|e| e.1[1] == 250).count(),
+            0,
+            "newest was dropped"
+        );
+        assert!(
+            q.push(&[0x90, 1, 1], 0),
+            "flow resumes once the consumer drained"
+        );
     }
 
     #[test]
@@ -391,7 +400,10 @@ mod tests {
         });
         let mut evs = Vec::new();
         let mut ts = Vec::new();
-        assert_eq!(q.drain_into(&mut evs, &mut ts), (THREADS as usize) * (PER as usize));
+        assert_eq!(
+            q.drain_into(&mut evs, &mut ts),
+            (THREADS as usize) * (PER as usize)
+        );
         let mut seen = vec![0u32; (THREADS as usize) * (PER as usize)];
         for (_, b) in &evs {
             let idx = b[0] as usize * PER as usize + u16::from_be_bytes([b[1], b[2]]) as usize;
@@ -415,7 +427,11 @@ mod tests {
         let mut ts = Vec::new();
         // The live event behind the stall must NOT jump the queue early...
         for _ in 0..MidiInQueue::STALL_SKIP - 1 {
-            assert_eq!(q.drain_into(&mut evs, &mut ts), 0, "must wait on the claimed slot");
+            assert_eq!(
+                q.drain_into(&mut evs, &mut ts),
+                0,
+                "must wait on the claimed slot"
+            );
         }
         // ... and must arrive on the skip drain, counted as one drop.
         assert_eq!(q.drain_into(&mut evs, &mut ts), 1);
@@ -460,10 +476,7 @@ mod tests {
 
     #[test]
     fn w9_dedupe_labels_shape() {
-        let names = ["A", "A", "B", "A"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names = ["A", "A", "B", "A"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
             dedupe_labels(names),
             vec![
@@ -479,7 +492,10 @@ mod tests {
     // ---- W12b: sub-block MIDI timing -------------------------------------
 
     fn stamped_batch(stamps: &[u64]) -> Vec<(u32, Vec<u8>)> {
-        stamps.iter().map(|_| (0u32, vec![0x90u8, 60, 100])).collect()
+        stamps
+            .iter()
+            .map(|_| (0u32, vec![0x90u8, 60, 100]))
+            .collect()
     }
     fn frames(evs: &[(u32, Vec<u8>)]) -> Vec<u32> {
         evs.iter().map(|e| e.0).collect()
@@ -517,7 +533,11 @@ mod tests {
         let stamps = [0u64, 0, 0];
         let mut evs = stamped_batch(&stamps);
         spread(&mut evs, &stamps, 48_000, 256);
-        assert_eq!(frames(&evs), vec![0, 0, 0], "driver without stamps: W9 behavior exactly");
+        assert_eq!(
+            frames(&evs),
+            vec![0, 0, 0],
+            "driver without stamps: W9 behavior exactly"
+        );
         // Degenerate clocks are no-ops, never a panic or a wild offset.
         let real = [1_000u64, 5_000];
         let mut e1 = stamped_batch(&real);
@@ -525,7 +545,11 @@ mod tests {
         assert_eq!(frames(&e1), vec![0, 0], "sr 0 (NULL engine) cannot convert");
         let mut e2 = stamped_batch(&real);
         spread(&mut e2, &real, 48_000, 0);
-        assert_eq!(frames(&e2), vec![0, 0], "zero-length block has no sub-block space");
+        assert_eq!(
+            frames(&e2),
+            vec![0, 0],
+            "zero-length block has no sub-block space"
+        );
         let mut e3: Vec<(u32, Vec<u8>)> = Vec::new();
         spread(&mut e3, &[], 48_000, 256); // empty batch: no-op
     }
