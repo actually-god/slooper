@@ -749,19 +749,23 @@ impl RtCfg {
 // manager thread
 // ---------------------------------------------------------------------------
 
+/// W12g: same reference-channel + verdict contract as `jack::run` — the
+/// Windows switch loop may re-dispatch with the same handles; `Quit` on
+/// the null-audio path, `Unavailable` when COM cannot even enumerate.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
-    cmd_rx: Receiver<Cmd>,
-    evt_tx: SyncSender<Evt>,
+    cmd_rx: &Receiver<Cmd>,
+    evt_tx: &SyncSender<Evt>,
     gain: Arc<AtomicU32>,
     peak: Arc<AtomicU32>,
     meter: Arc<crate::meter::MeterRing>,
     xruns: Arc<AtomicU64>,
     midi_drops: Arc<AtomicU64>,
     engine: Arc<Engine>,
-) {
+) -> ManagerExit {
     if std::env::var("SLOOPER_NULL_AUDIO").is_ok() {
         let _ = evt_tx.send(Evt::Unavailable("null audio (SLOOPER_NULL_AUDIO)".into()));
-        return;
+        return ManagerExit::Quit;
     }
     let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     let en = unsafe {
@@ -774,7 +778,7 @@ pub fn run(
         if com_ok {
             unsafe { CoUninitialize() }
         }
-        return;
+        return ManagerExit::Unavailable;
     };
     // The default render endpoint advertises the sample rate before any
     // patch is applied (the GUI enables fx chains on Evt::Ready).
@@ -828,8 +832,9 @@ pub fn run(
     session.publish_ports();
     session.publish_midi();
     let engine = session.engine.clone();
-    manager_loop(&cmd_rx, &evt_tx, &engine, sr, &mut session);
+    let exit = manager_loop(cmd_rx, evt_tx, &engine, sr, &mut session);
     session.teardown();
+    exit
 }
 
 struct WasapiSession {

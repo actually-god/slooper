@@ -503,7 +503,33 @@ pub enum Cmd {
     /// every remote port (`jack::rescan_midi_sources`) and there is nothing
     /// to select.
     SetMidiInputs(Vec<String>),
+    /// W12g (WINDOWS-PORT): hot-swap the live manager thread's backend
+    /// (Settings ▸ AUDIO BACKEND) with no app restart. The running session
+    /// tears down and `run_backend` re-dispatches the other host API over
+    /// the SAME channel/engine/meter handles — the project, synths and
+    /// transport survive the swap; only the device layer is rebuilt. The
+    /// Linux manager never sees this command (the picker is Windows-only
+    /// paint and `Backend::switch_backend` is inert there).
+    SwitchBackend(BackendKind),
     Quit,
+}
+
+/// How a `manager_loop` run ended (W12g). Linux ignores the verdict (its
+/// dispatch thread exits when `jack::run` returns, exactly as before);
+/// the Windows switch loop uses it to park or re-dispatch the other
+/// backend over the same channel and engine.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManagerExit {
+    /// `Cmd::Quit`, channel loss, or the null-audio test path: the
+    /// manager thread is done, full stop.
+    Quit,
+    /// The backend honestly reported itself unusable (Evt::Unavailable
+    /// already sent — missing DLL/server/COM). The Windows loop PARKS on
+    /// a device-less [`NullSession`] so a later switch (or a jack
+    /// install + re-pick) needs no app restart.
+    Unavailable,
+    /// `Cmd::SwitchBackend` arrived: tear down, re-dispatch the payload.
+    Switch(BackendKind),
 }
 
 /// Events from the audio manager thread to the GUI.
@@ -568,7 +594,19 @@ fn run_backend(
     midi_drops: Arc<AtomicU64>,
     engine: Arc<Engine>,
 ) {
-    jack::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+    // W12g: the verdict is Linux-inert — the Linux manager is never sent
+    // `SwitchBackend`, and the thread exits exactly when `jack::run`
+    // returns, byte-for-byte the pre-W12g lifecycle.
+    let _ = jack::run(
+        &cmd_rx,
+        &evt_tx,
+        gain,
+        peak,
+        meter,
+        xruns,
+        midi_drops,
+        engine,
+    );
 }
 
 /// Which host audio API the manager thread drives (W12f). Windows-only
@@ -616,18 +654,73 @@ fn run_backend(
     // `dll::found` probes once (OnceLock) — the same probe the settings
     // selector reads, and the probe never touches jack-sys FUNCTIONS, so
     // a Windows box without jack never dlopens anything.
-    let kind = resolve_backend(
+    let mut kind = resolve_backend(
         std::env::var("SLOOPER_AUDIO_BACKEND").ok().as_deref(),
         &crate::config::Config::load().win_audio_backend,
         jack::dll::found().is_some(),
     );
     eprintln!("[slooper] audio backend: {:?}", kind);
-    match kind {
-        BackendKind::Jack => {
-            jack::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
-        }
-        BackendKind::Wasapi => {
-            wasapi::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+    // W12g: hot-swap loop. `Cmd::SwitchBackend` (from Settings) tears the
+    // live session down and re-dispatches the other host API over the
+    // SAME cmd_rx/evt_tx/engine/meter handles — project, synths and
+    // transport survive; only the device layer is rebuilt. `Unavailable`
+    // parks on a device-less NullSession (the honest report was already
+    // sent by the backend) so installing jack or switching back needs no
+    // restart. `Cmd::Quit`/channel loss leaves exactly like the pre-W12g
+    // one-shot dispatch.
+    loop {
+        let exit = match kind {
+            BackendKind::Jack => jack::run(
+                &cmd_rx,
+                &evt_tx,
+                gain.clone(),
+                peak.clone(),
+                meter.clone(),
+                xruns.clone(),
+                midi_drops.clone(),
+                engine.clone(),
+            ),
+            BackendKind::Wasapi => wasapi::run(
+                &cmd_rx,
+                &evt_tx,
+                gain.clone(),
+                peak.clone(),
+                meter.clone(),
+                xruns.clone(),
+                midi_drops.clone(),
+                engine.clone(),
+            ),
+        };
+        match exit {
+            ManagerExit::Quit => return,
+            ManagerExit::Switch(next) => {
+                kind = next;
+                let word = match kind {
+                    BackendKind::Wasapi => "wasapi",
+                    BackendKind::Jack => "jack",
+                };
+                eprintln!("[slooper] audio backend switched: {word}");
+                let _ = evt_tx
+                    .try_send(Evt::Notice(format!("audio backend: {word} — live")));
+            }
+            ManagerExit::Unavailable => {
+                // Parked: keep the GUI served (commands/takes/engine) with
+                // no device until Switch or Quit. The park never yields
+                // Unavailable, so the match below can never spin here.
+                let sr = {
+                    let s = engine.sample_rate();
+                    if s == 0 {
+                        48_000
+                    } else {
+                        s
+                    }
+                };
+                match manager_loop(&cmd_rx, &evt_tx, &engine, sr, &mut NullSession) {
+                    ManagerExit::Switch(next) => kind = next,
+                    ManagerExit::Quit => return,
+                    ManagerExit::Unavailable => return,
+                }
+            }
         }
     }
 }
@@ -647,6 +740,20 @@ trait ManagerBackend {
     /// W9: open exactly these WinMM MIDI devices. The JACK backend never
     /// overrides this — auto-connected JACK MIDI is the Linux contract.
     fn set_midi_inputs(&mut self, _sel: &[String], _tx: &SyncSender<Evt>) {}
+}
+
+/// Device-less [`ManagerBackend`] for the W12g PARKED state: the chosen
+/// backend honestly reported itself unavailable, so the Windows switch
+/// loop keeps serving the GUI (commands, takes, engine dispatch) without
+/// any device until a `Cmd::SwitchBackend` or `Cmd::Quit` arrives. Every
+/// method is a no-op on purpose — parked slooper touches no hardware.
+#[allow(dead_code)] // W12g: entered on Windows, exercised by pins on both OSes
+struct NullSession;
+impl ManagerBackend for NullSession {
+    fn refresh(&mut self, _tx: &SyncSender<Evt>) {}
+    fn apply(&mut self, _ins: &[String], _outs: &[OutSel], _tx: &SyncSender<Evt>) {}
+    fn idle(&mut self, _tx: &SyncSender<Evt>) {}
+    fn teardown(&mut self) {}
 }
 
 /// Handle kept by the GUI.
@@ -722,6 +829,25 @@ impl Backend {
     /// Send a command, ignoring send errors (thread already gone).
     pub fn cmd(&self, c: Cmd) {
         let _ = self.cmd_tx.send(c);
+    }
+
+    /// W12g: apply a Settings ▸ AUDIO BACKEND change to the LIVE manager
+    /// thread — no restart. Resolution mirrors the startup dispatch
+    /// exactly (env override > explicit choice > auto+discovery) so the
+    /// selector can never "apply" something `run_backend` wouldn't pick
+    /// on a fresh launch. Linux is fully inert: the picker never paints
+    /// there, and even a stray call sends nothing.
+    pub fn switch_backend(&self, cfg_val: &str) {
+        if cfg!(windows) {
+            let kind = resolve_backend(
+                std::env::var("SLOOPER_AUDIO_BACKEND").ok().as_deref(),
+                cfg_val,
+                jack::dll::found().is_some(),
+            );
+            self.cmd(Cmd::SwitchBackend(kind));
+        } else {
+            let _ = cfg_val;
+        }
     }
 }
 
@@ -2294,20 +2420,27 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
 /// serves exports, and polls the backend's idle tick. THE loop body is
 /// identical for every OS — anything device-specific lives behind
 /// [`ManagerBackend`], never in a copy of this loop. Exits on
-/// `Cmd::Quit`/channel loss; the caller then runs backend teardown.
+/// `Cmd::Quit`/channel loss (`ManagerExit::Quit`) or `Cmd::SwitchBackend`
+/// (`ManagerExit::Switch`, W12g); the caller then runs backend teardown
+/// and, on Windows only, acts on the verdict.
 fn manager_loop(
     cmd_rx: &Receiver<Cmd>,
     evt_tx: &SyncSender<Evt>,
     engine: &Arc<Engine>,
     sample_rate: u32,
     session: &mut dyn ManagerBackend,
-) {
+) -> ManagerExit {
     loop {
         match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Cmd::Refresh) => session.refresh(evt_tx),
             Ok(Cmd::SetMidiInputs(sel)) => session.set_midi_inputs(&sel, evt_tx),
             Ok(Cmd::Apply { ins, outs }) => {
                 session.apply(&ins, &outs, evt_tx);
+            }
+            // W12g: the Windows switch loop re-dispatches on this verdict;
+            // on Linux nobody ever sends it (the picker is Windows-only).
+            Ok(Cmd::SwitchBackend(kind)) => {
+                return ManagerExit::Switch(kind);
             }
             Ok(Cmd::ToggleRecord { i }) => {
                 toggle_record(engine, i.min(MAX_LOOPS - 1), evt_tx);
@@ -2477,6 +2610,8 @@ fn manager_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    // Reached only from the two breaks above: the Quit-class exits.
+    ManagerExit::Quit
 }
 
 /// Clamp a loop-region request to the live project: `ls` never past the
@@ -8079,5 +8214,171 @@ mod w12f_tests {
             super::jack::dll::found().is_none(),
             "Linux never discovers anything — JACK is THE backend"
         );
+    }
+}
+
+// W12g (WINDOWS-PORT): hot backend swap — the receiving end of
+// `Cmd::SwitchBackend` and the shape of the Windows switch loop. The
+// manager loop itself is OS-neutral, so its verdict behavior is proven
+// RIGHT HERE on Linux; the Windows-only plumbing is source-pinned and
+// exercised by the windows-native job.
+#[cfg(test)]
+mod w12g_tests {
+    use super::*;
+
+    fn code(src: &str) -> String {
+        let cut = src.find("\n#[cfg(test)]").unwrap_or(src.len());
+        src[..cut]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The park verdict comes back with its payload. OS-neutral proof of
+    /// the Windows hot-swap's receiving end: a parked loop (NullSession)
+    /// survives an idle tick (no busy-spin, no events) and switches out.
+    #[test]
+    fn w12g_parked_loop_is_alive_quiet_and_switches_out() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::sync_channel::<Evt>(8);
+        let engine = Arc::new(Engine::new());
+        // Let the 250 ms idle tick fire at least once before switching:
+        // proves the park services the queue instead of spinning or dying.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(320));
+            let _ = cmd_tx.send(Cmd::SwitchBackend(BackendKind::Jack));
+        });
+        let exit = manager_loop(&cmd_rx, &evt_tx, &engine, 48_000, &mut NullSession);
+        assert_eq!(exit, ManagerExit::Switch(BackendKind::Jack));
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "a parked slooper touches no device and sends no events"
+        );
+    }
+
+    /// Quit-class hygiene in the park: device commands are ignored without
+    /// inventing events, and Quit leaves with `ManagerExit::Quit` (the
+    /// Windows loop then drops the thread exactly like the pre-W12g one).
+    #[test]
+    fn w12g_park_ignores_device_cmds_and_quit_leaves() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::sync_channel::<Evt>(8);
+        let engine = Arc::new(Engine::new());
+        cmd_tx.send(Cmd::Refresh).unwrap();
+        cmd_tx
+            .send(Cmd::Apply {
+                ins: vec!["ghost".into()],
+                outs: vec![("ghost".into(), 3)],
+            })
+            .unwrap();
+        cmd_tx.send(Cmd::Quit).unwrap();
+        let exit = manager_loop(&cmd_rx, &evt_tx, &engine, 48_000, &mut NullSession);
+        assert_eq!(exit, ManagerExit::Quit);
+        assert!(evt_rx.try_recv().is_err(), "NullSession is a no-op session");
+    }
+
+    /// Immediate (pre-idle) switch returns the verdict without waiting:
+    /// a Settings pick lands on the dispatch loop within one recv.
+    #[test]
+    fn w12g_switch_verdict_lands_immediately() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::sync_channel::<Evt>(8);
+        let engine = Arc::new(Engine::new());
+        cmd_tx
+            .send(Cmd::SwitchBackend(BackendKind::Wasapi))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let exit = manager_loop(&cmd_rx, &evt_tx, &engine, 48_000, &mut NullSession);
+        assert_eq!(exit, ManagerExit::Switch(BackendKind::Wasapi));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(200));
+    }
+
+    /// Shape pins: manager_loop gained the verdict; the Linux dispatch
+    /// twin stays inert (no park, no switch machinery, verdict discarded);
+    /// the Windows twin runs the loop over BOTH backends and parks.
+    #[test]
+    fn w12g_verdict_plumbing_is_shape_pinned() {
+        let src = code(include_str!("mod.rs"));
+        let start = src.find("fn manager_loop(").expect("manager_loop missing");
+        let body = &src[start..start + src[start..].find("fn clamp_loop_region(").unwrap()];
+        assert!(body.contains("-> ManagerExit"), "manager_loop lost its verdict");
+        assert!(body.contains("Cmd::SwitchBackend(kind)"));
+        assert!(body.contains("ManagerExit::Switch(kind)"));
+
+        let sites: Vec<usize> = src.match_indices("fn run_backend").map(|(i, _)| i).collect();
+        assert_eq!(sites.len(), 2, "still exactly two run_backend twins");
+        let body_at = |from: usize| {
+            let rest = &src[from..];
+            &rest[..rest.find("\n}").unwrap() + 2]
+        };
+        let lin = body_at(sites[0]);
+        assert!(
+            lin.contains("jack::run") && lin.contains("let _ ="),
+            "Linux dispatches jack and DISCARDS the verdict"
+        );
+        for banned in ["resolve_backend", "NullSession", "ManagerExit::Switch"] {
+            assert!(
+                !lin.contains(banned),
+                "Linux dispatch must stay inert: {banned}"
+            );
+        }
+        let win = body_at(sites[1]);
+        for shape in [
+            "loop {",
+            "ManagerExit::Quit => return",
+            "ManagerExit::Switch(next)",
+            "ManagerExit::Unavailable",
+            "manager_loop(&cmd_rx, &evt_tx, &engine, sr, &mut NullSession)",
+            "jack::run(",
+            "wasapi::run(",
+            "jack::dll::found()",
+            "resolve_backend(",
+        ] {
+            assert!(win.contains(shape), "Windows switch loop lost `{shape}`");
+        }
+    }
+
+    /// Both backends: the null-audio path still LEAVES (`Quit` — headless
+    /// tests see the identical thread death they always did), every
+    /// honest-failure path PARKS (`Unavailable`, after Evt::Unavailable).
+    #[test]
+    fn w12g_backend_run_verdicts_pinned() {
+        let jack = code(include_str!("jack.rs"));
+        let nul = jack
+            .find("null audio (SLOOPER_NULL_AUDIO)")
+            .expect("null-audio path gone");
+        assert!(
+            jack[nul..nul + 120].contains("return ManagerExit::Quit"),
+            "null audio must still QUIT the thread (no park)"
+        );
+        assert_eq!(
+            jack.matches("return ManagerExit::Unavailable").count(),
+            6,
+            "jack honest-failure parks: dll guard + no server + 2 slot \
+             registrations + midi port + activate"
+        );
+        let was = code(include_str!("wasapi.rs"));
+        let nul = was
+            .find("null audio (SLOOPER_NULL_AUDIO)")
+            .expect("null-audio path gone");
+        assert!(was[nul..nul + 120].contains("return ManagerExit::Quit"));
+        assert!(was.contains("return ManagerExit::Unavailable"), "COM failure must park");
+    }
+
+    /// The GUI-facing helper: resolves exactly like startup dispatch
+    /// (env > explicit > auto+discovery) and only ever sends on Windows.
+    #[test]
+    fn w12g_switch_backend_helper_shape() {
+        let src = code(include_str!("mod.rs"));
+        let sw = &src[src
+            .find("pub fn switch_backend")
+            .expect("switch_backend helper gone")..];
+        let sw = &sw[..sw.find("\n    }").unwrap() + 2];
+        assert!(sw.contains("cfg!(windows)"), "Linux must stay send-inert");
+        assert!(sw.contains("resolve_backend("), "must mirror startup resolution");
+        assert!(sw.contains("SLOOPER_AUDIO_BACKEND"));
+        assert!(sw.contains("jack::dll::found()"));
+        assert!(sw.contains("Cmd::SwitchBackend(kind)"));
     }
 }
