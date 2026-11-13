@@ -659,6 +659,26 @@ the fixed classes as: 6 synth + samples808 XDG = class (a)/(c); the 30
 ui names are the invalid-JSON rack harness config + inert-XDG data
 sandbox (classes b/c) — NOT script-synth dependencies as first assumed
 (preview/audition pins need no rustc).
+MEASURED (session 26, run 43414440995): 395cd43 landed
+windows-native **587 pass / 2 fail** (from 548/37) and port pins 123/123
+native — the 4 w14_ pins pass on real Windows. The 2 residues were both
+v28 rack rows asserting `contains("kit-a/kick")`-shaped NEEDLES against
+`Path::display` strings — Windows renders `\`, so only the needle was
+wrong (path-keyed selection itself passed). Fixed in f658ac5
+(replace \\ -> / before matching; Linux no-op). GROW-LIST VIRTUALLY
+CLOSED — the next windows-native run decides GREEN → drop
+continue-on-error.
+OPEN RISK FOUND (session 26): the Linux 'Script-FX pair' STRICT step
+aborts `v20_fx_bridge_slider_rmb_auto` SOLO (malloc corruption, SIGABRT)
+on 2/2 attempts of 395cd43, while rerunning the pre-W14 run 43379736143
+is green 2/2 on the same-day runners, and the new binary is green 35/35
+solo/pair locally. Reading: the content-stamp dlopen layout SHIFTED heap
+layout and surfaced the KNOWN OPEN v20_fx script-FX heap-corruption bug
+(its abort was previously monolith-only) — the corruption is
+pre-existing, not introduced. NEXT (dedicated session, per skill plan):
+nightly ASan (`--profile asandbg`) root-cause on the v20_fx pair;
+meanwhile the step flips warning-only with this note if it reddens
+main again.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
