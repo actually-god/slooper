@@ -1511,7 +1511,16 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
         std::fs::write(crate::paths::build_sidecar(out, "failed"), &err).ok();
         return Err(format!("compile failed:\n{err}"));
     }
-    std::fs::rename(&tmp, out).map_err(|e| format!("could not store {}: {e}", out.display()))
+    // W14 (WINDOWS-PORT, synth.rs twin): a concurrent instance may have
+    // built the same artifact; on Windows renaming onto a dll it has mapped
+    // fails. If the artifact exists now, it is exactly what we wanted.
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        if !out.is_file() {
+            return Err(format!("could not store {}: {e}", out.display()));
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
 }
 
 /// rustc crate names are `[a-z0-9_]`, cannot be empty or a keyword prefix

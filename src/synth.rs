@@ -433,17 +433,31 @@ impl Registry {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let lib = build.join(format!("{stem}.{}", crate::paths::dylib_ext()));
-            let entry = if needs_build(&src, &lib) {
+            let reject = |e: String| SynthEntry {
+                stem: stem.clone(),
+                desc: None,
+                fns: None,
+                error: Some(e),
+                _lib: None,
+            };
+            // W14 (WINDOWS-PORT): the artifact is CONTENT-stamped, so an
+            // unchanged script always reuses the existing file (no rustc,
+            // no rename at all) and an edited script builds to a FRESH
+            // name that can never collide with the old mapped dll.
+            let lib = match stamped_artifact(&build, &stem, &src) {
+                Ok(p) => p,
+                Err(e) => {
+                    out.push(reject(e));
+                    continue;
+                }
+            };
+            let entry = if !lib.is_file() {
                 match compile_synth(&src, &lib) {
-                    Ok(()) => unsafe { load_one(&stem, &lib) },
-                    Err(e) => SynthEntry {
-                        stem: stem.clone(),
-                        desc: None,
-                        fns: None,
-                        error: Some(e),
-                        _lib: None,
-                    },
+                    Ok(()) => {
+                        prune_stale(&build, &stem, &lib);
+                        unsafe { load_one(&stem, &lib) }
+                    }
+                    Err(e) => reject(e),
                 }
             } else {
                 unsafe { load_one(&stem, &lib) }
@@ -463,15 +477,48 @@ impl Registry {
     }
 }
 
-fn needs_build(src: &Path, lib: &Path) -> bool {
-    match (std::fs::metadata(src), std::fs::metadata(lib)) {
-        (Ok(s), Ok(l)) => {
-            let (Ok(sm), Ok(lm)) = (s.modified(), l.modified()) else {
-                return true;
-            };
-            sm > lm
+/// W14: `<cache>/<stem>-<content-hash>.<dylib-ext>`. The old scheme was a
+/// fixed `<stem>.<ext>` rebuilt whenever the source mtime moved — on
+/// Windows that is a DEATH CLASS, not a nuisance: the repo never dlcloses,
+/// so the moment a script dll is loaded, the next rebuild's staging
+/// `rename` targets a MAPPED file and Windows refuses it
+/// (ERROR_USER_MAPPED_FILE; Linux silently swaps the inode, so the bug was
+/// structurally invisible there). Folding CONTENT instead of mtime+size
+/// also stops every re-seed from recompiling all bundled scripts: same
+/// bytes → same artifact → reused as-is. Same philosophy as the fx
+/// registry's stamped `.build/` artifacts (fx's fold stays mtime+size —
+/// unifying the two is a later, optional convergence).
+fn stamped_artifact(build: &Path, stem: &str, src: &Path) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("stat failed: {e}"))?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    stem.hash(&mut h);
+    bytes.hash(&mut h);
+    let stamp = h.finish();
+    Ok(build.join(format!(
+        "{stem}-{stamp:016x}.{}",
+        crate::paths::dylib_ext()
+    )))
+}
+
+/// Delete older artifacts of the same stem — extra stamps from edits and
+/// the pre-W14 fixed-name file (which nothing looks up anymore).
+/// Best-effort by design: deleting a still-mapped dll fails on Windows and
+/// the file lingers until it unmaps — harmless.
+fn prune_stale(build: &Path, stem: &str, keep: &Path) {
+    if let Ok(rd) = std::fs::read_dir(build) {
+        let prefix = format!("{stem}-");
+        let legacy = format!("{stem}.{}", crate::paths::dylib_ext());
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if (name.starts_with(&prefix) || name == legacy) && p != keep {
+                let _ = std::fs::remove_file(p);
+            }
         }
-        _ => true,
     }
 }
 
@@ -532,7 +579,18 @@ fn compile_synth(src: &Path, out: &Path) -> Result<(), String> {
         err.push('…');
         return Err(format!("compile failed:\n{err}"));
     }
-    std::fs::rename(&tmp, out).map_err(|e| format!("could not store {}: {e}", out.display()))
+    // W14 (WINDOWS-PORT): a second slooper instance may have built the same
+    // content stamp concurrently — on Windows renaming onto a dll THAT
+    // PROCESS has mapped fails (the reverse also holds for our own earlier
+    // registries, hence content-stamped names). Either way, if the artifact
+    // exists now, we have exactly the file we were trying to produce.
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        if !out.is_file() {
+            return Err(format!("could not store {}: {e}", out.display()));
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
 }
 
 unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
@@ -749,10 +807,24 @@ mod tests {
 
     #[test]
     fn bundled_piano_and_sampler_load_and_render() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
         let reg = test_registry("bundled");
         let stems = reg.stems();
-        assert!(stems.contains(&"piano".to_string()), "stems: {stems:?}");
-        assert!(stems.contains(&"sampler".to_string()), "stems: {stems:?}");
+        // W14: the rejection reasons MUST ride the failure line — on the
+        // CI windows lane this test failed as bare `stems: []` with the
+        // actual load/compile errors trapped unreachable inside the
+        // registry, forcing a whole CI cycle per triage guess.
+        let errs = reg.errors();
+        assert!(
+            stems.contains(&"piano".to_string()),
+            "stems: {stems:?}, errors: {errs:?}"
+        );
+        assert!(
+            stems.contains(&"sampler".to_string()),
+            "stems: {stems:?}, errors: {errs:?}"
+        );
         // Give the host a rack asset (asset id 0) so the sampler has something
         // to play; with an empty table silence is correct behavior.
         let sine: Arc<[f32]> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
@@ -760,7 +832,7 @@ mod tests {
         for stem in ["piano", "sampler"] {
             let inst = reg
                 .create_instance(stem, 48_000.0, &[])
-                .unwrap_or_else(|| panic!("{stem} instance"));
+                .unwrap_or_else(|| panic!("{stem} instance — errors: {:?}", reg.errors()));
             let mut p = [0.0f32; MAX_PARAMS];
             inst.read_params(&mut p);
             // defaults for unknown params are 0 — pass desc defaults instead
@@ -791,6 +863,9 @@ mod tests {
     /// bundle): a new script joins the gate by being bundled.
     #[test]
     fn all_bundled_synths_render_sound() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
         let reg = test_registry("allbundled");
         let sine: Arc<[f32]> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         set_host_assets(Arc::new(vec![sine]), 48_000);
@@ -802,7 +877,7 @@ mod tests {
             let stem = name.trim_end_matches(".rs");
             let inst = reg
                 .create_instance(stem, 48_000.0, &[])
-                .unwrap_or_else(|| panic!("{stem} instance"));
+                .unwrap_or_else(|| panic!("{stem} instance — errors: {:?}", reg.errors()));
             let desc = reg.desc(stem).unwrap();
             let mut p = [0.0f32; MAX_PARAMS];
             for (k, pd) in desc.params.iter().enumerate() {
@@ -838,6 +913,9 @@ mod tests {
     /// distance from its root note: +12 st ⇒ exactly twice the rate.
     #[test]
     fn v08_sampler_plays_asset_pitched() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
         let reg = test_registry("pitched");
         let sine: Arc<[f32]> = (0..48000)
             .map(|i| (i as f64 * 2.0 * std::f64::consts::TAU * 200.0 / 48000.0).sin() as f32 * 0.5)
@@ -845,7 +923,7 @@ mod tests {
         set_host_assets(Arc::new(vec![sine]), 48_000);
         let inst = reg
             .create_instance("sampler", 48_000.0, &[])
-            .expect("sampler");
+            .unwrap_or_else(|| panic!("sampler instance — errors: {:?}", reg.errors()));
         let desc = reg.desc("sampler").unwrap();
         let mut p = [0.0f32; MAX_PARAMS];
         for (k, pd) in desc.params.iter().enumerate() {
@@ -913,8 +991,13 @@ mod tests {
         // that make it a piano and not a toy: correct pitch, harmonic
         // spectrum that falls with frequency, sustain with a live decay,
         // real velocity dynamics, a damper that stops sound, and no NaN.
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
         let reg = test_registry("grand");
-        let inst = reg.create_instance("piano", 48_000.0, &[]).expect("piano");
+        let inst = reg
+            .create_instance("piano", 48_000.0, &[])
+            .unwrap_or_else(|| panic!("piano instance — errors: {:?}", reg.errors()));
         let desc = reg.desc("piano").unwrap().clone();
         let mut p = [0.0f32; MAX_PARAMS];
         for (k, pd) in desc.params.iter().enumerate() {
@@ -1030,11 +1113,14 @@ mod tests {
     /// synth for it to work" bug).
     #[test]
     fn v10_sampler_note_at_block_zero_is_not_dropped() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
         let reg = test_registry("v10-first-note");
         v10_host_table(vec![0.8f32; 900], 2);
         let inst = reg
             .create_instance("sampler", 48_000.0, &[2.0, 48.0, 1.0])
-            .expect("sampler instance");
+            .unwrap_or_else(|| panic!("sampler instance — errors: {:?}", reg.errors()));
         let mut ev = vec![(0u64, 3u8, 0u8, 60u8, 110u8), (40_000, 0, 0, 60, 0)];
         let mut out = vec![0f32; 48_000 / 4];
         crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
@@ -1047,11 +1133,14 @@ mod tests {
     /// (previously it kept the stale buffer until the synth was re-bound).
     #[test]
     fn v10_sampler_rereads_asset_when_content_moves() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
         let reg = test_registry("v10-stale");
         v10_host_table(vec![0.9f32; 900], 2);
         let inst = reg
             .create_instance("sampler", 48_000.0, &[2.0, 48.0, 1.0])
-            .expect("sampler instance");
+            .unwrap_or_else(|| panic!("sampler instance — errors: {:?}", reg.errors()));
         let render = |inst: &Instance| {
             let mut ev = vec![(0u64, 3u8, 0u8, 60u8, 110u8), (40_000, 0, 0, 60, 0)];
             let mut out = vec![0f32; 48_000 / 8];
@@ -1094,5 +1183,127 @@ mod tests {
         assert!(crate::paths::build_sidecar(&out, "failed").is_file());
         assert!(!out.is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================== W14 (WINDOWS-PORT) script-build pins =====================
+
+    #[test]
+    fn w14_synth_artifact_is_content_stamped() {
+        // The artifact name folds CONTENT, not mtime: an identical re-seed
+        // (fresh mtime) must reuse the file, and any content edit must
+        // produce a FRESH name (so a rename can never target the mapped
+        // old dll — the Windows death class this whole task removes).
+        let dir = std::env::temp_dir().join("sp-synth-w14stamp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("kick.rs");
+        std::fs::write(&src, "// v1 identical\n").unwrap();
+        let a = stamped_artifact(&dir, "kick", &src).unwrap();
+        std::fs::write(&src, "// v1 identical\n").unwrap(); // same bytes, new mtime
+        assert_eq!(
+            stamped_artifact(&dir, "kick", &src).unwrap(),
+            a,
+            "same content must reuse the artifact"
+        );
+        std::fs::write(&src, "// v2 edited\n").unwrap();
+        let b = stamped_artifact(&dir, "kick", &src).unwrap();
+        assert_ne!(a, b, "edited content must build a FRESH name");
+        // shape: flat in the build dir, `{stem}-` prefix, target suffix;
+        // and the stem folds into the hash (same bytes, other stem ≠ collide).
+        assert_eq!(a.parent().unwrap(), dir);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("kick-") && name.ends_with(&format!(".{}", crate::paths::dylib_ext())),
+            "{name}"
+        );
+        assert_ne!(stamped_artifact(&dir, "snare", &src).unwrap(), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn w14_synth_edit_reloads_while_old_artifact_mapped() {
+        // THE functional pin for the mapped-dll class: the loaded artifact
+        // is LEAKED by design (repo never dlcloses), then the script is
+        // edited. Under the pre-W14 fixed-name scheme every Windows rescan
+        // after this died on "could not store …: Access is denied"; Linux
+        // silently swapped the inode and never saw it.
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
+        let dir = std::env::temp_dir().join("sp-synth-w14edit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tri = BUNDLED
+            .iter()
+            .find(|(n, _)| *n == "tri_osc.rs")
+            .map(|(_, s)| (*s).to_string())
+            .expect("tri_osc bundled");
+        std::fs::write(dir.join("w14live.rs"), &tri).unwrap();
+        let art = |stem_src: &Path| stamped_artifact(&cache_dir(), "w14live", stem_src);
+        let first = art(&dir.join("w14live.rs")).unwrap();
+        let reg = Registry::open(dir.clone());
+        assert!(
+            reg.create_instance("w14live", 48_000.0, &[]).is_some(),
+            "custom script must load: errors {:?}",
+            reg.errors()
+        );
+        // Edit the script (content change; the old artifact stays MAPPED).
+        std::fs::write(dir.join("w14live.rs"), format!("{tri}\n// w14 edit\n")).unwrap();
+        let second = art(&dir.join("w14live.rs")).unwrap();
+        assert_ne!(first, second, "an edit must build a FRESH artifact name");
+        let reg = Registry::open(dir.clone());
+        assert!(
+            reg.create_instance("w14live", 48_000.0, &[]).is_some(),
+            "edited script must rebuild and load: errors {:?}",
+            reg.errors()
+        );
+        assert!(second.is_file(), "the fresh artifact must exist after rescan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn w14_script_compile_shape_pinned() {
+        // Source pins over the seams the W14 design depends on. Span-scoped
+        // (comment-stripped, needles built by concatenation) so pin text
+        // can never self-match (W12e/W6 vacuity traps).
+        let src = include_str!("synth.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let between = |a: &str, b: &str| -> String {
+            let i = code.find(a).unwrap_or_else(|| panic!("anchor {a} gone"));
+            let j = code[i..].find(b).unwrap_or_else(|| panic!("end anchor {b} gone"));
+            code[i..i + j].to_string()
+        };
+        let rescan = between("pub fn rescan", "fn stamped_artifact");
+        let st_a = ["stamped_artifact(&build, &stem, &sr", "c"].concat();
+        let nb = ["needs", "_build"].concat();
+        assert!(rescan.contains(&st_a), "rescan must resolve via the stamp");
+        assert!(!rescan.contains(&nb), "mtime-based rebuild is back");
+        assert!(rescan.contains("if !lib.is_file()"), "artifact reuse is gone");
+        assert!(rescan.contains("prune_stale(&build, &stem, &lib)"), "stale artifact prune is gone");
+        let fallback = ["if !out.is", "_file()"].concat();
+        for (start, end) in [
+            ("fn compile_synth", "unsafe fn load_one"),
+            ("fn compile_effect", "fn sanitize_crate_name"),
+        ] {
+            let s = if start == "fn compile_synth" {
+                between(start, end)
+            } else {
+                let fxsrc = include_str!("fx.rs");
+                let fxc: String = fxsrc
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let i = fxc.find(start).expect("fx compile gone");
+                let j = fxc[i..].find(end).expect("fx end gone");
+                fxc[i..i + j].to_string()
+            };
+            assert!(s.contains("if let Err(e) = std::fs::rename(&tmp, out)"), "{start}: rename must be fallible-checked");
+            assert!(s.contains(&fallback), "{start}: exists-fallback gone (W14 concurrent-build)");
+        }
     }
 }

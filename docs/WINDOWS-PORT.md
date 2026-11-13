@@ -131,9 +131,14 @@ ships the same crate via the windows target table + discovery
 libloading probe on `jack_client_open`) + resolve_backend (auto/wasapi/jack,
 env SLOOPER_AUDIO_BACKEND overrides) + Settings ▸ AUDIO BACKEND + config
 field win_audio_backend. A jack-less Windows stays 100% WASAPI. NEXT =
-whatever the Windows report-only grow-list surfaces (or a W12g: hot
-backend swap without restart — deliberately NOT built in W12f). The next
-real version tag publishes all assets automatically.
+W14 (opened 2026-11-13: the Windows full-suite grow-list — session 25
+attacked the three systemic classes: mapped-dll script rebuilds, invalid
+JSON test configs (backslash paths), and the inert-XDG data sandbox; the
+next session reads the NEW report-only list and continues until the
+windows-native full suite is green, then flips it blocking). W12g (hot
+backend swap without restart — deliberately NOT built in W12f) stays
+open behind it. The next real version tag publishes all assets
+automatically.
 
 ## Ground rules (apply to every task)
 
@@ -588,6 +593,72 @@ portable asset on the OLDEST distro we support, never the newest.
   ubuntu:22.04 (Depends-alone, PATH probe, file placement, clean purge).
   Proven locally on the b84b4a9 draft artifact (2/2 PASS) with the
   Arch-payload sabotage pair FAILing both tiers by GLIBC name.
+
+### W14 — Windows full-suite green list (grow-list program, opened 2026-11-13)
+
+The W10 windows-native job runs the FULL lib suite report-only
+(`continue-on-error`): the W10 baseline was 393 pass / 103 fail; the
+W12f run (session 24) sat at **548 / 37** — 30 script-synth-dependent
+ui tests, 6 synth tests, the samples808 XDG test, and stragglers. This
+task keeps picking root causes until the windows-native full suite is
+GREEN, then flips it blocking (drop `continue-on-error` + keep the
+pin-filter step). One root cause per session commit, same protocol.
+
+Session 25 diagnosed and fixed THREE systemic classes at once (the
+`stems: []` wall turned out to be diagnostic-free — every failure line
+now carries `reg.errors()` so future Windows triage costs one log read,
+not one CI cycle):
+- **(a) mapped-dll script rebuilds.** synth artifacts were fixed names
+  (`<stem>.<ext>`, rebuild when src mtime moved). The repo never
+  dlcloses, so on Windows the FIRST loaded script dll made every later
+  rebuild's staging `rename` target a MAPPED file → ERROR_USER_MAPPED_FILE
+  (`could not store …: Access is denied`) — invisible on Linux (rename
+  swaps the inode under a live mapping). Fixed = CONTENT-stamped
+  artifacts (`<cache>/<stem>-<hash>.<ext>`, the fx `.build/` philosophy
+  with the fold on bytes instead of mtime+size): unchanged script reuses
+  the artifact (no rustc — the suite also stops recompiling the 9 bundled
+  scripts per test_registry), an edit builds a FRESH name the old mapping
+  can never block. Legacy fixed names are pruned best-effort. Both
+  compile paths (synth + fx) got the concurrent-build fallback: rename
+  fails but `out.exists()` ⇒ success (a second instance built the same
+  stamp; on Windows renaming over ITS mapped copy fails legitimately).
+- **(b) invalid JSON test configs.** `headless_app` embedded the sandbox
+  samples path raw into a hand-written `config.json` — on Windows
+  `C:\Users\…` is INVALID JSON (backslash = escape char), the config load
+  fell back to defaults, and the rack saw no folders (the "kit rows: 0",
+  "rack row visible" and several v34 families). Fix: double backslashes
+  (Linux `.display()` has none — no-op there).
+- **(c) inert-XDG data sandbox.** XDG is inert on Windows (W12e lore):
+  `headless_app` sandboxed the data root with `XDG_DATA_HOME` only, so
+  every data-rooted seed (808 pack, automation shape presets) hit the
+  real `%LOCALAPPDATA%` while fixtures went to the sandbox. Fix: also
+  set `SLOOPER_DATA_DIR = <sandbox>/slooper` — the SAME resolved path as
+  XDG gives on Linux, so Linux behavior is unchanged; the samples808
+  scratch-home test and the deterministic-removal site got the same
+  parity.
+Pins: `w14_synth_artifact_is_content_stamped`,
+`w14_synth_edit_reloads_while_old_artifact_mapped` (the functional
+mapped-dll pin — an edited script rebuilds while the old artifact stays
+loaded; its fresh-name assertions also fail a content-blind stamp on
+Linux), `w14_script_compile_shape_pinned` (span-scoped source pin over
+rescan + BOTH compile paths, comment-stripped, concat-built needles),
+`w14_headless_app_data_dir_sandboxed` (cross-OS truth: data_dir() ==
+sandbox/slooper). All 4 added to the port-pins filter (`w14_`). The
+6 rustc-dependent synth batteries now carry the fx-style
+`rustc_available()` skip guard (W3 rule — a compiler-less machine must
+SKIP, not red), and every create_instance panic prints `reg.errors()`.
+Acceptance for the whole W14: windows-native full suite green →
+`continue-on-error` removed; Linux gates per commit.
+Session 26 landed the session-25 tree verbatim after full Linux gates
+(citest chunks 556+37+4 green, solo quarantines green modulo the
+documented resizes abort, e2e 32/32 live-JACK, clippy 0, gnullvm live-
+proved). Sabotage proofs: content-blind stamp → both functional synth
+pins red; fx exists-fallback removal → shape pin red. Baseline to beat
+= W12f run 43379736143: **548 pass / 37 fail** — the 37 names map to
+the fixed classes as: 6 synth + samples808 XDG = class (a)/(c); the 30
+ui names are the invalid-JSON rack harness config + inert-XDG data
+sandbox (classes b/c) — NOT script-synth dependencies as first assumed
+(preview/audition pins need no rustc).
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).

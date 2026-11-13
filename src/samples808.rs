@@ -181,10 +181,16 @@ mod tests {
 
     #[test]
     fn seeds_into_a_scratch_xdg_home() {
-        // Redirect XDG so the test never touches the real data dir.
+        // Redirect the data root so the test never touches the real data
+        // dir. XDG is Unix-only; the OS-neutral sandbox is SLOOPER_DATA_DIR
+        // (W2), pointed at what XDG would resolve (`base/slooper`) so the
+        // assertions below are IDENTICAL on both OSes (W14, WINDOWS-PORT —
+        // on Windows the XDG var alone was inert and the pack seeded into
+        // the real %LOCALAPPDATA%).
         let base = std::env::temp_dir().join(format!("sp-pack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::env::set_var("XDG_DATA_HOME", &base);
+        std::env::set_var(crate::paths::DATA_DIR_ENV, base.join("slooper"));
         let dir = seed_pack();
         assert_eq!(dir, base.join("slooper").join("samples").join("808"));
         for (name, data) in FILES {
@@ -200,5 +206,6 @@ mod tests {
         assert!(dir.join("808-kick.wav").exists());
         let _ = std::fs::remove_dir_all(&base);
         std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var(crate::paths::DATA_DIR_ENV);
     }
 }
