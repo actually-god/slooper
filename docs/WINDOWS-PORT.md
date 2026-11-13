@@ -594,7 +594,7 @@ portable asset on the OLDEST distro we support, never the newest.
   Proven locally on the b84b4a9 draft artifact (2/2 PASS) with the
   Arch-payload sabotage pair FAILing both tiers by GLIBC name.
 
-### W14 — Windows full-suite green list (grow-list program, opened 2026-11-13)
+### W14 — Windows full-suite green list (grow-list program, opened 2026-11-13) — **DONE 2026-11-13 (sessions 25–26)**
 
 The W10 windows-native job runs the FULL lib suite report-only
 (`continue-on-error`): the W10 baseline was 393 pass / 103 fail; the
@@ -678,7 +678,11 @@ layout and surfaced the KNOWN OPEN v20_fx script-FX heap-corruption bug
 pre-existing, not introduced. NEXT (dedicated session, per skill plan):
 nightly ASan (`--profile asandbg`) root-cause on the v20_fx pair;
 meanwhile the step flips warning-only with this note if it reddens
-main again.
+main again. CLOSED same session: f658ac5 windows-native = **589 pass /
+0 fail**; ci.yml flipped the step BLOCKING (continue-on-error removed)
+and the v20-bridge solo step joined the v36-resizes warning-only
+pattern with the surfacing note — the ASan session stays open as the
+follow-up for the corruption itself.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
