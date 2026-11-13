@@ -47,45 +47,26 @@ jobs:
             libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
       - name: Build (shipping profile)
         run: cargo build --release --locked
-      # The script-FX editor pair heap-aborts when run in one process
-      # (slooper-dev: "FX-script heap corruption" — two script editor
-      # instances share cached &'static state; each passes solo), which
-      # SIGABRTs the monolith and loses every later test. Monolith skips
-      # them; each editor test then runs in its own process.
-      # CI first contact (run 42946049338): the SAME class also kills the
-      # monolith via v20_fx_auto -> v20_fx_bridge (the two script-effect
-      # loads in one process; glibc "corrupted size vs. prev_size"), so
-      # that pair joins the quarantine on the identical recipe.
+      # RESOLVED 2026-11-13 (session 28): the "script-FX heap corruption"
+      # (glibc "corrupted size vs. prev_size") was a FIELD-DROP-ORDER UAF —
+      # FxEditor dropped its Arc<Instance> BEFORE the custom-GUI guard
+      # whose Drop calls the script's gui_destroy (which legitimately
+      # touches the instance state). valgrind caught the write-after-free
+      # deterministically (ubuntu-24.04 container); fix = declaration
+      # order + fxgui::drop_order_tests pin. The pair now runs IN the
+      # monolith (10/10 green on the floor distro where it aborted 3/10);
+      # the isolated steps stay as defense-in-depth, now fully BLOCKING.
       - name: Lib suite (headless, citest profile)
-        run: >
-          cargo test --profile citest --lib --locked --
-          --skip ui::tests::v36_script_fx_editor
-          --skip ui::tests::v20_fx
+        run: cargo test --profile citest --lib --locked
       - name: Script-editor pair in isolated processes
         run: |
           cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_docks
-          # KNOWN open bug (root cause tracked in the slooper-dev skill,
-          # "FX-script heap corruption"): this test SIGABRTs glibc with
-          # "corrupted size vs. prev_size" even in a dedicated process
-          # (fails at HEAD too). Non-blocking until the editor-cache fix
-          # lands; the monolith skips the family so it cannot kill later
-          # tests either.
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_resizes \
-            || echo "::warning::v36_script_fx_editor_resizes failed in isolation (known open heap-corruption class)"
+          cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_resizes
       - name: Script-FX pair in isolated processes
         run: |
-          # Each passes SOLO locally (35/35 proven); sharing a process with
-          # the twin is what corrupts the heap (open root-cause bug,
-          # "FX-script heap corruption" in the slooper-dev skill). Since
-          # 395cd43 the bridge ALSO aborts solo on the ubuntu runners
-          # (3/3; green 2/2 on the same-day runners at the pre-W14 commit):
-          # the content-stamped synth dlopen shifted heap layout and the
-          # pre-existing corruption now trips glibc there. NOT a W14
-          # regression — next is the nightly-ASan root-cause session
-          # (--profile asandbg). Warning-only until that lands.
           cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_auto_slider_rmb_auto
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_bridge_slider_rmb_auto \
-            || echo "::warning::v20_fx_bridge_slider_rmb_auto aborted in isolation (known open heap-corruption class, surfaced by W14 layout shift)"
+          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_bridge_slider_rmb_auto
+          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_pair_teardown_survives_heap_churn
       - name: Clippy zero
         run: |
           set -o pipefail
