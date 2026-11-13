@@ -9,7 +9,7 @@
 // (`sidx(d)`) instead of write-head-relative positions. The taps then
 // swept the whole ring once per wrap instead of holding a constant
 // delay — the feedback loop starved and an impulse came out as
-// (dry * (1−mix)) plus a slow smear. Same bug class as echo3.rs (see
+// (dry * (1−mix)) plus a slow smear. Same bug class as delay.rs (see
 // its header for the full post-mortem). Reads are head-relative now, the
 // base time is slew-limited, and the NaN path no longer wipes 256 KB of
 // ring per bad sample (the loop self-heals once filters are clean).

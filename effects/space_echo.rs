@@ -763,7 +763,7 @@ extern "C" fn gui_draw(
 // ---------------------------------------------------------------------------
 // Descriptor + GUI tables + exports.
 // Tier 3/4 export quartet: a v3 script must export ALL prefix symbols
-// (mirror spread.rs / echo3.rs exactly); the loader validates the prefix.
+// (mirror spread.rs / delay.rs exactly); the loader validates the prefix.
 // ---------------------------------------------------------------------------
 static PARAMS: [EffectParamV1; 12] = [
     EffectParamV1 { label: c"time".as_ptr(), min: 0.02, max: 2.4, default: 0.38 },
