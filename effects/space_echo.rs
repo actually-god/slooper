@@ -18,8 +18,8 @@
 //        └→ bank_R ──┘ ×verb ──┘
 //   banks cross-mix: L' = a·(1+w)/2 + b·(1−w)/2  (w = tail width)
 //
-// Tier 5 (docs/FL-SUITE.md): this is Reeverb 2 / LuxeVerb made native —
-// the FL rooms are stereo devices and the tier-1 script was mid-only.
+// Tier 5 (docs/EFFECT-SUITE.md): the algorithmic-room role made
+// native — stereo rooms, where the tier-1 script was mid-only.
 // The v1 fallback is `process_st(x,x)` returning the LEFT channel: with
 // the default width=1 the L bank carries the tier-1/2 tunings verbatim,
 // so every mono forensic pin (v13 DC wash, v14 snap glitch, mode
@@ -781,7 +781,7 @@ static PARAMS: [EffectParamV1; 12] = [
 ];
 
 const DESC_TEXT: &core::ffi::CStr =
-    c"Modulated echo and STEREO FDN reverb (Fruity Reeverb 2 / LuxeVerb task): per-side echo, dual decorrelated comb banks, tail width (0 = exact mono). Damped loops, wobble LFO, animated echo-pattern window, factory presets (plain echo + practice hall .. cathedral).";
+    c"Modulated echo and STEREO FDN reverb: per-side echo, dual decorrelated comb banks, tail width (0 = exact mono). Damped loops, wobble LFO, animated echo-pattern window, factory presets (plain echo + practice hall .. cathedral).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,

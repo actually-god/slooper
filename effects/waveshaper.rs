@@ -1,7 +1,6 @@
 // ============================================================ slooper ==
-// waveshaper.rs — draw-your-own distortion curve. Covers FL Studio's
-// Fruity WaveShaper (draggable curve), the shaping half of Hardcore/LSD,
-// and doubles as a generic transfer-function box. See docs/FL-SUITE.md.
+// waveshaper.rs — draw-your-own distortion curve (draggable curve),
+// doubling as a generic transfer-function box.
 //
 // The curve is NINE control points (params 0..8, y in -1..1, x fixed on a
 // grid) plus two fixed corner knots at (-1,-1) and (1,1). process() runs a

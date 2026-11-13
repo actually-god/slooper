@@ -1,11 +1,10 @@
 // ============================================================ slooper ==
-// echo3.rs — studio delay with shaped feedback + stereo ping-pong. Covers
-// Fruity Delay 2 / Delay 3 (and the single-bank core of Delay Bank). See
-// docs/FL-SUITE.md.
+// delay.rs — studio delay with shaped feedback + stereo ping-pong
+// (the single-bank delay role: tape + digital classics in one box).
 //
 // Clean delay line with filtered + saturated feedback (the "tone/damp"
 // of tape and digital classics), optional ducking of the wet by the dry
-// envelope (Fruity Delay 3's duck), wet trim, mix, output.
+// envelope (the classic "duck"), wet trim, mix, output.
 //
 // ABI v3 STEREO (tier-4 rework): the feedback bus runs on the MID while
 // each ear taps the ring at its own delay — right reads `time *
@@ -179,7 +178,7 @@ extern "C" fn process_st(
     s.buf[s.widx & D_MASK] = (mid + echo * fb.min(0.995)) as f32;
     s.widx = s.widx.wrapping_add(1);
 
-    // Duck the wet with the dry envelope (Delay 3's "duck").
+    // Duck the wet with the dry envelope (the classic duck).
     let a = mid.abs();
     if a > s.dry_env {
         s.dry_env += (a - s.dry_env) * 0.01;
@@ -220,10 +219,10 @@ static PARAMS: [EffectParamV1; NPARAMS] = [
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
-    name: c"Echo 3".as_ptr(),
+    name: c"Delay".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Studio delay: filtered + saturated feedback, ducking, wet trim, stereo ping-pong (ABI v3). The Fruity Delay 2/3 role.".as_ptr(),
+        c"Studio delay: filtered + saturated feedback, ducking, wet trim, stereo ping-pong (ABI v3).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -233,10 +232,10 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 
 pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     abi: SLOOPER_EFFECT_ABI_V2,
-    name: c"Echo 3".as_ptr(),
+    name: c"Delay".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Studio delay: filtered + saturated feedback, ducking, wet trim, stereo ping-pong (ABI v3). The Fruity Delay 2/3 role.".as_ptr(),
+        c"Studio delay: filtered + saturated feedback, ducking, wet trim, stereo ping-pong (ABI v3).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,
@@ -247,10 +246,10 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
 
 pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     abi: SLOOPER_EFFECT_ABI_V3,
-    name: c"Echo 3".as_ptr(),
+    name: c"Delay".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Studio delay: filtered + saturated feedback, ducking, wet trim, stereo ping-pong (ABI v3). The Fruity Delay 2/3 role.".as_ptr(),
+        c"Studio delay: filtered + saturated feedback, ducking, wet trim, stereo ping-pong (ABI v3).".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,

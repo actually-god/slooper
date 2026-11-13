@@ -2,8 +2,8 @@
 // slooper-synth-version: 6
 // granular.rs — granular cloud engine for rack samples.
 //
-// Covers the FL Suite granular task (Fruity Granulizer, and the textural
-// half of Slicex/FLEX pads). Like Granulizer's keyboard mapping, each
+// Granular pads and textures in one engine. Like a granulator's
+// keyboard mapping, each
 // held NOTE owns a playhead through the asset buffer: the note number
 // selects its start position (0..127 spans the clip), and the `scan`
 // slider sends playheads walking forward. Every held note spawns its own
@@ -222,7 +222,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
         }
         if v.pos == 0.0 && blen > 0.0 {
             // First frame of this note: place the playhead by note number
-            // (Granulizer's keyboard = position mapping).
+            // (granular keyboard = position mapping).
             v.pos = (v.note as f64 / 127.0) * blen * 0.999;
         }
         while v.timer <= dt {
@@ -306,7 +306,7 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
     name: c"granular".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Granular clouds over a rack sample (Fruity Granulizer task): notes are playheads, chords are clusters; spray, scatter, scan, window shape.".as_ptr(),
+        c"Granular clouds over a rack sample: notes are playheads, chords are clusters; spray, scatter, scan, window shape.".as_ptr(),
     n_params: 9,
     params: PARAMS.as_ptr(),
     create,

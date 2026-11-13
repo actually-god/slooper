@@ -980,7 +980,7 @@ mod tests {
         }
     }
 
-    /// FL Suite tier 2: EVERY bundled synth must compile, load, render
+    /// Native-suite tier 2: EVERY bundled synth must compile, load, render
     /// audible sound at its own default params, and fall silent on
     /// all_off. The list DERIVES from `BUNDLED` (same rule as the effect
     /// bundle): a new script joins the gate by being bundled.

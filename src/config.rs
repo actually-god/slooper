@@ -88,7 +88,8 @@ fn default_drum_sub() -> u32 {
 }
 
 /// v30 R1: the stock drum kit (pattern builder default): 8 silent pads
-/// with FL-flavoured names. An empty saved kit entry always means THIS.
+/// with generic instrument names. An empty saved kit entry always
+/// means THIS.
 pub fn default_drum_kit() -> Vec<DrumPadSave> {
     ["Kick", "Snare", "Hat", "Open", "Clap", "Tom", "Cow", "Perc"]
         .iter()
@@ -300,7 +301,7 @@ impl Default for DynDock {
     }
 }
 
-/// v47 R2: a NAMED window-layout template (Ableton "view template"): all
+/// v47 R2: a NAMED window-layout template (a "view template"): all
 /// side-window geometry, dock slots and tab groups, every registered
 /// dynamic window's geometry, and the list of dynamic-window KINDS that
 /// were open at capture time. Applying restores geometry for everything
@@ -554,7 +555,7 @@ pub struct Config {
     pub track_fx: Vec<Vec<TrackFxSave>>,
     /// Per-track mixer chains: index = track, entries = chain slots in
     /// audio order. Scripted effects and VST plugins are one unified list —
-    /// a plugin can sit anywhere in the chain (FL Studio mixer model).
+    /// a plugin can sit anywhere in the chain (the mixer-chain model).
     #[serde(default)]
     pub track_chain: Vec<Vec<ChainSave>>,
     /// v32 R5: sidechain send mask — bit k of `sc_send[t]` means "track k's

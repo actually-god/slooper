@@ -3539,9 +3539,9 @@ fn v46_e2e_poly_track_renders_per_lane_copies() {
     drop(active);
 }
 
-// ---------------------------------------------------- FL-suite tier 2 live --
+// --------------------------------------------- native-suite tier 2 live --
 
-/// FL-Suite tier 2: the four new bundled synths (tri_osc, pluck, fm,
+/// Native-suite tier 2: the four new bundled synths (tri_osc, pluck, fm,
 /// granular) and the new Convolver must work through the exact public
 /// command queue the UI uses. Synths come from the SEEDED user folder
 /// (same registry path every other e2e uses); the convolver from the
@@ -3884,7 +3884,7 @@ fn e2e_tier3_stereo_spread_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tier-4 live proof (docs/FL-SUITE.md rework): the upgraded v3 Echo 3
+/// Tier-4 live proof (docs/EFFECT-SUITE.md rework): the upgraded v3 Delay
 /// (ping-pong) and Chorus Doubler (per-side tap banks) must put REAL
 /// side energy on the master buses through the production RT chain —
 /// registry load, FxSlot attach, looping asset, live JACK transport.
@@ -3901,15 +3901,15 @@ fn e2e_tier4_stereo_echo_chorus_live() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut reg = slooper::fx::Registry::open(dir.clone());
     reg.rescan();
-    for stem in ["echo3", "chorus"] {
+    for stem in ["delay", "chorus"] {
         let d = reg.desc(stem).expect("stock script present").clone();
         assert!(d.stereo, "{stem} must load as an ABI-v3 stereo script");
     }
-    let de = reg.desc("echo3").unwrap().clone();
+    let de = reg.desc("delay").unwrap().clone();
     let dech = reg.desc("chorus").unwrap().clone();
     let i_echo = reg
-        .create_instance("echo3", sr as f64, &[])
-        .expect("echo3 compiles");
+        .create_instance("delay", sr as f64, &[])
+        .expect("delay compiles");
     let i_cho = reg
         .create_instance("chorus", sr as f64, &[])
         .expect("chorus compiles");
@@ -4011,7 +4011,7 @@ fn e2e_tier4_stereo_echo_chorus_live() {
     assert!(s_a > 0.01, "loop must be audible (sum rms {s_a})");
     assert!(
         d_a > s_a * 0.05,
-        "ping-pong echo3 must put side energy on the master buses (dif {d_a} vs sum {s_a})"
+        "ping-pong delay must put side energy on the master buses (dif {d_a} vs sum {s_a})"
     );
 
     // Phase B: swap to the stereo chorus in the same live chain.
@@ -4040,7 +4040,7 @@ fn e2e_tier4_stereo_echo_chorus_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// FL Suite tier 5 live gate (docs/FL-SUITE.md): space_echo went ABI-v3.
+/// Native Suite tier 5 live gate (docs/EFFECT-SUITE.md): space_echo went ABI-v3.
 /// Headless pins prove the DSP; this proves the script survives the REAL
 /// RT thread in a live chain — per-sample calls at RT block sizes, the
 /// engine pair bus feeding process_st, and decorrelated energy actually
@@ -4177,7 +4177,7 @@ fn e2e_tier5_stereo_reverb_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// FL Suite tier 5b live-RT proof (docs/FL-SUITE.md): shifter, gater,
+/// Native Suite tier 5b live-RT proof (docs/EFFECT-SUITE.md): shifter, gater,
 /// pitchshft and vocoder upgraded to ABI-v3 must put real SIDE energy on
 /// the LIVE master buses. For the vocoder (the only key-consuming script
 /// of the four) a one-bit self-send keys its envelopes off the track's
@@ -4348,7 +4348,7 @@ fn e2e_tier5b_stereo_mods_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// FL Suite tier-6 LIVE pin (docs/FL-SUITE.md tier-6 log): the gater in
+/// Native Suite tier-6 LIVE pin (docs/EFFECT-SUITE.md tier-6 log): the gater in
 /// `host = song` mode runs on the REAL RT thread — the per-block
 /// `refresh_sync -> push_sync` plumbing must lock the gate to SetMetro's
 /// BPM: 0.5 cycles/beat measures a 1.000 s period at 120 BPM and 2.000 s

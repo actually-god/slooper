@@ -2,9 +2,9 @@
 // slooper-synth-version: 6
 // fm.rs — two-operator FM with feedback and a sub sine.
 //
-// Covers the FL Suite FM task: Fruity DX10's bell/EP/organ world and the
-// FM half of Sytrus / Toxic Biohazard live in the same two-operator
-// skeleton — a modulator sine (its own A/D envelope and index) feeding a
+// The classic two-operator FM world — bells, EPs, organs — lives in
+// one skeleton: a modulator sine (its own A/D envelope and index)
+// feeding a
 // carrier with self feedback, plus an independent carrier envelope and a
 // sine sub for body. Ratio 1 + index 0 is a pure sine; ratio 2/3/4 with a
 // fast mod envelope is bells and mallets; slow envelopes are growls.
@@ -315,7 +315,7 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
     name: c"fm".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Two-operator FM (DX10 / Sytrus FM task): ratio, index, dual envelopes, feedback, sub sine. Bells, EPs, growls, basses.".as_ptr(),
+        c"Two-operator FM: ratio, index, dual envelopes, feedback, sub sine. Bells, EPs, growls, basses.".as_ptr(),
     n_params: 10,
     params: PARAMS.as_ptr(),
     create,

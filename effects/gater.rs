@@ -1,6 +1,5 @@
 // ============================================================ slooper ==
-// gater.rs — tempo volume-gating. Covers Fruity PanOMatic's volume side
-// and the gating half of Gross Beat. See docs/FL-SUITE.md.
+// gater.rs — tempo volume-gating (LFO gate / stutter-lite).
 //
 // A shape LFO multiplies the signal through click-free smoothed ramps.
 // Shapes: sine, triangle, pulse (duty = width), pluck (exponential
@@ -192,7 +191,7 @@ extern "C" fn process_st(
         // `rate` = cycles per BEAT; the phase follows the transport and
         // self-advances sample-exactly between pushes (ABI v4 contract).
         // While the transport is stopped the phase freezes; the next
-        // push re-anchors (so seeks and pauses behave like Gross Beat).
+        // push re-anchors (so seeks and pauses stay in phase).
         let b = s.sync_beats + if s.sync_playing { s.sync_in as f64 * s.sync_bps } else { 0.0 };
         if s.sync_playing && s.sync_in < i64::MAX / 2 {
             s.sync_in += 1;
@@ -292,7 +291,7 @@ static META: [ParamMetaV1; NPARAMS] = [
 ];
 
 const DESC_TXT: &core::ffi::CStr =
-    c"Tempo volume-gating: sine/triangle/pulse/pluck/random LFO with click-free edges. The PanOMatic-volume / Gross-Beat-gate role. ABI v3: dual-lane gating (R lane phase-spread, 1 = antiphase). ABI v4: host = song locks the gate phase to the transport (rate = cycles per beat).";
+    c"Tempo volume-gating: sine/triangle/pulse/pluck/random LFO with click-free edges. ABI v3: dual-lane gating (R lane phase-spread, 1 = antiphase). ABI v4: host = song locks the gate phase to the transport (rate = cycles per beat).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,

@@ -1,8 +1,7 @@
 // ============================================================ slooper ==
-// multiband.rs — three-band split dynamics. Consolidates FL Studio's
-// Maximus and Fruity Multiband Compressor: low/mid/high crossovers with
-// independent compressor + output gain per band, plus a limiter per band
-// for Maximus-style maximising. See docs/FL-SUITE.md.
+// multiband.rs — three-band split dynamics: low/mid/high crossovers
+// with independent compressor + output gain per band, plus a limiter
+// per band for maximising.
 //
 // Crossovers are Linkwitz-Riley (2nd-order Butterworth pairs) — the summed
 // output stays near flat, which is what mastering needs. Each band runs a
@@ -290,7 +289,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
     name: c"Multiband".as_ptr(),
     author: c"slooper".as_ptr(),
-    description: c"Three-band dynamics (LR crossovers): independent compressor or maximiser per band with per-band gain. The Maximus / Multiband Compressor role.".as_ptr(),
+    description: c"Three-band dynamics (LR crossovers): independent compressor or maximiser per band with per-band gain.".as_ptr(),
     n_params: NPARAMS as u32,
     params: PARAMS.as_ptr(),
     create,

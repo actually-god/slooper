@@ -1,10 +1,9 @@
 // ============================================================ slooper ==
 // flanger.rs — modulated short-delay flanger with a "voices" unison
-// stack. Covers Fruity Flanger and (consolidated) Fruity Flangus. See
-// docs/FL-SUITE.md.
+// stack (the flanger + unison-flange duties consolidated in one box).
 //
 // Each voice is the same comb with a phase-offset sine LFO; N voices with
-// even phase spreading produce the thick flanged-unison Flangus sound.
+// even phase spreading produce the thick flanged-unison sound.
 //
 // TIER-4 FIX (2026-11-06): the ring reads used ABSOLUTE slots
 // (`sidx(d)`) instead of write-head-relative positions. The taps then
@@ -209,7 +208,7 @@ static PARAMS: [EffectParamV1; NPARAMS] = [
 ];
 
 const DESC_TEXT: &core::ffi::CStr =
-    c"Modulated comb flanger with 1-4 phase-spread voices (Flangus-style unison), feedback and tone-friendly delay range. ABI v3: shared comb, opposite-sweep sides (spread).";
+    c"Modulated comb flanger with 1-4 phase-spread voices (phase-spread unison), feedback and tone-friendly delay range. ABI v3: shared comb, opposite-sweep sides (spread).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,

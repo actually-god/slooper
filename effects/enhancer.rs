@@ -1,7 +1,7 @@
 // ============================================================ slooper ==
-// goodizer.rs — the one-knob enhancer. Covers FL Studio's Soundgoodizer
-// (A/B/C/D characters), Emphasizer (presence) and Low Lifter (bass weight
-// for small speakers). See docs/FL-SUITE.md.
+// enhancer.rs — the one-knob enhancer: band-weighted saturation in
+// four characters (A bass / B fat / C presence / D air) covering the
+// classic presence / bass-weight one-knob roles.
 //
 // Approach: split into three bands, saturate each band with a character-
 // weighted drive, add a parallel harmonic exciter ("air"), glue with a
@@ -177,7 +177,7 @@ static DESC_TXT: &core::ffi::CStr =
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
-    name: c"Goodizer".as_ptr(),
+    name: c"Enhancer".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
@@ -189,7 +189,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 
 pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     abi: SLOOPER_EFFECT_ABI_V2,
-    name: c"Goodizer".as_ptr(),
+    name: c"Enhancer".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
@@ -202,7 +202,7 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
 
 pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     abi: SLOOPER_EFFECT_ABI_V3,
-    name: c"Goodizer".as_ptr(),
+    name: c"Enhancer".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
@@ -216,7 +216,7 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
 
 pub static DESC4: EffectInfoV4 = EffectInfoV4 {
     abi: SLOOPER_EFFECT_ABI_V4,
-    name: c"Goodizer".as_ptr(),
+    name: c"Enhancer".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,

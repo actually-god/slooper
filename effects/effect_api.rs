@@ -267,7 +267,7 @@ pub struct EffectInfoV3 {
 // documented mono graceful fallback (process the mid, return it for both
 // sides) and sets the appended `stereo` flag to 0.
 //
-// Transport sync (the Scratcher/Gross-Beat-class capability):
+// Transport sync (the scrub / retrigger-class capability):
 //   * When `set_sync` is non-null the host calls it ONCE PER AUDIO BLOCK,
 //     on the audio thread, before any `process`/`process_st` sample call
 //     of that block, with a `SyncInfoV1` describing the block start.

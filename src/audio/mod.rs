@@ -123,7 +123,7 @@ pub struct PortInfo {
 
 /// One slot of a track's chain: either a scripted effect or a hosted VST
 /// plugin. Both kinds live in the *same* ordered chain, so a plugin can sit
-/// anywhere in the effects order (FL Studio's mixer-slot model).
+/// anywhere in the effects order (the classic mixer-slot model).
 pub enum FxKind {
     /// Bundled/JS-compiled effect script.
     Scripted {
@@ -4469,7 +4469,7 @@ impl Proc {
     /// One control-rate automation pass (v0.11 R5). Returns the per-track
     /// mixer overrides and applies plugin-parameter targets straight to the
     /// live instances (atomic mirrors; `set_param_rt` never blocks).
-    /// Later clips win over earlier ones, matching FL's "last voice" rule.
+    /// Later clips win over earlier ones (the last-voice-wins rule).
     fn eval_automation(&self, p0: u64) -> AutoOut {
         let mut out = AutoOut::new();
         if self.auto_cache_gen == 0 {
@@ -5308,7 +5308,7 @@ impl Proc {
         // Control-rate pass: every automation clip sounding at this block's
         // start position writes its ABSOLUTE curve value once, overriding
         // the manual control it targets (a curve wins over the knob it
-        // rides while it sounds — FL semantics). Plugin-parameter targets
+        // rides while it sounds). Plugin-parameter targets
         // land directly on the live instances' atomics.
         // v34 R11: STOPPING keeps the last automation pass — a pause one
         // sample past an automation clip must not snap every automated
@@ -5385,7 +5385,7 @@ impl Proc {
         // Cache this cycle's input buffers (raw pointers are stable). Only
         // the connected slots are kept, compacted to the front, so the sample
         // loop iterates the live ones with no per-sample null checks.
-        // v42 MONITOR-STEAL FIX (tier-5b, docs/FL-SUITE.md): with NO input
+        // v42 MONITOR-STEAL FIX (tier-5b, docs/EFFECT-SUITE.md): with NO input
         // connected, the monitored chain used to run every sample on
         // silence — through the SAME script instances the playback path
         // uses. Narrow band/biquad state (vocoder banks) and envelope

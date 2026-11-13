@@ -2,8 +2,7 @@
 // slooper-synth-version: 6
 // tri_osc.rs — the subtractive synth workhorse.
 //
-// Covers the FL Suite "three-osc analog" task: 3x OSC, SimSynth, PoiZone,
-// MiniSynth, Sawer, BooBass and Transistor Bass are all the same machine —
+// The classic three-oscillator subtractive analog is all one machine —
 // waveform oscs + detune + sub + a resonant low-pass with an envelope on
 // it. This is that machine. Three oscillators per voice (main, detuned
 // twin, sub an octave down), a 24 dB low-pass, a simple A/R amp envelope
@@ -342,7 +341,7 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
     name: c"tri_osc".as_ptr(),
     author: c"slooper".as_ptr(),
     description:
-        c"Subtractive workhorse: 3 oscillators (detune + sub) into a 24 dB env-swept low-pass. Covers the 3x OSC / SimSynth / PoiZone / Transistor Bass task. Pedal aware.".as_ptr(),
+        c"Subtractive workhorse: 3 oscillators (detune + sub) into a 24 dB env-swept low-pass. The three-osc subtractive workhorse role. Pedal aware.".as_ptr(),
     n_params: 11,
     params: PARAMS.as_ptr(),
     create,

@@ -1,13 +1,9 @@
-//! v50 R1: sample-editing engine — the FL Studio / Ableton "sample
-//! properties" feature set, rendered OFFLINE into a new buffer.
+//! v50 R1: sample-editing engine — the per-sample "properties" feature
+//! set common to clip-based DAWs, rendered OFFLINE into a new buffer.
 //!
-//! Research summary (FL Studio sample controller, Ableton Simpler/clip):
-//! * FL: reverse, per-asset pitch (coarse + fine cents), pitch-bend
-//!   envelope, fade-in/out curves (Lin/Sin/Exp/Log/Sq/Sqrt/Flat), and a
-//!   hardware-stretch control (time stretch preserving pitch).
-//! * Ableton: reverse, fades with curve types (Sine/Log/Lin/Exp), pitch
-//!   in semitones+cents, a pitch envelope (bend), and warp-free
-//!   stretch/compress.
+//! Feature set: reverse, ping-pong, per-asset pitch (coarse + fine
+//! cents), a pitch-bend sweep across the clip, fade-in/out curves
+//! (Lin/Sin/Exp/Log/Sq/Sqrt/Flat), and time stretch preserving pitch.
 //!
 //! Pipeline order (documented + pinned by tests):
 //!
@@ -18,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Fade-curve shapes (FL Studio's fade dropdown plus the common extras).
+/// Fade-curve shapes (the standard fade dropdown set plus extras).
 /// `f(t)` maps t in [0,1] to gain, always 0 -> 1 for fade-in; fade-out
 /// mirrors it (`1 - f` of the reversed axis is applied by the caller via
 /// the same curve evaluated on the tail index).
@@ -26,11 +22,11 @@ use serde::{Deserialize, Serialize};
 pub enum Curve {
     /// Straight line.
     Linear,
-    /// Sine — Ableton's default (smooth at both ends).
+    /// Sine — smooth at both ends (the common default).
     Sin,
-    /// Exponential — slow start (FL "Exp").
+    /// Exponential — slow start.
     Exp,
-    /// Logarithmic — fast start (FL "Log").
+    /// Logarithmic — fast start.
     Log,
     /// Squared (gentle quadratic).
     Sq,
@@ -80,16 +76,16 @@ impl Curve {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub struct SampleEdit {
     pub reverse: bool,
-    /// Append the reversed copy after the forward one (FL ping-loop).
+    /// Append the reversed copy after the forward one (ping-pong loop).
     pub pingpong: bool,
     pub pitch_cents: f32,
     /// Linear pitch-bend sweep added on top of `pitch_cents`, evolving
-    /// from start to end across the clip (Ableton pitch envelope).
+    /// from start to end across the clip (pitch-bend envelope).
     pub bend_start_cents: f32,
     pub bend_end_cents: f32,
     /// Output length multiplier. 2.0 = twice as long.
     pub stretch: f32,
-    /// true: WSOLA time stretch (pitch preserved, FL hardware-stretch
+    /// true: WSOLA time stretch (pitch preserved, hardware-stretch
     /// style). false: plain resample (length and pitch ride together).
     pub preserve_pitch: bool,
     pub fade_in_ms: f32,
@@ -236,7 +232,7 @@ pub fn render(src: &[f32], sr: u32, e: &SampleEdit) -> Vec<f32> {
         };
     }
 
-    // 2) pitch + linear bend sweep. FL sample-window semantics: pitch is
+    // 2) pitch + linear bend sweep. Sample-window semantics: pitch is
     // a PLAYBACK-RATE change, so the buffer length follows the rate
     // (one octave up = half as long). The bend ramp spans the output.
     let p0 = e.pitch_cents + e.bend_start_cents;

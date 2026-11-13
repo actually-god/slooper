@@ -1,10 +1,9 @@
 // ============================================================ slooper ==
-// panmatic.rs — LFO pan + volume wheel over a stereo pair. Covers FL's
-// PanOMatic pan duties (and PanMan / Fruity Balance's pan half — the
-// trim half is the track fader here). ABI v3 pair effect: the wheel
-// shapes the pair the track pan then folds into the mix, so the image
-// moves for REAL (FL's PanOMatic on a mono channel does the same thing
-// with its two output "pan wheels").
+// autopan.rs — LFO pan + volume wheel over a stereo pair (the trim
+// half is the track fader here). ABI v3 pair effect: the wheel shapes
+// the pair the track pan then folds into the mix, so the image moves
+// for REAL — on a mono channel the two output "pan wheels" animate
+// the same way.
 //
 // Three LFO shapes drive a smooth equal-power pan angle; the volume
 // wheel is a second LFO at another shape/rate mapped through an
@@ -24,7 +23,7 @@
 //   gain        — output trim
 //
 // ABI v4 (tier 6): `host = song` drives BOTH wheels from the transport
-// push (rates then mean cycles per beat) — the PanOMatic tempo-lock.
+// push (rates then mean cycles per beat) — the tempo-lock.
 // host = free (default — pre-v4 sessions move not at all) keeps the
 // free-running clocks. Param metadata renders pickers/units in the auto
 // window (the scripted editor keeps its classic look + a host row).
@@ -363,11 +362,11 @@ static META: [ParamMetaV1; NPARAMS] = [
 ];
 
 static DESC_TXT: &core::ffi::CStr =
-    c"LFO pan + volume wheels (PanOMatic task). Equal-power pan, phase-offset tremolo, slewed squares. ABI v3. ABI v4: host = song locks both wheels to the transport (rates = cycles per beat).";
+    c"LFO pan + volume wheels. Equal-power pan, phase-offset tremolo, slewed squares. ABI v3. ABI v4: host = song locks both wheels to the transport (rates = cycles per beat).";
 
 pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
-    name: c"pan matic".as_ptr(),
+    name: c"Auto Pan".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
@@ -379,7 +378,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 
 pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     abi: SLOOPER_EFFECT_ABI_V2,
-    name: c"pan matic".as_ptr(),
+    name: c"Auto Pan".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
@@ -392,7 +391,7 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
 
 pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     abi: SLOOPER_EFFECT_ABI_V3,
-    name: c"pan matic".as_ptr(),
+    name: c"Auto Pan".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
@@ -406,7 +405,7 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
 
 pub static DESC4: EffectInfoV4 = EffectInfoV4 {
     abi: SLOOPER_EFFECT_ABI_V4,
-    name: c"pan matic".as_ptr(),
+    name: c"Auto Pan".as_ptr(),
     author: c"slooper".as_ptr(),
     description: DESC_TXT.as_ptr(),
     n_params: NPARAMS as u32,
