@@ -192,8 +192,19 @@ jobs:
         # slooper.nsi packages the SAME staged tree the zip carries.
         shell: pwsh
         run: |
-          $makensis = Join-Path ${env:ProgramFiles(x86)} NSIS\makensis.exe
-          if (-not (Test-Path $makensis)) { Write-Error "NSIS not on the runner"; exit 1 }
+          # NSIS used to ship on the runner image; newer images dropped
+          # it — probe the known layouts, else install it via choco.
+          $cands = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+            (Join-Path $env:ProgramFiles 'NSIS\makensis.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'NSIS\Bin\makensis.exe')
+          )
+          $makensis = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) {
+            choco install nsis --no-progress -y | Out-Null
+            $makensis = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $makensis) { Write-Error "NSIS not available on the runner"; exit 1 }
           $ver = if ($env:GITHUB_REF_NAME -like 'v*') { $env:GITHUB_REF_NAME.TrimStart('v') }
                  else { (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value + "-dev." + $env:GITHUB_SHA.Substring(0,7) }
           & $makensis -V2 "-DSLOOPER_VER=$ver" "-DSLOOPER_SRC=stage" packaging\slooper.nsi
