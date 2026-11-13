@@ -23213,7 +23213,16 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("slooper/config.json"),
-            format!(r#"{{"rack_folders":["{}"]}}"#, samples.display()),
+            // W14 (WINDOWS-PORT): Windows paths contain backslashes, which
+            // are escape characters in JSON — embedding a raw `C:\Users\…`
+            // made config.json INVALID JSON, the load fell back to defaults,
+            // and every rack-folder test in the suite read an empty rack
+            // (the CI windows lane's "kit rows: 0" family). On Linux
+            // `.display()` has no backslashes, so doubling is a no-op.
+            format!(
+                r#"{{"rack_folders":["{}"]}}"#,
+                samples.display().to_string().replace('\\', "\\\\")
+            ),
         )
         .unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &dir);
@@ -23228,6 +23237,11 @@ mod tests {
         // (and anything else data-rooted) must never seed into the real
         // account folder from a test run.
         std::env::set_var("XDG_DATA_HOME", &dir);
+        // W14: XDG is INERT on Windows — without this override every
+        // data-rooted seed (808 pack, shape presets) went to the real
+        // %LOCALAPPDATA% while the test's fixtures went to the sandbox.
+        // Same path XDG resolves on Linux, so Linux behavior is unchanged.
+        std::env::set_var(crate::paths::DATA_DIR_ENV, dir.join("slooper"));
         // v22: the config isolation alone was not enough — HOME still
         // pointed at the real account, so ANY test that happens to render
         // the plugin/synth window trips the lazy folder scan, and that
@@ -33596,6 +33610,7 @@ mod tests {
     fn v28_rack_default_folder_is_samples_root() {
         std::env::set_var("SLOOPER_NULL_AUDIO", "1");
         std::env::remove_var("XDG_DATA_HOME"); // deterministic data_dir()
+        std::env::remove_var(crate::paths::DATA_DIR_ENV); // W14: headless_app sets both
         let dir = std::env::temp_dir().join("sp-uity-v28def");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("slooper/effects")).unwrap();
@@ -38313,5 +38328,19 @@ mod tests {
         let app = headless_app("w8b_dynopen");
         assert!(!dyn_open(&app, DynKind::Vst(0)), "no editor open on a fresh app");
         assert!(!dyn_open(&app, DynKind::VstFx(0, 0)));
+    }
+
+    #[test]
+    fn w14_headless_app_data_dir_sandboxed() {
+        // W14 (WINDOWS-PORT): XDG is INERT on Windows — headless_app must
+        // sandbox the DATA root through the OS-neutral SLOOPER_DATA_DIR
+        // (not only XDG_DATA_HOME), or every data-rooted seed in the suite
+        // (808 pack, automation shape presets) silently hits the real
+        // %LOCALAPPDATA% while the test's fixtures sit in the sandbox —
+        // the CI windows lane's "kit rows: 0" family. Resolved path must
+        // be the SAME on both OSes: <sandbox>/slooper.
+        let _app = headless_app("w14data");
+        let want = std::env::temp_dir().join("sp-uity-w14data").join("slooper");
+        assert_eq!(crate::paths::data_dir(), want);
     }
 }

@@ -136,7 +136,7 @@ jobs:
         # `w8b_*` W8b embed pins (nor `w8c_*`), so each new sub-letter
         # series goes here. (`w9_` = W9 Windows MIDI; `w12` intentionally
         # covers the whole W12 polish family: w12a_, w12b_, …)
-        run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12
+        run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12 w14_
       - name: Release build proof (shipping profile = winrel, W12e)
         # `winrel` IS what ships (release.yml builds the zip with it):
         # release minus strip, plus minimal debuginfo, so the minidumps
