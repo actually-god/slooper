@@ -117,11 +117,15 @@ assert — sabotage-proved. W13b DONE 2026-11-12 (session 22, see DONE log):
 distro smoke matrix (`scripts/porting/w13b_matrix.sh`) — floor artifact runs
 green on arch/debian:12/ubuntu:22.04/fedora:40 containers with only runtime
 libs, and a newer-glibc build is caught by name; release.yml now smokes the
-STAGED exe on every release. NEXT = W13c (dependency contract in INSTALL.md),
-W13d (optional .deb), the last W12
-item (native JACK-on-Windows mode), or whatever the Windows report-only
-suite surfaces. The next real version tag publishes both assets
-automatically.
+STAGED exe on every release. W13c DONE 2026-11-12 (session 23, see DONE
+log): the dependency contract is documented in INSTALL.md — links-vs-
+dlopens tables, per-distro package lines, the floor rule in user terms.
+W13d DONE same session: optional .deb — the SAME staged tree repacked by
+w13d_make_deb.sh, apt-install-smoke-gated on debian:12/ubuntu:22.04 with
+an Arch-payload sabotage pair. NEXT = the last W12 item (native JACK-on-
+Windows via the jack crate's `dynamic_loading`) or whatever the Windows
+report-only grow-list surfaces. The next real version tag publishes all
+assets automatically.
 
 ## Ground rules (apply to every task)
 
@@ -556,9 +560,13 @@ portable asset on the OLDEST distro we support, never the newest.
   per-distro runtime packages, links-vs-dlopens tables measured from the
   shipped NEEDED set, and the floor-distro rule stated in user terms.
   Docs only; AUR flow untouched.
-- [ ] **W13d — optional `.deb`.** The tar.zst already carries an FHS `usr/`
-  layout, so Debian/Ubuntu packaging is mostly a control file + the runtime
-  dep list from W13b. Lowest priority.
+- [x] **W13d DONE 2026-11-12 (session 23, see DONE log)** — optional
+  `.deb`: `w13d_make_deb.sh` wraps the SAME staged `usr/` tree the W13b
+  matrix proved + a control file whose Depends = the measured load-time
+  set; `w13d_deb_smoke.sh` installs it apt-only in debian:12 +
+  ubuntu:22.04 (Depends-alone, PATH probe, file placement, clean purge).
+  Proven locally on the b84b4a9 draft artifact (2/2 PASS) with the
+  Arch-payload sabotage pair FAILing both tiers by GLIBC name.
 
 ## Deferred / explicitly NOT doing
 - No PulseAudio/WASAPI backend on Linux (JACK/PipeWire-JACK stays primary).
@@ -1464,3 +1472,36 @@ portable asset on the OLDEST distro we support, never the newest.
   packaging contracts are pinned by the container gates, not the lib
   suite). Every claim is copied from the DONE logs' measurements, not
   re-derived.
+
+- **2026-11-12 session 23 — W13d** (optional .deb): two scripts, no Rust.
+  `scripts/porting/w13d_make_deb.sh <staged-dir> <ver>` wraps the W11
+  staging tree's `usr/` subtree (ONLY that — README/LICENSE at the stage
+  root must not leak into `/`) + a generated DEBIAN/control; payload is
+  never rebuilt or touched (W13b rule). Version rule that bit during
+  design: dpkg splits at the LAST '-', the revision must START with a
+  digit, so `-dev.<sha>` is illegal → `~dev.<sha>` (also sorts BELOW the
+  eventual release, which is semantically right); the script converts and
+  asserts the round-trip with `dpkg-deb -f`. Control dep split = the W13c
+  contract verbatim: Depends `libx11-6, libstdc++6` (the load-time NEEDED
+  set the base image lacks; libc/libm/libgcc_s are base-system),
+  Recommends `pipewire-jack | libjack-jackd2-0`, Suggests `rustc, ffmpeg`
+  — dlopen'd things NEVER Depends. `scripts/porting/w13d_deb_smoke.sh`
+  runs the PACKAGE in debian:12 + ubuntu:22.04 containers: apt install
+  WITH `--no-install-recommends` (proves Depends-alone), `command -v
+  slooper` = /usr/bin/slooper, `dpkg -L` names desktop+icon, probe from
+  PATH exits 0 with the one JSON line, purge rc 0. LOCAL VERDICT on the
+  b84b4a9 draft asset (payload sha = floor exe, demand GLIBC 2.35):
+  legit deb 2/2 PASS, ARCH-payload sabotage (local release build, demand
+  2.43) FAILs BOTH tiers rc=1 with `GLIBC_2.43' not found` cause lines —
+  the same build-drift class W13b catches for the tar.zst, now caught
+  through the installer too. Two harness lessons: dpkg-deb's progress
+  chatter can go to STDOUT (redirect it or `out=$(...)` captures two
+  lines and the self-check explodes); and ld.so deaths through a SHELL
+  exec are exit **1**, the W13b note's 127 applies only when the SHELL
+  itself cannot exec — never assert a specific non-zero code, assert
+  NON-zero + stdout shape. release.yml: Stage+pack exports SLOOPER_VERSION
+  via $GITHUB_ENV (single version derivation), new steps Build .deb →
+  .deb smoke AFTER the W13b matrix (so the gate sees the matrix-proven
+  tree), deb-asset artifact → release job publishes it. Smoke NOT pinned
+  as a Rust test (containers + network = untestable from the lib suite;
+  sabotage pair is the pin-equivalent, same ruling as W13a/W13b).

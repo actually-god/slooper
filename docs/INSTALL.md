@@ -63,6 +63,13 @@ sudo apt-get install -y libx11-6 libstdc++6 pipewire-jack
 sudo dnf install libX11 libstdc++ pipewire-jack
 ```
 
+On Debian/Ubuntu you can skip the tar entirely: grab
+`slooper-<version>_amd64.deb` from the same Releases page — apt pulls the
+runtime deps for you (`sudo apt install ./slooper-<version>_amd64.deb`,
+remove again with `sudo apt remove slooper`). Same binary, same payload
+as the tar.zst — the package exists to answer "there's no .deb" reports;
+the tar.zst stays the reference artifact.
+
 ### The dependency contract (why one binary runs on every distro)
 
 A Linux binary permanently carries the **versioned symbols of its build
@@ -289,7 +296,8 @@ and Linux forensics stay `coredumpctl`.
 
 ## Uninstalling
 
-- Package installs (`pacman -R slooper`): removes binary, desktop entry, icon.
+- Package installs (`pacman -R slooper` / `apt remove slooper`): removes
+  binary, desktop entry, icon.
 - Remove `~/.config/slooper/` and `~/.local/share/slooper/` to discard
   your config and the effects folder.
 
