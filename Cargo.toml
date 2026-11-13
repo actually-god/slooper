@@ -68,6 +68,13 @@ jack = "0.13.5"
 
 [target.'cfg(windows)'.dependencies]
 midir = "0.11"
+# W12f: native JACK-on-Windows. Same crate, same version — the jack crate's
+# DEFAULT `dynamic_loading` feature already dlopens libjack at runtime (that
+# is why the Linux binary never links libjack either; see jack-sys
+# LIB_RESULT/JACK_LIB), so Windows gets the backend with ZERO link-time
+# coupling: no libjack import appears in the exe, and a jack-less Windows
+# stays 100% WASAPI. Which backend runs is resolved in `run_backend`.
+jack = "0.13.5"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",

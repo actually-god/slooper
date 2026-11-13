@@ -1460,6 +1460,11 @@ pub struct App {
     win_midi: Vec<String>,
     avail_midi: Vec<String>,
     sel_midi: std::collections::HashSet<String>,
+    /// W12f (Windows): host backend choice ("auto"|"wasapi"|"jack"), the
+    /// mirror of `Config::win_audio_backend`. Applied when the manager
+    /// thread starts — changing it saves the config and asks for a
+    /// restart. Linux never shows the section (JACK is THE backend).
+    win_backend: String,
     bind_loop_sel: usize,
 
     // --- export dialog ---
@@ -1681,6 +1686,8 @@ impl App {
             win_midi: cfg.win_midi_inputs.clone(),
             avail_midi: Vec::new(),
             sel_midi: cfg.win_midi_inputs.iter().cloned().collect(),
+            // W12f: the backend picker starts from the persisted choice.
+            win_backend: cfg.win_audio_backend.clone(),
             theme_was_light: None,
             status_at: std::time::Instant::now(),
             status_seen: "starting…".into(),
@@ -4509,6 +4516,7 @@ impl App {
             mpe: self.mpe_on,
             win_editor_embed: self.win_embed,
             win_midi_inputs: self.win_midi.clone(),
+            win_audio_backend: self.win_backend.clone(),
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -22088,6 +22096,22 @@ fn arrow_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
     resp
 }
 
+/// W12f: the options the Settings ▸ AUDIO BACKEND selector offers, as
+/// (config value, display label). Pure so Linux pins can prove the rule
+/// from the W12 spec — the "JACK (native)" entry exists ONLY when the DLL
+/// was discovered (or is the already-saved choice, so the user can always
+/// get away from a stale selection).
+pub fn backend_options(cfg_val: &str, jack_found: bool) -> Vec<(&'static str, String)> {
+    let mut opts: Vec<(&'static str, String)> = vec![
+        ("auto", "Auto (JACK if found, else WASAPI)".into()),
+        ("wasapi", "WASAPI".into()),
+    ];
+    if jack_found || cfg_val == "jack" {
+        opts.push(("jack", "JACK (native)".into()));
+    }
+    opts
+}
+
 fn port_list(
     ui: &mut egui::Ui,
     title: &str,
@@ -22853,6 +22877,55 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.backend.cmd(Cmd::Refresh);
                 }
             });
+            }
+            // ---- audio backend (Windows only) ------------------------------
+            // W12f: native JACK on Windows. When the jack-sys loader can
+            // find a real libjack DLL (PATH / %PROGRAMFILES%\Jack* /
+            // SLOOPER_JACK_DLL) the selector grows the "JACK (native)"
+            // option; the choice persists to the config and the manager
+            // thread reads it at startup — applying = restarting slooper
+            // (v1 is deliberately restart-to-apply; a hot backend swap
+            // would need whole new respawn machinery). Linux-inert.
+            if cfg!(windows)
+                && settings_sect(
+                    ui,
+                    &app.sett_filter,
+                    "AUDIO BACKEND",
+                    "audio backend wasapi jack native dll switch host api restart",
+                )
+            {
+                any = true;
+                let found_now = crate::audio::jack::dll::found();
+                let opts = backend_options(&app.win_backend, found_now.is_some());
+                let cur = opts
+                    .iter()
+                    .find(|(v, _)| *v == app.win_backend.as_str())
+                    .map_or_else(|| "Auto".to_string(), |(_, l)| l.clone());
+                let mut chosen = cur.clone();
+                egui::ComboBox::from_id_salt("slooper_audio_backend")
+                    .selected_text(cur.clone())
+                    .show_ui(ui, |ui| {
+                        for (_, label) in &opts {
+                            ui.selectable_value(&mut chosen, label.clone(), label);
+                        }
+                    });
+                if chosen != cur {
+                    if let Some((v, _)) = opts.iter().find(|(_, l)| *l == chosen) {
+                        app.win_backend = (*v).to_string();
+                        app.save_config();
+                        app.status = format!(
+                            "audio backend: {} — restart slooper to apply",
+                            app.win_backend
+                        );
+                    }
+                }
+                let line = match found_now {
+                    Some(p) => format!("JACK library in use when selected: {}", p.display()),
+                    None => "no JACK library found — install jack for Windows (jackbuilds) \
+                            or set SLOOPER_JACK_DLL; WASAPI stays in use"
+                        .to_string(),
+                };
+                ui.label(RichText::new(line).weak().small());
             }
             // ---- MIDI inputs (Windows only) --------------------------------
             // W9: WinMM device picker, same shape as the audio port lists.

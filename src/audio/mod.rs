@@ -35,9 +35,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 
-// OS backends (WINDOWS-PORT W5): exactly one compiles per OS.
-#[cfg(not(windows))]
-mod jack;
+// OS backends (WINDOWS-PORT W5): WASAPI compiles only on Windows. W12f:
+// the jack shim compiles on BOTH — Windows may drive it natively (jack-sys
+// dlopens libjack at RUNTIME, so a jack-less Windows never loads it; the
+// choice happens in `run_backend`, Linux behavior is byte-identical).
+// `pub` so Settings ▸ AUDIO BACKEND can ask `jack::dll::found()`.
+pub mod jack;
 #[cfg(windows)]
 mod wasapi;
 // W12a: pure lost-stream recovery table (pinned on every OS; only the
@@ -568,6 +571,34 @@ fn run_backend(
     jack::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
 }
 
+/// Which host audio API the manager thread drives (W12f). Windows-only
+/// choice in effect, but the resolution is pure and OS-neutral so Linux
+/// pins can prove the matrix.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum BackendKind {
+    Wasapi,
+    Jack,
+}
+
+/// Resolve the backend from `SLOOPER_AUDIO_BACKEND` (env wins — harnesses
+/// and bug reports pin it), else the config value, else auto. "auto" (and
+/// any unrecognized word) picks native JACK iff its DLL was discovered;
+/// an EXPLICIT "jack" survives a missing DLL — `jack::run` then reports
+/// honestly via `Evt::Unavailable` instead of silently switching back.
+pub fn resolve_backend(env: Option<&str>, cfg_val: &str, jack_found: bool) -> BackendKind {
+    let word = env
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(cfg_val)
+        .trim()
+        .to_ascii_lowercase();
+    match word.as_str() {
+        "jack" => BackendKind::Jack,
+        "wasapi" => BackendKind::Wasapi,
+        _ if jack_found => BackendKind::Jack,
+        _ => BackendKind::Wasapi,
+    }
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)] // twin of the unix spawn point above
 fn run_backend(
@@ -580,7 +611,25 @@ fn run_backend(
     midi_drops: Arc<AtomicU64>,
     engine: Arc<Engine>,
 ) {
-    wasapi::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+    // W12f: Settings ▸ AUDIO BACKEND decides; auto = JACK iff discovery
+    // validated libjack64.dll, else WASAPI (the pre-W12f shipped behavior).
+    // `dll::found` probes once (OnceLock) — the same probe the settings
+    // selector reads, and the probe never touches jack-sys FUNCTIONS, so
+    // a Windows box without jack never dlopens anything.
+    let kind = resolve_backend(
+        std::env::var("SLOOPER_AUDIO_BACKEND").ok().as_deref(),
+        &crate::config::Config::load().win_audio_backend,
+        jack::dll::found().is_some(),
+    );
+    eprintln!("[slooper] audio backend: {:?}", kind);
+    match kind {
+        BackendKind::Jack => {
+            jack::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+        }
+        BackendKind::Wasapi => {
+            wasapi::run(cmd_rx, evt_tx, gain, peak, meter, xruns, midi_drops, engine)
+        }
+    }
 }
 
 /// What `manager_loop` asks of the live backend device (WINDOWS-PORT W5).
