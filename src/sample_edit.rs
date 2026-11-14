@@ -7,7 +7,9 @@
 //!
 //! Pipeline order (documented + pinned by tests):
 //!
-//!     stretch -> pitch/bend -> reverse -> ping-pong -> fades.
+//! ```text
+//! stretch -> pitch/bend -> reverse -> ping-pong -> fades.
+//! ```
 //!
 //! Stretch first so pitch sees a stable length; fades last so they
 //! always hug the audible head/tail regardless of what came before.
