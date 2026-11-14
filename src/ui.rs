@@ -516,10 +516,14 @@ struct PianoRoll {
     /// MIDI clip or rack asset): **save** overwrites the asset in place
     /// instead of minting a new one.
     edit_asset: Option<u32>,
+    /// v52 R6: selected pitch-bend segment index (lane editor selection).
+    sel_bend: Option<usize>,
+    /// v52 R6: the segment being dragged into existence (BendNew).
+    bend_live: Option<crate::midipat::BendSeg>,
 }
 
 /// One in-flight piano-roll canvas gesture.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RollGesture {
     None,
     /// Drag note bodies. `fresh` = the press drew a brand-new note (its
@@ -547,6 +551,16 @@ enum RollGesture {
         from: egui::Pos2,
         add: bool,
     },
+    /// v52 R6: creating a pitch-bend glide live. The in-flight segment
+    /// rides `PianoRoll::bend_live`; `src` = source note PITCH when the
+    /// drag started from a note (Z-drag), enabling land-on-note snapping.
+    BendNew { t0: u32, v0: f32, src: Option<u8> },
+    /// v52 R6: drag one endpoint of a stored segment (`end` 0 = start).
+    BendEP { idx: usize, end: u8 },
+    /// v52 R6: drag the mid-curve dot vertically to set curvature.
+    BendCurve { idx: usize },
+    /// v52 R6: drag a bar in the velocity lane (absolute from pointer y).
+    VelDrag { idx: usize },
 }
 
 /// In-flight three-step calibration for one continuous (knob) MIDI binding.
@@ -1085,8 +1099,11 @@ pub struct App {
     /// Index into [`SUBDIVISIONS`] (click subdivision).
     metro_sub: usize,
     /// Index into [`SUBDIVISIONS`] for content quantize / clip snap.
-    q_sub: usize,
     snap_sub: usize,
+    /// Index into [`SUBDIVISIONS`] for the quantize-button grid.
+    q_sub: usize,
+    /// v52 R6: wheel-tick velocity trim step for the piano roll.
+    roll_vel_step: u8,
     /// v34 R1: automation manager snap selector (its own, persisted).
     auto_snap_on: bool,
     auto_snap_sub: usize,
@@ -1768,6 +1785,7 @@ impl App {
                 .unwrap_or(0),
             q_sub: sub_idx(cfg.q_sub),
             snap_sub: sub_idx(cfg.snap_sub),
+            roll_vel_step: cfg.roll_vel_step.clamp(1, 32),
             auto_snap_on: cfg.auto_snap_on,
             auto_snap_sub: sub_idx(cfg.auto_snap_sub),
             last_auto_asset: None,
@@ -4687,6 +4705,7 @@ impl App {
             snap_on: self.snap_on,
             auto_snap_on: self.auto_snap_on,
             auto_snap_sub: SUBDIVISIONS[self.auto_snap_sub].0,
+            roll_vel_step: self.roll_vel_step.clamp(1, 32),
             dir_memo: self.dir_memo.clone(),
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
@@ -8472,6 +8491,17 @@ impl App {
         for m in pat.press.iter() {
             ev.push((pat.ticks_to_samples(m.at, sr), 2, m.ch, 0, m.val));
         }
+        // v52 R6: baked pitch-bend lane (kind 5 = 14-bit lsb/msb, the
+        // engine's own encoding) so roll previews glide like the grid.
+        for m in pat.bends.iter() {
+            ev.push((
+                pat.ticks_to_samples(m.at, sr),
+                5,
+                m.ch,
+                (m.val & 0x7F) as u8,
+                ((m.val >> 7) & 0x7F) as u8,
+            ));
+        }
         ev
     }
 
@@ -8947,6 +8977,41 @@ impl App {
                 // keypress even do anything?").
                 self.status = format!("deleted {k} note(s)");
             }
+            // v52 R6: Page Up / Page Down = octave nudge on the whole
+            // selection (rows are semitones \u{2014} \u{b1}12), clamped
+            // at the keybed. Selection survives the shift.
+            let octave = ui.ctx().input(|i| {
+                if i.key_pressed(egui::Key::PageUp) {
+                    12
+                } else if i.key_pressed(egui::Key::PageDown) {
+                    -12
+                } else {
+                    0
+                }
+            });
+            if octave != 0 && !roll.sel_notes.is_empty() {
+                let ids = roll.sel_notes.clone();
+                let mut edge = false;
+                let mut moved = 0usize;
+                for s in ids {
+                    if let Some(n) = roll.pat.notes.get_mut(s) {
+                        let v = n.note as i32 + octave;
+                        if (0..=127).contains(&v) {
+                            n.note = v as u8;
+                            moved += 1;
+                        } else {
+                            edge = true;
+                        }
+                    }
+                }
+                roll.changed = true;
+                self.status = format!(
+                    "octave {} \u{b7} {} note(s){}",
+                    if octave > 0 { "up" } else { "down" },
+                    moved,
+                    if edge { " \u{b7} clamped at the keybed" } else { "" }
+                );
+            }
             // v37 R3: while the roll owns the keyboard, SPACE is the
             // PREVIEW transport — start/stop the roll's own playback,
             // never the main (hidden) arrangement transport. v38 R4: the
@@ -9037,7 +9102,11 @@ impl App {
                     (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6).then_some(i)
                 });
                 if let Some(i) = hit {
-                    let d: i16 = if wheel_dy > 0.0 { 5 } else { -5 };
+                    let d: i16 = if wheel_dy > 0.0 {
+                        self.roll_vel_step as i16
+                    } else {
+                        -(self.roll_vel_step as i16)
+                    };
                     let targets: Vec<usize> = if roll.sel_notes.contains(&i) {
                         roll.sel_notes.clone()
                     } else {
@@ -9186,6 +9255,8 @@ impl App {
             roll.pat.notes.clear();
             roll.pat.ccs.clear();
             roll.pat.press.clear();
+            roll.pat.bends.clear();
+            roll.pat.bend_segs.clear();
             roll.sel_notes.clear();
             roll.sel_anchor = None;
             roll.changed = true;
@@ -9396,6 +9467,34 @@ impl App {
                         roll.changed = true;
                         self.status = format!("quantized {n} note(s) to the grid");
                     }
+                    // v52 R6: discoverable zoom (Ctrl+wheel kept too).
+                    if ui
+                        .small_button("\u{2212}")
+                        .on_hover_text("Zoom the roll OUT (same as Ctrl+wheel)")
+                        .clicked()
+                    {
+                        roll.px_per_beat = (roll.px_per_beat / 1.25).clamp(30.0, 400.0);
+                    }
+                    if ui
+                        .small_button("+")
+                        .on_hover_text("Zoom the roll IN (same as Ctrl+wheel)")
+                        .clicked()
+                    {
+                        roll.px_per_beat = (roll.px_per_beat * 1.25).clamp(30.0, 400.0);
+                    }
+                    // v52 R6: how much ONE wheel tick trims a note's
+                    // velocity (was hard-wired \u{b1}5).
+                    if ui
+                        .add(egui::DragValue::new(&mut self.roll_vel_step).range(1..=32).suffix(" vel"))
+                        .on_hover_text("Velocity change per wheel tick over a note \u{b7} wheel a note or its velocity bar")
+                        .changed()
+                    {
+                        self.save_config();
+                        self.status = format!(
+                            "wheel trims velocity \u{b1}{} per tick",
+                            self.roll_vel_step
+                        );
+                    }
                     // v38 R4: the preview button SHOWS the audition
                     // state — while anything is playing it reads STOP in
                     // red (was: a static green label whether or not audio
@@ -9459,13 +9558,122 @@ impl App {
         let snap = |t: f64| (t / step_sec).floor() * step_sec;
         let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
 
+        // v52 R6: numeric start/end/curve edits for the selected glide
+        // ("easy start and end point edits and curvature amounts").
+        let mut rbake = false;
+        let mut rdel = false;
+        // The row ALWAYS exists: an appearing/disappearing row shifts the
+        // canvas allocation one item over, and the canvas response id
+        // changing mid-drag silently kills in-flight gestures.
+        let sel_si = roll.sel_bend.filter(|i| *i < roll.pat.bend_segs.len());
+        ui.horizontal(|ui| {
+            if let Some(si) = sel_si {
+                let g = roll.pat.bend_segs[si];
+                let mut t0 = g.t0 as i32;
+                let mut v0 = g.v0;
+                let mut t1 = g.t1 as i32;
+                let mut v1 = g.v1;
+                let mut cv = g.curve;
+                ui.label(RichText::new("glide \u{b7}").weak().small());
+                if ui
+                    .add(egui::DragValue::new(&mut t0).range(0..=1_000_000).suffix(" t0"))
+                    .on_hover_text("Glide START (ticks)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v0)
+                            .range(-12.0..=12.0)
+                            .speed(0.25)
+                            .suffix(" st"),
+                    )
+                    .on_hover_text("Pitch at the START (semitones)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut t1).range(1..=1_000_000).suffix(" t1"))
+                    .on_hover_text("Glide END (ticks)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v1)
+                            .range(-12.0..=12.0)
+                            .speed(0.25)
+                            .suffix(" st"),
+                    )
+                    .on_hover_text("Pitch at the END (semitones)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut cv).range(-100..=100).suffix(" curv"))
+                    .on_hover_text("Curvature: + bends EARLY (fast then settle), \u{2212} bends LATE")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .small_button("del glide")
+                    .on_hover_text("Delete this glide")
+                    .clicked()
+                {
+                    rdel = true;
+                }
+                if rdel {
+                    roll.pat.bend_segs.remove(si);
+                    roll.sel_bend = None;
+                    roll.changed = true;
+                    self.status = "glide deleted".into();
+                } else if rbake {
+                    let g = &mut roll.pat.bend_segs[si];
+                    g.t0 = t0.max(0) as u32;
+                    g.v0 = v0;
+                    g.t1 = t1.max(1) as u32;
+                    g.v1 = v1;
+                    g.curve = cv;
+                    if g.t1 <= g.t0 {
+                        g.t1 = g.t0 + 1;
+                    }
+                    self.status = format!(
+                        "glide {:+.1}\u{2192}{:+.1} st \u{b7} curve {:+}",
+                        g.v0, g.v1, g.curve as i32
+                    );
+                    roll.pat.bake_bends();
+                    roll.changed = true;
+                }
+            } else {
+                ui.label(
+                    RichText::new("glide \u{b7} drag in the lane to draw one; Z-drag from a note")
+                        .weak()
+                        .small(),
+                );
+            }
+        });
         // ---- canvas (fills the rest of the window; the manual
         // scrollbars painted on its edges own their pixels) ----
         let avail = ui.available_size();
-        let (rect, resp) = ui.allocate_at_least(
-            egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
-            Sense::click_and_drag(),
-        );
+        // STABLE id: the canvas response id is location-hashed, and a
+        // widget-count change in the rows above this allocation swaps it
+        // — an in-flight drag then loses its response and silently dies
+        // (pinned the hard way by v52_roll_glide_endpoint_drag).
+        // push_id pins the id against layout churn above it; the readout
+        // row below additionally stays always-present for visual calm.
+        let (rect, resp) = ui
+            .push_id("roll_canvas_alloc", |ui| {
+                ui.allocate_at_least(
+                    egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
+                    Sense::click_and_drag(),
+                )
+            })
+            .inner;
         if rect.width() <= 2.0 || rect.height() <= 2.0 {
             roll.canvas_rect = Some(rect);
             return;
@@ -9682,6 +9890,114 @@ impl App {
         let in_grid = |pt: egui::Pos2| {
             pt.x >= grid_x0 && pt.x <= rect.max.x - SB && pt.y >= grid_top && pt.y <= grid_bot
         };
+        // v52 R6: expression lanes painted over the bottom of the grid
+        // (DAW lane language): a velocity strip (BAR HEIGHT = velocity,
+        // the "want height not horizontal" want — drag bars there) and a
+        // pitch-GLIDE lane holding editable segments (endpoints + a
+        // mid-curve dot), sharing the note grid's time axis. The glide
+        // lane maps \u{b1}12 st across its height.
+        const VEL_LANE_H: f32 = 30.0;
+        const BEND_LANE_H: f32 = 46.0;
+        // Lane bottoms ride the PREVIOUS frame's canvas bottom: the
+        // toolbar readout row shifts `rect` by one row, and the wheel
+        // router in `roll_pass` hit-tests against the same remembered
+        // `canvas_rect` — one coordinate system for every lane gesture.
+        let lane_bot = roll
+            .canvas_rect
+            .map_or(grid_bot, |cr| cr.max.y - SB);
+        let bend_lane = egui::Rect::from_min_max(
+            egui::pos2(grid_x0, lane_bot - BEND_LANE_H),
+            egui::pos2(rect.max.x - SB, lane_bot),
+        );
+        let vel_lane = egui::Rect::from_min_max(
+            egui::pos2(grid_x0, lane_bot - BEND_LANE_H - VEL_LANE_H),
+            egui::pos2(rect.max.x - SB, lane_bot - BEND_LANE_H),
+        );
+        let bend_c = (bend_lane.min.y + bend_lane.max.y) * 0.5;
+        let bend_amp = BEND_LANE_H * 0.42;
+        let y_of_st = |v: f32| bend_c - v / 12.0 * bend_amp;
+        let st_at = |y: f32| (((bend_c - y) / bend_amp) * 12.0).clamp(-12.0, 12.0);
+        let in_bend = |pt: egui::Pos2| bend_lane.contains(pt);
+        let in_vel = |pt: egui::Pos2| vel_lane.contains(pt);
+        {
+            painter.rect_filled(vel_lane, 0.0, Color32::from_gray(18));
+            painter.rect_filled(bend_lane, 0.0, Color32::from_gray(16));
+            for (idx, note) in roll.pat.notes.iter().enumerate() {
+                let x0 = x_of(t_of(note.start));
+                let x1 = x_of(t_of(note.start + note.len.max(1)));
+                if x1 < grid_x0 || x0 > rect.max.x {
+                    continue;
+                }
+                let h = note.vel as f32 / 127.0 * (VEL_LANE_H - 4.0);
+                let sel = roll.sel_notes.contains(&idx);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0.max(grid_x0), vel_lane.max.y - 2.0 - h),
+                        egui::pos2(x1.max(x0 + 1.0), vel_lane.max.y - 2.0),
+                    ),
+                    1.0,
+                    if sel {
+                        Color32::from_rgb(250, 200, 50)
+                    } else {
+                        Color32::from_rgb(90, 160, 230)
+                    },
+                );
+            }
+            painter.line_segment(
+                [
+                    egui::pos2(bend_lane.min.x, bend_c),
+                    egui::pos2(bend_lane.max.x, bend_c),
+                ],
+                egui::Stroke::new(1.0, Color32::from_gray(70)),
+            );
+            painter.text(
+                egui::pos2(bend_lane.min.x + 3.0, bend_lane.min.y + 8.0),
+                egui::Align2::LEFT_TOP,
+                "glide lane \u{b7} drag = new glide \u{b7} Z-drag from a note glides to another",
+                egui::FontId::proportional(8.0),
+                Color32::from_gray(140),
+            );
+            let mut live_segs: Vec<(crate::midipat::BendSeg, bool)> = roll
+                .pat
+                .bend_segs
+                .iter()
+                .enumerate()
+                .map(|(i, g)| (*g, roll.sel_bend == Some(i)))
+                .collect();
+            if let Some(l) = roll.bend_live {
+                live_segs.push((l, true));
+            }
+            let mut tmp: Vec<crate::midipat::Bend> = Vec::new();
+            for (g, sel) in live_segs.iter() {
+                tmp.clear();
+                crate::midipat::bake_seg(g, 8, &mut tmp);
+                let col = if *sel {
+                    Color32::from_rgb(250, 200, 50)
+                } else {
+                    Color32::from_rgb(90, 220, 170)
+                };
+                for w in tmp.windows(2) {
+                    let a = egui::pos2(
+                        x_of(t_of(w[0].at)),
+                        y_of_st(crate::midipat::bend_to_st(w[0].val)),
+                    );
+                    let bq = egui::pos2(
+                        x_of(t_of(w[1].at)),
+                        y_of_st(crate::midipat::bend_to_st(w[1].val)),
+                    );
+                    painter.line_segment([a, bq], egui::Stroke::new(2.0, col));
+                }
+                let e0 = egui::pos2(x_of(t_of(g.t0)), y_of_st(g.v0));
+                let e1 = egui::pos2(x_of(t_of(g.t1)), y_of_st(g.v1));
+                let cc = (g.curve / 100.0).clamp(-1.0, 1.0);
+                let vc = g.v0 + (g.v1 - g.v0) * (0.5 + cc * 0.25);
+                let mc = egui::pos2(x_of(t_of(g.t0 + (g.t1 - g.t0) / 2)), y_of_st(vc));
+                for q in [e0, e1] {
+                    painter.circle_filled(q, 4.0, col);
+                }
+                painter.circle_filled(mc, 3.0, Color32::from_rgb(240, 150, 80));
+            }
+        }
         // Topmost note under a point (last drawn wins). Notes are
         // passed in as an arg so the helper borrows nothing mutable.
         let note_hit =
@@ -9698,6 +10014,62 @@ impl App {
                         .then_some((i, n0, n1))
                 })
             };
+        // v52 R6: glide/velocity lane hit tests — same no-borrow idiom
+        // as note_hit (the collection is an explicit argument).
+        let d2seg = |q: egui::Pos2, a: egui::Pos2, b: egui::Pos2| -> f32 {
+            let (abx, aby) = (b.x - a.x, b.y - a.y);
+            let l2 = (abx * abx + aby * aby).max(1e-6);
+            let t = (((q.x - a.x) * abx + (q.y - a.y) * aby) / l2).clamp(0.0, 1.0);
+            egui::vec2(a.x + abx * t - q.x, a.y + aby * t - q.y).length()
+        };
+        let bend_hit_at = |segs: &[crate::midipat::BendSeg],
+                           pt: egui::Pos2|
+         -> Option<(usize, u8)> {
+            let mut body = None;
+            for (i, g) in segs.iter().enumerate().rev() {
+                let e0 = egui::pos2(x_of(t_of(g.t0)), y_of_st(g.v0));
+                let e1 = egui::pos2(x_of(t_of(g.t1)), y_of_st(g.v1));
+                if (pt - e0).length() <= 7.0 {
+                    return Some((i, 0));
+                }
+                if (pt - e1).length() <= 7.0 {
+                    return Some((i, 1));
+                }
+                let cc = (g.curve / 100.0).clamp(-1.0, 1.0);
+                let vc = g.v0 + (g.v1 - g.v0) * (0.5 + cc * 0.25);
+                let mc = egui::pos2(x_of(t_of(g.t0 + (g.t1 - g.t0) / 2)), y_of_st(vc));
+                if (pt - mc).length() <= 7.0 {
+                    return Some((i, 2));
+                }
+                if body.is_none() {
+                    let mut tmp = Vec::new();
+                    crate::midipat::bake_seg(g, 8, &mut tmp);
+                    let mut best = f32::MAX;
+                    for w in tmp.windows(2) {
+                        let a = egui::pos2(
+                            x_of(t_of(w[0].at)),
+                            y_of_st(crate::midipat::bend_to_st(w[0].val)),
+                        );
+                        let bq = egui::pos2(
+                            x_of(t_of(w[1].at)),
+                            y_of_st(crate::midipat::bend_to_st(w[1].val)),
+                        );
+                        best = best.min(d2seg(pt, a, bq));
+                    }
+                    if best <= 5.0 {
+                        body = Some((i, 3));
+                    }
+                }
+            }
+            body
+        };
+        let vel_hit_at = |notes: &[crate::midipat::Note], pt: egui::Pos2| -> Option<usize> {
+            let sec = sec_at(pt.x);
+            notes.iter().enumerate().rev().find_map(|(i, n)| {
+                let s0 = t_of(n.start);
+                (sec >= s0 - 1e-6 && sec <= s0 + t_of(n.len.max(1)) + 1e-6).then_some(i)
+            })
+        };
         // v38 R5: MODE CURSOR — say what a press WILL do before
         // it happens: pointing hand over a note body (select /
         // drag; wheel trims velocity), side-arrows on an end cap
@@ -9762,6 +10134,22 @@ impl App {
             let mods = ui.input(|i| i.modifiers);
             // Right-click deletes the note under the cursor.
             if resp.secondary_clicked() && in_grid(pt) {
+                if in_bend(pt) {
+                    // v52 R6: right-click deletes a glide (same language
+                    // as deleting a note). Clearing the LAST glide must
+                    // also clear the baked events (bake skips empties).
+                    if let Some((i, _)) = bend_hit_at(&roll.pat.bend_segs, pt) {
+                        roll.pat.bend_segs.remove(i);
+                        if roll.pat.bend_segs.is_empty() {
+                            roll.pat.bends.clear();
+                        } else {
+                            roll.pat.bake_bends();
+                        }
+                        roll.sel_bend = None;
+                        roll.changed = true;
+                        self.status = "glide deleted".into();
+                    }
+                } else {
                 {
                     if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
                         let nm = note_name(roll.pat.notes[i].note);
@@ -9776,6 +10164,7 @@ impl App {
                         // v38 R6: the delete announces itself.
                         self.status = format!("deleted {nm} \u{b7} right-click");
                     }
+                }
                 }
             }
             // ---- press decides the gesture + selection ----
@@ -9792,6 +10181,97 @@ impl App {
             if press_now && matches!(roll.gesture, RollGesture::None) && in_grid(pt) {
                 let sec = sec_at(pt.x);
                 let row = (row_at(pt.y).clamp(0, 127)) as u8;
+                // v52 R6: the expression lanes own their bands.
+                if in_bend(pt) {
+                    match bend_hit_at(&roll.pat.bend_segs, pt) {
+                        Some((i, 0)) => {
+                            roll.sel_bend = Some(i);
+                            roll.gesture = RollGesture::BendEP { idx: i, end: 0 };
+                            self.status = "moving the glide start".into();
+                        }
+                        Some((i, 1)) => {
+                            roll.sel_bend = Some(i);
+                            roll.gesture = RollGesture::BendEP { idx: i, end: 1 };
+                            self.status = "moving the glide end".into();
+                        }
+                        Some((i, 2)) => {
+                            roll.sel_bend = Some(i);
+                            roll.gesture = RollGesture::BendCurve { idx: i };
+                            self.status =
+                                "curve drag \u{b7} up bends early, down bends late".into();
+                        }
+                        Some((i, _)) => {
+                            roll.sel_bend = Some(i);
+                            self.status =
+                                "glide selected \u{b7} drag a dot \u{b7} right-click deletes"
+                                    .into();
+                        }
+                        None => {
+                            let t0 = tick_of(snap(sec));
+                            let v0 = st_at(pt.y);
+                            roll.bend_live = Some(crate::midipat::BendSeg {
+                                t0,
+                                v0,
+                                t1: t0 + 1,
+                                v1: v0,
+                                curve: 0.0,
+                            });
+                            roll.sel_bend = None;
+                            roll.gesture = RollGesture::BendNew { t0, v0, src: None };
+                            self.status = "drawing a glide \u{b7} release to keep".into();
+                        }
+                    }
+                } else if in_vel(pt) {
+                    if let Some(i) = vel_hit_at(&roll.pat.notes, pt) {
+                        if !roll.sel_notes.contains(&i) {
+                            roll.sel_notes = vec![i];
+                            roll.sel_anchor = Some(i);
+                        }
+                        roll.gesture = RollGesture::VelDrag { idx: i };
+                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
+                            .clamp(0.0, 1.0)
+                            * 127.0)
+                            .round()
+                            .max(1.0) as u8;
+                        if roll.sel_notes.contains(&i) {
+                            let group: Vec<usize> = roll.sel_notes.clone();
+                            for s in group {
+                                if let Some(n) = roll.pat.notes.get_mut(s) {
+                                    n.vel = v;
+                                }
+                            }
+                        }
+                        if let Some(n) = roll.pat.notes.get_mut(i) {
+                            n.vel = v;
+                        }
+                        roll.changed = true;
+                    } else {
+                        roll.gesture = RollGesture::Marquee {
+                            from: pt,
+                            add: false,
+                        };
+                    }
+                } else if ui.input(|i| i.key_down(egui::Key::Z))
+                    && note_hit(&roll.pat.notes, pt).is_some()
+                {
+                    // Z-drag from a note: the glide LEAVES the note's end
+                    // at 0 st and (on release over another note) LANDS on
+                    // that note's pitch (Septabee-style note-to-note).
+                    let (idx, _, n1) = note_hit(&roll.pat.notes, pt).unwrap();
+                    let sp = roll.pat.notes[idx].note;
+                    let t0 = tick_of(n1);
+                    roll.bend_live = Some(crate::midipat::BendSeg {
+                        t0,
+                        v0: 0.0,
+                        t1: t0 + 1,
+                        v1: 0.0,
+                        curve: 0.0,
+                    });
+                    roll.sel_bend = None;
+                    roll.gesture = RollGesture::BendNew { t0, v0: 0.0, src: Some(sp) };
+                    self.status = "glide from the note end \u{b7} release over the target note"
+                        .into();
+                } else {
                 match note_hit(&roll.pat.notes, pt) {
                     Some((idx, n0, n1)) => {
                         let x1p = x_of(n1);
@@ -9924,6 +10404,7 @@ impl App {
                                 nm = note_name(row)
                             );
                             roll.changed = true;
+                            }
                         }
                     }
                 }
@@ -10000,6 +10481,60 @@ impl App {
                             roll.changed = true;
                         }
                     }
+                    RollGesture::BendNew { t0, v0, src: _ } => {
+                        if in_grid(pt) {
+                            let t1 = tick_of(snap(sec_at(pt.x))).max(t0 + 1);
+                            roll.bend_live = Some(crate::midipat::BendSeg {
+                                t0,
+                                v0,
+                                t1,
+                                v1: st_at(pt.y),
+                                curve: 0.0,
+                            });
+                        }
+                    }
+                    RollGesture::BendEP { idx, end } => {
+                        if let Some(g) = roll.pat.bend_segs.get_mut(idx) {
+                            let t = tick_of(snap(sec_at(pt.x)));
+                            let v = st_at(pt.y);
+                            if end == 0 {
+                                g.t0 = t.min(g.t1.saturating_sub(1));
+                                g.v0 = v;
+                            } else {
+                                g.t1 = t.max(g.t0 + 1);
+                                g.v1 = v;
+                            }
+                            roll.pat.bake_bends();
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::BendCurve { idx } => {
+                        if let Some(g) = roll.pat.bend_segs.get_mut(idx) {
+                            g.curve =
+                                ((bend_c - pt.y) / bend_amp * 100.0).clamp(-100.0, 100.0);
+                            roll.pat.bake_bends();
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::VelDrag { idx } => {
+                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
+                            .clamp(0.0, 1.0)
+                            * 127.0)
+                            .round()
+                            .max(1.0) as u8;
+                        if roll.sel_notes.contains(&idx) {
+                            let group: Vec<usize> = roll.sel_notes.clone();
+                            for s in group {
+                                if let Some(n) = roll.pat.notes.get_mut(s) {
+                                    n.vel = v;
+                                }
+                            }
+                        }
+                        if let Some(n) = roll.pat.notes.get_mut(idx) {
+                            n.vel = v;
+                        }
+                        roll.changed = true;
+                    }
                     RollGesture::Marquee { .. } => {} // painted live
                     RollGesture::None => {}
                 }
@@ -10040,6 +10575,34 @@ impl App {
                     }
                     roll.sel_anchor = roll.sel_notes.first().copied();
                     self.status = format!("selected {} note(s) by box", roll.sel_notes.len());
+                } else if let RollGesture::BendNew { src, .. } = roll.gesture {
+                    // v52 R6: keep the drawn glide. Released over a NOTE
+                    // (a Z-start glide), it LANDS there: ends at the
+                    // target's start, value = target pitch − source
+                    // pitch — Septabee's note-to-note portamento.
+                    if let Some(mut g) = roll.bend_live.take() {
+                        if let Some(sp) = src {
+                            let sec = sec_at(pt.x);
+                            if let Some(tn) = roll.pat.notes.iter().find(|n| {
+                                let s0 = t_of(n.start);
+                                sec >= s0 - 1e-6
+                                    && sec <= s0 + t_of(n.len.max(1)) + 1e-6
+                            }) {
+                                g.t1 = tick_of(t_of(tn.start)).max(g.t0 + 1);
+                                g.v1 = (tn.note as i32 - sp as i32) as f32;
+                            }
+                        }
+                        if g.t1 > g.t0 {
+                            roll.pat.bend_segs.push(g);
+                            roll.pat.bake_bends();
+                            roll.sel_bend = Some(roll.pat.bend_segs.len() - 1);
+                            roll.changed = true;
+                            self.status = format!(
+                                "glide {:+.1} st \u{b7} right-click it in the lane to delete",
+                                g.v1 - g.v0
+                            );
+                        }
+                    }
                 } else if was_move && roll.changed {
                     self.status = if was_fresh {
                         "note placed \u{b7} wheel over it = velocity".into()
@@ -20525,6 +21088,8 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 focused: true,
                 win_rect: None,
                 edit_asset: edit,
+                sel_bend: None,
+                bend_live: None,
             }));
         }
         ui.label(RichText::new("grid:").strong());
@@ -31930,6 +32495,8 @@ mod tests {
             focused: false,
             win_rect: None,
             edit_asset: None,
+            sel_bend: None,
+            bend_live: None,
         }));
         frame(&mut app, &ctx, vec![]);
         assert_eq!(win_count(&app), 6, "roll slot registered");
@@ -32187,6 +32754,8 @@ mod tests {
             focused: true,
             win_rect: None,
             edit_asset: Some(a3),
+            sel_bend: None,
+            bend_live: None,
         }));
         frame(&mut app, &ctx, vec![]);
         app.remove_asset_at(0);
@@ -42065,5 +42634,281 @@ mod tests {
             g.iter().any(|s| s.contains("DRUM KIT")),
             "non-sampler plugins keep the drum kit, got {g:?}"
         );
+    }
+
+    // ================= v52 R6: glide lane, velocity lane, roll knobs ====
+    //
+    // The piano roll gained native pitch GLIDES (editable segments baked
+    // to MIDI pitch-bend), a drag-anywhere velocity lane, a configurable
+    // wheel step, zoom buttons and an octave nudge. Pins below.
+
+    /// Shared rig: an open roll on a cleared canvas with pinned geometry.
+    /// Returns the canvas rect plus the closures' constants the test math
+    /// repeats (grid_x0 offset 58, bottom bar 10, lanes 30+46).
+    fn v52_roll_rig(app: &mut App, ctx: &egui::Context) -> egui::Rect {
+        clear_canvas(app);
+        let canvas = open_roll_headless(app, ctx);
+        assert!(canvas.width() > 300.0, "roll canvas exists");
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.px_per_beat = 160.0;
+            r.scroll_sec = 0.0;
+            r.vscroll_px = 500.0;
+            r.pat.notes.clear();
+            r.pat.bends.clear();
+            r.pat.bend_segs.clear();
+            r.sel_notes.clear();
+            r.sel_bend = None;
+        }
+        frame(app, ctx, vec![]);
+        painted_rect(app, ctx, (22, 22, 26)).expect("canvas after pinning")
+    }
+
+    #[test]
+    fn v52_roll_glide_lane_drag_creates_baked_glide() {
+        let mut app = headless_app("v52glidelane");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        let lane_mid = bot - 23.0; // bend lane = bottom 46 px
+        let a = egui::pos2(grid_x0 + 80.0, lane_mid);
+        let b = egui::pos2(grid_x0 + 320.0, lane_mid - 10.0);
+        frame(&mut app, &ctx, vec![moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(&mut app, &ctx, vec![moved(b), btn(b, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let r = app.piano_roll.as_ref().unwrap();
+        assert_eq!(r.pat.bend_segs.len(), 1, "one glide drawn");
+        assert!(r.pat.bend_segs[0].t1 > r.pat.bend_segs[0].t0, "has length");
+        assert!(
+            r.pat.bend_segs[0].v1 > r.pat.bend_segs[0].v0,
+            "dragged UP = rising pitch ({} -> {})",
+            r.pat.bend_segs[0].v0,
+            r.pat.bend_segs[0].v1
+        );
+        assert!(!r.pat.bends.is_empty(), "baked to pitch-bend events");
+        assert!(app.status.contains("glide"), "status echoes: {}", app.status);
+    }
+
+    #[test]
+    fn v52_roll_z_drag_from_note_lands_on_target_pitch() {
+        let mut app = headless_app("v52zglide");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        // y_of inverse with the rig's vscroll = 500:
+        // row R spans y in [B + V - (R+2)r, B + V - (R+1)r) → center −1.5r.
+        let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 63,
+                vel: 100,
+                press: 0,
+                start: 2400,
+                len: 480,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        // x(tick) = grid_x0 + tick/3 at 160 px/beat, 120 bpm.
+        let a = egui::pos2(grid_x0 + 80.0, row_y(60)); // src note body
+        let b = egui::pos2(grid_x0 + 800.0, row_y(63)); // target note body
+        let z = |down: bool| {
+            egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: down,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        frame(
+            &mut app,
+            &ctx,
+            vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(&mut app, &ctx, vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.bend_segs.len(), 1, "Z-drag made one glide");
+            let g = &r.pat.bend_segs[0];
+            assert_eq!(g.t0, 480, "leaves at the SOURCE note end");
+            assert_eq!(g.v0, 0.0, "starts in tune");
+            assert_eq!(g.t1, 2400, "lands at the TARGET note start");
+            assert_eq!(g.v1, 3.0, "target(63) - source(60) = +3 st");
+        }
+        // The Z-drag must NOT have moved the source note.
+        let n0 = app.piano_roll.as_ref().unwrap().pat.notes[0];
+        assert_eq!((n0.start, n0.note), (0, 60), "source note untouched");
+    }
+
+    #[test]
+    fn v52_roll_glide_endpoint_drag_and_rmb_delete() {
+        let mut app = headless_app("v52glideep");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.bend_segs.push(crate::midipat::BendSeg {
+                t0: 480,
+                v0: 0.0,
+                t1: 1440,
+                v1: 3.0,
+                curve: 0.0,
+            });
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.piano_roll.as_ref().unwrap().pat.bends.is_empty());
+        // END dot: x = grid_x0 + 1440/3; y = lane center − 3/12 * (46*0.42).
+        let bend_c = bot - 23.0;
+        let dot = egui::pos2(grid_x0 + 480.0, bend_c - 3.0 / 12.0 * (46.0 * 0.42));
+        let d = egui::pos2(dot.x + 200.0, dot.y);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(d)]);
+        frame(&mut app, &ctx, vec![moved(d), btn(d, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert!(
+                r.pat.bend_segs[0].t1 > 1440,
+                "endpoint drag stretched the glide: t1={}",
+                r.pat.bend_segs[0].t1
+            );
+        }
+        // Right-click ON the glide (its middle) deletes it and clears the
+        // baked events with it (bake skips empties — must not leave ghosts).
+        let mid = egui::pos2(grid_x0 + 240.0, bend_c + 1.5 / 12.0 * (46.0 * 0.42));
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert!(r.pat.bend_segs.is_empty(), "glide deleted");
+            assert!(r.pat.bends.is_empty(), "no ghost pitch-bend left");
+            assert!(app.status.contains("deleted"), "status: {}", app.status);
+        }
+    }
+
+    #[test]
+    fn v52_roll_velocity_lane_drag_sets_velocity() {
+        let mut app = headless_app("v52vellane");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        // Velocity lane = band above the glide lane; drag the pointer to
+        // HALF height over the note's x span.
+        let p = egui::pos2(grid_x0 + 80.0, bot - 46.0 - 15.0);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        let want = ((15.0f32 / 30.0) * 127.0).round() as u8;
+        assert!(
+            v.abs_diff(want) <= 3,
+            "bar drag set velocity {v}, pointer said {want}"
+        );
+        assert_ne!(v, 100, "changed");
+    }
+
+    #[test]
+    fn v52_roll_wheel_step_is_configurable() {
+        let mut app = headless_app("v52velstep");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+        }
+        app.roll_vel_step = 17;
+        frame(&mut app, &ctx, vec![]);
+        let p = egui::pos2(grid_x0 + 80.0, row_y(60));
+        let wheel = |dy: f32| {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), wheel(1.0)]);
+        frame(&mut app, &ctx, vec![]);
+        let r = app.piano_roll.as_ref().unwrap();
+        assert_eq!(r.pat.notes[0].vel, 117, "one tick = the configured step (+17)");
+    }
+
+    #[test]
+    fn v52_roll_pageup_octave_nudge() {
+        let mut app = headless_app("v52octave");
+        let ctx = egui::Context::default();
+        let _c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+            r.sel_notes = vec![0];
+            r.focused = true;
+        }
+        frame(&mut app, &ctx, vec![]);
+        let page = |key: egui::Key| {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        frame(&mut app, &ctx, vec![page(egui::Key::PageUp)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes[0].note, 72);
+        assert!(app.status.contains("octave up"), "status: {}", app.status);
+        frame(&mut app, &ctx, vec![page(egui::Key::PageDown)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes[0].note, 60);
     }
 }
