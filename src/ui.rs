@@ -16786,14 +16786,16 @@ fn def_w(idx: usize) -> f32 {
         // wide. With the master controls gone (R4) the band collapsed to
         // 250 and every strip header row wrapped. Keep the COMFORTABLE
         // default explicitly; windows can still shrink freely by hand.
-        3 => 360.0,
+        // v52 R4 added the strip's group ('G') toggle — 360 then clipped
+        // the child-lane '+' off the row (pinned by v32_mixer_state_swaps).
+        3 => 390.0,
         _ => 440.0,
     }
 }
 fn def_h(idx: usize) -> f32 {
     match idx {
         2 => 240.0,
-        3 => 620.0,
+        3 => 390.0,
         _ => 640.0,
     }
 }
@@ -20485,7 +20487,7 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // independent.
         let mut grp = app.rec_group.contains(&t);
         let grp_resp = ui
-            .checkbox(&mut grp, "grp")
+            .checkbox(&mut grp, "G")
             .on_hover_text(
                 "Record group: joined tracks arm and stop TOGETHER from the \
                  top-bar 'REC GROUP' button. The loop ('l') selector is shared \
@@ -31712,18 +31714,26 @@ mod tests {
             24_000,
             "dropped file decoded at 48 k"
         );
-        let inst = match app.track_synth_inst[0].as_deref() {
+        // v52 R2 contract change: a drop on the sampler is NO LONGER a
+        // single-patch swap — every dropped audio file becomes a KEY MAP
+        // slot (multiple samples per note, velocity layers), and the live
+        // instance follows the map, not the old patch-picker param.
+        let _inst = match app.track_synth_inst[0].as_deref() {
             Some(SynthHandle::Script(i)) => i.clone(),
             _ => panic!("sampler instance gone"),
         };
-        assert_eq!(
-            inst.values()[0] as usize,
-            1,
-            "live patch switched to the dropped file"
+        let map = app.sampler_maps[0]
+            .as_ref()
+            .expect("a drop seeds the track's key map");
+        assert_eq!(map.slots.len(), 1, "the dropped file became a map slot");
+        assert!(
+            map.slots[0].asset.contains("zap"),
+            "slot points at the new asset: {}",
+            map.slots[0].asset
         );
         assert!(
-            app.status.contains("zap"),
-            "status names the dropped patch: {}",
+            app.status.contains("sampler map"),
+            "status reports the map insert: {}",
             app.status
         );
     }
@@ -42297,10 +42307,10 @@ mod tests {
             auto: false,
         };
         // Join tracks 1 and 2 with real strip clicks.
-        let g = galley_centers(&mut app, &ctx, "grp", true);
+        let g = galley_centers(&mut app, &ctx, "G", true);
         assert!(g.len() >= 2, "every strip carries a group checkbox");
         click_pt(&mut app, &ctx, g[0]);
-        let g = galley_centers(&mut app, &ctx, "grp", true);
+        let g = galley_centers(&mut app, &ctx, "G", true);
         click_pt(&mut app, &ctx, g[1]);
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.rec_group, vec![0, 1], "two tracks selected for recording");
@@ -42334,9 +42344,9 @@ mod tests {
         clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
         app.rec_src[0].loop_rec = true;
-        let g = galley_centers(&mut app, &ctx, "grp", true);
+        let g = galley_centers(&mut app, &ctx, "G", true);
         click_pt(&mut app, &ctx, g[0]);
-        let g = galley_centers(&mut app, &ctx, "grp", true);
+        let g = galley_centers(&mut app, &ctx, "G", true);
         click_pt(&mut app, &ctx, g[1]);
         frame(&mut app, &ctx, vec![]);
         assert!(
