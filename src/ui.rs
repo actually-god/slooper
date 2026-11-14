@@ -470,7 +470,8 @@ struct AutoEdit {
 /// Floating piano-roll editor (the top-bar "Piano roll" window). Notes are
 /// drawn on the metronome grid exactly like the timeline: drag on empty
 /// space draws a note, drag on a note moves its whole selection, drag a
-/// note's edges resizes it (loop-area-handle style), right-click deletes,
+/// note's edges resizes it (loop-area-handle style), right-click opens
+/// the length menu (Shift+RMB deletes),
 /// Ctrl/Shift+drag on empty space rubber-band-selects. The window owns the
 /// full note-keyboard range through two scrollbars and closes with its X.
 struct PianoRoll {
@@ -520,6 +521,10 @@ struct PianoRoll {
     sel_bend: Option<usize>,
     /// v52 R6: the segment being dragged into existence (BendNew).
     bend_live: Option<crate::midipat::BendSeg>,
+    /// v55 (S2): press-point frozen when plain RMB opened the note menu.
+    /// The menu targets THIS point (grid v20 R4 anchor pattern), not the
+    /// drifting pointer. Cleared when the menu closes.
+    menu_anchor: Option<egui::Pos2>,
 }
 
 /// One in-flight piano-roll canvas gesture.
@@ -8915,7 +8920,8 @@ impl App {
     /// press a note = select (+drag moves the whole selection, dragging
     /// its yellow end caps resizes it, loop-area style), Ctrl/Shift+press
     /// toggles / range-selects (notes) or rubber-band-selects (empty
-    /// space), right-click deletes. Two manual scrollbars cover the full
+    /// space), right-click opens the note length menu (Shift+RMB
+    /// deletes). Two manual scrollbars cover the full
     /// keyboard range and the pattern length; the window opens near
     /// fullscreen, closes with its X, and owns the keyboard while focused
     /// (space can never start the transport behind it).
@@ -10208,7 +10214,7 @@ impl App {
                         hp + egui::vec2(14.0, 14.0),
                         egui::Align2::LEFT_TOP,
                         format!(
-                            "{} \u{b7} vel {} \u{b7} wheel to change",
+                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length",
                             note_name(n.note),
                             n.vel
                         ),
@@ -10233,39 +10239,64 @@ impl App {
             .or(if coalesced_press { hover } else { None })
         {
             let mods = ui.input(|i| i.modifiers);
-            // Right-click deletes the note under the cursor.
+            // v55 (S2): plain right-click OPENS the note menu (grid
+            // clip-menu conventions); Shift+right-click keeps the v37
+            // instant delete so the old muscle memory still works — the
+            // menu spells the shortcut on its Delete row.
             if resp.secondary_clicked() && in_grid(pt) {
-                if in_bend(pt) {
-                    // v52 R6: right-click deletes a glide (same language
-                    // as deleting a note). Clearing the LAST glide must
-                    // also clear the baked events (bake skips empties).
-                    if let Some((i, _)) = bend_hit_at(&roll.pat.bend_segs, pt) {
-                        roll.pat.bend_segs.remove(i);
-                        if roll.pat.bend_segs.is_empty() {
-                            roll.pat.bends.clear();
-                        } else {
-                            roll.pat.bake_bends();
-                        }
-                        roll.sel_bend = None;
-                        roll.changed = true;
-                        self.status = "glide deleted".into();
-                    }
-                } else {
-                {
-                    if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
-                        let nm = note_name(roll.pat.notes[i].note);
-                        roll.pat.notes.remove(i);
-                        roll.sel_notes.retain(|s| *s != i);
-                        for s in roll.sel_notes.iter_mut() {
-                            if *s > i {
-                                *s -= 1;
+                if mods.shift {
+                    if in_bend(pt) {
+                        // v52 R6: Shift+RMB deletes a glide (same language
+                        // as deleting a note). Clearing the LAST glide must
+                        // also clear the baked events (bake skips empties).
+                        if let Some((i, _)) = bend_hit_at(&roll.pat.bend_segs, pt) {
+                            roll.pat.bend_segs.remove(i);
+                            if roll.pat.bend_segs.is_empty() {
+                                roll.pat.bends.clear();
+                            } else {
+                                roll.pat.bake_bends();
                             }
+                            roll.sel_bend = None;
+                            roll.changed = true;
+                            self.status = "glide deleted".into();
                         }
-                        roll.changed = true;
-                        // v38 R6: the delete announces itself.
-                        self.status = format!("deleted {nm} \u{b7} right-click");
+                    } else {
+                        if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
+                            let nm = note_name(roll.pat.notes[i].note);
+                            roll.pat.notes.remove(i);
+                            roll.sel_notes.retain(|s| *s != i);
+                            for s in roll.sel_notes.iter_mut() {
+                                if *s > i {
+                                    *s -= 1;
+                                }
+                            }
+                            roll.changed = true;
+                            // v38 R6: the delete announces itself.
+                            self.status = format!("deleted {nm} \u{b7} Shift+RMB");
+                        }
                     }
-                }
+                    // A shift-delete must never leave a menu anchored on
+                    // the (now gone) item.
+                    roll.menu_anchor = None;
+                } else {
+                    // Anchor on the frozen PRESS point (grid v20 R4):
+                    // the menu content must stay about what was clicked,
+                    // not wherever the pointer drifts while reaching.
+                    let press = ui
+                        .ctx()
+                        .input(|i| {
+                            i.events.iter().rev().find_map(|e| match e {
+                                egui::Event::PointerButton {
+                                    button: egui::PointerButton::Secondary,
+                                    pressed: true,
+                                    pos,
+                                    ..
+                                } => Some(*pos),
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or(pt);
+                    roll.menu_anchor = in_grid(press).then_some(press);
                 }
             }
             // ---- press decides the gesture + selection ----
@@ -10304,7 +10335,7 @@ impl App {
                         Some((i, _)) => {
                             roll.sel_bend = Some(i);
                             self.status =
-                                "glide selected \u{b7} drag a dot \u{b7} right-click deletes"
+                                "glide selected \u{b7} drag a dot \u{b7} right-click = menu"
                                     .into();
                         }
                         None => {
@@ -10739,6 +10770,23 @@ impl App {
         if let Some(ic) = hover_icon {
             ui.ctx().set_cursor_icon(ic);
         }
+        // v55 (S2): decide the RMB menu's target NOW — the geometry
+        // closures used here borrow what the scrollbar/zoom widgets below
+        // mutate, so this must precede them. The result is an owned enum;
+        // the menu itself attaches at the function's end.
+        let rmb_hit = roll.menu_anchor.filter(|p| in_grid(*p)).map(|p| {
+            if in_bend(p) {
+                match bend_hit_at(&roll.pat.bend_segs, p) {
+                    Some((gi, _)) => RollRmbHit::Glide(gi),
+                    None => RollRmbHit::Empty,
+                }
+            } else {
+                match note_hit(&roll.pat.notes, p) {
+                    Some((ni, _, _)) => RollRmbHit::Note(ni),
+                    None => RollRmbHit::Empty,
+                }
+            }
+        });
 
         // ================= scrollbars =================
         // Content extents → thumb sizes. Manual because the canvas
@@ -10840,12 +10888,20 @@ impl App {
                     let _ = p_changed(&rr, br0, &mut roll.row_h);
                     ui.label(
                         RichText::new(
-                            "drag empty = draw \u{b7} drag note = move \u{b7} yellow caps = resize \u{b7} ctrl/shift+drag = box select \u{b7} right-click = delete",
+                            "drag empty = draw \u{b7} drag note = move \u{b7} yellow caps = resize \u{b7} ctrl/shift+drag = box select \u{b7} right-click = menu \u{b7} Shift+RMB = delete",
                         )
                         .weak()
                         .small(),
                     );
                 });
+        // v55 (S2): the piano-roll right-click menu. The anchor clears
+        // with the menu (grid v20 R4 pattern verbatim); egui opens the
+        // menu itself on the plain secondary click on this response.
+        if !resp.secondary_clicked() && !resp.context_menu_opened() && roll.menu_anchor.is_some()
+        {
+            roll.menu_anchor = None;
+        }
+        resp.context_menu(|ui| roll_rmb_menu(ui, roll, &mut self.status, rmb_hit));
     }
 
     /// In-place edit-save: overwrite the MIDI asset the roll was opened
@@ -21320,6 +21376,7 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 edit_asset: edit,
                 sel_bend: None,
                 bend_live: None,
+                menu_anchor: None,
             }));
         }
         ui.label(RichText::new("grid:").strong());
@@ -23112,6 +23169,240 @@ fn lane_row(
     resp.clone().context_menu(|ui| {
         grid_context_menu(ui, app, t, k, &clips, rect, x0, sr, px);
     });
+}
+
+/// v55 (S2): what a plain right-click on the piano-roll canvas targets.
+#[derive(Clone, Copy)]
+enum RollRmbHit {
+    Note(usize),
+    Glide(usize),
+    Empty,
+}
+
+/// v55: the RMB menu's exact length tables (ticks, PPQ=480, 4/4). Every
+/// label carries its tick value, so a pin click can never collide with
+/// snap-combo text and the user sees what each row means. `·` = U+00B7
+/// (proven glyph coverage; see v35 glyph probe).
+const ROLL_LEN_BASE: [(&str, u32); 7] = [
+    ("whole \u{b7} 1920t", 1920),
+    ("1/2 \u{b7} 960t", 960),
+    ("1/4 \u{b7} 480t", 480),
+    ("1/8 \u{b7} 240t", 240),
+    ("1/16 \u{b7} 120t", 120),
+    ("1/32 \u{b7} 60t", 60),
+    ("1/64 \u{b7} 30t", 30),
+];
+const ROLL_LEN_DOT: [(&str, u32); 5] = [
+    ("dot 1/2 \u{b7} 1440t", 1440),
+    ("dot 1/4 \u{b7} 720t", 720),
+    ("dot 1/8 \u{b7} 360t", 360),
+    ("dot 1/16 \u{b7} 180t", 180),
+    ("dot 1/32 \u{b7} 90t", 90),
+];
+const ROLL_LEN_TRIP: [(&str, u32); 5] = [
+    ("trip 1/4 \u{b7} 320t", 320),
+    ("trip 1/8 \u{b7} 160t", 160),
+    ("trip 1/16 \u{b7} 80t", 80),
+    ("trip 1/32 \u{b7} 40t", 40),
+    ("trip 1/64 \u{b7} 20t", 20),
+];
+
+/// v55 (S2): the piano-roll right-click menu. Exact musical note lengths
+/// (whole..1/64 + dotted + triplet, double/halve), selection-aware, and
+/// the delete lives here as one row — plain RMB opened this menu, the
+/// instant delete lives on as Shift+RMB. Conventions mirror the grid
+/// clip menu: frozen press anchor, select-on-open, one-shot rows
+/// self-close, destructive row answers on hover (v54 invariant).
+fn roll_rmb_menu(
+    ui: &mut egui::Ui,
+    roll: &mut PianoRoll,
+    status: &mut String,
+    hit: Option<RollRmbHit>,
+) {
+    // Shift+RMB deletes instantly instead of opening anything — if the
+    // shift key is still down, refuse the menu (muscle-memory contract).
+    if ui.input(|i| i.modifiers.shift) {
+        ui.close();
+        return;
+    }
+    match hit {
+        Some(RollRmbHit::Note(i)) if i < roll.pat.notes.len() => {
+            // The right-clicked note joins the selection alone UNLESS it
+            // is already part of a multi-selection — then every length
+            // edit applies to the whole group (grid clip-menu convention).
+            let targets: Vec<usize> = if roll.sel_notes.contains(&i) && roll.sel_notes.len() > 1 {
+                roll.sel_notes.clone()
+            } else {
+                roll.sel_notes = vec![i];
+                vec![i]
+            };
+            let cur = roll.pat.notes[i].len;
+            let head = if targets.len() > 1 {
+                format!(
+                    "{} \u{b7} len {}t \u{b7} applies to {} selected notes",
+                    note_name(roll.pat.notes[i].note),
+                    cur,
+                    targets.len()
+                )
+            } else {
+                format!(
+                    "{} \u{b7} len {}t \u{b7} pick an exact length",
+                    note_name(roll.pat.notes[i].note),
+                    cur
+                )
+            };
+            ui.label(RichText::new(head).strong());
+            let mut pick: Option<(&'static str, u32)> = None;
+            // Two hand-laid columns (base | dotted+triplet). egui 0.36's
+            // columns() gives no per-column handle usable here.
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    for (lab, t) in ROLL_LEN_BASE {
+                        if ui
+                            .add_sized([102.0, 18.0], egui::Button::selectable(cur == t, lab))
+                            .clicked()
+                        {
+                            pick = Some((lab, t));
+                        }
+                    }
+                });
+                ui.vertical(|ui| {
+                    for (lab, t) in ROLL_LEN_DOT.into_iter().chain(ROLL_LEN_TRIP) {
+                        if ui
+                            .add_sized([102.0, 18.0], egui::Button::selectable(cur == t, lab))
+                            .clicked()
+                        {
+                            pick = Some((lab, t));
+                        }
+                    }
+                });
+            });
+            if let Some((lab, t)) = pick {
+                apply_note_len(roll, &targets, t);
+                *status = format!("note len {lab} \u{b7} {} note(s)", targets.len());
+                roll.changed = true;
+                roll.menu_anchor = None;
+                ui.close();
+                return;
+            }
+            ui.separator();
+            let mut op: Option<u8> = None;
+            ui.horizontal(|ui| {
+                if ui
+                    .button("double")
+                    .on_hover_text("Double the note length (selection-aware)")
+                    .clicked()
+                {
+                    op = Some(1);
+                }
+                if ui
+                    .button("halve")
+                    .on_hover_text("Halve the note length (min 1 tick)")
+                    .clicked()
+                {
+                    op = Some(2);
+                }
+            });
+            if let Some(o) = op {
+                for &ix in &targets {
+                    if let Some(n) = roll.pat.notes.get_mut(ix) {
+                        n.len = match o {
+                            1 => (n.len * 2).min(1920 * 32),
+                            _ => (n.len / 2).max(1),
+                        };
+                    }
+                }
+                grow_pattern(roll);
+                roll.changed = true;
+                *status = format!(
+                    "length {} \u{b7} {} note(s)",
+                    if o == 1 { "x2" } else { "/2" },
+                    targets.len()
+                );
+                roll.menu_anchor = None;
+                ui.close();
+                return;
+            }
+            ui.separator();
+            if ui
+                .button("Delete note (Shift+RMB)")
+                .on_hover_text("Remove this note now — or Shift+right-click it")
+                .clicked()
+            {
+                let mut ts = targets.clone();
+                ts.sort_unstable();
+                ts.dedup();
+                for &ix in ts.iter().rev() {
+                    if ix < roll.pat.notes.len() {
+                        roll.pat.notes.remove(ix);
+                    }
+                }
+                roll.sel_notes.clear();
+                roll.changed = true;
+                roll.menu_anchor = None;
+                *status = format!("deleted {} note(s)", ts.len());
+                ui.close();
+            }
+        }
+        Some(RollRmbHit::Glide(i)) if i < roll.pat.bend_segs.len() => {
+            let s = &roll.pat.bend_segs[i];
+            ui.label(RichText::new(format!("glide \u{b7} {}→{} ticks", s.t0, s.t1)).strong());
+            if ui
+                .button("Delete glide (Shift+RMB)")
+                .on_hover_text("Remove this glide now — or Shift+right-click it")
+                .clicked()
+            {
+                roll.pat.bend_segs.remove(i);
+                if roll.pat.bend_segs.is_empty() {
+                    roll.pat.bends.clear();
+                } else {
+                    roll.pat.bake_bends();
+                }
+                roll.sel_bend = None;
+                roll.changed = true;
+                roll.menu_anchor = None;
+                *status = "glide deleted".into();
+                ui.close();
+            }
+        }
+        // Empty canvas (or a stale index mid-edit): the menu still
+        // answers with WHY — every action gets feedback.
+        _ => {
+            ui.label(RichText::new("no note under the cursor").weak());
+            ui.label(
+                RichText::new("drag to draw \u{b7} Shift+RMB on a note deletes")
+                    .weak()
+                    .small(),
+            );
+        }
+    }
+}
+
+/// v55: set exact note lengths on `targets` and grow the pattern if a
+/// note would now die at the pattern end.
+fn apply_note_len(roll: &mut PianoRoll, targets: &[usize], t: u32) {
+    for &ix in targets {
+        if let Some(n) = roll.pat.notes.get_mut(ix) {
+            n.len = t.max(1);
+        }
+    }
+    grow_pattern(roll);
+}
+
+/// v55: len_ticks grows (bar-rounded, `quantize_grid`'s formula) so a
+/// length edit never silently truncates; never shrinks.
+fn grow_pattern(roll: &mut PianoRoll) {
+    let end = roll
+        .pat
+        .notes
+        .iter()
+        .map(|n| n.start + n.len)
+        .max()
+        .unwrap_or(0);
+    if end > roll.pat.len_ticks {
+        let bar = 4 * PPQ as u32;
+        roll.pat.len_ticks = end.div_euclid(bar).max(1) * bar + (end % bar != 0) as u32 * bar;
+    }
 }
 
 /// v0.15: the grid right-click menu. On a clip: Copy / Cut / Duplicate /
@@ -32828,6 +33119,7 @@ mod tests {
             edit_asset: None,
             sel_bend: None,
             bend_live: None,
+            menu_anchor: None,
         }));
         frame(&mut app, &ctx, vec![]);
         assert_eq!(win_count(&app), 6, "roll slot registered");
@@ -33087,6 +33379,7 @@ mod tests {
             edit_asset: Some(a3),
             sel_bend: None,
             bend_live: None,
+            menu_anchor: None,
         }));
         frame(&mut app, &ctx, vec![]);
         app.remove_asset_at(0);
