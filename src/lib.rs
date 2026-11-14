@@ -27,6 +27,7 @@ pub mod crash;
 pub mod ffiguard;
 pub mod fx;
 pub mod fxgui;
+pub(crate) mod kit;
 pub mod meter;
 pub mod midi;
 pub mod midiin;
