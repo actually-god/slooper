@@ -1779,8 +1779,14 @@ mod tests {
     #[test]
     fn v52_sampler_velocity_layers_crossfade_blends() {
         // Layers 40 and 100 on one root: note v=70 sits EXACTLY halfway,
-        // so both layers sound with equal weight (pitch axis untouched —
-        // exact root hit). Note v=20 is under every layer -> lowest only.
+        // so both layers sound with equal BLEND weight (pitch axis
+        // untouched — exact root hit). Note v=20 is under every layer ->
+        // lowest only.
+        // v57 retarget: equal blend weight no longer means equal POWER —
+        // each layer plays at its recorded dynamic as unity, so the note
+        // over the vel-40 layer (200 Hz) is boosted 70/40 = 1.75x and the
+        // one over vel-100 (800 Hz) cut to 70/100 = 0.7x: amplitude ratio
+        // 2.5, POWER ratio 6.25. (Was: r ~ 1.0 under note/127 gain.)
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
@@ -1790,7 +1796,10 @@ mod tests {
         let p1 = tone_power(&x, 800.0, 48000.0, 512, 3800);
         assert!(p0 > 5e4 && p1 > 5e4, "both layers must sound: {p0} {p1}");
         let r = p0 / p1;
-        assert!((r - 1.0).abs() < 0.5, "equal blend expected, power ratio {r}");
+        assert!(
+            (r - 6.25).abs() < 1.2,
+            "v57 unity-reference blend: power ratio ~6.25, got {r}"
+        );
         let x = v52_render(&inst, 48, 20);
         let p0 = tone_power(&x, 200.0, 48000.0, 512, 7680);
         let p1 = tone_power(&x, 800.0, 48000.0, 512, 7680);
