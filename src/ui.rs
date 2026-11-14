@@ -29719,6 +29719,43 @@ mod tests {
         hit.map(|c| egui::Rect::from_center_size(c, egui::vec2(6.0, 10.0)))
     }
 
+    /// Absolute Rect of the LAST painted `Shape::Text` whose galley text
+    /// contains `needle` (windows paint last), read from one extra
+    /// zero-input 853-viewport frame. `galley_at`'s rect is a synthetic
+    /// 6x10 center marker — this is the variant that measures real galley
+    /// extent (width checks for collapsed/justified text bugs).
+    fn painted_text_rect(
+        ctx: &egui::Context,
+        app: &mut App,
+        needle: &str,
+    ) -> Option<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().rev().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text().contains(needle) {
+                    let local = t.galley.rect;
+                    return Some(egui::Rect::from_min_size(
+                        t.pos + local.min.to_vec2(),
+                        local.size(),
+                    ));
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit
+    }
+
     fn galley_at_last(app: &mut App, ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -42886,4 +42923,230 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes[0].note, 60);
     }
+
+    // ---- v53 GUI-kit feedback pass (fxgui bridge + auto grid) ----
+
+    /// Every kit widget painted by the LAST frame: (label, global rect).
+    /// Populated only under cfg(test) by crate::fxgui::probe_record.
+    fn kit_probe(needle: &str) -> Vec<egui::Rect> {
+        let m = crate::fxgui::KIT_PROBE.lock().unwrap();
+        let out: Vec<egui::Rect> = m
+            .borrow()
+            .iter()
+            .filter(|(l, _)| l.starts_with(needle))
+            .map(|(_, r)| *r)
+            .collect();
+        out
+    }
+
+    fn kit_clear() {
+        let m = crate::fxgui::KIT_PROBE.lock().unwrap();
+        m.borrow_mut().clear();
+    }
+
+    /// Every text galley painted by a fresh frame.
+    fn painted_texts(app: &mut App, ctx: &egui::Context) -> Vec<String> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        texts
+    }
+
+    /// Hover `p` (then hold it still) until egui pops a tooltip containing
+    /// one of `needles`, then return every painted text galley of that
+    /// frame. egui's first tooltip delay is 0.3 s; frames run on the
+    /// 1/64 s test clock, so 70 idle frames bounds the wait.
+    fn hover_until_tip(
+        app: &mut App,
+        ctx: &egui::Context,
+        p: egui::Pos2,
+        needles: &[&str],
+    ) -> Vec<String> {
+        frame(app, ctx, vec![moved(p)]);
+        for _ in 0..70 {
+            frame(app, ctx, vec![]);
+            let texts = painted_texts(app, ctx);
+            if texts.iter().any(|t| needles.iter().any(|n| t.contains(n))) {
+                return texts;
+            }
+        }
+        painted_texts(app, ctx)
+    }
+
+    /// Headless app with `stem`'s fx editor window open. `space_echo` is
+    /// the custom-GUI fixture (knobs + buttons); `vfilter` has NO custom
+    /// GUI, so its window shows the auto grid — incl. tier-6 units (cutoff
+    /// Hz) and enum pickers (mode, slope).
+    fn open_script_fx_editor(tag: &str, stem: &str) -> (App, egui::Context) {
+        let mut app = headless_app(tag);
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        if app.fx_registry.desc(stem).is_none() {
+            let dir = app.fx_registry.dir().to_path_buf();
+            let src: &str = match stem {
+                "space_echo" => include_str!("../effects/space_echo.rs"),
+                "vfilter" => include_str!("../effects/vfilter.rs"),
+                _ => panic!("unwired fixture"),
+            };
+            std::fs::write(dir.join(format!("{stem}.rs")), src).unwrap();
+            app.rescan_fx();
+        }
+        app.add_fx_script(0, stem);
+        frame(&mut app, &ctx, vec![]);
+        app.open_fx_editor(0, 0);
+        frame(&mut app, &ctx, vec![]);
+        (app, ctx)
+    }
+
+    #[test]
+    fn v53_bridge_knob_hover_shows_tip_and_live_value() {
+        let (mut app, ctx) = open_script_fx_editor("v53knob", "space_echo");
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        // The `time` knob: caption is script-decorated ("time 380ms"), so
+        // the probe needle is the label prefix the router uses.
+        let knob = *kit_probe("time ").first().expect("space_echo knob painted");
+        let texts = hover_until_tip(&mut app, &ctx, knob.center(), &["double-click"]);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("double-click: set value") && t.contains("right-click: automation")),
+            "knob hover must hand out the kit gesture tip; galleys: {texts:?}"
+        );
+        // The caption carries the script label AND the kit's live value,
+        // and it is NOT the tooltip (no gesture text on the caption
+        // galley). egui collapses literal spaces across runs when it
+        // justifies the label — assert content, not the pad width.
+        let cap = texts
+            .iter()
+            .find(|t| {
+                t.contains("time 380ms")
+                    && t.contains("0.38")
+                    && !t.contains("double-click")
+                    && !t.contains("range")
+            })
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !cap.is_empty(),
+            "knob caption must paint script label + live kit value; galleys: {texts:?}"
+        );
+    }
+
+    /// v53 regression pin (real bug): the kit knob caption must paint as a
+    /// HORIZONTAL galley centered under the knob — an early `ui.put` strip
+    /// implementation hit egui's justify/WRAP trap and rendered one
+    /// vertical character column, which also slid the galley right so the
+    /// v20 caption-offset RMB pin clicked the NEIGHBOUR knob.
+    #[test]
+    fn v53_knob_caption_paints_horizontal_under_knob() {
+        let (mut app, ctx) = open_script_fx_editor("v53capgeo", "space_echo");
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let knob = *kit_probe("tone ").first().expect("space_echo tone knob painted");
+        // The ABSOLUTE painted rect of the caption. `galley_at` hands out a
+        // synthetic 6x10 center marker (fine for center math, useless for
+        // width), so scan the text shapes of one extra zero-input frame.
+        let cap = painted_text_rect(&ctx, &mut app, "tone 3.6kHz")
+            .expect("tone caption painted");
+        assert!(
+            cap.width() > 60.0,
+            "caption must be a horizontal galley, not a collapsed column: {cap:?}"
+        );
+        assert!(
+            (cap.center().x - knob.center().x).abs() < 16.0,
+            "caption centered under its knob: cap={cap:?} knob={knob:?}"
+        );
+        assert!(
+            cap.center().y > knob.max.y && cap.center().y < knob.max.y + 20.0,
+            "caption hugs the knob bottom: cap={cap:?} knob={knob:?}"
+        );
+        // And the -30px caption-offset gesture still lands ON this knob
+        // (the exact math the v20 RMB pin derives from).
+        let p = egui::pos2(cap.center().x, cap.center().y - 30.0);
+        assert!(
+            knob.contains(p),
+            "caption-derived -30px point must be inside the knob circle: p={p:?} knob={knob:?}"
+        );
+    }
+
+    #[test]
+    fn v53_auto_slider_tooltip_states_units_and_gestures() {
+        let (mut app, ctx) = open_script_fx_editor("v53auto", "vfilter");
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        // `cutoff` is a slider row with the Hz unit meta (row 2 — near the
+        // top of the grid, so its rect is inside the viewport).
+        let row = *kit_probe("cutoff").first().expect("vfilter cutoff row painted");
+        let texts = hover_until_tip(&mut app, &ctx, row.center(), &["double-click"]);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("cutoff") && t.contains("Hz") && t.contains("range")),
+            "auto-grid hover must state the unit and the range; galleys: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn v53_auto_enum_right_click_opens_value_menu() {
+        let (mut app, ctx) = open_script_fx_editor("v53enum", "vfilter");
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        // `mode` is an enum-picker param (labels mode 0..3) — row 1.
+        let row = *kit_probe("mode").first().expect("vfilter mode combo painted");
+        frame(&mut app, &ctx, vec![moved(row.center())]);
+        frame(&mut app, &ctx, vec![btn(row.center(), egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(row.center(), egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at_last(&mut app, &ctx, "Create automation clip").is_some(),
+            "right-clicking an enum param row must open the same value menu slider rows get"
+        );
+    }
+
+    #[test]
+    fn v53_preset_strip_delete_hover_feedback() {
+        let (mut app, ctx) = open_script_fx_editor("v53del", "vfilter");
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let del = galley_at_last(&mut app, &ctx, "Delete").expect("preset-strip Delete painted");
+        // Nothing selected -> the tooltip explains why clicking would fail.
+        // (The button is deliberately ENABLED: a disabled egui widget is
+        // never hoverable, so a disabled-state tooltip cannot exist.)
+        let texts = hover_until_tip(&mut app, &ctx, del.center(), &["pick a preset", "delete the"]);
+        assert!(
+            texts.iter().any(|t| t.contains("pick a preset to delete first")),
+            "Delete must explain the no-selection state on hover; galleys: {texts:?}"
+        );
+        // And clicking must ANSWER in the strip's own status line — with
+        // the pointer parked far away so the tooltip can't pass this
+        // vacuously.
+        frame(&mut app, &ctx, vec![btn(del.center(), egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(del.center(), egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(20.0, 820.0))]);
+        frame(&mut app, &ctx, vec![moved(egui::pos2(20.0, 820.0))]);
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("pick a preset to delete first")),
+            "dead Delete click must answer in the status line; galleys: {texts:?}"
+        );
+    }
+
 }
