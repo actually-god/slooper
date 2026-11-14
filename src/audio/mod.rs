@@ -6201,6 +6201,33 @@ mod tests {
         assert_eq!(e.pos(), 900, "project shrink keeps the playhead in bounds");
     }
 
+    /// v52 R4: two tracks can HOLD takes simultaneously and stopping one
+    /// leaves the other running — the record-group master arms several
+    /// members at once and depends on this engine-side independence.
+    #[test]
+    fn v52_two_tracks_record_simultaneously() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 100_000);
+        e.seek_to(1000);
+        e.start_rec(0);
+        e.start_rec(3);
+        assert_eq!(e.rec_state_of(0), TR_REC);
+        assert_eq!(e.rec_state_of(3), TR_REC, "two tracks arm at once");
+        for _ in 0..32 {
+            // Contract: rec_sample only returns TRUE when the take buffer
+            // is full — capture itself happens on the false path.
+            assert!(!e.rec_sample(0, 0.25));
+            assert!(!e.rec_sample(3, -0.25));
+        }
+        assert!(e.rec_len_of(0) > 0 && e.rec_len_of(3) > 0, "both feeders fill");
+        // Stop one: the other keeps capturing (mirrors STOP semantics —
+        // only the bounced member changes state).
+        e.rec_state[3].store(TR_IDLE, Ordering::Relaxed);
+        assert_eq!(e.rec_state_of(0), TR_REC, "one stop must not affect the other");
+        let (_at, data, _pv) = e.copy_take(0);
+        assert!(!data.is_empty(), "the running member's take is complete");
+    }
+
     #[test]
     fn take_capture_and_finish_roundtrip() {
         let e = Engine::new();

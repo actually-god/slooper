@@ -516,10 +516,14 @@ struct PianoRoll {
     /// MIDI clip or rack asset): **save** overwrites the asset in place
     /// instead of minting a new one.
     edit_asset: Option<u32>,
+    /// v52 R6: selected pitch-bend segment index (lane editor selection).
+    sel_bend: Option<usize>,
+    /// v52 R6: the segment being dragged into existence (BendNew).
+    bend_live: Option<crate::midipat::BendSeg>,
 }
 
 /// One in-flight piano-roll canvas gesture.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RollGesture {
     None,
     /// Drag note bodies. `fresh` = the press drew a brand-new note (its
@@ -547,6 +551,16 @@ enum RollGesture {
         from: egui::Pos2,
         add: bool,
     },
+    /// v52 R6: creating a pitch-bend glide live. The in-flight segment
+    /// rides `PianoRoll::bend_live`; `src` = source note PITCH when the
+    /// drag started from a note (Z-drag), enabling land-on-note snapping.
+    BendNew { t0: u32, v0: f32, src: Option<u8> },
+    /// v52 R6: drag one endpoint of a stored segment (`end` 0 = start).
+    BendEP { idx: usize, end: u8 },
+    /// v52 R6: drag the mid-curve dot vertically to set curvature.
+    BendCurve { idx: usize },
+    /// v52 R6: drag a bar in the velocity lane (absolute from pointer y).
+    VelDrag { idx: usize },
 }
 
 /// In-flight three-step calibration for one continuous (knob) MIDI binding.
@@ -964,6 +978,10 @@ pub struct App {
     /// docks occupy no space and paint no heading.
     show_rack: bool,
     show_mixer: bool,
+    /// v52 R5: while true (default), a LEFT/RIGHT-docked mixer mirrors the
+    /// main GUI's track heights + scroll. Off: strips keep a uniform height,
+    /// start at the panel top and own their scroll even when docked.
+    mixer_follow_tracks: bool,
     /// v30 R3: scratch name for saving an automation shape preset.
     auto_preset_name: String,
     /// v30 R4: the project-value-bindings window is part of the main GUI.
@@ -1081,8 +1099,11 @@ pub struct App {
     /// Index into [`SUBDIVISIONS`] (click subdivision).
     metro_sub: usize,
     /// Index into [`SUBDIVISIONS`] for content quantize / clip snap.
-    q_sub: usize,
     snap_sub: usize,
+    /// Index into [`SUBDIVISIONS`] for the quantize-button grid.
+    q_sub: usize,
+    /// v52 R6: wheel-tick velocity trim step for the piano roll.
+    roll_vel_step: u8,
     /// v34 R1: automation manager snap selector (its own, persisted).
     auto_snap_on: bool,
     auto_snap_sub: usize,
@@ -1327,6 +1348,12 @@ pub struct App {
     auto_rec: Vec<AutoRecState>,
     /// v29: per-track sources armed by the single REC button.
     rec_src: Vec<RecSrc>,
+    /// v52 R4: tracks joined to the RECORD GROUP, in JOIN ORDER (front =
+    /// oldest). The top-bar "REC GROUP" master arms/stops every member at
+    /// once; the loop ("l") selector is LINKED across members (a joining
+    /// track inherits the oldest member's value, a toggle mirrors to all),
+    /// every other selector stays per-track.
+    rec_group: Vec<usize>,
     /// v29 R7: per-project MIDI-to-value bindings (automation manager
     /// side rack). Session copy lives in config; the project file wins.
     value_binds: Vec<crate::config::ValueBind>,
@@ -1346,12 +1373,24 @@ pub struct App {
     /// piano-roll map (slots = (asset path, root note) + mode).
     sampler_maps: Vec<Option<crate::config::SamplerMapSave>>,
     /// v51: track whose sampler key-map (piano roll) window is open.
-    smap_win: Option<usize>,
+
     /// Harness hook: the last (keyboard-strip rect, lane-strip min-x) the
     /// map window painted this frame, so tests can drive real drags/clicks
     /// without color archaeology. Written every painted frame; read-only
     /// cost for the app.
     smap_probe: Option<(f32, f32, f32, f32, f32)>,
+    /// v52 R2: rect of the FIRST PAINTED BLACK KEY (note 37) — pins that
+    /// the painted black key sits in the same column its click binds.
+    smap_black_probe: Option<egui::Rect>,
+    /// v52 R3: harness probe — every drum-grid cell rect painted this frame
+    /// as (pad, step, rect); tests drive real clicks without color
+    /// archaeology (same pattern as `smap_probe`). Written every painted frame.
+    drum_probe: Vec<(usize, usize, egui::Rect)>,
+    /// v52 R3: set when "commit to track" pressed with nothing stampable.
+    /// The status line was far too easy to miss — a live user concluded the
+    /// button "doesn't work at all" after pressing it on an empty pattern.
+    /// The popup is the honest, impossible-to-miss answer.
+    drum_commit_note: Option<String>,
     /// v51: selected slot row inside the open key-map window.
     smap_sel: Option<usize>,
     /// v51: note currently held by a key/lane press in the map window.
@@ -1688,6 +1727,7 @@ impl App {
             show_settings: false,
             show_rack: cfg.show_rack,
             show_mixer: cfg.show_mixer,
+            mixer_follow_tracks: cfg.mixer_follow_tracks,
             auto_preset_name: String::new(),
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
@@ -1745,6 +1785,7 @@ impl App {
                 .unwrap_or(0),
             q_sub: sub_idx(cfg.q_sub),
             snap_sub: sub_idx(cfg.snap_sub),
+            roll_vel_step: cfg.roll_vel_step.clamp(1, 32),
             auto_snap_on: cfg.auto_snap_on,
             auto_snap_sub: sub_idx(cfg.auto_snap_sub),
             last_auto_asset: None,
@@ -1845,6 +1886,7 @@ impl App {
                     }
                 })
                 .collect(),
+            rec_group: Vec::new(),
             value_binds: cfg.value_binds.clone(),
             value_learning: None,
             vb_target: None,
@@ -1862,8 +1904,11 @@ impl App {
                 }
                 m
             },
-            smap_win: None,
+
             smap_probe: None,
+            smap_black_probe: None,
+            drum_probe: Vec::new(),
+            drum_commit_note: None,
             smap_sel: None,
             smap_hold: None,
             show_drums: cfg.show_drums,
@@ -4553,6 +4598,7 @@ impl App {
             n_tracks: self.n_tracks,
             show_rack: self.show_rack,
             show_mixer: self.show_mixer,
+            mixer_follow_tracks: self.mixer_follow_tracks,
             show_midi: self.show_midi,
             show_binds: self.show_binds,
             side_wins: self.side_wins,
@@ -4659,6 +4705,7 @@ impl App {
             snap_on: self.snap_on,
             auto_snap_on: self.auto_snap_on,
             auto_snap_sub: SUBDIVISIONS[self.auto_snap_sub].0,
+            roll_vel_step: self.roll_vel_step.clamp(1, 32),
             dir_memo: self.dir_memo.clone(),
             vol_scale_v2: true,
             project_dir: self.project_dir.clone(),
@@ -5903,14 +5950,14 @@ impl App {
         match self.sampler_maps.get(t).cloned().flatten() {
             None => inst.clear_map(),
             Some(m) => {
-                let slots: Vec<(u32, u8)> = m
+                let slots: Vec<(u32, u8, u8)> = m
                     .slots
                     .iter()
                     .filter_map(|s| {
                         self.assets
                             .iter()
                             .position(|a| a.path.to_string_lossy() == s.asset)
-                            .map(|k| (k as u32, s.root))
+                            .map(|k| (k as u32, s.root, s.vel.max(1)))
                     })
                     .collect();
                 inst.set_map(&slots, m.mode);
@@ -5989,7 +6036,11 @@ impl App {
                 .unwrap_or(48);
             if !m.slots.iter().any(|s| s.asset == sp) {
                 m.slots
-                    .push(crate::config::SamplerSlotSave { asset: sp, root });
+                    .push(crate::config::SamplerSlotSave {
+                    asset: sp,
+                    root,
+                    vel: 127,
+                    });
             }
             added += 1;
         }
@@ -6050,8 +6101,14 @@ impl App {
             self.kit(t).iter().map(|p| (p.asset, p.muted)).collect();
         let nl0 = self.arr.tracks[t].lanes.len();
         let mut n = 0usize;
+        // v52 R3: hits that could NOT stamp (pad silent/muted) must be
+        // counted and explained, not dropped in silence.
+        let mut silent_hits = 0usize;
+        let mut new_ids: Vec<(usize, usize, usize)> = Vec::new();
         for (pi, (aid, muted)) in pads.iter().enumerate() {
-            if *muted {
+            let hits = grid.get(pi).map(|r| r.iter().filter(|&&v| v > 0).count()).unwrap_or(0);
+            if *muted || aid.is_none() {
+                silent_hits += hits;
                 continue;
             }
             let Some(id) = aid else { continue };
@@ -6068,19 +6125,45 @@ impl App {
                 let mut cl = Clip::new(id32, base + si as u64 * step);
                 cl.gain = (*v as f32 / 127.0).powi(2).max(0.01);
                 self.arr.insert(t, pi, cl);
+                new_ids.push((t, pi, self.arr.tracks[t].lanes[pi].clips.len() - 1));
                 n += 1;
             }
         }
         if n == 0 {
-            self.status = "drums: nothing to commit (pick pad sounds and paint hits)".into();
+            let painted: usize = grid.iter().flatten().filter(|&&v| v > 0).count();
+            self.status = "drums: nothing to commit".into();
+            self.drum_commit_note = Some(if painted == 0 {
+                "Nothing to commit — the pattern is empty.\n\
+                 Click grid cells to build a beat (click toggles a hit, hover \
+                 + mouse wheel paints its velocity), then press commit again."
+                    .to_string()
+            } else {
+                format!(
+                    "{painted} hit(s) sit on pads with no sound assigned (or muted).\n\
+                     Pick the pad sounds in this track's SYNTHS window \
+                     (drum kit), then press commit again."
+                )
+            });
             return;
         }
+        self.drum_commit_note = None;
         self.grow_for_lanes(t, nl0);
         self.push_project();
-        self.status = format!(
+        // v52 R3: make the result impossible to miss — the target track
+        // becomes the selected track and every freshly stamped clip is
+        // outlined (the historic complaint was "commit does nothing", but
+        // clips at an offscreen playhead with no feedback read as nothing).
+        self.selected = t;
+        self.last_click_track = Some(t);
+        self.sel_clips = new_ids;
+        let mut msg = format!(
             "drums: {n} hits committed to track {} (one lane per pad)",
             t + 1
         );
+        if silent_hits > 0 {
+            msg.push_str(&format!(" \u{2014} {silent_hits} hit(s) skipped: pad silent/muted"));
+        }
+        self.status = msg;
     }
 
     /// v29 R7: apply a value in the TARGET's own domain (the units
@@ -6960,6 +7043,7 @@ impl App {
         let mut dirty = false;
         let mut commit_now = false;
         let ctx = ui.ctx().clone();
+        self.drum_probe.clear();
         // v30 R1: ONE grid = ONE bar of the chosen subdivision
         // (steps per bar = metronome beats x steps per beat).
         let want = (self.beats().max(1) as usize * self.drum.sub.max(1) as usize).clamp(2, 256);
@@ -7132,6 +7216,7 @@ impl App {
                             p + 1,
                             s + 1
                         ));
+                        self.drum_probe.push((p, s, resp.rect));
                         if resp.clicked() {
                             let dv = pad.vel.max(1);
                             let now = self.drum.grid[p][s];
@@ -7185,6 +7270,21 @@ impl App {
         if commit_now {
             self.drum_commit();
             dirty = true;
+        }
+        // v52 R3: an empty/silent commit gets a popup, not a whisper: the
+        // one-line status at the bottom of a fullscreen DAW was missed, and
+        // the button "seemed to do nothing at all".
+        if let Some(note) = self.drum_commit_note.clone() {
+            egui::Window::new("drums: commit to track")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(&ctx, |ui| {
+                    ui.label(note);
+                    if ui.button("OK").clicked() {
+                        self.drum_commit_note = None;
+                    }
+                });
         }
         if dirty {
             self.save_config();
@@ -8391,6 +8491,17 @@ impl App {
         for m in pat.press.iter() {
             ev.push((pat.ticks_to_samples(m.at, sr), 2, m.ch, 0, m.val));
         }
+        // v52 R6: baked pitch-bend lane (kind 5 = 14-bit lsb/msb, the
+        // engine's own encoding) so roll previews glide like the grid.
+        for m in pat.bends.iter() {
+            ev.push((
+                pat.ticks_to_samples(m.at, sr),
+                5,
+                m.ch,
+                (m.val & 0x7F) as u8,
+                ((m.val >> 7) & 0x7F) as u8,
+            ));
+        }
         ev
     }
 
@@ -8866,6 +8977,41 @@ impl App {
                 // keypress even do anything?").
                 self.status = format!("deleted {k} note(s)");
             }
+            // v52 R6: Page Up / Page Down = octave nudge on the whole
+            // selection (rows are semitones \u{2014} \u{b1}12), clamped
+            // at the keybed. Selection survives the shift.
+            let octave = ui.ctx().input(|i| {
+                if i.key_pressed(egui::Key::PageUp) {
+                    12
+                } else if i.key_pressed(egui::Key::PageDown) {
+                    -12
+                } else {
+                    0
+                }
+            });
+            if octave != 0 && !roll.sel_notes.is_empty() {
+                let ids = roll.sel_notes.clone();
+                let mut edge = false;
+                let mut moved = 0usize;
+                for s in ids {
+                    if let Some(n) = roll.pat.notes.get_mut(s) {
+                        let v = n.note as i32 + octave;
+                        if (0..=127).contains(&v) {
+                            n.note = v as u8;
+                            moved += 1;
+                        } else {
+                            edge = true;
+                        }
+                    }
+                }
+                roll.changed = true;
+                self.status = format!(
+                    "octave {} \u{b7} {} note(s){}",
+                    if octave > 0 { "up" } else { "down" },
+                    moved,
+                    if edge { " \u{b7} clamped at the keybed" } else { "" }
+                );
+            }
             // v37 R3: while the roll owns the keyboard, SPACE is the
             // PREVIEW transport — start/stop the roll's own playback,
             // never the main (hidden) arrangement transport. v38 R4: the
@@ -8956,7 +9102,11 @@ impl App {
                     (n.note as i32 == row && sec >= n0 - 1e-6 && sec <= n1 + 1e-6).then_some(i)
                 });
                 if let Some(i) = hit {
-                    let d: i16 = if wheel_dy > 0.0 { 5 } else { -5 };
+                    let d: i16 = if wheel_dy > 0.0 {
+                        self.roll_vel_step as i16
+                    } else {
+                        -(self.roll_vel_step as i16)
+                    };
                     let targets: Vec<usize> = if roll.sel_notes.contains(&i) {
                         roll.sel_notes.clone()
                     } else {
@@ -9105,6 +9255,8 @@ impl App {
             roll.pat.notes.clear();
             roll.pat.ccs.clear();
             roll.pat.press.clear();
+            roll.pat.bends.clear();
+            roll.pat.bend_segs.clear();
             roll.sel_notes.clear();
             roll.sel_anchor = None;
             roll.changed = true;
@@ -9315,6 +9467,34 @@ impl App {
                         roll.changed = true;
                         self.status = format!("quantized {n} note(s) to the grid");
                     }
+                    // v52 R6: discoverable zoom (Ctrl+wheel kept too).
+                    if ui
+                        .small_button("\u{2212}")
+                        .on_hover_text("Zoom the roll OUT (same as Ctrl+wheel)")
+                        .clicked()
+                    {
+                        roll.px_per_beat = (roll.px_per_beat / 1.25).clamp(30.0, 400.0);
+                    }
+                    if ui
+                        .small_button("+")
+                        .on_hover_text("Zoom the roll IN (same as Ctrl+wheel)")
+                        .clicked()
+                    {
+                        roll.px_per_beat = (roll.px_per_beat * 1.25).clamp(30.0, 400.0);
+                    }
+                    // v52 R6: how much ONE wheel tick trims a note's
+                    // velocity (was hard-wired \u{b1}5).
+                    if ui
+                        .add(egui::DragValue::new(&mut self.roll_vel_step).range(1..=32).suffix(" vel"))
+                        .on_hover_text("Velocity change per wheel tick over a note \u{b7} wheel a note or its velocity bar")
+                        .changed()
+                    {
+                        self.save_config();
+                        self.status = format!(
+                            "wheel trims velocity \u{b1}{} per tick",
+                            self.roll_vel_step
+                        );
+                    }
                     // v38 R4: the preview button SHOWS the audition
                     // state — while anything is playing it reads STOP in
                     // red (was: a static green label whether or not audio
@@ -9378,13 +9558,122 @@ impl App {
         let snap = |t: f64| (t / step_sec).floor() * step_sec;
         let snap_up = |t: f64| (t / step_sec).ceil() * step_sec;
 
+        // v52 R6: numeric start/end/curve edits for the selected glide
+        // ("easy start and end point edits and curvature amounts").
+        let mut rbake = false;
+        let mut rdel = false;
+        // The row ALWAYS exists: an appearing/disappearing row shifts the
+        // canvas allocation one item over, and the canvas response id
+        // changing mid-drag silently kills in-flight gestures.
+        let sel_si = roll.sel_bend.filter(|i| *i < roll.pat.bend_segs.len());
+        ui.horizontal(|ui| {
+            if let Some(si) = sel_si {
+                let g = roll.pat.bend_segs[si];
+                let mut t0 = g.t0 as i32;
+                let mut v0 = g.v0;
+                let mut t1 = g.t1 as i32;
+                let mut v1 = g.v1;
+                let mut cv = g.curve;
+                ui.label(RichText::new("glide \u{b7}").weak().small());
+                if ui
+                    .add(egui::DragValue::new(&mut t0).range(0..=1_000_000).suffix(" t0"))
+                    .on_hover_text("Glide START (ticks)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v0)
+                            .range(-12.0..=12.0)
+                            .speed(0.25)
+                            .suffix(" st"),
+                    )
+                    .on_hover_text("Pitch at the START (semitones)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut t1).range(1..=1_000_000).suffix(" t1"))
+                    .on_hover_text("Glide END (ticks)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v1)
+                            .range(-12.0..=12.0)
+                            .speed(0.25)
+                            .suffix(" st"),
+                    )
+                    .on_hover_text("Pitch at the END (semitones)")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut cv).range(-100..=100).suffix(" curv"))
+                    .on_hover_text("Curvature: + bends EARLY (fast then settle), \u{2212} bends LATE")
+                    .changed()
+                {
+                    rbake = true;
+                }
+                if ui
+                    .small_button("del glide")
+                    .on_hover_text("Delete this glide")
+                    .clicked()
+                {
+                    rdel = true;
+                }
+                if rdel {
+                    roll.pat.bend_segs.remove(si);
+                    roll.sel_bend = None;
+                    roll.changed = true;
+                    self.status = "glide deleted".into();
+                } else if rbake {
+                    let g = &mut roll.pat.bend_segs[si];
+                    g.t0 = t0.max(0) as u32;
+                    g.v0 = v0;
+                    g.t1 = t1.max(1) as u32;
+                    g.v1 = v1;
+                    g.curve = cv;
+                    if g.t1 <= g.t0 {
+                        g.t1 = g.t0 + 1;
+                    }
+                    self.status = format!(
+                        "glide {:+.1}\u{2192}{:+.1} st \u{b7} curve {:+}",
+                        g.v0, g.v1, g.curve as i32
+                    );
+                    roll.pat.bake_bends();
+                    roll.changed = true;
+                }
+            } else {
+                ui.label(
+                    RichText::new("glide \u{b7} drag in the lane to draw one; Z-drag from a note")
+                        .weak()
+                        .small(),
+                );
+            }
+        });
         // ---- canvas (fills the rest of the window; the manual
         // scrollbars painted on its edges own their pixels) ----
         let avail = ui.available_size();
-        let (rect, resp) = ui.allocate_at_least(
-            egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
-            Sense::click_and_drag(),
-        );
+        // STABLE id: the canvas response id is location-hashed, and a
+        // widget-count change in the rows above this allocation swaps it
+        // — an in-flight drag then loses its response and silently dies
+        // (pinned the hard way by v52_roll_glide_endpoint_drag).
+        // push_id pins the id against layout churn above it; the readout
+        // row below additionally stays always-present for visual calm.
+        let (rect, resp) = ui
+            .push_id("roll_canvas_alloc", |ui| {
+                ui.allocate_at_least(
+                    egui::vec2(avail.x, (avail.y - 30.0).max(120.0)),
+                    Sense::click_and_drag(),
+                )
+            })
+            .inner;
         if rect.width() <= 2.0 || rect.height() <= 2.0 {
             roll.canvas_rect = Some(rect);
             return;
@@ -9601,6 +9890,114 @@ impl App {
         let in_grid = |pt: egui::Pos2| {
             pt.x >= grid_x0 && pt.x <= rect.max.x - SB && pt.y >= grid_top && pt.y <= grid_bot
         };
+        // v52 R6: expression lanes painted over the bottom of the grid
+        // (DAW lane language): a velocity strip (BAR HEIGHT = velocity,
+        // the "want height not horizontal" want — drag bars there) and a
+        // pitch-GLIDE lane holding editable segments (endpoints + a
+        // mid-curve dot), sharing the note grid's time axis. The glide
+        // lane maps \u{b1}12 st across its height.
+        const VEL_LANE_H: f32 = 30.0;
+        const BEND_LANE_H: f32 = 46.0;
+        // Lane bottoms ride the PREVIOUS frame's canvas bottom: the
+        // toolbar readout row shifts `rect` by one row, and the wheel
+        // router in `roll_pass` hit-tests against the same remembered
+        // `canvas_rect` — one coordinate system for every lane gesture.
+        let lane_bot = roll
+            .canvas_rect
+            .map_or(grid_bot, |cr| cr.max.y - SB);
+        let bend_lane = egui::Rect::from_min_max(
+            egui::pos2(grid_x0, lane_bot - BEND_LANE_H),
+            egui::pos2(rect.max.x - SB, lane_bot),
+        );
+        let vel_lane = egui::Rect::from_min_max(
+            egui::pos2(grid_x0, lane_bot - BEND_LANE_H - VEL_LANE_H),
+            egui::pos2(rect.max.x - SB, lane_bot - BEND_LANE_H),
+        );
+        let bend_c = (bend_lane.min.y + bend_lane.max.y) * 0.5;
+        let bend_amp = BEND_LANE_H * 0.42;
+        let y_of_st = |v: f32| bend_c - v / 12.0 * bend_amp;
+        let st_at = |y: f32| (((bend_c - y) / bend_amp) * 12.0).clamp(-12.0, 12.0);
+        let in_bend = |pt: egui::Pos2| bend_lane.contains(pt);
+        let in_vel = |pt: egui::Pos2| vel_lane.contains(pt);
+        {
+            painter.rect_filled(vel_lane, 0.0, Color32::from_gray(18));
+            painter.rect_filled(bend_lane, 0.0, Color32::from_gray(16));
+            for (idx, note) in roll.pat.notes.iter().enumerate() {
+                let x0 = x_of(t_of(note.start));
+                let x1 = x_of(t_of(note.start + note.len.max(1)));
+                if x1 < grid_x0 || x0 > rect.max.x {
+                    continue;
+                }
+                let h = note.vel as f32 / 127.0 * (VEL_LANE_H - 4.0);
+                let sel = roll.sel_notes.contains(&idx);
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0.max(grid_x0), vel_lane.max.y - 2.0 - h),
+                        egui::pos2(x1.max(x0 + 1.0), vel_lane.max.y - 2.0),
+                    ),
+                    1.0,
+                    if sel {
+                        Color32::from_rgb(250, 200, 50)
+                    } else {
+                        Color32::from_rgb(90, 160, 230)
+                    },
+                );
+            }
+            painter.line_segment(
+                [
+                    egui::pos2(bend_lane.min.x, bend_c),
+                    egui::pos2(bend_lane.max.x, bend_c),
+                ],
+                egui::Stroke::new(1.0, Color32::from_gray(70)),
+            );
+            painter.text(
+                egui::pos2(bend_lane.min.x + 3.0, bend_lane.min.y + 8.0),
+                egui::Align2::LEFT_TOP,
+                "glide lane \u{b7} drag = new glide \u{b7} Z-drag from a note glides to another",
+                egui::FontId::proportional(8.0),
+                Color32::from_gray(140),
+            );
+            let mut live_segs: Vec<(crate::midipat::BendSeg, bool)> = roll
+                .pat
+                .bend_segs
+                .iter()
+                .enumerate()
+                .map(|(i, g)| (*g, roll.sel_bend == Some(i)))
+                .collect();
+            if let Some(l) = roll.bend_live {
+                live_segs.push((l, true));
+            }
+            let mut tmp: Vec<crate::midipat::Bend> = Vec::new();
+            for (g, sel) in live_segs.iter() {
+                tmp.clear();
+                crate::midipat::bake_seg(g, 8, &mut tmp);
+                let col = if *sel {
+                    Color32::from_rgb(250, 200, 50)
+                } else {
+                    Color32::from_rgb(90, 220, 170)
+                };
+                for w in tmp.windows(2) {
+                    let a = egui::pos2(
+                        x_of(t_of(w[0].at)),
+                        y_of_st(crate::midipat::bend_to_st(w[0].val)),
+                    );
+                    let bq = egui::pos2(
+                        x_of(t_of(w[1].at)),
+                        y_of_st(crate::midipat::bend_to_st(w[1].val)),
+                    );
+                    painter.line_segment([a, bq], egui::Stroke::new(2.0, col));
+                }
+                let e0 = egui::pos2(x_of(t_of(g.t0)), y_of_st(g.v0));
+                let e1 = egui::pos2(x_of(t_of(g.t1)), y_of_st(g.v1));
+                let cc = (g.curve / 100.0).clamp(-1.0, 1.0);
+                let vc = g.v0 + (g.v1 - g.v0) * (0.5 + cc * 0.25);
+                let mc = egui::pos2(x_of(t_of(g.t0 + (g.t1 - g.t0) / 2)), y_of_st(vc));
+                for q in [e0, e1] {
+                    painter.circle_filled(q, 4.0, col);
+                }
+                painter.circle_filled(mc, 3.0, Color32::from_rgb(240, 150, 80));
+            }
+        }
         // Topmost note under a point (last drawn wins). Notes are
         // passed in as an arg so the helper borrows nothing mutable.
         let note_hit =
@@ -9617,6 +10014,62 @@ impl App {
                         .then_some((i, n0, n1))
                 })
             };
+        // v52 R6: glide/velocity lane hit tests — same no-borrow idiom
+        // as note_hit (the collection is an explicit argument).
+        let d2seg = |q: egui::Pos2, a: egui::Pos2, b: egui::Pos2| -> f32 {
+            let (abx, aby) = (b.x - a.x, b.y - a.y);
+            let l2 = (abx * abx + aby * aby).max(1e-6);
+            let t = (((q.x - a.x) * abx + (q.y - a.y) * aby) / l2).clamp(0.0, 1.0);
+            egui::vec2(a.x + abx * t - q.x, a.y + aby * t - q.y).length()
+        };
+        let bend_hit_at = |segs: &[crate::midipat::BendSeg],
+                           pt: egui::Pos2|
+         -> Option<(usize, u8)> {
+            let mut body = None;
+            for (i, g) in segs.iter().enumerate().rev() {
+                let e0 = egui::pos2(x_of(t_of(g.t0)), y_of_st(g.v0));
+                let e1 = egui::pos2(x_of(t_of(g.t1)), y_of_st(g.v1));
+                if (pt - e0).length() <= 7.0 {
+                    return Some((i, 0));
+                }
+                if (pt - e1).length() <= 7.0 {
+                    return Some((i, 1));
+                }
+                let cc = (g.curve / 100.0).clamp(-1.0, 1.0);
+                let vc = g.v0 + (g.v1 - g.v0) * (0.5 + cc * 0.25);
+                let mc = egui::pos2(x_of(t_of(g.t0 + (g.t1 - g.t0) / 2)), y_of_st(vc));
+                if (pt - mc).length() <= 7.0 {
+                    return Some((i, 2));
+                }
+                if body.is_none() {
+                    let mut tmp = Vec::new();
+                    crate::midipat::bake_seg(g, 8, &mut tmp);
+                    let mut best = f32::MAX;
+                    for w in tmp.windows(2) {
+                        let a = egui::pos2(
+                            x_of(t_of(w[0].at)),
+                            y_of_st(crate::midipat::bend_to_st(w[0].val)),
+                        );
+                        let bq = egui::pos2(
+                            x_of(t_of(w[1].at)),
+                            y_of_st(crate::midipat::bend_to_st(w[1].val)),
+                        );
+                        best = best.min(d2seg(pt, a, bq));
+                    }
+                    if best <= 5.0 {
+                        body = Some((i, 3));
+                    }
+                }
+            }
+            body
+        };
+        let vel_hit_at = |notes: &[crate::midipat::Note], pt: egui::Pos2| -> Option<usize> {
+            let sec = sec_at(pt.x);
+            notes.iter().enumerate().rev().find_map(|(i, n)| {
+                let s0 = t_of(n.start);
+                (sec >= s0 - 1e-6 && sec <= s0 + t_of(n.len.max(1)) + 1e-6).then_some(i)
+            })
+        };
         // v38 R5: MODE CURSOR — say what a press WILL do before
         // it happens: pointing hand over a note body (select /
         // drag; wheel trims velocity), side-arrows on an end cap
@@ -9681,6 +10134,22 @@ impl App {
             let mods = ui.input(|i| i.modifiers);
             // Right-click deletes the note under the cursor.
             if resp.secondary_clicked() && in_grid(pt) {
+                if in_bend(pt) {
+                    // v52 R6: right-click deletes a glide (same language
+                    // as deleting a note). Clearing the LAST glide must
+                    // also clear the baked events (bake skips empties).
+                    if let Some((i, _)) = bend_hit_at(&roll.pat.bend_segs, pt) {
+                        roll.pat.bend_segs.remove(i);
+                        if roll.pat.bend_segs.is_empty() {
+                            roll.pat.bends.clear();
+                        } else {
+                            roll.pat.bake_bends();
+                        }
+                        roll.sel_bend = None;
+                        roll.changed = true;
+                        self.status = "glide deleted".into();
+                    }
+                } else {
                 {
                     if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
                         let nm = note_name(roll.pat.notes[i].note);
@@ -9695,6 +10164,7 @@ impl App {
                         // v38 R6: the delete announces itself.
                         self.status = format!("deleted {nm} \u{b7} right-click");
                     }
+                }
                 }
             }
             // ---- press decides the gesture + selection ----
@@ -9711,6 +10181,97 @@ impl App {
             if press_now && matches!(roll.gesture, RollGesture::None) && in_grid(pt) {
                 let sec = sec_at(pt.x);
                 let row = (row_at(pt.y).clamp(0, 127)) as u8;
+                // v52 R6: the expression lanes own their bands.
+                if in_bend(pt) {
+                    match bend_hit_at(&roll.pat.bend_segs, pt) {
+                        Some((i, 0)) => {
+                            roll.sel_bend = Some(i);
+                            roll.gesture = RollGesture::BendEP { idx: i, end: 0 };
+                            self.status = "moving the glide start".into();
+                        }
+                        Some((i, 1)) => {
+                            roll.sel_bend = Some(i);
+                            roll.gesture = RollGesture::BendEP { idx: i, end: 1 };
+                            self.status = "moving the glide end".into();
+                        }
+                        Some((i, 2)) => {
+                            roll.sel_bend = Some(i);
+                            roll.gesture = RollGesture::BendCurve { idx: i };
+                            self.status =
+                                "curve drag \u{b7} up bends early, down bends late".into();
+                        }
+                        Some((i, _)) => {
+                            roll.sel_bend = Some(i);
+                            self.status =
+                                "glide selected \u{b7} drag a dot \u{b7} right-click deletes"
+                                    .into();
+                        }
+                        None => {
+                            let t0 = tick_of(snap(sec));
+                            let v0 = st_at(pt.y);
+                            roll.bend_live = Some(crate::midipat::BendSeg {
+                                t0,
+                                v0,
+                                t1: t0 + 1,
+                                v1: v0,
+                                curve: 0.0,
+                            });
+                            roll.sel_bend = None;
+                            roll.gesture = RollGesture::BendNew { t0, v0, src: None };
+                            self.status = "drawing a glide \u{b7} release to keep".into();
+                        }
+                    }
+                } else if in_vel(pt) {
+                    if let Some(i) = vel_hit_at(&roll.pat.notes, pt) {
+                        if !roll.sel_notes.contains(&i) {
+                            roll.sel_notes = vec![i];
+                            roll.sel_anchor = Some(i);
+                        }
+                        roll.gesture = RollGesture::VelDrag { idx: i };
+                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
+                            .clamp(0.0, 1.0)
+                            * 127.0)
+                            .round()
+                            .max(1.0) as u8;
+                        if roll.sel_notes.contains(&i) {
+                            let group: Vec<usize> = roll.sel_notes.clone();
+                            for s in group {
+                                if let Some(n) = roll.pat.notes.get_mut(s) {
+                                    n.vel = v;
+                                }
+                            }
+                        }
+                        if let Some(n) = roll.pat.notes.get_mut(i) {
+                            n.vel = v;
+                        }
+                        roll.changed = true;
+                    } else {
+                        roll.gesture = RollGesture::Marquee {
+                            from: pt,
+                            add: false,
+                        };
+                    }
+                } else if ui.input(|i| i.key_down(egui::Key::Z))
+                    && note_hit(&roll.pat.notes, pt).is_some()
+                {
+                    // Z-drag from a note: the glide LEAVES the note's end
+                    // at 0 st and (on release over another note) LANDS on
+                    // that note's pitch (Septabee-style note-to-note).
+                    let (idx, _, n1) = note_hit(&roll.pat.notes, pt).unwrap();
+                    let sp = roll.pat.notes[idx].note;
+                    let t0 = tick_of(n1);
+                    roll.bend_live = Some(crate::midipat::BendSeg {
+                        t0,
+                        v0: 0.0,
+                        t1: t0 + 1,
+                        v1: 0.0,
+                        curve: 0.0,
+                    });
+                    roll.sel_bend = None;
+                    roll.gesture = RollGesture::BendNew { t0, v0: 0.0, src: Some(sp) };
+                    self.status = "glide from the note end \u{b7} release over the target note"
+                        .into();
+                } else {
                 match note_hit(&roll.pat.notes, pt) {
                     Some((idx, n0, n1)) => {
                         let x1p = x_of(n1);
@@ -9843,6 +10404,7 @@ impl App {
                                 nm = note_name(row)
                             );
                             roll.changed = true;
+                            }
                         }
                     }
                 }
@@ -9919,6 +10481,60 @@ impl App {
                             roll.changed = true;
                         }
                     }
+                    RollGesture::BendNew { t0, v0, src: _ } => {
+                        if in_grid(pt) {
+                            let t1 = tick_of(snap(sec_at(pt.x))).max(t0 + 1);
+                            roll.bend_live = Some(crate::midipat::BendSeg {
+                                t0,
+                                v0,
+                                t1,
+                                v1: st_at(pt.y),
+                                curve: 0.0,
+                            });
+                        }
+                    }
+                    RollGesture::BendEP { idx, end } => {
+                        if let Some(g) = roll.pat.bend_segs.get_mut(idx) {
+                            let t = tick_of(snap(sec_at(pt.x)));
+                            let v = st_at(pt.y);
+                            if end == 0 {
+                                g.t0 = t.min(g.t1.saturating_sub(1));
+                                g.v0 = v;
+                            } else {
+                                g.t1 = t.max(g.t0 + 1);
+                                g.v1 = v;
+                            }
+                            roll.pat.bake_bends();
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::BendCurve { idx } => {
+                        if let Some(g) = roll.pat.bend_segs.get_mut(idx) {
+                            g.curve =
+                                ((bend_c - pt.y) / bend_amp * 100.0).clamp(-100.0, 100.0);
+                            roll.pat.bake_bends();
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::VelDrag { idx } => {
+                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
+                            .clamp(0.0, 1.0)
+                            * 127.0)
+                            .round()
+                            .max(1.0) as u8;
+                        if roll.sel_notes.contains(&idx) {
+                            let group: Vec<usize> = roll.sel_notes.clone();
+                            for s in group {
+                                if let Some(n) = roll.pat.notes.get_mut(s) {
+                                    n.vel = v;
+                                }
+                            }
+                        }
+                        if let Some(n) = roll.pat.notes.get_mut(idx) {
+                            n.vel = v;
+                        }
+                        roll.changed = true;
+                    }
                     RollGesture::Marquee { .. } => {} // painted live
                     RollGesture::None => {}
                 }
@@ -9959,6 +10575,34 @@ impl App {
                     }
                     roll.sel_anchor = roll.sel_notes.first().copied();
                     self.status = format!("selected {} note(s) by box", roll.sel_notes.len());
+                } else if let RollGesture::BendNew { src, .. } = roll.gesture {
+                    // v52 R6: keep the drawn glide. Released over a NOTE
+                    // (a Z-start glide), it LANDS there: ends at the
+                    // target's start, value = target pitch − source
+                    // pitch — Septabee's note-to-note portamento.
+                    if let Some(mut g) = roll.bend_live.take() {
+                        if let Some(sp) = src {
+                            let sec = sec_at(pt.x);
+                            if let Some(tn) = roll.pat.notes.iter().find(|n| {
+                                let s0 = t_of(n.start);
+                                sec >= s0 - 1e-6
+                                    && sec <= s0 + t_of(n.len.max(1)) + 1e-6
+                            }) {
+                                g.t1 = tick_of(t_of(tn.start)).max(g.t0 + 1);
+                                g.v1 = (tn.note as i32 - sp as i32) as f32;
+                            }
+                        }
+                        if g.t1 > g.t0 {
+                            roll.pat.bend_segs.push(g);
+                            roll.pat.bake_bends();
+                            roll.sel_bend = Some(roll.pat.bend_segs.len() - 1);
+                            roll.changed = true;
+                            self.status = format!(
+                                "glide {:+.1} st \u{b7} right-click it in the lane to delete",
+                                g.v1 - g.v0
+                            );
+                        }
+                    }
                 } else if was_move && roll.changed {
                     self.status = if was_fresh {
                         "note placed \u{b7} wheel over it = velocity".into()
@@ -10203,23 +10847,7 @@ impl App {
     /// (ties round down); crossfade blends the two nearest samples by
     /// inverse distance. OS/asset drops while this window is open add
     /// samples (routed centrally at the top of `ui_root`).
-    fn sampler_map_window(&mut self, ui: &mut egui::Ui, t: usize) {
-        // Guard: the window only exists while track t runs the sampler.
-        let Some(stem) = self.track_synth.get(t).cloned().flatten() else {
-            self.smap_win = None;
-            self.smap_release();
-            return;
-        };
-        let is_sampler = self
-            .synth_registry
-            .desc(&stem)
-            .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
-            .unwrap_or(false);
-        if !is_sampler {
-            self.smap_win = None;
-            self.smap_release();
-            return;
-        }
+    fn sampler_map_inline(&mut self, ui: &mut egui::Ui, t: usize) {
         // Release watchdog: a held map key must die with the mouse button
         // (the piano roll's own watchdog only runs while the ROLL is open).
         if self.smap_hold.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
@@ -10247,7 +10875,7 @@ impl App {
             let mut slots = Vec::new();
             let a = vals.first().copied().unwrap_or(0.0).round() as usize;
             if a < self.assets.len() && self.assets[a].pattern.is_none() {
-                slots.push(crate::config::SamplerSlotSave {
+                slots.push(crate::config::SamplerSlotSave { vel: 127,
                     asset: self.assets[a].path.to_string_lossy().into_owned(),
                     root: vals
                         .get(1)
@@ -10261,27 +10889,18 @@ impl App {
             self.push_sampler_map(t);
             self.save_config();
         }
-        let mut open = true;
-        let resp = egui::Window::new(format!("\u{266a} sampler map \u{b7} track {}", t + 1))
-            .id(egui::Id::new(("smapwin", t)))
-            .open(&mut open)
-            // Open wide enough that the lane rows never wrap (header cell +
-            // 49 keys); like the piano roll, size follows the viewport.
-            .default_pos(egui::pos2(60.0, 80.0))
-            .default_size({
-                let screen = ui.ctx().viewport_rect();
-                [(screen.width() - 80.0).clamp(760.0, 1180.0), 320.0_f32]
-            })
-            .min_width(300.0)
-            .min_height(150.0)
-            .show(ui, |ui| {
-                body_clipped(ui, |ui| self.smap_body(ui, t));
-            });
-        let _ = resp;
-        if !open {
-            self.smap_win = None;
-            self.smap_release();
-        }
+        // v52 R2: the map paints HERE, inside the sampler's own window —
+        // no separate popup. The fixed C2..C6 range is wider than any
+        // window, so the roll sits in a horizontal scroll; every drag
+        // reads the live (scrolled) lane/key rects, so geometry follows.
+        ui.label(
+            RichText::new("\u{266a} KEY MAP \u{b7} drag a lane block to its root key")
+                .strong()
+                .small(),
+        );
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.smap_body(ui, t));
     }
 
     /// The key-map window's body: header (mode/add/remove) + one lane row
@@ -10360,6 +10979,7 @@ impl App {
                                     .map(|s| (s.root as i32 + 7).clamp(24, 96) as u8)
                                     .unwrap_or(48);
                                 m.slots.push(crate::config::SamplerSlotSave {
+                                    vel: 127,
                                     asset: sp.clone(),
                                     root,
                                 });
@@ -10401,7 +11021,8 @@ impl App {
             RichText::new(
                 "drag a lane block onto a piano key \u{b7} or select a lane and click a key \
                  \u{b7} cutoff: zones switch at the midpoint, ties go DOWN \u{b7} crossfade: \
-                 the two nearest samples mix by inverse distance",
+                 the two nearest samples mix by inverse distance \u{b7} several lanes on ONE \
+                 key = velocity layers (the v value): cutoff switches, crossfade blends",
             )
             .weak()
             .small(),
@@ -10446,7 +11067,15 @@ impl App {
         for i in 0..n {
             let (name, root, resolved) = infos[i].clone();
             let sel = self.smap_sel == Some(i);
+            let cur_vel = self
+                .sampler_maps
+                .get(t)
+                .and_then(|o| o.as_ref())
+                .and_then(|m| m.slots.get(i))
+                .map(|s| s.vel)
+                .unwrap_or(127);
             let mut new_asset: Option<String> = None;
+            let mut new_vel: Option<u8> = None;
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(HDR_W, LANE_H),
@@ -10454,7 +11083,7 @@ impl App {
                     |ui| {
                         let cur = format!("#{} {}", i + 1, name);
                         egui::ComboBox::from_id_salt(("smapcombo", t, i))
-                            .width(HDR_W - 40.0)
+                            .width(HDR_W - 96.0)
                             .selected_text(RichText::new(cur).small())
                             .show_ui(ui, |ui| {
                                 for (k, nm) in &audio_assets {
@@ -10465,6 +11094,23 @@ impl App {
                                     }
                                 }
                             });
+                        // v52 R2: this slot's LAYER velocity. Several slots
+                        // on one key answer different velocity ranges.
+                        let mut vv = cur_vel as i32;
+                        let vr = ui.add_sized(
+                            [64.0, 18.0],
+                            egui::DragValue::new(&mut vv)
+                                .range(1..=127)
+                                .speed(2)
+                                .prefix("v\u{2009}")
+                                .suffix(" \u{2669}"),
+                        );
+                        if vr.changed() {
+                            new_vel = Some(vv.clamp(1, 127) as u8);
+                        }
+                        if vr.hovered() {
+                            ui.ctx().request_repaint();
+                        }
                         if ui
                             .add_sized(
                                 [18.0, 18.0],
@@ -10602,6 +11248,17 @@ impl App {
                     }
                 }
             }
+            if let Some(v) = new_vel {
+                if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                    if let Some(s) = m.slots.get_mut(i) {
+                        if s.vel != v {
+                            s.vel = v;
+                            self.push_sampler_map(t);
+                            self.save_config();
+                        }
+                    }
+                }
+            }
         }
         if n == 0 {
             ui.label(
@@ -10664,13 +11321,20 @@ impl App {
                 if !is_black(note) {
                     continue;
                 }
-                let x = kr.min.x + (k + 1) as f32 * KW - KW * 0.32;
+                // v52 R2: the black key sits CENTERED in its own column —
+                // the same column the lane block and note_at() use. (It
+                // used to straddle the next boundary, so selecting a key
+                // bound a note half a key away from what was painted.)
+                let x = kr.min.x + k as f32 * KW + KW * 0.18;
                 let r = egui::Rect::from_min_max(
                     egui::pos2(x, kr.min.y),
                     egui::pos2(x + KW * 0.64, kr.min.y + KEY_H * 0.6),
                 );
                 ui.painter()
                     .rect_filled(r, 1.0, egui::Color32::from_gray(28));
+                if note == 37 {
+                    self.smap_black_probe = Some(r);
+                }
             }
             // Selected slot's root marker.
             if let Some(i) = self.smap_sel.filter(|i| *i < n) {
@@ -10743,41 +11407,6 @@ impl App {
             .then_some(t)
     }
 
-    /// v18: apply an OS-drop batch to the live sampler on `t`: import
-    /// each audio file (rack dedup via `ensure_asset`) and swap the
-    /// patch — no restart, no re-pick. Kept status string identical to
-    /// the old in-window handler so existing pins hold.
-    fn sampler_files_dropped(&mut self, t: usize, paths: &[std::path::PathBuf]) {
-        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
-            return;
-        };
-        if !matches!(handle.as_ref(), SynthHandle::Script(_)) {
-            return;
-        }
-        let mut swapped: Option<usize> = None;
-        let mut rejected = 0usize;
-        for path in paths {
-            if !crate::assets::is_audio_file(path) {
-                rejected += 1;
-                continue; // midi/auto/unknown: not a sample
-            }
-            if let Some(k) = self.ensure_asset(path) {
-                self.sampler_set_asset(t, k);
-                swapped = Some(k);
-            }
-        }
-        match swapped.and_then(|k| self.assets.get(k).map(|a| a.name.clone())) {
-            Some(n) => self.status = format!("track {} sampler: {n} (dropped file)", t + 1),
-            None if rejected > 0 => {
-                self.status = format!(
-                    "sampler: dropped file{} not audio",
-                    if rejected == 1 { "" } else { "s" }
-                );
-            }
-            None => {}
-        }
-    }
-
     /// Auto sliders for a track's live synth instance (values ride the
     /// instance atomics, exactly like effect params).
     fn synth_sliders_window(&mut self, ui: &mut egui::Ui, t: usize) {
@@ -10795,11 +11424,24 @@ impl App {
             return;
         }
         let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
+        // v52 R2: the sampler's window now hosts the KEY MAP inline, so
+        // a FRESH sampler window opens wide enough for the C2..C6 roll
+        // (tracks the user resized keep their own rect and the roll
+        // scrolls inside them).
+        let is_sampler = self
+            .synth_registry
+            .desc(&stem)
+            .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            .unwrap_or(false);
         let mut open = true;
         let mut w = egui::Window::new(format!("\u{266a} {stem} \u{b7} track {}", t + 1))
             .id(egui::Id::new(("synthwin", t)))
             .open(&mut open)
-            .default_size([420.0, 430.0])
+            .default_size(if is_sampler {
+                [1150.0, 520.0]
+            } else {
+                [420.0, 430.0]
+            })
             .min_width(80.0)
             .min_height(70.0);
         if let Some(r) = self.dyn_rect(idx) {
@@ -10970,17 +11612,12 @@ impl App {
                     );
                 }
             }
-            // v51: the map editor for this track — a piano roll of lanes,
-            // drag each sample's block onto the key that is its root.
-            if ui.button("piano map \u{2026}").clicked() {
-                self.smap_win = Some(t);
-                self.smap_sel = None;
-            }
-            // v18: OS-level file drops (file manager → app while
-            // this window is open) are claimed CENTRALLY at the
-            // top of `ui_root` (one drain per frame, then the
-            // sampler swap via `sampler_files_dropped`); by the
-            // time this window paints the queue is already empty.
+
+            // v18/v52: OS-level file drops (file manager → app while
+            // this window is open) are claimed CENTRALLY at the top of
+            // `ui_root`: the sampler-window branch hands them to
+            // `sampler_map_files_dropped` (each file becomes a mapped
+            // slot); by the time this window paints the queue is empty.
             ui.separator();
         }
         for (k, pd) in desc.params.iter().enumerate() {
@@ -11012,6 +11649,12 @@ impl App {
                 dirty = true;
             }
         }
+        // v52 R2: the key map is part of the SAMPLER's main GUI, and the
+        // drum kit is NOT — it only shows for non-sampler plugins.
+        if sampler {
+            self.sampler_map_inline(ui, t);
+        }
+        if !sampler {
         // --- v30-batch-2: drum kit lives IN the plugin GUI ---------
         // (moved out of the synth picker; the pattern builder fires THESE pads).
         // The pattern builder ("Drums") fires THESE pads. The kit is
@@ -11212,6 +11855,7 @@ impl App {
             self.drum.ensure_rows(self.kit(t).len());
             self.save_config();
         }
+        } // v52 R2: end of the !sampler (drum kit) section
         if dirty {
             self.track_synth_params[t] = inst.values();
             self.save_config();
@@ -13951,14 +14595,12 @@ impl App {
             }
         }
         if !self.os_drops.is_empty() {
-            if let Some(t) = self.smap_win {
-                // v51: the open KEY-MAP window owns drops: every audio
-                // file becomes a mapped slot (rack-dedup).
+            if let Some(t) = self.sampler_editor_open() {
+                // v52 R2: the open SAMPLER window (now the one sampler
+                // GUI) owns drops: every audio file becomes a mapped
+                // slot (rack-dedup).
                 let paths = std::mem::take(&mut self.os_drops);
                 self.sampler_map_files_dropped(t, &paths);
-            } else if let Some(t) = self.sampler_editor_open() {
-                let paths = std::mem::take(&mut self.os_drops);
-                self.sampler_files_dropped(t, &paths);
             } else if let Some(t) = self.synth_win {
                 // v34 R5: the open SYNTHS window's drum kit pad rows are
                 // OS-drop targets too — the pad under the pointer adopts
@@ -14303,11 +14945,16 @@ impl App {
         if let Some(t) = sw {
             self.synth_sliders_window(ui, t);
         }
-        // v51: sampler key-map (piano roll) window.
-        let sm = self.smap_win;
-        if let Some(t) = sm {
-            self.sampler_map_window(ui, t);
+        // v52 R2: the key map lives in the sampler window now — when no
+        // sampler window is open its drag probe and any still-held
+        // audition note must die with it.
+        if self.sampler_editor_open().is_none()
+            && (self.smap_probe.is_some() || self.smap_hold.is_some())
+        {
+            self.smap_release();
+            self.smap_probe = None;
         }
+
         let sp = self.synth_pick;
         if let Some(t) = sp {
             synth_pick_window(ui, self, t);
@@ -14771,6 +15418,53 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     app.backend
                         .cmd(if on { Cmd::StopAll } else { Cmd::PlayAll });
                 }
+                // v52 R4: RECORD GROUP master — one click arms every grouped
+                // track with its OWN ticked sources; while any member is
+                // recording it becomes STOP GROUP and bounces them together.
+                {
+                    let mem: Vec<usize> = app.rec_group.clone();
+                    let any_rec = mem
+                        .iter()
+                        .copied()
+                        .any(|j| rec_group_member_active(app, j));
+                    let glbl = if any_rec { "STOP GROUP" } else { "REC GROUP" };
+                    let g_btn = egui::Button::new(
+                        RichText::new(glbl)
+                            .color(if mem.is_empty() {
+                                Color32::from_gray(110)
+                            } else if any_rec {
+                                Color32::from_rgb(255, 90, 90)
+                            } else {
+                                Color32::from_rgb(220, 180, 120)
+                            })
+                            .strong()
+                            .small(),
+                    )
+                    .min_size(egui::vec2(84.0, 0.0));
+                    let g_resp = ui.add(g_btn).on_hover_text(format!(
+                        "Record group: {} track(s) joined (select them with \
+                         'grp' on their strips). Click arms every member at \
+                         once, each with its own ticked sources; while any \
+                         member records, this STOPs them all together.",
+                        mem.len()
+                    ));
+                    if g_resp.clicked() && !mem.is_empty() {
+                        for &j in mem.iter() {
+                            // Stop pass: only bounce the members that ARE
+                            // recording; an idle member must not get armed
+                            // by a STOP click.
+                            if any_rec && !rec_group_member_active(app, j) {
+                                continue;
+                            }
+                            app.toggle_record_all(j);
+                        }
+                        app.status = format!(
+                            "record group: {} track(s) {}",
+                            mem.len(),
+                            if any_rec { "stopped" } else { "armed" }
+                        );
+                    }
+                }
                 ui.label(RichText::new(pos_label(app)).monospace());
 
                 // ---- metronome / grid tempo ----
@@ -14893,6 +15587,24 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             if ui
                                 .checkbox(&mut app.show_mixer, "mixer dock")
                                 .on_hover_text("Per-track mixer strips (grid-aligned).")
+                                .changed()
+                            {
+                                app.save_config();
+                            }
+                            // v52 R5: mixer dependent/independent of the main
+                            // GUI's tracks (uniform strip height + own scroll).
+                            if ui
+                                .checkbox(
+                                    &mut app.mixer_follow_tracks,
+                                    "mixer follows tracks",
+                                )
+                                .on_hover_text(
+                                    "On (default): while docked left/right the mixer \
+                                     mirrors the main GUI's track heights and scroll. \
+                                     Off: strips keep a uniform height, start at the \
+                                     panel top and scroll on their own — the mixer \
+                                     becomes its own view.",
+                                )
                                 .changed()
                             {
                                 app.save_config();
@@ -16053,7 +16765,16 @@ fn merge_host_hit(app: &App, pt: egui::Pos2, carried: usize) -> Option<usize> {
 /// tying those placements to the grid is what made it feel welded to the
 /// main GUI.
 fn mixer_independent(app: &App) -> bool {
-    !is_docked(app, 3) || dock_edge(app, 3) == 2
+    // v52 R5: the user can FORCE independence — then the mixer never
+    // mirrors the main GUI's track geometry, whatever the dock placement.
+    !app.mixer_follow_tracks || !is_docked(app, 3) || dock_edge(app, 3) == 2
+}
+/// v52 R4: is ANY record source live on track `j` (audio take / MIDI take /
+/// write automation)? Shared by the record-group master's label + pass.
+fn rec_group_member_active(app: &App, j: usize) -> bool {
+    app.backend.engine.rec_state_of(j) == TR_REC
+        || app.midi_rec[j].armed
+        || app.auto_rec[j].armed
 }
 fn def_w(idx: usize) -> f32 {
     match idx {
@@ -16065,14 +16786,16 @@ fn def_w(idx: usize) -> f32 {
         // wide. With the master controls gone (R4) the band collapsed to
         // 250 and every strip header row wrapped. Keep the COMFORTABLE
         // default explicitly; windows can still shrink freely by hand.
-        3 => 360.0,
+        // v52 R4 added the strip's group ('G') toggle — 360 then clipped
+        // the child-lane '+' off the row (pinned by v32_mixer_state_swaps).
+        3 => 390.0,
         _ => 440.0,
     }
 }
 fn def_h(idx: usize) -> f32 {
     match idx {
         2 => 240.0,
-        3 => 620.0,
+        3 => 390.0,
         _ => 640.0,
     }
 }
@@ -19680,7 +20403,15 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
         base.max,
     ));
     for t in 0..app.n_tracks {
-        let th = app.track_h(t);
+        // v52 R5: on the independent path the strips keep a UNIFORM
+        // mixer-owned height — the main GUI's track heights (which follow
+        // lane counts and per-track resizes) are not mirrored. `tied`
+        // preserves the historic grid-aligned behavior exactly.
+        let th = if tied {
+            app.track_h(t)
+        } else {
+            LANE_H.max(TRACK_MIN_H)
+        };
         if y + th >= base.min.y && y <= base.max.y {
             let r =
                 egui::Rect::from_min_size(egui::pos2(base.min.x, y), egui::vec2(base.width(), th));
@@ -19749,6 +20480,41 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         {
             app.toggle_record_all(t);
         }
+        // v52 R4: RECORD GROUP membership. Joined tracks are armed/stopped
+        // together by the top-bar master; the loop ("l") selector is LINKED
+        // across members — joining inherits the oldest member's value, a
+        // toggle on any member mirrors to all. The other selectors stay
+        // independent.
+        let mut grp = app.rec_group.contains(&t);
+        let grp_resp = ui
+            .checkbox(&mut grp, "G")
+            .on_hover_text(
+                "Record group: joined tracks arm and stop TOGETHER from the \
+                 top-bar 'REC GROUP' button. The loop ('l') selector is shared \
+                 across members: joining inherits it from the first member, \
+                 toggling it mirrors to all. The other source selectors stay \
+                 per-track.",
+            );
+        if grp_resp.changed() {
+            if grp {
+                if let Some(old) = app.rec_group.first().copied() {
+                    app.rec_src[t].loop_rec = app.rec_src[old].loop_rec;
+                }
+                app.rec_group.push(t);
+                app.status = format!(
+                    "record group: track {} joins — {} track(s) selected",
+                    t + 1,
+                    app.rec_group.len()
+                );
+            } else {
+                app.rec_group.retain(|&j| j != t);
+                app.status = format!(
+                    "record group: track {} leaves — {} track(s) selected",
+                    t + 1,
+                    app.rec_group.len()
+                );
+            }
+        }
         let mut src = app.rec_src[t];
         let ac = ui
             .checkbox(&mut src.audio, "a")
@@ -19791,6 +20557,15 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             );
         if ac.changed() || pc.changed() || lc.changed() || mc.changed() || xc.changed() {
             app.rec_src[t] = src;
+            // v52 R4: loop ("l") is the LINKED selector — while several
+            // tracks are grouped, toggling it on one member sets it on all.
+            if lc.changed() && app.rec_group.len() > 1 && app.rec_group.contains(&t) {
+                for &j in app.rec_group.iter() {
+                    if j != t {
+                        app.rec_src[j].loop_rec = src.loop_rec;
+                    }
+                }
+            }
             app.save_config();
         }
         // v32: reserved slot — "on"↔"mute" must not move the strip.
@@ -20280,6 +21055,8 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 focused: true,
                 win_rect: None,
                 edit_asset: edit,
+                sel_bend: None,
+                bend_live: None,
             }));
         }
         ui.label(RichText::new("grid:").strong());
@@ -22228,6 +23005,28 @@ fn grid_context_menu(
             app.open_auto_editor(Some(clips[ci].0.asset as usize));
             ui.close();
         }
+        // v52 R1: "Edit sample" reaches an audio clip from the ARRANGEMENT
+        // too (was rack-only). Same key = the asset path, so the editor
+        // edits THAT specific asset live, exactly like the rack entry —
+        // and "save as new asset" in the editor still mints a copy.
+        if app
+            .assets
+            .get(clips[ci].0.asset as usize)
+            .is_some_and(|a| !a.is_midi() && !a.is_auto())
+            && ui
+                .button("Edit sample")
+                .on_hover_text("reverse, ping-pong, fades, pitch, bend, time stretch \u{b7} \
+                     edits apply to this asset across the project; save-as keeps the original")
+                .clicked()
+        {
+            if let Some(a) = app.assets.get(clips[ci].0.asset as usize) {
+                let key = a.path.to_string_lossy().into_owned();
+                let nm = a.name.clone();
+                app.sample_edit_win = Some(key);
+                app.se_name = format!("{nm} (edit)");
+            }
+            ui.close();
+        }
         ui.separator();
     } else {
         let has = app.clipboard.is_some();
@@ -23936,6 +24735,19 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.save_config();
                 }
                 if ui.checkbox(&mut app.show_mixer, "mixer dock").changed() {
+                    app.save_config();
+                }
+                // v52 R5: dependent (default) / independent mixer layout.
+                if ui
+                    .checkbox(&mut app.mixer_follow_tracks, "mixer follows tracks")
+                    .on_hover_text(
+                        "On (default): while docked left/right the mixer mirrors \
+                         the main GUI's track heights and scroll. Off: strips keep \
+                         a uniform height and scroll on their own — the mixer \
+                         becomes its own view.",
+                    )
+                    .changed()
+                {
                     app.save_config();
                 }
                 if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
@@ -29785,7 +30597,7 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         // No map yet (never opened) — the engine still runs legacy params.
         assert!(app.sampler_maps[0].is_none(), "unopened track has no map");
-        app.smap_win = Some(0);
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
         let seeded = app.sampler_maps[0].clone().expect("open seeds a map");
         assert_eq!(seeded.mode, 0, "default mode is hard cutoff");
@@ -29830,10 +30642,13 @@ mod tests {
                 "map window must paint {needle:?} exactly once, got: {g:?}"
             );
         }
-        // Guard: a NON-sampler track can't keep the window open.
+        // Guard: a NON-sampler track can't keep the map editor alive.
         app.set_track_synth_stem(0, "piano");
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.smap_win, None, "window closes when the sampler unbinds");
+        assert!(
+            app.smap_probe.is_none(),
+            "map editor is gone when the sampler unbinds"
+        );
     }
 
     /// v51: "+ add sample" appends a lane (selected asset, root +7) and
@@ -29864,7 +30679,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        app.smap_win = Some(0);
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.sampler_maps[0].as_ref().unwrap().slots.len(), 1);
         let add = galley_at(&mut app, &ctx, "+ add sample")
@@ -29938,7 +30753,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        app.smap_win = Some(0);
+        app.synth_win = Some(0);
         frame(&mut app, &ctx, vec![]);
         let seeded = app.sampler_maps[0].clone().expect("open seeds");
         assert_eq!((seeded.slots.len(), seeded.slots[0].root), (1, 48));
@@ -30008,7 +30823,7 @@ mod tests {
         assert!(exists, "map published");
         let kick = app.assets.iter().position(|a| a.name == "kick").unwrap() as u32;
         assert!(
-            slots.iter().any(|(a, r)| *a == kick && *r == 40),
+            slots.iter().any(|(a, r, _v)| *a == kick && *r == 40),
             "engine map must carry kick@40, got {slots:?}"
         );
     }
@@ -30899,18 +31714,26 @@ mod tests {
             24_000,
             "dropped file decoded at 48 k"
         );
-        let inst = match app.track_synth_inst[0].as_deref() {
+        // v52 R2 contract change: a drop on the sampler is NO LONGER a
+        // single-patch swap — every dropped audio file becomes a KEY MAP
+        // slot (multiple samples per note, velocity layers), and the live
+        // instance follows the map, not the old patch-picker param.
+        let _inst = match app.track_synth_inst[0].as_deref() {
             Some(SynthHandle::Script(i)) => i.clone(),
             _ => panic!("sampler instance gone"),
         };
-        assert_eq!(
-            inst.values()[0] as usize,
-            1,
-            "live patch switched to the dropped file"
+        let map = app.sampler_maps[0]
+            .as_ref()
+            .expect("a drop seeds the track's key map");
+        assert_eq!(map.slots.len(), 1, "the dropped file became a map slot");
+        assert!(
+            map.slots[0].asset.contains("zap"),
+            "slot points at the new asset: {}",
+            map.slots[0].asset
         );
         assert!(
-            app.status.contains("zap"),
-            "status names the dropped patch: {}",
+            app.status.contains("sampler map"),
+            "status reports the map insert: {}",
             app.status
         );
     }
@@ -31647,6 +32470,8 @@ mod tests {
             focused: false,
             win_rect: None,
             edit_asset: None,
+            sel_bend: None,
+            bend_live: None,
         }));
         frame(&mut app, &ctx, vec![]);
         assert_eq!(win_count(&app), 6, "roll slot registered");
@@ -31904,6 +32729,8 @@ mod tests {
             focused: true,
             win_rect: None,
             edit_asset: Some(a3),
+            sel_bend: None,
+            bend_live: None,
         }));
         frame(&mut app, &ctx, vec![]);
         app.remove_asset_at(0);
@@ -41214,5 +42041,849 @@ mod tests {
             app.proj_name, "demo",
             "import must go through the existing pipeline"
         );
+    }
+
+    // ---- v52 R1: "Edit sample" on ARRANGEMENT audio clips ---------------
+
+    /// The grid clip menu carries "Edit sample" for an audio clip and the
+    /// click opens the sample editor keyed to THAT clip's asset path.
+    #[test]
+    fn v52_track_edit_sample_opens() {
+        let mut app = headless_app("v52se1");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        let es = galley_centers(&mut app, &ctx, "Edit sample", true);
+        assert!(!es.is_empty(), "audio clip menu offers Edit sample");
+        click_pt(&mut app, &ctx, es[0]);
+        frame(&mut app, &ctx, vec![]);
+        let key = app.assets[a as usize].path.to_string_lossy().into_owned();
+        assert_eq!(
+            app.sample_edit_win.as_deref(),
+            Some(key.as_str()),
+            "editor opened for the CLIP's asset"
+        );
+        assert_eq!(
+            app.se_name,
+            format!("{} (edit)", app.assets[a as usize].name),
+            "save-as default name pre-filled"
+        );
+    }
+
+    /// MIDI and automation clips must NOT offer the sample editor.
+    #[test]
+    fn v52_track_edit_sample_hidden_for_midi() {
+        use crate::assets::Asset;
+        use crate::midipat::{Note, Pattern, PPQ};
+        let mut app = headless_app("v52se2");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let mut pat = Pattern::new(120);
+        pat.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: PPQ as u32,
+        });
+        let m = app.assets.len() as u32;
+        app.assets.push(Asset::midi(
+            m,
+            "patone".into(),
+            std::path::PathBuf::new(),
+            std::sync::Arc::new(pat),
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(m, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        assert!(
+            galley_centers(&mut app, &ctx, "Edit sample", true).is_empty(),
+            "MIDI clip menu must not offer Edit sample"
+        );
+    }
+
+    // ---- v52 R3: drum window "commit to track" ---------------------------
+
+    /// Click-driven: with a rack sound on a pad and hits painted, clicking
+    /// "commit to track" IN THE WINDOW stamps one clip per hit (the model
+    /// call was pinned since v29 — this pins the button path itself).
+    #[test]
+    fn v52_drum_commit_button_stamps() {
+        let mut app = headless_app("v52drum");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap();
+        // Assign the sound to pad 0 of track 0's kit (combobox equivalent)
+        // and paint three hits on its row.
+        app.kit_mut(0)[0].asset_path = kick.to_string_lossy().into_owned();
+        app.drum_resolve();
+        assert_eq!(app.kit(0)[0].asset, Some(a), "pad 0 resolves the rack asset");
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.drum.grid.is_empty() && app.drum.grid[0].len() >= 9);
+        app.drum.grid[0][0] = 110;
+        app.drum.grid[0][2] = 90;
+        app.drum.grid[0][8] = 70;
+        frame(&mut app, &ctx, vec![]);
+        let before = clip_ids(&app).len();
+        click_exact(&mut app, &ctx, "commit to track");
+        frame(&mut app, &ctx, vec![]);
+        let after = clip_ids(&app);
+        assert!(
+            after.len() >= before + 3,
+            "commit must stamp 3 clips: before={before} after={after:?}"
+        );
+        assert!(
+            after.iter().any(|(t, _, _, _)| *t == app.drum.track),
+            "clips land on the drum window's target track: {after:?}"
+        );
+        assert!(
+            app.status.contains("committed"),
+            "the click must answer: {}",
+            app.status
+        );
+        // v52 R3: the result announces itself — stamped clips selected, and
+        // the target track becomes the selected track.
+        assert!(
+            !app.sel_clips.is_empty()
+                && app.sel_clips.iter().all(|(t, _, _)| *t == app.drum.track),
+            "stamped clips must be selected: {:?}",
+            app.sel_clips
+        );
+        assert_eq!(app.selected, app.drum.track, "target track selected");
+    }
+
+    /// A commit pressed on an EMPTY pattern must answer with a popup, not
+    /// just the (historically missed) status line — and OK dismisses it.
+    #[test]
+    fn v52_drum_commit_empty_shows_popup() {
+        let mut app = headless_app("v52dpop");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.drum.grid.iter().flatten().filter(|&&v| v > 0).count(),
+            0,
+            "fresh app must start with an empty pattern"
+        );
+        click_exact(&mut app, &ctx, "commit to track");
+        assert!(
+            app.drum_commit_note.is_some(),
+            "an empty commit must not pass silently"
+        );
+        let note = app.drum_commit_note.clone().unwrap();
+        assert!(note.contains("pattern is empty"), "explains itself: {note}");
+        click_last(&mut app, &ctx, "OK");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.drum_commit_note.is_none(), "OK dismisses the popup");
+    }
+
+    /// Hits on SILENT pads must be counted and explained, never dropped in
+    /// silence (the pad had no sound at commit time).
+    #[test]
+    fn v52_drum_commit_silent_pads_explained() {
+        let mut app = headless_app("v52dsil");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        app.drum.grid[0][0] = 100;
+        app.drum.grid[0][4] = 80;
+        // pad 0 deliberately has NO asset_path -> both hits are silent.
+        click_exact(&mut app, &ctx, "commit to track");
+        assert!(
+            clip_ids(&app).is_empty(),
+            "silent hits must not stamp clips"
+        );
+        let note = app.drum_commit_note.clone().unwrap_or_default();
+        assert!(
+            note.contains("2 hit(s)") && note.contains("no sound"),
+            "the popup must count the dropped hits: {note}"
+        );
+    }
+
+    /// A REAL click on a grid cell toggles the hit AND the pattern lands in
+    /// config.json — the whole paint -> dirty -> save chain, end to end.
+    /// (The historic grid in the user's config held zero hits across every
+    /// backup: nothing ever proved a painted hit survives.)
+    #[test]
+    fn v52_drum_paint_click_persists() {
+        let mut app = headless_app("v52dpnt");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let cell = app
+            .drum_probe
+            .iter()
+            .find(|(p, s, _)| *p == 0 && *s == 3)
+            .map(|(_, _, r)| *r);
+        let r = cell.expect("grid cell (0,3) must be painted with a probe rect");
+        click_pt(&mut app, &ctx, r.center());
+        assert!(app.drum.grid[0][3] > 0, "clicking a cell paints a hit");
+        let cfg_path = std::path::Path::new(&std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("slooper")
+            .join("config.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert!(
+            cfg["drum"]["grid"][0][3].as_i64().unwrap_or(0) > 0,
+            "the painted hit must reach config.json: {}",
+            cfg["drum"]["grid"][0]
+        );
+        // Toggle off, then the persisted copy must follow.
+        let r2 = app
+            .drum_probe
+            .iter()
+            .find(|(p, s, _)| *p == 0 && *s == 3)
+            .map(|(_, _, r)| *r)
+            .expect("cell repaints");
+        click_pt(&mut app, &ctx, r2.center());
+        assert_eq!(app.drum.grid[0][3], 0, "click again clears the hit");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            cfg["drum"]["grid"][0][3].as_i64(),
+            Some(0),
+            "the cleared hit must follow in config.json"
+        );
+    }
+
+    // ---- v52 R4: multi-track recording ----------------------------------
+
+    /// Two strips joined via real "grp" clicks; the top-bar "REC GROUP"
+    /// master arms BOTH members at once and flips to "STOP GROUP", which
+    /// bounces them together. (The audio take itself arms engine-side —
+    /// pinned in audio/mod.rs; NULL audio never drains the Cmd queue.)
+    #[test]
+    fn v52_rec_multi_select_master() {
+        let mut app = headless_app("v52rec1");
+        let ctx = egui::Context::default();
+        app.sample_rate = 48_000; // null audio never sends Evt::Ready
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.rec_src[0] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: true,
+            auto: false,
+        };
+        app.rec_src[1] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: true,
+            auto: false,
+        };
+        // Join tracks 1 and 2 with real strip clicks.
+        let g = galley_centers(&mut app, &ctx, "G", true);
+        assert!(g.len() >= 2, "every strip carries a group checkbox");
+        click_pt(&mut app, &ctx, g[0]);
+        let g = galley_centers(&mut app, &ctx, "G", true);
+        click_pt(&mut app, &ctx, g[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rec_group, vec![0, 1], "two tracks selected for recording");
+        // The master arms both at once.
+        click_last(&mut app, &ctx, "REC GROUP");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.midi_rec[0].armed && app.midi_rec[1].armed,
+            "one click must arm every member"
+        );
+        assert!(app.status.contains("armed"), "{}", app.status);
+        // While a member records, the master is STOP GROUP and stops all.
+        let s = galley_centers(&mut app, &ctx, "STOP GROUP", true);
+        assert!(!s.is_empty(), "master flips to STOP GROUP while recording");
+        click_pt(&mut app, &ctx, s[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.midi_rec[0].armed && !app.midi_rec[1].armed,
+            "one click must stop every member"
+        );
+    }
+
+    /// The loop ("l") selector is LINKED across members: joining inherits
+    /// the oldest member's value, and a toggle on any member mirrors to
+    /// all — while tracks OUTSIDE the group stay independent.
+    #[test]
+    fn v52_rec_loop_link_inherit() {
+        let mut app = headless_app("v52reclink");
+        let ctx = egui::Context::default();
+        app.sample_rate = 48_000;
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.rec_src[0].loop_rec = true;
+        let g = galley_centers(&mut app, &ctx, "G", true);
+        click_pt(&mut app, &ctx, g[0]);
+        let g = galley_centers(&mut app, &ctx, "G", true);
+        click_pt(&mut app, &ctx, g[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.rec_src[1].loop_rec,
+            "joining inherits the oldest member's loop value"
+        );
+        assert!(
+            !app.rec_src[2].loop_rec,
+            "a track outside the group never follows"
+        );
+        // Untick loop on the SECOND member -> mirrors to the first.
+        let ls = galley_centers(&mut app, &ctx, "l", true);
+        assert!(ls.len() >= 3, "one loop checkbox per strip");
+        click_pt(&mut app, &ctx, ls[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.rec_src[1].loop_rec, "unticked on the member itself");
+        assert!(!app.rec_src[0].loop_rec, "mirrored to every member");
+        // Re-tick from the OTHER member -> mirrors again.
+        let ls = galley_centers(&mut app, &ctx, "l", true);
+        click_pt(&mut app, &ctx, ls[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.rec_src[0].loop_rec && app.rec_src[1].loop_rec,
+            "loop re-ticked from one member mirrors to all"
+        );
+        // An independent selector (audio 'a') must NOT mirror: default mix
+        // is audio-ON, so unticking it on one member leaves the other ON.
+        assert!(app.rec_src[0].audio && app.rec_src[1].audio, "default mix: audio on");
+        let as_ = galley_centers(&mut app, &ctx, "a", true);
+        click_pt(&mut app, &ctx, as_[1]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.rec_src[0].audio, "member 0 keeps its audio tick");
+        assert!(!app.rec_src[1].audio, "audio is NOT the linked selector");
+    }
+
+    // ---- v52 R5: mixer dependent / independent --------------------------
+
+    /// Default = dependent (today's behavior preserved). Toggling
+    /// "mixer follows tracks" OFF makes a LEFT-docked mixer independent —
+    /// and the choice round-trips through config.
+    #[test]
+    fn v52_mixer_follow_default() {
+        let mut app = headless_app("v52mxfl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.mixer_follow_tracks, "default: dependent (current behavior)");
+        // Left-docked + follow ON = tied to the grid (v34 behavior intact).
+        app.side_wins.dock[3] = [1, 0, 0];
+        assert!(!mixer_independent(&app), "left dock + follow = tied");
+        // Flip OFF through the real settings checkbox.
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "mixer follows tracks").expect("R5 checkbox");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.mixer_follow_tracks, "checkbox flips independence");
+        assert!(
+            mixer_independent(&app),
+            "left dock + NO follow = independent layout"
+        );
+        // Persisted.
+        let b = App::new(Backend::start());
+        assert!(!b.mixer_follow_tracks, "independent mixer round-trips config");
+    }
+
+    /// Independent geometry: strips keep a UNIFORM height even when a track
+    /// grew extra child lanes, while follow-ON keeps mirroring the grid.
+    #[test]
+    fn v52_mixer_independent_geometry() {
+        let mut app = headless_app("v52mxgeo");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.side_wins.dock[3] = [1, 0, 0];
+        // Grow track 1 to three child lanes: its grid row (and therefore
+        // a FOLLOWING strip) gets taller — a normal row is one lane tall.
+        let base_h = app.track_h(0);
+        app.arr.add_lane(0);
+        app.arr.add_lane(0);
+        let tall_h = app.track_h(0);
+        assert!(tall_h > base_h, "child lanes grew track 1's row");
+        // HOLD the pointer over the docked mixer (a docked panel that is
+        // NOT hovered is memo-skipped, so strips paint no galleys).
+        let probe = egui::pos2(150.0, 90.0);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![moved(probe)]);
+        }
+        let t1 = galley_centers(&mut app, &ctx, "Track 1", true)
+            .first()
+            .copied()
+            .expect("strip 1 paints");
+        let t2 = galley_centers(&mut app, &ctx, "Track 2", true)
+            .first()
+            .copied()
+            .expect("strip 2 paints");
+        let pitch_tied = t2.y - t1.y;
+        assert!(
+            (pitch_tied - (tall_h + TRACK_SEP_HIT)).abs() < 2.0,
+            "follow ON mirrors the tall grid row: pitch {pitch_tied} vs {}",
+            tall_h + TRACK_SEP_HIT
+        );
+        // Independent: uniform mixer-owned height instead.
+        app.mixer_follow_tracks = false;
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![moved(probe)]);
+        }
+        let t1 = galley_centers(&mut app, &ctx, "Track 1", true)
+            .first()
+            .copied()
+            .expect("strip 1 paints");
+        let t2 = galley_centers(&mut app, &ctx, "Track 2", true)
+            .first()
+            .copied()
+            .expect("strip 2 paints");
+        let pitch_free = t2.y - t1.y;
+        assert!(
+            (pitch_free - (96.0 + TRACK_SEP_HIT)).abs() < 2.0,
+            "independent strips are uniform: pitch {pitch_free}"
+        );
+    }
+
+    /// v52 R2: the key map is BUILT INTO the sampler window (no popup
+    /// title anywhere), the DRUM KIT does not show for the sampler but
+    /// still does for other plugins, clicking a BLACK KEY's painted
+    /// center binds that black key (the alignment fix), and a slot's
+    /// velocity reaches the live engine map.
+    #[test]
+    fn v52_sampler_inline_map_kit_gating_blackkey_velocity() {
+        let mut app = headless_app("v52map");
+        let ctx = egui::Context::default();
+        for _ in 0..800 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.assets.iter().any(|a| a.name == "kick") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        app.set_track_synth_stem(0, "sampler");
+        frame(&mut app, &ctx, vec![]);
+        let kick = galley_at(&mut app, &ctx, "kick").expect("kick rack row");
+        for ev in [
+            vec![moved(kick.center())],
+            vec![
+                moved(kick.center()),
+                btn(kick.center(), egui::PointerButton::Primary, true),
+            ],
+            vec![btn(kick.center(), egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        for _ in 0..1200 {
+            frame(&mut app, &ctx, vec![]);
+            logic_tick(&mut app);
+            if app.synth_registry.desc("sampler").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        app.synth_win.expect("window open");
+        let galleys = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let g: Vec<String> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        return Some(t.galley.text().to_string());
+                    }
+                    None
+                })
+                .collect();
+            out.textures_delta.clear();
+            g
+        };
+        let g = galleys(&mut app, &ctx);
+        assert!(
+            g.iter().any(|s| s.contains("KEY MAP")),
+            "the inline KEY MAP section must paint, got {g:?}"
+        );
+        assert!(
+            !g.iter().any(|s| s.contains("sampler map")),
+            "the separate sampler-map popup must be gone, got {g:?}"
+        );
+        assert!(
+            !g.iter().any(|s| s.contains("DRUM KIT")),
+            "the drum kit must NOT be part of the sampler, got {g:?}"
+        );
+        assert!(
+            g.iter().any(|s| s.contains("127")),
+            "the default slot must show its velocity layer value, got {g:?}"
+        );
+        // The PAINTED black key (first = C#2/37) must sit centered in
+        // its own column — the exact column note_at() binds — else the
+        // selection visibly trails the keys by half a key (the bug).
+        let (kx, _ky, lx, ly, _rw) = app.smap_probe.expect("map painted");
+        let bk = app.smap_black_probe.expect("black key painted");
+        let want_c = kx + (37 - 36) as f32 * 18.0 + 9.0;
+        assert!(
+            (bk.center().x - want_c).abs() < 1.0,
+            "black key must be centered in its note column: {} vs {want_c}",
+            bk.center().x
+        );
+        // Black-key click: C#3 = 49 (is_black), click its painted CENTER
+        // (column center — where the fixed black key now sits).
+        // Select lane 0 via its background strip.
+        let sel_pt = egui::pos2(lx + 5.0, ly + 12.0);
+        for ev in [
+            vec![moved(sel_pt)],
+            vec![moved(sel_pt), btn(sel_pt, egui::PointerButton::Primary, true)],
+            vec![btn(sel_pt, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(app.smap_sel, Some(0), "lane strip click selects");
+        let kp = egui::pos2(kx + (49 - 36) as f32 * 18.0 + 9.0, _ky + 10.0);
+        for ev in [
+            vec![moved(kp)],
+            vec![moved(kp), btn(kp, egui::PointerButton::Primary, true)],
+            vec![btn(kp, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(
+            app.sampler_maps[0].as_ref().unwrap().slots[0].root,
+            49,
+            "clicking a black key's painted center must bind THAT key"
+        );
+        // Velocity rides to the live engine map.
+        app.sampler_maps[0].as_mut().expect("map present").slots[0].vel = 45;
+        app.push_sampler_map(0);
+        let inst = app.track_synth_inst[0].clone().expect("bound instance");
+        let SynthHandle::Script(si) = inst.as_ref() else {
+            panic!("script handle expected");
+        };
+        let (slots, _mode, exists) = si.map_snapshot();
+        assert!(exists);
+        assert!(
+            slots.iter().any(|(_a, r, v)| *r == 49 && *v == 45),
+            "engine map must carry root 49 @ vel 45, got {slots:?}"
+        );
+        // A NON-sampler plugin keeps its drum kit.
+        app.set_track_synth_stem(1, "piano");
+        frame(&mut app, &ctx, vec![]);
+        app.synth_win = Some(1);
+        frame(&mut app, &ctx, vec![]);
+        let g = galleys(&mut app, &ctx);
+        assert!(
+            g.iter().any(|s| s.contains("DRUM KIT")),
+            "non-sampler plugins keep the drum kit, got {g:?}"
+        );
+    }
+
+    // ================= v52 R6: glide lane, velocity lane, roll knobs ====
+    //
+    // The piano roll gained native pitch GLIDES (editable segments baked
+    // to MIDI pitch-bend), a drag-anywhere velocity lane, a configurable
+    // wheel step, zoom buttons and an octave nudge. Pins below.
+
+    /// Shared rig: an open roll on a cleared canvas with pinned geometry.
+    /// Returns the canvas rect plus the closures' constants the test math
+    /// repeats (grid_x0 offset 58, bottom bar 10, lanes 30+46).
+    fn v52_roll_rig(app: &mut App, ctx: &egui::Context) -> egui::Rect {
+        clear_canvas(app);
+        let canvas = open_roll_headless(app, ctx);
+        assert!(canvas.width() > 300.0, "roll canvas exists");
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.px_per_beat = 160.0;
+            r.scroll_sec = 0.0;
+            r.vscroll_px = 500.0;
+            r.pat.notes.clear();
+            r.pat.bends.clear();
+            r.pat.bend_segs.clear();
+            r.sel_notes.clear();
+            r.sel_bend = None;
+        }
+        frame(app, ctx, vec![]);
+        painted_rect(app, ctx, (22, 22, 26)).expect("canvas after pinning")
+    }
+
+    #[test]
+    fn v52_roll_glide_lane_drag_creates_baked_glide() {
+        let mut app = headless_app("v52glidelane");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        let lane_mid = bot - 23.0; // bend lane = bottom 46 px
+        let a = egui::pos2(grid_x0 + 80.0, lane_mid);
+        let b = egui::pos2(grid_x0 + 320.0, lane_mid - 10.0);
+        frame(&mut app, &ctx, vec![moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(&mut app, &ctx, vec![moved(b), btn(b, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let r = app.piano_roll.as_ref().unwrap();
+        assert_eq!(r.pat.bend_segs.len(), 1, "one glide drawn");
+        assert!(r.pat.bend_segs[0].t1 > r.pat.bend_segs[0].t0, "has length");
+        assert!(
+            r.pat.bend_segs[0].v1 > r.pat.bend_segs[0].v0,
+            "dragged UP = rising pitch ({} -> {})",
+            r.pat.bend_segs[0].v0,
+            r.pat.bend_segs[0].v1
+        );
+        assert!(!r.pat.bends.is_empty(), "baked to pitch-bend events");
+        assert!(app.status.contains("glide"), "status echoes: {}", app.status);
+    }
+
+    #[test]
+    fn v52_roll_z_drag_from_note_lands_on_target_pitch() {
+        let mut app = headless_app("v52zglide");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        // y_of inverse with the rig's vscroll = 500:
+        // row R spans y in [B + V - (R+2)r, B + V - (R+1)r) → center −1.5r.
+        let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 63,
+                vel: 100,
+                press: 0,
+                start: 2400,
+                len: 480,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        // x(tick) = grid_x0 + tick/3 at 160 px/beat, 120 bpm.
+        let a = egui::pos2(grid_x0 + 80.0, row_y(60)); // src note body
+        let b = egui::pos2(grid_x0 + 800.0, row_y(63)); // target note body
+        let z = |down: bool| {
+            egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: down,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        frame(
+            &mut app,
+            &ctx,
+            vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(&mut app, &ctx, vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.bend_segs.len(), 1, "Z-drag made one glide");
+            let g = &r.pat.bend_segs[0];
+            assert_eq!(g.t0, 480, "leaves at the SOURCE note end");
+            assert_eq!(g.v0, 0.0, "starts in tune");
+            assert_eq!(g.t1, 2400, "lands at the TARGET note start");
+            assert_eq!(g.v1, 3.0, "target(63) - source(60) = +3 st");
+        }
+        // The Z-drag must NOT have moved the source note.
+        let n0 = app.piano_roll.as_ref().unwrap().pat.notes[0];
+        assert_eq!((n0.start, n0.note), (0, 60), "source note untouched");
+    }
+
+    #[test]
+    fn v52_roll_glide_endpoint_drag_and_rmb_delete() {
+        let mut app = headless_app("v52glideep");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.bend_segs.push(crate::midipat::BendSeg {
+                t0: 480,
+                v0: 0.0,
+                t1: 1440,
+                v1: 3.0,
+                curve: 0.0,
+            });
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.piano_roll.as_ref().unwrap().pat.bends.is_empty());
+        // END dot: x = grid_x0 + 1440/3; y = lane center − 3/12 * (46*0.42).
+        let bend_c = bot - 23.0;
+        let dot = egui::pos2(grid_x0 + 480.0, bend_c - 3.0 / 12.0 * (46.0 * 0.42));
+        let d = egui::pos2(dot.x + 200.0, dot.y);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(d)]);
+        frame(&mut app, &ctx, vec![moved(d), btn(d, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert!(
+                r.pat.bend_segs[0].t1 > 1440,
+                "endpoint drag stretched the glide: t1={}",
+                r.pat.bend_segs[0].t1
+            );
+        }
+        // Right-click ON the glide (its middle) deletes it and clears the
+        // baked events with it (bake skips empties — must not leave ghosts).
+        let mid = egui::pos2(grid_x0 + 240.0, bend_c + 1.5 / 12.0 * (46.0 * 0.42));
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert!(r.pat.bend_segs.is_empty(), "glide deleted");
+            assert!(r.pat.bends.is_empty(), "no ghost pitch-bend left");
+            assert!(app.status.contains("deleted"), "status: {}", app.status);
+        }
+    }
+
+    #[test]
+    fn v52_roll_velocity_lane_drag_sets_velocity() {
+        let mut app = headless_app("v52vellane");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        // Velocity lane = band above the glide lane; drag the pointer to
+        // HALF height over the note's x span.
+        let p = egui::pos2(grid_x0 + 80.0, bot - 46.0 - 15.0);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        let want = ((15.0f32 / 30.0) * 127.0).round() as u8;
+        assert!(
+            v.abs_diff(want) <= 3,
+            "bar drag set velocity {v}, pointer said {want}"
+        );
+        assert_ne!(v, 100, "changed");
+    }
+
+    #[test]
+    fn v52_roll_wheel_step_is_configurable() {
+        let mut app = headless_app("v52velstep");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+        }
+        app.roll_vel_step = 17;
+        frame(&mut app, &ctx, vec![]);
+        let p = egui::pos2(grid_x0 + 80.0, row_y(60));
+        let wheel = |dy: f32| {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), wheel(1.0)]);
+        frame(&mut app, &ctx, vec![]);
+        let r = app.piano_roll.as_ref().unwrap();
+        assert_eq!(r.pat.notes[0].vel, 117, "one tick = the configured step (+17)");
+    }
+
+    #[test]
+    fn v52_roll_pageup_octave_nudge() {
+        let mut app = headless_app("v52octave");
+        let ctx = egui::Context::default();
+        let _c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+            });
+            r.sel_notes = vec![0];
+            r.focused = true;
+        }
+        frame(&mut app, &ctx, vec![]);
+        let page = |key: egui::Key| {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        frame(&mut app, &ctx, vec![page(egui::Key::PageUp)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes[0].note, 72);
+        assert!(app.status.contains("octave up"), "status: {}", app.status);
+        frame(&mut app, &ctx, vec![page(egui::Key::PageDown)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.notes[0].note, 60);
     }
 }

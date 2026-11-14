@@ -57,6 +57,57 @@ pub struct Bend {
     pub at: u32,
 }
 
+/// v52 R6: ONE editable pitch-bend segment — a glide from (t0,v0) to
+/// (t1,v1), velocities in SEMITONES (x100 fixed point in the file),
+/// `curve` −100..100 warps the value ramp: value = lerp(v0,v1,s'), where
+/// s' = s + c·s(1−s), c = curve/100 (positive bulges EARLY — ease-out,
+/// negative sags — ease-in; the warp is monotonic for |c| ≤ 1).
+/// Segments are the EDITABLE source of truth; `Pattern::bake_bends`
+/// samples them into the standard 14-bit `bends` lane the engine, the
+/// VST shim and every external editor already understand.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BendSeg {
+    pub t0: u32,
+    pub v0: f32,
+    pub t1: u32,
+    pub v1: f32,
+    pub curve: f32,
+}
+
+/// Full-scale semitone span of a baked bend (standard receivers map the
+/// 14-bit range to ±2 st; the raw value is scale-only, 12 st is our
+/// editor's full deflection so glides of a whole octave reach full scale).
+pub const BEND_FULL_ST: f32 = 12.0;
+
+/// Bake one segment into raw 14-bit bends (dense: every `step` ticks).
+pub fn bake_seg(seg: &BendSeg, step: u32, out: &mut Vec<Bend>) {
+    let t1 = seg.t1.max(seg.t0 + 1);
+    let steps = ((t1 - seg.t0) / step.max(1)).max(1);
+    let c = (seg.curve / 100.0).clamp(-1.0, 1.0);
+    for i in 0..=steps {
+        let s = i as f32 / steps as f32;
+        let sp = (s + c * s * (1.0 - s)).clamp(0.0, 1.0);
+        let v = seg.v0 + (seg.v1 - seg.v0) * sp;
+        let d = (v / BEND_FULL_ST * 8191.0).round().clamp(-8192.0, 8191.0) as i32;
+        out.push(Bend {
+            ch: 0,
+            val: (8192 + d) as u16,
+            at: seg.t0 + ((t1 - seg.t0) as f64 * s as f64).round() as u32,
+        });
+    }
+}
+
+/// Raw 14-bit value → semitones (editor space).
+pub fn bend_to_st(val: u16) -> f32 {
+    (val as f32 - 8192.0) / 8191.0 * BEND_FULL_ST
+}
+
+/// Semitones → raw 14-bit value.
+pub fn st_to_bend(v: f32) -> u16 {
+    let d = (v / BEND_FULL_ST * 8191.0).round().clamp(-8192.0, 8191.0) as i32;
+    (8192 + d) as u16
+}
+
 /// A timed polyphonic aftertouch (0xA) message, v42/MPE: pressure for ONE
 /// held note while other voices on the same channel stay unaffected — the
 /// core per-voice expression message of MPE performance.
@@ -82,6 +133,10 @@ pub struct Pattern {
     /// through the SMF file like every other lane.
     pub bends: Vec<Bend>,
     pub polys: Vec<Poly>,
+    /// v52 R6: editable pitch-bend glides (the SOURCE; `bends` is their
+    /// baked playback form — hand-written `bends` from an import survive
+    /// until the first segment edit re-bakes the lane).
+    pub bend_segs: Vec<BendSeg>,
 }
 
 impl Pattern {
@@ -94,6 +149,7 @@ impl Pattern {
             press: Vec::new(),
             bends: Vec::new(),
             polys: Vec::new(),
+            bend_segs: Vec::new(),
         }
     }
 
@@ -107,13 +163,51 @@ impl Pattern {
         out.press.extend(other.press.iter().copied());
         out.bends.extend(other.bends.iter().copied());
         out.polys.extend(other.polys.iter().copied());
+        out.bend_segs.extend(other.bend_segs.iter().copied());
         out.notes.sort_by_key(|n| (n.start, n.note));
         out.ccs.sort_by_key(|c| (c.at, c.num));
         out.press.sort_by_key(|p| (p.at, p.ch));
         out.bends.sort_by_key(|b| (b.at, b.ch));
         out.polys.sort_by_key(|p| (p.at, p.note));
+        out.bend_segs.sort_by_key(|s| s.t0);
         out.len_ticks = out.len_ticks.max(other.len_ticks);
         out
+    }
+
+    /// v52 R6: rebuild the raw `bends` lane from the editable segments
+    /// (segments are then authoritative). Call after ANY seg edit.
+    pub fn bake_bends(&mut self) {
+        if self.bend_segs.is_empty() {
+            return;
+        }
+        let mut out = Vec::new();
+        for seg in self.bend_segs.iter() {
+            bake_seg(seg, 8, &mut out);
+        }
+        out.sort_by_key(|b| b.at);
+        self.bends = out;
+    }
+
+    /// v52 R6: an imported file's raw bends (no `slooper-bnd` meta)
+    /// become a polyline of curve-0 segments so the lane can display and
+    /// edit them. Bends are left untouched until the first edit re-bakes.
+    pub fn segs_from_bends(&mut self) {
+        let mut bs = self.bends.clone();
+        bs.sort_by_key(|b| b.at);
+        let mut segs = Vec::new();
+        for w in bs.windows(2) {
+            if w[0].at == w[1].at {
+                continue;
+            }
+            segs.push(BendSeg {
+                t0: w[0].at,
+                v0: bend_to_st(w[0].val),
+                t1: w[1].at,
+                v1: bend_to_st(w[1].val),
+                curve: 0.0,
+            });
+        }
+        self.bend_segs = segs;
     }
 
     /// True when nothing sounds.
@@ -123,6 +217,7 @@ impl Pattern {
             && self.press.is_empty()
             && self.bends.is_empty()
             && self.polys.is_empty()
+            && self.bend_segs.is_empty()
     }
 
     /// Samples per tick at `bpm` and `rate` (f64 to survive long patterns).
@@ -197,6 +292,26 @@ impl Pattern {
         tr.push(0x01);
         tr.extend_from_slice(&vlq(txt.len() as u32));
         tr.extend_from_slice(txt.as_bytes());
+        // v52 R6: private bend-segment meta — the EDITABLE curve layer
+        // (the baked 0xE events below stay the portable playback form).
+        if !self.bend_segs.is_empty() {
+            let mut s = String::from("slooper-bnd");
+            for g in &self.bend_segs {
+                s.push_str(&format!(
+                    " {}:{}:{}:{}:{}",
+                    g.t0,
+                    (g.v0 * 100.0).round() as i32,
+                    g.t1,
+                    (g.v1 * 100.0).round() as i32,
+                    g.curve.round() as i32,
+                ));
+            }
+            tr.extend_from_slice(&vlq(0));
+            tr.push(0xFF);
+            tr.push(0x01);
+            tr.extend_from_slice(&vlq(s.len() as u32));
+            tr.extend_from_slice(s.as_bytes());
+        }
 
         // Flatten to (tick, event-bytes) and diff-sort.
         let mut ev: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -315,11 +430,32 @@ impl Pattern {
                             pat.bpm = (60_000_000 / us.max(1)).clamp(1, u16::MAX as u32) as u16;
                         }
                         0x01 => {
-                            if let Some(rest) =
-                                String::from_utf8_lossy(data).strip_prefix("slooper-len ")
-                            {
+                            let txt = String::from_utf8_lossy(data).into_owned();
+                            if let Some(rest) = txt.strip_prefix("slooper-len ") {
                                 if let Ok(v) = rest.trim().parse::<u32>() {
                                     pat.len_ticks = v;
+                                }
+                            } else if let Some(rest) = txt.strip_prefix("slooper-bnd") {
+                                // v52 R6: editable bend segments.
+                                for g in rest.split_whitespace() {
+                                    let f: Vec<&str> = g.split(':').collect();
+                                    if f.len() == 5 {
+                                        if let (Ok(t0), Ok(v0), Ok(t1), Ok(v1), Ok(cv)) = (
+                                            f[0].parse::<u32>(),
+                                            f[1].parse::<i32>(),
+                                            f[2].parse::<u32>(),
+                                            f[3].parse::<i32>(),
+                                            f[4].parse::<i32>(),
+                                        ) {
+                                            pat.bend_segs.push(BendSeg {
+                                                t0,
+                                                v0: v0 as f32 / 100.0,
+                                                t1,
+                                                v1: v1 as f32 / 100.0,
+                                                curve: cv as f32,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -461,6 +597,14 @@ impl Pattern {
             {
                 n.press = p.val;
             }
+        }
+        // v52 R6: file finalization — an editable meta layer is
+        // authoritative (re-baked from segments); a foreign file's raw
+        // bends get polyline segments so the lane can display/edit them.
+        if !pat.bend_segs.is_empty() {
+            pat.bake_bends();
+        } else if !pat.bends.is_empty() {
+            pat.segs_from_bends();
         }
         pat.sort();
         if pat.len_ticks == 0
@@ -694,6 +838,121 @@ mod tests {
         let q = Pattern::load_mid(&f).unwrap();
         assert_eq!(q.bends, p.bends, "bend lane round trip");
         assert_eq!(q.polys, p.polys, "poly lane round trip");
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn v52_bend_seg_bake_curve_and_linearity() {
+        // A straight (curve 0) glide bakes its midpoint exactly; a +100
+        // curve bulges EARLY (ease-out), a -100 curve SAGS (ease-in),
+        // and the bake is monotonic (no wiggle) at full curvature.
+        let mut pat = Pattern::new(120);
+        pat.bend_segs.push(BendSeg {
+            t0: 0,
+            v0: 0.0,
+            t1: 480,
+            v1: 6.0,
+            curve: 0.0,
+        });
+        pat.bake_bends();
+        assert!(!pat.bends.is_empty());
+        assert_eq!(pat.bends.first().unwrap().val, st_to_bend(0.0));
+        assert_eq!(pat.bends.last().unwrap().val, st_to_bend(6.0));
+        let at = |p: &Pattern, t: u32| {
+            p.bends
+                .iter()
+                .min_by_key(|b| (b.at as i64 - t as i64).abs())
+                .unwrap()
+                .val
+        };
+        assert!((bend_to_st(at(&pat, 240)) - 3.0).abs() < 0.1, "linear mid");
+        let mut early = pat.clone();
+        early.bend_segs[0].curve = 100.0;
+        early.bake_bends();
+        assert!(
+            bend_to_st(at(&early, 120)) > 2.0,
+            "curve +100 must bulge early, got {:.2} st",
+            bend_to_st(at(&early, 120))
+        );
+        let mut late = pat.clone();
+        late.bend_segs[0].curve = -100.0;
+        late.bake_bends();
+        assert!(
+            bend_to_st(at(&late, 120)) < 1.2,
+            "curve -100 must sag, got {:.2} st",
+            bend_to_st(at(&late, 120))
+        );
+        for w in early.bends.windows(2) {
+            assert!(w[1].val >= w[0].val, "bake must stay monotonic");
+        }
+    }
+
+    #[test]
+    fn v52_bend_segs_roundtrip_through_mid() {
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        });
+        p.bend_segs.push(BendSeg {
+            t0: 100,
+            v0: 0.0,
+            t1: 400,
+            v1: -3.5,
+            curve: 65.0,
+        });
+        p.bake_bends();
+        let f = std::env::temp_dir().join(format!("sp-v52bnd-{}.mid", std::process::id()));
+        p.save_mid(&f).unwrap();
+        let q = Pattern::load_mid(&f).unwrap();
+        assert_eq!(q.bend_segs.len(), 1, "editable layer survives the file");
+        let g = &q.bend_segs[0];
+        assert_eq!((g.t0, g.t1), (100, 400));
+        assert!(g.v0.abs() < 0.011 && (g.v1 + 3.5).abs() < 0.011);
+        assert!((g.curve - 65.0).abs() < 0.51);
+        // The meta is authoritative: the playback lane re-bakes equal.
+        assert_eq!(q.bends.len(), p.bends.len(), "rebaked lane matches");
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn v52_bend_import_raw_bends_become_polyline_segs() {
+        // A foreign file's raw 0xE events (no slooper-bnd meta) load as
+        // curve-0 polyline segments — editable immediately, and the
+        // PLAYBACK lane keeps the ORIGINAL events until an edit re-bakes.
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 90,
+            press: 0,
+            start: 0,
+            len: 480,
+        });
+        p.bends.push(Bend {
+            ch: 0,
+            val: st_to_bend(2.0),
+            at: 96,
+        });
+        p.bends.push(Bend {
+            ch: 0,
+            val: st_to_bend(-1.0),
+            at: 192,
+        });
+        let f = std::env::temp_dir().join(format!("sp-v52bndi-{}.mid", std::process::id()));
+        p.save_mid(&f).unwrap();
+        let q = Pattern::load_mid(&f).unwrap();
+        assert_eq!(q.bends.len(), 2, "raw bends untouched");
+        assert_eq!(q.bend_segs.len(), 1, "raw bends became one polyline seg");
+        let g = &q.bend_segs[0];
+        assert_eq!((g.t0, g.t1), (96, 192));
+        assert!((bend_to_st(st_to_bend(2.0)) - g.v0).abs() < 0.01);
+        assert!((g.v1 + 1.0).abs() < 0.011);
+        assert_eq!(g.curve, 0.0);
         std::fs::remove_file(&f).ok();
     }
 }
