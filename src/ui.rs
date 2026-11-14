@@ -43295,9 +43295,9 @@ mod tests {
             // lines, which leak the NEXT widget's tooltip and pass
             // vacuously (a removed tooltip still greened the pin).
             let mut end = (n + 8).min(lines.len() - 1);
-            for k in n..=end {
-                if lines[k].contains("clicked()") {
-                    end = k;
+            for (k, row) in lines[n..=end].iter().enumerate() {
+                if row.contains("clicked()") {
+                    end = n + k;
                     break;
                 }
             }
