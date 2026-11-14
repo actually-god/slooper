@@ -486,6 +486,10 @@ pub struct Config {
     /// `snap_sub`; independent of the main grid's choice).
     #[serde(default = "default_grid_sub")]
     pub auto_snap_sub: u32,
+    /// v52 R6: one wheel tick over a note trims its velocity by this
+    /// many points (was hard-wired 5; user asked to choose it).
+    #[serde(default = "default_roll_vel_step")]
+    pub roll_vel_step: u8,
     /// False only in configs written before 0.3.0, where volume was
     /// MIDI-linear (127 = 0 dB). `load` converts the stored faders once.
     #[serde(default)]
@@ -692,6 +696,7 @@ impl Default for Config {
             metro_num: default_metro_num(),
             q_sub: default_grid_sub(),
             snap_sub: default_grid_sub(),
+            roll_vel_step: default_roll_vel_step(),
             auto_snap_on: false,
             auto_snap_sub: default_grid_sub(),
             dir_memo: Default::default(),
@@ -805,6 +810,10 @@ fn default_metro_sub() -> u32 {
 
 fn default_metro_num() -> u32 {
     4
+}
+
+fn default_roll_vel_step() -> u8 {
+    5
 }
 
 fn default_grid_sub() -> u32 {
@@ -1189,6 +1198,7 @@ mod tests {
             win_editor_embed: true,
             auto_snap_on: false,
             auto_snap_sub: 8,
+            roll_vel_step: default_roll_vel_step(),
             dir_memo: Default::default(),
             n_tracks: 16,
             shortcuts: vec![Some("R".into()), None, Some("Space".into())],
