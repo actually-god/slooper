@@ -502,6 +502,12 @@ pub struct GuiApiV1 {
         ctx: *mut core::ffi::c_void, size: f32, s: *const core::ffi::c_char,
     ) -> f32,
     // ---- interaction widgets (return 1 the frame the user changed) ----
+    //
+    // The host layers the standard feedback on every widget below, free for
+    // every script: a hover tooltip with the current value, the full range
+    // and the two click gestures (double-click = set value, right-click =
+    // automation menu), and the pointing-hand / vertical-drag mouse cursor.
+    // Do NOT reimplement hover hints in a script.
     /// Horizontal slider `w × h` at (x, y), label baked in. `curve`:
     /// 1.0 linear, 0.0 logarithmic (needs min > 0), else exponent.
     /// Writes the new value through `value` when it returns 1.
@@ -511,7 +517,8 @@ pub struct GuiApiV1 {
         value: *mut f32, min: f32, max: f32, curve: f32,
     ) -> u32,
     /// Round knob of diameter `size` at (x, y) (drag up/down to edit;
-    /// label under it). Same value mechanics as `slider`.
+    /// label under it, and the host appends the live value behind the
+    /// label, so keep `label` short). Same value mechanics as `slider`.
     pub knob: extern "C" fn(
         ctx: *mut core::ffi::c_void,
         x: f32, y: f32, size: f32, label: *const core::ffi::c_char,
