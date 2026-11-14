@@ -29719,6 +29719,43 @@ mod tests {
         hit.map(|c| egui::Rect::from_center_size(c, egui::vec2(6.0, 10.0)))
     }
 
+    /// Absolute Rect of the LAST painted `Shape::Text` whose galley text
+    /// contains `needle` (windows paint last), read from one extra
+    /// zero-input 853-viewport frame. `galley_at`'s rect is a synthetic
+    /// 6x10 center marker — this is the variant that measures real galley
+    /// extent (width checks for collapsed/justified text bugs).
+    fn painted_text_rect(
+        ctx: &egui::Context,
+        app: &mut App,
+        needle: &str,
+    ) -> Option<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().rev().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text().contains(needle) {
+                    let local = t.galley.rect;
+                    return Some(egui::Rect::from_min_size(
+                        t.pos + local.min.to_vec2(),
+                        local.size(),
+                    ));
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit
+    }
+
     fn galley_at_last(app: &mut App, ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -43010,6 +43047,43 @@ mod tests {
         assert!(
             !cap.is_empty(),
             "knob caption must paint script label + live kit value; galleys: {texts:?}"
+        );
+    }
+
+    /// v53 regression pin (real bug): the kit knob caption must paint as a
+    /// HORIZONTAL galley centered under the knob — an early `ui.put` strip
+    /// implementation hit egui's justify/WRAP trap and rendered one
+    /// vertical character column, which also slid the galley right so the
+    /// v20 caption-offset RMB pin clicked the NEIGHBOUR knob.
+    #[test]
+    fn v53_knob_caption_paints_horizontal_under_knob() {
+        let (mut app, ctx) = open_script_fx_editor("v53capgeo", "space_echo");
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let knob = *kit_probe("tone ").first().expect("space_echo tone knob painted");
+        // The ABSOLUTE painted rect of the caption. `galley_at` hands out a
+        // synthetic 6x10 center marker (fine for center math, useless for
+        // width), so scan the text shapes of one extra zero-input frame.
+        let cap = painted_text_rect(&ctx, &mut app, "tone 3.6kHz")
+            .expect("tone caption painted");
+        assert!(
+            cap.width() > 60.0,
+            "caption must be a horizontal galley, not a collapsed column: {cap:?}"
+        );
+        assert!(
+            (cap.center().x - knob.center().x).abs() < 16.0,
+            "caption centered under its knob: cap={cap:?} knob={knob:?}"
+        );
+        assert!(
+            cap.center().y > knob.max.y && cap.center().y < knob.max.y + 20.0,
+            "caption hugs the knob bottom: cap={cap:?} knob={knob:?}"
+        );
+        // And the -30px caption-offset gesture still lands ON this knob
+        // (the exact math the v20 RMB pin derives from).
+        let p = egui::pos2(cap.center().x, cap.center().y - 30.0);
+        assert!(
+            knob.contains(p),
+            "caption-derived -30px point must be inside the knob circle: p={p:?} knob={knob:?}"
         );
     }
 
