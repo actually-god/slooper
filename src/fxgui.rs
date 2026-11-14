@@ -647,20 +647,18 @@ extern "C" fn tr_knob(
     let label = cstr(label);
     // v53: caption = script label + the live kit value (accent mono); empty
     // label still paints the value — the knob is never a silent dial.
-    // Painted via a justified Label in a knob-symmetric strip: the bridge
-    // only holds `&Context`, and LayoutJobs need `fonts_mut` (which egui
-    // does not hand out), while `Label::new(WidgetText::from(job))` lays
-    // out through the same internal path.
+    // PAINTED via the painter, NOT `ui.put`: a Label put into a strip rect
+    // gets justified WRAP layout and collapses to a one-char vertical
+    // column (the documented put trap) — and the moved galley also broke
+    // the v20 caption-offset pin. `Painter::layout_no_wrap` accepts a
+    // LayoutJob directly (it carries its own per-section styles) and the
+    // CENTER_TOP anchor at max.y+8 is kept so knobs keep their geometry.
     let unit = br.param_by_label(&label).map_or(0, |k| br.params[k].unit);
     {
         let job = kit_caption(br.ui, &label, v, unit);
-        let strip = Rect::from_min_max(
-            Pos2::new(rect.min.x - 44.0, rect.max.y + 5.0),
-            Pos2::new(rect.max.x + 44.0, rect.max.y + 23.0),
-        );
-        with_no_wrap(br.ui, |ui| {
-            ui.put(strip, egui::Label::new(egui::WidgetText::from(job)).selectable(false))
-        });
+        let gal = br.ui.ctx().fonts_mut(|f| f.layout_job(job));
+        let top = Pos2::new(c.x - gal.size().x * 0.5, rect.max.y + 8.0);
+        p.galley(top, gal, egui::Color32::WHITE);
     }
     if hovered {
         br.ui.ctx().request_repaint();
