@@ -1,15 +1,15 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 5
+// slooper-synth-version: 6
 // sampler.rs — pitch-following audio-clip synthesizer (multi-sample).
 //
 // Plays ANY audio asset from the rack as an instrument. A note plays the
 // mapped sample whose ROOT NOTE is closest to it, transposed by the
 // semitone distance — the classic sampler trick, now with a whole KEY MAP:
-// the sampler map window binds as many rack samples as you like, one root
+// the sampler section binds as many rack samples as you like, one root
 // note each (drag a sample onto a piano key). With one sample the map is
 // exactly the old single-asset behavior.
 //
-// Two selection modes (set in the map window):
+// Two selection modes (set in the map section):
 //   hard cutoff — zones switch at the halfway point between neighbor
 //                 roots; a note exactly halfway plays the LOWER sample.
 //   crossfade   — the two nearest samples (one below, one above) are both
@@ -17,6 +17,17 @@
 //                 samples on A2 and E3, note C3 = 3 st above A2 and 4
 //                 below E3 -> A2 gets 4/7 of the volume, E3 gets 3/7.
 //                 Notes outside the map's range play the extreme sample.
+//
+// v52 R2 — VELOCITY LAYERS: several slots may share one root, each with
+// its own velocity value, and BOTH modes apply on the velocity axis too.
+//   hard cutoff — within the winning root, switch to the highest layer
+//                 whose velocity is at/below the note velocity; when the
+//                 note is under every layer, the LOWEST layer answers.
+//   crossfade   — within each bracketing root, blend the two layers whose
+//                 velocities bracket the note velocity by inverse
+//                 distance, multiplied into the pitch-axis weights.
+// A layer at velocity 127 (the default) answers every note, so maps saved
+// before v52 keep the exact old behavior.
 //
 // Legacy params (the map is authoritative when it is non-empty):
 //   asset     — rack asset id to sample (fallback single sample).
@@ -28,6 +39,7 @@
 // host at a block boundary (the host pointer is valid only briefly), so
 // edits are live — no rebind, no restart. Buffers are cached per asset id
 // and shared by every slot that references them. 24-voice poly.
+// Slots pack `(asset << 16) | (velocity << 8) | root`.
 // ---------------------------------------------------------------------------
 
 include!("synth_api.rs");
@@ -44,11 +56,13 @@ struct Buf {
     data: std::rc::Rc<std::vec::Vec<f32>>,
 }
 
-/// A mapped slot: rack asset + the note the sample IS.
+/// A mapped slot: rack asset, the note the sample IS, and the velocity
+/// the layer answers (v52 R2).
 #[derive(Clone, Copy)]
 struct Slot {
     asset: u32,
     root: f64,
+    vel: u8,
 }
 
 struct Voice {
@@ -136,7 +150,8 @@ fn sync_map(s: &mut Sampler) {
         eff[..n].copy_from_slice(&packed[..n]);
         en = n;
     } else if s.asset >= 0 {
-        eff[0] = ((s.asset as u32) as u64) << 8 | ((s.root as u32) as u64) & 0xFF;
+        // Legacy fallback: one slot answering every velocity.
+        eff[0] = ((s.asset as u64) << 16) | (127u64 << 8) | ((s.root as u64) & 0xFF);
         en = 1;
     }
     if en == s.raw_n && mode == s.raw_mode && has_map == s.has_map && eff[..en] == s.raw[..en] {
@@ -147,15 +162,22 @@ fn sync_map(s: &mut Sampler) {
     }
     // Rebuild sorted slot list (insertion sort; stable, so two slots on
     // the same root keep their map order and the LOWER-indexed one wins
-    // the cutoff scan).
+    // the cutoff scan). Sorted by (root, vel) so each root's velocity
+    // layers sit in a contiguous ascending run.
     let mut slots: std::vec::Vec<Slot> = std::vec::Vec::with_capacity(en);
     for i in 0..en {
         slots.push(Slot {
-            asset: (eff[i] >> 8) as u32,
+            asset: (eff[i] >> 16) as u32,
             root: (eff[i] & 0xFF) as f64,
+            vel: ((eff[i] >> 8) & 0xFF) as u8,
         });
     }
-    slots.sort_by(|a, b| a.root.partial_cmp(&b.root).unwrap_or(core::cmp::Ordering::Equal));
+    slots.sort_by(|a, b| {
+        a.root
+            .partial_cmp(&b.root)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then(a.vel.cmp(&b.vel))
+    });
     s.slots = slots;
     s.mode = mode;
     s.raw[..en].copy_from_slice(&eff[..en]);
@@ -248,6 +270,63 @@ fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
     v.buf = buf;
 }
 
+/// First/last index of the same-root run containing `i` (slots are sorted
+/// by (root, vel), so a root's velocity layers are contiguous).
+fn root_run(s: &Sampler, i: usize) -> (usize, usize) {
+    let r = s.slots[i].root;
+    let mut g0 = i;
+    while g0 > 0 && (s.slots[g0 - 1].root - r).abs() < 1e-6 {
+        g0 -= 1;
+    }
+    let mut g1 = i;
+    while g1 + 1 < s.slots.len() && (s.slots[g1 + 1].root - r).abs() < 1e-6 {
+        g1 += 1;
+    }
+    (g0, g1)
+}
+
+/// Hard-cutoff layer pick inside a root: the HIGHEST layer velocity at or
+/// below the note velocity (ties keep the first-listed slot); when every
+/// layer sits above the note, the LOWEST layer answers.
+fn cutoff_layer(s: &Sampler, i: usize, vel: u8) -> usize {
+    let (g0, g1) = root_run(s, i);
+    let mut best: Option<(u8, usize)> = None;
+    for j in g0..=g1 {
+        let ev = s.slots[j].vel;
+        if ev <= vel && best.map_or(true, |(bv, _)| ev > bv) {
+            best = Some((ev, j));
+        }
+    }
+    best.map_or(g0, |(_, j)| j)
+}
+
+/// Crossfade layer mix inside a root: the two layers whose velocities
+/// bracket the note velocity, blended by inverse distance. One layer (or
+/// note under/over every layer) -> that single layer at full weight.
+fn crossfade_layers(s: &Sampler, i: usize, vel: u8) -> std::vec::Vec<(usize, f64)> {
+    let (g0, g1) = root_run(s, i);
+    let v = vel as i32;
+    let mut lo: Option<(i32, usize)> = None; // highest vel <= v
+    let mut hi: Option<(i32, usize)> = None; // lowest vel > v
+    for j in g0..=g1 {
+        let ev = s.slots[j].vel as i32;
+        if ev <= v && lo.map_or(true, |(lv, _)| ev > lv) {
+            lo = Some((ev, j));
+        }
+        if ev > v && hi.map_or(true, |(hv, _)| ev < hv) {
+            hi = Some((ev, j));
+        }
+    }
+    match (lo, hi) {
+        (Some((lv, jl)), Some((hv, jh))) => {
+            let t = ((v - lv) as f64 / (hv - lv) as f64).clamp(0.0, 1.0);
+            std::vec![(jl, 1.0 - t), (jh, t)]
+        }
+        (Some((_, j)), None) | (None, Some((_, j))) => std::vec![(j, 1.0)],
+        (None, None) => std::vec![(i, 1.0)],
+    }
+}
+
 extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     if s.is_null() {
         return;
@@ -262,7 +341,8 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     }
     let n = note as f64;
     if sm.mode == 1 {
-        // Crossfade: nearest below + nearest above, inverse-distance mix.
+        // Crossfade: nearest below + nearest above ROOT, inverse-distance
+        // mix; each side then expands across its velocity layers (v52 R2).
         let mut lo = None; // last slot with root <= note
         let mut hi = None; // first slot with root > note
         for (i, sl) in sm.slots.iter().enumerate() {
@@ -274,7 +354,13 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
             }
         }
         match (lo, hi) {
-            (Some(i), _) if (sm.slots[i].root - n).abs() < 1e-6 => start_voice(sm, i, note, vel, 1.0),
+            (Some(i), _) if (sm.slots[i].root - n).abs() < 1e-6 => {
+                for (j, w) in crossfade_layers(sm, i, vel) {
+                    if w > 0.0 {
+                        start_voice(sm, j, note, vel, w);
+                    }
+                }
+            }
             (Some(i), Some(j)) => {
                 let span = sm.slots[j].root - sm.slots[i].root;
                 let w_hi = if span > 1e-6 {
@@ -282,19 +368,39 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
                 } else {
                     1.0
                 };
-                start_voice(sm, i, note, vel, 1.0 - w_hi);
-                if w_hi > 0.0 {
-                    start_voice(sm, j, note, vel, w_hi);
+                for (k, w) in crossfade_layers(sm, i, vel) {
+                    let ww = (1.0 - w_hi) * w;
+                    if ww > 0.0 {
+                        start_voice(sm, k, note, vel, ww);
+                    }
+                }
+                for (k, w) in crossfade_layers(sm, j, vel) {
+                    let ww = w_hi * w;
+                    if ww > 0.0 {
+                        start_voice(sm, k, note, vel, ww);
+                    }
                 }
             }
-            (Some(i), None) => start_voice(sm, i, note, vel, 1.0),
-            (None, Some(j)) => start_voice(sm, j, note, vel, 1.0),
+            (Some(i), None) => {
+                for (j, w) in crossfade_layers(sm, i, vel) {
+                    if w > 0.0 {
+                        start_voice(sm, j, note, vel, w);
+                    }
+                }
+            }
+            (None, Some(j)) => {
+                for (j2, w) in crossfade_layers(sm, j, vel) {
+                    if w > 0.0 {
+                        start_voice(sm, j2, note, vel, w);
+                    }
+                }
+            }
             (None, None) => {}
         }
     } else {
-        // Hard cutoff: nearest root wins; an exact midpoint tie plays the
-        // LOWER sample (strict `<` over the ascending scan keeps the first
-        // = lower one on equal distance).
+        // Hard cutoff: nearest ROOT wins (exact midpoint tie plays the
+        // LOWER sample — strict `<` over the ascending scan keeps the
+        // first = lower one); inside that root the velocity layer picks.
         let mut best = 0usize;
         let mut bd = f64::MAX;
         for (i, sl) in sm.slots.iter().enumerate() {
@@ -304,7 +410,8 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
                 best = i;
             }
         }
-        start_voice(sm, best, note, vel, 1.0);
+        let j = cutoff_layer(sm, best, vel);
+        start_voice(sm, j, note, vel, 1.0);
     }
 }
 

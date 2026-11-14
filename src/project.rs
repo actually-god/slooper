@@ -336,6 +336,7 @@ mod tests {
                 slots: vec![crate::config::SamplerSlotSave {
                     asset: "/x/kick.wav".into(),
                     root: 48,
+                    vel: 127,
                 }],
                 mode: 1,
             })],
@@ -422,6 +423,7 @@ mod tests {
                 slots: vec![crate::config::SamplerSlotSave {
                     asset: "/x/kick.wav".into(),
                     root: 48,
+                    vel: 127,
                 }],
                 mode: 1,
             })]
