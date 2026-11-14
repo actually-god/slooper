@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 6
+// slooper-synth-version: 7
 // sampler.rs — pitch-following audio-clip synthesizer (multi-sample).
 //
 // Plays ANY audio asset from the rack as an instrument. A note plays the
@@ -28,6 +28,15 @@
 //                 distance, multiplied into the pitch-axis weights.
 // A layer at velocity 127 (the default) answers every note, so maps saved
 // before v52 keep the exact old behavior.
+//
+// v57 — UNITY-REFERENCE GAIN: a layer's velocity marks the DYNAMIC the
+// sample was RECORDED at, and that point is "volume 0" (unity gain).
+// A note played at the layer's velocity plays the sample at its natural
+// level; harder hits add gain (note/layer ratio), softer hits pull back
+// — so recordings made at various dynamics sit together as one
+// instrument instead of every soft sample playing quietly. Boost caps at
+// x4 (+12 dB) so a whisper sample hit fortissimo cannot detonate the
+// mix. Default (127) layers reduce to the old note/127 curve exactly.
 //
 // Legacy params (the map is authoritative when it is non-empty):
 //   asset     — rack asset id to sample (fallback single sample).
@@ -233,6 +242,13 @@ fn sync_bufs(s: &mut Sampler) {
     }
 }
 
+/// v57: gain relative to the layer's RECORDED dynamic — that velocity
+/// is unity (0 dB); the note's velocity scales around it, capped so a
+/// soft layer hit hard cannot detonate the mix.
+fn vel_gain(note_vel: u8, rec_vel: u8) -> f64 {
+    (note_vel as f64 / (rec_vel.max(1) as f64)).min(4.0)
+}
+
 /// Start one voice on slot `idx` transposed to `note`, scaled by `w`.
 fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
     let slot = s.slots[idx];
@@ -266,7 +282,7 @@ fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
     v.on = true;
     v.pos = 0.0;
     v.rate = ((2.0f64).powf(semis / 12.0) * native).clamp(0.0625, 16.0);
-    v.vel = (vel as f64 / 127.0) * w;
+    v.vel = vel_gain(vel, slot.vel) * w;
     v.buf = buf;
 }
 
