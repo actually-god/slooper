@@ -252,12 +252,12 @@ fn valid_range(min: f32, max: f32) -> bool {
 // bake their own decoration, the kit value rides behind it in accent mono.
 // Colors are the plugin-editor surface family (the auto grid borrows egui's
 // theme, the custom canvas paints KIT_BG): add new kit chrome here, never as
-// per-script magic numbers.
+// per-script magic numbers. Since v54 the values live in ONE module shared
+// with the main window (`crate::kit`); `Kit::of(visuals)` additionally makes
+// the knob/caption chrome follow the light theme, while KIT_BG stays dark by
+// design (script canvas colors are dark-authored floats).
 
-const KIT_BG: Color32 = Color32::from_rgb(21, 23, 28);
-const KIT_EDGE: Color32 = Color32::from_gray(58);
-const KIT_TEXT: Color32 = Color32::from_gray(170);
-const KIT_ACCENT: Color32 = Color32::from_rgb(150, 200, 255); // == ui COL_CLIP_SEL
+use crate::kit::{Kit, EDGE as KIT_EDGE, KIT_BG};
 
 /// Hover text shared by every kit param widget (bridge + auto grid).
 fn kit_tip(label: &str, v: f32, min: f32, max: f32, unit: u32) -> String {
@@ -271,6 +271,7 @@ fn kit_tip(label: &str, v: f32, min: f32, max: f32, unit: u32) -> String {
 /// whose script caption lacks a number (or is only a unit-decorated one)
 /// still reads out what the HOST thinks the value is.
 fn kit_caption(ui: &Ui, label: &str, v: f32, unit: u32) -> egui::epaint::text::LayoutJob {
+    let kit = Kit::of(ui.visuals());
     let f_small = egui::TextStyle::Small.resolve(ui.style());
     let mono = egui::FontId::monospace(f_small.size);
     let val = format!(" {v:.2}{}", unit_suffix(unit));
@@ -279,18 +280,18 @@ fn kit_caption(ui: &Ui, label: &str, v: f32, unit: u32) -> egui::epaint::text::L
         job.append(
             val.trim_start(),
             0.0,
-            egui::epaint::text::TextFormat::simple(mono, KIT_ACCENT),
+            egui::epaint::text::TextFormat::simple(mono, kit.accent),
         );
     } else {
         job.append(
             label,
             0.0,
-            egui::epaint::text::TextFormat::simple(f_small, KIT_TEXT),
+            egui::epaint::text::TextFormat::simple(f_small, kit.text),
         );
         job.append(
             &val,
             0.0,
-            egui::epaint::text::TextFormat::simple(mono, KIT_ACCENT),
+            egui::epaint::text::TextFormat::simple(mono, kit.accent),
         );
     }
     job
@@ -618,31 +619,43 @@ extern "C" fn tr_knob(
         v = denorm(n, min, max, curve);
         unsafe { *value = v };
     }
-    // Draw.
+    // Draw. v54: the knob chrome is the ONLY theme-blind surface the
+    // bridge still painted by hand (sliders/buttons already use
+    // ui.visuals()) — resolve it through the kit so a light-themed host
+    // gets light knobs and readable captions. Dark values are frozen in
+    // kit.rs and pinned byte-for-byte.
     let c = rect.center();
     let rad = d * 0.34;
     let hovered = resp.hovered() || resp.dragged();
     let p = br.ui.painter();
+    let kit = Kit::of(br.ui.visuals());
     p.circle_filled(
         c,
         rad,
-        Color32::from_rgb(
-            if hovered { 60 } else { 48 },
-            if hovered { 64 } else { 52 },
-            if hovered { 74 } else { 60 },
-        ),
+        if hovered {
+            kit.knob_fill_hover
+        } else {
+            kit.knob_fill
+        },
     );
     p.circle_stroke(
         c,
         rad,
-        Stroke::new(1.2, Color32::from_gray(if hovered { 170 } else { 110 })),
+        Stroke::new(
+            1.2,
+            if hovered {
+                kit.ring_hover
+            } else {
+                kit.ring
+            },
+        ),
     );
     let ang = (std::f32::consts::FRAC_PI_4 * -3.0)
         + norm(v, min, max, curve) * (std::f32::consts::FRAC_PI_4 * 6.0);
     let dir = Vec2::angled(ang + std::f32::consts::FRAC_PI_2);
     p.line_segment(
         [c, c + dir * (rad * 0.92)],
-        Stroke::new(1.6, Color32::from_rgb(150, 200, 255)),
+        Stroke::new(1.6, kit.accent),
     );
     let label = cstr(label);
     // v53: caption = script label + the live kit value (accent mono); empty

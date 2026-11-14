@@ -3133,7 +3133,10 @@ impl App {
                     .hint_text("preset name")
                     .desired_width(130.0),
             );
-            if ui.button("Save").clicked() {
+            if ui.button("Save")
+                .on_hover_text("save the current values as a named preset")
+                .clicked()
+            {
                 do_save = true;
             }
             egui::ComboBox::from_id_salt("slooper_param_presets")
@@ -3148,7 +3151,10 @@ impl App {
                     }
                     if !self.params_presets.is_empty() {
                         ui.separator();
-                        if ui.button("delete named preset").clicked() {
+                        if ui.button("delete named preset")
+                            .on_hover_text("delete the preset whose name is in the box")
+                            .clicked()
+                        {
                             do_del = true;
                         }
                     }
@@ -5184,7 +5190,12 @@ impl App {
                     {
                         save_as = true;
                     }
-                    if ui.button("reset").clicked() {
+                    if ui.button("reset")
+                        .on_hover_text(
+                            "throw away every edit in this editor \u{b7} the source file is never touched",
+                        )
+                        .clicked()
+                    {
                         reset = true;
                     }
                 });
@@ -7103,7 +7114,10 @@ impl App {
                 self.drum.step_start = self.backend.engine.pos();
                 self.drum.last_step = usize::MAX;
             }
-            if ui.button("clear all").clicked() {
+            if ui.button("clear all")
+                .on_hover_text("erase every step on every pad")
+                .clicked()
+            {
                 for row in self.drum.grid.iter_mut() {
                     row.iter_mut().for_each(|v| *v = 0);
                 }
@@ -7941,7 +7955,12 @@ impl App {
                     n.c = cc;
                     ed.changed = true;
                 }
-                if ui.button("delete").clicked() && ed.nodes.len() > 1 {
+                if ui
+                    .button("delete")
+                    .on_hover_text("remove the selected curve node (one node always stays)")
+                    .clicked()
+                    && ed.nodes.len() > 1
+                {
                     ed.nodes.remove(ed.sel);
                     ed.sel = ed.sel.saturating_sub(1);
                     ed.changed = true;
@@ -7990,7 +8009,10 @@ impl App {
                 }
                 let nm = name.clone();
                 btn.context_menu(|ui| {
-                    if ui.button("delete preset").clicked() {
+                    if ui.button("delete preset")
+                        .on_hover_text("delete this preset file from disk")
+                        .clicked()
+                    {
                         let _ = crate::automation::delete_preset(&nm);
                         self.status = format!("preset \u{201c}{nm}\u{201d} deleted");
                         ui.close();
@@ -9846,7 +9868,7 @@ impl App {
             let is_sel = roll.sel_notes.contains(&idx);
             let dragging = matches!(roll.gesture, RollGesture::Move { idx: d, .. } if d == idx);
             let col = if dragging {
-                Color32::from_rgb(150, 200, 255)
+                crate::kit::ACCENT
             } else if is_sel {
                 Color32::from_rgb(120, 185, 255)
             } else {
@@ -9879,7 +9901,7 @@ impl App {
                 painter.rect_stroke(
                     egui::Rect::from_two_pos(from, hp),
                     0.0,
-                    egui::Stroke::new(1.2f32, Color32::from_rgb(150, 200, 255)),
+                    egui::Stroke::new(1.2f32, crate::kit::ACCENT),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -11577,7 +11599,7 @@ impl App {
                         // lights the zone too (winit feeds raw.hovered_files).
                         || ui.input(|i| !i.raw.hovered_files.is_empty());
             let col = if dragging {
-                Color32::from_rgb(150, 200, 255)
+                crate::kit::ACCENT
             } else {
                 Color32::from_gray(75)
             };
@@ -11796,7 +11818,7 @@ impl App {
                         ui.painter().rect_stroke(
                             rowr.response.rect,
                             3.0,
-                            egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                            egui::Stroke::new(1.0, crate::kit::ACCENT),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -15225,6 +15247,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui
                             .button(RichText::new("Delete").color(Color32::from_rgb(255, 120, 120)))
+                            .on_hover_text("the file itself is removed \u{b7} cannot be undone")
                             .clicked()
                         {
                             del = true;
@@ -18423,7 +18446,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                     let lid =
                         egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-zone-hl"));
                     let p = ui.ctx().layer_painter(lid);
-                    let ghost = Color32::from_rgb(150, 215, 255);
+                    let ghost = crate::kit::ACCENT;
                     p.rect_filled(g, 3.0, ghost.linear_multiply(0.22));
                     p.rect_stroke(
                         g,
@@ -18452,12 +18475,12 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                         p.rect_filled(
                             g,
                             3.0,
-                            Color32::from_rgb(150, 215, 255).linear_multiply(0.22),
+                            crate::kit::ACCENT.linear_multiply(0.22),
                         );
                         p.rect_stroke(
                             g,
                             3.0,
-                            egui::Stroke::new(2.0, Color32::from_rgb(150, 215, 255)),
+                            egui::Stroke::new(2.0, crate::kit::ACCENT),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -18489,7 +18512,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             let (fill, stroke) = if hot {
                 (
                     Color32::from_rgb(70, 96, 128),
-                    egui::Stroke::new(1.2, Color32::from_rgb(150, 215, 255)),
+                    egui::Stroke::new(1.2, crate::kit::ACCENT),
                 )
             } else {
                 (
@@ -18513,7 +18536,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             p.rect_filled(
                 egui::Rect::from_min_max(egui::pos2(ic.max.x - bar_w, ic.min.y), ic.max),
                 0.0,
-                Color32::from_rgb(150, 215, 255),
+                crate::kit::ACCENT,
             );
             if hot {
                 let msg = "dock into the last slot";
@@ -18987,7 +19010,7 @@ fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
     // v0.11 R5: automation is the third kind and wears red, matching its
     // red clips on the grid.
     let (txt, col) = match kind {
-        1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
+        1 => ("MIDI", crate::kit::ACCENT),
         2 => ("AUTO", Color32::from_rgb(255, 120, 120)),
         // v50 R6: saved project rows in the rack.
         3 => ("PROJ", Color32::from_rgb(190, 150, 255)),
@@ -19212,7 +19235,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             ui.painter().rect_stroke(
                                 trow.response.rect,
                                 3.0,
-                                egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                                egui::Stroke::new(1.0, crate::kit::ACCENT),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -19254,7 +19277,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 ui.close();
                             }
                             if !app.record_target.is_empty()
-                                && ui.button("clear recordings target").clicked()
+                                && ui.button("clear recordings target").on_hover_text("recordings stop going to this folder").clicked()
                             {
                                 app.record_target.clear();
                                 app.save_config();
@@ -19376,7 +19399,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     ui.painter().rect_stroke(
                                         hr.rect,
                                         3.0,
-                                        egui::Stroke::new(1.0, Color32::from_rgb(150, 200, 255)),
+                                        egui::Stroke::new(1.0, crate::kit::ACCENT),
                                         egui::StrokeKind::Inside,
                                     );
                                 }
@@ -19460,7 +19483,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         ui.close();
                                     }
                                     if !app.record_target.is_empty()
-                                        && ui.button("clear recordings target").clicked()
+                                        && ui.button("clear recordings target").on_hover_text("recordings stop going to this folder").clicked()
                                     {
                                         app.record_target.clear();
                                         app.save_config();
@@ -19600,7 +19623,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     continue;
                                 }
                                 let (label, col) = match kind {
-                                    1 => ("MIDI", Color32::from_rgb(150, 200, 255)),
+                                    1 => ("MIDI", crate::kit::ACCENT),
                                     2 => ("AUTOMATION", Color32::from_rgb(255, 120, 120)),
                                     _ => ("audio", Color32::from_rgb(210, 175, 120)),
                                 };
@@ -19879,6 +19902,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         .button(RichText::new("delete file").color(
                                             Color32::from_rgb(255, 120, 120),
                                         ))
+                                        .on_hover_text(
+                                            "permanently remove this file \u{b7} clips using it go silent",
+                                        )
                                         .clicked()
                                     {
                                         app.rack_confirm_del = Some(apdisp.clone());
@@ -20723,7 +20749,11 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // user-preset bar for ANY plugin — including ones whose own GUI
         // works fine (a snapshot of everything you dialed, re-loadable).
         gbtn.context_menu(|ui| {
-            if ui.button("user presets / parameters").clicked() {
+            if ui
+                .button("user presets / parameters")
+                .on_hover_text("open this instrument's preset + parameter page")
+                .clicked()
+            {
                 app.params_win = Some(GuiTarget::Synth(t));
                 app.params_filter.clear();
                 ui.close();
@@ -22134,7 +22164,7 @@ fn lane_row(
             ui.painter().rect_stroke(
                 egui::Rect::from_min_max(egui::pos2(a, rect.min.y), egui::pos2(b, rect.max.y)),
                 0.0,
-                egui::Stroke::new(1.2f32, Color32::from_rgb(150, 200, 255)),
+                egui::Stroke::new(1.2f32, crate::kit::ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -22177,7 +22207,7 @@ fn lane_row(
         ui.painter().rect_stroke(
             rect.shrink(1.0),
             2.0,
-            egui::Stroke::new(1.5, Color32::from_rgb(150, 200, 255)),
+            egui::Stroke::new(1.5, crate::kit::ACCENT),
             egui::StrokeKind::Inside,
         );
     }
@@ -22926,7 +22956,11 @@ fn grid_context_menu(
             app.merge_selection();
             ui.close();
         }
-        if ui.button("Delete  (Del)").clicked() {
+        if ui
+            .button("Delete  (Del)")
+            .on_hover_text("delete the selected clips")
+            .clicked()
+        {
             app.delete_selection();
             ui.close();
         }
@@ -23055,7 +23089,11 @@ fn grid_context_menu(
         app.select_all_clips();
         ui.close();
     }
-    if ui.button("Clear this track's clips").clicked() {
+    if ui
+        .button("Clear this track's clips")
+        .on_hover_text("remove every clip from this track \u{b7} the samples stay in the rack")
+        .clicked()
+    {
         app.clear_track(t);
         ui.close();
     }
@@ -23501,7 +23539,7 @@ fn fx_buttons(ui: &mut egui::Ui, app: &mut App, i: usize) {
             "not loaded — open the FX chain window (FX button) to rescan or remove"
         });
         let color = if ok {
-            Color32::from_rgb(150, 200, 255)
+            crate::kit::ACCENT
         } else {
             Color32::from_gray(140)
         };
@@ -24150,7 +24188,12 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 app.fx_save_pending = true;
             }
         }
-        if m != 0 && ui.small_button("none").clicked() {
+        if m != 0
+            && ui
+                .small_button("none")
+                .on_hover_text("no other loop drives this chain's tempo or position")
+                .clicked()
+        {
             app.sc_send[loop_i] = 0;
             app.backend.engine.set_sc_send(loop_i, 0);
             app.fx_save_pending = true;
@@ -24246,13 +24289,21 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 app.apply_fx_dir();
             }
         }
-        if ui.button("Apply").clicked() {
+        if ui
+            .button("Apply")
+            .on_hover_text("move/reload the effects folder to the path above")
+            .clicked()
+        {
             app.apply_fx_dir();
         }
-        if ui.button("Rescan").clicked() {
+        if ui.button("Rescan").on_hover_text("reload all effect scripts").clicked() {
             app.rescan_fx();
         }
-        if ui.button("Add template").clicked() {
+        if ui
+            .button("Add template")
+            .on_hover_text("write a fresh script template into the folder and chain it here")
+            .clicked()
+        {
             match app.fx_registry.add_template() {
                 Ok(stem) => {
                     app.add_fx_script(loop_i, &stem);
@@ -24320,7 +24371,11 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
         });
     }
     ui.horizontal(|ui| {
-        if ui.button("Add folder…").clicked() {
+        if ui
+            .button("Add folder\u{2026}")
+            .on_hover_text("add a script folder to the search path")
+            .clicked()
+        {
             let mut dlg = rfd::FileDialog::new().set_title("VST folder");
             if let Some(d) = app.pick_dir("vst") {
                 dlg = dlg.set_directory(d);
@@ -24334,7 +24389,11 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 }
             }
         }
-        if ui.button("Rescan Plugins").clicked() {
+        if ui
+            .button("Rescan Plugins")
+            .on_hover_text("re-scan the plugin folders \u{b7} use after installing or removing one")
+            .clicked()
+        {
             app.vst_rescan();
         }
     });
@@ -24663,7 +24722,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         .hint_text("search settings\u{2026}")
                         .desired_width(190.0),
                 );
-                if !app.sett_filter.is_empty() && ui.small_button("clear").clicked() {
+                if !app.sett_filter.is_empty()
+                    && ui.small_button("clear").on_hover_text("clear the filter").clicked()
+                {
                     app.sett_filter.clear();
                 }
             });
@@ -25031,7 +25092,11 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             ) {
                 any = true;
             ui.horizontal(|ui| {
-                if ui.button("Reset to Defaults").clicked() {
+                if ui
+                    .button("Reset to Defaults")
+                    .on_hover_text("restore every shortcut to its shipped default")
+                    .clicked()
+                {
                     for (k, d) in app.short_keys.iter_mut().zip(SHORTCUT_DEFAULTS.iter()) {
                         *k = *d;
                     }
@@ -25156,7 +25221,11 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.backend.cmd(Cmd::Apply { ins, outs });
                     app.save_config();
                 }
-                if ui.button("Stop").clicked() {
+                if ui
+                    .button("Stop")
+                    .on_hover_text("disconnect all audio ports \u{b7} silent until you Apply again")
+                    .clicked()
+                {
                     app.backend.cmd(Cmd::Apply { ins: vec![], outs: vec![] });
                     // v25: make the Stop VISIBLE: before this nothing on
                     // screen changed, the top bar kept claiming "applied:
@@ -32634,7 +32703,7 @@ mod tests {
         // egui 0.36: rect_stroke tessellates as a stroked RectShape.
         let blue = out.shapes.iter().any(|cs| {
             matches!(&cs.shape, egui::epaint::Shape::Rect(r)
-                if r.stroke.color == egui::Color32::from_rgb(150, 215, 255))
+                if r.stroke.color == crate::kit::ACCENT)
         });
         let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
         drop(prims);
@@ -39551,7 +39620,7 @@ mod tests {
             .iter()
             .filter_map(|cs| {
                 if let egui::epaint::Shape::Rect(r) = &cs.shape {
-                    if r.stroke.color == egui::Color32::from_rgb(150, 215, 255)
+                    if r.stroke.color == crate::kit::ACCENT
                         && r.stroke.width > 1.0
                     {
                         return Some(r.rect);
@@ -43146,6 +43215,228 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("pick a preset to delete first")),
             "dead Delete click must answer in the status line; galleys: {texts:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // v54 — one accent, one theme: design-token + light-theme pins.
+    // ---------------------------------------------------------------------
+
+    /// The accent RGB may be WRITTEN in exactly one place (src/kit.rs).
+    /// Both polarities are split: the scan window must carry the unified
+    /// sites (no vacuous pass) AND contain no hand-written accent. The
+    /// needle is `concat!`-built and the scan lives below `mod tests`,
+    /// so the check can never match its own literal (the same-file
+    /// include_str trap).
+    #[test]
+    fn v54_accent_single_source() {
+        let n200 = concat!("from_rgb(150,2", "00,255");
+        let n215 = concat!("from_rgb(150,2", "15,255");
+        for (file, srcs) in [
+            ("ui.rs", include_str!("ui.rs").to_string()),
+            ("fxgui.rs", include_str!("fxgui.rs").to_string()),
+        ] {
+            let mut srcs = srcs;
+            // Production window only: stop at the tests module.
+            if let Some(i) = srcs.find("\n    mod tests") {
+                srcs.truncate(i);
+            }
+            if file == "ui.rs" {
+                // Polarity guard: v54 unified 18 sites in this file; an
+                // empty window would silently vacuate the absence check.
+                assert!(
+                    srcs.matches("kit::ACCENT").count() >= 18,
+                    "ui.rs production window must carry the unified kit sites"
+                );
+            }
+            let ns: String = srcs.chars().filter(|c| !c.is_whitespace()).collect();
+            for needle in [&n200, &n215] {
+                assert!(
+                    !ns.contains(needle),
+                    "{file} writes the accent RGB by hand \u{b7} import crate::kit::ACCENT"
+                );
+            }
+        }
+    }
+
+    /// Goal 1 as a machine-checked invariant: every button whose label
+    /// says delete/clear/reset/erase must hand out a hover explanation
+    /// within its statement. New destructive buttons that skip the
+    /// tooltip fail here.
+    #[test]
+    fn v54_destructive_buttons_explain_on_hover() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\n    mod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let lines: Vec<&str> = prod.lines().collect();
+        let mut checked = 0usize;
+        for (n, l) in lines.iter().enumerate() {
+            if !l.contains(".button(") && !l.contains("Button::new(") {
+                continue;
+            }
+            let s = l.trim_start();
+            if s.starts_with("//") || s.contains("format!") {
+                continue;
+            }
+            // First string literal on the line = the button label.
+            let Some(a) = l.find('"') else { continue };
+            let Some(b) = l[a + 1..].find('"') else { continue };
+            let label = l[a + 1..a + 1 + b].to_lowercase();
+            if !["delete", "clear", "reset", "erase"]
+                .iter()
+                .any(|w| label.contains(w))
+            {
+                continue;
+            }
+            // Statement-precise window: the label line through the
+            // button's OWN clicked() (the statement end) — not 10 loose
+            // lines, which leak the NEXT widget's tooltip and pass
+            // vacuously (a removed tooltip still greened the pin).
+            let mut end = (n + 8).min(lines.len() - 1);
+            for (k, row) in lines[n..=end].iter().enumerate() {
+                if row.contains("clicked()") {
+                    end = n + k;
+                    break;
+                }
+            }
+            let win: String = lines[n..=end].join(" ").to_lowercase();
+            assert!(
+                win.contains("on_hover"),
+                "destructive button {:?} at src/ui.rs:{} carries no hover explanation",
+                &l[a..a + 1 + b],
+                n + 1
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 15,
+            "scan found only {checked} destructive buttons \u{b7} broken scan"
+        );
+    }
+
+    /// v54 R3: the bridge knob is theme-aware. DARK renders the exact
+    /// colors shipped since v53 (byte-for-byte — the kit values are
+    /// frozen); LIGHT derives knob chrome + caption + needle from the
+    /// egui theme, so a light host never paints a dark blob or an
+    /// unreadable gray-170 caption onto white.
+    #[test]
+    fn v54_knob_chrome_follows_theme() {
+        let (mut app, ctx) = open_script_fx_editor("v54knobtheme", "space_echo");
+        // egui 0.36 fades every Area (incl. windows) in over real time —
+        // shape colors ride mid-fade (premultiplied) until animation_time
+        // elapses. Zero it so this pin reads FINAL paint colors.
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let knob = *kit_probe("tone ").first().expect("space_echo tone knob painted");
+
+        // One zero-input frame; collect the knob's painted chrome colors.
+        fn knob_paint(
+            app: &mut App,
+            ctx: &egui::Context,
+            knob: egui::Rect,
+        ) -> (
+            egui::Color32,
+            egui::Color32,
+            egui::Color32,
+            Vec<egui::Color32>,
+        ) {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let near = |p: egui::Pos2| knob.expand(6.0).contains(p);
+            let (mut fill, mut ring, mut needle) = (None, None, None);
+            let mut glyphs: Vec<egui::Color32> = Vec::new();
+            for cs in &out.shapes {
+                match &cs.shape {
+                    egui::epaint::Shape::Circle(c) if near(c.center) => {
+                        if c.fill != egui::Color32::TRANSPARENT {
+                            fill = Some(c.fill);
+                        } else {
+                            ring = Some(c.stroke.color);
+                        }
+                    }
+                    egui::epaint::Shape::LineSegment { points, stroke }
+                        if points.iter().all(|p| near(*p)) =>
+                    {
+                        needle = Some(stroke.color);
+                    }
+                    egui::epaint::Shape::Text(t) if t.galley.text().contains("tone 3.6kHz") => {
+                        glyphs.extend(t.galley.job.sections.iter().map(|s| s.format.color));
+                    }
+                    _ => {}
+                }
+            }
+            let _ = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            out.textures_delta.clear();
+            (
+                fill.unwrap_or(egui::Color32::PLACEHOLDER),
+                ring.unwrap_or(egui::Color32::PLACEHOLDER),
+                needle.unwrap_or(egui::Color32::PLACEHOLDER),
+                glyphs,
+            )
+        }
+
+        // DARK: the frozen pre-v54 colors.
+        let (fill, ring, needle, caps) = knob_paint(&mut app, &ctx, knob);
+        assert_eq!(fill, egui::Color32::from_rgb(48, 52, 60), "dark knob face");
+        assert_eq!(ring, egui::Color32::from_gray(110), "dark ring");
+        assert_eq!(needle, crate::kit::ACCENT, "dark needle = the one accent");
+        assert!(
+            caps.contains(&egui::Color32::from_gray(170))
+                && caps.contains(&crate::kit::ACCENT),
+            "dark caption = gray170 label + accent value; caps: {caps:?}"
+        );
+
+        // LIGHT: theme-derived chrome, readable on white.
+        app.light_theme = true;
+        frame(&mut app, &ctx, vec![]); // ui_root applies set_visuals same-frame
+        let (fill, ring, needle, caps) = knob_paint(&mut app, &ctx, knob);
+        let v = egui::Visuals::light();
+        assert_eq!(fill, egui::Color32::from_gray(214), "light knob face");
+        assert_eq!(ring, egui::Color32::from_gray(120), "light ring");
+        assert_eq!(needle, v.hyperlink_color, "light needle follows theme");
+        assert!(
+            caps.contains(&v.weak_text_color()),
+            "light caption label must use the theme text color; caps: {caps:?}"
+        );
+        assert!(
+            !caps.contains(&egui::Color32::from_gray(170)),
+            "the dark-only gray-170 caption must not survive in light theme; caps: {caps:?}"
+        );
+    }
+
+    /// v54 R4 (runtime sample of the hover invariant): the settings
+    /// window's two consequential buttons answer on hover — what the
+    /// shortcut reset destroys and what the port Stop disconnects.
+    #[test]
+    fn v54_settings_dangerous_buttons_explain_on_hover() {
+        let mut app = headless_app("v54settip");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        app.sett_filter = "keyboard".into();
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "Reset to Defaults")
+            .expect("Reset to Defaults painted");
+        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["shipped default"]);
+        assert!(
+            texts.iter().any(|t| t.contains("restore every shortcut")),
+            "shortcut reset must explain its blast radius on hover; galleys: {texts:?}"
+        );
+        app.sett_filter = "audio ports".into();
+        let r = painted_text_rect(&ctx, &mut app, "Stop").expect("ports Stop painted");
+        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["disconnect"]);
+        assert!(
+            texts.iter().any(|t| t.contains("disconnect all audio ports")),
+            "port Stop must state what it disconnects; galleys: {texts:?}"
         );
     }
 
