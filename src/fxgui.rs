@@ -239,6 +239,80 @@ fn valid_range(min: f32, max: f32) -> bool {
     max > min && min.is_finite() && max.is_finite()
 }
 
+// ---------------------------------------------------------------------------
+// v53 kit design tokens + shared widget feedback
+// ---------------------------------------------------------------------------
+//
+// The bridge widgets (slider/knob/button/checkbox) ARE the design system of
+// every custom script GUI, so the polish lives here, not per script: one
+// hover tooltip stating current value, full range (with unit) and the two
+// click gestures (double-click = set value, right-click = automation); a
+// pointing-hand cursor on click targets and a vertical-drag cursor on knobs;
+// and a LIVE numeric readout under every knob caption — many script captions
+// bake their own decoration, the kit value rides behind it in accent mono.
+// Colors are the plugin-editor surface family (the auto grid borrows egui's
+// theme, the custom canvas paints KIT_BG): add new kit chrome here, never as
+// per-script magic numbers.
+
+const KIT_BG: Color32 = Color32::from_rgb(21, 23, 28);
+const KIT_EDGE: Color32 = Color32::from_gray(58);
+const KIT_TEXT: Color32 = Color32::from_gray(170);
+const KIT_ACCENT: Color32 = Color32::from_rgb(150, 200, 255); // == ui COL_CLIP_SEL
+
+/// Hover text shared by every kit param widget (bridge + auto grid).
+fn kit_tip(label: &str, v: f32, min: f32, max: f32, unit: u32) -> String {
+    let u = unit_suffix(unit);
+    format!(
+        "{label}: {v:.2}{u}  ·  range {min:.2}…{max:.2}{u}\ndouble-click: set value · right-click: automation"
+    )
+}
+
+/// Knob caption = the script's label plus the live kit value, so a knob
+/// whose script caption lacks a number (or is only a unit-decorated one)
+/// still reads out what the HOST thinks the value is.
+fn kit_caption(ui: &Ui, label: &str, v: f32, unit: u32) -> egui::epaint::text::LayoutJob {
+    let f_small = egui::TextStyle::Small.resolve(ui.style());
+    let mono = egui::FontId::monospace(f_small.size);
+    let val = format!(" {v:.2}{}", unit_suffix(unit));
+    let mut job = egui::epaint::text::LayoutJob::default();
+    if label.is_empty() {
+        job.append(
+            val.trim_start(),
+            0.0,
+            egui::epaint::text::TextFormat::simple(mono, KIT_ACCENT),
+        );
+    } else {
+        job.append(
+            label,
+            0.0,
+            egui::epaint::text::TextFormat::simple(f_small, KIT_TEXT),
+        );
+        job.append(
+            &val,
+            0.0,
+            egui::epaint::text::TextFormat::simple(mono, KIT_ACCENT),
+        );
+    }
+    job
+}
+
+/// TEST SCAFFOLDING (`cfg(test)` only): every kit widget records its GLOBAL
+/// rect here so pins can hover kit widgets without coordinate archaeology —
+/// the `smap_probe` pattern from v51.
+#[cfg(test)]
+pub(crate) static KIT_PROBE: std::sync::Mutex<
+    std::cell::RefCell<Vec<(String, egui::Rect)>>,
+> = std::sync::Mutex::new(std::cell::RefCell::new(Vec::new()));
+
+fn probe_record(label: &str, rect: egui::Rect) {
+    #[cfg(test)]
+    if let Ok(m) = KIT_PROBE.lock() {
+        m.borrow_mut().push((label.to_string(), rect));
+    }
+    #[cfg(not(test))]
+    let _ = (label, rect);
+}
+
 /// Stroke width safe for values coming from plugin scripts (NaN-proof).
 fn stroke_w(w: f32) -> f32 {
     if w.is_finite() {
@@ -472,8 +546,20 @@ extern "C" fn tr_slider(
     if r.double_clicked() || dbl {
         br.note_dbl(&label, v);
     }
-    if crate::ui::p_changed(&r, before, &mut v) {
+    let changed = crate::ui::p_changed(&r, before, &mut v);
+    if changed {
         unsafe { *value = v.clamp(min, max) };
+    }
+    // v53: shared kit feedback (design tokens above). `hovered` is captured
+    // before on_hover_text moves the response.
+    let hovered = r.hovered();
+    let unit = br.param_by_label(&label).map_or(0, |k| br.params[k].unit);
+    probe_record(&label, r.rect);
+    let _ = r.on_hover_text(kit_tip(&label, v, min, max, unit));
+    if hovered {
+        br.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if changed {
         1
     } else {
         0
@@ -559,19 +645,31 @@ extern "C" fn tr_knob(
         Stroke::new(1.6, Color32::from_rgb(150, 200, 255)),
     );
     let label = cstr(label);
-    if !label.is_empty() {
-        p.text(
-            Pos2::new(c.x, rect.max.y + 8.0),
-            Align2::CENTER_TOP,
-            label,
-            egui::TextStyle::Small.resolve(br.ui.style()),
-            Color32::from_gray(170),
+    // v53: caption = script label + the live kit value (accent mono); empty
+    // label still paints the value — the knob is never a silent dial.
+    // Painted via a justified Label in a knob-symmetric strip: the bridge
+    // only holds `&Context`, and LayoutJobs need `fonts_mut` (which egui
+    // does not hand out), while `Label::new(WidgetText::from(job))` lays
+    // out through the same internal path.
+    let unit = br.param_by_label(&label).map_or(0, |k| br.params[k].unit);
+    {
+        let job = kit_caption(br.ui, &label, v, unit);
+        let strip = Rect::from_min_max(
+            Pos2::new(rect.min.x - 44.0, rect.max.y + 5.0),
+            Pos2::new(rect.max.x + 44.0, rect.max.y + 23.0),
         );
+        with_no_wrap(br.ui, |ui| {
+            ui.put(strip, egui::Label::new(egui::WidgetText::from(job)).selectable(false))
+        });
     }
     if hovered {
         br.ui.ctx().request_repaint();
+        br.ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNorth);
     }
-    if resp.dragged() || resp.drag_stopped() {
+    probe_record(&label, rect);
+    let done = resp.dragged() || resp.drag_stopped();
+    let _ = resp.on_hover_text(kit_tip(&label, v, min, max, unit));
+    if done {
         1
     } else {
         0
@@ -596,8 +694,12 @@ extern "C" fn tr_button(ctx: *mut c_void, x: f32, y: f32, w: f32, label: *const 
     let rect = Rect::from_min_size(br.pos(x, y), Vec2::new(w.max(24.0), 20.0));
     let label = cstr(label);
     let r = with_no_wrap(br.ui, |ui| {
-        ui.put(rect, egui::Button::new(RichText::new(label).small()))
+        ui.put(rect, egui::Button::new(RichText::new(label.clone()).small()))
     });
+    probe_record(&label, r.rect);
+    if r.hovered() {
+        br.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if r.clicked() {
         1
     } else {
@@ -631,10 +733,14 @@ extern "C" fn tr_checkbox(
             egui::UiBuilder::new()
                 .max_rect(row)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            |ui| ui.add(Checkbox::new(&mut b, label)),
+            |ui| ui.add(Checkbox::new(&mut b, label.clone())),
         )
         .inner
     });
+    probe_record(&label, r.rect);
+    if r.hovered() {
+        br.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if r.changed() {
         unsafe { *on = b as u32 as f32 };
         1
@@ -761,24 +867,29 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
                     }
                 }
             });
-            if ui
-                .button(RichText::new("Load").small())
-                .on_hover_text(if has_presets {
-                    "apply the selected preset"
-                } else {
-                    "save one first: type a name and press Save"
-                })
-                .clicked()
-            {
-                match ed.preset_sel {
-                    Some(i) => {
-                        let n = ed.preset_list[i].clone();
-                        ed.load_user_preset(&n);
-                    }
-                    None => ed.preset_msg = "pick a preset first".into(),
-                }
-            }
         });
+        // v53: Load and Delete stay enabled — a DISABLED egui widget never
+        // even hovers, so the old `add_enabled_ui` disabled state made the
+        // explanatory tooltip physically unreachable (a dead button with a
+        // hint nobody could read). Clicking with nothing selected now
+        // ANSWERS in the status line instead.
+        if ui
+            .button(RichText::new("Load").small())
+            .on_hover_text(if has_presets {
+                "apply the selected preset"
+            } else {
+                "save one first: type a name and press Save"
+            })
+            .clicked()
+        {
+            match ed.preset_sel {
+                Some(i) if has_presets => {
+                    let n = ed.preset_list[i].clone();
+                    ed.load_user_preset(&n);
+                }
+                _ => ed.preset_msg = "pick a preset first".into(),
+            }
+        }
         ui.add_sized(
             [110.0, 0.0],
             TextEdit::singleline(&mut ed.preset_name)
@@ -795,12 +906,20 @@ fn preset_strip(ui: &mut Ui, ed: &mut FxEditor) {
         }
         let have_sel = ed.preset_sel.is_some();
         if ui
-            .add_enabled(have_sel, egui::Button::new(RichText::new("Delete").small()))
+            .button(RichText::new("Delete").small())
+            .on_hover_text(if have_sel {
+                "delete the selected preset file"
+            } else {
+                "pick a preset to delete first"
+            })
             .clicked()
         {
-            if let Some(i) = ed.preset_sel {
-                let n = ed.preset_list[i].clone();
+            if have_sel {
+                // index-safe: `have_sel` guarantees a valid `preset_sel`
+                let n = ed.preset_list[ed.preset_sel.unwrap()].clone();
                 ed.delete_user_preset(&n);
+            } else {
+                ed.preset_msg = "pick a preset to delete first".into();
             }
         }
     });
@@ -939,12 +1058,11 @@ impl FxEditor {
 fn custom_ui(ui: &mut Ui, ed: &mut FxEditor, height: f32) {
     let w = (ui.available_width() - 8.0).max(220.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, height), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 3.0, Color32::from_rgb(21, 23, 28));
+    ui.painter().rect_filled(rect, 3.0, KIT_BG);
     ui.painter().rect_stroke(
         rect,
         3.0,
-        Stroke::new(1.0, Color32::from_gray(58)),
+        Stroke::new(1.0, KIT_EDGE),
         StrokeKind::Inside,
     );
 
@@ -1043,9 +1161,22 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                         0
                     };
                     let mut idx = cur;
-                    ComboBox::from_id_salt(("fxenum", ed.loop_i, ed.slot, k))
+                    let rc = ComboBox::from_id_salt(("fxenum", ed.loop_i, ed.slot, k))
                         .width(150.0)
                         .show_index(ui, &mut idx, n, |i| p.labels[i].clone());
+                    // v53: the auto grid states its gestures too, and enum
+                    // rows now open the SAME value menu the slider rows get
+                    // on right-click (automation for any param kind).
+                    probe_record(&p.label, rc.rect);
+                    // `secondary_clicked` first — on_hover_text moves the Response.
+                    let sec = rc.secondary_clicked();
+                    let _ = rc
+                        .on_hover_text("pick a choice · right-click: automation for this param");
+                    if sec {
+                        if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
+                            ed.ctx_menu = Some((k, v, pp));
+                        }
+                    }
                     if idx != cur {
                         v = val_of(idx);
                     }
@@ -1067,9 +1198,11 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
                 }
                 // v29: raw click gestures instead of the drag-killing
                 // same-id click union (see the bridge slider above).
-                let r = ui
-                    .add_sized(Vec2::new(150.0, 0.0), sl)
-                    .on_hover_text(format!("{:.2} … {:.2}", p.min, p.max));
+                let r = ui.add_sized(Vec2::new(150.0, 0.0), sl);
+                // v53: same kit tooltip the bridge widgets hand out
+                // (value, range with unit, both click gestures).
+                probe_record(&p.label, r.rect);
+                let r = r.on_hover_text(kit_tip(&p.label, v, p.min, p.max, p.unit));
                 let (rmb, dbl) = if r.hovered() {
                     ui.input(|i| {
                         (

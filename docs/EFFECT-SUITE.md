@@ -96,6 +96,14 @@ you can edit — see [USAGE.md](USAGE.md#presets).
 - **Preset format**: one JSON per preset in `user presets/`, named
   `{plugin stem}-{preset name}.json`, values in native units — see
   [USAGE.md](USAGE.md#presets).
+- **Widget feedback (v53)**: every kit widget (bridge slider, knob,
+  button, checkbox — and the auto-grid rows) states itself: a hover
+  tooltip with the current value, the full range with unit, and the two
+  click gestures (double-click = set value, right-click = automation);
+  knobs additionally paint the live value behind their caption, and
+  click/drag targets show the pointing-hand / vertical-drag cursor.
+  Script authors get all of this for free — do NOT reimplement hover
+  hints, and keep knob labels short (the value rides behind them).
 
 ## Writing your own
 
