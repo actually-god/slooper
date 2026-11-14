@@ -11407,41 +11407,6 @@ impl App {
             .then_some(t)
     }
 
-    /// v18: apply an OS-drop batch to the live sampler on `t`: import
-    /// each audio file (rack dedup via `ensure_asset`) and swap the
-    /// patch — no restart, no re-pick. Kept status string identical to
-    /// the old in-window handler so existing pins hold.
-    fn sampler_files_dropped(&mut self, t: usize, paths: &[std::path::PathBuf]) {
-        let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
-            return;
-        };
-        if !matches!(handle.as_ref(), SynthHandle::Script(_)) {
-            return;
-        }
-        let mut swapped: Option<usize> = None;
-        let mut rejected = 0usize;
-        for path in paths {
-            if !crate::assets::is_audio_file(path) {
-                rejected += 1;
-                continue; // midi/auto/unknown: not a sample
-            }
-            if let Some(k) = self.ensure_asset(path) {
-                self.sampler_set_asset(t, k);
-                swapped = Some(k);
-            }
-        }
-        match swapped.and_then(|k| self.assets.get(k).map(|a| a.name.clone())) {
-            Some(n) => self.status = format!("track {} sampler: {n} (dropped file)", t + 1),
-            None if rejected > 0 => {
-                self.status = format!(
-                    "sampler: dropped file{} not audio",
-                    if rejected == 1 { "" } else { "s" }
-                );
-            }
-            None => {}
-        }
-    }
-
     /// Auto sliders for a track's live synth instance (values ride the
     /// instance atomics, exactly like effect params).
     fn synth_sliders_window(&mut self, ui: &mut egui::Ui, t: usize) {
@@ -11648,11 +11613,11 @@ impl App {
                 }
             }
 
-            // v18: OS-level file drops (file manager → app while
-            // this window is open) are claimed CENTRALLY at the
-            // top of `ui_root` (one drain per frame, then the
-            // sampler swap via `sampler_files_dropped`); by the
-            // time this window paints the queue is already empty.
+            // v18/v52: OS-level file drops (file manager → app while
+            // this window is open) are claimed CENTRALLY at the top of
+            // `ui_root`: the sampler-window branch hands them to
+            // `sampler_map_files_dropped` (each file becomes a mapped
+            // slot); by the time this window paints the queue is empty.
             ui.separator();
         }
         for (k, pd) in desc.params.iter().enumerate() {
@@ -14983,11 +14948,11 @@ impl App {
         // v52 R2: the key map lives in the sampler window now — when no
         // sampler window is open its drag probe and any still-held
         // audition note must die with it.
-        if self.sampler_editor_open().is_none() {
-            if self.smap_probe.is_some() || self.smap_hold.is_some() {
-                self.smap_release();
-                self.smap_probe = None;
-            }
+        if self.sampler_editor_open().is_none()
+            && (self.smap_probe.is_some() || self.smap_hold.is_some())
+        {
+            self.smap_release();
+            self.smap_probe = None;
         }
 
         let sp = self.synth_pick;
@@ -42169,7 +42134,7 @@ mod tests {
         assert_eq!(app.kit(0)[0].asset, Some(a), "pad 0 resolves the rack asset");
         app.show_drums = true;
         frame(&mut app, &ctx, vec![]);
-        assert!(app.drum.grid.len() >= 1 && app.drum.grid[0].len() >= 9);
+        assert!(!app.drum.grid.is_empty() && app.drum.grid[0].len() >= 9);
         app.drum.grid[0][0] = 110;
         app.drum.grid[0][2] = 90;
         app.drum.grid[0][8] = 70;
@@ -42284,7 +42249,7 @@ mod tests {
         assert!(
             cfg["drum"]["grid"][0][3].as_i64().unwrap_or(0) > 0,
             "the painted hit must reach config.json: {}",
-            &cfg["drum"]["grid"][0]
+            cfg["drum"]["grid"][0]
         );
         // Toggle off, then the persisted copy must follow.
         let r2 = app
