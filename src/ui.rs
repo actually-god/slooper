@@ -11364,12 +11364,18 @@ impl App {
                             .prefix("v\u{2009}")
                             .suffix(" \u{2669}"),
                     );
+                    
                     if vr.changed() {
                         new_vel = Some(vv.clamp(1, 127) as u8);
                     }
                     if vr.hovered() {
                         ch.ctx().request_repaint();
                     }
+                    vr.on_hover_text(
+                        "the DYNAMIC this sample was recorded at \u{2014} it\n\
+                         plays at its natural level here. Harder notes\n\
+                         add gain up to \u{d7}4, softer notes pull back.",
+                    );
                     if ch
                         .add_sized(
                             [18.0, 18.0],
