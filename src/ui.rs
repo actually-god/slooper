@@ -23210,9 +23210,11 @@ const ROLL_LEN_TRIP: [(&str, u32); 5] = [
 /// v55 (S2): the piano-roll right-click menu. Exact musical note lengths
 /// (whole..1/64 + dotted + triplet, double/halve), selection-aware, and
 /// the delete lives here as one row — plain RMB opened this menu, the
-/// instant delete lives on as Shift+RMB. Conventions mirror the grid
-/// clip menu: frozen press anchor, select-on-open, one-shot rows
-/// self-close, destructive row answers on hover (v54 invariant).
+/// instant delete lives on as Shift+RMB. Lengths feed the v37 R3
+/// pattern-end contract in roll_pass (pattern end = last note tail).
+/// Conventions mirror the grid clip menu: frozen press anchor,
+/// select-on-open, one-shot rows self-close, destructive row answers on
+/// hover (v54 invariant).
 fn roll_rmb_menu(
     ui: &mut egui::Ui,
     roll: &mut PianoRoll,
@@ -23278,7 +23280,11 @@ fn roll_rmb_menu(
                 });
             });
             if let Some((lab, t)) = pick {
-                apply_note_len(roll, &targets, t);
+                for &ix in &targets {
+                    if let Some(n) = roll.pat.notes.get_mut(ix) {
+                        n.len = t.max(1);
+                    }
+                }
                 *status = format!("note len {lab} \u{b7} {} note(s)", targets.len());
                 roll.changed = true;
                 roll.menu_anchor = None;
@@ -23312,8 +23318,9 @@ fn roll_rmb_menu(
                         };
                     }
                 }
-                grow_pattern(roll);
                 roll.changed = true;
+                // v37 R3: no manual pattern extension — roll_pass
+                // re-derives len_ticks from the notes on every change.
                 *status = format!(
                     "length {} \u{b7} {} note(s)",
                     if o == 1 { "x2" } else { "/2" },
@@ -23375,33 +23382,6 @@ fn roll_rmb_menu(
                     .small(),
             );
         }
-    }
-}
-
-/// v55: set exact note lengths on `targets` and grow the pattern if a
-/// note would now die at the pattern end.
-fn apply_note_len(roll: &mut PianoRoll, targets: &[usize], t: u32) {
-    for &ix in targets {
-        if let Some(n) = roll.pat.notes.get_mut(ix) {
-            n.len = t.max(1);
-        }
-    }
-    grow_pattern(roll);
-}
-
-/// v55: len_ticks grows (bar-rounded, `quantize_grid`'s formula) so a
-/// length edit never silently truncates; never shrinks.
-fn grow_pattern(roll: &mut PianoRoll) {
-    let end = roll
-        .pat
-        .notes
-        .iter()
-        .map(|n| n.start + n.len)
-        .max()
-        .unwrap_or(0);
-    if end > roll.pat.len_ticks {
-        let bar = 4 * PPQ as u32;
-        roll.pat.len_ticks = end.div_euclid(bar).max(1) * bar + (end % bar != 0) as u32 * bar;
     }
 }
 
@@ -43419,12 +43399,20 @@ mod tests {
                 r.pat.bend_segs[0].t1
             );
         }
-        // Right-click ON the glide (its middle) deletes it and clears the
-        // baked events with it (bake skips empties — must not leave ghosts).
+        // v55 CONTRACT CHANGE: right-click ON the glide (its middle) now
+        // opens the glide menu; the Delete row carries the delete (and
+        // clears the baked events with it — bake skips empties, must not
+        // leave ghosts).
         let mid = egui::pos2(grid_x0 + 240.0, bend_c + 1.5 / 12.0 * (46.0 * 0.42));
         frame(&mut app, &ctx, vec![moved(mid)]);
         frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Secondary, true)]);
         frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "Delete glide").is_some(),
+            "glide RMB opens the glide menu (v55)"
+        );
+        click_last(&mut app, &ctx, "Delete glide (Shift+RMB)");
         frame(&mut app, &ctx, vec![]);
         {
             let r = app.piano_roll.as_ref().unwrap();
@@ -43432,6 +43420,243 @@ mod tests {
             assert!(r.pat.bends.is_empty(), "no ghost pitch-bend left");
             assert!(app.status.contains("deleted"), "status: {}", app.status);
         }
+    }
+
+    // ================= v55: piano-roll RMB length menu (S2) =================
+
+    /// Rig: v52_roll_rig + one known note. 480..960 ticks at pitch 60.
+    /// Returns (note_pos_center, canvas) — click the center to hit the note.
+    fn v55_rig_note(
+        app: &mut App,
+        ctx: &egui::Context,
+        start: u32,
+        len: u32,
+    ) -> (egui::Pos2, egui::Rect) {
+        let c = v52_roll_rig(app, ctx);
+        let grid_x0 = c.min.x + 58.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.len_ticks = 1920;
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start,
+                len,
+            });
+        }
+        frame(app, ctx, vec![]);
+        // x_of = grid_x0 + t/480*160 (the rig's px_per_beat), row_y from
+        // the v52 z-drag pin's inverse (vscroll 500, row_h 11).
+        let x = grid_x0 + (start as f32 / 480.0 * 160.0) + 40.0;
+        let y = c.max.y - 10.0 + 500.0 - 11.0 * (60.0 + 0.5);
+        (egui::pos2(x, y), c)
+    }
+
+    #[test]
+    fn v55_roll_rmb_menu_sets_length() {
+        let mut app = headless_app("v55len");
+        let ctx = egui::Context::default();
+        let (note, _c) = v55_rig_note(&mut app, &ctx, 480, 480);
+        rmb(&mut app, &ctx, note);
+        // The menu answers with WHAT and the current value...
+        assert!(
+            galley_at(&mut app, &ctx, "len 480t").is_some(),
+            "menu header shows the note's current length"
+        );
+        assert!(
+            galley_at_last(&mut app, &ctx, "whole \u{b7} 1920t").is_some(),
+            "length table painted (whole row present)"
+        );
+        let before = app.piano_roll.as_ref().unwrap().pat.len_ticks;
+        assert_eq!(before, 1920, "rig starts at one bar");
+        click_last(&mut app, &ctx, "1/8 \u{b7} 240t");
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes[0].len, 240, "1/8 set exactly 240 ticks");
+            // v37 R3 interlock: the pattern end FOLLOWS the notes.
+            assert_eq!(r.pat.len_ticks, 720, "pattern end = note tail");
+        }
+        assert!(app.status.contains("note len"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn v55_roll_rmb_dotted_triplet_lengths() {
+        // Fresh rig per open (v50 popup re-arm trap (e)).
+        let mut app = headless_app("v55dot");
+        let ctx = egui::Context::default();
+        let (note, _c) = v55_rig_note(&mut app, &ctx, 480, 480);
+        rmb(&mut app, &ctx, note);
+        click_last(&mut app, &ctx, "dot 1/4 \u{b7} 720t");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().pat.notes[0].len,
+            720,
+            "dotted quarter = 720 ticks"
+        );
+        let mut app2 = headless_app("v55trip");
+        let ctx2 = egui::Context::default();
+        let (note2, _c2) = v55_rig_note(&mut app2, &ctx2, 480, 480);
+        rmb(&mut app2, &ctx2, note2);
+        click_last(&mut app2, &ctx2, "trip 1/8 \u{b7} 160t");
+        frame(&mut app2, &ctx2, vec![]);
+        assert_eq!(
+            app2.piano_roll.as_ref().unwrap().pat.notes[0].len,
+            160,
+            "triplet eighth = 160 ticks"
+        );
+    }
+
+    #[test]
+    fn v55_roll_rmb_double_halve() {
+        // double — and the pattern GROWS so the longer note survives
+        // (quantize_grid's bar-rounding).
+        let mut app = headless_app("v55dbl");
+        let ctx = egui::Context::default();
+        let (note, _c) = v55_rig_note(&mut app, &ctx, 1440, 480);
+        {
+            app.piano_roll.as_mut().unwrap().pat.len_ticks = 1920;
+        }
+        rmb(&mut app, &ctx, note);
+        click_last(&mut app, &ctx, "double");
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes[0].len, 960, "double");
+            // v37 R3: the pattern end follows the doubled note.
+            assert_eq!(r.pat.len_ticks, 2400, "pattern end = note tail");
+        }
+        assert!(app.status.contains("x2"), "status: {}", app.status);
+        // halve — fresh rig (popup re-arm).
+        let mut app2 = headless_app("v55halve");
+        let ctx2 = egui::Context::default();
+        let (note2, _c2) = v55_rig_note(&mut app2, &ctx2, 480, 480);
+        rmb(&mut app2, &ctx2, note2);
+        click_last(&mut app2, &ctx2, "halve");
+        frame(&mut app2, &ctx2, vec![]);
+        assert_eq!(
+            app2.piano_roll.as_ref().unwrap().pat.notes[0].len,
+            240,
+            "halve"
+        );
+    }
+
+    #[test]
+    fn v55_roll_rmb_length_selection() {
+        let mut app = headless_app("v55sel");
+        let ctx = egui::Context::default();
+        let (note, _c) = v55_rig_note(&mut app, &ctx, 480, 480);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 62,
+                vel: 100,
+                press: 0,
+                start: 1920,
+                len: 480,
+            });
+            // Both selected; RMB on the FIRST must apply to BOTH.
+            r.sel_notes = vec![0, 1];
+        }
+        frame(&mut app, &ctx, vec![]);
+        rmb(&mut app, &ctx, note);
+        assert!(
+            galley_at(&mut app, &ctx, "applies to 2").is_some(),
+            "menu says the edit hits the whole selection"
+        );
+        click_last(&mut app, &ctx, "1/16 \u{b7} 120t");
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes[0].len, 120, "note 1");
+            assert_eq!(r.pat.notes[1].len, 120, "note 2 (selection)");
+        }
+        assert!(
+            app.status.contains("2 note(s)"),
+            "status counts targets: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v55_roll_rmb_menu_delete() {
+        let mut app = headless_app("v55del");
+        let ctx = egui::Context::default();
+        let (note, _c) = v55_rig_note(&mut app, &ctx, 480, 480);
+        rmb(&mut app, &ctx, note);
+        click_last(&mut app, &ctx, "Delete note (Shift+RMB)");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.piano_roll.as_ref().unwrap().pat.notes.is_empty(),
+            "menu Delete removed the note"
+        );
+        assert!(app.status.contains("deleted"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn v55_roll_shift_rmb_instant_delete() {
+        let mut app = headless_app("v55shdel");
+        let ctx = egui::Context::default();
+        let (note, _c) = v55_rig_note(&mut app, &ctx, 480, 480);
+        // Shift held through the whole right-click (ModifiersChanged is
+        // what `click_mod` proves the app reads).
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::SHIFT)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(note), btn(note, egui::PointerButton::Secondary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(note), btn(note, egui::PointerButton::Secondary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert!(r.pat.notes.is_empty(), "Shift+RMB deleted instantly");
+        }
+        assert!(
+            app.status.contains("deleted"),
+            "status: {}",
+            app.status
+        );
+        // ...and the menu must NOT have opened while Shift was down.
+        assert!(
+            galley_at(&mut app, &ctx, "Delete note").is_none(),
+            "Shift+RMB must not open the menu"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::ModifiersChanged(Default::default())],
+        );
+    }
+
+    #[test]
+    fn v55_roll_rmb_empty_explains() {
+        let mut app = headless_app("v55empty");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        // Far from any lane: upper area, no notes at all in the rig.
+        let p = egui::pos2(c.min.x + 300.0, c.min.y + 30.0);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            galley_at(&mut app, &ctx, "no note under the cursor").is_some(),
+            "empty-canvas RMB explains itself"
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.piano_roll.as_ref().unwrap().pat.notes.is_empty(),
+            "explain-only menu changed nothing"
+        );
     }
 
     #[test]
