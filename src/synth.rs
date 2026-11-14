@@ -985,6 +985,85 @@ mod tests {
         }
     }
 
+    /// v57: a layer's velocity is its RECORDED dynamic = unity gain.
+    /// Peak amplitude of one slot (root 60, vel 64) must scale with
+    /// note_vel/64 (capped x4), and a vel-127 layer must keep the old
+    /// note/127 curve exactly.
+    #[test]
+    fn v57_sampler_layer_vel_is_unity_gain_point() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
+        let reg = test_registry("v57gain");
+        let sine: Arc<[f32]> = (0..4800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[])
+            .expect("sampler instance");
+        let desc = reg.desc("sampler").unwrap();
+        let mut p = [0.0f32; MAX_PARAMS];
+        for (k, pd) in desc.params.iter().enumerate() {
+            p[k] = pd.default;
+        }
+        // Unity means unity: take the output-trim param out of the way.
+        if let Some(gi) = desc.params.iter().position(|pd| pd.label == "gain") {
+            p[gi] = 1.0;
+        }
+        // One sync block, then (re)set the map and sync again.
+        let mut out = vec![0.0f32; 2048];
+        unsafe { inst.process_into(&mut out, &p) };
+        inst.set_map(&[(0, 60, 64)], 0);
+        unsafe { inst.process_into(&mut out, &p) };
+        let peak_at = |vel: u8| -> f32 {
+            inst.all_off();
+            let mut drain = vec![0.0f32; 4096];
+            unsafe { inst.process_into(&mut drain, &p) };
+            inst.note_on(0, 60, vel);
+            let mut buf = vec![0.0f32; 2400];
+            unsafe { inst.process_into(&mut buf, &p) };
+            buf.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+        };
+        let p64 = peak_at(64); // unity by definition
+        let p127 = peak_at(127);
+        let p32 = peak_at(32);
+        assert!(p64 > 1e-4, "layer at its own dynamic must sound (peak {p64})");
+        // ABSOLUTE check: the 0.5-amplitude asset at its own recorded
+        // dynamic must play at 0.5 (unity) — the old note/127 curve
+        // played it at 0.25 (the reported defect).
+        assert!(
+            (p64 - 0.5).abs() < 0.04,
+            "layer velocity must be the UNITY gain point: 0.5-asset at its\n \
+             own dynamic must peak ~0.5, got {p64}"
+        );
+        let up = p127 / p64;
+        let down = p32 / p64;
+        assert!(
+            (up - 2.0).abs() < 0.06,
+            "note 127 over a vel-64 layer = x2 gain, got {up}"
+        );
+        assert!(
+            (down - 0.5).abs() < 0.02,
+            "note 32 over a vel-64 layer = x0.5, got {down}"
+        );
+        // Default (127) layers keep the historic note/127 curve exactly.
+        inst.set_map(&[(0, 60, 127)], 0);
+        unsafe { inst.process_into(&mut out, &p) };
+        let r = peak_at(100) / peak_at(50);
+        assert!(
+            (r - 2.0).abs() < 0.06,
+            "vel-127 layer must follow note/127 (old behavior), got {r}"
+        );
+        // Boost cap: vel-16 layer at note 127 would be x7.9 uncapped.
+        inst.set_map(&[(0, 60, 16)], 0);
+        unsafe { inst.process_into(&mut out, &p) };
+        let cap = peak_at(127) / peak_at(16);
+        assert!(
+            (cap - 4.0).abs() < 0.12,
+            "boost must cap at x4 (+12 dB), got {cap}"
+        );
+        inst.all_off();
+    }
+
     /// Native-suite tier 2: EVERY bundled synth must compile, load, render
     /// audible sound at its own default params, and fall silent on
     /// all_off. The list DERIVES from `BUNDLED` (same rule as the effect
@@ -1700,8 +1779,14 @@ mod tests {
     #[test]
     fn v52_sampler_velocity_layers_crossfade_blends() {
         // Layers 40 and 100 on one root: note v=70 sits EXACTLY halfway,
-        // so both layers sound with equal weight (pitch axis untouched —
-        // exact root hit). Note v=20 is under every layer -> lowest only.
+        // so both layers sound with equal BLEND weight (pitch axis
+        // untouched — exact root hit). Note v=20 is under every layer ->
+        // lowest only.
+        // v57 retarget: equal blend weight no longer means equal POWER —
+        // each layer plays at its recorded dynamic as unity, so the note
+        // over the vel-40 layer (200 Hz) is boosted 70/40 = 1.75x and the
+        // one over vel-100 (800 Hz) cut to 70/100 = 0.7x: amplitude ratio
+        // 2.5, POWER ratio 6.25. (Was: r ~ 1.0 under note/127 gain.)
         let reg = v51_registry();
         v51_tones();
         let inst = v51_sampler(&reg);
@@ -1711,7 +1796,10 @@ mod tests {
         let p1 = tone_power(&x, 800.0, 48000.0, 512, 3800);
         assert!(p0 > 5e4 && p1 > 5e4, "both layers must sound: {p0} {p1}");
         let r = p0 / p1;
-        assert!((r - 1.0).abs() < 0.5, "equal blend expected, power ratio {r}");
+        assert!(
+            (r - 6.25).abs() < 1.2,
+            "v57 unity-reference blend: power ratio ~6.25, got {r}"
+        );
         let x = v52_render(&inst, 48, 20);
         let p0 = tone_power(&x, 200.0, 48000.0, 512, 7680);
         let p1 = tone_power(&x, 800.0, 48000.0, 512, 7680);
