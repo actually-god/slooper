@@ -43290,9 +43290,18 @@ mod tests {
             {
                 continue;
             }
-            let win: String = lines[n..(n + 10).min(lines.len())]
-                .join(" ")
-                .to_lowercase();
+            // Statement-precise window: the label line through the
+            // button's OWN clicked() (the statement end) — not 10 loose
+            // lines, which leak the NEXT widget's tooltip and pass
+            // vacuously (a removed tooltip still greened the pin).
+            let mut end = (n + 8).min(lines.len() - 1);
+            for k in n..=end {
+                if lines[k].contains("clicked()") {
+                    end = k;
+                    break;
+                }
+            }
+            let win: String = lines[n..=end].join(" ").to_lowercase();
             assert!(
                 win.contains("on_hover"),
                 "destructive button {:?} at src/ui.rs:{} carries no hover explanation",
