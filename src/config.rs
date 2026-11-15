@@ -201,6 +201,47 @@ pub enum ChainSave {
     },
 }
 
+/// v61 (S12): ONE named track template — the complete instrument setup
+/// of a single track: synth binding (stem + params + state chunk), the
+/// effects chain (same tagged row format the saves already carry, so a
+/// template can mix scripts and hosted plugins), mixer vol/pan/gain in
+/// MIDI units, and the track's default clip color. Written as
+/// `<name>.json` under `data_dir()/track-templates/` (v56 sampler-preset
+/// layout; sanitized single-component file names on both OSes).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackTemplateSave {
+    /// Synth stem (plugin stems ride their encoded form, same as
+    /// `Config::track_synth`); `None` = unbound track.
+    pub synth: Option<String>,
+    #[serde(default)]
+    pub synth_params: Vec<f32>,
+    /// Plugin state chunk, base64 (same vessel as `track_synth_states`).
+    #[serde(default)]
+    pub synth_state: Option<String>,
+    /// FX chain in order.
+    #[serde(default)]
+    pub chain: Vec<ChainSave>,
+    #[serde(default = "unity_vol_default")]
+    pub vol: u8,
+    #[serde(default = "center_pan_default")]
+    pub pan: u8,
+    #[serde(default = "unity_gain_default")]
+    pub gain: u8,
+    /// Clip-palette index (see `Config::trk_color`); `None` = unset.
+    #[serde(default)]
+    pub color: Option<u8>,
+}
+
+fn unity_vol_default() -> u8 {
+    crate::ui::VOL_UNITY_MIDI
+}
+fn center_pan_default() -> u8 {
+    64
+}
+fn unity_gain_default() -> u8 {
+    crate::audio::GAIN_UNITY_MIDI
+}
+
 // ---------------------------------------------------------------------------
 // base64 (standard alphabet, padded) — hand-rolled so plugin state can ride
 // in JSON/config without pulling a dependency (offline AUR builds).

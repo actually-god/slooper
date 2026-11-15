@@ -951,6 +951,70 @@ impl Clone for ChainRow {
     }
 }
 
+/// v61: the ONE row→save conversion. `save_config`, project saves and
+/// track templates all route through it so the persisted chain shape can
+/// never drift between entry points.
+fn chain_row_to_save(row: &ChainRow) -> ChainSave {
+    match row {
+        ChainRow::Script { stem, params } => ChainSave::Fx {
+            stem: stem.clone(),
+            params: params.clone(),
+        },
+        ChainRow::Vst {
+            path,
+            kind,
+            plugin_id,
+            name,
+            params,
+            entry: _,
+            open_rx: _,
+            state,
+        } => ChainSave::Vst {
+            path: path.clone(),
+            kind: kind.tag().to_string(),
+            plugin_id: plugin_id.clone(),
+            name: name.clone(),
+            params: params.clone(),
+            state: state.as_deref().map(crate::config::b64_encode),
+        },
+    }
+}
+
+/// v61: the ONE save→row conversion (startup load + template apply).
+/// An unparseable kind tag drops the row exactly like the old startup
+/// path did; the row lands unopened (`entry: None`) and `rebuild_fx`
+/// opens it lazily like every other loaded row.
+fn chain_row_from_save(s: &ChainSave) -> Option<ChainRow> {
+    match s {
+        ChainSave::Fx { stem, params } => Some(ChainRow::Script {
+            stem: stem.clone(),
+            params: params.clone(),
+        }),
+        ChainSave::Vst {
+            path,
+            kind,
+            plugin_id,
+            name,
+            params,
+            state,
+        } => {
+            let kind = crate::vsthost::VstKind::parse(kind)?;
+            Some(ChainRow::Vst {
+                path: path.clone(),
+                kind,
+                plugin_id: plugin_id.clone(),
+                name: name.clone(),
+                params: params.clone(),
+                entry: None,
+                open_rx: None,
+                // v22: decode the persisted chunk so the first rebuild
+                // boots the plugin in the exact state the user saved.
+                state: state.as_deref().and_then(crate::config::b64_decode),
+            })
+        }
+    }
+}
+
 /// Plugin-instrument synth bindings reuse the `track_synth` stem table with
 /// a scheme prefix: `"vst3:/abs/x.vst3"` / `"vst2:/abs/x.so"` /
 /// `"clap:/abs/x.clap#com.vendor.plug"` — absolute paths can never collide
@@ -1353,6 +1417,11 @@ pub struct App {
     show_save_prompt: bool,
     save_draft: String,
     show_load: bool,
+    /// v61 (S12): TRACK TEMPLATES window open + the strip that opened it
+    /// (the target track) + the save-name buffer.
+    show_tpl: bool,
+    tpl_track: usize,
+    tpl_name: String,
 
     // --- MIDI subsystem (patterns, synths, recording, piano roll) ---
     synth_registry: synth::Registry,
@@ -1743,39 +1812,7 @@ impl App {
             .map(|i| {
                 chain_cfg
                     .get(i)
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|s| match s {
-                                ChainSave::Fx { stem, params } => Some(ChainRow::Script {
-                                    stem: stem.clone(),
-                                    params: params.clone(),
-                                }),
-                                ChainSave::Vst {
-                                    path,
-                                    kind,
-                                    plugin_id,
-                                    name,
-                                    params,
-                                    state,
-                                } => {
-                                    let kind = crate::vsthost::VstKind::parse(kind)?;
-                                    Some(ChainRow::Vst {
-                                        path: path.clone(),
-                                        kind,
-                                        plugin_id: plugin_id.clone(),
-                                        name: name.clone(),
-                                        params: params.clone(),
-                                        entry: None,
-                                        open_rx: None,
-                                        // v22: decode the persisted chunk so the
-                                        // first rebuild boots the plugin in the
-                                        // exact state the user saved.
-                                        state: state.as_deref().and_then(crate::config::b64_decode),
-                                    })
-                                }
-                            })
-                            .collect()
-                    })
+                    .map(|v| v.iter().filter_map(chain_row_from_save).collect())
                     .unwrap_or_default()
             })
             .collect();
@@ -2028,6 +2065,9 @@ impl App {
             show_save_prompt: false,
             save_draft: String::new(),
             show_load: false,
+            show_tpl: false,
+            tpl_track: 0,
+            tpl_name: String::new(),
             synth_registry,
             track_synth,
             track_synth_params,
@@ -5020,33 +5060,7 @@ impl App {
             track_chain: self
                 .fx_rows
                 .iter()
-                .map(|rows| {
-                    rows.iter()
-                        .map(|r| match r {
-                            ChainRow::Script { stem, params } => ChainSave::Fx {
-                                stem: stem.clone(),
-                                params: params.clone(),
-                            },
-                            ChainRow::Vst {
-                                path,
-                                kind,
-                                plugin_id,
-                                name,
-                                params,
-                                entry: _,
-                                open_rx: _,
-                                state,
-                            } => ChainSave::Vst {
-                                path: path.clone(),
-                                kind: kind.tag().to_string(),
-                                plugin_id: plugin_id.clone(),
-                                name: name.clone(),
-                                params: params.clone(),
-                                state: state.as_deref().map(crate::config::b64_encode),
-                            },
-                        })
-                        .collect()
-                })
+                .map(|rows| rows.iter().map(chain_row_to_save).collect())
                 .collect(),
             track_fx: Vec::new(),
             track_synth: self.track_synth.clone(),
@@ -11322,6 +11336,111 @@ impl App {
         }
     }
 
+    // ---- v61 (S12): track templates ---------------------------------------
+    // A template is ONE track's complete instrument setup: synth binding
+    // (+params+state), the FX chain, mixer vol/pan/gain and the track
+    // color. Files live under data_dir()/track-templates/ exactly like the
+    // v56 sampler presets (the sanitizer is deliberately shared).
+
+    fn track_template_dir() -> PathBuf {
+        crate::paths::data_dir().join("track-templates")
+    }
+    fn track_template_list() -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(Self::track_template_dir())
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().is_some_and(|x| x == "json") {
+                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+    fn track_template_save(&mut self, t: usize) {
+        let name = Self::sampler_preset_sanitize(&self.tpl_name.clone());
+        if name.is_empty() {
+            self.status = "track template: type a name first".into();
+            return;
+        }
+        let tpl = crate::config::TrackTemplateSave {
+            synth: self.track_synth[t].clone().filter(|s| !s.is_empty()),
+            synth_params: self.track_synth_params[t].clone(),
+            synth_state: self.track_synth_state[t]
+                .as_deref()
+                .map(crate::config::b64_encode),
+            chain: self.fx_rows[t].iter().map(chain_row_to_save).collect(),
+            vol: self.trk_vol[t],
+            pan: self.trk_pan[t],
+            gain: self.trk_gain[t],
+            color: self.trk_color[t],
+        };
+        let dir = Self::track_template_dir();
+        let res = std::fs::create_dir_all(&dir).and_then(|()| {
+            let js = serde_json::to_string_pretty(&tpl)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            std::fs::write(dir.join(format!("{name}.json")), js)
+        });
+        self.status = match res {
+            Ok(()) => format!("track template saved: {name}"),
+            Err(e) => format!("track template save failed: {e}"),
+        };
+    }
+    fn track_template_apply(&mut self, t: usize, name: &str) {
+        let name = Self::sampler_preset_sanitize(name);
+        let path = Self::track_template_dir().join(format!("{name}.json"));
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| {
+                serde_json::from_str::<crate::config::TrackTemplateSave>(&s)
+                    .map_err(|e| e.to_string())
+            });
+        match parsed {
+            Ok(tpl) => {
+                // Synth: fields first, then the SAME rebuild path a project
+                // load uses (async VST land, script seed+create, per-track
+                // default piano for unbound MIDI tracks all live there).
+                self.track_synth[t] = tpl.synth.clone();
+                self.track_synth_params[t] = tpl.synth_params.clone();
+                self.track_synth_state[t] = tpl
+                    .synth_state
+                    .as_deref()
+                    .and_then(crate::config::b64_decode);
+                self.rebuild_track_synth(t);
+                self.fx_rows[t] = tpl.chain.iter().filter_map(chain_row_from_save).collect();
+                self.rebuild_fx(t);
+                // Mixer writes go through the setters (they push to the
+                // engine + automation note — a direct array poke would be
+                // stomped by the per-frame mirror).
+                self.set_trk_vol(t, tpl.vol);
+                self.set_trk_pan(t, tpl.pan);
+                self.set_trk_gain(t, tpl.gain);
+                self.set_trk_color(t, tpl.color);
+                self.save_config();
+                self.status = format!(
+                    "template \"{name}\" loaded onto track {}: synth + {} fx",
+                    t + 1,
+                    self.fx_rows[t].len()
+                );
+            }
+            Err(e) => self.status = format!("track template load failed: {e}"),
+        }
+    }
+    fn track_template_delete(&mut self, name: &str) {
+        let name = Self::sampler_preset_sanitize(name);
+        let path = Self::track_template_dir().join(format!("{name}.json"));
+        self.status = match std::fs::remove_file(&path) {
+            Ok(()) => format!("track template deleted: {name}"),
+            Err(e) => format!("track template delete failed: {e}"),
+        };
+    }
+
     /// v51: end a held map-window audition.
     fn smap_release(&mut self) {
         self.smap_hold_until = None;
@@ -13633,32 +13752,7 @@ impl App {
                         ChainRow::Vst { .. } => None,
                     })
                     .collect(),
-                chain: self.fx_rows[t]
-                    .iter()
-                    .map(|r| match r {
-                        ChainRow::Script { stem, params } => ChainSave::Fx {
-                            stem: stem.clone(),
-                            params: params.clone(),
-                        },
-                        ChainRow::Vst {
-                            path,
-                            kind,
-                            plugin_id,
-                            name,
-                            params,
-                            entry: _,
-                            open_rx: _,
-                            state,
-                        } => ChainSave::Vst {
-                            path: path.clone(),
-                            kind: kind.tag().to_string(),
-                            plugin_id: plugin_id.clone(),
-                            name: name.clone(),
-                            params: params.clone(),
-                            state: state.as_deref().map(crate::config::b64_encode),
-                        },
-                    })
-                    .collect(),
+                chain: self.fx_rows[t].iter().map(chain_row_to_save).collect(),
                 lanes: self.arr.tracks[t]
                     .lanes
                     .iter()
@@ -15464,6 +15558,7 @@ impl App {
         }
         save_prompt_window(ui, self);
         load_window(ui, self);
+        track_template_window(ui, self);
         proj_confirm_window(ui, self);
         self.load_opts_window(ui);
         self.sample_edit_window(ui);
@@ -21022,8 +21117,22 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         }
         // v59: right-click opens the SAME Track color submenu the grid
         // menu carries (shared helper — the two menus cannot drift).
+        // v61: the strip menu is also the entry point for track templates.
         head.context_menu(|ui| {
             if track_color_submenu(ui, app, t) {
+                ui.close();
+            }
+            if ui
+                .button("Track templates\u{2026}")
+                .on_hover_text(
+                    "save this track's instrument, effects chain, mixer and \
+                     color as a named template, or re-apply a saved one",
+                )
+                .clicked()
+            {
+                app.tpl_track = t;
+                app.tpl_name = format!("Track {}", t + 1);
+                app.show_tpl = true;
                 ui.close();
             }
         });
@@ -26256,6 +26365,87 @@ fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
     }
     if !open {
         app.show_save_prompt = false;
+    }
+}
+
+/// v61 (S12): TRACK TEMPLATES — browse, re-apply, save and delete named
+/// per-track instrument setups. Opened from a mixer strip's RMB menu;
+/// the window targets that strip's track (`App::tpl_track`).
+fn track_template_window(ui: &mut egui::Ui, app: &mut App) {
+    if !app.show_tpl {
+        return;
+    }
+    let t = app.tpl_track.min(MAX_LOOPS - 1);
+    let mut open = true;
+    let mut apply: Option<String> = None;
+    let mut del: Option<String> = None;
+    let mut save_now = false;
+    egui::Window::new(RichText::new("TRACK TEMPLATES").strong())
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.label(format!(
+                "Track {} - a template keeps the instrument, effects chain, mixer and clip color",
+                t + 1
+            ));
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [190.0, 20.0],
+                    egui::TextEdit::singleline(&mut app.tpl_name).hint_text("template name"),
+                );
+                if ui
+                    .button("save")
+                    .on_hover_text(
+                        "capture this track's instrument, effects, mixer and \
+                         color into a new named template",
+                    )
+                    .clicked()
+                {
+                    save_now = true;
+                }
+            });
+            ui.separator();
+            let names = App::track_template_list();
+            if names.is_empty() {
+                ui.label("no saved templates yet");
+            }
+            for n in names {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&n).strong());
+                    if ui
+                        .button("apply")
+                        .on_hover_text(
+                            "replace this track's instrument, effects, mixer \
+                             and color with the template",
+                        )
+                        .clicked()
+                    {
+                        apply = Some(n.clone());
+                    }
+                    if ui
+                        .button("delete")
+                        .on_hover_text("remove this template file for good")
+                        .clicked()
+                    {
+                        del = Some(n.clone());
+                    }
+                });
+            }
+        });
+    // Actions fire OUTSIDE the pass (rows read a snapshot of the list;
+    // mutating mid-list would desync it).
+    if save_now {
+        app.track_template_save(t);
+    }
+    if let Some(n) = apply {
+        app.track_template_apply(t, &n);
+    }
+    if let Some(n) = del {
+        app.track_template_delete(&n);
+    }
+    if !open {
+        app.show_tpl = false;
     }
 }
 
@@ -45542,5 +45732,209 @@ mod tests {
             .filter(|rq| rq.width() < 20.0)
             .count();
         assert_eq!(chips, 0, "both chips are gone after reset");
+    }
+
+    // ---- v61 (S12): track templates ---------------------------------------
+
+    /// R3 core: open the strip RMB menu and click "Track templates…"
+    /// (the proven v59 header recipe: master closed, settle frames,
+    /// x > 1000 mixer band + y < 853 viewport).
+    fn v61_open_template_window(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..3 {
+            frame(app, ctx, vec![]);
+        }
+        let heads: Vec<egui::Pos2> = galley_centers(app, ctx, "Track 1", false)
+            .into_iter()
+            .filter(|c| c.x > 1000.0 && c.y < 853.0)
+            .collect();
+        assert_eq!(heads.len(), 1, "exactly one mixer 'Track 1' header: {heads:?}");
+        rmb(app, ctx, heads[0]);
+        let item =
+            galley_at_last(app, ctx, "Track templates").expect("template entry in the strip menu");
+        click_pt(app, ctx, item.center());
+        frame(app, ctx, vec![]);
+    }
+
+    /// R1: save captures the synth binding + FX chain into the sandboxed
+    /// data dir and "apply" puts both back — through the real widgets.
+    #[test]
+    fn v61_track_template_save_apply_roundtrip() {
+        let mut app = headless_app("v61tplround");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.track_synth[0] = Some("piano".into());
+        app.rebuild_track_synth(0);
+        app.add_fx_script(0, "delay");
+        v61_open_template_window(&mut app, &ctx);
+        assert!(
+            galley_at(&mut app, &ctx, "TRACK TEMPLATES").is_some(),
+            "template window opened"
+        );
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("track template saved: Track-1"),
+            "{}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("track-templates");
+        assert!(dir.to_string_lossy().contains("sp-uity"), "sandboxed data dir: {dir:?}");
+        assert!(dir.join("Track-1.json").is_file(), "template file landed");
+        // Strip the track down, then restore it with the list's "apply".
+        app.fx_rows[0].clear();
+        app.rebuild_fx(0);
+        app.track_synth[0] = None;
+        app.rebuild_track_synth(0);
+        frame(&mut app, &ctx, vec![]);
+        app.status = String::new();
+        click_exact(&mut app, &ctx, "apply");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_synth[0].as_deref(), Some("piano"), "synth binding restored");
+        let stems: Vec<&str> = app.fx_rows[0]
+            .iter()
+            .map(|r| match r {
+                ChainRow::Script { stem, .. } => stem.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(stems, ["delay"], "FX chain restored in order");
+        assert!(
+            app.status.contains("loaded onto track 1: synth + 1 fx"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// R2/R6: vol/pan/gain/color ride the template and land through the
+    /// setters (not naked array pokes); the status bar echoes.
+    #[test]
+    fn v61_track_template_mixer_values_restored() {
+        let mut app = headless_app("v61tplmix");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.set_trk_vol(0, 90);
+        app.set_trk_pan(0, 40);
+        app.set_trk_gain(0, 60);
+        app.set_trk_color(0, Some(2));
+        v61_open_template_window(&mut app, &ctx);
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("track template saved: Track-1"), "{}", app.status);
+        // Dirty every value the same way the mixer widgets do.
+        app.set_trk_vol(0, 115);
+        app.set_trk_pan(0, 64);
+        app.set_trk_gain(0, 80);
+        app.set_trk_color(0, None);
+        frame(&mut app, &ctx, vec![]);
+        app.status = String::new();
+        click_exact(&mut app, &ctx, "apply");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_vol[0], 90, "volume restored");
+        assert_eq!(app.trk_pan[0], 40, "pan restored");
+        assert_eq!(app.trk_gain[0], 60, "gain restored");
+        assert_eq!(app.trk_color[0], Some(2), "track color restored");
+        assert!(app.status.contains("loaded onto track 1"), "{}", app.status);
+    }
+
+    /// R3: the strip menu entry explains itself on hover (goal 1), opens
+    /// the window targeting that strip, and the window lists saved files.
+    #[test]
+    fn v61_track_template_mixer_menu_entry() {
+        let mut app = headless_app("v61tplmenu");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let heads: Vec<egui::Pos2> = galley_centers(&mut app, &ctx, "Track 1", false)
+            .into_iter()
+            .filter(|c| c.x > 1000.0 && c.y < 853.0)
+            .collect();
+        assert_eq!(heads.len(), 1, "one mixer header in view: {heads:?}");
+        rmb(&mut app, &ctx, heads[0]);
+        let item = galley_at_last(&mut app, &ctx, "Track templates")
+            .expect("strip menu carries the template entry")
+            .center();
+        let tips = hover_until_tip(&mut app, &ctx, item, &["named template"]);
+        assert!(tips.iter().any(|t| t.contains("named template")), "menu item explains on hover");
+        click_pt(&mut app, &ctx, item);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.show_tpl, "window opened from the strip menu");
+        assert_eq!(app.tpl_track, 0, "window targets the strip's track");
+        assert!(
+            galley_at(&mut app, &ctx, "no saved templates yet").is_some(),
+            "empty-list hint shows"
+        );
+        // A template appearing on disk is listed on the next frame.
+        let dir = crate::paths::data_dir().join("track-templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("handdrum.json"), "{}").unwrap();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(galley_centers(&mut app, &ctx, "handdrum", true).len(), 1, "list row appears");
+        assert!(galley_at(&mut app, &ctx, "no saved templates yet").is_none(), "hint gone");
+    }
+
+    /// R4: hostile names sanitize to single-component files; the live
+    /// path types into the real TextEdit (v56 traversal contract).
+    #[test]
+    fn v61_track_template_name_sanitized() {
+        let mut app = headless_app("v61tplsan");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        assert_eq!(App::sampler_preset_sanitize("  a/b c  "), "a-b-c");
+        assert_eq!(App::sampler_preset_sanitize("../evil name"), "evil-name");
+        v61_open_template_window(&mut app, &ctx);
+        app.tpl_name = String::new();
+        frame(&mut app, &ctx, vec![]);
+        let ed = galley_at(&mut app, &ctx, "template name").expect("name TextEdit (hint visible)");
+        click_pt(&mut app, &ctx, ed.center());
+        type_into_focused(&mut app, &ctx, "../evil name");
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("track template saved: evil-name"), "{}", app.status);
+        let dir = crate::paths::data_dir().join("track-templates");
+        assert!(dir.join("evil-name.json").is_file(), "file written single-component");
+        assert!(!crate::paths::data_dir().join("evil-name.json").exists(), "no parent escape");
+        assert!(!std::path::Path::new("evil-name.json").exists(), "no CWD dropping");
+    }
+
+    /// R5: per-row delete removes the file, updates the list and echoes
+    /// status; the button explains itself on hover (goal 1).
+    #[test]
+    fn v61_track_template_delete_updates_list() {
+        let mut app = headless_app("v61tpldel");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        let dir = crate::paths::data_dir().join("track-templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aa.json"), "{}").unwrap();
+        std::fs::write(dir.join("bb.json"), "{}").unwrap();
+        v61_open_template_window(&mut app, &ctx);
+        let aa = galley_centers(&mut app, &ctx, "aa", true);
+        assert_eq!(aa.len(), 1, "row aa paints");
+        assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "row bb paints");
+        // Delete the AA row: the delete button NEAREST the label's y
+        // (v58 lesson — common labels resolve by anchor, never [0]).
+        let aa_y = aa[0].y;
+        let del = galley_centers(&mut app, &ctx, "delete", true)
+            .into_iter()
+            .min_by(|a, b| (a.y - aa_y).total_cmp(&(b.y - aa_y)))
+            .expect("a delete button per row");
+        let tips = hover_until_tip(&mut app, &ctx, del, &["for good"]);
+        assert!(tips.iter().any(|t| t.contains("for good")), "delete explains on hover");
+        click_pt(&mut app, &ctx, del);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!dir.join("aa.json").exists(), "file removed");
+        assert!(dir.join("bb.json").is_file(), "other template untouched");
+        assert!(app.status.contains("track template deleted: aa"), "{}", app.status);
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        assert!(galley_centers(&mut app, &ctx, "aa", true).is_empty(), "row dropped from list");
+        assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "bb row remains");
     }
 }
