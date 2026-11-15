@@ -403,6 +403,10 @@ pub struct Config {
     /// 0 dB). Missing entries fall back to 127.
     #[serde(default)]
     pub trk_vol: Vec<u8>,
+    /// v58: per-track default clip color (palette index; null/absent =
+    /// built-in kind colors). Session state, like the volume tables.
+    #[serde(default)]
+    pub trk_color: Vec<Option<u8>>,
     /// Per-track grid block height in points, written when the user drags a
     /// separation bar (0 = automatic: lanes × lane height). Missing entries
     /// fall back to automatic.
@@ -687,6 +691,7 @@ impl Default for Config {
             gui_scale: default_gui_scale(),
             latency_ms: 0.0,
             trk_vol: Vec::new(),
+            trk_color: Vec::new(),
             trk_h: Vec::new(),
             trk_gain: Vec::new(),
             trk_pan: Vec::new(),
