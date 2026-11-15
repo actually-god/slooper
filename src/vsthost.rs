@@ -183,6 +183,24 @@ pub trait StageEntry: Send + Sync {
     }
     fn set_param(&self, index: usize, value: f32);
     fn set_param_rt(&self, index: usize, value: f32);
+    /// v60: factory program ("patch") names in plugin order. Snapshot
+    /// taken once at open — NEVER plugin code per call; empty means this
+    /// backend/plugin reports none (CLAP and VST3 today, see field docs).
+    fn programs(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// v60: currently selected factory program (`None` = backend does
+    /// not track one).
+    fn current_program(&self) -> Option<usize> {
+        None
+    }
+    /// v60: switch the LIVE instance to factory program `index`; true =
+    /// the plugin accepted it. Control thread only (VST2 dispatches on
+    /// the plugin GUI thread, the same way the plugin's own editor does);
+    /// never touches a dead/parked entry.
+    fn select_program(&self, _index: usize) -> bool {
+        false
+    }
     /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
     /// Audio thread only.
     fn process(&self, input: &[f32], output: &mut [f32]);
@@ -242,6 +260,16 @@ impl StageEntry for RtStageEntry {
     }
     fn set_param_rt(&self, index: usize, value: f32) {
         RtStageEntry::set_param_rt(self, index, value)
+    }
+    fn programs(&self) -> Vec<String> {
+        self.programs.clone()
+    }
+    fn current_program(&self) -> Option<usize> {
+        let p = self.program.load(Ordering::Relaxed);
+        (p >= 0).then_some(p as usize)
+    }
+    fn select_program(&self, index: usize) -> bool {
+        RtStageEntry::select_program(self, index)
     }
     fn process(&self, input: &[f32], output: &mut [f32]) {
         RtStageEntry::process(self, input, output)
@@ -2078,6 +2106,14 @@ pub struct RtStageEntry {
     control: Mutex<Option<vst3_host::realtime::RtControl>>,
     params: Arc<VstParams>,
     descs: Vec<VstParamDesc>,
+    /// v60: factory program names snapshotted at open. VST2 only today:
+    /// VST3's `RtControl` command ring carries no program command and
+    /// CLAP factory presets (`clap.presets` factory) are unhosted — both
+    /// report empty and the UI hides the row (docs/WINDOWS-PORT.md rule:
+    /// additive gaps, never half-wired chrome).
+    programs: Vec<String>,
+    /// v60: last known current program (-1 = never reported / unsupported).
+    program: std::sync::atomic::AtomicI32,
     name: String,
     /// Where this plugin was loaded from (re-opens offline render copies).
     spec: (PathBuf, VstKind),
@@ -2123,7 +2159,21 @@ impl Vst2Handle {
     pub fn as_usize(&self) -> usize {
         self.0 as usize
     }
+    /// v60: rebuild a handle from [`Self::as_usize`] so a program select
+    /// can carry the address into an `on_gui_thread` job.
+    pub(crate) fn from_addr(addr: usize) -> Self {
+        Self(addr as *mut vst2::api::AEffect)
+    }
     /// Raw `AEffect::dispatcher` call with a VST2 opcode number.
+    ///
+    /// v60 ABI FOLD: the vendored crate declares the return as `isize`,
+    /// but a real VST2 plugin (the C ABI) returns a C `long` — 32-bit on
+    /// Windows. x86-64 zero-extends the 32-bit write, so a plugin's `-1`
+    /// ("refused", e.g. effSetProgram out-of-range) arrives as
+    /// 4294967295 = TRUE on Windows (found by the v60 pins on the real
+    /// runner: -1 asserted, huge positive observed). Every C plugin is
+    /// on the honor system of the 32-bit VST2 return; fold back to the
+    /// signed 32-bit domain. Linux: `long == isize`, fold is a no-op.
     pub fn dispatch(
         &self,
         opcode: i32,
@@ -2132,9 +2182,14 @@ impl Vst2Handle {
         ptr: *mut std::ffi::c_void,
         opt: f32,
     ) -> isize {
-        unsafe {
+        let r = unsafe {
             let ae = self.0;
             ((*ae).dispatcher)(ae, opcode, index, value, ptr, opt)
+        };
+        if cfg!(windows) {
+            r as u32 as i32 as isize
+        } else {
+            r
         }
     }
     /// v22: current parameter value straight through `AEffect::getParameter`
@@ -2776,6 +2831,9 @@ struct RtParts {
     v3_bufs: Option<vst3_host::audio::AudioBuffers>,
     control: Option<vst3_host::realtime::RtControl>,
     out_channels: usize,
+    /// v60: factory programs snapshotted at open (empty + -1 = none).
+    programs: Vec<String>,
+    program0: i32,
 }
 
 fn assemble(
@@ -2818,6 +2876,8 @@ fn assemble(
         control: Mutex::new(parts.control),
         params,
         descs,
+        programs: parts.programs,
+        program: std::sync::atomic::AtomicI32::new(parts.program0),
         name,
         spec: parts.spec,
         has_editor,
@@ -2954,6 +3014,10 @@ fn open_v3(
             v3_bufs: Some(bufs),
             control: Some(control),
             out_channels: out_ch,
+            // v60: VST3 programs need a runner-side program command (the
+            // RtControl ring carries none) — documented gap, see field docs.
+            programs: Vec::new(),
+            program0: -1,
         },
         params,
         descs,
@@ -3049,6 +3113,39 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     // the instance moves into the realtime backend.
     let has_editor = unsafe { ((*inst.raw_effect()).flags & 1) != 0 };
     let vst2 = Some(Vst2Handle::from_instance(&inst));
+    // v60: snapshot the factory programs ("presets" in the vendored
+    // crate's dialect: ChangePreset=2, GetCurrentPresetNum=3,
+    // GetCurrentPresetName=5). open_v2 runs ON the vst2-gui thread
+    // (open_inner's contract), so this dispatch is already on the
+    // sanctioned control thread — no on_gui_thread nest, no RT contact.
+    // numPrograms<=0 = the plugin implements no programs (VST2.4 rule).
+    let (programs, program0) = {
+        let h = vst2.as_ref().expect("just built");
+        let n = unsafe { (*inst.raw_effect()).numPrograms }.clamp(0, 1024) as usize;
+        let mut names = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut buf = [0 as std::ffi::c_char; 64];
+            let ok = h.dispatch(5, i as i32, 0, buf.as_mut_ptr() as *mut std::ffi::c_void, 0.0);
+            if ok != 0 {
+                let s = unsafe {
+                    buf[63] = 0;
+                    std::ffi::CStr::from_ptr(buf.as_ptr())
+                }
+                .to_string_lossy()
+                .trim_end()
+                .to_string();
+                if !s.is_empty() {
+                    names.push(s);
+                }
+            }
+        }
+        let cur = if names.is_empty() {
+            -1
+        } else {
+            h.dispatch(3, 0, 0, std::ptr::null_mut(), 0.0) as i32
+        };
+        (names, cur)
+    };
     lap("handle+assemble", &mut last);
     if trace {
         eprintln!(
@@ -3067,6 +3164,8 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
             v3_bufs: None,
             control: None,
             out_channels: out_ch,
+            programs,
+            program0,
         },
         params,
         descs,
@@ -3094,6 +3193,34 @@ impl RtStageEntry {
     /// VST2 editor dispatch handle (`None` for VST3 — see docs/PLUGINS.md).
     pub fn vst2_handle(&self) -> Option<Vst2Handle> {
         self.vst2
+    }
+
+    /// v60: switch the LIVE instance to factory program `index`. VST2
+    /// only: the `ChangePreset` dispatch rides the vst2-gui thread, the
+    /// same thread (and same call shape) the plugin's own editor uses,
+    /// so no new thread-affinity class is opened. Every other format and
+    /// every dead/parked entry (v42 firewall) returns false without
+    /// touching the library.
+    pub fn select_program(&self, index: usize) -> bool {
+        if self.dead.load(Ordering::Relaxed) || index >= self.programs.len() {
+            return false;
+        }
+        let Some(h) = self.vst2 else {
+            return false;
+        };
+        let addr = h.as_usize();
+        // Never call from a GUI job (would wait on the blocked thread);
+        // UI/pins only — the same contract as every `on_gui_thread` user.
+        match on_gui_thread(move || Vst2Handle::from_addr(addr).dispatch(2, 0, index as isize, std::ptr::null_mut(), 0.0))
+        {
+            // Plugins answer with the program they actually switched to
+            // (>= 0); -1 / Err = refused. Adopt the plugin's verdict.
+            Ok(r) if r >= 0 => {
+                self.program.store(r as i32, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Plugin file path this entry was loaded from.
@@ -5066,6 +5193,141 @@ mod tests {
     // .dll); the #[cfg(windows)] pins assert the opposite truth on Windows
     // CI (W10). One fixture, two OSes, each asserts its own semantics.
 
+    /// v60 R1/R2: the w6 fixture's three factory programs must enumerate
+    /// in order, and selection must round-trip through the LIVE instance.
+    /// Out-of-range selection is refused HOST-side (never touching the
+    /// library, so a stale cache cannot provoke a bogus call) — and the
+    /// raw plugin-side refusal (-1) the guard mirrors is asserted too.
+    /// Quick tier: pure-C fixture dlopen, the same class as the w6 probe
+    /// pins (the hang class is C++ toolkits, not this file).
+    #[test]
+    fn v60_vst2_programs_enumerated_and_selected() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        // OWN copy of the fixture: the program counter is a static INSIDE
+        // the library, so every open of the same file path would share
+        // one live plugin across tests (the UI combo pin moves programs
+        // too). The unique temp copy is the same trick the w6-live pin
+        // uses — and the never-dlclosed entry pins the ORIGINAL file's
+        // statics for every other test, keeping them pristine.
+        let dir = w6_temp_dir("v60host");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load =
+            open(&fixture, VstKind::V2, 48_000, None).unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        assert_eq!(e.programs(), vec!["Init", "Fat", "Thin"], "names, in order");
+        assert_eq!(e.current_program(), Some(0), "fixture boots at program 0");
+        assert!(e.select_program(2), "valid select is accepted");
+        assert_eq!(e.current_program(), Some(2), "selection is reported back");
+        assert!(e.select_program(1));
+        assert_eq!(e.current_program(), Some(1));
+        assert!(!e.select_program(99), "out-of-range is refused");
+        assert_eq!(e.current_program(), Some(1), "a refusal leaves state alone");
+        // The plugin-side contract the guard mirrors: the same request
+        // straight through the dispatcher must NOT move the plugin, and
+        // at OUR seam the answer is exactly -1 — the fixture's refusal
+        // answer arrives sign-folded by Vst2Handle::dispatch (without
+        // the v60 ABI fold this assert is what goes red on the Windows
+        // runner: x64 delivers the C 32-bit -1 zero-extended as
+        // 4294967295; found by exactly this pin on 2026-11-15).
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let h = rt.vst2_handle().expect("VST2 handle");
+        let addr = h.as_usize();
+        let raw = on_gui_thread(move || {
+            Vst2Handle::from_addr(addr).dispatch(2, 0, 99, std::ptr::null_mut(), 0.0)
+        })
+        .expect("gui thread");
+        assert_eq!(raw, -1, "out-of-range ChangePreset refused (-1, folded)");
+        let read = on_gui_thread(move || {
+            Vst2Handle::from_addr(addr).dispatch(3, 0, 0, std::ptr::null_mut(), 0.0)
+        })
+        .expect("gui thread");
+        assert_eq!(read, 1, "the refused dispatch left the plugin on program 1");
+    }
+
+    /// v60 R6: the program surface DEFAULTS to inert — every backend that
+    /// does not implement programs (CLAP today, any future format) must
+    /// answer empty/None/false without any library contact.
+    #[test]
+    fn v60_trait_program_defaults_are_inert() {
+        struct Dummy;
+        impl StageEntry for Dummy {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("/")
+            }
+            fn spec(&self) -> &(std::path::PathBuf, VstKind) {
+                static S: std::sync::OnceLock<(std::path::PathBuf, VstKind)> =
+                    std::sync::OnceLock::new();
+                S.get_or_init(|| (std::path::PathBuf::from("/"), VstKind::V2))
+            }
+            fn kind(&self) -> VstKind {
+                VstKind::V2
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn descs(&self) -> &[VstParamDesc] {
+                &[]
+            }
+            fn params(&self) -> &std::sync::Arc<VstParams> {
+                static P: std::sync::OnceLock<std::sync::Arc<VstParams>> =
+                    std::sync::OnceLock::new();
+                P.get_or_init(|| VstParams::new(&[]))
+            }
+            fn has_editor(&self) -> bool {
+                false
+            }
+            fn set_param(&self, _i: usize, _v: f32) {}
+            fn set_param_rt(&self, _i: usize, _v: f32) {}
+            fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+            fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+            fn all_notes_off(&self) {}
+            fn flush(&self) {}
+            fn midi_drops(&self) -> u64 {
+                0
+            }
+        }
+        let d = Dummy;
+        let e: &dyn StageEntry = &d;
+        assert!(e.programs().is_empty());
+        assert_eq!(e.current_program(), None);
+        assert!(!e.select_program(0));
+    }
+
+    /// v60 follow-up (bit for real on 2026-11-15): the program counter
+    /// lives INSIDE the fixture library, so every open of one FILE is
+    /// one live plugin across the whole test process. A second open must
+    /// still boot at program 0 (VSTPluginMain resets its statics) — and
+    /// a program change must never bleed into a copy's next open. This
+    /// is the contract that makes unique-temp-copy pins hermetic.
+    #[test]
+    fn v60_vst2_open_resets_program() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v60reset");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let a = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("first open: {e}"))
+            .entry;
+        assert_eq!(a.current_program(), Some(0));
+        assert!(a.select_program(2));
+        // Same file, second instance: must boot at 0, not inherit 2.
+        let b = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("second open: {e}"))
+            .entry;
+        assert_eq!(
+            b.current_program(),
+            Some(0),
+            "VSTPluginMain must reset the program static (two entries, one library)"
+        );
+        // And the host-side view of instance 1 was not retroactively
+        // changed by opening instance 2 (its snapshot stays 2).
+        assert_eq!(a.current_program(), Some(2), "instance 1 keeps its program");
+    }
+
     fn w6_fixture(name: &str) -> PathBuf {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/w6")
@@ -5636,3 +5898,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
