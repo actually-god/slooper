@@ -50,6 +50,12 @@ pub struct Clip {
     pub fade_in: u64,
     /// Fade-out length in timeline samples (linear gain → 0 at clip end).
     pub fade_out: u64,
+    /// v58: palette index for the clip's color (`None` = follow the
+    /// track default, then the kind default). The palette itself lives
+    /// with the painters in `ui.rs` (`CLIP_PALETTE`); this is just its
+    /// index so the model stays egui-free. Applies to all clip kinds —
+    /// audio, MIDI and automation alike.
+    pub color: Option<u8>,
 }
 
 impl Clip {
@@ -64,6 +70,7 @@ impl Clip {
             gain: 1.0,
             fade_in: 0,
             fade_out: 0,
+            color: None,
         }
     }
     /// Samples of playable source left after `cut`.
@@ -591,6 +598,7 @@ mod tests {
             gain: 1.0,
             fade_in: 100,
             fade_out: 200,
+            color: None,
         };
         assert_eq!(cl.fade_at(999, alen), 0.0); // outside the clip
         assert_eq!(cl.fade_at(1000, alen), 0.0); // fade-in starts silent
