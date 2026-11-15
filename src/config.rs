@@ -198,6 +198,10 @@ pub enum ChainSave {
         /// Older files simply lack the key and load with `None`.
         #[serde(default)]
         state: Option<String>,
+        /// v62: selected VST2 factory program (None = none/untracked).
+        /// Additive serde key — old files load unchanged.
+        #[serde(default)]
+        program: Option<i32>,
     },
 }
 
@@ -650,6 +654,10 @@ pub struct Config {
     /// every change a user made inside a plugin GUI.
     #[serde(default)]
     pub track_synth_states: Vec<Option<String>>,
+    /// v62: per-track selected VST2 factory program (-1 = none). Index =
+    /// track; re-applied when the synth (re)opens.
+    #[serde(default)]
+    pub track_synth_programs: Vec<i32>,
     /// Number of tracks the program exposes (clamped 1..=16). Per-track
     /// levels and bindings are kept for ALL 16 slots regardless, so raising
     /// the count again restores everything that was configured while a
@@ -784,6 +792,7 @@ impl Default for Config {
             track_synth: Vec::new(),
             track_synth_params: Vec::new(),
             track_synth_states: Vec::new(),
+            track_synth_programs: Vec::new(),
             show_rack: true,
             show_mixer: true,
             mixer_follow_tracks: true,
@@ -907,6 +916,8 @@ impl Config {
                         name: vs.name.clone(),
                         params: vs.params.clone(),
                         state: None,
+                        // v62: legacy single-VST rows predate factory programs.
+                        program: None,
                     });
                 }
                 v
@@ -1346,6 +1357,7 @@ mod tests {
             track_synth: vec![None, Some("piano".into())],
             track_synth_params: vec![vec![], vec![0.2]],
             track_synth_states: vec![],
+            track_synth_programs: vec![],
             vst_dirs: vec!["/tmp/vst".into()],
             track_vst: vec![
                 None,
@@ -1567,6 +1579,7 @@ mod tests {
             name: "CamComp".into(),
             params: vec![0.5],
             state: Some(b64_encode(b"F1 0.25")),
+            program: None,
         };
         let j = serde_json::to_string(&c).unwrap();
         assert!(j.contains("\"CLAP\""), "{j}");
@@ -1612,6 +1625,7 @@ mod tests {
             name: "Thing".into(),
             params: vec![0.25, 0.75],
             state: Some(b64_encode(b"plugin-chunk")),
+            program: Some(3),
         };
         let j = serde_json::to_string(&c).unwrap();
         let back: ChainSave = serde_json::from_str(&j).unwrap();
@@ -1630,5 +1644,48 @@ mod tests {
             ChainSave::Vst { state, .. } => assert!(state.is_none(), "old files load state=None"),
             _ => unreachable!(),
         }
+    }
+
+/// v62 R1/R3: the factory program rides ChainSave and the per-track
+    /// synth table as an ADDITIVE serde key: round-trip keeps the value,
+    /// legacy files (key absent) load as None/empty — no format bump.
+    #[test]
+    fn v62_program_config_serde() {
+        let c = ChainSave::Vst {
+            path: "/p/x.so".into(),
+            kind: "VST2".into(),
+            plugin_id: None,
+            name: "x".into(),
+            params: vec![0.5],
+            state: None,
+            program: Some(2),
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"program\":2"), "{j}");
+        match serde_json::from_str::<ChainSave>(&j).unwrap() {
+            ChainSave::Vst { program, .. } => assert_eq!(program, Some(2), "round-trip"),
+            _ => unreachable!(),
+        }
+        // Legacy shape: strip the key from the written JSON and reload.
+        let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        v.as_object_mut().unwrap().remove("program");
+        match serde_json::from_str::<ChainSave>(&v.to_string()).unwrap() {
+            ChainSave::Vst { program, .. } => assert_eq!(program, None, "old files load None"),
+            _ => unreachable!(),
+        }
+        // The per-track synth table round-trips and loads empty when the
+        // key is absent (App maps missing slots to -1 itself).
+        let cfg = Config {
+            track_synth_programs: vec![-1, 3],
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&cfg).unwrap();
+        assert!(j.contains("\"track_synth_programs\":[-1,3]"), "table lands in JSON");
+        let back: Config = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.track_synth_programs, vec![-1, 3]);
+        let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        v.as_object_mut().unwrap().remove("track_synth_programs");
+        let old: Config = serde_json::from_str(&v.to_string()).unwrap();
+        assert!(old.track_synth_programs.is_empty(), "old configs load empty");
     }
 }

@@ -201,6 +201,12 @@ pub trait StageEntry: Send + Sync {
     fn select_program(&self, _index: usize) -> bool {
         false
     }
+    /// v62: re-read the plugin's current program into the entry snapshot,
+    /// so a program the plugin changed inside its OWN editor becomes
+    /// visible to the host (combo + persistence capture). Inert for
+    /// backends without program tracking; control thread only, like
+    /// `select_program`.
+    fn refresh_program(&self) {}
     /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
     /// Audio thread only.
     fn process(&self, input: &[f32], output: &mut [f32]);
@@ -270,6 +276,9 @@ impl StageEntry for RtStageEntry {
     }
     fn select_program(&self, index: usize) -> bool {
         RtStageEntry::select_program(self, index)
+    }
+    fn refresh_program(&self) {
+        RtStageEntry::refresh_program(self)
     }
     fn process(&self, input: &[f32], output: &mut [f32]) {
         RtStageEntry::process(self, input, output)
@@ -2224,6 +2233,10 @@ pub struct VstLoad {
 pub struct VstPatch {
     pub chunk: Vec<u8>,
     pub params: Vec<(u32, f32)>,
+    /// v62: selected VST2 factory program (None / negative = leave the
+    /// plugin's own program alone). Rides the patch so a program-only
+    /// restore (VST2 has no chunk ABI on this host) needs no new vessel.
+    pub program: Option<i32>,
 }
 
 /// Process-wide plugin instantiation lock. dlopen-ing plugin code and
@@ -2666,8 +2679,17 @@ fn open_inner(
     }
     let entry = match kind {
         VstKind::V3 => open_v3(path, sample_rate, saved, patch)?,
-        // VST2 editors edit the live instance: no chunk round-trip exists.
-        VstKind::V2 => open_v2(path, sample_rate, saved)?,
+        // VST2 editors edit the live instance: no chunk round-trip exists
+        // (v62: the factory program still rides the patch — program-only).
+        VstKind::V2 => open_v2(
+            path,
+            sample_rate,
+            saved,
+            patch
+                .and_then(|p| p.program)
+                .filter(|p| *p >= 0)
+                .map(|p| p as usize),
+        )?,
         VstKind::Clap => unreachable!(),
     };
     Ok(VstLoad {
@@ -3027,7 +3049,12 @@ fn open_v3(
     ))
 }
 
-fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtStageEntry, String> {
+fn open_v2(
+    path: &Path,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    saved_program: Option<usize>,
+) -> Result<RtStageEntry, String> {
     use vst2::{
         host::{HostBuffer, PluginLoader},
         plugin::{Plugin, PluginParameters},
@@ -3074,41 +3101,10 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         info.vendor.to_string(),
         info.inputs == 0,
     );
-    let params_obj: Arc<dyn PluginParameters> = inst.get_parameter_object();
-    let n = (info.parameters.max(0) as usize).min(VST_MAX_PARAMS);
-    let descs: Vec<VstParamDesc> = (0..n)
-        .map(|i| {
-            let name = params_obj.get_parameter_name(i as i32);
-            VstParamDesc {
-                id: i as u32,
-                name: if name.trim().is_empty() {
-                    format!("Param {}", i + 1)
-                } else {
-                    name
-                },
-                default: params_obj.get_parameter(i as i32),
-                writable: true,
-            }
-        })
-        .collect();
-    let params = VstParams::new(&descs);
-    lap("descs scan", &mut last);
-    apply_saved(&params, &descs, saved);
-    // v33: a FRESH open writes NOTHING back — the mirror above is seeded
-    // from the plugin's own current values (the v17 doctrine VST3 already
-    // follows: seed from state, never re-plug the plugin's own face). The
-    // write-back loop only runs on a RESTORE, and only for saved values:
-    // for yabridge plugins every setParameter crosses the Wine boundary,
-    // so the unconditional pass was pure open-time tax (and a silence trap
-    // for plugins whose "current value" readouts are lies).
-    if saved.is_some() {
-        for (k, d) in descs.iter().enumerate() {
-            if d.writable {
-                params_obj.set_parameter(d.id as i32, params.get(k));
-            }
-        }
-    }
-    let out_ch = info.outputs.clamp(1, 2) as usize;
+    // v62: editor handle + factory-program snapshot moved BEFORE the
+    // descriptor scan (was after it): a restored program must land in the
+    // plugin before its parameter values are seeded into the mirror, or
+    // the knobs come up showing values the plugin no longer plays.
     // Editor hosting: grab the raw effect handle + has-editor flag before
     // the instance moves into the realtime backend.
     let has_editor = unsafe { ((*inst.raw_effect()).flags & 1) != 0 };
@@ -3146,6 +3142,59 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         };
         (names, cur)
     };
+    // v62: apply the program the project/config saved, on the FRESH
+    // instance, before any parameter seeding. The plugin's answer wins
+    // (a refusal keeps the plugin's own program — same doctrine as
+    // select_program, and the snapshot stays the plugin's truth).
+    let program0 = match saved_program.filter(|w| *w < programs.len()) {
+        Some(want) => {
+            let r = vst2
+                .as_ref()
+                .expect("just built")
+                .dispatch(2, 0, want as isize, std::ptr::null_mut(), 0.0);
+            if r >= 0 {
+                r as i32
+            } else {
+                program0
+            }
+        }
+        None => program0,
+    };
+    let params_obj: Arc<dyn PluginParameters> = inst.get_parameter_object();
+    let n = (info.parameters.max(0) as usize).min(VST_MAX_PARAMS);
+    let descs: Vec<VstParamDesc> = (0..n)
+        .map(|i| {
+            let name = params_obj.get_parameter_name(i as i32);
+            VstParamDesc {
+                id: i as u32,
+                name: if name.trim().is_empty() {
+                    format!("Param {}", i + 1)
+                } else {
+                    name
+                },
+                default: params_obj.get_parameter(i as i32),
+                writable: true,
+            }
+        })
+        .collect();
+    let params = VstParams::new(&descs);
+    lap("descs scan", &mut last);
+    apply_saved(&params, &descs, saved);
+    // v33: a FRESH open writes NOTHING back — the mirror above is seeded
+    // from the plugin's own current values (the v17 doctrine VST3 already
+    // follows: seed from state, never re-plug the plugin's own face). The
+    // write-back loop only runs on a RESTORE, and only for saved values:
+    // for yabridge plugins every setParameter crosses the Wine boundary,
+    // so the unconditional pass was pure open-time tax (and a silence trap
+    // for plugins whose "current value" readouts are lies).
+    if saved.is_some() {
+        for (k, d) in descs.iter().enumerate() {
+            if d.writable {
+                params_obj.set_parameter(d.id as i32, params.get(k));
+            }
+        }
+    }
+    let out_ch = info.outputs.clamp(1, 2) as usize;
     lap("handle+assemble", &mut last);
     if trace {
         eprintln!(
@@ -3220,6 +3269,29 @@ impl RtStageEntry {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// v62: re-read the plugin's CURRENT program into the snapshot (VST2
+    /// only: dispatch #3 on the vst2-gui thread). This is how a program
+    /// the plugin changed inside its own editor reaches the host combo —
+    /// and what the save-time capture then persists. Blocking on the
+    /// GUI-thread hop like [`Self::select_program`]; UI/pins only, and
+    /// the PARAMETERS window throttles it (~1 s) while it is open.
+    pub fn refresh_program(&self) {
+        if self.dead.load(Ordering::Relaxed) || self.programs.is_empty() {
+            return;
+        }
+        let Some(h) = self.vst2 else {
+            return;
+        };
+        let addr = h.as_usize();
+        match on_gui_thread(move || {
+            Vst2Handle::from_addr(addr).dispatch(3, 0, 0, std::ptr::null_mut(), 0.0)
+        }) {
+            // Same doctrine as select_program: adopt only a real answer.
+            Ok(r) if r >= 0 => self.program.store(r as i32, Ordering::Relaxed),
+            _ => {}
         }
     }
 
@@ -4136,6 +4208,7 @@ mod tests {
             Some(&VstPatch {
                 chunk: bytes.clone(),
                 params: Vec::new(),
+                program: None,
             }),
         ) {
             Ok(l) => l,
@@ -5011,6 +5084,7 @@ mod tests {
             Some(&VstPatch {
                 chunk: chunk.clone(),
                 params: Vec::new(),
+                program: None,
             }),
         ) {
             Ok(l) => l,
@@ -5038,6 +5112,7 @@ mod tests {
             Some(&VstPatch {
                 chunk,
                 params: params_ids.clone(),
+                program: None,
             }),
         )
         .expect("KR-106 reopen with patch");
@@ -5897,5 +5972,74 @@ mod tests {
         w6_assert_clean_effect(&entries, "w6.dll");
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
 
+/// v62 R1/R5: a fresh open carrying a patch program boots the plugin
+    /// (and the host snapshot) ON that program; an out-of-range saved
+    /// value is ignored (the plugin's own program stands); and
+    /// `refresh_program` adopts the plugin's truth when the host cache
+    /// is stale — the exact shape of a program the plugin changed
+    /// inside its own editor. Unique fixture copies: the program counter
+    /// is a per-file static (the v60 hermeticity contract).
+    #[test]
+    fn v62_program_open_restores_and_refresh() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v62restore");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open_with_state(
+            &fixture,
+            VstKind::V2,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(2),
+            }),
+        )
+        .expect("restored open");
+        assert_eq!(
+            load.entry.current_program(),
+            Some(2),
+            "the saved program lands on the fresh instance"
+        );
+        // Refresh adopts plugin truth: dispatch ChangePreset behind the
+        // host's back (what the plugin's own editor does), stale cache,
+        // then refresh_program() must follow the plugin.
+        let rt = load
+            .entry
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry");
+        let addr = rt.vst2_handle().expect("VST2 handle").as_usize();
+        on_gui_thread(move || {
+            Vst2Handle::from_addr(addr).dispatch(2, 0, 1, std::ptr::null_mut(), 0.0)
+        })
+        .expect("gui thread");
+        rt.program.store(0, std::sync::atomic::Ordering::Relaxed); // stale
+        load.entry.refresh_program();
+        assert_eq!(load.entry.current_program(), Some(1), "refresh adopts the plugin\u{2019}s truth");
+        // Out-of-range restore is IGNORED on a fresh copy (a stale config
+        // from a different plugin build must not provoke library calls).
+        let dir2 = w6_temp_dir("v62range");
+        let fixture2 = dir2.join(file);
+        std::fs::copy(w6_fixture(file), &fixture2).unwrap();
+        let load2 = open_with_state(
+            &fixture2,
+            VstKind::V2,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(99),
+            }),
+        )
+        .expect("out-of-range open");
+        assert_eq!(
+            load2.entry.current_program(),
+            Some(0),
+            "out-of-range saved program leaves the plugin at its own program"
+        );
+    }
+}
