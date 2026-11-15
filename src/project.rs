@@ -154,6 +154,9 @@ pub struct Project {
     /// Per-track synth state chunk (base64; index = track).
     #[serde(default)]
     pub track_synth_states: Vec<Option<String>>,
+    /// v62: per-track selected VST2 factory program (-1 = none).
+    #[serde(default)]
+    pub track_synth_programs: Vec<i32>,
     /// v29 R7: MIDI bindings to values (mixer / plugin controls) —
     /// per-project, managed from the automation manager's bindings rack.
     #[serde(default)]
@@ -338,6 +341,7 @@ mod tests {
             track_synths: vec![Some("piano".into())],
             track_synth_params: vec![vec![0.5]],
             track_synth_states: vec![],
+            track_synth_programs: vec![],
 
             value_binds: Vec::new(),
             drum: None,
@@ -546,6 +550,7 @@ mod tests {
             track_synths: Vec::new(),
             track_synth_params: Vec::new(),
             track_synth_states: Vec::new(),
+            track_synth_programs: Vec::new(),
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
@@ -576,6 +581,58 @@ mod tests {
         let legacy = load(&older).expect("pre-v58 file loads");
         assert_eq!(legacy.tracks[0].color, None);
         assert_eq!(legacy.tracks[0].lanes[0][0].color, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+/// v62 R1/R7: the project document carries the per-track factory
+    /// programs (additive key): save/load round-trip keeps the table, a
+    /// pre-v62 file (key stripped) loads empty — load() must not complain.
+    #[test]
+    fn v62_project_program_roundtrip() {
+        let pr = Project {
+            format: FORMAT.into(),
+            version: VERSION,
+            name: "programs".into(),
+            metro: ProjMetro {
+                bpm: 120,
+                num: 4,
+                sub: 4,
+            },
+            quantize: ProjQuantize {
+                q_sub: 4,
+                snap_sub: 4,
+                auto: false,
+                loop_tl: false,
+            },
+            dirs: Vec::new(),
+            playhead: 0,
+            tracks: Vec::new(),
+            assets: Vec::new(),
+            n_tracks: Some(16),
+            track_synths: Vec::new(),
+            track_synth_params: Vec::new(),
+            track_synth_states: Vec::new(),
+            track_synth_programs: vec![-1, 4],
+            value_binds: Vec::new(),
+            drum: None,
+            drum_kits: Vec::new(),
+            sampler_maps: Vec::new(),
+            sample_edits: Default::default(),
+        };
+        let dir = std::env::temp_dir().join(format!("slooper-v62-prg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prg.slooper");
+        save(&p, &pr).expect("save");
+        let back = load(&p).expect("load");
+        assert_eq!(back.track_synth_programs, vec![-1, 4], "programs survive save/load");
+        // Pre-v62 file: strip the key -> the project still loads, empty table.
+        let s = serde_json::to_string(&pr).unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&s).unwrap();
+        j.as_object_mut().unwrap().remove("track_synth_programs");
+        let older = dir.join("older.slooper");
+        std::fs::write(&older, j.to_string()).unwrap();
+        let legacy = load(&older).expect("pre-v62 file loads");
+        assert!(legacy.track_synth_programs.is_empty(), "legacy loads empty");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
