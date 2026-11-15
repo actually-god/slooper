@@ -3819,6 +3819,7 @@ mod tests {
     /// deleted shared plugin state under the live instance (delete-while-
     /// active warnings, then death). Skips without the plugin.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v17_bound_instrument_survives_rescan() {
         let home = match std::env::var("HOME") {
             Ok(h) => h,
@@ -3940,6 +3941,7 @@ mod tests {
     /// the fresh instance AND seed the parameter cells from the restored
     /// patch — the harvest/rebuild path runs through exactly this call.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v20_vst3_open_with_state_restores() {
         let wolf = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
             .join(".vst3/wolf-shaper.vst3");
@@ -4058,6 +4060,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn smoke_local_plugins_if_present() {
         let found = scan_with(&default_vst_dirs(), true);
         let mut ran = 0;
@@ -4107,6 +4110,7 @@ mod tests {
     /// plugin silently never plays as a track instrument. `open` must leave
     /// every loadable instrument on an activated output bus.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn every_local_instrument_makes_sound() {
         let found = scan_with(&default_vst_dirs(), true);
         let mut checked = 0;
@@ -4172,6 +4176,7 @@ mod tests {
     /// plugin that swallows all input (dead output bus, failed activate)
     /// fails here with the path named.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v12_local_vst3_effects_pass_audio() {
         let found = scan_with(&default_vst_dirs(), true);
         let mut checked = 0;
@@ -4420,6 +4425,7 @@ mod tests {
     /// entirely" for the rest of a session.
     #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
+    #[ignore = "slow-tier: plugin dlopen/probe (hang class)"]
     fn v21_bridge_probe_recovers_after_transient_failure() {
         // Fake Wine: first probe dies like a cold/draining wineserver; every
         // later probe answers with the host banner (= works).
@@ -4570,6 +4576,7 @@ mod tests {
     /// byte equality: plugin cores are stateful and carry process-global
     /// JUCE singletons — that is plugin behaviour, not ring behaviour.)
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v16_vst_rt_ring_determinism() {
         // -- FxRing: exact FIFO under arbitrary push/drain patterns.
         let mut r = FxRing::with_capacity(1000);
@@ -4772,6 +4779,7 @@ mod tests {
     /// harvest made the move appear. The cap must exceed reality, and a
     /// high-index cell write must round-trip.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen/probe (hang class)"]
     fn v23_param_table_covers_huge_plugins() {
         // Compile-time: the whole point of the constant is to stay ahead
         // of reality; a shrink does not compile, which is the pin.
@@ -4823,6 +4831,7 @@ mod tests {
     /// shadow's parameter values, applied chunk-first, values second.
     /// RED on chunk-only rebuild, GREEN with the patch path.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen/probe (hang class)"]
     fn v23_patch_reopen_keeps_params_a_chunk_omits() {
         let home = crate::test_real_home();
         let kr = std::path::Path::new(&home)
@@ -4967,6 +4976,7 @@ mod tests {
     /// scanned before AND after it still arrive.
     #[cfg(unix)] // W6: yabridge/Wine/fork fixture semantics are Linux-only
     #[test]
+    #[ignore = "slow-tier: plugin dlopen/probe (hang class)"]
     fn v37_scan_survives_crashing_probe() {
         let Some(fixture) = crate::claphost::tests::fixture_clap() else {
             eprintln!("no cc / clap fixture — skip");
@@ -5470,6 +5480,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "slow-tier: plugin dlopen/probe (hang class)"]
     fn w7_child_timeout_kills_helper() {
         // A hung helper is KILLED at the deadline and reaped (exec keeps
         // it the DIRECT child — no grandchild escapes the kill).

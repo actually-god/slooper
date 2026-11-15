@@ -450,7 +450,8 @@ makepkg's default `$srcdir=$PWD/src` collides with Rust's own `src/`.
 ## Tests
 
 ```sh
-cargo test -- --test-threads=1
+scripts/test-quick.sh   # dev-loop gate (~2 min): fast lib pins + parity check + clippy
+scripts/test-full.sh    # release gate (~5 min): + slow tier (plugins/e2e/doctests)
 ```
 
 Unit tests (640+) cover MIDI parsing/binding and shortcut-table
