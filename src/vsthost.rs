@@ -183,6 +183,24 @@ pub trait StageEntry: Send + Sync {
     }
     fn set_param(&self, index: usize, value: f32);
     fn set_param_rt(&self, index: usize, value: f32);
+    /// v60: factory program ("patch") names in plugin order. Snapshot
+    /// taken once at open — NEVER plugin code per call; empty means this
+    /// backend/plugin reports none (CLAP and VST3 today, see field docs).
+    fn programs(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// v60: currently selected factory program (`None` = backend does
+    /// not track one).
+    fn current_program(&self) -> Option<usize> {
+        None
+    }
+    /// v60: switch the LIVE instance to factory program `index`; true =
+    /// the plugin accepted it. Control thread only (VST2 dispatches on
+    /// the plugin GUI thread, the same way the plugin's own editor does);
+    /// never touches a dead/parked entry.
+    fn select_program(&self, _index: usize) -> bool {
+        false
+    }
     /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
     /// Audio thread only.
     fn process(&self, input: &[f32], output: &mut [f32]);
@@ -242,6 +260,16 @@ impl StageEntry for RtStageEntry {
     }
     fn set_param_rt(&self, index: usize, value: f32) {
         RtStageEntry::set_param_rt(self, index, value)
+    }
+    fn programs(&self) -> Vec<String> {
+        self.programs.clone()
+    }
+    fn current_program(&self) -> Option<usize> {
+        let p = self.program.load(Ordering::Relaxed);
+        (p >= 0).then_some(p as usize)
+    }
+    fn select_program(&self, index: usize) -> bool {
+        RtStageEntry::select_program(self, index)
     }
     fn process(&self, input: &[f32], output: &mut [f32]) {
         RtStageEntry::process(self, input, output)
@@ -2078,6 +2106,14 @@ pub struct RtStageEntry {
     control: Mutex<Option<vst3_host::realtime::RtControl>>,
     params: Arc<VstParams>,
     descs: Vec<VstParamDesc>,
+    /// v60: factory program names snapshotted at open. VST2 only today:
+    /// VST3's `RtControl` command ring carries no program command and
+    /// CLAP factory presets (`clap.presets` factory) are unhosted — both
+    /// report empty and the UI hides the row (docs/WINDOWS-PORT.md rule:
+    /// additive gaps, never half-wired chrome).
+    programs: Vec<String>,
+    /// v60: last known current program (-1 = never reported / unsupported).
+    program: std::sync::atomic::AtomicI32,
     name: String,
     /// Where this plugin was loaded from (re-opens offline render copies).
     spec: (PathBuf, VstKind),
@@ -2122,6 +2158,11 @@ impl Vst2Handle {
     /// `audioMasterSizeWindow` side channel (`take_size_request`).
     pub fn as_usize(&self) -> usize {
         self.0 as usize
+    }
+    /// v60: rebuild a handle from [`Self::as_usize`] so a program select
+    /// can carry the address into an `on_gui_thread` job.
+    pub(crate) fn from_addr(addr: usize) -> Self {
+        Self(addr as *mut vst2::api::AEffect)
     }
     /// Raw `AEffect::dispatcher` call with a VST2 opcode number.
     pub fn dispatch(
@@ -2786,6 +2827,8 @@ fn assemble(
     has_editor: bool,
     vst2: Option<Vst2Handle>,
     editor_state: Option<Vec<u8>>,
+    programs: Vec<String>,
+    program0: i32,
 ) -> RtStageEntry {
     let last: Vec<f32> = (0..descs.len()).map(|k| params.get(k)).collect();
     let seen_gen = params.generation();
@@ -2818,6 +2861,8 @@ fn assemble(
         control: Mutex::new(parts.control),
         params,
         descs,
+        programs,
+        program: std::sync::atomic::AtomicI32::new(program0),
         name,
         spec: parts.spec,
         has_editor,
@@ -2960,6 +3005,10 @@ fn open_v3(
         has_editor,
         None,
         patch.map(|p| p.chunk.clone()).filter(|v| !v.is_empty()),
+        // v60: VST3 programs need a runner-side program command (the
+        // RtControl ring carries none) — documented gap, see field docs.
+        Vec::new(),
+        -1,
     ))
 }
 
@@ -3049,6 +3098,39 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
     // the instance moves into the realtime backend.
     let has_editor = unsafe { ((*inst.raw_effect()).flags & 1) != 0 };
     let vst2 = Some(Vst2Handle::from_instance(&inst));
+    // v60: snapshot the factory programs ("presets" in the vendored
+    // crate's dialect: ChangePreset=2, GetCurrentPresetNum=3,
+    // GetCurrentPresetName=5). open_v2 runs ON the vst2-gui thread
+    // (open_inner's contract), so this dispatch is already on the
+    // sanctioned control thread — no on_gui_thread nest, no RT contact.
+    // numPrograms<=0 = the plugin implements no programs (VST2.4 rule).
+    let (programs, program0) = {
+        let h = vst2.as_ref().expect("just built");
+        let n = unsafe { (*inst.raw_effect()).numPrograms }.clamp(0, 1024) as usize;
+        let mut names = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut buf = [0 as std::ffi::c_char; 64];
+            let ok = h.dispatch(5, i as i32, 0, buf.as_mut_ptr() as *mut std::ffi::c_void, 0.0);
+            if ok != 0 {
+                let s = unsafe {
+                    buf[63] = 0;
+                    std::ffi::CStr::from_ptr(buf.as_ptr())
+                }
+                .to_string_lossy()
+                .trim_end()
+                .to_string();
+                if !s.is_empty() {
+                    names.push(s);
+                }
+            }
+        }
+        let cur = if names.is_empty() {
+            -1
+        } else {
+            h.dispatch(3, 0, 0, std::ptr::null_mut(), 0.0) as i32
+        };
+        (names, cur)
+    };
     lap("handle+assemble", &mut last);
     if trace {
         eprintln!(
@@ -3073,6 +3155,8 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
         has_editor,
         vst2,
         None,
+        programs,
+        program0,
     ))
 }
 
@@ -3094,6 +3178,34 @@ impl RtStageEntry {
     /// VST2 editor dispatch handle (`None` for VST3 — see docs/PLUGINS.md).
     pub fn vst2_handle(&self) -> Option<Vst2Handle> {
         self.vst2
+    }
+
+    /// v60: switch the LIVE instance to factory program `index`. VST2
+    /// only: the `ChangePreset` dispatch rides the vst2-gui thread, the
+    /// same thread (and same call shape) the plugin's own editor uses,
+    /// so no new thread-affinity class is opened. Every other format and
+    /// every dead/parked entry (v42 firewall) returns false without
+    /// touching the library.
+    pub fn select_program(&self, index: usize) -> bool {
+        if self.dead.load(Ordering::Relaxed) || index >= self.programs.len() {
+            return false;
+        }
+        let Some(h) = self.vst2 else {
+            return false;
+        };
+        let addr = h.as_usize();
+        // Never call from a GUI job (would wait on the blocked thread);
+        // UI/pins only — the same contract as every `on_gui_thread` user.
+        match on_gui_thread(move || Vst2Handle::from_addr(addr).dispatch(2, 0, index as isize, std::ptr::null_mut(), 0.0))
+        {
+            // Plugins answer with the program they actually switched to
+            // (>= 0); -1 / Err = refused. Adopt the plugin's verdict.
+            Ok(r) if r >= 0 => {
+                self.program.store(r as i32, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Plugin file path this entry was loaded from.
@@ -5636,3 +5748,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

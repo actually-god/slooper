@@ -61,6 +61,18 @@ struct W6AEffect {
 #define W6OP_GetProductName 48
 #define W6OP_GetApiVersion 58
 
+/* v60: factory-program dialect — crate OpCode ChangePreset=2,
+ * GetCurrentPresetNum=3, GetCurrentPresetName=5 (these three coincide
+ * with the VST2.4 eff* numbers because the enum keeps the SDK's leading
+ * order). A program index >= numPrograms answers -1 for ChangePreset:
+ * the v60 pins require the host to surface that as a refused select. */
+#define W6OP_ChangePreset 2
+#define W6OP_GetCurrentPresetNum 3
+#define W6OP_GetCurrentPresetName 5
+#define W6_NUM_PROGRAMS 3
+static const char *W6_PROGRAMS[W6_NUM_PROGRAMS] = {"Init", "Fat", "Thin"};
+static int g_program = 0;
+
 #define W6_NAME "W6 VST Fixture"
 #define W6_VENDOR "slooper W6"
 
@@ -88,6 +100,18 @@ static long w6_dispatch(W6AEffect *e, int opcode, int index, long value,
         return 1;
     case W6OP_GetApiVersion:
         return 2400;
+    case W6OP_ChangePreset:
+        if (value < 0 || value >= W6_NUM_PROGRAMS)
+            return -1;
+        g_program = (int)value;
+        return g_program;
+    case W6OP_GetCurrentPresetNum:
+        return g_program;
+    case W6OP_GetCurrentPresetName:
+        if (index < 0 || index >= W6_NUM_PROGRAMS)
+            return 0;
+        w6_copy64((char *)ptr, W6_PROGRAMS[index]);
+        return 1;
     default:
         return 0;
     }
@@ -128,7 +152,7 @@ W6EXPORT void *VSTPluginMain(void *host_callback) {
     g_fx.process = w6_process;
     g_fx.setParameter = w6_setparam;
     g_fx.getParameter = w6_getparam;
-    g_fx.numPrograms = 1;
+    g_fx.numPrograms = W6_NUM_PROGRAMS;
     g_fx.numParams = 0;
     g_fx.numInputs = 1;
     g_fx.numOutputs = 1;
