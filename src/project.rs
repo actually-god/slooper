@@ -65,6 +65,10 @@ pub struct ProjClip {
     pub fade_in: u64,
     #[serde(default)]
     pub fade_out: u64,
+    /// v58: clip color palette index (absent = follow the track default,
+    /// then the kind default). The palette lives with the painters.
+    #[serde(default)]
+    pub color: Option<u8>,
 }
 
 fn unity_gain() -> f32 {
@@ -97,6 +101,10 @@ pub struct ProjTrack {
     /// single old drag made track 1 load MASSIVE forever.
     #[serde(default)]
     pub h: f32,
+    /// v58: the track's default clip color (palette index; absent =
+    /// built-in kind colors).
+    #[serde(default)]
+    pub color: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -302,6 +310,7 @@ mod tests {
                 pan: 64,
                 on: true,
                 poly: false,
+                color: None,
                 fx: vec![TrackFxSave {
                     stem: "template".into(),
                     params: vec![1.0],
@@ -317,6 +326,7 @@ mod tests {
                         gain: 1.0,
                         fade_in: 0,
                         fade_out: 0,
+                        color: None,
                     }],
                     vec![],
                 ],
