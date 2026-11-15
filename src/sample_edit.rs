@@ -158,8 +158,14 @@ fn resample_to(x: &[f32], out_len: usize) -> Vec<f32> {
 /// search (no FFT). `factor` = output length / input length.
 fn wsola(x: &[f32], factor: f64) -> Vec<f32> {
     let n = x.len();
-    let w = n.min(2048) & !1; // window size (even)
-    if w < 64 || (factor - 1.0).abs() < 1e-3 {
+    // v63: the window must fit several times into the buffer — a 2048-px
+    // window on a 100 ms one-shot left barely two frames, the analysis
+    // cursor clamped against `n - w` and STALLED, stamping the last frame
+    // until the allocation was exhausted (a 0.86 stretch rendered LONGER
+    // than the source). Shrink the window for short buffers; long ones
+    // keep the original 2048 exactly.
+    let w = (n / 6).clamp(64, 2048) & !1; // window size (even)
+    if w < 64 || (factor - 1.0).abs() < 1e-3 || n <= w {
         return x.to_vec();
     }
     let h = w / 2; // synthesis hop
@@ -167,7 +173,8 @@ fn wsola(x: &[f32], factor: f64) -> Vec<f32> {
         .map(|k| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (w - 1) as f32).cos())
         .collect();
     let target = (h as f64 / factor).max(1.0); // analysis hop for this factor
-    let mut out = vec![0.0f32; (n as f64 * factor) as usize + 2 * h + 4];
+    let want = (n as f64 * factor).max(1.0) as usize;
+    let mut out = vec![0.0f32; want + 2 * h + 4];
     let mut s = 0usize; // synthesis cursor
     let mut a = 0usize; // analysis cursor
     let mut guard = 0usize;
@@ -180,21 +187,40 @@ fn wsola(x: &[f32], factor: f64) -> Vec<f32> {
         // cheapest continuation is the right one).
         let base = a + target as usize;
         let mut best = base.min(n.saturating_sub(w));
-        let mut best_err = f64::MAX;
         let lo = base.saturating_sub(search).max(h / 2);
         let hi = (base + search).min(n.saturating_sub(w));
         if hi > lo && a >= h / 2 {
+            // v63: score = error + a tiny deviation-from-target penalty.
+            // On periodic material (pure tones) MANY candidates tie at
+            // ~zero error and the strict-less scan picked the EARLIEST
+            // (lo = base - search/2) every frame, so the analysis cursor
+            // crept backwards and a "compressed" stretch came out LONGER
+            // than the source. The penalty is negligible against real
+            // signal errors (hundreds) and only decides exact ties.
+            let mut best_score = f64::MAX;
             for cand in (lo..=hi).step_by(2) {
                 let mut err = 0.0f64;
                 for u in 0..(h / 2) {
                     let d = x[a - h / 2 + u] as f64 - x[cand - h / 2 + u] as f64;
                     err += d * d;
                 }
-                if err < best_err {
-                    best_err = err;
+                let dev = cand.abs_diff(base) as f64;
+                let score = err + dev * dev * 1e-6;
+                if score < best_score {
+                    best_score = score;
                     best = cand;
                 }
             }
+        }
+        // v63: no forward progress means the analysis material is
+        // exhausted — stamping the clamped frame again would repeat it
+        // forever (the stall above). Lay this last frame and stop.
+        if best <= a {
+            for k in 0..w {
+                out[s + k] += hann[k] * x[best + k];
+            }
+            s += h;
+            break;
         }
         for k in 0..w {
             out[s + k] += hann[k] * x[best + k];
@@ -204,7 +230,12 @@ fn wsola(x: &[f32], factor: f64) -> Vec<f32> {
         a = best;
         s += h;
     }
-    out.truncate(s + w);
+    // Land on the requested length: `s + w` is where the frames stopped,
+    // `want + h` the closest honest bound — short buffers overshoot by
+    // the final window, and clipping it to `want` would chop the tail
+    // crossfade.
+    let end = (s + w).min(want + h);
+    out.truncate(end);
     if out.is_empty() {
         return vec![0.0];
     }
@@ -459,6 +490,130 @@ mod tests {
         );
         assert!((o.len() as f32 / s.len() as f32 - 2.0).abs() < 0.02);
         assert!((zc_freq(&o, 48000) - 150.0).abs() < 6.0, "pitch halves");
+    }
+
+    #[test]
+    fn v63_wsola_periodic_tone_hits_target() {
+        // Pure sine = the WSOLA tie-break torture case: every
+        // period-aligned candidate scores (near) zero continuity error,
+        // and a naive strict-less scan picked the EARLIEST tie every
+        // frame, creeping the analysis cursor backwards — a "compressed"
+        // stretch rendered LONGER than the source. Exact ratios remain
+        // unreachable on a pure tone by design (WSOLA aligns to the
+        // period; forcing `target` hops through a periodic signal would
+        // click every frame). What MUST hold — and what v50 violated:
+        // compression shrinks, expansion grows, pitch survives.
+        for factor in [0.6f64, 0.86, 1.4] {
+            let s = sine(48_000, 220.0, 48_000);
+            let o = render(
+                &s,
+                48_000,
+                &SampleEdit {
+                    stretch: factor as f32,
+                    preserve_pitch: true,
+                    ..Default::default()
+                },
+            );
+            let ratio = o.len() as f64 / s.len() as f64;
+            if factor < 1.0 {
+                assert!(ratio < 1.0, "periodic compress {factor}: grew to {ratio}");
+            } else {
+                assert!(ratio > 1.05, "periodic expand {factor}: shrank to {ratio}");
+            }
+            let (f0, f) = (zc_freq(&s, 48_000), zc_freq(&o, 48_000));
+            assert!((f - f0).abs() < 0.08 * f0, "pitch kept: {f0} -> {f}");
+        }
+    }
+
+    #[test]
+    fn v63_wsola_short_oneshot_hits_target() {
+        // The v50 stall class: a 100 ms one-shot (4800 samples) cannot
+        // host a 2048-sample window with room to search — the cursor
+        // clamped and re-stamped the last frame until the allocation was
+        // exhausted, so "compress to 0.86" rendered 1.29x LONGER. Short
+        // buffers now shrink the WSOLA window and must land near the
+        // requested multiplier. Noise-dominant material: no periodicity
+        // for WSOLA to snap to, so the analysis hop tracks `target` and
+        // the ratio is tight (pure tones CANNOT pin the ratio —
+        // period-snapping frames the hop; that case lives in
+        // v63_wsola_periodic_tone_hits_target).
+        for factor in [0.6f64, 0.86, 1.3] {
+            let mut st = 12345u32;
+            let s: Vec<f32> = (0..4800)
+                .map(|i| {
+                    st = st
+                        .wrapping_mul(1664525)
+                        .wrapping_add(1013904223);
+                    let n = (st >> 8) as f32 / 8_388_608.0 - 1.0;
+                    0.6 * n
+                        + 0.5 * (i as f32 * 2.0 * std::f32::consts::PI * 220.0 / 48_000.0).sin()
+                })
+                .collect();
+            let o = render(
+                &s,
+                48_000,
+                &SampleEdit {
+                    stretch: factor as f32,
+                    preserve_pitch: true,
+                    ..Default::default()
+                },
+            );
+            let ratio = o.len() as f64 / s.len() as f64;
+            assert!(
+                (ratio - factor).abs() < 0.16,
+                "one-shot stretch {factor}: ratio {ratio} ({})",
+                o.len()
+            );
+            // And it must still SOUND like the source: a plain resample
+            // would move the tone's energy to f0/factor; WSOLA keeps it
+            // at f0. Zero-crossing density is meaningless under the
+            // noise term, so measure spectral energy (Goertzel) instead.
+            let f0 = 220.0f32;
+            let at = |x: &[f32], freq: f32| {
+                let w = 2.0f64 * std::f64::consts::PI * (freq as f64) / 48_000.0f64;
+                let coeff = 2.0 * w.cos();
+                let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                for &v in x {
+                    let s0 = v as f64 + coeff * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                s1 * s1 + s2 * s2 - coeff * s1 * s2
+            };
+            // The regression class this guards: the keep-pitch path
+            // silently degenerating into a plain resample. Render the
+            // resample reference (preserve_pitch=false) and require the
+            // WSOLA output to be a different signal — while the
+            // reference itself proves the pitch DID move there (probe
+            // sanity: Goertzel energy follows f0/factor on the
+            // resampled audio, and stays near f0 on the WSOLA audio).
+            let o2 = render(
+                &s,
+                48_000,
+                &SampleEdit {
+                    stretch: factor as f32,
+                    preserve_pitch: false,
+                    ..Default::default()
+                },
+            );
+            let identical = o.len() == o2.len()
+                && o.iter().zip(o2.iter()).all(|(a, b)| (a - b).abs() < 1e-6);
+            assert!(
+                !identical,
+                "keep-pitch stretch degenerated to a resample at {factor}"
+            );
+            assert!(
+                at(&o2, f0 / factor as f32) > at(&o2, f0) * 4.0,
+                "resample reference must move the pitch ({factor})"
+            );
+            assert!(
+                at(&o, f0) > at(&o2, f0) * 4.0,
+                "keep-pitch output must retain f0 energy the resample loses ({factor}): \
+                 wsola p({f0})={:.3e} vs resample p({f0})={:.3e}",
+                at(&o, f0),
+                at(&o2, f0)
+            );
+        }
     }
 
     #[test]
