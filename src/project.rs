@@ -65,6 +65,10 @@ pub struct ProjClip {
     pub fade_in: u64,
     #[serde(default)]
     pub fade_out: u64,
+    /// v58: clip color palette index (absent = follow the track default,
+    /// then the kind default). The palette lives with the painters.
+    #[serde(default)]
+    pub color: Option<u8>,
 }
 
 fn unity_gain() -> f32 {
@@ -97,6 +101,10 @@ pub struct ProjTrack {
     /// single old drag made track 1 load MASSIVE forever.
     #[serde(default)]
     pub h: f32,
+    /// v58: the track's default clip color (palette index; absent =
+    /// built-in kind colors).
+    #[serde(default)]
+    pub color: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -302,6 +310,7 @@ mod tests {
                 pan: 64,
                 on: true,
                 poly: false,
+                color: None,
                 fx: vec![TrackFxSave {
                     stem: "template".into(),
                     params: vec![1.0],
@@ -317,6 +326,7 @@ mod tests {
                         gain: 1.0,
                         fade_in: 0,
                         fade_out: 0,
+                        color: None,
                     }],
                     vec![],
                 ],
@@ -481,6 +491,91 @@ mod tests {
         let r = resolve_asset("/gone/kick.wav", std::slice::from_ref(&dir)).expect("found");
         assert_eq!(r, dir.join("kick.wav"));
         assert!(resolve_asset("/gone/nope.wav", std::slice::from_ref(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v58: clip and track colors survive save/load; a legacy file
+    /// without the fields loads uncolored (serde defaults).
+    #[test]
+    fn v58_project_colors_round_trip_and_legacy() {
+        let clip = ProjClip {
+            asset: 0,
+            pos: 0,
+            cut: 0,
+            pre_pad: 0,
+            play_len: None,
+            gain: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+            color: Some(7),
+        };
+        let pr = Project {
+            format: FORMAT.into(),
+            version: VERSION,
+            name: "colors".into(),
+            metro: ProjMetro {
+                bpm: 120,
+                num: 4,
+                sub: 4,
+            },
+            quantize: ProjQuantize {
+                q_sub: 4,
+                snap_sub: 4,
+                auto: false,
+                loop_tl: false,
+            },
+            dirs: Vec::new(),
+            playhead: 0,
+            tracks: vec![ProjTrack {
+                vol: 100,
+                gain: 80,
+                pan: 64,
+                on: true,
+                fx: Vec::new(),
+                chain: Vec::new(),
+                lanes: vec![vec![clip]],
+                poly: false,
+                h: 0.0,
+                color: Some(3),
+            }],
+            assets: vec![ProjAsset {
+                name: "kick".into(),
+                file: "/x/kick.wav".into(),
+            }],
+            n_tracks: Some(16),
+            track_synths: Vec::new(),
+            track_synth_params: Vec::new(),
+            track_synth_states: Vec::new(),
+            value_binds: Vec::new(),
+            drum: None,
+            drum_kits: Vec::new(),
+            sampler_maps: Vec::new(),
+            sample_edits: Default::default(),
+        };
+        let dir = std::env::temp_dir().join(format!("slooper-v58-col-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("colors.slooper");
+        save(&p, &pr).expect("save");
+        let back = load(&p).expect("load");
+        assert_eq!(back.tracks[0].color, Some(3), "track color survives");
+        assert_eq!(
+            back.tracks[0].lanes[0][0].color,
+            Some(7),
+            "clip color survives"
+        );
+        // Legacy file: strip both color keys -> the pre-v58 shape loads.
+        let s = serde_json::to_string(&pr).unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&s).unwrap();
+        j["tracks"][0].as_object_mut().unwrap().remove("color");
+        j["tracks"][0]["lanes"][0][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("color");
+        let older = dir.join("older.slooper");
+        std::fs::write(&older, j.to_string()).unwrap();
+        let legacy = load(&older).expect("pre-v58 file loads");
+        assert_eq!(legacy.tracks[0].color, None);
+        assert_eq!(legacy.tracks[0].lanes[0][0].color, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

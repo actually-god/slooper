@@ -676,6 +676,8 @@ struct ClipboardItem {
     gain: f32,
     fade_in: u64,
     fade_out: u64,
+    /// v58: clip color travels with copy/paste.
+    color: Option<u8>,
 }
 
 /// The clipboard: one copied group (pasted at the playhead on the target
@@ -716,6 +718,43 @@ const COL_BEAT_LINE: Color32 = Color32::from_gray(78);
 /// glow build and out-shone the beat lines (the user's "swap downbeat and
 /// subdivision" report).
 const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
+
+/// v58 palette: the named clip/track colors the arrangement menus offer
+/// (shared by all three clip kinds — audio, MIDI, automation). Stays in
+/// ui.rs with the other data palettes: kit.rs owns CHROME only (see its
+/// module docs). Index == the `Clip::color` / `Config::trk_color` value.
+const CLIP_PALETTE: [Color32; 10] = [
+    Color32::from_rgb(226, 96, 122), // rose
+    Color32::from_rgb(240, 156, 64), // amber
+    Color32::from_rgb(228, 206, 84), // gold
+    Color32::from_rgb(136, 202, 96), // lime
+    Color32::from_rgb(64, 196, 176), // teal
+    Color32::from_rgb(86, 178, 234), // sky
+    Color32::from_rgb(112, 122, 238), // azure
+    Color32::from_rgb(176, 112, 234), // violet
+    Color32::from_rgb(230, 104, 198), // magenta
+    Color32::from_rgb(152, 162, 178), // slate
+];
+/// Menu / status-line names for [`CLIP_PALETTE`] (same order).
+const CLIP_PALETTE_NAMES: [&str; 10] = [
+    "rose", "amber", "gold", "lime", "teal", "sky", "azure", "violet", "magenta", "slate",
+];
+
+/// v58: resolve a clip's PAINT color: own palette entry, else the track
+/// default, else the kind default (blue for audio/MIDI, red for
+/// automation). `t` indexes [`App::trk_color`].
+fn clip_paint_color(app: &App, c: &crate::arrange::Clip, t: usize, is_auto: bool) -> Color32 {
+    let pal = |i: u8| CLIP_PALETTE.get(i as usize).copied();
+    c.color
+        .and_then(pal)
+        .or_else(|| app.trk_color.get(t).copied().flatten().and_then(pal))
+        .unwrap_or(if is_auto {
+            Color32::from_rgb(170, 70, 74)
+        } else {
+            COL_CLIP
+        })
+}
+
 /// Nominal lane-strip height in the grid. A track's block is
 /// `lanes × LANE_H`, never shorter than `TRACK_MIN_H` (the height its
 /// mixer strip needs), so clips get tall waveforms and the mixer stays
@@ -1072,6 +1111,9 @@ pub struct App {
     trk_vol: [u8; MAX_LOOPS],
     trk_gain: [u8; MAX_LOOPS],
     trk_pan: [u8; MAX_LOOPS],
+    /// v58: per-track default clip color (palette index; None = built-in
+    /// kind colors). GUI-only — the engine never reads it.
+    trk_color: [Option<u8>; MAX_LOOPS],
     /// v32 R5: sidechain send mask per track (bit k = source); mirrored
     /// into the engine atomics on every change.
     sc_send: [u128; MAX_LOOPS],
@@ -1729,6 +1771,8 @@ impl App {
         let trk_gain =
             core::array::from_fn(|i| cfg.trk_gain.get(i).copied().unwrap_or(GAIN_UNITY_MIDI));
         let trk_pan = core::array::from_fn(|i| cfg.trk_pan.get(i).copied().unwrap_or(64));
+        // v58: per-track clip colors (None = built-in kind colors).
+        let trk_color = core::array::from_fn(|i| cfg.trk_color.get(i).copied().flatten());
         // v32 R5: sidechain routes (mixer SC picker) → engine atomics.
         let sc_send = core::array::from_fn(|i| cfg.sc_send.get(i).copied().unwrap_or(0));
         for t in 0..MAX_LOOPS {
@@ -1849,6 +1893,7 @@ impl App {
             trk_vol,
             trk_gain,
             trk_pan,
+            trk_color,
             sc_send,
             sel_sent: usize::MAX,
             levels_dirty: false,
@@ -2632,6 +2677,46 @@ impl App {
         self.trk_vol[i] = v;
         self.backend.engine.set_loop_vol(i, vol_amp(v));
         self.note_auto(i, crate::automation::TARGET_TRACK_VOL, vol_amp(v));
+    }
+
+    /// v58: recolor the selected clips (palette index; `None` = back to
+    /// the track default / built-in kind color). Audio, MIDI and
+    /// automation clips all follow one rule — see [`clip_paint_color`].
+    fn color_selection(&mut self, col: Option<u8>) {
+        let mut n = 0usize;
+        for &(t, k, c) in self.sel_clips.iter() {
+            if let Some(cl) = self
+                .arr
+                .tracks
+                .get_mut(t)
+                .and_then(|tr| tr.lanes.get_mut(k))
+                .and_then(|ln| ln.clips.get_mut(c))
+            {
+                cl.color = col;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        self.push_project();
+        self.status = match col {
+            Some(i) => format!(
+                "{n} clip(s) colored {}",
+                CLIP_PALETTE_NAMES[i as usize]
+            ),
+            None => format!("{n} clip(s) reset to the track color"),
+        };
+    }
+
+    /// v58: a track's default clip color (`None` = built-in kind
+    /// colors). GUI-only; rides the session Config like the volume
+    /// tables, plus the project file (see `project.rs`).
+    fn set_trk_color(&mut self, t: usize, col: Option<u8>) {
+        if let Some(slot) = self.trk_color.get_mut(t) {
+            *slot = col;
+        }
+        self.save_config();
     }
 
     /// Set loop `i`'s gain trim from a MIDI-range value (0..=127).
@@ -4500,6 +4585,7 @@ impl App {
                             gain: 1.0,
                             fade_in: 0,
                             fade_out: 0,
+                            color: None,
                         }],
                     });
                     let nm = a.name.clone();
@@ -4535,6 +4621,7 @@ impl App {
                     gain: cl.gain,
                     fade_in: cl.fade_in,
                     fade_out: cl.fade_out,
+                    color: cl.color,
                 })
             })
             .collect();
@@ -4587,6 +4674,7 @@ impl App {
                     gain: it.gain,
                     fade_in: it.fade_in,
                     fade_out: it.fade_out,
+                    color: it.color,
                 },
                 span,
             );
@@ -4775,6 +4863,7 @@ impl App {
             trk_vol: self.trk_vol.to_vec(),
             trk_gain: self.trk_gain.to_vec(),
             trk_pan: self.trk_pan.to_vec(),
+            trk_color: self.trk_color.to_vec(),
             trk_h: self.trk_height.clone(),
             metro_bpm: self.bpm(),
             metro_sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
@@ -13387,6 +13476,7 @@ impl App {
             .map(|t| ProjTrack {
                 vol: self.trk_vol[t],
                 h: self.trk_height.get(t).copied().unwrap_or(0.0).max(0.0),
+                color: self.trk_color.get(t).copied().flatten(),
                 gain: self.trk_gain[t],
                 pan: self.trk_pan[t],
                 on: self.backend.engine.track_on(t),
@@ -13442,6 +13532,7 @@ impl App {
                                 gain: c.gain,
                                 fade_in: c.fade_in,
                                 fade_out: c.fade_out,
+                                color: c.color,
                             })
                             .collect()
                     })
@@ -13706,6 +13797,7 @@ impl App {
                 self.trk_vol[t] = pt.vol;
                 self.trk_gain[t] = pt.gain;
                 self.trk_pan[t] = pt.pan;
+                self.trk_color[t] = pt.color; // v58: track default clip color
                 self.backend.engine.set_loop_vol(t, vol_amp(pt.vol));
                 self.backend.engine.set_loop_gain(t, gain_amp(pt.gain));
                 self.backend.engine.set_loop_pan(t, pan01(pt.pan));
@@ -13736,6 +13828,7 @@ impl App {
                             gain: c.gain,
                             fade_in: c.fade_in,
                             fade_out: c.fade_out,
+                            color: c.color,
                         },
                     );
                 }
@@ -22160,8 +22253,23 @@ fn lane_row(
     paint_grid(ui, app, rect, px, sr, false, x0);
     // Lane tag rides inside the strip's left edge: it must NOT take layout
     // room, or the lane grids would sit right of the ruler's.
+    // v58: a track-color chip leads the tag when the track has a default
+    // color (paint-only, same rule as the tag itself).
+    let chip = app
+        .trk_color
+        .get(t)
+        .copied()
+        .flatten()
+        .and_then(|i| CLIP_PALETTE.get(i as usize).copied());
+    if let Some(sw) = chip {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 4.0), egui::vec2(7.0, 7.0)),
+            1.0,
+            sw,
+        );
+    }
     ui.painter().text(
-        rect.min + egui::vec2(4.0, 1.0),
+        rect.min + egui::vec2(if chip.is_some() { 14.0 } else { 4.0 }, 1.0),
         egui::Align2::LEFT_TOP,
         format!("T{} {}", t + 1, if k == 0 { "track" } else { "child" }),
         egui::FontId::proportional(9.0),
@@ -22191,11 +22299,9 @@ fn lane_row(
             .assets
             .get(c.asset as usize)
             .is_some_and(|a| a.is_auto());
-        let fill = if is_auto {
-            Color32::from_rgb(170, 70, 74)
-        } else {
-            COL_CLIP
-        };
+        // v58: palette color wins, then the track default, then the kind
+        // default. (Before v58 the fill was just the kind default.)
+        let fill = clip_paint_color(app, c, t, is_auto);
         // v18: hover brighten — the clip under the pointer lifts a touch.
         let fill = if hover_pt.is_some_and(|p| cres.contains(p)) {
             fill.linear_multiply(1.4)
@@ -23387,8 +23493,9 @@ fn roll_rmb_menu(
 
 /// v0.15: the grid right-click menu. On a clip: Copy / Cut / Duplicate /
 /// Delete (operating on the selection — the clip is selected first if it
-/// is not part of it). On empty grid: Paste here. Both: Select all and an
-/// explicit (safe) "Clear this track".
+/// is not part of it), plus a v58 Color submenu. On empty grid: Paste
+/// here + the v58 Track color submenu. Both: Select all and an explicit
+/// (safe) "Clear this track".
 /// Bare dB number for the level readouts ("-inf", "+0.0", "-12.3").
 fn db_num(amp: f32) -> String {
     if amp <= 0.0 {
@@ -23444,6 +23551,37 @@ fn grid_context_menu(
         if ui.button("Duplicate  (Ctrl+D)").clicked() {
             app.duplicate_selection();
             ui.close();
+        }
+        // v58: recolor the selected clips (any kind). The pick lands on
+        // the whole selection, exactly like Delete/Duplicate above;
+        // "Track / default" clears the override back to the track's
+        // default color (or the built-in blue/red).
+        {
+            let mut pick: Option<Option<u8>> = None;
+            ui.menu_button("Color", |ui| {
+                for (i, sw) in CLIP_PALETTE.iter().enumerate() {
+                    let nm = CLIP_PALETTE_NAMES[i];
+                    if ui
+                        .button(RichText::new(format!("\u{25a0} {nm}")).color(*sw))
+                        .clicked()
+                    {
+                        pick = Some(Some(i as u8));
+                        ui.close();
+                    }
+                }
+                if ui
+                    .button("Track / default")
+                    .on_hover_text("clear this clip's own color \u{b7} follow the track default (built-in blue, red for automation)")
+                    .clicked()
+                {
+                    pick = Some(None);
+                    ui.close();
+                }
+            });
+            if let Some(col) = pick {
+                app.color_selection(col);
+                ui.close();
+            }
         }
         // v46: merge the whole selection (one kind) into a single asset.
         if app.sel_clips.len() >= 2
@@ -23588,6 +23726,42 @@ fn grid_context_menu(
             ui.close();
         }
         ui.separator();
+        // v58: the track's default clip color — every clip on this track
+        // WITHOUT its own color follows it (audio, MIDI and automation
+        // alike); a chip by the lane tag shows it.
+        {
+            let mut pick: Option<Option<u8>> = None;
+            ui.menu_button("Track color", |ui| {
+                for (i, sw) in CLIP_PALETTE.iter().enumerate() {
+                    let nm = CLIP_PALETTE_NAMES[i];
+                    if ui
+                        .button(RichText::new(format!("\u{25a0} {nm}")).color(*sw))
+                        .clicked()
+                    {
+                        pick = Some(Some(i as u8));
+                        ui.close();
+                    }
+                }
+                if ui
+                    .button("Reset")
+                    .on_hover_text("clear this track's color \u{b7} clips go back to the built-in blue/red")
+                    .clicked()
+                {
+                    pick = Some(None);
+                    ui.close();
+                }
+            });
+            if let Some(col) = pick {
+                app.set_trk_color(t, col);
+                app.status = match col {
+                    Some(i) => {
+                        format!("track {} color: {}", t + 1, CLIP_PALETTE_NAMES[i as usize])
+                    }
+                    None => format!("track {} color reset \u{b7} built-in clip colors", t + 1),
+                };
+                ui.close();
+            }
+        }
     }
     if ui.button("Select all clips").clicked() {
         app.select_all_clips();
@@ -27552,6 +27726,7 @@ mod tests {
             gain: 1.0,
             fade_in: 0,
             fade_out: 0,
+            color: None,
         };
         app.arr.insert(0, 0, mk(0, 192_000));
         app.arr.insert(1, 0, mk(0, 48_000));
@@ -28062,6 +28237,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         app.sel_clips = vec![(0, 0, 0), (2, 0, 0)];
@@ -29046,6 +29222,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
             app.assets[k1].samples(),
         );
@@ -31061,6 +31238,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         app.arr.insert(
@@ -31075,6 +31253,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         app.arr.insert(
@@ -31089,6 +31268,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         frame(&mut app, &ctx, vec![]);
@@ -42309,6 +42489,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         let ctx = egui::Context::default();
@@ -42385,6 +42566,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         let ctx = egui::Context::default();
@@ -42447,6 +42629,7 @@ mod tests {
                 gain: 1.0,
                 fade_in: 0,
                 fade_out: 0,
+                color: None,
             },
         );
         let ctx = egui::Context::default();
@@ -44698,6 +44881,277 @@ mod tests {
             names,
             vec!["evil.json".to_string()],
             "a traversal attempt must collapse to one safe file"
+        );
+    }
+
+    // ---- v58: clip & track colors (S7/S5) ----
+
+    /// The clip RMB Color submenu recolors the selection: state, status
+    /// echo, painted body, and Duplicate carries the color. (The reset
+    /// item is its own pin — popup re-arm, v50-e lesson.)
+    #[test]
+    fn v58_clip_color_menu_paints() {
+        let mut app = headless_app("v58clipcol");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        assert_eq!(app.sel_clips, vec![(0, 0, 0)], "click selected the clip");
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        // The Color item: pick the candidate NEAREST the menu anchor (the
+        // same trick v29 uses for "Track 3" — other panels paint labels).
+        let cms = galley_centers(&mut app, &ctx, "Color", false);
+        let cm = cms
+            .into_iter()
+            .min_by(|x, y| {
+                (*x - p)
+                    .length_sq()
+                    .partial_cmp(&(*y - p).length_sq())
+                    .unwrap()
+            })
+            .expect("Color item present in the clip menu");
+        click_pt(&mut app, &ctx, cm);
+        let sw = galley_centers(&mut app, &ctx, "\u{25a0} amber", true);
+        assert_eq!(sw.len(), 1, "submenu lists the amber swatch");
+        click_pt(&mut app, &ctx, sw[0]);
+        frame(&mut app, &ctx, vec![]);
+        // State + feedback.
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips[0].color,
+            Some(1),
+            "amber is palette index 1"
+        );
+        assert_eq!(app.status, "1 clip(s) colored amber", "status echoes");
+        // Paint: amber body replaces the blue one.
+        let body = {
+            let c = CLIP_PALETTE[1].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let rects = painted_rects(&mut app, &ctx, body);
+        assert_eq!(rects.len(), 1, "clip body painted amber: {rects:?}");
+        let old = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert!(
+            painted_rects(&mut app, &ctx, old).is_empty(),
+            "the default-blue body is gone"
+        );
+        // Duplicate rides the Clip, color included.
+        app.duplicate_selection();
+        assert!(
+            app.arr.tracks[0].lanes[0]
+                .clips
+                .iter()
+                .all(|c| c.color == Some(1)),
+            "duplicate carries the color"
+        );
+    }
+
+    /// "Track / default" clears the clip override and the paint falls
+    /// back to the TRACK default (not the kind default). Own pin:
+    /// opening the clip menu a second time in one session is the v50-e
+    /// re-arm trap zone — fresh app here.
+    #[test]
+    fn v58_clip_color_reset_to_track_default() {
+        let mut app = headless_app("v58clipreset");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                color: Some(1), // amber override
+                ..Clip::new(a, 0)
+            },
+        );
+        app.trk_color[0] = Some(4); // teal track default (setters: other pin)
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        let cms = galley_centers(&mut app, &ctx, "Color", false);
+        let cm = cms
+            .into_iter()
+            .min_by(|x, y| {
+                (*x - p)
+                    .length_sq()
+                    .partial_cmp(&(*y - p).length_sq())
+                    .unwrap()
+            })
+            .expect("Color item present");
+        click_pt(&mut app, &ctx, cm);
+        let td = galley_centers(&mut app, &ctx, "Track / default", true);
+        assert_eq!(td.len(), 1, "reset item present");
+        click_pt(&mut app, &ctx, td[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.arr.tracks[0].lanes[0].clips[0].color, None);
+        assert_eq!(app.status, "1 clip(s) reset to the track color");
+        // Falls back to TEAL (track), not blue and not amber.
+        let teal = {
+            let c = CLIP_PALETTE[4].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert_eq!(painted_rects(&mut app, &ctx, teal).len(), 1);
+        let amber = {
+            let c = CLIP_PALETTE[1].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert!(painted_rects(&mut app, &ctx, amber).is_empty());
+    }
+
+    /// The empty-grid Track color submenu sets the track default: the
+    /// chip paints, status echoes, clips without their own color
+    /// inherit, and the own-color clip keeps its color.
+    #[test]
+    fn v58_track_color_menu_inherits_and_chips() {
+        let mut app = headless_app("v58trkcol");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0)); // follows the track
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                color: Some(6), // azure override
+                ..Clip::new(a, 30_000)
+            },
+        );
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(700.0, top0 + app.track_h(0) * 0.5); // empty grid
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Paste here").is_empty(),
+            "empty-grid menu opened"
+        );
+        let tcs = galley_centers(&mut app, &ctx, "Track color", false);
+        let tc = tcs
+            .into_iter()
+            .min_by(|x, y| {
+                (*x - p)
+                    .length_sq()
+                    .partial_cmp(&(*y - p).length_sq())
+                    .unwrap()
+            })
+            .expect("Track color item present");
+        click_pt(&mut app, &ctx, tc);
+        let sw = galley_centers(&mut app, &ctx, "\u{25a0} teal", true);
+        assert_eq!(sw.len(), 1, "submenu lists the teal swatch");
+        click_pt(&mut app, &ctx, sw[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_color[0], Some(4), "track default set");
+        assert_eq!(app.status, "track 1 color: teal", "status echoes");
+        // Inheritance on the PAINT: teal body (inheriting) + azure body.
+        let teal = {
+            let c = CLIP_PALETTE[4].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert_eq!(painted_rects(&mut app, &ctx, teal).len(), 1);
+        let azure = {
+            let c = CLIP_PALETTE[6].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert_eq!(
+            painted_rects(&mut app, &ctx, azure).len(),
+            1,
+            "the override clip keeps its own color"
+        );
+        // The lane-tag chip: a small (7px) FULL-strength teal square.
+        let (r, g, b, _) = CLIP_PALETTE[4].to_tuple();
+        let chip = painted_rects(&mut app, &ctx, (r, g, b))
+            .into_iter()
+            .filter(|rq| rq.width() < 20.0)
+            .count();
+        assert_eq!(chip, 1, "the track-color chip paints once");
+    }
+
+    /// Automation clips follow the same rule: default red, palette color
+    /// on override. (S5 closes under this one path — they are Clips.)
+    #[test]
+    fn v58_automation_clip_uses_palette() {
+        use crate::automation::{Automation, Node, TARGET_TRACK_VOL};
+        let mut app = headless_app("v58autocol");
+        clear_canvas(&mut app);
+        let auto = Automation {
+            target: TARGET_TRACK_VOL.into(),
+            len_samples: 96_000,
+            nodes: vec![
+                Node { t: 0, v: 0.2, c: 0.0 },
+                Node {
+                    t: 48_000,
+                    v: 0.8,
+                    c: 0.0,
+                },
+            ],
+        };
+        let id = app.assets.len() as u32;
+        app.assets.push(Asset::automation_asset(
+            id,
+            "vol".into(),
+            std::path::PathBuf::new(),
+            std::sync::Arc::new(auto),
+            true,
+        ));
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: id,
+                pos: 0,
+                cut: 0,
+                pre_pad: 0,
+                play_len: Some(96_000),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+                color: None,
+            },
+        );
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let body = |i: Color32| {
+            let c = i.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        // Default: the automation red.
+        assert_eq!(painted_rects(&mut app, &ctx, body(Color32::from_rgb(170, 70, 74))).len(), 1);
+        // Override: rose body replaces the red (direct model set — the
+        // menu path is pinned by the clip pins above).
+        app.arr.tracks[0].lanes[0].clips[0].color = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(painted_rects(&mut app, &ctx, body(CLIP_PALETTE[0])).len(), 1);
+        assert!(
+            painted_rects(&mut app, &ctx, body(Color32::from_rgb(170, 70, 74))).is_empty(),
+            "the red body is replaced"
         );
     }
 }
