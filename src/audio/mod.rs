@@ -765,6 +765,12 @@ pub struct Backend {
     pub midi_drops: Arc<AtomicU64>,
     /// Shared engine (GUI reads atomics for transport display).
     pub engine: Arc<Engine>,
+    /// v63: count of `Cmd::SetProject` pushes (the engine-table refresh
+    /// seam). Edit paths that change asset/arrangement data must bump the
+    /// engine table — this makes "did the GUI actually push?" observable
+    /// to headless pins (under SLOOPER_NULL_AUDIO the manager thread is
+    /// gone, so `engine.assets()` can never show the command landing).
+    pub set_project_pushes: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -779,6 +785,7 @@ impl Backend {
         let meter = Arc::new(crate::meter::MeterRing::new());
         let xruns = Arc::new(AtomicU64::new(0));
         let midi_drops = Arc::new(AtomicU64::new(0));
+        let set_project_pushes = Arc::new(AtomicU64::new(0));
         let engine = Engine::new();
         let (t_gain, t_peak, t_meter, t_xruns, t_midi_drops, t_engine) = (
             gain.clone(),
@@ -814,12 +821,18 @@ impl Backend {
             xruns,
             midi_drops,
             engine,
+            set_project_pushes,
             thread: Some(thread),
         }
     }
 
     /// Send a command, ignoring send errors (thread already gone).
     pub fn cmd(&self, c: Cmd) {
+        // v63: the SetProject push seam is observable even with no manager
+        // thread (headless tests) — see `set_project_pushes`.
+        if matches!(c, Cmd::SetProject { .. }) {
+            self.set_project_pushes.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = self.cmd_tx.send(c);
     }
 
@@ -8486,5 +8499,54 @@ mod w12g_tests {
         assert!(sw.contains("SLOOPER_AUDIO_BACKEND"));
         assert!(sw.contains("jack::dll::found()"));
         assert!(sw.contains("Cmd::SwitchBackend(kind)"));
+    }
+
+    /// v63 (user bug: "sample edits show in the GUI but playback never
+    /// changes"): the RT/offline mix reads the LATEST pushed asset table,
+    /// not the one first installed. Same clip, same arrangement — a
+    /// `set_project` swap must be audible on the very next render. This
+    /// is the engine half of the contract the GUI satisfies by pushing
+    /// after every sample edit (`se_apply`).
+    #[test]
+    fn v63_engine_playback_reads_pushed_table() {
+        let fwd: Arc<[f32]> = Arc::from(vec![0.1f32, 0.2, 0.3, 0.4]);
+        let rev: Arc<[f32]> = Arc::from(vec![0.4f32, 0.3, 0.2, 0.1]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, crate::arrange::Clip::new(0, 0));
+        let e = Engine::new();
+        e.set_sample_rate(48_000);
+        e.set_project(Arc::new(vec![fwd.clone()]), Arc::new(arr.clone()), 4);
+        let out1 = e.render_project().expect("clip renders");
+        e.set_project(Arc::new(vec![rev.clone()]), Arc::new(arr), 4);
+        let out2 = e.render_project().expect("clip still renders");
+        assert!(
+            (out1[0] - 0.1).abs() < 1e-6 && (out1[3] - 0.4).abs() < 1e-6,
+            "first table plays: got {:?} {:?}",
+            &out1[..4],
+            &out2[..4]
+        );
+        assert!(
+            (out2[0] - 0.4).abs() < 1e-6 && (out2[3] - 0.1).abs() < 1e-6,
+            "the SWAPPED table plays (this is the v63 bug's engine half)"
+        );
+    }
+
+    /// v63: the push seam is honest — `Backend::cmd` counts exactly the
+    /// `SetProject` commands (the headless pins watch this counter because
+    /// under SLOOPER_NULL_AUDIO the manager thread is gone and
+    /// `engine.assets()` can never show a command landing).
+    #[test]
+    fn v63_backend_counts_set_project_pushes() {
+        let b = Backend::start();
+        // Drain the startup event noise; we only care about the counter.
+        let base = b.set_project_pushes.load(Ordering::Relaxed);
+        b.cmd(Cmd::SetLoop(false));
+        assert_eq!(b.set_project_pushes.load(Ordering::Relaxed), base, "other cmds do not tick");
+        b.cmd(Cmd::SetProject {
+            assets: Arc::new(Vec::new()),
+            arr: Arc::new(crate::arrange::Arrangement::new()),
+            len: 0,
+        });
+        assert_eq!(b.set_project_pushes.load(Ordering::Relaxed), base + 1, "SetProject ticks once");
     }
 }
