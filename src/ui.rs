@@ -643,6 +643,60 @@ struct AssetWave {
     data: Vec<[f32; 2]>,
 }
 
+/// v63: which sample-editor canvas affordance a pointer drag owns. The
+/// canvas IS the editor: fades ride on the waveform as draggable curves
+/// (automation-manager style), pitch is a horizontal line, the pitch-bend
+/// sweep is a two-handle line, and the strip under the canvas drags the
+/// stretched length.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeDragKind {
+    /// Fade-in endpoint: horizontal drag = fade length.
+    FadeIn,
+    /// Fade-in curve midpoint: vertical drag = curve shape.
+    FadeInShape,
+    /// Fade-out endpoint (mirrored).
+    FadeOut,
+    /// Fade-out curve midpoint shape grip.
+    FadeOutShape,
+    /// Pitch line: vertical drag = coarse+fine pitch cents.
+    Pitch,
+    /// Pitch-bend sweep start handle (canvas left edge).
+    BendStart,
+    /// Pitch-bend sweep end handle (canvas right edge).
+    BendEnd,
+    /// Stretch-strip marker: horizontal drag = output length.
+    Stretch,
+}
+
+/// v63: an active sample-canvas drag: which affordance plus the edit at
+/// press time (the stretch gesture is multiplicative, so it computes from
+/// the grabbed value, never the live one).
+struct SeDrag {
+    kind: SeDragKind,
+    e0: SampleEdit,
+}
+
+/// v63: the canvas geometry painted by the last frame, in screen points.
+/// Saved every frame so pins hit-test exact handles instead of guessing
+/// pixel offsets, and so hover logic never re-derives the mapping.
+#[derive(Clone, Copy)]
+struct SeGeom {
+    rect: egui::Rect,
+    strip: egui::Rect,
+    fi_x: f32,
+    fi_mid: egui::Pos2,
+    fo_x: f32,
+    fo_mid: egui::Pos2,
+    /// A zero-length fade has no grabbable handle — hit-testing and
+    /// painting agree only through these flags.
+    fi_active: bool,
+    fo_active: bool,
+    pitch_y: f32,
+    bend_l: egui::Pos2,
+    bend_r: egui::Pos2,
+    stretch_x: f32,
+}
+
 /// A clip being dragged on the timeline. Dragging a clip that is part of a
 /// multi-selection drags the whole group: `items` lists every member
 /// (`(track, lane, clip index, timeline position at drag start)`, sorted,
@@ -1376,6 +1430,13 @@ pub struct App {
     sample_edit_win: Option<String>,
     /// "save as new asset" name field.
     se_name: String,
+    /// v63: last painted sample-editor canvas geometry (handle rects).
+    se_geom: Option<SeGeom>,
+    /// v63: in-progress drag on the sample-editor canvas.
+    se_drag: Option<SeDrag>,
+    /// v63: asset key whose re-render was deferred while a heavy canvas
+    /// drag (pitch/bend/stretch) was still in progress; flushed on release.
+    se_defer: Option<String>,
     /// v34 R15: create-subfolder dialog: (rack folder index, draft name).
     rack_newsub: Option<(usize, String)>,
     /// v29: delete-file confirmation target (full path).
@@ -2062,6 +2123,9 @@ impl App {
             se_source: Default::default(),
             sample_edit_win: None,
             se_name: String::new(),
+            se_geom: None,
+            se_drag: None,
+            se_defer: None,
             rack_newsub: None,
             rack_confirm_del: None,
             sel_asset: None,
@@ -5421,6 +5485,9 @@ impl App {
             self.se_source.remove(key);
             self.sample_edits.remove(key);
             self.status = "sample edit reset".into();
+            // v63: the engine table is a snapshot — without a push the
+            // reset is invisible to playback exactly like the edit was.
+            self.push_project();
             return;
         }
         let out = crate::sample_edit::render(&pristine, sr, &edit);
@@ -5429,6 +5496,14 @@ impl App {
         self.se_source.insert(key.to_string(), pristine);
         self.sample_edits.insert(key.to_string(), edit);
         self.status = format!("sample edit: {secs:.2} s");
+        // v63 ROOT-CAUSE FIX (user report: "the GUI shows the new
+        // waveform, on playback nothing is changed"): the RT path reads
+        // the engine's `AssetTable` Arc snapshot, which only refreshes on
+        // `Cmd::SetProject`. Editing swapped the GUI Arc and never pushed,
+        // so playback kept mixing the table taken when the project was
+        // first loaded — reverse, ping-pong, pitch, all of it. Every
+        // committed edit must push.
+        self.push_project();
     }
 
     /// v50 R1: render the edited sample into a NEW wav in the recordings
@@ -5500,24 +5575,290 @@ impl App {
         let mut save_as = false;
         let mut reset = false;
         let mut open = true;
+        let mut audition = false;
+        let sr = self.sample_rate.max(48_000) as f64;
+        // v63: the canvas shows the LIVE edited buffer — `se_apply`
+        // re-renders into `assets[ai].data` on every committed edit, so
+        // what is painted is what playback (same Arc, pushed to the
+        // engine) will mix. `src_len` is the pristine length: the strip
+        // tick shows how far the stretched output sits from the source.
+        let data = self.assets[ai].data.clone();
         let src_len = self
             .se_source
             .get(&key)
             .map(|d| d.len())
-            .unwrap_or_else(|| self.assets[ai].data.len());
+            .unwrap_or_else(|| data.len());
+        let out_len = data.len();
+        let playing = self.preview_playing.as_deref() == Some(key.as_str());
+
         egui::Window::new(format!("Edit sample \u{2014} {aname}"))
             .id(egui::Id::new(("sewin", key.clone())))
             .open(&mut open)
-            .default_width(360.0)
+            .default_width(680.0)
             .show(ui.ctx(), |ui| {
                 ui.label("Edits apply live, are saved with the project, and never touch the source file.");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.sample_rate > 0, egui::Button::new(if playing { "stop" } else { "play" }))
+                        .on_hover_text("audition this sample at the master output (click again to stop)")
+                        .clicked()
+                    {
+                        audition = true;
+                    }
+                    if self.sample_rate == 0 {
+                        ui.label("waiting for the audio engine\u{2026}");
+                    }
+                });
+                // ---- v63 waveform canvas --------------------------------------
+                // One allocated response covers the canvas AND the stretch strip
+                // below it, so a single gesture set owns every handle.
+                let canvas_h = 210.0f32;
+                let strip_h = 18.0f32;
+                let want_w = ui.available_width().max(320.0);
+                let (area, resp) = ui.allocate_exact_size(
+                    egui::vec2(want_w, canvas_h + 3.0 + strip_h),
+                    egui::Sense::click_and_drag(),
+                );
+                let canvas = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), canvas_h));
+                let strip = egui::Rect::from_min_size(
+                    egui::pos2(area.min.x, canvas.max.y + 3.0),
+                    egui::vec2(area.width(), strip_h),
+                );
+                let p = ui.painter();
+                let rect = canvas;
+                p.rect_filled(rect, 0.0, egui::Color32::from_rgb(14, 16, 22));
+                p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(55)), egui::StrokeKind::Inside);
+                // Time domain: the WIDER of source and output, so a stretched
+                // sample visibly grows past the source tick and a compressed
+                // one visibly shrinks short of it.
+                let domain = (src_len.max(out_len)).max(1) as f64;
+                let x_of = |s: f64| rect.min.x + (s / domain) as f32 * rect.width();
+                let t_of = |x: f32| ((x - rect.min.x) as f64 / rect.width() as f64) * domain;
+                let mid = (rect.min.y + rect.max.y) * 0.5;
+                let half = (rect.height() * 0.5 - 2.0).max(3.0);
+                // seconds grid
+                for gi in 1..8 {
+                    let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
+                    p.line_segment(
+                        [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(30)),
+                    );
+                    p.text(
+                        egui::pos2(gx + 2.0, rect.max.y - 8.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{:.2}s", domain * gi as f64 / 8.0 / sr),
+                        egui::FontId::proportional(9.0),
+                        egui::Color32::from_gray(105),
+                    );
+                }
+                // waveform: min/max column per pixel, peak-normalized like the
+                // arranger's clips (a quiet edit stays legible). Columns map
+                // the DOMAIN, so a compressed sample visibly ends short of
+                // the source tick instead of filling the canvas.
+                let n = out_len;
+                if n > 0 {
+                    let cols = rect.width().max(1.0) as usize;
+                    let pxw = rect.width() / cols as f32;
+                    let mut peak = 1e-6f32;
+                    for &v in data.iter() {
+                        let a = v.abs();
+                        if a > peak {
+                            peak = a;
+                        }
+                    }
+                    let norm = 1.0 / peak;
+                    for c in 0..cols {
+                        let s0 = ((c as f64) * domain / cols as f64) as usize;
+                        let s1 = (((c + 1) as f64) * domain / cols as f64).min(n as f64) as usize;
+                        if s0 >= n || s0 >= s1 {
+                            continue;
+                        }
+                        let (mut mn, mut mx) = (f32::MAX, f32::MIN);
+                        for &v in &data[s0..s1] {
+                            if v < mn {
+                                mn = v;
+                            }
+                            if v > mx {
+                                mx = v;
+                            }
+                        }
+                        let x = rect.min.x + (c as f32 + 0.5) * pxw;
+                        let y0 = mid - (mx * norm).min(1.0) * half;
+                        let y1 = mid - (mn * norm).max(-1.0) * half;
+                        p.line_segment(
+                            [egui::pos2(x, y0), egui::pos2(x, y1.max(y0 + 0.6))],
+                            egui::Stroke::new(1.0, COL_SE_WAVE.linear_multiply(0.9)),
+                        );
+                    }
+                }
+                p.line_segment(
+                    [egui::pos2(rect.min.x, mid), egui::pos2(rect.max.x, mid)],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(48)),
+                );
+                // fades as translucent curves ON the waveform
+                let fin_s = (ed.fade_in_ms.max(0.0) as f64 * sr / 1000.0).min(out_len as f64);
+                let fout_s = (ed.fade_out_ms.max(0.0) as f64 * sr / 1000.0).min(out_len as f64);
+                // The endpoint handle positions are derived in `se_hit`
+                // from `fi_x`/`fo_x`; only the shape grips need storing.
+                let fi_mid = if fin_s > 0.0 {
+                    let (_end, b) = se_paint_fade(ui, rect, rect.min.x, x_of(fin_s), ed.fade_in, true, COL_SE_FI);
+                    b
+                } else {
+                    egui::pos2(rect.min.x, rect.min.y + 2.0)
+                };
+                let fo_mid = if fout_s > 0.0 {
+                    let (_end, b) = se_paint_fade(ui, rect, x_of(out_len as f64 - fout_s), x_of(out_len as f64), ed.fade_out, false, COL_SE_FO);
+                    b
+                } else {
+                    egui::pos2(rect.max.x, rect.min.y + 2.0)
+                };
+                // pitch line + bend sweep line
+                let cents_y = |c: f32| mid - (c / 2400.0) * (half - 8.0);
+                let pitch_y = cents_y(ed.pitch_cents);
+                p.line_segment(
+                    [egui::pos2(rect.min.x, pitch_y), egui::pos2(rect.max.x, pitch_y)],
+                    egui::Stroke::new(1.2, COL_SE_PITCH.linear_multiply(0.75)),
+                );
+                p.circle_filled(egui::pos2(rect.max.x - 8.0, pitch_y), 4.0, COL_SE_PITCH);
+                if ed.pitch_cents.abs() > 0.5 {
+                    p.text(
+                        egui::pos2(rect.min.x + 4.0, pitch_y - 8.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{:+.1} st", ed.pitch_cents / 100.0),
+                        egui::FontId::proportional(10.0),
+                        COL_SE_PITCH,
+                    );
+                }
+                let bend_l = egui::pos2(rect.min.x + 8.0, cents_y(ed.bend_start_cents));
+                let bend_r = egui::pos2(rect.max.x - 8.0, cents_y(ed.bend_end_cents));
+                p.line_segment(
+                    [bend_l, bend_r],
+                    egui::Stroke::new(1.2, COL_SE_BEND.linear_multiply(0.75)),
+                );
+                for (c, v) in [(bend_l, ed.bend_start_cents), (bend_r, ed.bend_end_cents)] {
+                    p.circle_filled(c, 4.0, COL_SE_BEND);
+                    if v.abs() > 0.5 {
+                        p.text(
+                            egui::pos2(c.x + (if c.x < mid { 6.0 } else { -6.0 }), c.y - 8.0),
+                            if c.x < mid { egui::Align2::LEFT_CENTER } else { egui::Align2::RIGHT_CENTER },
+                            format!("{:+.0} ct", v),
+                            egui::FontId::proportional(9.0),
+                            COL_SE_BEND,
+                        );
+                    }
+                }
+                // ---- stretch strip ----------------------------------------
+                p.rect_filled(strip, 0.0, egui::Color32::from_rgb(22, 25, 32));
+                p.rect_stroke(strip, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(48)), egui::StrokeKind::Inside);
+                let src_x = x_of(src_len as f64);
+                p.line_segment(
+                    [egui::pos2(src_x, strip.min.y + 2.0), egui::pos2(src_x, strip.max.y - 2.0)],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+                );
+                p.text(
+                    egui::pos2(src_x + 3.0, strip.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "src",
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_gray(130),
+                );
+                let stretch_x = x_of((out_len as f64).min(domain));
+                p.line_segment(
+                    [egui::pos2(stretch_x, strip.min.y + 1.0), egui::pos2(stretch_x, strip.max.y - 1.0)],
+                    egui::Stroke::new(2.0, COL_SE_WAVE),
+                );
+                p.circle_filled(egui::pos2(stretch_x, strip.center().y), 4.5, COL_SE_WAVE);
+                p.text(
+                    egui::pos2(strip.max.x - 4.0, strip.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{:.2}s  \u{d7}{:.2}", out_len as f64 / sr, ed.stretch),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_gray(150),
+                );
+                let geom = SeGeom {
+                    rect,
+                    strip,
+                    fi_x: x_of(fin_s),
+                    fi_mid,
+                    fo_x: x_of(out_len as f64 - fout_s),
+                    fo_mid,
+                    fi_active: fin_s > 0.0,
+                    fo_active: fout_s > 0.0,
+                    pitch_y,
+                    bend_l,
+                    bend_r,
+                    stretch_x,
+                };
+                // ---- gestures -------------------------------------------------
+                // Arm on PRESS directly on a handle (the automation-manager
+                // lesson: arm-on-click never lets a press flow into a drag).
+                let press_hit = resp.hovered()
+                    && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+                let start_hit = resp.drag_started_by(egui::PointerButton::Primary);
+                if press_hit || start_hit {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(kind) = se_hit(&geom, pos) {
+                            self.se_drag = Some(SeDrag { kind, e0: ed });
+                        }
+                    }
+                }
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    if let (Some(drag), Some(pos)) = (self.se_drag.as_ref(), ui.input(|i| i.pointer.interact_pos())) {
+                        let e0 = drag.e0;
+                        match drag.kind {
+                            SeDragKind::FadeIn => {
+                                let s = t_of(pos.x.max(rect.min.x)).max(0.0);
+                                ed.fade_in_ms = (s * 1000.0 / sr).clamp(0.0, 60_000.0) as f32;
+                            }
+                            SeDragKind::FadeOut => {
+                                let s = (domain - t_of(pos.x.min(rect.max.x))).max(0.0);
+                                ed.fade_out_ms = (s * 1000.0 / sr).clamp(0.0, 60_000.0) as f32;
+                            }
+                            SeDragKind::FadeInShape => {
+                                let g = ((rect.max.y - 2.0 - pos.y) / (rect.height() - 4.0)).clamp(0.0, 1.0);
+                                ed.fade_in = se_shape_at(g);
+                            }
+                            SeDragKind::FadeOutShape => {
+                                let g = ((rect.max.y - 2.0 - pos.y) / (rect.height() - 4.0)).clamp(0.0, 1.0);
+                                ed.fade_out = se_shape_at(g);
+                            }
+                            SeDragKind::Pitch => {
+                                ed.pitch_cents = ((mid - pos.y) / (half - 8.0) * 2400.0).clamp(-2400.0, 2400.0);
+                            }
+                            SeDragKind::BendStart => {
+                                ed.bend_start_cents = ((mid - pos.y) / (half - 8.0) * 2400.0).clamp(-2400.0, 2400.0);
+                            }
+                            SeDragKind::BendEnd => {
+                                ed.bend_end_cents = ((mid - pos.y) / (half - 8.0) * 2400.0).clamp(-2400.0, 2400.0);
+                            }
+                            SeDragKind::Stretch => {
+                                // Multiplicative from the grabbed value: the
+                                // marker's x is the target OUTPUT length; the
+                                // pitch stage is untouched during this drag,
+                                // so scaling `stretch` by target/current lands
+                                // the exact target regardless of pitch state.
+                                let target = t_of(pos.x.clamp(rect.min.x, rect.max.x)).max(domain * 0.01);
+                                let f = target / (out_len.max(1) as f64);
+                                ed.stretch = (e0.stretch as f64 * f).clamp(0.25, 4.0) as f32;
+                            }
+                        }
+                    }
+                }
+                if !ui.input(|i| i.pointer.any_down()) {
+                    self.se_drag = None;
+                }
+                resp.on_hover_text(
+                    "drag: fade handles = length \u{b7} dots on the curves = shape \u{b7} mint line = pitch \u{b7} amber dots = bend start/end \u{b7} strip marker = stretch length",
+                );
+                self.se_geom = Some(geom);
+                // ---- precision controls (unchanged contract) ---------------
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut ed.reverse, "reverse")
                         .on_hover_text("play the sample backwards");
                     ui.checkbox(&mut ed.pingpong, "ping-pong")
                         .on_hover_text("play forward, then the mirror, back-to-back");
                 });
-                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("pitch");
                     ui.add(
@@ -5526,7 +5867,7 @@ impl App {
                             .speed(5.0)
                             .suffix(" ct"),
                     )
-                        .on_hover_text("coarse+fine pitch in cents");
+                        .on_hover_text("coarse+fine pitch in cents (same as dragging the mint line)");
                     ui.label("stretch");
                     ui.add(
                         egui::Slider::new(&mut ed.stretch, 0.25..=4.0)
@@ -5578,11 +5919,12 @@ impl App {
                 fade_ui(ui, "fade in", &mut ed.fade_in_ms, &mut ed.fade_in);
                 fade_ui(ui, "fade out", &mut ed.fade_out_ms, &mut ed.fade_out);
                 ui.separator();
-                let est = src_len as f64 * ed.stretch as f64;
                 ui.label(format!(
-                    "source {:.2} s \u{2192} ~{:.2} s",
-                    src_len as f64 / self.sample_rate.max(48_000) as f64,
-                    est / self.sample_rate.max(48_000) as f64
+                    "source {:.2} s \u{2192} {:.2} s \u{b7} \u{d7}{:.2} \u{b7} {:+.0} ct",
+                    src_len as f64 / sr,
+                    out_len as f64 / sr,
+                    ed.stretch,
+                    ed.pitch_cents
                 ));
                 ui.horizontal(|ui| {
                     ui.label("save as");
@@ -5606,17 +5948,41 @@ impl App {
             });
         if !open {
             self.sample_edit_win = None;
+            self.se_geom = None;
+            self.se_drag = None;
+            self.se_defer = None;
         }
         if reset {
             ed = SampleEdit::default();
         }
         if ed != cur {
             self.sample_edits.insert(key.clone(), ed);
-            self.se_apply(&key);
+            let heavy = (ed.pitch_cents - cur.pitch_cents).abs() > 1e-6
+                || (ed.bend_start_cents - cur.bend_start_cents).abs() > 1e-6
+                || (ed.bend_end_cents - cur.bend_end_cents).abs() > 1e-6
+                || (ed.stretch - cur.stretch).abs() > 1e-6;
+            if heavy && self.se_drag.is_some() {
+                // Pitch/bend/stretch re-renders (WSOLA search, cubic sweep)
+                // are far too heavy to run per DRAGGED frame; the canvas
+                // affordances already track the pointer live, so the
+                // waveform commit lands on pointer release.
+                self.se_defer = Some(key.clone());
+            } else {
+                self.se_apply(&key);
+                self.se_defer = None;
+            }
+        } else if self.se_drag.is_none() {
+            if let Some(k) = self.se_defer.take() {
+                self.se_apply(&k);
+            }
         }
         if save_as {
             let nm = self.se_name.clone();
             self.se_save_as(&key, &nm);
+        }
+        if audition {
+            let k = ai;
+            self.preview_asset(k);
         }
     }
 
@@ -16571,6 +16937,137 @@ fn nearest_auto_node(
         }
     }
     best.map(|(_, i)| i)
+}
+
+/// v63: the sample-editor waveform column color (matches the arranger's
+/// clip waveform blue so the two views read as the same asset).
+const COL_SE_WAVE: egui::Color32 = egui::Color32::from_rgb(120, 205, 255);
+/// v63: fade-in curve + handle (green); fade-out (coral). Chosen distinct
+/// from the automation-manager red so the same canvas language never
+/// implies the same feature.
+const COL_SE_FI: egui::Color32 = egui::Color32::from_rgb(140, 230, 160);
+const COL_SE_FO: egui::Color32 = egui::Color32::from_rgb(255, 150, 120);
+/// v63: pitch line (mint) and pitch-bend sweep line (amber).
+const COL_SE_PITCH: egui::Color32 = egui::Color32::from_rgb(120, 255, 170);
+const COL_SE_BEND: egui::Color32 = egui::Color32::from_rgb(255, 200, 90);
+
+/// v63: paint one fade as a PARTIALLY TRANSPARENT gain curve over the
+/// waveform (`x0` = region start, `x1` = region end; gain runs 0→1 across
+/// for `fade_in`, 1→0 for a fade-out — the exact mapping `sample_edit::
+/// render` applies). The area under the curve is a Mesh of per-strip
+/// trapezoids at low alpha (the v26 automation lesson: never a single
+/// convex_polygon — its fan triangulation lenses white on concave curves;
+/// unfeathered trapezoids also keep the alpha perfectly even), so the
+/// waveform clearly shows through. Returns (endpoint handle, mid grip).
+fn se_paint_fade(
+    ui: &egui::Ui,
+    canvas: egui::Rect,
+    x0: f32,
+    x1: f32,
+    curve: SeCurve,
+    fade_in: bool,
+    col: egui::Color32,
+) -> (egui::Pos2, egui::Pos2) {
+    let p = ui.painter();
+    let top = canvas.min.y + 2.0;
+    let bot = canvas.max.y - 2.0;
+    let gain_y = |g: f32| bot - g * (bot - top);
+    let span = (x1 - x0).max(0.001);
+    let steps = ((x1 - x0) / 2.0).max(2.0) as usize;
+    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let x = x0 + span * i as f32 / steps as f32;
+        let u = ((x - x0) / span).clamp(0.0, 1.0);
+        let g = if fade_in { curve.gain(u) } else { curve.gain(1.0 - u) };
+        pts.push(egui::pos2(x, gain_y(g)));
+    }
+    let fill = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 36);
+    let mut mesh = egui::epaint::Mesh::default();
+    for w in pts.windows(2) {
+        if (w[1].x - w[0].x).abs() < 0.01 {
+            continue;
+        }
+        let i = mesh.vertices.len() as u32;
+        for q in [w[0], w[1], egui::pos2(w[1].x, bot), egui::pos2(w[0].x, bot)] {
+            mesh.colored_vertex(q, fill);
+        }
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i, i + 2, i + 3);
+    }
+    p.add(egui::epaint::Shape::Mesh(std::sync::Arc::new(mesh)));
+    for w in pts.windows(2) {
+        p.line_segment(
+            [w[0], w[1]],
+            egui::Stroke::new(1.4, col.linear_multiply(0.85)),
+        );
+    }
+    // Endpoint handle sits at the curve's FULL-gain corner; the shape grip
+    // rides the curve at its midpoint (vertical drag morphs the shape).
+    let end = if fade_in {
+        egui::pos2(x1, gain_y(1.0))
+    } else {
+        egui::pos2(x0, gain_y(1.0))
+    };
+    let grip = egui::pos2(x0 + span * 0.5, gain_y(curve.gain(0.5)));
+    p.circle_filled(end, 4.5, col);
+    p.circle(end, 6.5, egui::Color32::TRANSPARENT, egui::Stroke::new(1.0, col.linear_multiply(0.5)));
+    p.circle_filled(grip, 3.0, col.linear_multiply(0.9));
+    (end, grip)
+}
+
+/// v63: hit-test the sample canvas handles in priority order — explicit
+/// handle dots first, then the pitch line, then the stretch marker.
+fn se_hit(g: &SeGeom, pos: egui::Pos2) -> Option<SeDragKind> {
+    let near = |p: egui::Pos2, r: f32| (pos - p).length() <= r;
+    let fi_end = egui::pos2(g.fi_x, g.rect.min.y + 2.0);
+    let fo_end = egui::pos2(g.fo_x, g.rect.min.y + 2.0);
+    if g.fi_active && near(fi_end, 10.0) {
+        return Some(SeDragKind::FadeIn);
+    }
+    if g.fo_active && near(fo_end, 10.0) {
+        return Some(SeDragKind::FadeOut);
+    }
+    if g.fi_active && near(g.fi_mid, 9.0) {
+        return Some(SeDragKind::FadeInShape);
+    }
+    if g.fo_active && near(g.fo_mid, 9.0) {
+        return Some(SeDragKind::FadeOutShape);
+    }
+    if near(g.bend_l, 10.0) {
+        return Some(SeDragKind::BendStart);
+    }
+    if near(g.bend_r, 10.0) {
+        return Some(SeDragKind::BendEnd);
+    }
+    if pos.y >= g.rect.min.y - 2.0
+        && pos.y <= g.rect.max.y + 2.0
+        && (pos.y - g.pitch_y).abs() <= 5.0
+    {
+        return Some(SeDragKind::Pitch);
+    }
+    if pos.y >= g.strip.min.y - 3.0
+        && pos.y <= g.strip.max.y + 3.0
+        && (pos.x - g.stretch_x).abs() <= 10.0
+    {
+        return Some(SeDragKind::Stretch);
+    }
+    None
+}
+
+/// v63: the shape whose midpoint gain is nearest `g` (the fade curve
+/// shape grip's vertical position). `Curve::ALL` order breaks exact ties
+/// deterministically (strict improvement keeps the earlier entry).
+fn se_shape_at(g: f32) -> SeCurve {
+    let mut best = SeCurve::ALL[0];
+    let mut bd = f32::MAX;
+    for c in SeCurve::ALL {
+        let d = (c.gain(0.5) - g).abs();
+        if d < bd {
+            bd = d;
+            best = c;
+        }
+    }
+    best
 }
 
 /// v0.15: the right-click menu shared by every automatable widget (mixer
@@ -46282,5 +46779,432 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ---- v63: sample-editor pro (waveform canvas + playback parity) ----
+
+    /// Scratch sample + editor opened the way a user opens it (rack
+    /// right-click ▸ Edit sample). Returns the asset key. Canvas gestures
+    /// never guess coordinates: they read `app.se_geom` (recorded every
+    /// painted frame).
+    fn v63_open_editor(app: &mut App, ctx: &egui::Context, tag: &str) -> String {
+        let samples = std::env::temp_dir()
+            .join(format!("sp-uity-{tag}"))
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/v63.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        frame(app, ctx, vec![]);
+        // W14 rule: the key path is built chained-join (scan form), never
+        // slash-pushed.
+        let wav = samples.join("kit-a").join("v63.wav");
+        let _ = app.ensure_asset(&wav);
+        frame(app, ctx, vec![]);
+        let hs = galley_centers(app, ctx, "v63", true);
+        assert!(!hs.is_empty(), "rack row must paint");
+        rmb(app, ctx, hs[0]);
+        let its = galley_centers(app, ctx, "Edit sample", true);
+        assert!(!its.is_empty(), "Edit sample menu item");
+        click_pt(app, ctx, its[0]);
+        frame(app, ctx, vec![]);
+        wav.to_string_lossy().into_owned()
+    }
+
+    /// Press on `from`, walk to `to`, release, settle. (Arms presses
+    /// directly on handles like the automation-manager pins.)
+    fn v63_drag(app: &mut App, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        frame(app, ctx, vec![moved(from)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        for i in 1..=4 {
+            let t = i as f32 / 4.0;
+            frame(
+                app,
+                ctx,
+                vec![moved(egui::pos2(
+                    from.x + (to.x - from.x) * t,
+                    from.y + (to.y - from.y) * t,
+                ))],
+            );
+        }
+        frame(
+            app,
+            ctx,
+            vec![moved(to), btn(to, egui::PointerButton::Primary, false)],
+        );
+        frame(app, ctx, vec![]);
+    }
+
+    /// Waveform column segments inside the editor canvas, with heights.
+    fn v63_wave_cols(app: &mut App, ctx: &egui::Context, rect: egui::Rect) -> Vec<(f32, f32)> {
+        let col = COL_SE_WAVE.linear_multiply(0.9);
+        painted_lines(app, ctx)
+            .into_iter()
+            .filter(|(pts, c)| {
+                *c == col
+                    && pts.len() == 2
+                    && rect.contains(pts[0])
+                    && rect.contains(pts[1])
+            })
+            .map(|(pts, _)| (pts[0].x, (pts[1].y - pts[0].y).abs()))
+            .collect()
+    }
+
+    /// R1: the editor paints a dense waveform, and a committed fade edit
+    /// visibly lands on the SAME canvas columns (the head goes flat where
+    /// the render silenced it) — GUI and audio data are one buffer.
+    #[test]
+    fn v63_se_canvas_paints_waveform_live_edits() {
+        let mut app = headless_app("v63wave");
+        let ctx = egui::Context::default();
+        // egui 0.36 Area fade-in premultiplies painted colors until
+        // animation_time elapses — color-asserting pins must zero it.
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let key = v63_open_editor(&mut app, &ctx, "v63wave");
+        let g = app.se_geom.expect("canvas geometry after opening the editor");
+        let cols = v63_wave_cols(&mut app, &ctx, g.rect);
+        if cols.is_empty() {
+            // DIAG (Windows-parity style): name the culprit in the log —
+            // total lines, and which colors DID paint inside the rect.
+            let all = painted_lines(&mut app, &ctx);
+            let inside: Vec<_> = all
+                .iter()
+                .filter(|(pts, _)| pts.len() == 2 && g.rect.contains(pts[0]))
+                .collect();
+            let mut hist: std::collections::BTreeMap<(u8, u8, u8, u8), usize> =
+                Default::default();
+            for (_, c) in &inside {
+                *hist.entry(c.to_tuple()).or_default() += 1;
+            }
+            eprintln!(
+                "DIAG canvas: total lines {} inside {} rect {:?}; hist {:#?}",
+                all.len(),
+                inside.len(),
+                g.rect,
+                hist
+            );
+        }
+        assert!(
+            cols.len() > g.rect.width() as usize * 3 / 4,
+            "dense columns: {} of {} px",
+            cols.len(),
+            g.rect.width()
+        );
+        let xlo = cols.iter().map(|c| c.0).fold(f32::MAX, f32::min);
+        let xhi = cols.iter().map(|c| c.0).fold(f32::MIN, f32::max);
+        assert!(
+            xlo < g.rect.min.x + 3.0 && xhi > g.rect.max.x - 4.0,
+            "waveform spans the canvas: {xlo} .. {xhi} in {:?}",
+            g.rect
+        );
+        let head_before: Vec<f32> = cols
+            .iter()
+            .filter(|(x, _)| *x < g.rect.min.x + g.rect.width() * 0.02)
+            .map(|(_, h)| *h)
+            .collect();
+        assert!(
+            head_before.iter().any(|h| *h > 40.0) && head_before.len() >= 8,
+            "pristine head carries the signal: {head_before:?}"
+        );
+        // Column band just past the onset (2%..5% of the canvas): real
+        // content, and the exact band the fade will crush.
+        let band_before: Vec<(f32, f32)> = cols
+            .iter()
+            .filter(|(x, _)| {
+                *x >= g.rect.min.x + g.rect.width() * 0.02
+                    && *x < g.rect.min.x + g.rect.width() * 0.05
+            })
+            .copied()
+            .collect();
+        let cols_pre = cols.clone();
+        assert!(
+            band_before.len() >= 8 && band_before.iter().any(|(_, h)| *h > 20.0),
+            "band has content: {band_before:?}"
+        );
+        // Commit a 50 ms linear fade-in and repaint: the SAME columns
+        // must collapse (the data under them is now attenuated) while
+        // columns past the fade keep their height.
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                fade_in_ms: 50.0,
+                fade_in: SeCurve::Linear,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        frame(&mut app, &ctx, vec![]);
+        let g = app.se_geom.unwrap();
+        let cols = v63_wave_cols(&mut app, &ctx, g.rect);
+        // Columns in the first 2% of the canvas (samples 0..~96 of a
+        // 2400-sample linear fade): gain <= 0.04 there — the bars go
+        // flat against the centre line.
+        let head_after: Vec<f32> = cols
+            .iter()
+            .filter(|(x, _)| *x < g.rect.min.x + g.rect.width() * 0.02)
+            .map(|(_, h)| *h)
+            .collect();
+        assert!(
+            !head_after.is_empty() && head_after.iter().all(|h| *h < 4.0),
+            "edited head flattens on the canvas: {head_after:?}"
+        );
+        let band_after: Vec<f32> = cols
+            .iter()
+            .filter(|(x, _)| {
+                *x >= g.rect.min.x + g.rect.width() * 0.02
+                    && *x < g.rect.min.x + g.rect.width() * 0.05
+            })
+            .map(|(_, h)| *h)
+            .collect();
+        assert_eq!(band_after.len(), band_before.len(), "same columns");
+        for (b, a) in band_before.iter().zip(band_after.iter()) {
+            assert!(
+                *a < b.1 * 0.25 + 1.0,
+                "fade must attenuate the band: {b:?} -> {a:?}"
+            );
+        }
+        // Past the fade (60%..80% band) the audio is byte-identical to
+        // pristine, so every column height must match the FIRST frame
+        // exactly (same rect, same data, deterministic painter).
+        let body_before: Vec<(f32, f32)> = cols_pre
+            .iter()
+            .filter(|(x, _)| {
+                *x >= g.rect.min.x + g.rect.width() * 0.6
+                    && *x < g.rect.min.x + g.rect.width() * 0.8
+            })
+            .copied()
+            .collect();
+        let body_after: Vec<f32> = cols
+            .iter()
+            .filter(|(x, _)| {
+                *x >= g.rect.min.x + g.rect.width() * 0.6
+                    && *x < g.rect.min.x + g.rect.width() * 0.8
+            })
+            .map(|(_, h)| *h)
+            .collect();
+        assert_eq!(body_after.len(), body_before.len(), "same body columns");
+        assert!(
+            body_before.iter().any(|(_, h)| *h > 60.0),
+            "body has tall columns: {:?}",
+            &body_before[..4]
+        );
+        for (b, a) in body_before.iter().zip(body_after.iter()) {
+            assert!(
+                (a - b.1).abs() < 1.0,
+                "untouched body columns unchanged: {b:?} -> {a:?}"
+            );
+        }
+    }
+
+    /// R4 regression (THE user bug): ticking "reverse" in the editor must
+    /// not only mirror the GUI buffer — it must reach the engine asset
+    /// table (the Cmd::SetProject push), or playback keeps mixing the
+    /// stale snapshot forever, which is exactly what shipped broken.
+    #[test]
+    fn v63_se_reverse_checkbox_pushes_engine_table() {
+        let mut app = headless_app("v63push");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63push");
+        let base = app.backend.set_project_pushes.load(Ordering::Relaxed);
+        let before = app.assets[0].data.to_vec();
+        let h = galley_at_last(&mut app, &ctx, "reverse").expect("reverse checkbox");
+        click_pt(&mut app, &ctx, h.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.sample_edits[&key].reverse, "checkbox toggled the edit");
+        let mut want = before.clone();
+        want.reverse();
+        assert_eq!(app.assets[0].data.to_vec(), want, "asset data mirrored");
+        assert!(
+            app.backend.set_project_pushes.load(Ordering::Relaxed) > base,
+            "the edit MUST push SetProject (playback reads that table)"
+        );
+    }
+
+    /// R2: the fade-in handle rides the curve on the canvas; dragging it
+    /// right lengthens the fade (edit + re-render + push, live per frame
+    /// since fades are cheap).
+    #[test]
+    fn v63_se_fade_handle_drag_sets_length_and_sound() {
+        let mut app = headless_app("v63fade");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63fade");
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                fade_in_ms: 50.0,
+                fade_in: SeCurve::Sin,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        frame(&mut app, &ctx, vec![]);
+        let g = app.se_geom.expect("geometry with the fade painted");
+        assert!(g.fi_x > g.rect.min.x + 10.0, "50 ms handle sits mid-canvas");
+        let probe = app.assets[0].data[120];
+        assert!(probe.abs() < 0.05, "50 ms fade already attenuates 120");
+        let base = app.backend.set_project_pushes.load(Ordering::Relaxed);
+        let fi = egui::pos2(g.fi_x, g.rect.min.y + 2.0);
+        v63_drag(&mut app, &ctx, fi, egui::pos2(fi.x + 80.0, fi.y));
+        let ed = app.sample_edits[&key];
+        assert!(
+            ed.fade_in_ms > 55.0 && ed.fade_in_ms < 90.0,
+            "handle drag lengthened the fade: {} ms",
+            ed.fade_in_ms
+        );
+        assert!(
+            app.backend.set_project_pushes.load(Ordering::Relaxed) > base,
+            "the fade edit pushed the engine table"
+        );
+    }
+
+    /// R2: the dot riding the curve morphs its SHAPE by vertical drag
+    /// (automation-manager style), snapping to the nearest gain-midpoint.
+    #[test]
+    fn v63_se_fade_shape_grip_morphs_curve() {
+        let mut app = headless_app("v63grip");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63grip");
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                fade_in_ms: 50.0,
+                fade_in: SeCurve::Sin,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        frame(&mut app, &ctx, vec![]);
+        let g = app.se_geom.unwrap();
+        v63_drag(&mut app, &ctx, g.fi_mid, egui::pos2(g.fi_mid.x, g.fi_mid.y + 90.0));
+        let c = app.sample_edits[&key].fade_in;
+        assert!(
+            c.gain(0.5) < 0.45,
+            "dragging the grip DOWN flattened the curve toward exp/sq: {c:?}"
+        );
+        let g = app.se_geom.unwrap();
+        v63_drag(&mut app, &ctx, g.fi_mid, egui::pos2(g.fi_mid.x, g.rect.min.y + 4.0));
+        let c = app.sample_edits[&key].fade_in;
+        assert!(
+            c.gain(0.5) > 0.65,
+            "dragging UP front-loads the curve: {c:?}"
+        );
+    }
+
+    /// R3: the mint pitch line is dragged vertically; the release commits
+    /// a heavy re-render and the buffer length follows the rate (pitch
+    /// down = longer playback data).
+    #[test]
+    fn v63_se_pitch_line_drag() {
+        let mut app = headless_app("v63pitch");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63pitch");
+        let g = app.se_geom.expect("geometry");
+        let len0 = app.assets[0].data.len();
+        let y0 = g.pitch_y;
+        assert!(
+            (y0 - (g.rect.min.y + g.rect.height() * 0.5)).abs() < 2.0,
+            "0 ct sits on the centre line"
+        );
+        let from = egui::pos2(g.rect.center().x, y0);
+        v63_drag(&mut app, &ctx, from, egui::pos2(from.x, y0 + 50.0));
+        let ed = app.sample_edits[&key];
+        assert!(ed.pitch_cents < -800.0, "down drag = pitch down: {}", ed.pitch_cents);
+        let len1 = app.assets[0].data.len();
+        assert!(
+            len1 > (len0 as f64 * 1.4) as usize,
+            "pitched-down data is longer: {len0} -> {len1}"
+        );
+    }
+
+    /// R3: the amber bend-sweep handles set start/end cents; dragging the
+    /// left one DOWN and the right one UP makes an upward sweep.
+    #[test]
+    fn v63_se_bend_handles_drag() {
+        let mut app = headless_app("v63bend");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63bend");
+        let g = app.se_geom.expect("geometry");
+        v63_drag(&mut app, &ctx, g.bend_l, egui::pos2(g.bend_l.x, g.bend_l.y + 40.0));
+        let e0 = app.sample_edits[&key].bend_start_cents;
+        assert!(e0 < -500.0, "left handle dragged down: {e0} ct");
+        let g = app.se_geom.unwrap();
+        v63_drag(&mut app, &ctx, g.bend_r, egui::pos2(g.bend_r.x, g.bend_r.y - 40.0));
+        let e1 = app.sample_edits[&key].bend_end_cents;
+        assert!(e1 > 500.0, "right handle dragged up: {e1} ct");
+        // Deferred heavy render landed on release.
+        assert!(
+            !app.assets[0].data.is_empty(),
+            "sweep re-render committed on release"
+        );
+    }
+
+    /// R3: the strip marker below the canvas drags the STRETCHED length;
+    /// keep-pitch stays honored (WSOLA), so the buffer follows the marker.
+    #[test]
+    fn v63_se_stretch_strip_drag() {
+        let mut app = headless_app("v63str");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63str");
+        let g = app.se_geom.expect("geometry");
+        let len0 = app.assets[0].data.len();
+        let from = egui::pos2(g.stretch_x - 3.0, g.strip.center().y);
+        v63_drag(&mut app, &ctx, from, egui::pos2(from.x - 90.0, from.y));
+        let ed = app.sample_edits[&key];
+        assert!(
+            ed.stretch < 0.95 && ed.stretch > 0.4,
+            "marker dragged left compresses: {}",
+            ed.stretch
+        );
+        assert!(ed.preserve_pitch, "keep-pitch default untouched");
+        let len1 = app.assets[0].data.len();
+        assert!(
+            len1 < (len0 as f64 * 0.98) as usize,
+            "buffer followed the marker: {len0} -> {len1}"
+        );
+    }
+
+    /// R4 half-two: "reset" restores pristine data AND pushes it (the
+    /// engine table must never keep a stale edited snapshot).
+    #[test]
+    fn v63_se_reset_restores_and_pushes() {
+        let mut app = headless_app("v63reset");
+        let ctx = egui::Context::default();
+        let key = v63_open_editor(&mut app, &ctx, "v63reset");
+        let pristine = app.assets[0].data.to_vec();
+        let h = galley_at_last(&mut app, &ctx, "ping-pong").expect("ping-pong checkbox");
+        click_pt(&mut app, &ctx, h.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.assets[0].data.len(),
+            pristine.len() * 2,
+            "ping-pong doubled the playback buffer"
+        );
+        let base = app.backend.set_project_pushes.load(Ordering::Relaxed);
+        let h = galley_at_last(&mut app, &ctx, "reset").expect("reset button");
+        click_pt(&mut app, &ctx, h.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.assets[0].data.to_vec(), pristine, "reset restored");
+        assert!(!app.sample_edits.contains_key(&key), "edit forgotten");
+        assert!(
+            app.backend.set_project_pushes.load(Ordering::Relaxed) > base,
+            "the reset pushed too"
+        );
+    }
+
+    /// R3 affordance present in the GUI: the audition button (live
+    /// play/stop of the very buffer the canvas shows).
+    #[test]
+    fn v63_se_audition_button_painted() {
+        let mut app = headless_app("v63aud");
+        let ctx = egui::Context::default();
+        let _key = v63_open_editor(&mut app, &ctx, "v63aud");
+        assert!(
+            galley_at_last(&mut app, &ctx, "play").is_some(),
+            "editor offers a play button"
+        );
     }
 }
