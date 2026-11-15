@@ -44883,4 +44883,275 @@ mod tests {
             "a traversal attempt must collapse to one safe file"
         );
     }
+
+    // ---- v58: clip & track colors (S7/S5) ----
+
+    /// The clip RMB Color submenu recolors the selection: state, status
+    /// echo, painted body, and Duplicate carries the color. (The reset
+    /// item is its own pin — popup re-arm, v50-e lesson.)
+    #[test]
+    fn v58_clip_color_menu_paints() {
+        let mut app = headless_app("v58clipcol");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        assert_eq!(app.sel_clips, vec![(0, 0, 0)], "click selected the clip");
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        // The Color item: pick the candidate NEAREST the menu anchor (the
+        // same trick v29 uses for "Track 3" — other panels paint labels).
+        let cms = galley_centers(&mut app, &ctx, "Color", false);
+        let cm = cms
+            .into_iter()
+            .min_by(|x, y| {
+                (*x - p)
+                    .length_sq()
+                    .partial_cmp(&(*y - p).length_sq())
+                    .unwrap()
+            })
+            .expect("Color item present in the clip menu");
+        click_pt(&mut app, &ctx, cm);
+        let sw = galley_centers(&mut app, &ctx, "\u{25a0} amber", true);
+        assert_eq!(sw.len(), 1, "submenu lists the amber swatch");
+        click_pt(&mut app, &ctx, sw[0]);
+        frame(&mut app, &ctx, vec![]);
+        // State + feedback.
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips[0].color,
+            Some(1),
+            "amber is palette index 1"
+        );
+        assert_eq!(app.status, "1 clip(s) colored amber", "status echoes");
+        // Paint: amber body replaces the blue one.
+        let body = {
+            let c = CLIP_PALETTE[1].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        let rects = painted_rects(&mut app, &ctx, body);
+        assert_eq!(rects.len(), 1, "clip body painted amber: {rects:?}");
+        let old = {
+            let c = COL_CLIP.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert!(
+            painted_rects(&mut app, &ctx, old).is_empty(),
+            "the default-blue body is gone"
+        );
+        // Duplicate rides the Clip, color included.
+        app.duplicate_selection();
+        assert!(
+            app.arr.tracks[0].lanes[0]
+                .clips
+                .iter()
+                .all(|c| c.color == Some(1)),
+            "duplicate carries the color"
+        );
+    }
+
+    /// "Track / default" clears the clip override and the paint falls
+    /// back to the TRACK default (not the kind default). Own pin:
+    /// opening the clip menu a second time in one session is the v50-e
+    /// re-arm trap zone — fresh app here.
+    #[test]
+    fn v58_clip_color_reset_to_track_default() {
+        let mut app = headless_app("v58clipreset");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                color: Some(1), // amber override
+                ..Clip::new(a, 0)
+            },
+        );
+        app.trk_color[0] = Some(4); // teal track default (setters: other pin)
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Cut").is_empty(),
+            "clip menu opened"
+        );
+        let cms = galley_centers(&mut app, &ctx, "Color", false);
+        let cm = cms
+            .into_iter()
+            .min_by(|x, y| {
+                (*x - p)
+                    .length_sq()
+                    .partial_cmp(&(*y - p).length_sq())
+                    .unwrap()
+            })
+            .expect("Color item present");
+        click_pt(&mut app, &ctx, cm);
+        let td = galley_centers(&mut app, &ctx, "Track / default", true);
+        assert_eq!(td.len(), 1, "reset item present");
+        click_pt(&mut app, &ctx, td[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.arr.tracks[0].lanes[0].clips[0].color, None);
+        assert_eq!(app.status, "1 clip(s) reset to the track color");
+        // Falls back to TEAL (track), not blue and not amber.
+        let teal = {
+            let c = CLIP_PALETTE[4].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert_eq!(painted_rects(&mut app, &ctx, teal).len(), 1);
+        let amber = {
+            let c = CLIP_PALETTE[1].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert!(painted_rects(&mut app, &ctx, amber).is_empty());
+    }
+
+    /// The empty-grid Track color submenu sets the track default: the
+    /// chip paints, status echoes, clips without their own color
+    /// inherit, and the own-color clip keeps its color.
+    #[test]
+    fn v58_track_color_menu_inherits_and_chips() {
+        let mut app = headless_app("v58trkcol");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0)); // follows the track
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                color: Some(6), // azure override
+                ..Clip::new(a, 30_000)
+            },
+        );
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(700.0, top0 + app.track_h(0) * 0.5); // empty grid
+        rmb(&mut app, &ctx, p);
+        assert!(
+            !v25_hits(&mut app, &ctx, "Paste here").is_empty(),
+            "empty-grid menu opened"
+        );
+        let tcs = galley_centers(&mut app, &ctx, "Track color", false);
+        let tc = tcs
+            .into_iter()
+            .min_by(|x, y| {
+                (*x - p)
+                    .length_sq()
+                    .partial_cmp(&(*y - p).length_sq())
+                    .unwrap()
+            })
+            .expect("Track color item present");
+        click_pt(&mut app, &ctx, tc);
+        let sw = galley_centers(&mut app, &ctx, "\u{25a0} teal", true);
+        assert_eq!(sw.len(), 1, "submenu lists the teal swatch");
+        click_pt(&mut app, &ctx, sw[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_color[0], Some(4), "track default set");
+        assert_eq!(app.status, "track 1 color: teal", "status echoes");
+        // Inheritance on the PAINT: teal body (inheriting) + azure body.
+        let teal = {
+            let c = CLIP_PALETTE[4].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert_eq!(painted_rects(&mut app, &ctx, teal).len(), 1);
+        let azure = {
+            let c = CLIP_PALETTE[6].linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        assert_eq!(
+            painted_rects(&mut app, &ctx, azure).len(),
+            1,
+            "the override clip keeps its own color"
+        );
+        // The lane-tag chip: a small (7px) FULL-strength teal square.
+        let (r, g, b, _) = CLIP_PALETTE[4].to_tuple();
+        let chip = painted_rects(&mut app, &ctx, (r, g, b))
+            .into_iter()
+            .filter(|rq| rq.width() < 20.0)
+            .count();
+        assert_eq!(chip, 1, "the track-color chip paints once");
+    }
+
+    /// Automation clips follow the same rule: default red, palette color
+    /// on override. (S5 closes under this one path — they are Clips.)
+    #[test]
+    fn v58_automation_clip_uses_palette() {
+        use crate::automation::{Automation, Node, TARGET_TRACK_VOL};
+        let mut app = headless_app("v58autocol");
+        clear_canvas(&mut app);
+        let auto = Automation {
+            target: TARGET_TRACK_VOL.into(),
+            len_samples: 96_000,
+            nodes: vec![
+                Node { t: 0, v: 0.2, c: 0.0 },
+                Node {
+                    t: 48_000,
+                    v: 0.8,
+                    c: 0.0,
+                },
+            ],
+        };
+        let id = app.assets.len() as u32;
+        app.assets.push(Asset::automation_asset(
+            id,
+            "vol".into(),
+            std::path::PathBuf::new(),
+            std::sync::Arc::new(auto),
+            true,
+        ));
+        app.arr.insert(
+            0,
+            0,
+            Clip {
+                asset: id,
+                pos: 0,
+                cut: 0,
+                pre_pad: 0,
+                play_len: Some(96_000),
+                gain: 1.0,
+                fade_in: 0,
+                fade_out: 0,
+                color: None,
+            },
+        );
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let body = |i: Color32| {
+            let c = i.linear_multiply(0.45);
+            let (r, g, b, _) = c.to_tuple();
+            (r, g, b)
+        };
+        // Default: the automation red.
+        assert_eq!(painted_rects(&mut app, &ctx, body(Color32::from_rgb(170, 70, 74))).len(), 1);
+        // Override: rose body replaces the red (direct model set — the
+        // menu path is pinned by the clip pins above).
+        app.arr.tracks[0].lanes[0].clips[0].color = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(painted_rects(&mut app, &ctx, body(CLIP_PALETTE[0])).len(), 1);
+        assert!(
+            painted_rects(&mut app, &ctx, body(Color32::from_rgb(170, 70, 74))).is_empty(),
+            "the red body is replaced"
+        );
+    }
 }
