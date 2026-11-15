@@ -6535,6 +6535,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn render_applies_effect_chain() {
         if !crate::fx::rustc_available() {
             return; // environments without a compiler skip the loader
@@ -7437,6 +7438,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
     /// 750, 1500, 2250, 3000, 3750 — everything past sample 1000 was hard
     /// silence in the historical per-clip phase-0 render.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v48_export_tail_rings_past_clip_end() {
         if !crate::fx::rustc_available() {
             return;
@@ -7465,6 +7467,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
     /// echo train. Fresh per-clip instances could not produce tap(1500) =
     /// 0.5 (inside B's span, from A).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v48_export_chain_state_survives_gap() {
         if !crate::fx::rustc_available() {
             return;
@@ -7497,6 +7500,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
     /// clip A's tail flows into clip B's part of the window; the window
     /// still ends at the selection end (taps beyond it are truncated).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v48_export_selection_window_chain() {
         if !crate::fx::rustc_available() {
             return;
@@ -7528,6 +7532,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
     /// export (v2 scripts duck under the source's post-trim dry taps), and
     /// muting the source removes the tap — the live audible gate mirrored.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v48_export_sidechain_ducks_target() {
         if !crate::fx::rustc_available() {
             return;
