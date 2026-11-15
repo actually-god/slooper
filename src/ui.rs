@@ -5007,6 +5007,24 @@ impl App {
         self.vst_scan_rx = Some(crate::vsthost::scan_async(dirs));
     }
 
+    /// v62: the ONE synth-side program capture (save_config + build_project):
+    /// the LIVE synth's cached program wins (kept fresh by the parameters
+    /// window refresh); the table is the fallback when no instance is loaded.
+    fn synth_programs_for_save(&self) -> Vec<i32> {
+        (0..MAX_LOOPS)
+            .map(|t| {
+                self.track_synth_inst
+                    .get(t)
+                    .and_then(|h| h.as_ref())
+                    .and_then(|h| match &**h {
+                        crate::audio::SynthHandle::Vst(e) => e.current_program().map(|p| p as i32),
+                        _ => None,
+                    })
+                    .unwrap_or(self.track_synth_program[t])
+            })
+            .collect()
+    }
+
     /// Persist every user-facing setting (bindings, mixer, grid, rack,
     /// ports, effects chains) to disk.
     fn save_config(&self) {
@@ -5162,22 +5180,7 @@ impl App {
                 .iter()
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
-            // v62: the LIVE synth's cached program wins (kept fresh by
-            // the parameters window refresh); the table is the fallback.
-            track_synth_programs: (0..MAX_LOOPS)
-                .map(|t| {
-                    self.track_synth_inst
-                        .get(t)
-                        .and_then(|h| h.as_ref())
-                        .and_then(|h| match &**h {
-                            crate::audio::SynthHandle::Vst(e) => {
-                                e.current_program().map(|p| p as i32)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(self.track_synth_program[t])
-                })
-                .collect(),
+            track_synth_programs: self.synth_programs_for_save(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
@@ -13937,22 +13940,7 @@ impl App {
                 .iter()
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
-            // v62: the LIVE synth's cached program wins (kept fresh by
-            // the parameters window refresh); the table is the fallback.
-            track_synth_programs: (0..MAX_LOOPS)
-                .map(|t| {
-                    self.track_synth_inst
-                        .get(t)
-                        .and_then(|h| h.as_ref())
-                        .and_then(|h| match &**h {
-                            crate::audio::SynthHandle::Vst(e) => {
-                                e.current_program().map(|p| p as i32)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(self.track_synth_program[t])
-                })
-                .collect(),
+            track_synth_programs: self.synth_programs_for_save(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
