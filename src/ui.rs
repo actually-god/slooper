@@ -45733,4 +45733,208 @@ mod tests {
             .count();
         assert_eq!(chips, 0, "both chips are gone after reset");
     }
+
+    // ---- v61 (S12): track templates ---------------------------------------
+
+    /// R3 core: open the strip RMB menu and click "Track templates…"
+    /// (the proven v59 header recipe: master closed, settle frames,
+    /// x > 1000 mixer band + y < 853 viewport).
+    fn v61_open_template_window(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..3 {
+            frame(app, ctx, vec![]);
+        }
+        let heads: Vec<egui::Pos2> = galley_centers(app, ctx, "Track 1", false)
+            .into_iter()
+            .filter(|c| c.x > 1000.0 && c.y < 853.0)
+            .collect();
+        assert_eq!(heads.len(), 1, "exactly one mixer 'Track 1' header: {heads:?}");
+        rmb(app, ctx, heads[0]);
+        let item =
+            galley_at_last(app, ctx, "Track templates").expect("template entry in the strip menu");
+        click_pt(app, ctx, item.center());
+        frame(app, ctx, vec![]);
+    }
+
+    /// R1: save captures the synth binding + FX chain into the sandboxed
+    /// data dir and "apply" puts both back — through the real widgets.
+    #[test]
+    fn v61_track_template_save_apply_roundtrip() {
+        let mut app = headless_app("v61tplround");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.track_synth[0] = Some("piano".into());
+        app.rebuild_track_synth(0);
+        app.add_fx_script(0, "delay");
+        v61_open_template_window(&mut app, &ctx);
+        assert!(
+            galley_at(&mut app, &ctx, "TRACK TEMPLATES").is_some(),
+            "template window opened"
+        );
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("track template saved: Track-1"),
+            "{}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("track-templates");
+        assert!(dir.to_string_lossy().contains("sp-uity"), "sandboxed data dir: {dir:?}");
+        assert!(dir.join("Track-1.json").is_file(), "template file landed");
+        // Strip the track down, then restore it with the list's "apply".
+        app.fx_rows[0].clear();
+        app.rebuild_fx(0);
+        app.track_synth[0] = None;
+        app.rebuild_track_synth(0);
+        frame(&mut app, &ctx, vec![]);
+        app.status = String::new();
+        click_exact(&mut app, &ctx, "apply");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_synth[0].as_deref(), Some("piano"), "synth binding restored");
+        let stems: Vec<&str> = app.fx_rows[0]
+            .iter()
+            .map(|r| match r {
+                ChainRow::Script { stem, .. } => stem.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(stems, ["delay"], "FX chain restored in order");
+        assert!(
+            app.status.contains("loaded onto track 1: synth + 1 fx"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// R2/R6: vol/pan/gain/color ride the template and land through the
+    /// setters (not naked array pokes); the status bar echoes.
+    #[test]
+    fn v61_track_template_mixer_values_restored() {
+        let mut app = headless_app("v61tplmix");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.set_trk_vol(0, 90);
+        app.set_trk_pan(0, 40);
+        app.set_trk_gain(0, 60);
+        app.set_trk_color(0, Some(2));
+        v61_open_template_window(&mut app, &ctx);
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("track template saved: Track-1"), "{}", app.status);
+        // Dirty every value the same way the mixer widgets do.
+        app.set_trk_vol(0, 115);
+        app.set_trk_pan(0, 64);
+        app.set_trk_gain(0, 80);
+        app.set_trk_color(0, None);
+        frame(&mut app, &ctx, vec![]);
+        app.status = String::new();
+        click_exact(&mut app, &ctx, "apply");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_vol[0], 90, "volume restored");
+        assert_eq!(app.trk_pan[0], 40, "pan restored");
+        assert_eq!(app.trk_gain[0], 60, "gain restored");
+        assert_eq!(app.trk_color[0], Some(2), "track color restored");
+        assert!(app.status.contains("loaded onto track 1"), "{}", app.status);
+    }
+
+    /// R3: the strip menu entry explains itself on hover (goal 1), opens
+    /// the window targeting that strip, and the window lists saved files.
+    #[test]
+    fn v61_track_template_mixer_menu_entry() {
+        let mut app = headless_app("v61tplmenu");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let heads: Vec<egui::Pos2> = galley_centers(&mut app, &ctx, "Track 1", false)
+            .into_iter()
+            .filter(|c| c.x > 1000.0 && c.y < 853.0)
+            .collect();
+        assert_eq!(heads.len(), 1, "one mixer header in view: {heads:?}");
+        rmb(&mut app, &ctx, heads[0]);
+        let item = galley_at_last(&mut app, &ctx, "Track templates")
+            .expect("strip menu carries the template entry")
+            .center();
+        let tips = hover_until_tip(&mut app, &ctx, item, &["named template"]);
+        assert!(tips.iter().any(|t| t.contains("named template")), "menu item explains on hover");
+        click_pt(&mut app, &ctx, item);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.show_tpl, "window opened from the strip menu");
+        assert_eq!(app.tpl_track, 0, "window targets the strip's track");
+        assert!(
+            galley_at(&mut app, &ctx, "no saved templates yet").is_some(),
+            "empty-list hint shows"
+        );
+        // A template appearing on disk is listed on the next frame.
+        let dir = crate::paths::data_dir().join("track-templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("handdrum.json"), "{}").unwrap();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(galley_centers(&mut app, &ctx, "handdrum", true).len(), 1, "list row appears");
+        assert!(galley_at(&mut app, &ctx, "no saved templates yet").is_none(), "hint gone");
+    }
+
+    /// R4: hostile names sanitize to single-component files; the live
+    /// path types into the real TextEdit (v56 traversal contract).
+    #[test]
+    fn v61_track_template_name_sanitized() {
+        let mut app = headless_app("v61tplsan");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        assert_eq!(App::sampler_preset_sanitize("  a/b c  "), "a-b-c");
+        assert_eq!(App::sampler_preset_sanitize("../evil name"), "evil-name");
+        v61_open_template_window(&mut app, &ctx);
+        app.tpl_name = String::new();
+        frame(&mut app, &ctx, vec![]);
+        let ed = galley_at(&mut app, &ctx, "template name").expect("name TextEdit (hint visible)");
+        click_pt(&mut app, &ctx, ed.center());
+        type_into_focused(&mut app, &ctx, "../evil name");
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("track template saved: evil-name"), "{}", app.status);
+        let dir = crate::paths::data_dir().join("track-templates");
+        assert!(dir.join("evil-name.json").is_file(), "file written single-component");
+        assert!(!crate::paths::data_dir().join("evil-name.json").exists(), "no parent escape");
+        assert!(!std::path::Path::new("evil-name.json").exists(), "no CWD dropping");
+    }
+
+    /// R5: per-row delete removes the file, updates the list and echoes
+    /// status; the button explains itself on hover (goal 1).
+    #[test]
+    fn v61_track_template_delete_updates_list() {
+        let mut app = headless_app("v61tpldel");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        let dir = crate::paths::data_dir().join("track-templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aa.json"), "{}").unwrap();
+        std::fs::write(dir.join("bb.json"), "{}").unwrap();
+        v61_open_template_window(&mut app, &ctx);
+        let aa = galley_centers(&mut app, &ctx, "aa", true);
+        assert_eq!(aa.len(), 1, "row aa paints");
+        assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "row bb paints");
+        // Delete the AA row: the delete button NEAREST the label's y
+        // (v58 lesson — common labels resolve by anchor, never [0]).
+        let aa_y = aa[0].y;
+        let del = galley_centers(&mut app, &ctx, "delete", true)
+            .into_iter()
+            .min_by(|a, b| (a.y - aa_y).total_cmp(&(b.y - aa_y)))
+            .expect("a delete button per row");
+        let tips = hover_until_tip(&mut app, &ctx, del, &["for good"]);
+        assert!(tips.iter().any(|t| t.contains("for good")), "delete explains on hover");
+        click_pt(&mut app, &ctx, del);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!dir.join("aa.json").exists(), "file removed");
+        assert!(dir.join("bb.json").is_file(), "other template untouched");
+        assert!(app.status.contains("track template deleted: aa"), "{}", app.status);
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        assert!(galley_centers(&mut app, &ctx, "aa", true).is_empty(), "row dropped from list");
+        assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "bb row remains");
+    }
 }
