@@ -25947,6 +25947,25 @@ mod tests {
         if std::env::var_os("CARGO_HOME").is_none() {
             std::env::set_var("CARGO_HOME", format!("{rh}/.cargo"));
         }
+        // Synth script-cache SHARED across sandboxes. The cache key is the
+        // script CONTENT hash (`synth::stamped_artifact`) and `cache_home()`
+        // has exactly that one consumer, so sharing is safe — and necessary:
+        // with the cache following the per-test dir, EVERY headless_app
+        // rustc-recompiled all bundled script synths (~0.8 s/test measured —
+        // the entire suite's floor; shared-warm boots are ~30 ms instead).
+        // One dir per machine: the first boot pays each content once, every
+        // later boot dlopens. It also persists across suite runs, so it goes
+        // under the shared temp root (content-hashed, self-pruning; never
+        // deleted here). XDG_CACHE_HOME is inert on Windows, whose
+        // cache_home() reads LOCALAPPDATA — data/config dirs are already
+        // pinned via SLOOPER_CONFIG_DIR/DATA_DIR_ENV above, and a plugin
+        // scan finding an empty shared dir keeps the same isolation the
+        // HOME sandbox provides on Linux.
+        let shared_cache = std::env::temp_dir().join("slooper-synth-test-cache");
+        std::fs::create_dir_all(&shared_cache).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &shared_cache);
+        #[cfg(windows)]
+        std::env::set_var("LOCALAPPDATA", &shared_cache);
         std::env::set_var("HOME", &dir);
         let mut app = App::new(Backend::start());
         app.drain_events(); // discard the null-audio notice
