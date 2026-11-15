@@ -2817,6 +2817,9 @@ struct RtParts {
     v3_bufs: Option<vst3_host::audio::AudioBuffers>,
     control: Option<vst3_host::realtime::RtControl>,
     out_channels: usize,
+    /// v60: factory programs snapshotted at open (empty + -1 = none).
+    programs: Vec<String>,
+    program0: i32,
 }
 
 fn assemble(
@@ -2827,8 +2830,6 @@ fn assemble(
     has_editor: bool,
     vst2: Option<Vst2Handle>,
     editor_state: Option<Vec<u8>>,
-    programs: Vec<String>,
-    program0: i32,
 ) -> RtStageEntry {
     let last: Vec<f32> = (0..descs.len()).map(|k| params.get(k)).collect();
     let seen_gen = params.generation();
@@ -2861,8 +2862,8 @@ fn assemble(
         control: Mutex::new(parts.control),
         params,
         descs,
-        programs,
-        program: std::sync::atomic::AtomicI32::new(program0),
+        programs: parts.programs,
+        program: std::sync::atomic::AtomicI32::new(parts.program0),
         name,
         spec: parts.spec,
         has_editor,
@@ -2999,16 +3000,16 @@ fn open_v3(
             v3_bufs: Some(bufs),
             control: Some(control),
             out_channels: out_ch,
+            // v60: VST3 programs need a runner-side program command (the
+            // RtControl ring carries none) — documented gap, see field docs.
+            programs: Vec::new(),
+            program0: -1,
         },
         params,
         descs,
         has_editor,
         None,
         patch.map(|p| p.chunk.clone()).filter(|v| !v.is_empty()),
-        // v60: VST3 programs need a runner-side program command (the
-        // RtControl ring carries none) — documented gap, see field docs.
-        Vec::new(),
-        -1,
     ))
 }
 
@@ -3149,14 +3150,14 @@ fn open_v2(path: &Path, sample_rate: u32, saved: Option<&[f32]>) -> Result<RtSta
             v3_bufs: None,
             control: None,
             out_channels: out_ch,
+            programs,
+            program0,
         },
         params,
         descs,
         has_editor,
         vst2,
         None,
-        programs,
-        program0,
     ))
 }
 
