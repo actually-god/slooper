@@ -1089,7 +1089,11 @@ impl EditorWindow {
             .ok()
             .and_then(|mut p| p.take())
             .unwrap_or_default();
-        Some(crate::vsthost::VstPatch { chunk, params })
+        Some(crate::vsthost::VstPatch {
+            chunk,
+            params,
+            program: None,
+        })
     }
 
     /// v22: non-destructive peek at the harvested chunk (see `take_state`).
