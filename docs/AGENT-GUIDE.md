@@ -188,7 +188,9 @@ docs/           INSTALL.md, USAGE.md, PLUGINS.md, EFFECT-SUITE.md,
 | Command | Notes |
 | --- | --- |
 | `cargo build --release` | release profile: LTO + panic=abort; ~13–15 MB binary |
-| `cargo test -- --test-threads=1` | full suite (~640 lib pins + ~60 e2e); e2e tests **self-skip** without a live audio backend |
+| `scripts/test-quick.sh` | **dev-loop gate (tier 1, ~minutes):** fast lib pins (everything NOT `#[ignore = "slow-tier: …"]`) + gnullvm compile check + clippy-zero. Run after every change. |
+| `scripts/test-full.sh` | **release gate (tier 2):** quick tier + the slow tier in its own process (plugin-dlopen/heavy pins — the old 3-chunk deadlock split, now mechanism-based) + live-JACK e2e + doctests + both parity gates. Run before a release tag; CI runs the same coverage on every push/PR. |
+| `cargo test -- --test-threads=1` | raw full monolith (everything incl. ignored); the two scripts above are the sanctioned workflow — a monolith risks the known dlopen deadlock class |
 | `cargo test --release` | the release suite is the clean reference — the DEBUG lib suite has a known intermittent glibc `corrupted size vs. prev_size` abort inside dlopen (~15–30 % of runs) unrelated to correctness; verify with `--release` before chasing |
 | `cargo clippy --all-targets` | repo standard: zero warnings (check with `... 2>&1 | grep -cE "^warning: \|^error"` = 0 — grepping just `^error` false-passes) |
 | `PKGBUILD_PATH=/path/to/aur/checkout/PKGBUILD ./tests/packaging.sh` | packaging checks (the PKGBUILD now lives in the AUR package repo) |
@@ -200,7 +202,11 @@ engine renders, and the egui layer headlessly (real clicks/drags through
 `App::ui`). Feature work lands as **acceptance pins** named
 `vNN_<area>_<behavior>` (e.g. `v07_roll_fills_scrolls_gates_and_closes`)
 that drive the real UI, not the implementer directly — run `cargo test
-vNN_` first. The e2e tests drive real JACK clients in real time (transport,
+vNN_` first. **New pins are quick-tier by default**; add
+`#[ignore = "slow-tier: <why>"]` only when a test dlopens a plugin binary,
+spawns probe/editor processes, or sleeps in real time beyond ~2 s — then
+`test-full.sh` and CI still gate it. The e2e tests drive real JACK clients
+in real time (transport,
 seek, loop wrap, metronome grid, record→take, MIDI capture + sinco fire, VST
 processing in export, export, MIDI monitor, mixing/routing). **Never remove
 the `E2E_LOCK` mutex serialization in `tests/e2e.rs`** — concurrent e2e runs

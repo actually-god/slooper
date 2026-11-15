@@ -29311,6 +29311,7 @@ mod tests {
     /// chain and persists it in `track_chain`. Uses a private scan folder;
     /// skips without a local plugin.
     #[test]
+    #[ignore = "slow-tier: local display-dependent plugin fixture (known flake)"]
     fn chain_window_adds_scanned_plugin_slot() {
         let home = real_home();
         let plugin = std::path::PathBuf::from(format!("{home}/.vst/DragonflyHallReverb-vst.so"));
@@ -29516,6 +29517,7 @@ mod tests {
     /// (instruments are bound through the ♪ synth picker). Headless,
     /// real folder scan, real popup galleys.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v19_fx_menu_hides_instruments() {
         fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
             std::fs::create_dir_all(dst).unwrap();
@@ -29863,6 +29865,7 @@ mod tests {
     /// v0.15 ran every plugin's dlopen+instantiate inside the window's
     /// paint: multi-second full-app freeze on first chain-window open.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v16_ui_scan_first_open_nonblocking() {
         let Some((mut app, dir, real_home)) = v16_plugin_env("scan") else {
             return;
@@ -29915,6 +29918,7 @@ mod tests {
     /// the freeze window where v0.15 ate clicks is structurally gone.
     /// The entry then lands via poll and the v0.10 auto-open still runs.
     #[test]
+    #[ignore = "slow-tier: plugin dlopen (hang class)"]
     fn v16_ui_add_vst_plugin_nonblocking() {
         let Some((mut app, dir, real_home)) = v16_plugin_env("add") else {
             return;
@@ -30921,6 +30925,7 @@ mod tests {
     /// first open materializes the legacy single-asset params as slot 0
     /// at the track's current root (the map becomes the single truth).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v51_sampler_map_window_paints_and_seeds_legacy() {
         let mut app = headless_app("v51map");
         let ctx = egui::Context::default();
@@ -34748,6 +34753,7 @@ mod tests {
     /// window, announces itself in the status line, and its sliders feed
     /// the same cells + persistence tick as a real editor would.
     #[test]
+    #[ignore = "slow-tier: spawns slooper-probe child (probe class)"]
     fn v23_ui_banned_editor_opens_params_window() {
         let home = real_home();
         let wolf = format!("{home}/.vst3/wolf-shaper.vst3");
@@ -35219,6 +35225,7 @@ mod tests {
     /// synchronously — no re-probe, no extra latency (the guard must not
     /// tax healthy plugins after the first check).
     #[test]
+    #[ignore = "slow-tier: spawns slooper-probe child (probe class)"]
     fn v23_ui_cached_safe_opens_window_directly() {
         if !crate::vstedit::x11_available() {
             eprintln!("skip: no X display");
@@ -35264,6 +35271,7 @@ mod tests {
     /// rebuild. On chunk-only rebuild this reverted to the factory
     /// preset (336-byte chunk for 2138 params — sweep fact).
     #[test]
+    #[ignore = "slow-tier: spawns slooper-probe child (probe class)"]
     fn v23_ui_synth_gui_close_persists_patch() {
         if !crate::vstedit::x11_available() {
             eprintln!("skip: no X display");
@@ -35374,6 +35382,7 @@ mod tests {
     /// thousands of params (Surge XT: 2855) — search narrows, the list is
     /// capped, and empty search still fills the list to the cap.
     #[test]
+    #[ignore = "slow-tier: spawns slooper-probe child (probe class)"]
     fn v23_target_lists_filter_huge_plugins() {
         let targets: Vec<(String, String)> = (0..3000)
             .map(|i| {
@@ -36104,11 +36113,13 @@ mod tests {
     /// concave curve) headlessly and dumps every painted shape as an SVG to
     /// $SLOOPER_V26_DUMP (rasterize with ImageMagick -> real pixels, no
     /// live-window input needed). `cargo test --lib -- --ignored` to run.
+    /// Without the env var it no-ops, so the slow-tier (`--ignored`) run
+    /// — test-full.sh / CI — passes it over instead of failing on it.
     #[test]
     #[ignore = "manual visual smoke: set SLOOPER_V26_DUMP=/path/out.svg"]
     fn v26_dump_manager_svg() {
         use crate::automation::Node;
-        let out_path = std::env::var("SLOOPER_V26_DUMP").expect("set SLOOPER_V26_DUMP=/path.svg");
+        let Ok(out_path) = std::env::var("SLOOPER_V26_DUMP") else { return };
         let mut app = headless_app("v26dump");
         let ctx = egui::Context::default();
         v26_manager_open(&mut app, &ctx);
@@ -38969,6 +38980,7 @@ mod tests {
     /// deprecated there — those bind per PROJECT in the MIDI BINDINGS
     /// window. Transport/record rows stay (they have no second home).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v32_settings_binding_menu_globals_only() {
         let mut app = headless_app("v32bindmenu");
         let ctx = egui::Context::default();
@@ -42850,6 +42862,7 @@ mod tests {
     /// center binds that black key (the alignment fix), and a slot's
     /// velocity reaches the live engine map.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (deep render/scan flow)"]
     fn v52_sampler_inline_map_kit_gating_blackkey_velocity() {
         let mut app = headless_app("v52map");
         let ctx = egui::Context::default();

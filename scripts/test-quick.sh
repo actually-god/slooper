@@ -28,12 +28,29 @@ t0=$(date +%s)
 
 step() { echo; echo "== $* =="; }
 
+# cargo's exit code is NOT trustworthy for test steps: the v35 sfizz
+# exit-hush (test_hush_vendor_exit_trap) can turn an aborted/failed plugin
+# suite into exit 0. A test step passes only if the log contains at least
+# one `test result:` line AND none of them say FAILED.
+gate_log() { # logpath
+  local log=$1
+  local res
+  res=$(grep -E "^test result:" "$log" | tail -1)
+  if [ -z "$res" ]; then echo "  no 'test result' line in $log — FAILURE (hushed trap?)"; return 1; fi
+  if echo "$res" | grep -q FAILED; then
+    echo "$res"
+    sed -n '/^failures:$/,/^$/p' "$log" | grep '^    ' | sed 's/^    /  FAILED: /' | sort -u
+    return 1
+  fi
+  echo "  $res"
+  return 0
+}
+
 step "[1/3] lib suite — quick tier (profile=$PROFILE; slow tier skipped by #[ignore])"
 # Non-ignored set only. Single-threaded via .cargo/config.toml RUST_TEST_THREADS=1
 # (test_app set_vars global env — do not parallelize).
-if cargo test --profile "$PROFILE" --lib --locked 2>&1 | tee "$LOGDIR/quick-lib.log"; then :; else rc_all=1; fi
-grep -E "^test result:" "$LOGDIR/quick-lib.log" | tail -1 || true
-sed -n '/^failures:$/,/^$/p' "$LOGDIR/quick-lib.log" | grep '^    ' | sed 's/^    /  FAILED: /' | sort -u || true
+cargo test --profile "$PROFILE" --lib --locked 2>&1 | tee "$LOGDIR/quick-lib.log" || true
+gate_log "$LOGDIR/quick-lib.log" || rc_all=1
 
 if [ "${SLOOPER_SKIP_WIN:-0}" != 1 ]; then
   step "[2/3] gnullvm compile check (Windows parity — compile only)"
