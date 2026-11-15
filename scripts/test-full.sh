@@ -37,9 +37,12 @@ run_step() { # name timeout cmd... (output -> $LOGDIR/<name>.log)
   echo "   rc=$rc ${res:+| }$res"
   NAMES+=("$name"); STEPS+=("$*"); RCS+=("$rc"); LOGS+=("$LOGDIR/$name.log")
   [ $rc -eq 0 ] || return 1
-  # libtest EXIT 0 with no results line = a mid-run trap was hushed: FAILURE
+  # libtest EXIT 0 with no results line = a mid-run trap was hushed: FAILURE.
+  # A results line saying FAILED fails the step too — cargo's rc lies when
+  # the sfizz exit-hush trap is armed (v35), so the LOG is the verdict.
   case "$*" in
-    *cargo*test*) [ -n "$res" ] || { echo "   no 'test result' line — treat as FAILED"; return 1; } ;;
+    *cargo*test*) [ -n "$res" ] || { echo "   no 'test result' line — treat as FAILED"; return 1; }
+                  echo "$res" | grep -q FAILED && { echo "   results line says FAILED"; sed -n '/^failures:$/,/^$/p' "$LOGDIR/$name.log" | grep '^    ' | head -8 | sed 's/^   / /'; return 1; } ;;
   esac
 }
 
