@@ -914,6 +914,10 @@ pub enum ChainRow {
         /// shadow editor (see `vstedit::Shared::state`). Session-only —
         /// like VSTi params it never enters config or project saves.
         state: Option<Vec<u8>>,
+        /// v62: last known VST2 factory program (persisted). The live
+        /// entry's cached program wins at save (see `chain_row_to_save`);
+        /// this is the fallback for rows that never opened this session.
+        program: Option<i32>,
     },
 }
 
@@ -936,6 +940,7 @@ impl Clone for ChainRow {
                 params,
                 entry,
                 state,
+                program,
                 ..
             } => ChainRow::Vst {
                 path: path.clone(),
@@ -945,6 +950,7 @@ impl Clone for ChainRow {
                 params: params.clone(),
                 entry: entry.clone(),
                 state: state.clone(),
+                program: *program,
                 open_rx: None,
             },
         }
@@ -966,9 +972,10 @@ fn chain_row_to_save(row: &ChainRow) -> ChainSave {
             plugin_id,
             name,
             params,
-            entry: _,
+            entry,
             open_rx: _,
             state,
+            program,
         } => ChainSave::Vst {
             path: path.clone(),
             kind: kind.tag().to_string(),
@@ -976,6 +983,14 @@ fn chain_row_to_save(row: &ChainRow) -> ChainSave {
             name: name.clone(),
             params: params.clone(),
             state: state.as_deref().map(crate::config::b64_encode),
+            // v62: the LIVE plugin's cached program wins (kept fresh by
+            // the parameters window's throttled refresh); the row value
+            // is the fallback for rows that never opened this session.
+            program: entry
+                .as_ref()
+                .and_then(|e| e.current_program())
+                .map(|p| p as i32)
+                .or(*program),
         },
     }
 }
@@ -997,6 +1012,7 @@ fn chain_row_from_save(s: &ChainSave) -> Option<ChainRow> {
             name,
             params,
             state,
+            program,
         } => {
             let kind = crate::vsthost::VstKind::parse(kind)?;
             Some(ChainRow::Vst {
@@ -1007,6 +1023,7 @@ fn chain_row_from_save(s: &ChainSave) -> Option<ChainRow> {
                 params: params.clone(),
                 entry: None,
                 open_rx: None,
+                program: *program,
                 // v22: decode the persisted chunk so the first rebuild
                 // boots the plugin in the exact state the user saved.
                 state: state.as_deref().and_then(crate::config::b64_decode),
@@ -1659,6 +1676,12 @@ pub struct App {
     /// is not painted at all (no dead chrome).
     params_programs: Vec<String>,
     params_programs_for: String,
+    /// v62: ctx time the parameters window may next re-read the plugin's
+    /// LIVE factory program (editor-side-change sync, ~1 s throttle).
+    params_prog_sync_at: f64,
+    /// v62: per-track selected VST2 factory program (-1 = none). Seeded
+    /// from config, pushed by the PARAMETERS combo, captured on save.
+    track_synth_program: Vec<i32>,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -2203,6 +2226,10 @@ impl App {
             params_presets_for: String::new(),
             params_programs: Vec::new(),
             params_programs_for: String::new(),
+            params_prog_sync_at: 0.0,
+            track_synth_program: (0..MAX_LOOPS)
+                .map(|t| cfg.track_synth_programs.get(t).copied().unwrap_or(-1))
+                .collect(),
             auto_press_pt: None,
             auto_click_pt: None,
             export_fmt: 0,
@@ -2863,6 +2890,7 @@ impl App {
                     entry,
                     open_rx,
                     state,
+                    program,
                 } => {
                     // Open lazily (first rebuild after load, or after the
                     // folder rescan dropped a failed load). v16: rows with
@@ -2875,10 +2903,24 @@ impl App {
                             // patch header (params empty: the row's cell
                             // snapshot rides `saved` and was kept fresh by
                             // the persistence tick).
-                            let patch = state.as_deref().map(|c| crate::vsthost::VstPatch {
-                                chunk: c.to_vec(),
-                                params: Vec::new(),
-                            });
+                            // v62: a saved program rides the patch too —
+                            // a VST2 row has no chunk, so the program can
+                            // be the ONLY payload, and it must still reach
+                            // the fresh instance.
+                            let saved_prog = (*program).unwrap_or(-1);
+                            let patch = match state.as_deref() {
+                                Some(c) => Some(crate::vsthost::VstPatch {
+                                    chunk: c.to_vec(),
+                                    params: Vec::new(),
+                                    program: (saved_prog >= 0).then_some(saved_prog),
+                                }),
+                                None if saved_prog >= 0 => Some(crate::vsthost::VstPatch {
+                                    chunk: Vec::new(),
+                                    params: Vec::new(),
+                                    program: Some(saved_prog),
+                                }),
+                                _ => None,
+                            };
                             match crate::vsthost::open_pid(
                                 p,
                                 *kind,
@@ -3430,6 +3472,22 @@ impl App {
             self.params_programs = if ps.len() > 1 { ps } else { Vec::new() };
         }
         if !self.params_programs.is_empty() {
+            // v62: the plugin may change its program INSIDE its own
+            // editor — re-read the live value (throttled ~1 s, one
+            // GUI-thread hop) while this window shows the entry, so the
+            // combo and the persistence tables follow the plugin's truth.
+            let now = ui.ctx().input(|i| i.time);
+            if now >= self.params_prog_sync_at {
+                self.params_prog_sync_at = now + 1.0;
+                entry.refresh_program();
+                if let GuiTarget::Synth(t) = target {
+                    if t < MAX_LOOPS {
+                        if let Some(p) = entry.current_program() {
+                            self.track_synth_program[t] = p as i32;
+                        }
+                    }
+                }
+            }
             let cur = entry.current_program();
             let sel = cur
                 .and_then(|i| self.params_programs.get(i).cloned())
@@ -3489,6 +3547,25 @@ impl App {
             let nm = self.params_programs.get(i).cloned().unwrap_or_default();
             if entry.select_program(i) {
                 self.status = format!("program \u{2192} \u{201c}{nm}\u{201d} (live)");
+                // v62: persist where the plugin ACTUALLY landed — save
+                // also reads the live entry, but the row/table is the
+                // fallback for never-opened rows and the template path.
+                match target {
+                    GuiTarget::Chain(ti, slot) => {
+                        if let Some(ChainRow::Vst { program, .. }) =
+                            self.fx_rows.get_mut(ti).and_then(|rows| rows.get_mut(slot))
+                        {
+                            *program = entry.current_program().map(|p| p as i32);
+                        }
+                    }
+                    GuiTarget::Synth(t) => {
+                        if t < MAX_LOOPS {
+                            if let Some(p) = entry.current_program() {
+                                self.track_synth_program[t] = p as i32;
+                            }
+                        }
+                    }
+                }
             } else {
                 self.status = format!("program \u{201c}{nm}\u{201d} refused by the plugin");
             }
@@ -3549,6 +3626,7 @@ impl App {
             params: Vec::new(),
             entry: None,
             open_rx: Some(rx),
+            program: None,
         });
         let row = self.fx_rows[i].len() - 1;
         self.vst_pending_gui.push((i, row));
@@ -3587,8 +3665,22 @@ impl App {
                         match rx.try_recv() {
                             Ok(Ok(e)) => {
                                 let np = e.programs().len();
+                                // v62: a restored (project/config)
+                                // program gets named in the load hint —
+                                // the user sees the persistence landed.
+                                let restored = (np > 1).then(|| {
+                                    e.current_program()
+                                        .filter(|p| *p > 0)
+                                        .and_then(|p| e.programs().get(p).cloned())
+                                });
+                                let restored = restored.flatten();
                                 *entry = Some(e);
-                                self.vst_note = if np > 1 {
+                                self.vst_note = if let Some(r) = restored {
+                                    format!(
+                                        "{name}: loaded \u{b7} {np} factory programs \
+                                         \u{b7} program \u{201c}{r}\u{201d}"
+                                    )
+                                } else if np > 1 {
                                     format!(
                                         "{name}: loaded \u{b7} {np} factory programs \
                                          \u{b7} pick one in the parameters window"
@@ -5070,6 +5162,22 @@ impl App {
                 .iter()
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
+            // v62: the LIVE synth's cached program wins (kept fresh by
+            // the parameters window refresh); the table is the fallback.
+            track_synth_programs: (0..MAX_LOOPS)
+                .map(|t| {
+                    self.track_synth_inst
+                        .get(t)
+                        .and_then(|h| h.as_ref())
+                        .and_then(|h| match &**h {
+                            crate::audio::SynthHandle::Vst(e) => {
+                                e.current_program().map(|p| p as i32)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(self.track_synth_program[t])
+                })
+                .collect(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
@@ -5701,12 +5809,23 @@ impl App {
         };
         // v23: chunk + the parameter list harvested with it. Chunks may
         // omit normalized values — the list keeps knob moves.
-        let patch = self.track_synth_state[t]
-            .clone()
-            .map(|chunk| crate::vsthost::VstPatch {
+        // v62: the selected factory program rides the SAME patch — a
+        // VST2 synth has no chunk, so the program may be the only
+        // payload; -1 in the table = no program.
+        let program = (self.track_synth_program[t] >= 0).then_some(self.track_synth_program[t]);
+        let patch = match self.track_synth_state[t].clone() {
+            Some(chunk) => Some(crate::vsthost::VstPatch {
                 chunk,
                 params: std::mem::take(&mut self.synth_patch_params[t]),
-            });
+                program,
+            }),
+            None if program.is_some() => Some(crate::vsthost::VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program,
+            }),
+            None => None,
+        };
         (saved, patch)
     }
 
@@ -13818,6 +13937,22 @@ impl App {
                 .iter()
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
+            // v62: the LIVE synth's cached program wins (kept fresh by
+            // the parameters window refresh); the table is the fallback.
+            track_synth_programs: (0..MAX_LOOPS)
+                .map(|t| {
+                    self.track_synth_inst
+                        .get(t)
+                        .and_then(|h| h.as_ref())
+                        .and_then(|h| match &**h {
+                            crate::audio::SynthHandle::Vst(e) => {
+                                e.current_program().map(|p| p as i32)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(self.track_synth_program[t])
+                })
+                .collect(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
@@ -14097,6 +14232,7 @@ impl App {
                         name,
                         params,
                         state,
+                        program,
                     } => {
                         let kind = crate::vsthost::VstKind::parse(&kind)?;
                         Some(ChainRow::Vst {
@@ -14107,6 +14243,7 @@ impl App {
                             params,
                             entry: None,
                             open_rx: None,
+                            program,
                             state: state.as_deref().and_then(crate::config::b64_decode),
                         })
                     }
@@ -14139,6 +14276,10 @@ impl App {
                 .get(t)
                 .and_then(|s| s.as_deref())
                 .and_then(crate::config::b64_decode);
+            // v62: factory programs are synth setup — restore before the
+            // rebuild below reopens every bound instrument.
+            self.track_synth_program[t] =
+                pr.track_synth_programs.get(t).copied().unwrap_or(-1);
         }
         if sel.instruments || sel.synth_setup {
             self.rebuild_all_synths();
@@ -35570,6 +35711,7 @@ mod tests {
             entry: Some(entry.clone()),
             state: None,
             open_rx: None,
+            program: None,
         });
         app.params_win = Some(GuiTarget::Chain(0, 0));
         let ctx = egui::Context::default();
@@ -35649,6 +35791,7 @@ mod tests {
             entry: Some(entry.clone()),
             state: None,
             open_rx: None,
+            program: None,
         });
         app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone(), true);
         assert!(
@@ -36067,6 +36210,7 @@ mod tests {
             entry: Some(entry),
             state: None,
             open_rx: None,
+            program: None,
         });
         app.vst_row_gui(0, 0);
         assert_eq!(
@@ -36120,6 +36264,7 @@ mod tests {
             entry: Some(entry.clone()),
             state: None,
             open_rx: None,
+            program: None,
         });
         app.open_plugin_gui(GuiTarget::Chain(0, 0), entry.clone(), true);
         assert!(
@@ -45936,5 +46081,218 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert!(galley_centers(&mut app, &ctx, "aa", true).is_empty(), "row dropped from list");
         assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "bb row remains");
+    }
+
+/// v62 R1/R6: the selection persists through the ONE row\u2192save
+    /// conversion (live entry wins; the row value is the fallback for
+    /// never-opened rows), `chain_row_from_save` carries it back, and the
+    /// patch that shape opens a fresh fixture instance ON the program \u2014
+    /// end-to-end through the real conversion functions `rebuild_fx` uses.
+    #[test]
+    fn v62_program_chain_row_persist() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mk = |tag: &str| {
+            let dir = std::env::temp_dir().join(format!("v62row-{}-{}-{}", tag, std::process::id(), nanos));
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join(file);
+            std::fs::copy(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/w6")
+                    .join(file),
+                &f,
+            )
+            .unwrap();
+            f
+        };
+        let fixture = mk("open");
+        let entry = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("w6 opens")
+            .entry;
+        assert!(entry.select_program(2), "fixture accepts program 2");
+        let mk_row = |path: String, entry: Option<std::sync::Arc<dyn crate::vsthost::StageEntry>>, program: Option<i32>| {
+            ChainRow::Vst {
+                path,
+                kind: crate::vsthost::VstKind::V2,
+                plugin_id: None,
+                name: "w6".into(),
+                params: vec![],
+                entry,
+                open_rx: None,
+                state: None,
+                program,
+            }
+        };
+        // Live entry wins: row.program is None, the plugin says 2.
+        let row = mk_row(fixture.display().to_string(), Some(entry.clone()), None);
+        match chain_row_to_save(&row) {
+            crate::config::ChainSave::Vst { program, .. } => {
+                assert_eq!(program, Some(2), "live entry\u{2019}s program is captured")
+            }
+            _ => unreachable!(),
+        }
+        // Fallback: never-opened row persists its own (restored) value.
+        let row = mk_row("/nonexistent/x.so".into(), None, Some(1));
+        match chain_row_to_save(&row) {
+            crate::config::ChainSave::Vst { program, .. } => {
+                assert_eq!(program, Some(1), "saved row value is the fallback")
+            }
+            _ => unreachable!(),
+        }
+        // Load path: the conversion back keeps it, and a fresh open with
+        // that value boots ON it (the patch rebuild_fx builds for a chunk-less
+        // VST2 row).
+        let saved = chain_row_to_save(&mk_row(fixture.display().to_string(), Some(entry), None));
+        let back = chain_row_from_save(&saved).expect("row parses");
+        match &back {
+            ChainRow::Vst { program, .. } => assert_eq!(*program, Some(2), "restore carries the program"),
+            _ => unreachable!(),
+        }
+        let fixture2 = mk("restore");
+        let load2 = crate::vsthost::open_pid(
+            &fixture2,
+            crate::vsthost::VstKind::V2,
+            None,
+            48_000,
+            None,
+            Some(&crate::vsthost::VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(2),
+            }),
+        )
+        .expect("restored open");
+        assert_eq!(load2.entry.current_program(), Some(2), "restore opens ON the program");
+    }
+
+    /// v62 R2: the synth-side capture in `save_config` prefers the LIVE
+    /// entry\u{2019}s cached program over a stale table (a plugin moved the
+    /// program; the user never touched the combo) and falls back to the
+    /// table when no instance is loaded.
+    #[test]
+    fn v62_program_synth_capture_config() {
+        struct V62Prog;
+        impl crate::vsthost::StageEntry for V62Prog {
+            fn name(&self) -> &str {
+                "v62prog"
+            }
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("/")
+            }
+            fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+                static S: std::sync::OnceLock<(std::path::PathBuf, crate::vsthost::VstKind)> =
+                    std::sync::OnceLock::new();
+                S.get_or_init(|| (std::path::PathBuf::from("/"), crate::vsthost::VstKind::V2))
+            }
+            fn kind(&self) -> crate::vsthost::VstKind {
+                crate::vsthost::VstKind::V2
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+                &[]
+            }
+            fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+                static P: std::sync::OnceLock<std::sync::Arc<crate::vsthost::VstParams>> =
+                    std::sync::OnceLock::new();
+                P.get_or_init(|| crate::vsthost::VstParams::new(&[]))
+            }
+            fn has_editor(&self) -> bool {
+                false
+            }
+            fn current_program(&self) -> Option<usize> {
+                Some(3)
+            }
+            fn set_param(&self, _i: usize, _v: f32) {}
+            fn set_param_rt(&self, _i: usize, _v: f32) {}
+            fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+            fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+            fn all_notes_off(&self) {}
+            fn flush(&self) {}
+            fn midi_drops(&self) -> u64 {
+                0
+            }
+        }
+        let mut app = headless_app("v62synth");
+        app.track_synth_inst[2] = Some(std::sync::Arc::new(crate::audio::SynthHandle::Vst(
+            std::sync::Arc::new(V62Prog),
+        )));
+        app.track_synth_program[2] = 0; // stale table \u2014 the live entry wins
+        app.track_synth_program[5] = 7; // no instance \u2014 the table carries it
+        app.save_config();
+        let cfg = crate::config::Config::load();
+        assert_eq!(cfg.track_synth_programs.get(2).copied(), Some(3), "live entry wins");
+        assert_eq!(cfg.track_synth_programs.get(5).copied(), Some(7), "table fallback");
+    }
+
+    /// v62 R1/R5 UI loop: picking a row in the PARAMETERS combo lands the
+    /// plugin AND writes the row\u{2019}s persisted `program` \u2014 what
+    /// save_config then captures. The throttled live refresh runs on the
+    /// first painted frame (it must not disturb the selection path).
+    #[test]
+    fn v62_program_combo_persist() {
+        let mut app = headless_app("v62combo");
+        app.show_master = false;
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v62combo-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join(file);
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/w6")
+                .join(file),
+            &fixture,
+        )
+        .unwrap();
+        let load = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("w6 fixture opens");
+        let entry = load.entry;
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: fixture.display().to_string(),
+            kind: crate::vsthost::VstKind::V2,
+            plugin_id: None,
+            name: "w6".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        let combo = galley_at(&mut app, &ctx, "Init")
+            .expect("combo shows the current program")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "Thin")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert_eq!(entry.current_program(), Some(2), "the plugin switched");
+        match &app.fx_rows[0][0] {
+            ChainRow::Vst { program, .. } => {
+                assert_eq!(*program, Some(2), "the row persisted the pick")
+            }
+            _ => unreachable!(),
+        }
     }
 }
