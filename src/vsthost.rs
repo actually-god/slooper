@@ -2165,6 +2165,15 @@ impl Vst2Handle {
         Self(addr as *mut vst2::api::AEffect)
     }
     /// Raw `AEffect::dispatcher` call with a VST2 opcode number.
+    ///
+    /// v60 ABI FOLD: the vendored crate declares the return as `isize`,
+    /// but a real VST2 plugin (the C ABI) returns a C `long` — 32-bit on
+    /// Windows. x86-64 zero-extends the 32-bit write, so a plugin's `-1`
+    /// ("refused", e.g. effSetProgram out-of-range) arrives as
+    /// 4294967295 = TRUE on Windows (found by the v60 pins on the real
+    /// runner: -1 asserted, huge positive observed). Every C plugin is
+    /// on the honor system of the 32-bit VST2 return; fold back to the
+    /// signed 32-bit domain. Linux: `long == isize`, fold is a no-op.
     pub fn dispatch(
         &self,
         opcode: i32,
@@ -2173,9 +2182,14 @@ impl Vst2Handle {
         ptr: *mut std::ffi::c_void,
         opt: f32,
     ) -> isize {
-        unsafe {
+        let r = unsafe {
             let ae = self.0;
             ((*ae).dispatcher)(ae, opcode, index, value, ptr, opt)
+        };
+        if cfg!(windows) {
+            r as u32 as i32 as isize
+        } else {
+            r
         }
     }
     /// v22: current parameter value straight through `AEffect::getParameter`
@@ -5210,7 +5224,12 @@ mod tests {
         assert!(!e.select_program(99), "out-of-range is refused");
         assert_eq!(e.current_program(), Some(1), "a refusal leaves state alone");
         // The plugin-side contract the guard mirrors: the same request
-        // straight through the dispatcher answers -1 and moves nothing.
+        // straight through the dispatcher must NOT move the plugin, and
+        // at OUR seam the answer is exactly -1 — the fixture's refusal
+        // answer arrives sign-folded by Vst2Handle::dispatch (without
+        // the v60 ABI fold this assert is what goes red on the Windows
+        // runner: x64 delivers the C 32-bit -1 zero-extended as
+        // 4294967295; found by exactly this pin on 2026-11-15).
         let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
         let h = rt.vst2_handle().expect("VST2 handle");
         let addr = h.as_usize();
@@ -5218,7 +5237,7 @@ mod tests {
             Vst2Handle::from_addr(addr).dispatch(2, 0, 99, std::ptr::null_mut(), 0.0)
         })
         .expect("gui thread");
-        assert_eq!(raw, -1, "fixture must refuse program 99 with -1");
+        assert_eq!(raw, -1, "out-of-range ChangePreset refused (-1, folded)");
         let read = on_gui_thread(move || {
             Vst2Handle::from_addr(addr).dispatch(3, 0, 0, std::ptr::null_mut(), 0.0)
         })
