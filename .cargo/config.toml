@@ -2,7 +2,9 @@
 # per-test temp dir via `std::env::set_var` while other tests (and backend
 # threads they spawned) read env vars — a data race that glibc reports as
 # heap corruption ("corrupted size vs. prev_size", SIGABRT, intermittent).
-# The whole suite runs in ~2 s, so keep it single-threaded and race-free.
+# Keep the suite single-threaded and race-free. (Test-runtime reality incl.
+# the tiered gates: scripts/test-quick.sh + scripts/test-full.sh; the old
+# "~2 s" full-suite figure predates the vNN pin families by ~500 tests.)
 [env]
 RUST_TEST_THREADS = "1"
 

@@ -56,17 +56,25 @@ jobs:
       # order + fxgui::drop_order_tests pin. The pair now runs IN the
       # monolith (10/10 green on the floor distro where it aborted 3/10);
       # the isolated steps stay as defense-in-depth, now fully BLOCKING.
-      - name: Lib suite (headless, citest profile)
+      - name: Lib suite, fast tier (headless, citest profile)
+        # Quick-tier pins = what scripts/test-quick.sh runs locally.
         run: cargo test --profile citest --lib --locked
+      - name: Lib suite, slow tier (plugin dlopen + heavy pins, isolated)
+        # The #[ignore = "slow-tier: …"] set in its OWN process — same
+        # isolation the old manual 3-chunk filter protocol provided against
+        # the dlopen deadlock class, now mechanism-based.
+        run: cargo test --profile citest --lib --locked -- --ignored
+      - name: Doctests
+        run: cargo test --profile citest --doc --locked
       - name: Script-editor pair in isolated processes
         run: |
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_docks
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v36_script_fx_editor_resizes
+          cargo test --profile citest --lib --locked -- --include-ignored --exact ui::tests::v36_script_fx_editor_docks
+          cargo test --profile citest --lib --locked -- --include-ignored --exact ui::tests::v36_script_fx_editor_resizes
       - name: Script-FX pair in isolated processes
         run: |
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_auto_slider_rmb_auto
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_bridge_slider_rmb_auto
-          cargo test --profile citest --lib --locked -- --exact ui::tests::v20_fx_pair_teardown_survives_heap_churn
+          cargo test --profile citest --lib --locked -- --include-ignored --exact ui::tests::v20_fx_auto_slider_rmb_auto
+          cargo test --profile citest --lib --locked -- --include-ignored --exact ui::tests::v20_fx_bridge_slider_rmb_auto
+          cargo test --profile citest --lib --locked -- --include-ignored --exact ui::tests::v20_fx_pair_teardown_survives_heap_churn
       - name: Clippy zero
         run: |
           set -o pipefail
@@ -124,7 +132,9 @@ jobs:
         # `w8b_*` W8b embed pins (nor `w8c_*`), so each new sub-letter
         # series goes here. (`w9_` = W9 Windows MIDI; `w12` intentionally
         # covers the whole W12 polish family: w12a_, w12b_, …)
-        run: cargo test --profile citest --lib --locked -- w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12 w14_
+        # --include-ignored: tier-2 (slow-tier) port pins live in the ignored
+        # set — a bare filter run would silently skip them.
+        run: cargo test --profile citest --lib --locked -- --include-ignored w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12 w14_
       - name: Release build proof (shipping profile = winrel, W12e)
         # `winrel` IS what ships (release.yml builds the zip with it):
         # release minus strip, plus minimal debuginfo, so the minidumps
@@ -132,6 +142,9 @@ jobs:
         # real profile builds, not a look-alike.
         run: cargo build --profile winrel --locked
       - name: Full lib suite (BLOCKING since W14 — 589/0 on f658ac5, 13-Nov)
+        # --include-ignored: run the slow tier too (Linux splits it into a
+        # second step for the dlopen-deadlock class; the Windows loader is
+        # not affected, one monolithic run is proven green here).
         env:
           SLOOPER_PROBE_EXE: ${{ github.workspace }}\target\citest\slooper-probe.exe
-        run: cargo test --profile citest --lib --locked --no-fail-fast
+        run: cargo test --profile citest --lib --locked --no-fail-fast -- --include-ignored

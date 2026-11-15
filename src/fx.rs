@@ -2009,6 +2009,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn bundled_examples_load_with_custom_guis() {
         // A fresh effects folder seeds template + examples; every one must
         // compile through the real loader, and the two examples must carry
@@ -2111,6 +2112,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn bipolar_params_survive_loading() {
         // Band gain on the EQ is bipolar (-24..+24 dB). Both the initial
         // seed (loading a saved chain) and live slider moves must keep
@@ -2133,6 +2135,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn space_echo_holds_a_wet_tail() {
         // After a single impulse, a wet echo must keep producing decaying
         // output for at least one delay time — proof the effect state and
@@ -2168,6 +2171,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn space_echo_tail_modes_are_dense_not_metallic() {
         // Objective guard against the metallic "ping" on transients: after
         // an impulse, the LATE reverb tail must be a dense wash, not a
@@ -2295,6 +2299,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: diagnostic probe, not a gate"]
     fn diag_whine_probe() {
         // TEMPORARY diagnostic — high-pitched whine report. Removed before ship.
         if !rustc_available() {
@@ -2440,6 +2445,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: diagnostic probe, not a gate"]
     fn diag_sine_adds_nothing() {
         // TEMPORARY diagnostic - sine in, anything else out? A whine is energy
         // the plugin invents away from the input. Removed before ship.
@@ -2534,6 +2540,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn space_echo_verb_and_echo_levels_are_independent() {
         // The two level params pick between the two effect halves:
         // with VERB at 0 nothing exists between the impulse and the first
@@ -2803,6 +2810,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn template_compiles_and_runs() {
         // The whole pipeline the GUI relies on, on a real effect: write the
         // embedded API contract + template to a temp folder, compile, load,
@@ -3330,6 +3338,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// AC5.2: a default preset lands on a REAL compiled EQ instance —
     /// applying "Radio filter" must visibly crush the low end it promises.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn v10_default_preset_lands_on_the_chain() {
         if !rustc_available() {
             return;
@@ -3621,6 +3630,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// input is gone, the flanger comb rings, and the ping-pong right
     /// ear echo arrives a fraction of a repeat LATE.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier4_feedback_loops_ring() {
         if !rustc_available() {
             return;
@@ -3784,6 +3794,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// 3. the v1 fallback (`process`) equals the ST path's LEFT channel at
     ///    default width — mono hosts keep the historical circuit exactly.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier5_space_echo_stereo_tail() {
         if !rustc_available() {
             return;
@@ -3989,6 +4000,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// or re-tunes 0..10, or flips the v3 flag semantics (stereo yes,
     /// sidechain no: `desc.sidechain` is exact-v2-only, tier-3b rule).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier5_space_echo_params_appended_only() {
         if !rustc_available() {
             return;
@@ -4045,6 +4057,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     ///
     /// Also freezes the param tables (0..6 sticky, 7 = appended `spread`).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier5_phaser_flanger_stereo() {
         if !rustc_available() {
             return;
@@ -4194,6 +4207,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     ///  * v1 fallback ≡ ST-path LEFT bit-for-bit (vocoder: v1 stays the
     ///    documented passthrough).
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier5b_stereo_mods() {
         if !rustc_available() {
             return;
@@ -4413,6 +4427,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// default tables in order and fails if anyone reorders, renames or
     /// re-tunes the sticky 0..N-1 params, or flips the v3 flag semantics.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier5b_params_appended_only() {
         if !rustc_available() {
             return;
@@ -4495,6 +4510,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// while paused, and self-advancing between pushes (block-size
     /// agnostic), with free mode left bit-identical for old sessions.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn tier6_param_metadata_and_host_sync() {
         if !rustc_available() {
             return;
@@ -4641,6 +4657,7 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// partitioned convolution are all real. Index 0 (built-in hall)
     /// must instead produce a long decaying tail.
     #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn convolver_folder_ir_delta() {
         if !rustc_available() {
             return;
