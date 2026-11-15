@@ -755,6 +755,44 @@ fn clip_paint_color(app: &App, c: &crate::arrange::Clip, t: usize, is_auto: bool
         })
 }
 
+/// v59: the shared "Track color" submenu — BOTH the grid's empty-track
+/// menu (v58) and the mixer strip's right-click (v59) call this, so the
+/// two entry points can never drift (same swatches, same Reset, same
+/// status echo). Returns true when the user picked — the caller closes
+/// its own popup.
+fn track_color_submenu(ui: &mut egui::Ui, app: &mut App, t: usize) -> bool {
+    let mut pick: Option<Option<u8>> = None;
+    ui.menu_button("Track color", |ui| {
+        for (i, sw) in CLIP_PALETTE.iter().enumerate() {
+            let nm = CLIP_PALETTE_NAMES[i];
+            if ui
+                .button(RichText::new(format!("\u{25a0} {nm}")).color(*sw))
+                .clicked()
+            {
+                pick = Some(Some(i as u8));
+                ui.close();
+            }
+        }
+        if ui
+            .button("Reset")
+            .on_hover_text("clear this track's color \u{b7} clips go back to the built-in blue/red")
+            .clicked()
+        {
+            pick = Some(None);
+            ui.close();
+        }
+    });
+    if let Some(col) = pick {
+        app.set_trk_color(t, col);
+        app.status = match col {
+            Some(i) => format!("track {} color: {}", t + 1, CLIP_PALETTE_NAMES[i as usize]),
+            None => format!("track {} color reset \u{b7} built-in clip colors", t + 1),
+        };
+        return true;
+    }
+    false
+}
+
 /// Nominal lane-strip height in the grid. A track's block is
 /// `lanes × LANE_H`, never shorter than `TRACK_MIN_H` (the height its
 /// mixer strip needs), so clips get tall waveforms and the mixer stays
@@ -9662,6 +9700,42 @@ impl App {
                         roll.pat.quantize_grid(step, true);
                         roll.changed = true;
                         self.status = format!("quantized {n} note(s) to the grid");
+                    }
+                    // v59 (backlog S6): the roll's OWN snap switch — the
+                    // SAME app state as the grid header's (the metro
+                    // pattern): composing needs magnet control without
+                    // hunting for the header. step_sec above re-derives
+                    // every frame, so a flip lands on the next drag.
+                    ui.label("snap");
+                    if ui
+                        .checkbox(&mut self.snap_on, "")
+                        .on_hover_text(
+                            "Note snap on/off \u{b7} the SAME switch as the grid header \
+                             \u{b7} off = note drags land on any SAMPLE",
+                        )
+                        .changed()
+                    {
+                        self.save_config();
+                        self.status = if self.snap_on {
+                            format!("note snap ON \u{b7} {}", SUBDIVISIONS[self.snap_sub].1)
+                        } else {
+                            "note snap OFF \u{b7} drags land on any sample".into()
+                        };
+                    }
+                    ui.add_enabled_ui(self.snap_on, |ui| {
+                        egui::ComboBox::from_id_salt("roll_snap_cb")
+                            .selected_text(SUBDIVISIONS[self.snap_sub].1)
+                            .show_ui(ui, |ui| {
+                                for (n, s) in SUBDIVISIONS.iter().enumerate() {
+                                    if ui.selectable_value(&mut self.snap_sub, n, s.1).changed() {
+                                        self.save_config();
+                                        self.status = format!("note snap \u{b7} {}", s.1);
+                                    }
+                                }
+                            });
+                    });
+                    if !self.snap_on {
+                        ui.label(RichText::new("(off: 1 sample)").weak().small());
                     }
                     // v52 R6: discoverable zoom (Ctrl+wheel kept too).
                     if ui
@@ -20855,12 +20929,36 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
     let nl = app.arr.tracks[t].lanes.len();
     let clips: usize = app.arr.tracks[t].lanes.iter().map(|l| l.clips.len()).sum();
     ui.horizontal(|ui| {
+        // v59: when the track has a default clip color, a 7px chip leads
+        // the header (same square as the v58 lane-tag chip). Unset = no
+        // chip, no layout shift — the strip geometry pins never see it.
+        let chip = app
+            .trk_color
+            .get(t)
+            .copied()
+            .flatten()
+            .and_then(|i| CLIP_PALETTE.get(i as usize).copied());
+        if let Some(sw) = chip {
+            let cr = egui::Rect::from_min_size(
+                ui.cursor().min + egui::vec2(0.0, 5.0),
+                egui::vec2(7.0, 7.0),
+            );
+            ui.painter().rect_filled(cr, 0.0, sw);
+            ui.allocate_space(egui::vec2(11.0, 16.0));
+        }
         let head = ui
             .selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong())
-            .on_hover_text("Click to select \u{b7} right-click this track's grid for its menu (copy / paste / clear)");
+            .on_hover_text("Click to select \u{b7} right-click for the track menu (color)");
         if head.clicked() {
             app.selected = t;
         }
+        // v59: right-click opens the SAME Track color submenu the grid
+        // menu carries (shared helper — the two menus cannot drift).
+        head.context_menu(|ui| {
+            if track_color_submenu(ui, app, t) {
+                ui.close();
+            }
+        });
         // v29: ONE record button + source checkboxes. REC arms every
         // ticked source on this track at once; STOP bounces them all.
         let any_rec = rec || app.midi_rec[t].armed || app.auto_rec[t].armed;
@@ -23728,39 +23826,10 @@ fn grid_context_menu(
         ui.separator();
         // v58: the track's default clip color — every clip on this track
         // WITHOUT its own color follows it (audio, MIDI and automation
-        // alike); a chip by the lane tag shows it.
-        {
-            let mut pick: Option<Option<u8>> = None;
-            ui.menu_button("Track color", |ui| {
-                for (i, sw) in CLIP_PALETTE.iter().enumerate() {
-                    let nm = CLIP_PALETTE_NAMES[i];
-                    if ui
-                        .button(RichText::new(format!("\u{25a0} {nm}")).color(*sw))
-                        .clicked()
-                    {
-                        pick = Some(Some(i as u8));
-                        ui.close();
-                    }
-                }
-                if ui
-                    .button("Reset")
-                    .on_hover_text("clear this track's color \u{b7} clips go back to the built-in blue/red")
-                    .clicked()
-                {
-                    pick = Some(None);
-                    ui.close();
-                }
-            });
-            if let Some(col) = pick {
-                app.set_trk_color(t, col);
-                app.status = match col {
-                    Some(i) => {
-                        format!("track {} color: {}", t + 1, CLIP_PALETTE_NAMES[i as usize])
-                    }
-                    None => format!("track {} color reset \u{b7} built-in clip colors", t + 1),
-                };
-                ui.close();
-            }
+        // alike); a chip by the lane tag shows it. v59: the submenu body
+        // lives in track_color_submenu, shared with the mixer strip.
+        if track_color_submenu(ui, app, t) {
+            ui.close();
         }
     }
     if ui.button("Select all clips").clicked() {
@@ -45085,12 +45154,14 @@ mod tests {
             "the override clip keeps its own color"
         );
         // The lane-tag chip: a small (7px) FULL-strength teal square.
+        // v59 RETARGET: the mixer strip now carries the same chip, so
+        // count only the grid-side one (x < 400 per the v30 convention).
         let (r, g, b, _) = CLIP_PALETTE[4].to_tuple();
         let chip = painted_rects(&mut app, &ctx, (r, g, b))
             .into_iter()
-            .filter(|rq| rq.width() < 20.0)
+            .filter(|rq| rq.width() < 20.0 && rq.center().x < 400.0)
             .count();
-        assert_eq!(chip, 1, "the track-color chip paints once");
+        assert_eq!(chip, 1, "the track-color chip paints once (lane tag)");
     }
 
     /// Automation clips follow the same rule: default red, palette color
@@ -45153,5 +45224,167 @@ mod tests {
             painted_rects(&mut app, &ctx, body(Color32::from_rgb(170, 70, 74))).is_empty(),
             "the red body is replaced"
         );
+    }
+
+    /// v59 R1 (backlog S6): the roll toolbar carries its own snap switch.
+    /// Flipping it there edits the SAME state as the grid header (metro
+    /// pattern) — the unit drops to one sample, the status answers, and
+    /// BOTH toolbars show the "(off: 1 sample)" hint next frame.
+    #[test]
+    fn v59_roll_snap_switch_mirrors_grid() {
+        let mut app = headless_app("v59snap");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let canvas = open_roll_headless(&mut app, &ctx);
+        app.snap_on = true;
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        // The roll's toolbar row sits just ABOVE its dark canvas; the
+        // grid header's snap label is far above (y < canvas.min.y - 60),
+        // so the y band isolates the roll's label from every other
+        // "snap" text on screen (automation dock's selector is its OWN
+        // state — clicking that would not flip app.snap_on, and the
+        // assert below would catch it).
+        let band = (canvas.min.y - 60.0)..(canvas.min.y - 4.0);
+        let all = galley_centers(&mut app, &ctx, "snap", false);
+        let roll_lbl = all
+            .iter()
+            .filter(|c| band.contains(&c.y))
+            .max_by(|a, b| a.x.partial_cmp(&b.x).unwrap())
+            .copied()
+            .unwrap_or_else(|| panic!("snap label in the roll toolbar; all hits: {all:?}"));
+        click_pt(&mut app, &ctx, egui::pos2(roll_lbl.x + 20.0, roll_lbl.y));
+        assert!(!app.snap_on, "roll checkbox flips the shared switch");
+        assert_eq!(app.snap_unit(), 1.0, "snap off = one sample");
+        assert!(app.status.contains("snap OFF"), "status: {}", app.status);
+        frame(&mut app, &ctx, vec![]);
+        let hints = galley_centers(&mut app, &ctx, "(off: 1 sample)", true);
+        assert!(
+            hints.len() >= 2,
+            "the off-hint paints in grid header AND roll toolbar, got {}",
+            hints.len()
+        );
+        // Flip back from the GRID header (first match = the panel row,
+        // proven by the v07 AC6.2 pin) — proves the mirror is ONE state.
+        app.status = String::new();
+        let gl = galley_at(&mut app, &ctx, "snap").expect("grid header snap label");
+        click_pt(&mut app, &ctx, egui::pos2(gl.center().x + 20.0, gl.center().y));
+        assert!(app.snap_on, "grid header checkbox flips it back");
+    }
+
+    /// v59 R1: the roll's subdivision combo edits + persists the shared
+    // snap_sub, and the header's combo mirrors it (both read one field).
+    #[test]
+    fn v59_roll_snap_sub_choice_persists() {
+        let mut app = headless_app("v59sub");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        open_roll_headless(&mut app, &ctx);
+        app.snap_on = true;
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        // The roll's combo shows the current subdivision word; windows
+        // paint last, so the LAST such galley is the roll's combo
+        // (v50 convention). "thirty-second note" is no default selection,
+        // so the popup row is unique.
+        let cur = SUBDIVISIONS[app.snap_sub].1.to_string();
+        let combo = galley_at_last(&mut app, &ctx, &cur).expect("roll snap combo");
+        click_pt(&mut app, &ctx, combo.center());
+        click_last(&mut app, &ctx, "thirty-second note");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.snap_sub, 5, "thirty-second note selected via the roll");
+        assert_eq!(app.status, "note snap \u{b7} thirty-second note", "status: {}", app.status);
+        // Config stores STEPS-PER-BEAT, not the index (init re-derives
+        // the index via the steps→index map at App::new) — a
+        // thirty-second note is 8 steps/beat.
+        let cfg = crate::config::Config::load();
+        assert_eq!(cfg.snap_sub, SUBDIVISIONS[5].0, "subdivision choice persisted (steps/beat)");
+        // Mirror: with the status cleared, the word still shows in BOTH
+        // closed combos (grid header + roll toolbar).
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        let hits = galley_centers(&mut app, &ctx, "thirty-second note", false);
+        assert!(
+            hits.len() >= 2,
+            "both toolbars read the shared combo state, got {:?}",
+            hits.len()
+        );
+    }
+
+    /// v59 R2: right-click a mixer strip header → the SAME Track color
+    /// submenu the grid menu uses (shared helper). Picking a swatch sets
+    /// the track default, echoes status, and paints the chip in BOTH
+    /// panels (lane tag + strip header).
+    #[test]
+    fn v59_mixer_rmb_track_color() {
+        let mut app = headless_app("v59mixcol");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // v30 convention: MASTER OUT docks right by default and shifts
+        // the mixer strips — close it, then settle (3 frames) so the
+        // strips sit in the x > 1000 band.
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // y < 853 keeps the 853-viewport strip header: below the fold
+        // the automation dock paints several track-labelled rows.
+        let heads: Vec<egui::Pos2> = galley_centers(&mut app, &ctx, "Track 1", false)
+            .into_iter()
+            .filter(|c| c.x > 1000.0 && c.y < 853.0) // mixer side (v30 convention)
+            .collect();
+        assert_eq!(heads.len(), 1, "exactly one mixer 'Track 1' header: {heads:?}");
+        rmb(&mut app, &ctx, heads[0]);
+        let tc = galley_at_last(&mut app, &ctx, "Track color").expect("submenu in the strip menu");
+        click_pt(&mut app, &ctx, tc.center());
+        let sw = galley_centers(&mut app, &ctx, "\u{25a0} teal", true);
+        assert_eq!(sw.len(), 1, "submenu lists the teal swatch");
+        click_pt(&mut app, &ctx, sw[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_color[0], Some(4), "track default set from the strip");
+        assert_eq!(app.status, "track 1 color: teal", "status echoes");
+        // Chips paint in BOTH panels: lane tag (grid side) + strip header.
+        let (r, g, b, _) = CLIP_PALETTE[4].to_tuple();
+        let chips = painted_rects(&mut app, &ctx, (r, g, b))
+            .into_iter()
+            .filter(|rq| rq.width() < 20.0)
+            .collect::<Vec<_>>();
+        assert!(chips.iter().any(|rq| rq.center().x < 400.0), "lane-tag chip paints");
+        assert!(
+            chips.iter().any(|rq| rq.center().x > 1000.0),
+            "mixer strip chip paints"
+        );
+    }
+
+    /// v59 R2: Reset in the strip submenu clears the default (status
+    /// echo + tooltip — v54 hover invariant) and BOTH chips disappear.
+    #[test]
+    fn v59_mixer_track_color_reset() {
+        let mut app = headless_app("v59mixrst");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.trk_color[0] = Some(4);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let heads: Vec<egui::Pos2> = galley_centers(&mut app, &ctx, "Track 1", false)
+            .into_iter()
+            .filter(|c| c.x > 1000.0 && c.y < 853.0)
+            .collect();
+        assert_eq!(heads.len(), 1, "one mixer header in view: {heads:?}");
+        rmb(&mut app, &ctx, heads[0]);
+        let tc = galley_at_last(&mut app, &ctx, "Track color").expect("submenu in the strip menu");
+        click_pt(&mut app, &ctx, tc.center());
+        click_last(&mut app, &ctx, "Reset");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_color[0], None, "reset clears the track default");
+        assert!(app.status.contains("color reset"), "status: {}", app.status);
+        let (r, g, b, _) = CLIP_PALETTE[4].to_tuple();
+        let chips = painted_rects(&mut app, &ctx, (r, g, b))
+            .into_iter()
+            .filter(|rq| rq.width() < 20.0)
+            .count();
+        assert_eq!(chips, 0, "both chips are gone after reset");
     }
 }
