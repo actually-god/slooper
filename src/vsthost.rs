@@ -5278,6 +5278,37 @@ mod tests {
         assert!(!e.select_program(0));
     }
 
+    /// v60 follow-up (bit for real on 2026-11-15): the program counter
+    /// lives INSIDE the fixture library, so every open of one FILE is
+    /// one live plugin across the whole test process. A second open must
+    /// still boot at program 0 (VSTPluginMain resets its statics) — and
+    /// a program change must never bleed into a copy's next open. This
+    /// is the contract that makes unique-temp-copy pins hermetic.
+    #[test]
+    fn v60_vst2_open_resets_program() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v60reset");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let a = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("first open: {e}"))
+            .entry;
+        assert_eq!(a.current_program(), Some(0));
+        assert!(a.select_program(2));
+        // Same file, second instance: must boot at 0, not inherit 2.
+        let b = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("second open: {e}"))
+            .entry;
+        assert_eq!(
+            b.current_program(),
+            Some(0),
+            "VSTPluginMain must reset the program static (two entries, one library)"
+        );
+        // And the host-side view of instance 1 was not retroactively
+        // changed by opening instance 2 (its snapshot stays 2).
+        assert_eq!(a.current_program(), Some(2), "instance 1 keeps its program");
+    }
+
     fn w6_fixture(name: &str) -> PathBuf {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/w6")

@@ -147,6 +147,11 @@ static W6AEffect g_fx;
 W6EXPORT void *VSTPluginMain(void *host_callback) {
     (void)host_callback;
     memset(&g_fx, 0, sizeof g_fx);
+    /* v60: every VSTPluginMain call hands the host a FRESH plugin state,
+     * like a real effect allocating a new AEffect — the program counter
+     * must not carry from a previous instance of the same file (the
+     * v60_vst2_open_resets_program pin asserts this contract). */
+    g_program = 0;
     g_fx.magic = 0x56737450; /* 'VstP' */
     g_fx.dispatcher = w6_dispatch;
     g_fx.process = w6_process;
