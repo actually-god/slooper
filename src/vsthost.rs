@@ -5178,6 +5178,105 @@ mod tests {
     // .dll); the #[cfg(windows)] pins assert the opposite truth on Windows
     // CI (W10). One fixture, two OSes, each asserts its own semantics.
 
+    /// v60 R1/R2: the w6 fixture's three factory programs must enumerate
+    /// in order, and selection must round-trip through the LIVE instance.
+    /// Out-of-range selection is refused HOST-side (never touching the
+    /// library, so a stale cache cannot provoke a bogus call) — and the
+    /// raw plugin-side refusal (-1) the guard mirrors is asserted too.
+    /// Quick tier: pure-C fixture dlopen, the same class as the w6 probe
+    /// pins (the hang class is C++ toolkits, not this file).
+    #[test]
+    fn v60_vst2_programs_enumerated_and_selected() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        // OWN copy of the fixture: the program counter is a static INSIDE
+        // the library, so every open of the same file path would share
+        // one live plugin across tests (the UI combo pin moves programs
+        // too). The unique temp copy is the same trick the w6-live pin
+        // uses — and the never-dlclosed entry pins the ORIGINAL file's
+        // statics for every other test, keeping them pristine.
+        let dir = w6_temp_dir("v60host");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load =
+            open(&fixture, VstKind::V2, 48_000, None).unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        assert_eq!(e.programs(), vec!["Init", "Fat", "Thin"], "names, in order");
+        assert_eq!(e.current_program(), Some(0), "fixture boots at program 0");
+        assert!(e.select_program(2), "valid select is accepted");
+        assert_eq!(e.current_program(), Some(2), "selection is reported back");
+        assert!(e.select_program(1));
+        assert_eq!(e.current_program(), Some(1));
+        assert!(!e.select_program(99), "out-of-range is refused");
+        assert_eq!(e.current_program(), Some(1), "a refusal leaves state alone");
+        // The plugin-side contract the guard mirrors: the same request
+        // straight through the dispatcher answers -1 and moves nothing.
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let h = rt.vst2_handle().expect("VST2 handle");
+        let addr = h.as_usize();
+        let raw = on_gui_thread(move || {
+            Vst2Handle::from_addr(addr).dispatch(2, 0, 99, std::ptr::null_mut(), 0.0)
+        })
+        .expect("gui thread");
+        assert_eq!(raw, -1, "fixture must refuse program 99 with -1");
+        let read = on_gui_thread(move || {
+            Vst2Handle::from_addr(addr).dispatch(3, 0, 0, std::ptr::null_mut(), 0.0)
+        })
+        .expect("gui thread");
+        assert_eq!(read, 1, "the refused dispatch left the plugin on program 1");
+    }
+
+    /// v60 R6: the program surface DEFAULTS to inert — every backend that
+    /// does not implement programs (CLAP today, any future format) must
+    /// answer empty/None/false without any library contact.
+    #[test]
+    fn v60_trait_program_defaults_are_inert() {
+        struct Dummy;
+        impl StageEntry for Dummy {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("/")
+            }
+            fn spec(&self) -> &(std::path::PathBuf, VstKind) {
+                static S: std::sync::OnceLock<(std::path::PathBuf, VstKind)> =
+                    std::sync::OnceLock::new();
+                S.get_or_init(|| (std::path::PathBuf::from("/"), VstKind::V2))
+            }
+            fn kind(&self) -> VstKind {
+                VstKind::V2
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn descs(&self) -> &[VstParamDesc] {
+                &[]
+            }
+            fn params(&self) -> &std::sync::Arc<VstParams> {
+                static P: std::sync::OnceLock<std::sync::Arc<VstParams>> =
+                    std::sync::OnceLock::new();
+                P.get_or_init(|| VstParams::new(&[]))
+            }
+            fn has_editor(&self) -> bool {
+                false
+            }
+            fn set_param(&self, _i: usize, _v: f32) {}
+            fn set_param_rt(&self, _i: usize, _v: f32) {}
+            fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+            fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+            fn all_notes_off(&self) {}
+            fn flush(&self) {}
+            fn midi_drops(&self) -> u64 {
+                0
+            }
+        }
+        let d = Dummy;
+        let e: &dyn StageEntry = &d;
+        assert!(e.programs().is_empty());
+        assert_eq!(e.current_program(), None);
+        assert!(!e.select_program(0));
+    }
+
     fn w6_fixture(name: &str) -> PathBuf {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/w6")

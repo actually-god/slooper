@@ -1584,6 +1584,12 @@ pub struct App {
     params_preset_name: String,
     params_presets: Vec<String>,
     params_presets_for: String,
+    /// v60: factory program list shown by the parameter bar + the plugin
+    /// name it was cached from (same refresh pattern as `params_presets`).
+    /// Empty when the backend/plugin reports no programs — then the row
+    /// is not painted at all (no dead chrome).
+    params_programs: Vec<String>,
+    params_programs_for: String,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -2155,6 +2161,8 @@ impl App {
             params_preset_name: String::new(),
             params_presets: Vec::new(),
             params_presets_for: String::new(),
+            params_programs: Vec::new(),
+            params_programs_for: String::new(),
             auto_press_pt: None,
             auto_click_pt: None,
             export_fmt: 0,
@@ -3296,6 +3304,9 @@ impl App {
         let mut do_save = false;
         let mut do_del = false;
         let mut load_name: Option<String> = None;
+        // v60: program picked in the factory-program combo (applied
+        // after the row closes — same deferred-action shape as preset).
+        let mut pick_prog: Option<usize> = None;
         let total = entry.descs().iter().filter(|d| d.writable).count();
         ui.horizontal(|ui| {
             ui.label("filter");
@@ -3367,6 +3378,45 @@ impl App {
                     }
                 });
         });
+        // v60: factory-program row — the plugin's OWN shipped patches.
+        // One surface for instruments AND chain FX (this window serves
+        // every GuiTarget); backends/plugins reporting no programs skip
+        // the row entirely. VST2 today — VST3/CLAP gaps are documented
+        // in vsthost field docs, and empty() keeps them invisible.
+        if self.params_programs_for != entry.name() {
+            let nm = entry.name().to_string();
+            self.params_programs_for = nm.clone();
+            let ps = entry.programs();
+            self.params_programs = if ps.len() > 1 { ps } else { Vec::new() };
+        }
+        if !self.params_programs.is_empty() {
+            let cur = entry.current_program();
+            let sel = cur
+                .and_then(|i| self.params_programs.get(i).cloned())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            ui.horizontal(|ui| {
+                ui.label("program");
+                egui::ComboBox::from_id_salt("slooper_v60_programs")
+                    .selected_text(sel)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        let list = self.params_programs.clone();
+                        for (i, p) in list.iter().enumerate() {
+                            if ui
+                                .selectable_label(cur == Some(i), p.chars().take(40).collect::<String>())
+                                .clicked()
+                            {
+                                pick_prog = Some(i);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "factory patches built into the plugin \u{b7} picking one \
+                         changes the sound immediately",
+                    );
+            });
+        }
         let ql = new_filter.trim().to_lowercase();
         let rows: Vec<(usize, String)> = entry
             .descs()
@@ -3393,6 +3443,16 @@ impl App {
                 }
             });
         self.params_filter = new_filter;
+        // v60: apply the program picked this frame (deferred so the row
+        // closed before we touch self.status).
+        if let Some(i) = pick_prog {
+            let nm = self.params_programs.get(i).cloned().unwrap_or_default();
+            if entry.select_program(i) {
+                self.status = format!("program \u{2192} \u{201c}{nm}\u{201d} (live)");
+            } else {
+                self.status = format!("program \u{201c}{nm}\u{201d} refused by the plugin");
+            }
+        }
         // v34 R2: run the preset-bar actions collected this frame.
         if do_save {
             let nm = self.params_preset_name.clone();
@@ -3486,8 +3546,16 @@ impl App {
                     if let Some(rx) = open_rx.as_ref() {
                         match rx.try_recv() {
                             Ok(Ok(e)) => {
+                                let np = e.programs().len();
                                 *entry = Some(e);
-                                self.vst_note = format!("{name}: loaded");
+                                self.vst_note = if np > 1 {
+                                    format!(
+                                        "{name}: loaded \u{b7} {np} factory programs \
+                                         \u{b7} pick one in the parameters window"
+                                    )
+                                } else {
+                                    format!("{name}: loaded")
+                                };
                                 opened = true;
                             }
                             Ok(Err(err)) => {
@@ -35268,6 +35336,94 @@ mod tests {
         // The same open flagged user-initiated may arm the probe (or open
         // when the environment lacks the X display to probe — either is
         // acceptable; spawning a silent probe at BOOT is the forbidden one).
+    }
+
+    /// v60 R3/R4: the PARAMETERS window paints a factory-program combo
+    /// for a plugin that reports programs, picking a row switches the
+    /// LIVE plugin (verified through the entry), the plugin's answer
+    /// drives the combo label, and a status echo closes the feedback
+    /// loop. Quick tier: pure-C fixture dlopen (same class as the host
+    /// pins — no probe child, no C++ toolkit).
+    #[test]
+    fn v60_programs_ui_combo() {
+        let mut app = headless_app("v60prog");
+        // v39 parity with the v23 pin: close MASTER OUT early so extra
+        // dynamic windows never interfere.
+        app.show_master = false;
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        // Own copy (see the host pin): the fixture's program counter is
+        // one process-wide static per dlopened file.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v60-ui-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join(file);
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/w6")
+                .join(file),
+            &fixture,
+        )
+        .unwrap();
+        let load =
+            crate::vsthost::open(&fixture, crate::vsthost::VstKind::V2, 48_000, None)
+                .expect("w6 fixture opens");
+        let entry = load.entry;
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: fixture.display().to_string(),
+            kind: crate::vsthost::VstKind::V2,
+            plugin_id: None,
+            name: "w6".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.params_programs,
+            vec!["Init", "Fat", "Thin"],
+            "program cache fills from the entry"
+        );
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        // The combo leads with the CURRENT program name.
+        let combo = galley_at(&mut app, &ctx, "Init")
+            .expect("combo shows the current program")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "Fat")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert_eq!(entry.current_program(), Some(1), "the plugin switched");
+        assert!(
+            app.status.contains("Fat") && app.status.contains("program"),
+            "status echo closes the loop: {}",
+            app.status
+        );
+        // Next frame: the combo label follows the plugin's answer; clear
+        // the echo FIRST (it also contains "Fat" and would shadow the
+        // combo — the v56 galley-first-match trap).
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "Fat").is_some(),
+            "combo now leads with the switched-to program"
+        );
+        std::mem::forget(entry);
     }
 
     /// v23 gate pin (issue 3, UI half): a plugin with a CACHED-BAN verdict
