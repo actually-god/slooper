@@ -821,6 +821,7 @@ fn track_color_submenu(ui: &mut egui::Ui, app: &mut App, t: usize) -> bool {
             let nm = CLIP_PALETTE_NAMES[i];
             if ui
                 .button(RichText::new(format!("\u{25a0} {nm}")).color(*sw))
+                .on_hover_text("use this color for this track")
                 .clicked()
             {
                 pick = Some(Some(i as u8));
@@ -3603,7 +3604,7 @@ impl App {
                 .show_ui(ui, |ui| {
                     let list = self.params_presets.clone();
                     for p in list {
-                        if ui.selectable_label(false, &p).clicked() {
+                        if ui.selectable_label(false, &p).on_hover_text("load this preset").clicked() {
                             load_name = Some(p);
                         }
                     }
@@ -3663,6 +3664,7 @@ impl App {
                         for (i, p) in list.iter().enumerate() {
                             if ui
                                 .selectable_label(cur == Some(i), p.chars().take(40).collect::<String>())
+                                .on_hover_text(p.clone())
                                 .clicked()
                             {
                                 pick_prog = Some(i);
@@ -6035,7 +6037,7 @@ impl App {
                             .selected_text(c.name())
                             .show_ui(ui, |ui| {
                                 for k in SeCurve::ALL {
-                                    if ui.selectable_label(*c == k, k.name()).clicked() {
+                                    if ui.selectable_label(*c == k, k.name()).on_hover_text("fade curve shape: how the gain ramps").clicked() {
                                         *c = k;
                                     }
                                 }
@@ -7984,6 +7986,7 @@ impl App {
                     for t in 0..self.n_tracks {
                         if ui
                             .selectable_label(self.drum.track == t, format!("Track {}", t + 1))
+                            .on_hover_text("edit this track's drum kit")
                             .clicked()
                         {
                             self.drum.track = t;
@@ -8016,7 +8019,11 @@ impl App {
             // of the row when the drum machine starts/stops).
             let pp_btn = egui::Button::new(if playing { "\u{25a0} stop" } else { "play" })
                 .min_size(egui::vec2(56.0, 0.0));
-            if ui.add(pp_btn).clicked() {
+            if ui
+                .add(pp_btn)
+                .on_hover_text(if playing { "stop the pattern loop" } else { "play the kit in a loop" })
+                .clicked()
+            {
                 self.drum.playing = !self.drum.playing;
                 self.drum.step_start = self.backend.engine.pos();
                 self.drum.last_step = usize::MAX;
@@ -8202,7 +8209,7 @@ impl App {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(&ctx, |ui| {
                     ui.label(note);
-                    if ui.button("OK").clicked() {
+                    if ui.button("OK").on_hover_text("dismiss this notice").clicked() {
                         self.drum_commit_note = None;
                     }
                 });
@@ -8957,13 +8964,13 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Save as new asset + clip").clicked() {
+            if ui.button("Save as new asset + clip").on_hover_text("render the edits into a NEW sample and drop a clip").clicked() {
                 *action = 1;
             }
-            if ed.asset.is_some() && ui.button("Save (overwrite asset)").clicked() {
+            if ed.asset.is_some() && ui.button("Save (overwrite asset)").on_hover_text("bake the edits into the sample file behind this asset").clicked() {
                 *action = 2;
             }
-            if ui.button("Close").clicked() {
+            if ui.button("Close").on_hover_text("close this editor").clicked() {
                 *action = 3;
             }
             if ed.changed {
@@ -12679,6 +12686,7 @@ impl App {
             ui.label(RichText::new("mode \u{b7}").weak().small());
             if ui
                 .selectable_label(mode == 0, RichText::new("hard cutoff").small())
+                .on_hover_text("new notes hard-cut the old layer")
                 .clicked()
                 && mode != 0
             {
@@ -12690,6 +12698,7 @@ impl App {
             }
             if ui
                 .selectable_label(mode == 1, RichText::new("crossfade").small())
+                .on_hover_text("new notes fade in while the old layer fades out")
                 .clicked()
                 && mode != 1
             {
@@ -12700,7 +12709,7 @@ impl App {
                 }
             }
             ui.separator();
-            if ui.button(RichText::new("+ add sample").small()).clicked() {
+            if ui.button(RichText::new("+ add sample").small()).on_hover_text("add the selected asset as a new layer").clicked() {
                 let pick = self
                     .sel_asset
                     .filter(|k| audio_assets.iter().any(|(a, _)| a == k))
@@ -12758,7 +12767,7 @@ impl App {
                         );
                     }
                     for nm in names {
-                        if ui.selectable_label(false, &nm).clicked() {
+                        if ui.selectable_label(false, &nm).on_hover_text("use this preset").clicked() {
                             load_pick = Some(nm);
                         }
                     }
@@ -12870,7 +12879,7 @@ impl App {
                         .selected_text(RichText::new(cur).small())
                         .show_ui(&mut ch, |ui| {
                             for (k, nm) in &audio_assets {
-                                if ui.selectable_label(false, format!("#{k} {nm}")).clicked() {
+                                if ui.selectable_label(false, format!("#{k} {nm}")).on_hover_text("use this sample as the new layer").clicked() {
                                     new_asset = Some(
                                         self.assets[*k].path.to_string_lossy().into_owned(),
                                     );
@@ -13340,7 +13349,7 @@ impl App {
                             ui.label(RichText::new("no presets saved yet").weak().small());
                         }
                         for p in list {
-                            if ui.selectable_label(false, &p).clicked() {
+                            if ui.selectable_label(false, &p).on_hover_text("apply this preset to the synth").clicked() {
                                 self.synth_preset_apply(t, &p);
                             }
                         }
@@ -13397,6 +13406,7 @@ impl App {
                         // `changed` on a pick — watch the popup rows.
                         if ui
                             .selectable_label(cur == *k, format!("#{k} {name}"))
+                            .on_hover_text("switch the sampler to this sample")
                             .clicked()
                         {
                             picked = Some(*k);
@@ -13547,7 +13557,7 @@ impl App {
                         ui.label(RichText::new("no kits saved yet").weak().small());
                     }
                     for k in list {
-                        if ui.selectable_label(false, &k).clicked() {
+                        if ui.selectable_label(false, &k).on_hover_text("replace the kit with this preset").clicked() {
                             self.kit_preset_apply(t, &k);
                         }
                     }
@@ -13643,6 +13653,7 @@ impl App {
                             .show_ui(ui, |ui| {
                                 if ui
                                     .selectable_label(cur_path.is_empty(), "(silent)")
+                                    .on_hover_text("unassign the sample (pad stays silent)")
                                     .clicked()
                                 {
                                     kit[p].asset_path.clear();
@@ -13652,6 +13663,7 @@ impl App {
                                 for (path, nm) in &audio_rows {
                                     if ui
                                         .selectable_label(&cur_path == path, nm.as_str())
+                                        .on_hover_text("assign this sample to the pad")
                                         .clicked()
                                     {
                                         kit[p].asset_path = path.clone();
@@ -15632,11 +15644,12 @@ impl App {
                             egui::Button::new(egui::RichText::new("Import").strong())
                                 .min_size(egui::vec2(110.0, 0.0)),
                         )
+                        .on_hover_text("import the checked setup slices")
                         .clicked()
                     {
                         import = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").on_hover_text("close without importing").clicked() {
                         cancel = true;
                     }
                 });
@@ -17066,10 +17079,10 @@ impl App {
                         }
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Apply").clicked() {
+                        if ui.button("Apply").on_hover_text("rename the file on disk").clicked() {
                             apply = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").on_hover_text("keep the old name").clicked() {
                             cancel = true;
                         }
                     });
@@ -17110,10 +17123,10 @@ impl App {
                             .hint_text("kit/greens ('/' nests)"),
                     );
                     re.request_focus();
-                    if ui.button("Create").clicked() {
+                    if ui.button("Create").on_hover_text("create the sub-folder").clicked() {
                         create = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").on_hover_text("close without creating").clicked() {
                         cancel = true;
                     }
                     if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -17157,7 +17170,7 @@ impl App {
                         {
                             del = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").on_hover_text("keep the file (nothing is deleted)").clicked() {
                             cancel = true;
                         }
                     });
@@ -17202,10 +17215,10 @@ impl App {
                         self.value_dialog_focus = false;
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Apply").clicked() {
+                        if ui.button("Apply").on_hover_text("commit the typed value").clicked() {
                             apply = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").on_hover_text("keep the current value").clicked() {
                             cancel = true;
                         }
                     });
@@ -17452,7 +17465,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 // File actions; the master volume + peak meter moved to the top
                 // of the mixer dock (`master_strip`).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export").clicked() {
+                    if ui.button("Export").on_hover_text("open the export dialog").clicked() {
                         app.show_export = true;
                     }
                     if ui
@@ -19795,7 +19808,7 @@ fn window_slot_menu(ui: &mut egui::Ui, app: &mut App, idx: usize, done: &mut boo
         if docked && e == cur {
             continue;
         }
-        if ui.button(format!("dock to the {name} edge")).clicked() {
+        if ui.button(format!("dock to the {name} edge")).on_hover_text(format!("dock this panel to the {name} edge of the main window")).clicked() {
             let r = if docked {
                 app.dock_rects[idx]
             } else {
@@ -19835,12 +19848,12 @@ fn window_slot_menu(ui: &mut egui::Ui, app: &mut App, idx: usize, done: &mut boo
             }
         }
     }
-    if docked && is_tabbed(app, idx) && ui.button("detach into own slot").clicked() {
+    if docked && is_tabbed(app, idx) && ui.button("detach into own slot").on_hover_text("give this panel its own dock slot").clicked() {
         detach_tab(app, idx);
         *done = true;
         ui.close();
     }
-    if docked && ui.button("float out (free window)").clicked() {
+    if docked && ui.button("float out (free window)").on_hover_text("lift the panel into a floating window").clicked() {
         let r = app.dock_rects[idx];
         undock_to(app, idx, [r[0], r[1]]);
         app.dock_just_floated = Some(idx);
@@ -19873,7 +19886,7 @@ fn window_slot_menu(ui: &mut egui::Ui, app: &mut App, idx: usize, done: &mut boo
         }
     }
     ui.separator();
-    if ui.button("close this window").clicked() {
+    if ui.button("close this window").on_hover_text("hide this panel (the Windows menu re-opens it)").clicked() {
         set_visible(app, idx, false);
         *done = true;
         ui.close();
@@ -20982,7 +20995,7 @@ fn rack_file_row(
                 ui.close();
             }
         }
-        if ui.button("rename\u{2026}").clicked() {
+        if ui.button("rename\u{2026}").on_hover_text("rename this file on disk").clicked() {
             app.rack_rename = Some((fp_disp.clone(), name.to_string(), true));
             ui.close();
         }
@@ -20998,7 +21011,7 @@ fn rack_file_row(
                     ui.close();
                 }
                 for d in dirs {
-                    if ui.button(d.as_str()).clicked() {
+                    if ui.button(d.as_str()).on_hover_text("move this file into this folder").clicked() {
                         mv = Some(
                             std::iter::once(PathBuf::from(froot))
                                 .next()
@@ -21409,7 +21422,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     ui.id()
                                         .with(("rackdirg", &key, hr.rect.min.y as i32)),
                                     Sense::click_and_drag(),
-                                );
+                                )
+                                .on_hover_text(if open { "click to collapse · drag to move · right-click for the menu" }
+                                    else { "click to expand · drag to move · right-click for the menu" });
                                 if hg.clicked() {
                                     if open {
                                         app.rack_collapsed.insert(key.clone());
@@ -21492,7 +21507,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         mv = Some(-1i32);
                                         ui.close();
                                     }
-                                    if ui.button("down").clicked() {
+                                    if ui.button("down").on_hover_text("move this folder down in the list").clicked() {
                                         mv = Some(1);
                                         ui.close();
                                     }
@@ -21896,7 +21911,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                             ui.close();
                                         }
                                     }
-                                    if ui.button("rename\u{2026}").clicked() {
+                                    if ui.button("rename\u{2026}").on_hover_text("rename this folder on disk").clicked() {
                                         app.rack_rename =
                                             Some((apdisp.clone(), name.clone(), true));
                                         ui.close();
@@ -21911,14 +21926,14 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                                 .find(|o| o.folder == f.path)
                                                 .map(|o| o.dirs.clone())
                                                 .unwrap_or_default();
-                                            if ui.button("(primary root)").clicked() {
+                                            if ui.button("(primary root)").on_hover_text("move this folder into the library root").clicked() {
                                                 mv = Some(std::path::PathBuf::from(
                                                     f.path.trim(),
                                                 ));
                                                 ui.close();
                                             }
                                             for d in f.dirs_in_order(&pref) {
-                                                if ui.button(d.as_str()).clicked() {
+                                                if ui.button(d.as_str()).on_hover_text("move this folder here").clicked() {
                                                     mv = Some(
                                                         std::path::PathBuf::from(f.path.trim())
                                                             .join(d.replace(
@@ -23292,7 +23307,8 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 } else {
                     RichText::new(format!("[{tag}]  {label}"))
                 };
-                let resp = ui.add_sized([full_w, 24.0], egui::Button::new(txt).frame(false));
+                let resp = ui.add_sized([full_w, 24.0], egui::Button::new(txt).frame(false))
+                    .on_hover_text("switch this track to this instrument");
                 if resp.clicked() && !active {
                     pick = Some(stem);
                 }
@@ -25626,16 +25642,16 @@ fn grid_context_menu(
         if !app.is_sel(id) {
             app.select_one(id);
         }
-        if ui.button("Copy  (Ctrl+C)").clicked() {
+        if ui.button("Copy  (Ctrl+C)").on_hover_text("copy the selected clips to the clipboard").clicked() {
             app.clipboard_copy();
             ui.close();
         }
-        if ui.button("Cut  (Ctrl+X)").clicked() {
+        if ui.button("Cut  (Ctrl+X)").on_hover_text("copy the selection, then delete it").clicked() {
             app.clipboard_copy();
             app.delete_selection();
             ui.close();
         }
-        if ui.button("Duplicate  (Ctrl+D)").clicked() {
+        if ui.button("Duplicate  (Ctrl+D)").on_hover_text("copy the selection into new clips in place").clicked() {
             app.duplicate_selection();
             ui.close();
         }
@@ -25650,6 +25666,7 @@ fn grid_context_menu(
                     let nm = CLIP_PALETTE_NAMES[i];
                     if ui
                         .button(RichText::new(format!("\u{25a0} {nm}")).color(*sw))
+                        .on_hover_text("paint the selected clips this color")
                         .clicked()
                     {
                         pick = Some(Some(i as u8));
@@ -25712,12 +25729,12 @@ fn grid_context_menu(
                             } else {
                                 format!("child {}", lane)
                             };
-                            if ui.button(format!("lane {} ({})", lane + 1, name)).clicked() {
+                            if ui.button(format!("lane {} ({})", lane + 1, name)).on_hover_text("move the clip into this lane").clicked() {
                                 dest = Some((tt, Some(lane)));
                                 ui.close();
                             }
                         }
-                        if ui.button("new child lane").clicked() {
+                        if ui.button("new child lane").on_hover_text("append a lane and move the clip into it").clicked() {
                             dest = Some((tt, Some(nl)));
                             ui.close();
                         }
@@ -25763,7 +25780,7 @@ fn grid_context_menu(
             .assets
             .get(clips[ci].0.asset as usize)
             .is_some_and(|a| a.is_auto())
-            && ui.button("Edit automation curve").clicked()
+            && ui.button("Edit automation curve").on_hover_text("open this clip in the automation editor").clicked()
         {
             app.open_auto_editor(Some(clips[ci].0.asset as usize));
             ui.close();
@@ -26422,7 +26439,7 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Lock axis").clicked() {
+                        if ui.button("Lock axis").on_hover_text("freeze the detected control type and channel").clicked() {
                             act = Act::LockAxis;
                         }
                         ui.label(
@@ -26435,7 +26452,7 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                     ui.label(RichText::new(format!("2. Axis locked: {axis}")).strong());
                     ui.horizontal(|ui| {
                         ui.label(format!("minimum raw value: {}", kl.lo));
-                        if ui.button("Lock min").clicked() {
+                        if ui.button("Lock min").on_hover_text("accept this raw value as the axis minimum").clicked() {
                             act = Act::LockMin;
                         }
                     });
@@ -26479,10 +26496,10 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").on_hover_text("abandon the capture").clicked() {
                         act = Act::Cancel;
                     }
-                    if kl.has_axis && ui.button("Restart").clicked() {
+                    if kl.has_axis && ui.button("Restart").on_hover_text("start the capture over from step 1").clicked() {
                         act = Act::Restart;
                     }
                 });
@@ -26677,7 +26694,7 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
             ui.label("Destination:");
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut app.export_path).desired_width(290.0));
-                if ui.button("Browse…").clicked() {
+                if ui.button("Browse…").on_hover_text("choose the destination file").clicked() {
                     // No extension here — the Format dropdown adds it at
                     // export time (see `do_export`), so changing the format
                     // never means re-picking the destination.
@@ -26720,10 +26737,10 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("close without exporting").clicked() {
                     cancelled = true;
                 }
-                if ui.button("Export").clicked() {
+                if ui.button("Export").on_hover_text("render the mix to the chosen file").clicked() {
                     eprintln!("PP exporting");
         app.do_export();
         eprintln!("PP export queued");
@@ -26976,6 +26993,7 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                         .unwrap_or_else(|| s.clone());
                     if ui
                         .selectable_label(false, format!("{name}  ({s})"))
+                        .on_hover_text("add this effect to the chain")
                         .clicked()
                     {
                         app.add_fx_script(loop_i, s);
@@ -27032,7 +27050,7 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
     ui.label("Effects folder (Rust scripts):");
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut app.fx_dir_edit).desired_width(330.0));
-        if ui.button("Browse…").clicked() {
+        if ui.button("Browse…").on_hover_text("choose the user effects folder").clicked() {
             let mut dlg = rfd::FileDialog::new().set_title("Effects folder");
             if let Some(d) = app.pick_dir("effects") {
                 dlg = dlg.set_directory(d);
@@ -27485,6 +27503,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .selectable_label(app.sett_filter.is_empty(), "all")
+                    .on_hover_text("show every settings section")
                     .clicked()
                 {
                     app.sett_filter.clear();
@@ -27492,6 +27511,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 for (name, q) in SETTINGS_CHIPS {
                     if ui
                         .selectable_label(app.sett_filter.trim().eq_ignore_ascii_case(q), name)
+                        .on_hover_text("show only this section")
                         .clicked()
                     {
                         app.sett_filter = q.to_string();
@@ -27645,7 +27665,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             ui.horizontal(|ui| {
                 ui.label("latency (ms):");
                 ui.add(egui::TextEdit::singleline(&mut app.latency_ms).desired_width(60.0));
-                if ui.button("Apply").clicked() {
+                if ui.button("Apply").on_hover_text("send the offset to the audio engine").clicked() {
                     let ms = app.latency_ms.trim().parse::<f32>().unwrap_or(0.0).clamp(0.0, 1000.0);
                     app.latency_ms = format!("{ms}");
                     app.backend.cmd(Cmd::SetLatency { ms });
@@ -27760,7 +27780,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 {
                     app.save_config();
                 }
-                if ui.button("Browse…").clicked() {
+                if ui.button("Browse…").on_hover_text("choose the projects folder").clicked() {
                     let mut dlg = rfd::FileDialog::new().set_title("Projects folder");
                     if let Some(d) = app.pick_dir("projects") {
                         dlg = dlg.set_directory(d);
@@ -27970,7 +27990,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 &mut app.sel_out,
             );
             ui.horizontal(|ui| {
-                if ui.button("Apply Selection").clicked() {
+                if ui.button("Apply Selection").on_hover_text("map the selected inputs to the tracks").clicked() {
                     // Sort for deterministic slot assignment, so the same
                     // selection maps to the same slots across restarts.
                     let mut ins: Vec<String> = app.sel_in.iter().cloned().collect();
@@ -28003,7 +28023,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         "audio: all ports disconnected — tick ports, then Apply Selection"
                             .into();
                 }
-                if ui.button("Refresh").clicked() {
+                if ui.button("Refresh").on_hover_text("re-scan the JACK port list").clicked() {
                     app.backend.cmd(Cmd::Refresh);
                 }
             });
@@ -28105,7 +28125,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Apply Selection").clicked() {
+                    if ui.button("Apply Selection").on_hover_text("connect the selected MIDI ports").clicked() {
                         // Sorted for a stable config file; the backend
                         // opens in enumeration order either way.
                         let mut sel: Vec<String> =
@@ -28116,7 +28136,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         app.save_config();
                         app.status = "midi: selection applied".into();
                     }
-                    if ui.button("Refresh").clicked() {
+                    if ui.button("Refresh").on_hover_text("re-scan the JACK port list").clicked() {
                         app.backend.cmd(Cmd::Refresh);
                     }
                 });
@@ -28192,10 +28212,10 @@ fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui.button("Save").on_hover_text("write the project file").clicked() {
                     do_save = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("close the prompt without saving").clicked() {
                     app.show_save_prompt = false;
                 }
             });
@@ -28379,6 +28399,7 @@ fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
                         egui::Button::new(egui::RichText::new("Load").strong())
                             .min_size(egui::vec2(90.0, 0.0)),
                     )
+                    .on_hover_text("replace the current project with this file")
                     .clicked()
                 {
                     answer = Some(Some(path.clone()));
@@ -28393,7 +28414,7 @@ fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
                     app.do_save(&n);
                     answer = Some(Some(path.clone()));
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("keep the current project").clicked() {
                     answer = Some(None);
                 }
             });
@@ -50101,4 +50122,119 @@ mod tests {
         assert_eq!(app.assets.len(), n, "the rack dedups by path");
     }
 
+
+    /// v71 R1: EVERY button whose literal label is an action verb explains
+    /// itself on hover. Same statement-precise window as the v54 destructive
+    /// pin: the window ENDS at the button's own clicked() so a neighbour's
+    /// tooltip can never leak in and pass the check vacuously. Scope note:
+    /// the scan covers button affordances only — a list row whose label IS
+    /// its content (a sample name in the rack) is feedback-complete at
+    /// click time (the selection repaints) and is deliberately NOT hovered;
+    /// a tooltip there would just repeat the label.
+    #[test]
+    fn v71_action_buttons_explain_on_hover() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\n    mod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let lines: Vec<&str> = prod.lines().collect();
+        // Multi-word entries match by substring on the lowercased label;
+        // single words match WHOLE label tokens ("cut" hits "Cut (Ctrl+X)"
+        // but not "Execute"), words >= 6 chars may also match as substrings.
+        const WORDS: [&str; 31] = [
+            "apply", "cancel", "close", "save", "export", "import", "refresh",
+            "browse", "create", "rename", "dock to", "float out", "detach",
+            "lock axis", "lock min", "restart", "duplicate", "copy", "cut",
+            "edit automation", "new child", "primary root", "down",
+            "add sample", "play", "stop", "load", "ok", "wav", "assign",
+            "switch to",
+        ];
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (n, l) in lines.iter().enumerate() {
+            if !l.contains(".button(") && !l.contains("Button::new(") {
+                continue;
+            }
+            let s = l.trim_start();
+            if s.starts_with("//") {
+                continue;
+            }
+            // First string literal on the line = the button label.
+            let Some(a) = l.find('"') else { continue };
+            let rest = &l[a + 1..];
+            let Some(b) = rest.find('"') else { continue };
+            let label = &rest[..b];
+            let low = label.to_lowercase();
+            let toks: Vec<String> = low
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+                .collect();
+            let hit = WORDS.iter().any(|w| {
+                if let Some((head, tail)) = w.split_once(' ') {
+                    let _ = tail;
+                    return low.contains(w);
+                }
+                toks.iter().any(|t| t == w) || (w.len() >= 6 && low.contains(w))
+            });
+            if !hit {
+                continue;
+            }
+            // Statement window: label line through the button's OWN
+            // clicked(); no clicked() nearby -> 18-line cap.
+            let mut end = (n + 18).min(lines.len() - 1);
+            for (k, row) in lines[n..=end].iter().enumerate() {
+                if row.contains("clicked()") || row.contains("clicked_by") {
+                    end = n + k;
+                    break;
+                }
+            }
+            let win: String = lines[n..=end].join(" ").to_lowercase();
+            if win.contains("on_hover") {
+                checked += 1;
+            } else {
+                offenders.push(format!("src/ui.rs:{}: {}", n + 1, s));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "action buttons without hover explanation:\n{}",
+            offenders.join("\n")
+        );
+        assert!(
+            checked >= 55,
+            "scan found only {checked} action buttons \u{b7} broken scan"
+        );
+    }
+
+    /// v71 R3: the new tooltips RENDER, not just compile: hover_until_tip
+    /// polls real frames until the tooltip galley paints.
+    #[test]
+    fn v71_new_tooltips_paint() {
+        let mut app = headless_app("v71tip1");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_save_prompt = true;
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "Save").expect("Save painted");
+        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["write the project file"]);
+        assert!(
+            texts.iter().any(|t| t.contains("write the project file")),
+            "SAVE PROJECT Save must tooltip what it does; galleys: {texts:?}"
+        );
+        let mut app2 = headless_app("v71tip2");
+        let ctx2 = egui::Context::default();
+        frame(&mut app2, &ctx2, vec![]);
+        app2.show_settings = true;
+        app2.sett_filter = "audio ports".into();
+        frame(&mut app2, &ctx2, vec![]);
+        let r2 = painted_text_rect(&ctx2, &mut app2, "Refresh")
+            .expect("ports Refresh painted");
+        let texts2 = hover_until_tip(&mut app2, &ctx2, r2.center(), &["re-scan the JACK"]);
+        assert!(
+            texts2.iter().any(|t| t.contains("re-scan the JACK port list")),
+            "ports Refresh must tooltip its rescan; galleys: {texts2:?}"
+        );
+    }
 }
