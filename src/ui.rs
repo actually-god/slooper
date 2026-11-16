@@ -1737,6 +1737,11 @@ pub struct App {
     params_preset_name: String,
     params_presets: Vec<String>,
     params_presets_for: String,
+    /// v65: synth-window preset bar — name buffer + cached preset list
+    /// keyed by synth STEM (same refresh pattern as `params_presets`).
+    synth_preset_name: String,
+    synth_presets: Vec<String>,
+    synth_presets_for: String,
     /// v60: factory program list shown by the parameter bar + the plugin
     /// name it was cached from (same refresh pattern as `params_presets`).
     /// Empty when the backend/plugin reports no programs — then the row
@@ -2295,6 +2300,9 @@ impl App {
             params_preset_name: String::new(),
             params_presets: Vec::new(),
             params_presets_for: String::new(),
+            synth_preset_name: String::new(),
+            synth_presets: Vec::new(),
+            synth_presets_for: String::new(),
             params_programs: Vec::new(),
             params_programs_for: String::new(),
             params_prog_sync_at: 0.0,
@@ -12033,6 +12041,173 @@ impl App {
         }
     }
 
+    // ---- v65: script-synth user presets ------------------------------------
+    // Goal-5 parity: script FX (v0.13), hosted plugins (v34 R2) and the
+    // sampler key map (v56) all had named presets; the script-synth slider
+    // window had NONE. Files live under data_dir()/synth-presets/<stem>/ —
+    // PER STEM, so a piano preset never shows up in the fm picker. Values
+    // are the POSITIONAL slider table (same shape as Config
+    // track_synth_params and the v61 templates) and load through
+    // synth::seed_values against the LIVE desc, so a preset written
+    // against an older/newer script layout degrades to desc defaults
+    // instead of bricking the instrument (the fx.rs preset rule).
+    // The sanitizer is deliberately shared with v56/v61 (no traversal).
+
+    fn synth_preset_dir(stem: &str) -> PathBuf {
+        let slug = Self::sampler_preset_sanitize(stem);
+        crate::paths::data_dir().join("synth-presets").join(if slug.is_empty() {
+            "synth".to_string()
+        } else {
+            slug
+        })
+    }
+    fn list_synth_presets(stem: &str) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(Self::synth_preset_dir(stem))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().is_some_and(|x| x == "json") {
+                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+    /// The (stem, desc) pair a synth-preset action needs, or None when
+    /// the track has no SCRIPT synth (no binding / hosted instrument —
+    /// the window itself never paints the bar there, the guard keeps the
+    /// methods honest).
+    fn synth_preset_ctx(&self, t: usize) -> Option<(String, crate::synth::SynthDesc)> {
+        let stem = self.track_synth.get(t)?.clone()?;
+        let desc = self.synth_registry.desc(&stem).cloned()?;
+        match self.track_synth_inst.get(t)?.as_ref().map(|h| h.as_ref())? {
+            SynthHandle::Script(_) => Some((stem, desc)),
+            SynthHandle::Vst(_) => None,
+        }
+    }
+    /// Every preset action shares one refusal echo for a track the bar
+    /// cannot act on (kept in ONE string so pins can assert it verbatim).
+    const NO_SCRIPT_SYNTH: &'static str = "synth preset: this track has no script synth";
+
+    fn synth_preset_save(&mut self, t: usize) {
+        let name = Self::sampler_preset_sanitize(&self.synth_preset_name.clone());
+        if name.is_empty() {
+            self.status = "synth preset: type a name first".into();
+            return;
+        }
+        let Some((stem, _)) = self.synth_preset_ctx(t) else {
+            self.status = Self::NO_SCRIPT_SYNTH.into();
+            return;
+        };
+        // The snapshot reads the LIVE instance — exactly what the sliders
+        // just moved, not the table (which the frame-end refresh mirrors).
+        let Some(inst) = (match self.track_synth_inst[t].as_ref().map(|h| h.as_ref()) {
+            Some(SynthHandle::Script(i)) => Some(i.clone()),
+            _ => None,
+        }) else {
+            self.status = Self::NO_SCRIPT_SYNTH.into();
+            return;
+        };
+        let vals = inst.values();
+        let rec = crate::config::SynthPresetSave {
+            synth: stem.clone(),
+            name: name.clone(),
+            values: vals.clone(),
+        };
+        let dir = Self::synth_preset_dir(&stem);
+        let res = std::fs::create_dir_all(&dir).and_then(|()| {
+            let js = serde_json::to_string_pretty(&rec)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            std::fs::write(dir.join(format!("{name}.json")), js)
+        });
+        match res {
+            Ok(()) => {
+                self.synth_presets = Self::list_synth_presets(&stem);
+                self.synth_presets_for = stem;
+                self.status = format!("synth preset saved: {name} ({} params)", vals.len());
+            }
+            Err(e) => self.status = format!("synth preset save failed: {e}"),
+        }
+    }
+    fn synth_preset_apply(&mut self, t: usize, preset: &str) {
+        let name = preset.to_string();
+        let Some((stem, desc)) = self.synth_preset_ctx(t) else {
+            self.status = Self::NO_SCRIPT_SYNTH.into();
+            return;
+        };
+        // The picker rows are file stems — re-sanitize so a hand-built
+        // call can never escape the stem folder either.
+        let p = Self::synth_preset_dir(&stem)
+            .join(format!("{}.json", Self::sampler_preset_sanitize(&name)));
+        let parsed = std::fs::read_to_string(&p)
+            .map_err(|e| e.to_string())
+            .and_then(|s| {
+                serde_json::from_str::<crate::config::SynthPresetSave>(&s)
+                    .map_err(|e| e.to_string())
+            });
+        match parsed {
+            Ok(rec) => {
+                let vals = synth::seed_values(&rec.values, &desc);
+                if let Some(h) = self.track_synth_inst[t].as_ref() {
+                    if let SynthHandle::Script(i) = h.as_ref() {
+                        for (k, v) in vals.iter().enumerate() {
+                            i.set_param(k, *v);
+                        }
+                        // Canonical table refresh (same shape as the
+                        // slider-commit path) so save/project carry it.
+                        self.track_synth_params[t] = i.values();
+                    }
+                }
+                self.save_config();
+                self.status = format!("synth preset {name}: {} params loaded", vals.len());
+            }
+            Err(e) => self.status = format!("synth preset load failed: {e}"),
+        }
+    }
+    fn synth_preset_delete(&mut self, t: usize) {
+        let name = Self::sampler_preset_sanitize(&self.synth_preset_name.clone());
+        if name.is_empty() {
+            self.status = "synth preset: type the preset name to delete first".into();
+            return;
+        }
+        let Some((stem, _)) = self.synth_preset_ctx(t) else {
+            self.status = Self::NO_SCRIPT_SYNTH.into();
+            return;
+        };
+        let p = Self::synth_preset_dir(&stem).join(format!("{name}.json"));
+        match std::fs::remove_file(&p) {
+            Ok(()) => {
+                self.synth_presets = Self::list_synth_presets(&stem);
+                self.synth_presets_for = stem;
+                self.status = format!("synth preset deleted: {name}");
+            }
+            Err(e) => self.status = format!("synth preset delete failed: {e}"),
+        }
+    }
+    fn synth_preset_defaults(&mut self, t: usize) {
+        let Some((stem, desc)) = self.synth_preset_ctx(t) else {
+            self.status = Self::NO_SCRIPT_SYNTH.into();
+            return;
+        };
+        let vals = synth::seed_values(&[], &desc);
+        if let Some(h) = self.track_synth_inst[t].as_ref() {
+            if let SynthHandle::Script(i) = h.as_ref() {
+                for (k, v) in vals.iter().enumerate() {
+                    i.set_param(k, *v);
+                }
+                self.track_synth_params[t] = i.values();
+            }
+        }
+        self.save_config();
+        self.status = format!("synth {stem}: defaults restored ({} params)", vals.len());
+    }
+
     // ---- v61 (S12): track templates ---------------------------------------
     // A template is ONE track's complete instrument setup: synth binding
     // (+params+state), the FX chain, mixer vol/pan/gain and the track
@@ -12881,6 +13056,70 @@ impl App {
         // drop target instead of a blind 0..63 id slider — the user
         // could not tell which asset any id was, let alone pick one.
         let sampler = desc.params.first().is_some_and(|p| p.label == "asset");
+
+        // v65: the SAMPLER window carries the richer v56 key-map preset
+        // bar already; painting the generic bar too would stack TWO bars
+        // labeled save/load in one window (label shadowing on screen AND
+        // in galley reads). Generic script synths get the v65 bar.
+        if !sampler {
+            // ---- v65: user-preset bar for SCRIPT synths (goal-5 parity with
+            // the FX, hosted-plugin and sampler bars). One row, same labels
+            // and shapes as the v34 plugin bar; delete lives inside the
+            // picker exactly like there. Values are positional and load
+            // through the desc, so stale presets can never brick the synth.
+            if self.synth_presets_for != stem {
+                self.synth_presets_for = stem.clone();
+                self.synth_presets = Self::list_synth_presets(&stem);
+            }
+            ui.horizontal(|ui| {
+                ui.label("user preset");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.synth_preset_name)
+                        .hint_text("preset name")
+                        .desired_width(110.0),
+                );
+                if ui
+                    .button("save")
+                    .on_hover_text("save the current slider values as a named preset for this synth")
+                    .clicked()
+                {
+                    self.synth_preset_save(t);
+                }
+                let pick = egui::ComboBox::from_id_salt(("synth_preset_pick", t))
+                    .selected_text("load")
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        let list = self.synth_presets.clone();
+                        if list.is_empty() {
+                            ui.label(RichText::new("no presets saved yet").weak().small());
+                        }
+                        for p in list {
+                            if ui.selectable_label(false, &p).clicked() {
+                                self.synth_preset_apply(t, &p);
+                            }
+                        }
+                        if !self.synth_presets.is_empty() {
+                            ui.separator();
+                            if ui
+                                .button("delete named preset")
+                                .on_hover_text("delete the preset whose name is in the box")
+                                .clicked()
+                            {
+                                self.synth_preset_delete(t);
+                            }
+                        }
+                    });
+                pick.response
+                    .on_hover_text("load a saved preset \u{2014} it lands on the live instrument");
+                if ui
+                    .button("defaults")
+                    .on_hover_text("set every slider back to this synth's built-in defaults")
+                    .clicked()
+                {
+                    self.synth_preset_defaults(t);
+                }
+            });
+        }
         if sampler {
             let cur = vals.first().copied().unwrap_or(0.0).round() as usize;
             let cur_name = audio_assets
@@ -47946,5 +48185,318 @@ mod tests {
             2,
             "no stale note paste happened"
         );
+    }
+
+    // ================= v65: script-synth user presets ======================
+    // (requirements list: scratch slooper-v65/REQUIREMENTS.md — goal-5
+    // parity: FX (v0.13), hosted plugins (v34) and the sampler (v56) all
+    // had named presets; the script-synth window had none.)
+
+    /// v65 helper: headless app with the SCRIPT piano bound to track 0
+    /// and its slider window open (the preset bar lives in that body —
+    /// the same fn the docked panel draws).
+    fn v65_synth_win(tag: &str) -> (App, egui::Context) {
+        let mut app = headless_app(tag);
+        let ctx = egui::Context::default();
+        app.set_track_synth_stem(0, "piano"); // script stem: sync bind
+        for _ in 0..200 {
+            frame(&mut app, &ctx, vec![]);
+            if app.synth_registry.desc("piano").is_some()
+                && matches!(
+                    app.track_synth_inst[0].as_ref().map(|h| h.as_ref()),
+                    Some(SynthHandle::Script(_))
+                )
+            {
+                break;
+            }
+        }
+        assert!(
+            matches!(
+                app.track_synth_inst[0].as_ref().map(|h| h.as_ref()),
+                Some(SynthHandle::Script(_))
+            ),
+            "piano script instance bound: {}",
+            app.status
+        );
+        app.synth_win = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "user preset").is_some(),
+            "preset bar painted in the synth window (status {:?})",
+            app.status
+        );
+        (app, ctx)
+    }
+
+    /// v65 helper: name the preset through the real TextEdit, then click
+    /// the window's save button (windows paint last → click_last).
+    fn v65_name_and_save(app: &mut App, ctx: &egui::Context, name: &str) {
+        let ed = galley_at(app, ctx, "preset name")
+            .expect("preset TextEdit")
+            .center();
+        click_pt(app, ctx, ed);
+        type_into_focused(app, ctx, name);
+        click_last(app, ctx, "save");
+    }
+
+    /// v65 helper: live piano instance for value asserts.
+    fn v65_piano(app: &App) -> std::sync::Arc<crate::synth::Instance> {
+        match app.track_synth_inst[0].as_ref().map(|h| h.as_ref()) {
+            Some(SynthHandle::Script(i)) => i.clone(),
+            _ => panic!("piano script instance expected"),
+        }
+    }
+
+    #[test]
+    fn v65_synth_preset_save_writes_file() {
+        let (mut app, ctx) = v65_synth_win("v65save");
+        let inst = v65_piano(&app);
+        inst.set_param(0, 0.31);
+        inst.set_param(1, 0.72);
+        v65_name_and_save(&mut app, &ctx, "warm");
+        assert!(
+            app.status.contains("synth preset saved: warm (2 params)"),
+            "echo: {}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("synth-presets").join("piano");
+        assert!(
+            dir.to_string_lossy().contains("sp-uity"),
+            "presets must sandbox with the test HOME: {dir:?}"
+        );
+        let js = std::fs::read_to_string(dir.join("warm.json")).expect("preset file");
+        let rec: crate::config::SynthPresetSave =
+            serde_json::from_str(&js).expect("preset json");
+        assert_eq!(rec.synth, "piano");
+        assert_eq!(rec.name, "warm");
+        assert_eq!(rec.values.len(), 2);
+        assert!((rec.values[0] - 0.31).abs() < 1e-6, "{:?}", rec.values);
+        assert!((rec.values[1] - 0.72).abs() < 1e-6, "{:?}", rec.values);
+    }
+
+    #[test]
+    fn v65_synth_preset_load_restores_values() {
+        let (mut app, ctx) = v65_synth_win("v65load");
+        let inst = v65_piano(&app);
+        inst.set_param(0, 0.31);
+        inst.set_param(1, 0.72);
+        v65_name_and_save(&mut app, &ctx, "warm");
+        // Wreck the live values, then restore through the picker. The
+        // status echo AND the name box both contain "warm" and paint
+        // before the popup — clear them first (v56 shadowing lesson).
+        inst.set_param(0, 0.01);
+        app.status = String::new();
+        app.synth_preset_name.clear();
+        frame(&mut app, &ctx, vec![]);
+        click_last(&mut app, &ctx, "load");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "warm")
+            .expect("preset row in the popup")
+            .center();
+        click_pt(&mut app, &ctx, row);
+        let after = v65_piano(&app).values();
+        assert!(
+            (after[0] - 0.31).abs() < 1e-6 && (after[1] - 0.72).abs() < 1e-6,
+            "load must move the LIVE instance: {after:?}"
+        );
+        assert_eq!(
+            app.track_synth_params[0], after,
+            "the table the Config/project save ride must follow"
+        );
+        assert!(
+            app.status.contains("synth preset warm: 2 params loaded"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v65_synth_preset_delete_removes_file() {
+        let (mut app, ctx) = v65_synth_win("v65del");
+        v65_name_and_save(&mut app, &ctx, "doomed");
+        let f = crate::paths::data_dir()
+            .join("synth-presets")
+            .join("piano")
+            .join("doomed.json");
+        assert!(f.exists(), "the save must have landed first");
+        // The name box still carries "doomed" — that is the contract the
+        // delete row explains on hover. Open the picker and click it.
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        click_last(&mut app, &ctx, "load");
+        frame(&mut app, &ctx, vec![]);
+        let row = galley_at(&mut app, &ctx, "delete named preset")
+            .expect("delete row inside the picker")
+            .center();
+        click_pt(&mut app, &ctx, row);
+        assert!(!f.exists(), "delete must remove exactly the named file");
+        assert_eq!(
+            App::list_synth_presets("piano"),
+            Vec::<String>::new(),
+            "the cached folder must be empty afterwards"
+        );
+        assert!(
+            app.status.contains("synth preset deleted: doomed"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v65_synth_preset_name_sanitized() {
+        let (mut app, ctx) = v65_synth_win("v65sanit");
+        v65_name_and_save(&mut app, &ctx, "../evil");
+        let root = crate::paths::data_dir().join("synth-presets");
+        assert!(root.to_string_lossy().contains("sp-uity"));
+        let dir = root.join("piano");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("preset dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["evil.json".to_string()], "{names:?}");
+        assert!(
+            !crate::paths::data_dir().join("evil.json").exists(),
+            "traversal must never escape the stem folder"
+        );
+    }
+
+    #[test]
+    fn v65_synth_preset_empty_name_echo() {
+        let (mut app, ctx) = v65_synth_win("v65empty");
+        click_last(&mut app, &ctx, "save");
+        assert!(
+            app.status.contains("synth preset: type a name first"),
+            "echo: {}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("synth-presets");
+        assert!(
+            !dir.join("piano").exists(),
+            "a refused save must not create anything: {:?}",
+            dir.join("piano")
+        );
+    }
+
+    #[test]
+    fn v65_synth_preset_defaults_resets_sliders() {
+        let (mut app, ctx) = v65_synth_win("v65dflt");
+        let desc = app.synth_registry.desc("piano").unwrap().clone();
+        let want = crate::synth::seed_values(&[], &desc);
+        let inst = v65_piano(&app);
+        inst.set_param(0, 0.0);
+        inst.set_param(1, 0.0);
+        click_last(&mut app, &ctx, "defaults");
+        let after = v65_piano(&app).values();
+        assert_eq!(after, want, "defaults must land on the desc defaults");
+        assert_eq!(app.track_synth_params[0], want);
+        assert!(
+            app.status.contains("synth piano: defaults restored (2 params)"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v65_synth_preset_per_stem_lists() {
+        let (mut app, ctx) = v65_synth_win("v65stem");
+        v65_name_and_save(&mut app, &ctx, "warm");
+        // Rebind to a DIFFERENT script synth: its picker must be its own.
+        app.set_track_synth_stem(0, "fm");
+        for _ in 0..200 {
+            frame(&mut app, &ctx, vec![]);
+            if matches!(
+                app.track_synth_inst[0].as_ref().map(|h| h.as_ref()),
+                Some(SynthHandle::Script(_))
+            ) && app.synth_registry.desc("fm").is_some()
+            {
+                break;
+            }
+        }
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.synth_presets_for, "fm", "cache follows the stem");
+        assert!(
+            app.synth_presets.is_empty(),
+            "fm must not see piano presets: {:?}",
+            app.synth_presets
+        );
+        // Back to piano: the list comes right back.
+        app.set_track_synth_stem(0, "piano");
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.synth_presets, vec!["warm".to_string()]);
+    }
+
+    /// v65 R8 (the guard's SCOPE, v64 lesson): the generic bar is hidden
+    /// in the SAMPLER window — the v56 key-map bar owns that window's
+    /// preset surface (two bars labeled save/load would shadow each
+    /// other on screen and in every galley read).
+    #[test]
+    fn v65_synth_preset_bar_hidden_for_sampler() {
+        let (mut app, ctx) = v56_open_sampler_map("v65gate");
+        // The synth window is open with the v56 bar painted ("preset
+        // name"): the generic bar's OWN label must be absent.
+        assert!(
+            galley_at(&mut app, &ctx, "preset name").is_some(),
+            "the v56 sampler preset bar must still paint"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "user preset").is_none(),
+            "the generic v65 bar must NOT stack onto the sampler window"
+        );
+    }
+
+    /// v65 R6 (goal 1): every new affordance carries a hover tooltip.
+    /// Source-scan invariant in the v54 style: each button statement,
+    /// windowed to its OWN clicked(), must contain on_hover_text.
+    #[test]
+    fn v65_synth_preset_bar_hovers() {
+        let srcs = include_str!("ui.rs");
+        let start = srcs
+            .find("v65: user-preset bar for SCRIPT synths")
+            .expect("bar present");
+        let end = srcs[start..]
+            .find("let vals = inst.values();")
+            .map(|i| start + i)
+            .expect("bar block ends");
+        let bar = &srcs[start..end];
+        let lines: Vec<&str> = bar.lines().collect();
+        let mut checked = 0usize;
+        for label in ["\"save\"", "\"delete named preset\"", "\"defaults\""] {
+            let n = lines
+                .iter()
+                .position(|l| l.contains(".button(") && l.contains(label))
+                .unwrap_or_else(|| panic!("button {label} vanished from the bar"));
+            let mut stop = lines.len() - 1;
+            for (k, row) in lines[n..].iter().enumerate() {
+                if row.contains("clicked()") {
+                    stop = n + k;
+                    break;
+                }
+            }
+            let win: String = lines[n..=stop].join(" ");
+            assert!(
+                win.contains("on_hover_text"),
+                "preset bar button {label} carries no hover explanation"
+            );
+            checked += 1;
+        }
+        // The picker itself: from the ComboBox line through the
+        // on_hover_text attached to its response.
+        let combo = lines
+            .iter()
+            .position(|l| l.contains("from_id_salt((\"synth_preset_pick\""))
+            .expect("picker vanished");
+        let tail: String = lines[combo..].join(" ");
+        let resp = tail
+            .find("pick.response")
+            .expect("combo response must be captured");
+        let seg = &tail[resp..resp + 120.min(tail.len() - resp)];
+        assert!(
+            seg.contains(".on_hover_text("),
+            "picker hover must attach to the ComboBox response"
+        );
+        checked += 1;
+        assert_eq!(checked, 4, "broken scan");
     }
 }
