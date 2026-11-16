@@ -3354,7 +3354,7 @@ impl App {
             .descs()
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.writable)
+            .filter(|(_, d)| d.writable && !d.program_change)
             .map(|(k, _)| (k, entry.params().get(k)))
             .collect();
         let json: String = serde_json::to_string(
@@ -3468,7 +3468,7 @@ impl App {
         // v60: program picked in the factory-program combo (applied
         // after the row closes — same deferred-action shape as preset).
         let mut pick_prog: Option<usize> = None;
-        let total = entry.descs().iter().filter(|d| d.writable).count();
+        let total = entry.descs().iter().filter(|d| d.writable && !d.program_change).count();
         ui.horizontal(|ui| {
             ui.label("filter");
             ui.add(
@@ -3519,7 +3519,7 @@ impl App {
                 do_save = true;
             }
             egui::ComboBox::from_id_salt("slooper_param_presets")
-                .selected_text("Load\u{25be}")
+                .selected_text("Load")
                 .width(150.0)
                 .show_ui(ui, |ui| {
                     let list = self.params_presets.clone();
@@ -3542,8 +3542,9 @@ impl App {
         // v60: factory-program row — the plugin's OWN shipped patches.
         // One surface for instruments AND chain FX (this window serves
         // every GuiTarget); backends/plugins reporting no programs skip
-        // the row entirely. VST2 today — VST3/CLAP gaps are documented
-        // in vsthost field docs, and empty() keeps them invisible.
+        // the row entirely. VST2 since v60, VST3 since v66 (IUnitInfo
+        // program lists + the program-change parameter, the documented
+        // gap now closed); CLAP presets too.
         if self.params_programs_for != entry.name() {
             let nm = entry.name().to_string();
             self.params_programs_for = nm.clone();
@@ -3599,7 +3600,7 @@ impl App {
             .descs()
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.writable)
+            .filter(|(_, d)| d.writable && !d.program_change)
             .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
             .take(400)
             .map(|(k, d)| (k, d.name.clone()))
@@ -7432,7 +7433,7 @@ impl App {
                                     if let SynthHandle::Vst(e) = h.as_ref() {
                                         let nm = e.name().to_string();
                                         for (k, d) in e.descs().iter().enumerate() {
-                                            if d.writable {
+                                            if d.writable && !d.program_change {
                                                 es.push((format!("synth:{k}"), d.name.clone()));
                                             }
                                         }
@@ -7457,7 +7458,7 @@ impl App {
                                         e.descs()
                                             .iter()
                                             .enumerate()
-                                            .filter(|(_, d)| d.writable)
+                                            .filter(|(_, d)| d.writable && !d.program_change)
                                             .map(|(k, d)| (format!("fx:{r}:{k}"), d.name.clone()))
                                             .collect(),
                                     ),
@@ -20430,7 +20431,7 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
         } else if let Some(Some(h)) = app.track_synth_inst.get(t) {
             if let SynthHandle::Vst(e) = h.as_ref() {
                 for (k, d) in e.descs().iter().enumerate() {
-                    if d.writable {
+                    if d.writable && !d.program_change {
                         out.push((format!("synth:{k}"), format!("synth \u{b7} {}", d.name)));
                     }
                 }
@@ -20446,7 +20447,7 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
                     ..
                 } => {
                     for (k, d) in e.descs().iter().enumerate() {
-                        if d.writable {
+                        if d.writable && !d.program_change {
                             out.push((format!("fx:{r}:{k}"), format!("{name} \u{b7} {}", d.name)));
                         }
                     }
@@ -36733,6 +36734,89 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert!(
             galley_at(&mut app, &ctx, "Fat").is_some(),
+            "combo now leads with the switched-to program"
+        );
+        std::mem::forget(entry);
+    }
+
+    /// v66 (goal 3/5, UI half): the v60 program combo must work for a
+    /// VST3 too — the fixture's IUnitInfo list fills it, a row picks the
+    /// program on the LIVE plugin (mirror relay + refresh adoption), the
+    /// answer drives the label, the status echo closes the loop, and the
+    /// program-change param is NOT rendered as a redundant knob row.
+    #[test]
+    fn v66_params_window_program_combo_vst3() {
+        let mut app = headless_app("v66prog");
+        app.show_master = false;
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/v66")
+            .join(file);
+        assert!(fixture.is_file(), "v66 fixture missing (build script)");
+        let load = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let entry = load.entry;
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: fixture.display().to_string(),
+            kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
+            name: "v66".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.params_programs,
+            vec!["init", "pluck", "bass", "lead"],
+            "program cache fills from the VST3 unit list"
+        );
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        // The knob grid carries "level" but NOT the program parameter:
+        // its cell belongs to the combo (goal 4: one surface, no
+        // redundant knob that would fight it). The program row's own
+        // label is literally "program", so "hidden" means exactly ONE
+        // such galley on screen (the label) — a knob would add a second.
+        assert!(galley_at(&mut app, &ctx, "level").is_some(), "normal knob paints");
+        assert_eq!(
+            galley_centers(&mut app, &ctx, "program", true).len(),
+            1,
+            "program-change param hidden from the knob list (only the row label paints)"
+        );
+        // The combo leads with the CURRENT program name.
+        let combo = galley_at(&mut app, &ctx, "init")
+            .expect("combo shows the current program")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "pluck")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        // The UI row -> select_program -> mirror -> refresh_program
+        // chain: the combo's own read-back adopts the value.
+        assert_eq!(entry.current_program(), Some(1), "the plugin switched");
+        assert!(
+            app.status.contains("pluck") && app.status.contains("program"),
+            "status echo closes the loop: {}",
+            app.status
+        );
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "pluck").is_some(),
             "combo now leads with the switched-to program"
         );
         std::mem::forget(entry);
