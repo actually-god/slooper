@@ -49439,7 +49439,7 @@ mod tests {
         drag_pt(&mut app, &ctx, from, to);
         frame(&mut app, &ctx, vec![]);
         assert!(
-            app.trk_vol[1] > 110,
+            app.trk_vol[1] > 118,
             "vertical drag toward the TOP raised the volume (now {})",
             app.trk_vol[1]
         );
@@ -49454,7 +49454,7 @@ mod tests {
         );
         frame(&mut app, &ctx, vec![]);
         assert!(
-            app.trk_gain[1] < 20,
+            app.trk_gain[1] < 10,
             "gain fader drags down too (now {})",
             app.trk_gain[1]
         );
