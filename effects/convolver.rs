@@ -562,7 +562,8 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
 // PARAM DISPLAY METADATA (ABI v4). Units drive the auto window + v53 kit
 // tooltips; steps/pickers mirror the quantization `process` already applies.
 // ---------------------------------------------------------------------------
-static META: [ParamMetaV1; 3] = [
+static META: [ParamMetaV1; 4] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 1.0, labels: core::ptr::null(), n_labels: 0 },
     ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
     ParamMetaV1 { unit: SLOOPER_UNIT_TIMES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
     ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
