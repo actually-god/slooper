@@ -13050,69 +13050,76 @@ impl App {
             ui.label(RichText::new(format!("by {a}")).weak().small());
         }
         ui.separator();
-        // ---- v65: user-preset bar for SCRIPT synths (goal-5 parity with
-        // the FX, hosted-plugin and sampler bars). One row, same labels
-        // and shapes as the v34 plugin bar; delete lives inside the
-        // picker exactly like there. Values are positional and load
-        // through the desc, so stale presets can never brick the synth.
-        if self.synth_presets_for != stem {
-            self.synth_presets_for = stem.clone();
-            self.synth_presets = Self::list_synth_presets(&stem);
-        }
-        ui.horizontal(|ui| {
-            ui.label("user preset");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.synth_preset_name)
-                    .hint_text("preset name")
-                    .desired_width(110.0),
-            );
-            if ui
-                .button("save")
-                .on_hover_text("save the current slider values as a named preset for this synth")
-                .clicked()
-            {
-                self.synth_preset_save(t);
-            }
-            let pick = egui::ComboBox::from_id_salt(("synth_preset_pick", t))
-                .selected_text("load")
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    let list = self.synth_presets.clone();
-                    if list.is_empty() {
-                        ui.label(RichText::new("no presets saved yet").weak().small());
-                    }
-                    for p in list {
-                        if ui.selectable_label(false, &p).clicked() {
-                            self.synth_preset_apply(t, &p);
-                        }
-                    }
-                    if !self.synth_presets.is_empty() {
-                        ui.separator();
-                        if ui
-                            .button("delete named preset")
-                            .on_hover_text("delete the preset whose name is in the box")
-                            .clicked()
-                        {
-                            self.synth_preset_delete(t);
-                        }
-                    }
-                });
-            pick.response
-                .on_hover_text("load a saved preset \u{2014} it lands on the live instrument");
-            if ui
-                .button("defaults")
-                .on_hover_text("set every slider back to this synth's built-in defaults")
-                .clicked()
-            {
-                self.synth_preset_defaults(t);
-            }
-        });
         let vals = inst.values();
         // A synth whose FIRST param is named "asset" samples rack
         // audio (the bundled sampler): give it a named picker and a
         // drop target instead of a blind 0..63 id slider — the user
         // could not tell which asset any id was, let alone pick one.
         let sampler = desc.params.first().is_some_and(|p| p.label == "asset");
+
+        // v65: the SAMPLER window carries the richer v56 key-map preset
+        // bar already; painting the generic bar too would stack TWO bars
+        // labeled save/load in one window (label shadowing on screen AND
+        // in galley reads). Generic script synths get the v65 bar.
+        if !sampler {
+            // ---- v65: user-preset bar for SCRIPT synths (goal-5 parity with
+            // the FX, hosted-plugin and sampler bars). One row, same labels
+            // and shapes as the v34 plugin bar; delete lives inside the
+            // picker exactly like there. Values are positional and load
+            // through the desc, so stale presets can never brick the synth.
+            if self.synth_presets_for != stem {
+                self.synth_presets_for = stem.clone();
+                self.synth_presets = Self::list_synth_presets(&stem);
+            }
+            ui.horizontal(|ui| {
+                ui.label("user preset");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.synth_preset_name)
+                        .hint_text("preset name")
+                        .desired_width(110.0),
+                );
+                if ui
+                    .button("save")
+                    .on_hover_text("save the current slider values as a named preset for this synth")
+                    .clicked()
+                {
+                    self.synth_preset_save(t);
+                }
+                let pick = egui::ComboBox::from_id_salt(("synth_preset_pick", t))
+                    .selected_text("load")
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        let list = self.synth_presets.clone();
+                        if list.is_empty() {
+                            ui.label(RichText::new("no presets saved yet").weak().small());
+                        }
+                        for p in list {
+                            if ui.selectable_label(false, &p).clicked() {
+                                self.synth_preset_apply(t, &p);
+                            }
+                        }
+                        if !self.synth_presets.is_empty() {
+                            ui.separator();
+                            if ui
+                                .button("delete named preset")
+                                .on_hover_text("delete the preset whose name is in the box")
+                                .clicked()
+                            {
+                                self.synth_preset_delete(t);
+                            }
+                        }
+                    });
+                pick.response
+                    .on_hover_text("load a saved preset \u{2014} it lands on the live instrument");
+                if ui
+                    .button("defaults")
+                    .on_hover_text("set every slider back to this synth's built-in defaults")
+                    .clicked()
+                {
+                    self.synth_preset_defaults(t);
+                }
+            });
+        }
         if sampler {
             let cur = vals.first().copied().unwrap_or(0.0).round() as usize;
             let cur_name = audio_assets
@@ -48418,6 +48425,25 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.synth_presets, vec!["warm".to_string()]);
+    }
+
+    /// v65 R8 (the guard's SCOPE, v64 lesson): the generic bar is hidden
+    /// in the SAMPLER window — the v56 key-map bar owns that window's
+    /// preset surface (two bars labeled save/load would shadow each
+    /// other on screen and in every galley read).
+    #[test]
+    fn v65_synth_preset_bar_hidden_for_sampler() {
+        let (mut app, ctx) = v56_open_sampler_map("v65gate");
+        // The synth window is open with the v56 bar painted ("preset
+        // name"): the generic bar's OWN label must be absent.
+        assert!(
+            galley_at(&mut app, &ctx, "preset name").is_some(),
+            "the v56 sampler preset bar must still paint"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "user preset").is_none(),
+            "the generic v65 bar must NOT stack onto the sampler window"
+        );
     }
 
     /// v65 R6 (goal 1): every new affordance carries a hover tooltip.
