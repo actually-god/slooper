@@ -863,6 +863,72 @@ pub static GUI: EffectGuiV1 = EffectGuiV1 {
     destroy: gui_destroy,
 };
 
+// ---------------------------------------------------------------------------
+// PARAM DISPLAY METADATA (ABI v4). Units drive the auto window + v53 kit
+// tooltips; steps/pickers mirror the quantization `process` already applies.
+// ---------------------------------------------------------------------------
+// Labels for the enum pickers (ABI v4 meta). KEEP IN SYNC with TYPE_NAMES
+// above — the auto window shows these where the custom GUI shows those.
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+unsafe impl<const N: usize> Sync for Labels<N> {}
+static TYPE_LABELS: Labels<8> = Labels([
+    c"off".as_ptr(),
+    c"low shelf".as_ptr(),
+    c"hi shelf".as_ptr(),
+    c"peak".as_ptr(),
+    c"low pass".as_ptr(),
+    c"hi pass".as_ptr(),
+    c"notch".as_ptr(),
+    c"band pass".as_ptr(),
+]);
+
+static META: [ParamMetaV1; NPARAMS as usize] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: TYPE_LABELS.0.as_ptr(), n_labels: 8 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: TYPE_LABELS.0.as_ptr(), n_labels: 8 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: TYPE_LABELS.0.as_ptr(), n_labels: 8 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: TYPE_LABELS.0.as_ptr(), n_labels: 8 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: TYPE_LABELS.0.as_ptr(), n_labels: 8 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: TYPE_LABELS.0.as_ptr(), n_labels: 8 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_TIMES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+];
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"Parametric EQ".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description:
+        c"6-band parametric EQ (RBJ biquads): shelf/peak/notch/bandpass per band, response curve + live spectrum in its own window.".as_ptr(),
+    n_params: NPARAMS,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc: None,
+    process_st: None,
+    stereo: 0,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
@@ -871,4 +937,9 @@ pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 {
     &GUI
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }

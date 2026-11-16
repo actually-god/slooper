@@ -33,7 +33,9 @@ pub use api::{
     EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectInfoV3, EffectInfoV4, EffectParamV1, GuiApiV1,
     GuiFrameV1, ParamMetaV1, SyncInfoV1, SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2,
     SLOOPER_EFFECT_ABI_V3, SLOOPER_EFFECT_ABI_V4, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
-    SLOOPER_SYNC_ABI, SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_MS,
+    SLOOPER_SYNC_ABI, SLOOPER_UNIT_BEATS, SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_MS,
+    SLOOPER_UNIT_PERCENT, SLOOPER_UNIT_SAMPLES, SLOOPER_UNIT_SEMITONES, SLOOPER_UNIT_SECONDS,
+    SLOOPER_UNIT_TIMES,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
@@ -1094,6 +1096,12 @@ impl Instance {
             }
             SLOOPER_UNIT_DB => format!("{:.1} dB", v),
             SLOOPER_UNIT_MS => format!("{:.1} ms", v),
+            SLOOPER_UNIT_PERCENT => format!("{:.1} %", v),
+            SLOOPER_UNIT_SEMITONES => format!("{:.1} st", v),
+            SLOOPER_UNIT_TIMES => format!("{:.2}x", v),
+            SLOOPER_UNIT_SECONDS => format!("{:.2} s", v),
+            SLOOPER_UNIT_SAMPLES => format!("{:.0} smp", v),
+            SLOOPER_UNIT_BEATS => format!("{:.2} beats", v),
             _ => format!("{:.3}", v),
         }
     }
@@ -1572,8 +1580,8 @@ unsafe fn validate(
                     v4.abi
                 ));
             }
-            process_sc = Some(v4.process_sc);
-            process_st = Some(v4.process_st);
+            process_sc = v4.process_sc;
+            process_st = v4.process_st;
             set_sync = v4.set_sync;
             stereo_decl = Some(v4.stereo != 0);
             param_meta = v4.param_meta;
@@ -4798,4 +4806,191 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
             "{h}"
         );
     }
+
+    /// v70 SOURCE-SCAN invariant (quick tier, both OSes): every stock
+    /// effect carries a complete ABI v4 metadata table — v4 entry point,
+    /// `param_meta: META.as_ptr()`, one META entry per declared param,
+    /// unit codes ONLY from the named SLOOPER_UNIT_* set (a bare number
+    /// silently misreads if the ABI renumbers), and every enum label list
+    /// backed by a declared `Labels<N>` static with exactly N strings.
+    /// The scan runs on the EMBEDDED sources — what every install gets.
+    #[test]
+    fn v70_stock_effects_declare_full_meta() {
+        const UNIT_EXPRS: [&str; 10] = [
+            "0",
+            "SLOOPER_UNIT_PERCENT",
+            "SLOOPER_UNIT_DB",
+            "SLOOPER_UNIT_HZ",
+            "SLOOPER_UNIT_MS",
+            "SLOOPER_UNIT_SEMITONES",
+            "SLOOPER_UNIT_BEATS",
+            "SLOOPER_UNIT_TIMES",
+            "SLOOPER_UNIT_SAMPLES",
+            "SLOOPER_UNIT_SECONDS",
+        ];
+        for (file, src) in EXAMPLES {
+            assert!(
+                src.contains("pub extern \"C\" fn slooper_effect_info_v4()"),
+                "{file}: no ABI v4 entry point"
+            );
+            assert!(
+                src.contains("param_meta: META.as_ptr()"),
+                "{file}: DESC4 without param_meta"
+            );
+            let mstart = src
+                .find("static META: [ParamMetaV1")
+                .unwrap_or_else(|| panic!("{file}: no META static"));
+            let block = &src[mstart..mstart + src[mstart..].find("];").unwrap() + 2];
+            // entry count == n_params (resolve NPARAMS const when used)
+            let n_meta = block.matches("ParamMetaV1 {").count();
+            let np_at = src.find("n_params:").expect("n_params field");
+            let mut nexpr = src[np_at + "n_params:".len()..].split(',').next().unwrap().trim();
+            nexpr = nexpr.strip_suffix("as u32").unwrap_or(nexpr).trim();
+            let ndecl: usize = match nexpr.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) if nexpr == "PARAMS.len()" => {
+                    let s = src.find("static PARAMS:").expect("PARAMS static");
+                    let blk = &src[s..s + src[s..].find("];").unwrap()];
+                    blk.matches("EffectParamV1 {").count()
+                }
+                Err(_) => {
+                    assert_eq!(nexpr, "NPARAMS", "{file}: unexpected n_params expr");
+                    let c = src.find("const NPARAMS:").unwrap_or_else(|| panic!("{file}"));
+                    let rhs = src[c..].split('=').nth(1).unwrap().split(';').next().unwrap().trim();
+                    rhs.parse().unwrap()
+                }
+            };
+            assert_eq!(n_meta, ndecl, "{file}: META entries != n_params");
+            // per-entry sanity
+            for line in block.lines().filter(|l| l.contains("ParamMetaV1 {")) {
+                let unit = line.split("unit:").nth(1).unwrap().split(',').next().unwrap().trim();
+                assert!(UNIT_EXPRS.contains(&unit), "{file}: bare/unknown unit '{unit}'");
+                let nl: u32 = line
+                    .split("n_labels:")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{file}: unparsable n_labels"));
+                if nl >= 1 {
+                    let lname = line
+                        .split("labels:")
+                        .nth(1)
+                        .unwrap()
+                        .split(".0.as_ptr()")
+                        .next()
+                        .unwrap()
+                        .trim()
+                        .to_string();
+                    assert_ne!(lname, "core::ptr::null", "{file}: n_labels>0 but null labels");
+                    let s_at = src
+                        .find(&format!("static {lname}: Labels<"))
+                        .unwrap_or_else(|| panic!("{file}: {lname} static missing"));
+                    let seg = &src[s_at..s_at + src[s_at..].find(");").unwrap() + 2];
+                    let n_strs = seg.matches(".as_ptr()").count();
+                    assert_eq!(n_strs, nl as usize, "{file}: {lname} string count != n_labels");
+                }
+            }
+        }
+    }
+
+    /// v70 RUNTIME invariant (slow tier): every stock effect's v4 table
+    /// really loads through the host — per-param views sane, per-effect
+    /// spot asserts from REQUIREMENTS.md, mono/stereo path identity, and
+    /// the fmt_param unit branches (TIMES / SECONDS) proven from the
+    /// loaded tables.
+    #[test]
+    #[ignore = "slow-tier: script-compile all 23 stock effects"]
+    fn v70_all_stock_meta_runtime() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v70meta");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+
+        // ---- every effect: table loaded + sane -------------------------
+        for (file, _) in EXAMPLES {
+            let stem = file.trim_end_matches(".rs");
+            let inst = reg
+                .create_instance(stem, 48000.0, &[])
+                .unwrap_or_else(|| panic!("{stem}: instance"));
+            let d = reg.desc(stem).expect("desc");
+            let mut any = false;
+            for k in 0..d.params.len() {
+                let m = inst.param_meta(k);
+                assert!(m.unit <= 9, "{stem} param {k}: unit {} out of range", m.unit);
+                assert!(m.labels.len() <= 32, "{stem} param {k}: too many labels");
+                any |= m.unit > 0 || !m.labels.is_empty() || m.step > 0.0;
+            }
+            assert!(any, "{stem}: v4 param_meta table did not load");
+            drop(inst);
+        }
+
+        // ---- spot asserts (units/steps/labels per REQUIREMENTS.md) -----
+        let c = reg.create_instance("chorus", 48000.0, &[]).unwrap();
+        assert_eq!(c.param_meta(0).unit, SLOOPER_UNIT_HZ, "chorus rate");
+        assert_eq!(c.param_meta(4).unit, SLOOPER_UNIT_HZ, "chorus tone");
+        assert_eq!(c.param_meta(6).unit, SLOOPER_UNIT_TIMES, "chorus out");
+        assert_eq!(c.param_meta(7).step, 1.0, "chorus voices integer step");
+        assert!(c.is_stereo(), "chorus keeps its v3-era stereo path");
+        drop(c);
+        let cr = reg.create_instance("crush", 48000.0, &[]).unwrap();
+        assert_eq!(cr.param_meta(0).step, 1.0, "crush bits integer step");
+        assert_eq!(cr.param_meta(1).unit, SLOOPER_UNIT_MS, "crush downsample");
+        assert!(!cr.is_stereo(), "crush stays on the v1-era mono path");
+        drop(cr);
+        let ph = reg.create_instance("phaser", 48000.0, &[]).unwrap();
+        assert_eq!(ph.param_meta(4).step, 1.0, "phaser stages integer step");
+        drop(ph);
+        let eq = reg.create_instance("parametric_eq", 48000.0, &[]).unwrap();
+        assert_eq!(
+            eq.param_meta(0).labels,
+            vec!["off", "low shelf", "hi shelf", "peak", "low pass", "hi pass", "notch", "band pass"],
+            "EQ band type picker labels (must equal TYPE_NAMES)"
+        );
+        assert_eq!(eq.param_meta(1).unit, SLOOPER_UNIT_HZ, "EQ freq");
+        assert_eq!(eq.param_meta(2).unit, SLOOPER_UNIT_DB, "EQ gain");
+        assert_eq!(eq.param_meta(4).labels.len(), 8, "EQ B2 type labels");
+        assert!(eq.param_meta(3).labels.is_empty(), "EQ B1 Q carries no labels");
+        drop(eq);
+        let ws = reg.create_instance("waveshaper", 48000.0, &[]).unwrap();
+        assert_eq!(ws.param_meta(12).labels, vec!["off", "on"], "waveshaper dc toggle");
+        assert_eq!(ws.param_meta(9).unit, SLOOPER_UNIT_TIMES, "waveshaper drive");
+        drop(ws);
+        let mb = reg.create_instance("multiband", 48000.0, &[]).unwrap();
+        assert_eq!(mb.param_meta(13).labels, vec!["compress", "maximise"]);
+        drop(mb);
+        let sp = reg.create_instance("spread", 48000.0, &[]).unwrap();
+        assert_eq!(sp.param_meta(4).labels, vec!["off", "flip R"], "spread flip toggle");
+        assert!(sp.is_stereo(), "spread keeps its v3-era stereo path");
+        drop(sp);
+        let voc = reg.create_instance("vocoder", 48000.0, &[]).unwrap();
+        assert_eq!(voc.param_meta(0).unit, SLOOPER_UNIT_MS, "vocoder attack");
+        assert_eq!(voc.param_meta(5).unit, SLOOPER_UNIT_DB, "vocoder brightness");
+        drop(voc);
+
+        // ---- fmt_param new-unit branches (loaded tables) ---------------
+        let comp = reg.create_instance("compressor", 48000.0, &[]).unwrap();
+        let d = reg.desc("compressor").unwrap();
+        let (lo, hi) = (d.params[1].min, d.params[1].max); // ratio 1..24
+        assert_eq!(comp.fmt_param(1, 0.5, lo, hi), "12.50x", "TIMES unit fmt");
+        assert!(!comp.is_stereo(), "compressor (v1-era) stays mono-path");
+        drop(comp);
+        let se = reg.create_instance("space_echo", 48000.0, &[]).unwrap();
+        let d2 = reg.desc("space_echo").unwrap();
+        let (lo2, hi2) = (d2.params[0].min, d2.params[0].max); // 0.02..2.4 s
+        assert_eq!(se.fmt_param(0, 0.5, lo2, hi2), "1.21 s", "SECONDS unit fmt");
+        assert!(d2.stereo, "space_echo v4 table keeps the stereo declaration");
+        assert!(se.is_stereo(), "space_echo v4 table keeps the stereo path");
+        drop(se);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
