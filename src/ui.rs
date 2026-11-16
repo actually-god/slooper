@@ -12319,6 +12319,141 @@ impl App {
         self.status = format!("synth {stem}: defaults restored ({} params)", vals.len());
     }
 
+    // ---- v69: named drum-kit presets --------------------------------------
+    // Goal-5 parity: kits were the LAST synth-side surface without named
+    // presets (FX v0.13, plugins v34, sampler v56, templates v61, script
+    // synths v65 all have them). Files live under data_dir()/drum-kits/
+    // <name>.json — ONE flat folder: a kit is stem-independent, so the
+    // same kit can arm any track. Pads keep asset PATHS (exactly how
+    // projects carry their kit table), so loading a kit into another
+    // project re-links against that rack and unresolved pads stay
+    // silent — never a brick. The sanitizer is deliberately shared with
+    // v56/v61/v65 (no traversal).
+
+    fn kit_preset_dir() -> PathBuf {
+        crate::paths::data_dir().join("drum-kits")
+    }
+    fn list_kit_presets() -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(Self::kit_preset_dir())
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().is_some_and(|x| x == "json") {
+                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+    fn kit_preset_refresh(&mut self) {
+        self.kit_presets = Self::list_kit_presets();
+        self.kit_presets_ready = true;
+    }
+    fn kit_preset_save(&mut self, t: usize) {
+        let name = Self::sampler_preset_sanitize(&self.kit_preset_name.clone());
+        if name.is_empty() {
+            self.status = "drum kit preset: type a name first".into();
+            return;
+        }
+        let pads: Vec<crate::config::DrumPadSave> = self.kit(t).iter().map(pad_to_save).collect();
+        let n = pads.len();
+        let rec = crate::config::DrumKitSave {
+            name: name.clone(),
+            pads,
+        };
+        let dir = Self::kit_preset_dir();
+        let res = std::fs::create_dir_all(&dir).and_then(|()| {
+            let js = serde_json::to_string_pretty(&rec)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            std::fs::write(dir.join(format!("{name}.json")), js)
+        });
+        match res {
+            Ok(()) => {
+                self.kit_preset_refresh();
+                self.status = format!("drum kit preset saved: {name} ({n} pads)");
+            }
+            Err(e) => self.status = format!("drum kit preset save failed: {e}"),
+        }
+    }
+    fn kit_preset_apply(&mut self, t: usize, preset: &str) {
+        let name = preset.to_string();
+        // The picker rows are file stems — re-sanitize so a hand-built
+        // call can never escape the folder either (v65 rule).
+        let p = Self::kit_preset_dir().join(format!(
+            "{}.json",
+            Self::sampler_preset_sanitize(&name)
+        ));
+        let parsed = std::fs::read_to_string(&p)
+            .map_err(|e| e.to_string())
+            .and_then(|s| {
+                serde_json::from_str::<crate::config::DrumKitSave>(&s).map_err(|e| e.to_string())
+            });
+        match parsed {
+            Ok(rec) if !rec.pads.is_empty() => {
+                *self.kit_mut(t) = rec.pads.iter().map(pad_from_save).collect();
+                self.drum_resolve();
+                self.drum.ensure_rows(self.kit(t).len());
+                self.save_config();
+                self.status =
+                    format!("drum kit preset loaded: {name} ({} pads)", self.kit(t).len());
+            }
+            Ok(_) => self.status = format!("drum kit preset {name}: no pads in file"),
+            Err(e) => self.status = format!("drum kit preset load failed: {e}"),
+        }
+    }
+    fn kit_preset_delete(&mut self) {
+        let name = Self::sampler_preset_sanitize(&self.kit_preset_name.clone());
+        if name.is_empty() {
+            self.status = "drum kit preset: type the kit name to delete first".into();
+            return;
+        }
+        let p = Self::kit_preset_dir().join(format!("{name}.json"));
+        match std::fs::remove_file(&p) {
+            Ok(()) => {
+                self.kit_preset_refresh();
+                self.status = format!("drum kit preset deleted: {name}");
+            }
+            Err(e) => self.status = format!("drum kit preset delete failed: {e}"),
+        }
+    }
+    fn kit_preset_stock(&mut self, t: usize) {
+        *self.kit_mut(t) = default_drum_kit();
+        self.drum.ensure_rows(self.kit(t).len());
+        self.save_config();
+        self.status = format!(
+            "drum kit: track {} restored to the {}-pad stock kit",
+            t + 1,
+            self.kit(t).len()
+        );
+    }
+    /// v69 (S1): the ONE pad-sound assignment path: an audio file enters
+    /// the rack (`ensure_asset` dedups) and becomes pad `p`'s sound.
+    /// Shared by the per-pad "wav" import button and the central OS-drop
+    /// handler, so the two entry points CANNOT drift. Returns the rack
+    /// path on success; a non-audio file or out-of-range pad is None
+    /// with no side effect.
+    fn assign_pad_file(
+        &mut self,
+        kit: &mut [DrumPad],
+        p: usize,
+        path: &Path,
+    ) -> Option<String> {
+        if p >= kit.len() || !crate::assets::is_audio_file(path) {
+            return None;
+        }
+        let k = self.ensure_asset(path)?;
+        let sp = self.assets[k].path.to_string_lossy().into_owned();
+        kit[p].asset_path = sp.clone();
+        kit[p].asset = None;
+        Some(sp)
+    }
+
     // ---- v61 (S12): track templates ---------------------------------------
     // A template is ONE track's complete instrument setup: synth binding
     // (+params+state), the FX chain, mixer vol/pan/gain and the track
@@ -13378,6 +13513,65 @@ impl App {
             .weak()
             .small(),
         );
+        // v69: named kit presets (goal-5 parity with the v34/v56/v61/v65
+        // bars). Button words carry "kit" on purpose — the SAME window
+        // paints the v65 user-preset bar, whose galley reads must not
+        // shadow onto these (substring reads hit "save kit" for "save";
+        // the v65 pins now use exact reads for the same reason).
+        if !self.kit_presets_ready {
+            self.kit_preset_refresh();
+        }
+        ui.horizontal(|ui| {
+            ui.label("kit preset");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.kit_preset_name)
+                    .hint_text("kit name")
+                    .desired_width(100.0),
+            );
+            if ui
+                .button("save kit")
+                .on_hover_text(
+                    "save this track's whole kit — every pad's name, \
+                     sound, velocity and mute — as a named preset",
+                )
+                .clicked()
+            {
+                self.kit_preset_save(t);
+            }
+            let pick = egui::ComboBox::from_id_salt(("kit_preset_pick", t))
+                .selected_text("load kit")
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    let list = self.kit_presets.clone();
+                    if list.is_empty() {
+                        ui.label(RichText::new("no kits saved yet").weak().small());
+                    }
+                    for k in list {
+                        if ui.selectable_label(false, &k).clicked() {
+                            self.kit_preset_apply(t, &k);
+                        }
+                    }
+                    if !self.kit_presets.is_empty() {
+                        ui.separator();
+                        if ui
+                            .button("delete kit")
+                            .on_hover_text("delete the kit whose name is in the box")
+                            .clicked()
+                        {
+                            self.kit_preset_delete();
+                        }
+                    }
+                });
+            pick.response
+                .on_hover_text("load a saved kit onto this track (replaces the pads)");
+            if ui
+                .button("stock kit")
+                .on_hover_text("replace this track's kit with the built-in 8-pad stock kit")
+                .clicked()
+            {
+                self.kit_preset_stock(t);
+            }
+        });
         let audio_rows: Vec<(String, String)> = self
             .assets
             .iter()
@@ -13466,6 +13660,43 @@ impl App {
                                     }
                                 }
                             });
+                        // v69 (S1): import a sound straight from disk —
+                        // no file-manager round-trip for a drop. The
+                        // dialog is native (unreachable headless), so
+                        // the pins exercise the SAME seam its callback
+                        // calls: assign_pad_file, which the central
+                        // OS-drop handler also drives.
+                        if ui
+                            .add(egui::Button::new("wav").min_size(egui::vec2(24.0, 18.0)))
+                            .on_hover_text(
+                                "import an audio file: it joins the rack \
+                                 and becomes this pad's sound",
+                            )
+                            .clicked()
+                        {
+                            let dlg = rfd::FileDialog::new()
+                                .set_title("Import pad sound")
+                                .add_filter(
+                                    "Audio",
+                                    &["wav", "mp3", "ogg", "flac", "m4a", "aiff", "aif"],
+                                );
+                            if let Some(path) = dlg.pick_file() {
+                                match self.assign_pad_file(&mut kit, p, &path) {
+                                    Some(sp) => {
+                                        kit_changed = true;
+                                        self.status = format!(
+                                            "drum kit: pad {} <- imported {}",
+                                            p + 1,
+                                            sp.rsplit('/').next().unwrap_or(&sp)
+                                        );
+                                    }
+                                    None => {
+                                        self.status =
+                                            "drum kit: import wants an audio file".into();
+                                    }
+                                }
+                            }
+                        }
                         let before_v = kit[p].vel;
                         let rv = ui
                             .add_sized([52.0, 16.0], egui::Slider::new(&mut kit[p].vel, 1..=127))
@@ -13522,7 +13753,7 @@ impl App {
                             kit[p].asset_path = path;
                             kit[p].asset = None;
                             kit_changed = true;
-                            self.status = format!("drum kit: pad {} \u{2190} dropped asset", p + 1);
+                            self.status = format!("drum kit: pad {} <- dropped asset", p + 1);
                         }
                     }
                 }
@@ -16310,27 +16541,24 @@ impl App {
                 self.kit_drop_rects = rows;
                 if let Some(p) = hit {
                     let paths = std::mem::take(&mut self.os_drops);
+                    let mut kit = std::mem::take(self.kit_mut(t));
                     let mut assigned = 0usize;
                     let mut rest = Vec::new();
                     for path in paths {
-                        if crate::assets::is_audio_file(&path) {
-                            if let Some(k) = self.ensure_asset(&path) {
-                                let sp = self.assets[k].path.to_string_lossy().into_owned();
-                                if let Some(pad) = self.kit_mut(t).get_mut(p) {
-                                    pad.asset_path = sp;
-                                    pad.asset = None;
-                                }
-                                assigned += 1;
-                                continue;
-                            }
+                        // v69 (S1): the SAME seam as the per-pad "wav"
+                        // button — the two entry points cannot drift.
+                        if self.assign_pad_file(&mut kit, p, &path).is_some() {
+                            assigned += 1;
+                            continue;
                         }
                         rest.push(path);
                     }
+                    *self.kit_mut(t) = kit;
                     if assigned > 0 {
                         self.drum.ensure_rows(self.kit(t).len());
                         self.save_config();
                         self.status = format!(
-                            "drum kit: pad {} \u{2190} {} dropped sample(s)",
+                            "drum kit: pad {} <- {} dropped sample(s)",
                             p + 1,
                             assigned
                         );
@@ -34709,6 +34937,24 @@ mod tests {
         frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
     }
 
+    /// Left-click the LAST painted galley whose text EQUALS `needle`
+    /// (853 viewport like click_last; exact like click_exact). v69 added
+    /// "save kit"/"load kit" buttons to the same window the v65 preset
+    /// bar paints in, so its save/load reads may no longer be substrings.
+    fn click_last_exact(app: &mut App, ctx: &egui::Context, needle: &str) {
+        let all = galleys_all(app, ctx, needle);
+        let p = *all
+            .last()
+            .unwrap_or_else(|| panic!("exact galley {needle:?} not painted"));
+        frame(app, ctx, vec![moved(p)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+    }
+
     /// Left-click the painted galley whose text equals `needle`.
     fn click_label(app: &mut App, ctx: &egui::Context, needle: &str) {
         let r = galley_at(app, ctx, needle)
@@ -48811,7 +49057,7 @@ mod tests {
             .center();
         click_pt(app, ctx, ed);
         type_into_focused(app, ctx, name);
-        click_last(app, ctx, "save");
+        click_last_exact(app, ctx, "save");
     }
 
     /// v65 helper: live piano instance for value asserts.
@@ -48863,7 +49109,7 @@ mod tests {
         app.status = String::new();
         app.synth_preset_name.clear();
         frame(&mut app, &ctx, vec![]);
-        click_last(&mut app, &ctx, "load");
+        click_last_exact(&mut app, &ctx, "load");
         frame(&mut app, &ctx, vec![]); // popup paints
         let row = galley_at(&mut app, &ctx, "warm")
             .expect("preset row in the popup")
@@ -48898,7 +49144,7 @@ mod tests {
         // delete row explains on hover. Open the picker and click it.
         app.status = String::new();
         frame(&mut app, &ctx, vec![]);
-        click_last(&mut app, &ctx, "load");
+        click_last_exact(&mut app, &ctx, "load");
         frame(&mut app, &ctx, vec![]);
         let row = galley_at(&mut app, &ctx, "delete named preset")
             .expect("delete row inside the picker")
@@ -48939,7 +49185,7 @@ mod tests {
     #[test]
     fn v65_synth_preset_empty_name_echo() {
         let (mut app, ctx) = v65_synth_win("v65empty");
-        click_last(&mut app, &ctx, "save");
+        click_last_exact(&mut app, &ctx, "save");
         assert!(
             app.status.contains("synth preset: type a name first"),
             "echo: {}",
@@ -49556,4 +49802,303 @@ mod tests {
              page was open: {y1} -> {y2}"
         );
     }
+
+    // ================= v69: drum kit user presets + per-pad import ======
+    // (requirements: scratch slooper-v69/REQUIREMENTS.md — goal-5 parity
+    // for drum kits (the last synth-side surface without named presets)
+    // + S1 per-pad .wav import. The kit bar shares the synth window with
+    // the v65 bar, so every read here is EXACT (click_last_exact) and
+    // the v65 pins were retargeted to exact reads in the same commit.)
+
+    /// v69 helper: type a kit name into the bar's box (real TextEdit)
+    /// and click the bar's OWN save button.
+    fn v69_type_and_save(app: &mut App, ctx: &egui::Context, name: &str) {
+        let ed = galley_at(app, ctx, "kit name")
+            .expect("kit name TextEdit")
+            .center();
+        click_pt(app, ctx, ed);
+        type_into_focused(app, ctx, name);
+        click_last_exact(app, ctx, "save kit");
+    }
+
+    #[test]
+    fn v69_kit_preset_bar_paints() {
+        // The piano window (non-sampler script synth) gets the full bar.
+        let (mut app, ctx) = v65_synth_win("v69paint");
+        for needle in ["kit preset", "save kit", "load kit", "stock kit", "kit name"] {
+            assert!(
+                !galleys_all(&mut app, &ctx, needle).is_empty(),
+                "kit bar missing {needle:?} (status {:?})",
+                app.status
+            );
+        }
+        // R6: every pad row gained the import button.
+        assert!(
+            !galleys_all(&mut app, &ctx, "wav").is_empty(),
+            "per-pad wav import button missing"
+        );
+        // R1 guard: the SAMPLER window must not stack a second kit bar
+        // (the v56 key-map bar owns that window — v65 rule).
+        let (mut app2, ctx2) = v56_open_sampler_map("v69paintsam");
+        assert!(
+            galley_at(&mut app2, &ctx2, "kit preset").is_none(),
+            "the kit bar must NOT stack onto the sampler window"
+        );
+    }
+
+    #[test]
+    fn v69_kit_bar_hovers() {
+        // Source-scan invariant (v54/v65 style): each new button's OWN
+        // statement, windowed to its clicked(), carries on_hover_text.
+        let srcs = include_str!("ui.rs");
+        let start = srcs
+            .find("v69: named kit presets")
+            .expect("kit bar present");
+        let end = srcs[start..]
+            .find("let audio_rows: Vec<(String, String)>")
+            .map(|i| start + i)
+            .expect("kit bar block ends");
+        let lines: Vec<&str> = srcs[start..end].lines().collect();
+        let mut checked = 0usize;
+        for label in ["\"save kit\"", "\"delete kit\"", "\"stock kit\""] {
+            let n = lines
+                .iter()
+                .position(|l| l.contains(".button(") && l.contains(label))
+                .unwrap_or_else(|| panic!("button {label} vanished from the kit bar"));
+            let mut stop = lines.len() - 1;
+            for (k, row) in lines[n..].iter().enumerate() {
+                if row.contains("clicked()") {
+                    stop = n + k;
+                    break;
+                }
+            }
+            let win: String = lines[n..=stop].join(" ");
+            assert!(
+                win.contains("on_hover_text"),
+                "kit bar button {label} carries no hover explanation"
+            );
+            checked += 1;
+        }
+        // The picker: hover must attach to the ComboBox response.
+        let tail: String = lines.join(" ");
+        let resp = tail
+            .find("pick.response")
+            .expect("combo response must be captured");
+        let seg = &tail[resp..resp + 120.min(tail.len() - resp)];
+        assert!(
+            seg.contains(".on_hover_text("),
+            "kit picker hover must attach to the ComboBox response"
+        );
+        checked += 1;
+        // The per-pad import button: hover between its creation and its
+        // clicked() (its statement lives in the pad-row loop, not here).
+        let w = srcs
+            .find("Button::new(\"wav\")")
+            .expect("wav import button present");
+        let seg = &srcs[w..w + 400.min(srcs.len() - w)];
+        let seg = &seg[..seg.find(".clicked()").expect("wav button clicked")];
+        assert!(
+            seg.contains("on_hover_text"),
+            "wav import button carries no hover explanation"
+        );
+        checked += 1;
+        assert_eq!(checked, 5, "broken scan");
+    }
+
+    #[test]
+    fn v69_kit_preset_save_writes_file() {
+        let (mut app, ctx) = v65_synth_win("v69save");
+        // Distinctive pads so the file asserts discriminate fields (the
+        // stock kit alone cannot tell vel/mute paths apart).
+        app.kit_mut(0)[0].asset_path = "/rack/kick.wav".into();
+        app.kit_mut(0)[0].vel = 44;
+        app.kit_mut(0)[0].muted = true;
+        v69_type_and_save(&mut app, &ctx, "workshop");
+        assert!(
+            app.status.contains("drum kit preset saved: workshop (8 pads)"),
+            "echo: {}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("drum-kits");
+        assert!(
+            dir.to_string_lossy().contains("sp-uity"),
+            "kits must sandbox with the test HOME: {dir:?}"
+        );
+        let js = std::fs::read_to_string(dir.join("workshop.json")).expect("kit file");
+        let rec: crate::config::DrumKitSave = serde_json::from_str(&js).expect("kit json");
+        assert_eq!(rec.name, "workshop");
+        assert_eq!(rec.pads.len(), 8);
+        assert_eq!(rec.pads[0].asset, "/rack/kick.wav");
+        assert_eq!(rec.pads[0].vel, 44);
+        assert!(rec.pads[0].muted);
+        assert_eq!(rec.pads[1].name, "Snare");
+    }
+
+    #[test]
+    fn v69_kit_preset_empty_name_echo() {
+        let (mut app, ctx) = v65_synth_win("v69noname");
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "save kit");
+        assert!(
+            app.status.contains("drum kit preset: type a name first"),
+            "echo: {}",
+            app.status
+        );
+        assert!(
+            !crate::paths::data_dir().join("drum-kits").exists(),
+            "a refused save must not create the kits folder"
+        );
+    }
+
+    #[test]
+    fn v69_kit_preset_name_sanitized() {
+        let (mut app, ctx) = v65_synth_win("v69sanit");
+        v69_type_and_save(&mut app, &ctx, "../evil");
+        let dir = crate::paths::data_dir().join("drum-kits");
+        assert!(
+            dir.join("evil.json").exists(),
+            "sanitized name must land INSIDE drum-kits: {:?}",
+            app.status
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("kits dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["evil.json".to_string()], "{names:?}");
+        assert!(
+            !crate::paths::data_dir().join("evil.json").exists(),
+            "the sanitizer must not escape the kits folder"
+        );
+    }
+
+    #[test]
+    fn v69_kit_preset_load_applies_kit() {
+        let (mut app, ctx) = v65_synth_win("v69load");
+        // Build a distinctive 3-pad kit and save it through the bar.
+        app.kit_mut(0)[0].asset_path = "/rack/boom.wav".into();
+        app.kit_mut(0)[0].vel = 33;
+        app.kit_mut(0)[0].muted = true;
+        app.kit_mut(0).truncate(3);
+        v69_type_and_save(&mut app, &ctx, "pack");
+        assert!(
+            app.status.contains("drum kit preset saved: pack (3 pads)"),
+            "save echo: {}",
+            app.status
+        );
+        // Wreck the live kit (back to the 8-pad stock), then load. The
+        // status echo AND the name box both contain "pack" and paint
+        // before the popup — clear them first (v56 shadowing lesson).
+        *app.kit_mut(0) = default_drum_kit();
+        app.drum.ensure_rows(8);
+        app.status = String::new();
+        app.kit_preset_name.clear();
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "load kit");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "pack")
+            .expect("kit row in the picker")
+            .center();
+        click_pt(&mut app, &ctx, row);
+        let kit = app.kit(0);
+        assert_eq!(kit.len(), 3, "load replaces the whole pad table");
+        assert_eq!(kit[0].asset_path, "/rack/boom.wav");
+        assert_eq!(kit[0].vel, 33);
+        assert!(kit[0].muted);
+        assert!(
+            app.drum.grid.len() >= 3,
+            "the pattern grid must carry a row per pad: {}",
+            app.drum.grid.len()
+        );
+        assert!(
+            app.status.contains("drum kit preset loaded: pack (3 pads)"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v69_kit_preset_delete_removes_file() {
+        let (mut app, ctx) = v65_synth_win("v69del");
+        v69_type_and_save(&mut app, &ctx, "doomed");
+        let dir = crate::paths::data_dir().join("drum-kits");
+        assert!(dir.join("doomed.json").exists(), "setup save failed");
+        // The box still holds "doomed" (delete acts on the NAME FROM THE
+        // BOX). Open the picker, click the delete row inside it.
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "load kit");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        click_last_exact(&mut app, &ctx, "delete kit");
+        assert!(
+            !dir.join("doomed.json").exists(),
+            "delete must remove exactly that file"
+        );
+        assert!(
+            app.kit_presets.is_empty(),
+            "cached list must refresh after delete: {:?}",
+            app.kit_presets
+        );
+        assert!(
+            app.status.contains("drum kit preset deleted: doomed"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v69_kit_preset_stock_restore() {
+        let (mut app, ctx) = v65_synth_win("v69stock");
+        // Wreck: drop to 2 renamed pads with a sound and a mute.
+        app.kit_mut(0).truncate(2);
+        app.kit_mut(0)[0].name = "Wreck".into();
+        app.kit_mut(0)[0].asset_path = "/rack/x.wav".into();
+        app.kit_mut(0)[0].muted = true;
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "stock kit");
+        assert_eq!(app.kit(0).len(), 8, "stock kit is 8 pads");
+        assert!(kit_is_stock(app.kit(0)), "kit must equal the stock set");
+        assert!(
+            app.status.contains("restored to the 8-pad stock kit"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v69_pad_import_assigns() {
+        // The seam the native dialog callback AND the OS-drop handler
+        // call (native rfd dialogs are unreachable headless — house
+        // precedent: the export_path pins; the real drop path drives the
+        // SAME helper via v34_drum_pad_drop_accepts_assets_and_os_files).
+        let mut app = headless_app("v69import");
+        let samples = std::env::temp_dir().join("sp-uity-v69import/samples");
+        let rim = samples.join("rim.wav");
+        std::fs::copy(samples.join("kick.wav"), &rim).expect("second wav fixture");
+        let txt = samples.join("notes.txt");
+        std::fs::write(&txt, "not audio").unwrap();
+        let mut kit = app.kit(0).to_vec();
+        let before = app.assets.len();
+        // Refusals: out-of-range pad, non-audio file — no rack growth.
+        assert!(app.assign_pad_file(&mut kit, 99, &rim).is_none());
+        assert!(app.assign_pad_file(&mut kit, 0, &txt).is_none());
+        assert_eq!(app.assets.len(), before, "refusals must not import");
+        // The import itself: rack entry + pad assignment.
+        let sp = app
+            .assign_pad_file(&mut kit, 0, &rim)
+            .expect("wav imports and assigns");
+        assert_eq!(sp, rim.to_string_lossy());
+        assert_eq!(kit[0].asset_path, sp);
+        assert_eq!(kit[0].asset, None, "ids re-resolve via drum_resolve");
+        assert!(
+            app.assets.iter().any(|a| a.path == rim),
+            "the file joined the rack"
+        );
+        // Dedup: the same file on another pad adds no second rack entry.
+        let n = app.assets.len();
+        assert!(app.assign_pad_file(&mut kit, 1, &rim).is_some());
+        assert_eq!(app.assets.len(), n, "the rack dedups by path");
+    }
+
 }
