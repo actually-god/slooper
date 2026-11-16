@@ -160,6 +160,25 @@ impl VstKind {
 /// ClapStageEntry`. Chains, synth handles and the UI all traffic in
 /// `Arc<dyn StageEntry>` so a new plugin format is a new implementor, never
 /// a new chain-row variant.
+
+/// v67: a plugin-initiated preset-load report. The CLAP v1 ABI has NO
+/// host-side preset enumeration - `clap.preset-load/2` is instead the
+/// plugin's way to tell the host "I loaded a preset through my own
+/// machinery" (`loaded`) or "a load location failed" (`on_error`).
+/// VST2/VST3 and bundled plugins never emit these.
+#[derive(Debug, Clone)]
+pub enum PresetLoadEvent {
+    Loaded {
+        location: String,
+        load_key: Option<String>,
+    },
+    Failed {
+        location: String,
+        load_key: Option<String>,
+        message: String,
+    },
+}
+
 pub trait StageEntry: Send + Sync {
     fn name(&self) -> &str;
     fn path(&self) -> &std::path::Path;
@@ -185,7 +204,9 @@ pub trait StageEntry: Send + Sync {
     fn set_param_rt(&self, index: usize, value: f32);
     /// v60: factory program ("patch") names in plugin order. Snapshot
     /// taken once at open — NEVER plugin code per call; empty means this
-    /// backend/plugin reports none (CLAP and VST3 today, see field docs).
+    /// backend/plugin reports none: VST2 since v60, VST3 since v66, and
+    /// CLAP never — the v1 ABI has no enumeration; a CLAP plugin that
+    /// loads its OWN preset reports it via `take_preset_report` instead.
     fn programs(&self) -> Vec<String> {
         Vec::new()
     }
@@ -207,6 +228,14 @@ pub trait StageEntry: Send + Sync {
     /// backends without program tracking; control thread only, like
     /// `select_program`.
     fn refresh_program(&self) {}
+    /// v67: pop the most recent plugin-side preset-load report (CLAP
+    /// `clap.preset-load`; the PARAMETERS window echoes it while the
+    /// entry is on screen). Drained once; always None on backends with
+    /// no such notification. The sink is mutex-guarded (a plugin thread
+    /// writes, the control thread reads).
+    fn take_preset_report(&self) -> Option<PresetLoadEvent> {
+        None
+    }
     /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
     /// Audio thread only.
     fn process(&self, input: &[f32], output: &mut [f32]);
