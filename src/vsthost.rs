@@ -1949,6 +1949,24 @@ pub struct VstParamDesc {
     pub default: f32,
     /// False for VST3 read-only meters — the UI hides them.
     pub writable: bool,
+    /// v66: VST3 `kIsProgramChange` parameter — the factory-program combo
+    /// OWNS this parameter (its row drives the same cell), so every generic
+    /// knob list filters it out. It stays in the mirror/descs so the shadow
+    /// editor's own program edits stay index-aligned and the runtime
+    /// selection write has a slot to push through the RT ring.
+    pub program_change: bool,
+}
+
+/// VST3 `ParameterInfo::kIsProgramChange` (ivsteditcontroller.h, 1 << 15).
+pub(crate) const VST3_K_IS_PROGRAM_CHANGE: u32 = 1 << 15;
+
+/// Normalized program-change value -> program index (the VST3 mapping both
+/// this host and the v66 fixture use: `index / (count - 1)`, nearest).
+pub(crate) fn norm_to_program(v: f64, count: usize) -> i32 {
+    if count <= 1 {
+        return 0;
+    }
+    ((v * (count - 1) as f64).round() as i32).clamp(0, count as i32 - 1)
 }
 
 /// Shared parameter cell: the UI writes, the audio thread reads (VST2) or
@@ -2115,14 +2133,22 @@ pub struct RtStageEntry {
     control: Mutex<Option<vst3_host::realtime::RtControl>>,
     params: Arc<VstParams>,
     descs: Vec<VstParamDesc>,
-    /// v60: factory program names snapshotted at open. VST2 only today:
-    /// VST3's `RtControl` command ring carries no program command and
-    /// CLAP factory presets (`clap.presets` factory) are unhosted — both
-    /// report empty and the UI hides the row (docs/WINDOWS-PORT.md rule:
-    /// additive gaps, never half-wired chrome).
+    /// v60: factory program names snapshotted at open. VST2 via the
+    /// dispatcher; VST3 via `IUnitInfo` program lists + the
+    /// `kIsProgramChange` parameter (v66). CLAP factory presets
+    /// (`clap.presets` factory) remain unhosted — it reports empty and the
+    /// UI hides the row (docs/WINDOWS-PORT.md rule: additive gaps, never
+    /// half-wired chrome).
     programs: Vec<String>,
     /// v60: last known current program (-1 = never reported / unsupported).
     program: std::sync::atomic::AtomicI32,
+    /// v66: desc index of the wired VST3 program-change parameter (see
+    /// `RtParts::program_param`). select_program writes this mirror slot
+    /// (poll_params relays it to the processor on the next RT block);
+    /// refresh_program reads it back, which is also how the VST3 shadow
+    /// editor's own program edits (relayed into the mirror) reach the
+    /// combo. None for VST2 (dispatcher path) and unwired formats.
+    program_param: Option<usize>,
     name: String,
     /// Where this plugin was loaded from (re-opens offline render copies).
     spec: (PathBuf, VstKind),
@@ -2856,6 +2882,10 @@ struct RtParts {
     /// v60: factory programs snapshotted at open (empty + -1 = none).
     programs: Vec<String>,
     program0: i32,
+    /// v66: desc index of the wired VST3 program-change parameter (None =
+    /// no runtime select path: VST2 uses the dispatcher, CLAP has no
+    /// factory presets, multi-list VST3 stays open-time restore only).
+    program_param: Option<usize>,
 }
 
 fn assemble(
@@ -2900,6 +2930,7 @@ fn assemble(
         descs,
         programs: parts.programs,
         program: std::sync::atomic::AtomicI32::new(parts.program0),
+        program_param: parts.program_param,
         name,
         spec: parts.spec,
         has_editor,
@@ -2959,6 +2990,44 @@ fn open_v3(
             }
         }
     }
+    // v66: factory-program surface (S3 VST3 parity with v60/v62 VST2).
+    // Query IUnitInfo + the kIsProgramChange parameter HERE — on the
+    // exclusive handle, before the RT runner takes the plugin — and apply
+    // a saved program through the plugin's OWN select path (which drives
+    // controller and processor). The parameter snapshot taken below then
+    // already reflects the restored state, so the fresh-open doctrine
+    // (write nothing back) holds and mirror/plugin cannot disagree.
+    let units = plugin.get_units().unwrap_or_default();
+    let program_unit = units
+        .iter()
+        .find(|u| u.id == 0 && !u.programs.is_empty())
+        .or_else(|| units.iter().find(|u| !u.programs.is_empty()));
+    let programs: Vec<String> = program_unit.map(|u| u.programs.clone()).unwrap_or_default();
+    let pcand: Vec<u32> = plugin
+        .get_parameters()
+        .map(|ps| {
+            ps.iter()
+                .filter(|p| p.flags & VST3_K_IS_PROGRAM_CHANGE != 0)
+                .map(|p| p.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Runtime selection writes the ONE program-change cell through the
+    // mirror; with several program-change params (multi-part plugins) the
+    // cell for the enumerated unit is ambiguous, so runtime select stays
+    // refused there — while open-time restore still works, because the
+    // crate's select_program resolves unit -> param itself.
+    let program_param_id: Option<u32> = if pcand.len() == 1 { Some(pcand[0]) } else { None };
+    if !programs.is_empty() {
+        if let Some(sp) = patch
+            .and_then(|p| p.program)
+            .filter(|p| *p >= 0)
+            .map(|p| p as usize)
+            .filter(|p| *p < programs.len())
+        {
+            let _ = plugin.select_program(program_unit.map(|u| u.id).unwrap_or(0), sp as i32);
+        }
+    }
     let ps = plugin
         .get_parameters()
         .map_err(|e| format!("params: {e}"))?;
@@ -2970,8 +3039,23 @@ fn open_v3(
             name: p.name.clone(),
             default: p.default as f32,
             writable: !p.is_read_only,
+            program_change: p.flags & VST3_K_IS_PROGRAM_CHANGE != 0,
         })
         .collect();
+    // v66 snapshot: read the wired program cell back. With several
+    // program-change params (multi-part plugin) the cell belonging to the
+    // enumerated list is ambiguous — report -1 ("(unknown)" in the combo)
+    // rather than guess from a foreign unit's cell.
+    let program0: i32 = if programs.is_empty() {
+        -1
+    } else if let Some(pid) = program_param_id {
+        ps.iter()
+            .find(|p| p.id == pid)
+            .map(|p| norm_to_program(p.value, programs.len()))
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
     // Seed the mirror from the plugin's CURRENT values, not its reported
     // defaults. Several synths (Dexed, JS80P) initialize from patch/program
     // data and advertise bogus `default_value` metadata (Output = 0.0): a
@@ -3036,10 +3120,12 @@ fn open_v3(
             v3_bufs: Some(bufs),
             control: Some(control),
             out_channels: out_ch,
-            // v60: VST3 programs need a runner-side program command (the
-            // RtControl ring carries none) — documented gap, see field docs.
-            programs: Vec::new(),
-            program0: -1,
+            // v60 gap CLOSED in v66: programs ride IUnitInfo + the
+            // program-change parameter (wired via the mirror below).
+            programs,
+            program0,
+            program_param: program_param_id
+                .and_then(|pid| descs.iter().position(|d| d.id == pid)),
         },
         params,
         descs,
@@ -3174,6 +3260,7 @@ fn open_v2(
                 },
                 default: params_obj.get_parameter(i as i32),
                 writable: true,
+                program_change: false,
             }
         })
         .collect();
@@ -3215,6 +3302,7 @@ fn open_v2(
             out_channels: out_ch,
             programs,
             program0,
+            program_param: None,
         },
         params,
         descs,
@@ -3244,15 +3332,30 @@ impl RtStageEntry {
         self.vst2
     }
 
-    /// v60: switch the LIVE instance to factory program `index`. VST2
-    /// only: the `ChangePreset` dispatch rides the vst2-gui thread, the
-    /// same thread (and same call shape) the plugin's own editor uses,
-    /// so no new thread-affinity class is opened. Every other format and
-    /// every dead/parked entry (v42 firewall) returns false without
-    /// touching the library.
+    /// v60: switch the LIVE instance to factory program `index`. VST2:
+    /// the `ChangePreset` dispatch rides the vst2-gui thread, the same
+    /// thread (and same call shape) the plugin's own editor uses, so no
+    /// new thread-affinity class is opened. v66 VST3: writes the
+    /// program-change cell through the parameter mirror (relayed by
+    /// poll_params to the processor; see `program_param`). Every other
+    /// format and every dead/parked entry (v42 firewall) returns false
+    /// without touching the library.
     pub fn select_program(&self, index: usize) -> bool {
         if self.dead.load(Ordering::Relaxed) || index >= self.programs.len() {
             return false;
+        }
+        // v66: VST3 — the program-change parameter rides the EXISTING
+        // parameter mirror: this write bumps its generation, and
+        // poll_params relays it into the runner's ring as a
+        // ProcessData.inputParameterChanges point on the next RT block.
+        // No new thread-affinity class (params.set is the ordinary UI
+        // param path), and the mirror is also what refresh_program reads
+        // and where the shadow editor's own program edits land.
+        if let Some(k) = self.program_param {
+            let n = (self.programs.len() - 1).max(1) as f32;
+            self.params.set(k, index as f32 / n);
+            self.program.store(index as i32, Ordering::Relaxed);
+            return true;
         }
         let Some(h) = self.vst2 else {
             return false;
@@ -3280,6 +3383,17 @@ impl RtStageEntry {
     /// the PARAMETERS window throttles it (~1 s) while it is open.
     pub fn refresh_program(&self) {
         if self.dead.load(Ordering::Relaxed) || self.programs.is_empty() {
+            return;
+        }
+        // v66: VST3 — read the wired mirror cell. That cell is written by
+        // the combo (select_program) AND by the shadow editor's relay
+        // (route_param_edits3 → VstParams::set → apply_snapshot), so this
+        // read adopts editor-side program changes exactly like the v62
+        // VST2 dispatch read adopts plugin-editor changes.
+        if let Some(k) = self.program_param {
+            let n = (self.programs.len() - 1) as f32;
+            let idx = (self.params.get(k) * n).round().clamp(0.0, n) as i32;
+            self.program.store(idx, Ordering::Relaxed);
             return;
         }
         let Some(h) = self.vst2 else {
@@ -3490,6 +3604,23 @@ impl RtStageEntry {
                 self.name
             );
             output.fill(0.0);
+        }
+    }
+
+    /// Test-only: read the plugin's OWN state stream (VST3). Same
+    /// exclusive-access contract as `process` — the caller must be the
+    /// sole driver of this entry (fixture pins are; the fresh-open path
+    /// has no RT thread). This is what lets a pin prove a program change
+    /// reached the LIBRARY rather than only the host mirror: the fixture
+    /// encodes its program in getState.
+    #[cfg(test)]
+    pub fn save_state(&self) -> Result<Vec<u8>, String> {
+        // SAFETY: `#[cfg(test)]` + caller-owns-entry contract (above);
+        // identical discipline to `process_inner`'s borrow.
+        let s = unsafe { &mut *self.state.get() };
+        match &mut s.backend {
+            Backend::V3(rt) => rt.0.plugin().save_state().map_err(|e| e.to_string()),
+            Backend::V2(_) => Err("save_state probe is VST3-only".into()),
         }
     }
 
@@ -3894,12 +4025,14 @@ mod tests {
                 name: "Output".into(),
                 default: 0.0, // the bogus metadata Dexed reports
                 writable: true,
+                program_change: false,
             },
             VstParamDesc {
                 id: 1,
                 name: "Cutoff".into(),
                 default: 0.0,
                 writable: true,
+                program_change: false,
             },
         ];
         // Plugin's actual state on fresh load: full output, filter open.
@@ -3921,12 +4054,14 @@ mod tests {
                 name: "a".into(),
                 default: 0.25,
                 writable: true,
+                program_change: false,
             },
             VstParamDesc {
                 id: 1,
                 name: "b".into(),
                 default: 0.75,
                 writable: true,
+                program_change: false,
             },
         ];
         let p = VstParams::new(&descs);
@@ -6041,5 +6176,197 @@ mod tests {
             Some(0),
             "out-of-range saved program leaves the plugin at its own program"
         );
+    }
+
+    // ---- v66: VST3 factory programs (S3 gap closed) --------------------
+    //
+    // Fixture: scripts/porting/v66_vst3_fixture.c — raw C, one component
+    // ("V66 Prog") implementing IComponent + IEditController +
+    // IAudioProcessor + IUnitInfo: unit 0 "root" carries a 4-entry program
+    // list (init/pluck/bass/lead), params are id 100 "level" and id 1000
+    // "program" (kIsProgramChange|kIsList|kIsHidden). Program state is
+    // PER INSTANCE (no library statics) and both apply routes —
+    // setParamNormalized and the process-cycle inputParameterChanges pull
+    // — converge on one variable. getState writes [i32 program, f64 level]
+    // (12 bytes), so save_state is direct evidence of what the LIBRARY
+    // holds, not just the host cache.
+
+    fn v66_fixture(name: &str) -> PathBuf {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/v66")
+            .join(name);
+        assert!(
+            p.is_file(),
+            "V66 fixture missing: {} (run scripts/porting/v66_build_fixtures.sh)",
+            p.display()
+        );
+        p
+    }
+
+    /// Parse the saved stream. vst3-host wraps the plugin's bytes in its
+    /// documented envelope (magic | u32 version | u32 component_len |
+    /// u32 controller_len | payload...) — unwrap it, then parse the
+    /// fixture payload [i32 program, f64 level] (12 bytes). Every shape
+    /// guard is explicit so a foreign or truncated stream can never
+    /// false-pass a program assert.
+    fn v66_state(save: &[u8]) -> Option<i32> {
+        if save.len() < 40 || &save[0..16] != b"VST3HOST_STATE\0\0" {
+            return None;
+        }
+        if u32::from_le_bytes(save[16..20].try_into().ok()?) != 1 {
+            return None;
+        }
+        if u32::from_le_bytes(save[20..24].try_into().ok()?) != 12 {
+            return None;
+        }
+        // save[24..28] = controller-state length (u32::MAX = absent; this
+        // fixture's controller IS the component, so whatever the crate
+        // captures there is the same payload — not our evidence).
+        let level = f64::from_le_bytes(save[32..40].try_into().ok()?);
+        if (level - 0.5).abs() > f64::EPSILON {
+            return None;
+        }
+        Some(i32::from_le_bytes(save[28..32].try_into().ok()?))
+    }
+
+    /// The host must SEE the program surface: unit-0 list names in order,
+    /// the initial program, and the flag that keeps the program-change
+    /// cell OUT of the generic knob grid while the mirror still carries
+    /// it (writable — the editor relay and the runtime write need it; the
+    /// fixture sets kIsHidden, so this also pins that the crate does NOT
+    /// filter hidden params out of the mirror).
+    #[test]
+    fn v66_vst3_program_surface_enumerated() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let e = &load.entry;
+        assert_eq!(
+            e.programs(),
+            vec!["init", "pluck", "bass", "lead"],
+            "names, in order"
+        );
+        assert_eq!(e.current_program(), Some(0), "fixture boots at program 0");
+        let prog = e
+            .descs()
+            .iter()
+            .find(|d| d.program_change)
+            .expect("program-change param visible in the mirror");
+        assert_eq!(prog.id, 1000, "the fixture's kIsProgramChange id");
+        assert!(prog.writable, "relay + runtime write need the cell writable");
+        assert_eq!(e.descs().iter().filter(|d| d.program_change).count(), 1);
+        let level = e.descs().iter().find(|d| d.id == 100).expect("level param");
+        assert!(!level.program_change, "plain param must not carry the flag");
+    }
+
+    /// The combo must reach the LIBRARY, not just the host cache: select
+    /// pushes through the parameter mirror, `process` relays it as a
+    /// parameter point (the crate pulls it into the controller inside the
+    /// process cycle), and the fixture's own saveState reports the moved
+    /// program — the same evidence chain as the v62 VST2 dispatcher pin.
+    #[test]
+    fn v66_vst3_select_program_reaches_library() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let e = &load.entry;
+        assert!(e.select_program(3), "valid select accepted");
+        assert_eq!(e.current_program(), Some(3));
+        assert!(!e.select_program(9), "out-of-range refused host-side");
+        assert_eq!(e.current_program(), Some(3), "refusal leaves state alone");
+        // Relay: drive the process pump so the pending mirror change is
+        // handed to the plugin (this is the RT block loop offline).
+        let inp = vec![0.0f32; 8192];
+        let mut outp = vec![0.0f32; 8192];
+        for _ in 0..4 {
+            e.process(&inp, &mut outp);
+        }
+        let save = e
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry")
+            .save_state()
+            .expect("fixture state save");
+        assert_eq!(
+            v66_state(&save),
+            Some(3),
+            "the LIBRARY holds program 3 after the relay (state stream = {save:?})"
+        );
+    }
+
+    /// Save/load (goal 5): a project's saved program must be LIVE on the
+    /// reopened instance — applied through the plugin's own select path
+    /// before the parameter snapshot is taken, so plugin and host cache
+    /// cannot disagree. Out-of-range values leave the plugin's own choice.
+    #[test]
+    fn v66_vst3_saved_program_restored_at_open() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open_with_state(
+            v66_fixture(file).as_path(),
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(2),
+            }),
+        )
+        .expect("restore open");
+        assert_eq!(load.entry.current_program(), Some(2), "cache reflects restore");
+        let save = load
+            .entry
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry")
+            .save_state()
+            .expect("state save");
+        assert_eq!(
+            v66_state(&save),
+            Some(2),
+            "the program-change param really moved inside the plugin"
+        );
+        // Out-of-range: ignored, plugin keeps its own boot program.
+        let load2 = open_with_state(
+            v66_fixture(file).as_path(),
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(99),
+            }),
+        )
+        .expect("out-of-range restore open");
+        assert_eq!(load2.entry.current_program(), Some(0), "bogus value ignored");
+    }
+
+    /// v62 parity (goal 1 + 3): when the change comes from the OTHER
+    /// direction — a hosted editor relaying a program edit into the
+    /// mirror — `refresh_program` adopts it into the combo exactly like
+    /// the VST2 dispatch read adopts an editor-side ChangePreset.
+    #[test]
+    fn v66_vst3_editor_relay_adopts_mirror_cell() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let e = &load.entry;
+        let k = e
+            .descs()
+            .iter()
+            .position(|d| d.program_change)
+            .expect("program cell");
+        // Shadow-editor relay shape: apply_snapshot writes params by desc
+        // index (route_param_edits3 -> VstParams::set). 1/3 of the range
+        // is program 1 ("pluck") under the vst3 index/(count-1) mapping.
+        e.params().set(k, 1.0 / 3.0);
+        assert_eq!(e.current_program(), Some(0), "not adopted before a refresh tick");
+        e.refresh_program();
+        assert_eq!(e.current_program(), Some(1), "the editor's program is adopted");
+        // And it survives as a selectable round-trip (combo re-select).
+        assert!(e.select_program(0));
+        e.refresh_program();
+        assert_eq!(e.current_program(), Some(0));
     }
 }
