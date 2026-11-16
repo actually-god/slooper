@@ -1239,6 +1239,7 @@ pub(crate) fn open_unlocked(
                 name,
                 default,
                 writable,
+                program_change: false,
             });
             ranges.push((info.min_value, info.max_value));
             cur_vals.push(default_from_plain(cur, &info));
