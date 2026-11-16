@@ -1774,6 +1774,11 @@ pub struct App {
     /// keyed by synth STEM (same refresh pattern as `params_presets`).
     synth_preset_name: String,
     synth_presets: Vec<String>,
+    /// v69: drum kit preset bar — name box + cached folder list (refreshed
+    /// on save/delete and on first paint of the kit page).
+    kit_preset_name: String,
+    kit_presets: Vec<String>,
+    kit_presets_ready: bool,
     synth_presets_for: String,
     /// v60: factory program list shown by the parameter bar + the plugin
     /// name it was cached from (same refresh pattern as `params_presets`).
@@ -2341,6 +2346,9 @@ impl App {
             params_presets_for: String::new(),
             synth_preset_name: String::new(),
             synth_presets: Vec::new(),
+            kit_preset_name: String::new(),
+            kit_presets: Vec::new(),
+            kit_presets_ready: false,
             synth_presets_for: String::new(),
             params_programs: Vec::new(),
             params_programs_for: String::new(),
