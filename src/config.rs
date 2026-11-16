@@ -55,6 +55,18 @@ pub struct DrumPadSave {
     pub muted: bool,
 }
 
+/// v69 (goal-5 parity): a named drum kit user preset. Lives under
+/// `data_dir()/drum-kits/<name>.json` — the same folder layout as the v56
+/// sampler presets and v61 track templates (one shared sanitizer, no
+/// traversal). Pads keep asset PATHS like [`DrumPadSave`], so a kit saved
+/// in one project re-links against another project's rack (unresolved
+/// pads stay silent, they never brick).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrumKitSave {
+    pub name: String,
+    pub pads: Vec<DrumPadSave>,
+}
+
 /// v30 R1: the drum machine PATTERN (the pattern builder): a velocity
 /// grid of `steps` columns x pad rows. The pad SOUNDS (the kit) are NOT
 /// here any more — every track's synth module owns its own kit, so each
