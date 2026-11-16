@@ -66,6 +66,11 @@ mod ffi {
     pub static CLAP_EXT_PARAMS_C: &CStr = c"clap.params";
     pub static CLAP_EXT_AUDIO_PORTS_C: &CStr = c"clap.audio-ports";
     pub static CLAP_EXT_STATE_C: &CStr = c"clap.state";
+    /// v67: plugin-side preset-load notification (CLAP v1 has no preset
+    /// enumeration; this is the whole factory-preset story). The vendored
+    /// 1.2.2 header ships primary + compat ids - answer both.
+    pub static CLAP_EXT_PRESET_LOAD_C: &CStr = c"clap.preset-load/2";
+    pub static CLAP_EXT_PRESET_LOAD_COMPAT_C: &CStr = c"clap.preset-load.draft/2";
 
     #[repr(C)]
     pub struct ClapVersion {
@@ -221,6 +226,27 @@ mod ffi {
         ) -> bool,
     }
 
+    /// Host sink for `clap.preset-load/2` (v67). The plugin reports a
+    /// preset it loaded through its own machinery (`loaded`), or a failed
+    /// load location (`on_error`).
+    #[repr(C)]
+    pub struct ClapHostPresetLoad {
+        pub on_error: unsafe extern "C" fn(
+            host: *const ClapHost,
+            location_kind: u32,
+            location: *const c_char,
+            load_key: *const c_char,
+            os_error: i32,
+            msg: *const c_char,
+        ),
+        pub loaded: unsafe extern "C" fn(
+            host: *const ClapHost,
+            location_kind: u32,
+            location: *const c_char,
+            load_key: *const c_char,
+        ),
+    }
+
     #[repr(C)]
     pub struct ClapProcess {
         pub steady_time: i64,
@@ -335,8 +361,9 @@ impl Default for EvSlot {
 
 struct HostGlobals {
     log: ffi::ClapHostLog,
-    host: ffi::ClapHost,
-    // Read by plugins through the clap_host_t layout (Rust never touches).
+    // The `clap_host_t` itself is PER ENTRY since v67 (host_data routes
+    // plugin-side preset-load reports back to their entry); these
+    // strings are shared by all entries.
     #[allow(dead_code)]
     name: CString,
     #[allow(dead_code)]
@@ -356,31 +383,77 @@ static HOST: LazyLock<HostGlobals> = LazyLock::new(|| {
     let url = CString::new("https://github.com/actually-god/slooper").unwrap();
     let version = CString::new(env!("CARGO_PKG_VERSION")).unwrap();
     let log = ffi::ClapHostLog { log: host_log_cb };
-    let host = ffi::ClapHost {
-        clap_version: ffi::ClapVersion {
-            major: 1,
-            minor: 2,
-            revision: 0,
-        },
-        host_data: std::ptr::null_mut(),
-        name: name.as_ptr(),
-        vendor: vendor.as_ptr(),
-        url: url.as_ptr(),
-        version: version.as_ptr(),
-        get_extension: host_get_extension,
-        request_restart: host_noop,
-        request_process: host_noop,
-        request_callback: host_noop,
-    };
     HostGlobals {
         log,
-        host,
         name,
         vendor,
         url,
         version,
     }
 });
+
+/// v67: per-entry sink for plugin-side preset-load reports. Each entry
+/// hands its plugins a dedicated `clap_host_t` whose `host_data` points
+/// here (both the Box and the Arc clone it holds are LEAKED - plugins are
+/// never unloaded and entries are never destroyed), so the one global
+/// `PRESET_LOAD` vtable can route every callback to the reporting entry.
+#[derive(Default)]
+struct PresetSlot {
+    report: std::sync::Mutex<Option<crate::vsthost::PresetLoadEvent>>,
+}
+
+static PRESET_LOAD: ffi::ClapHostPresetLoad = ffi::ClapHostPresetLoad {
+    on_error: host_preset_error,
+    loaded: host_preset_loaded,
+};
+
+unsafe fn preset_slot_of(host: *const ffi::ClapHost) -> Option<&'static PresetSlot> {
+    if host.is_null() {
+        return None;
+    }
+    let data = unsafe { (*host).host_data };
+    if data.is_null() {
+        return None;
+    }
+    Some(unsafe { &*(data as *const PresetSlot) })
+}
+
+unsafe extern "C" fn host_preset_loaded(
+    host: *const ffi::ClapHost,
+    _location_kind: u32,
+    location: *const c_char,
+    load_key: *const c_char,
+) {
+    if let Some(slot) = unsafe { preset_slot_of(host) } {
+        let mut report = slot.report.lock().unwrap_or_else(|p| p.into_inner());
+        *report = Some(crate::vsthost::PresetLoadEvent::Loaded {
+            location: unsafe { cstr_to_string(location) },
+            load_key: (!load_key.is_null()).then(|| unsafe { cstr_to_string(load_key) }),
+        });
+    }
+}
+
+unsafe extern "C" fn host_preset_error(
+    host: *const ffi::ClapHost,
+    _location_kind: u32,
+    location: *const c_char,
+    load_key: *const c_char,
+    _os_error: i32,
+    msg: *const c_char,
+) {
+    if let Some(slot) = unsafe { preset_slot_of(host) } {
+        let mut report = slot.report.lock().unwrap_or_else(|p| p.into_inner());
+        *report = Some(crate::vsthost::PresetLoadEvent::Failed {
+            location: unsafe { cstr_to_string(location) },
+            load_key: (!load_key.is_null()).then(|| unsafe { cstr_to_string(load_key) }),
+            message: if msg.is_null() {
+                "plugin reported no message".to_string()
+            } else {
+                unsafe { cstr_to_string(msg) }
+            },
+        });
+    }
+}
 
 unsafe extern "C" fn host_get_extension(
     _host: *const ffi::ClapHost,
@@ -392,6 +465,12 @@ unsafe extern "C" fn host_get_extension(
     let id = CStr::from_ptr(id);
     if id.to_bytes() == b"clap.log" {
         return &HOST.log as *const _ as *const c_void;
+    }
+    // v67: clap.preset-load - the plugin's notification channel for
+    // presets IT loaded (the CLAP v1 ABI has no host-side enumeration).
+    // Primary + compat ids both answered.
+    if id == ffi::CLAP_EXT_PRESET_LOAD_C || id == ffi::CLAP_EXT_PRESET_LOAD_COMPAT_C {
+        return &PRESET_LOAD as *const _ as *const c_void;
     }
     std::ptr::null()
 }
@@ -709,6 +788,8 @@ pub struct ClapStageEntry {
     /// 0 = plugin declares no audio input ports (an instrument).
     in_ports: u32,
     midi_drops: std::sync::Arc<AtomicU64>,
+    /// v67: plugin-side preset-load reports (CLAP `clap.preset-load`).
+    preset_slot: std::sync::Arc<PresetSlot>,
 }
 
 unsafe impl Send for ClapStageEntry {}
@@ -1027,6 +1108,14 @@ impl StageEntry for ClapStageEntry {
         self.midi_drops.load(Ordering::Relaxed)
     }
 
+    fn take_preset_report(&self) -> Option<crate::vsthost::PresetLoadEvent> {
+        self.preset_slot
+            .report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
     fn all_notes_off(&self) {
         // SAFETY: audio-thread-only (engine contract identical to VST).
         let s = unsafe { &mut *self.state.get() };
@@ -1184,10 +1273,32 @@ pub(crate) fn open_unlocked(
         });
     }
 
+    // v67: per-entry `clap_host_t` - `host_data` routes this plugin's
+    // preset-load reports back to the owning entry (the vtable itself
+    // stays one global). The Box and the Arc clone inside host_data are
+    // leaked on purpose: plugins are never unloaded, entries never
+    // destroyed (standing leak policy).
+    let preset_slot = std::sync::Arc::new(PresetSlot::default());
+    let host = Box::leak(Box::new(ffi::ClapHost {
+        clap_version: ffi::ClapVersion {
+            major: 1,
+            minor: 2,
+            revision: 0,
+        },
+        host_data: std::sync::Arc::into_raw(preset_slot.clone()) as *mut c_void,
+        name: HOST.name.as_ptr(),
+        vendor: HOST.vendor.as_ptr(),
+        url: HOST.url.as_ptr(),
+        version: HOST.version.as_ptr(),
+        get_extension: host_get_extension,
+        request_restart: host_noop,
+        request_process: host_noop,
+        request_callback: host_noop,
+    }));
     let plugin = unsafe {
         let id =
             CString::new(CStr::from_ptr((*desc).id).to_str().unwrap_or("")).unwrap_or_default();
-        (factory.create_plugin)(factory, &HOST.host, id.as_ptr())
+        (factory.create_plugin)(factory, host, id.as_ptr())
     };
     if plugin.is_null() {
         return Err("CLAP create_plugin returned null".into());
@@ -1390,6 +1501,7 @@ pub(crate) fn open_unlocked(
         state_ext,
         in_ports,
         midi_drops: std::sync::Arc::new(AtomicU64::new(0)),
+        preset_slot,
     });
     unsafe {
         let s = &mut *std::sync::Arc::get_mut(&mut e).unwrap().state.get();
@@ -1540,13 +1652,67 @@ pub(crate) mod tests {
     #[test]
     fn v34_clap_open_reads_normalized_params() {
         let e = fixture_entry("gain");
-        assert_eq!(e.descs().len(), 2);
+        // v67: fixture-gain gained `fixload` (the preset-load trigger) - 3.
+        assert_eq!(e.descs().len(), 3);
         assert_eq!(e.descs()[0].name, "fixgain");
         // plain default 1.0 on [0,1] normalizes to 1.0
         assert!((e.descs()[0].default - 1.0).abs() < 1e-6);
         assert!(
             (e.params().get(0) - 1.0).abs() < 1e-6,
             "cells seed from plugin, not host"
+        );
+    }
+
+    /// v67 (goals 3/5, host half): a CLAP plugin that loads a preset
+    /// through its OWN machinery must reach the host - the fixture calls
+    /// `clap_host_preset_load.loaded` when `fixload` arms. The entry
+    /// surfaces the report (drained once, exact location, no container
+    /// key), and the plugin-side state change lands in the next chunk so
+    /// project save persists it.
+    #[test]
+    fn v67_clap_preset_load_report_surfaces() {
+        let e = fixture_entry("gain");
+        assert!(
+            e.take_preset_report().is_none(),
+            "nothing to report until the plugin loads"
+        );
+        e.params().set(2, 1.0); // fixload cell (plain == normalized on [0,1])
+        let input: Vec<f32> = (0..1536).map(|_| 0.5).collect();
+        let mut out = vec![0.0f32; 1536];
+        e.process(&input, &mut out); // delivers the PARAM_VALUE event
+        let r = e
+            .take_preset_report()
+            .expect("the fixture reported its preset load");
+        match &r {
+            crate::vsthost::PresetLoadEvent::Loaded { location, load_key } => {
+                assert_eq!(location, "slooper-fixture-factory-preset");
+                assert!(load_key.is_none(), "factory preset carries no container key");
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+        assert!(e.take_preset_report().is_none(), "reports drain once");
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.75"),
+            "the plugin's own preset state reaches the chunk: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+    }
+
+    /// v67 negative polarity: no `fixload` arm means no report at all,
+    /// and the plugin's untouched state keeps the chunk at the default.
+    #[test]
+    fn v67_clap_preset_load_silent_until_triggered() {
+        let e = fixture_entry("gain");
+        let input: Vec<f32> = (0..1024).map(|_| 0.5).collect();
+        let mut out = vec![0.0f32; 1024];
+        e.process(&input, &mut out);
+        assert!(e.take_preset_report().is_none());
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 1.00"),
+            "no plugin-side load expected: {:?}",
+            String::from_utf8_lossy(&chunk)
         );
     }
 

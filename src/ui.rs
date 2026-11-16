@@ -1751,6 +1751,8 @@ pub struct App {
     /// v62: ctx time the parameters window may next re-read the plugin's
     /// LIVE factory program (editor-side-change sync, ~1 s throttle).
     params_prog_sync_at: f64,
+    /// v67: throttle for the plugin-side preset-load report pump.
+    params_preset_sync_at: f64,
     /// v62: per-track selected VST2 factory program (-1 = none). Seeded
     /// from config, pushed by the PARAMETERS combo, captured on save.
     track_synth_program: Vec<i32>,
@@ -2306,6 +2308,7 @@ impl App {
             params_programs: Vec::new(),
             params_programs_for: String::new(),
             params_prog_sync_at: 0.0,
+            params_preset_sync_at: 0.0,
             track_synth_program: (0..MAX_LOOPS)
                 .map(|t| cfg.track_synth_programs.get(t).copied().unwrap_or(-1))
                 .collect(),
@@ -3544,7 +3547,9 @@ impl App {
         // every GuiTarget); backends/plugins reporting no programs skip
         // the row entirely. VST2 since v60, VST3 since v66 (IUnitInfo
         // program lists + the program-change parameter, the documented
-        // gap now closed); CLAP presets too.
+        // gap now closed). CLAP has NO factory enumeration in the v1 ABI
+        // by design — its user presets ride the value bar above, and a
+        // preset the PLUGIN loads itself surfaces as the v67 echo below.
         if self.params_programs_for != entry.name() {
             let nm = entry.name().to_string();
             self.params_programs_for = nm.clone();
@@ -3594,6 +3599,35 @@ impl App {
                          changes the sound immediately",
                     );
             });
+        }
+        // v67: surface plugin-side preset-load reports (CLAP
+        // `clap.preset-load`) while this window shows the entry - same
+        // throttled-pump shape as the v62 program sync. A plugin that
+        // loaded one of its OWN presets would otherwise change the sound
+        // with no host-side trace; the echo closes that feedback loop
+        // (goal 1) and the save-time chunk harvest persists the state.
+        let now = ui.ctx().input(|i| i.time);
+        if now >= self.params_preset_sync_at {
+            self.params_preset_sync_at = now + 1.0;
+            if let Some(r) = entry.take_preset_report() {
+                match r {
+                    crate::vsthost::PresetLoadEvent::Loaded { location, load_key } => {
+                        self.status = match load_key {
+                            Some(k) => format!(
+                                "preset loaded \u{201c}{location}\u{201d} [{k}] (from the plugin)"
+                            ),
+                            None => format!(
+                                "preset loaded \u{201c}{location}\u{201d} (from the plugin)"
+                            ),
+                        };
+                    }
+                    crate::vsthost::PresetLoadEvent::Failed { location, message, .. } => {
+                        self.status = format!(
+                            "preset load FAILED \u{201c}{location}\u{201d}: {message}"
+                        );
+                    }
+                }
+            }
         }
         let ql = new_filter.trim().to_lowercase();
         let rows: Vec<(usize, String)> = entry
@@ -48582,5 +48616,199 @@ mod tests {
         );
         checked += 1;
         assert_eq!(checked, 4, "broken scan");
+    }
+
+    /// v67 (goal 1, UI half): a CLAP plugin's own preset load must ECHO
+    /// into the status line while the PARAMETERS window shows the entry.
+    /// The dummy entry is Clap-kind with NO factory programs, which also
+    /// pins that the pump runs independently of the v60 program branch.
+    #[test]
+    fn v67_preset_report_status_echo() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct V67Report {
+            pending: AtomicBool,
+        }
+        impl crate::vsthost::StageEntry for V67Report {
+            fn name(&self) -> &str {
+                "v67report"
+            }
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("/")
+            }
+            fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+                static S: std::sync::OnceLock<(std::path::PathBuf, crate::vsthost::VstKind)> =
+                    std::sync::OnceLock::new();
+                S.get_or_init(|| (std::path::PathBuf::from("/"), crate::vsthost::VstKind::Clap))
+            }
+            fn kind(&self) -> crate::vsthost::VstKind {
+                crate::vsthost::VstKind::Clap
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+                &[]
+            }
+            fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+                static P: std::sync::OnceLock<std::sync::Arc<crate::vsthost::VstParams>> =
+                    std::sync::OnceLock::new();
+                P.get_or_init(|| crate::vsthost::VstParams::new(&[]))
+            }
+            fn has_editor(&self) -> bool {
+                false
+            }
+            fn set_param(&self, _i: usize, _v: f32) {}
+            fn set_param_rt(&self, _i: usize, _v: f32) {}
+            fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+            fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+            fn all_notes_off(&self) {}
+            fn flush(&self) {}
+            fn midi_drops(&self) -> u64 {
+                0
+            }
+            fn take_preset_report(&self) -> Option<crate::vsthost::PresetLoadEvent> {
+                self.pending
+                    .swap(false, Ordering::SeqCst)
+                    .then(|| crate::vsthost::PresetLoadEvent::Loaded {
+                        location: "memory://v67-preset.clampreset".into(),
+                        load_key: None,
+                    })
+            }
+        }
+        let mut app = headless_app("v67echo");
+        app.show_master = false;
+        let entry = std::sync::Arc::new(V67Report {
+            pending: AtomicBool::new(true),
+        });
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: "/dev/null".into(),
+            kind: crate::vsthost::VstKind::Clap,
+            plugin_id: Some("com.slooper.fixture-gain".into()),
+            name: "v67report".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("preset loaded") && app.status.contains("v67-preset.clampreset"),
+            "plugin-side preset load echoed: {:?}",
+            app.status
+        );
+        assert!(
+            app.params_programs.is_empty(),
+            "the echo works with NO factory programs (CLAP has none by ABI)"
+        );
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.status.contains("preset loaded"),
+            "the report drains once - not an echo loop: {:?}",
+            app.status
+        );
+    }
+
+    /// v67 (goal 5, parity pin): a Clap-kind row must round-trip the
+    /// generic v34 user-preset bar - save captures the live cell mirror,
+    /// apply writes through the entry, delete removes the file. For CLAP
+    /// this bar is the ONLY user-preset surface (no factory list by ABI),
+    /// so its coverage is pinned explicitly for a Clap-kind entry.
+    #[test]
+    fn v67_clap_kind_user_preset_roundtrip() {
+        fn d67() -> &'static [crate::vsthost::VstParamDesc] {
+            static D: std::sync::OnceLock<Vec<crate::vsthost::VstParamDesc>> =
+                std::sync::OnceLock::new();
+            D.get_or_init(|| {
+                vec![crate::vsthost::VstParamDesc {
+                    id: 1,
+                    name: "v67p".into(),
+                    default: 0.5,
+                    writable: true,
+                    program_change: false,
+                }]
+            })
+        }
+        struct V67Clap {
+            params: std::sync::Arc<crate::vsthost::VstParams>,
+        }
+        impl crate::vsthost::StageEntry for V67Clap {
+            fn name(&self) -> &str {
+                "v67clap"
+            }
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("/")
+            }
+            fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+                static S: std::sync::OnceLock<(std::path::PathBuf, crate::vsthost::VstKind)> =
+                    std::sync::OnceLock::new();
+                S.get_or_init(|| (std::path::PathBuf::from("/"), crate::vsthost::VstKind::Clap))
+            }
+            fn kind(&self) -> crate::vsthost::VstKind {
+                crate::vsthost::VstKind::Clap
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+                d67()
+            }
+            fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+                &self.params
+            }
+            fn has_editor(&self) -> bool {
+                false
+            }
+            fn set_param(&self, i: usize, v: f32) {
+                self.params.set(i, v);
+            }
+            fn set_param_rt(&self, i: usize, v: f32) {
+                self.params.set(i, v);
+            }
+            fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+            fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+            fn all_notes_off(&self) {}
+            fn flush(&self) {}
+            fn midi_drops(&self) -> u64 {
+                0
+            }
+        }
+        let mut app = headless_app("v67userpreset");
+        let entry = std::sync::Arc::new(V67Clap {
+            params: crate::vsthost::VstParams::new(d67()),
+        });
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: "/dev/null".into(),
+            kind: crate::vsthost::VstKind::Clap,
+            plugin_id: None,
+            name: "v67clap".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        let target = GuiTarget::Chain(0, 0);
+        entry.params.set(0, 0.4);
+        assert_eq!(
+            app.save_param_preset(target, "v67probe").unwrap(),
+            1,
+            "one param captured"
+        );
+        entry.params.set(0, 0.9);
+        assert_eq!(app.apply_param_preset(target, "v67probe").unwrap(), 1);
+        assert!(
+            (entry.params.get(0) - 0.4).abs() < 1e-6,
+            "the preset restored the saved value"
+        );
+        app.delete_param_preset(target, "v67probe").unwrap();
+        assert!(
+            App::list_param_presets("v67clap").is_empty(),
+            "delete removed the preset file"
+        );
     }
 }
