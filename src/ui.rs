@@ -847,6 +847,28 @@ fn track_color_submenu(ui: &mut egui::Ui, app: &mut App, t: usize) -> bool {
     false
 }
 
+/// v68 (S4): ONE body for a track header's RMB menu — the dock strip
+/// (v59 color + v61 templates) and the mix-page columns call this, so
+/// the two entry points cannot drift.
+fn track_head_menu(ui: &mut egui::Ui, app: &mut App, t: usize) {
+    if track_color_submenu(ui, app, t) {
+        ui.close();
+    }
+    if ui
+        .button("Track templates\u{2026}")
+        .on_hover_text(
+            "save this track's instrument, effects chain, mixer and \
+             color as a named template, or re-apply a saved one",
+        )
+        .clicked()
+    {
+        app.tpl_track = t;
+        app.tpl_name = format!("Track {}", t + 1);
+        app.show_tpl = true;
+        ui.close();
+    }
+}
+
 /// Nominal lane-strip height in the grid. A track's block is
 /// `lanes × LANE_H`, never shorter than `TRACK_MIN_H` (the height its
 /// mixer strip needs), so clips get tall waveforms and the mixer stays
@@ -1480,6 +1502,17 @@ pub struct App {
     /// Grid snap enable (main header checkbox). OFF = placement/resize
     /// snaps to ONE SAMPLE — the program's minimum resolution.
     snap_on: bool,
+    /// v68 (S4): FL-style full-page MIXER tab. ON = the center area
+    /// draws the mix page (one channel column per track) instead of the
+    /// grid; the mixer dock stays live but drops to independent layout.
+    /// Session state only (no Config field — the toggle and F9 are
+    /// always on screen, nothing is persisted-stale).
+    mix_tab: bool,
+    /// v68: mix-page rects painted THIS frame (the v63 SeGeom pattern);
+    /// empty while the page is closed.
+    mix_geom: MixGeom,
+    /// v68: horizontal scroll offset of the mix page (session).
+    mix_hscroll: f32,
     /// Asset name currently auditioning (clicking it again toggles stop).
     preview_playing: Option<String>,
 
@@ -2075,6 +2108,10 @@ impl App {
             sc_send,
             sel_sent: usize::MAX,
             levels_dirty: false,
+            // v68: mix-page session state (see the `mix_tab` field).
+            mix_tab: false,
+            mix_geom: MixGeom::default(),
+            mix_hscroll: 0.0,
             selected: 0,
             n_tracks: cfg.n_tracks.clamp(1, MAX_LOOPS),
             loop_tl: cfg.loop_tl,
@@ -2543,6 +2580,7 @@ impl App {
     /// auto-repeat doesn't re-fire an action, and the keys are ignored while
     /// ANY text box has focus.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+
         // Ignore keys while a text box anywhere in the program has focus —
         // the egui focus registry, so it covers every TextEdit (quantize
         // fields, FX preset name, export path, level nudge, …) including
@@ -2841,6 +2879,19 @@ impl App {
             return; // swallow the key
         }
 
+        // v68 (S4): F9 — FL's Mixing key — flips grid ↔ mix page.
+        // Deliberately NOT a MidiAction slot: the persisted shortcut
+        // tables address slots POSITIONALLY and every current one is
+        // 140 long; appending a 141st slot would make them all match
+        // the v0.1.x (coincidentally also 140-wide) remap arm of
+        // migrate_shortcuts and scramble keymaps on upgrade. Rides the
+        // Ctrl+zoom-key pattern instead. (A user who binds another
+        // action to F9 loses the race — this handler returns first.)
+        if pressed_keys.contains(&egui::Key::F9) {
+            self.toggle_mix_page();
+            return; // swallow the key
+        }
+
         // Selected clips delete with Delete/Backspace — same vocabulary as
         // clearing bindings (learn modes above already swallowed the key if
         // they were open, and typing focus returned earlier). The assets
@@ -2865,6 +2916,23 @@ impl App {
                 }
             }
         }
+    }
+
+    /// v68 (S4): flip the mix page and echo it (the F9 route; the
+    /// toolbar toggle flips through its own binding, then calls the
+    /// SAME echo — one status voice for both entry points, goal 1).
+    fn toggle_mix_page(&mut self) {
+        self.mix_tab = !self.mix_tab;
+        self.echo_mix_page();
+    }
+
+    /// v68: ONE status echo for both mix-page entry points.
+    fn echo_mix_page(&mut self) {
+        self.status = if self.mix_tab {
+            "mix page: on \u{b7} F9 or the toolbar toggle back to the grid".into()
+        } else {
+            "mix page: off \u{b7} back to the grid".into()
+        };
     }
 
     /// Set loop `i`'s playback volume from a MIDI-range value (0..=127).
@@ -22081,6 +22149,343 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
 // OUT (top-bar "Meter", Windows ▸ master out) is now the one master
 // section; it docks beside the mixer out of the box.
 
+// ---- v68 (S4): full-page mix page — FL's Mixing tab -----------------
+
+/// Column width + gap for the mix page. Columns are UNIFORM — every
+/// column lays out the same fixed-size rows, so headers, fader tops
+/// and pan rows share one line across the page (goal 4: alignment).
+const MIX_COL_W: f32 = 130.0;
+const MIX_COL_GAP: f32 = 8.0;
+
+/// v68: screen rects the mix page painted THIS frame (the v63 SeGeom
+/// pattern): pins hit-test exact column rects instead of guessing.
+/// Length ALWAYS equals `n_tracks` — columns scrolled off carry
+/// `Rect::NOTHING` so callers index by track.
+#[derive(Clone, Default)]
+struct MixGeom {
+    head: Vec<egui::Rect>,
+    fader: Vec<egui::Rect>,
+    gain: Vec<egui::Rect>,
+    pan: Vec<egui::Rect>,
+}
+
+/// v68 (S4): the full-page mixer. One channel column per track: header
+/// (color chip + select + track menu), record + mute, VERTICAL vol +
+/// gain faders with dB readouts, pan slider + readout, FX and synth
+/// chips. Every control rides the SAME setter / display / hover sources
+/// as the dock strips (goal 3 parity). NO master column: MASTER OUT is
+/// the only master section (AGENT-GUIDE rule).
+fn mix_page(ui: &mut egui::Ui, app: &mut App) {
+    let base = ui.max_rect();
+    app.mix_geom = MixGeom::default();
+    ui.label(
+        RichText::new(
+            "mix page \u{b7} one channel per track \u{b7} shift+wheel or the \
+             scroller moves sideways \u{b7} F9 back to the grid",
+        )
+        .weak()
+        .small(),
+    );
+    let rows = ui.available_rect_before_wrap();
+    let total = app.n_tracks as f32 * (MIX_COL_W + MIX_COL_GAP) - MIX_COL_GAP;
+    let max_scroll = (total - rows.width()).max(0.0);
+    // The page owns its own horizontal offset (the grid's hscroll
+    // belongs to the timeline). Trackpad-x AND shift+wheel both work.
+    if ui.rect_contains_pointer(base) {
+        let d = ui.input(|i| {
+            let s = i.smooth_scroll_delta;
+            if i.modifiers.shift {
+                s.y
+            } else {
+                s.x
+            }
+        });
+        if d != 0.0 {
+            app.mix_hscroll = (app.mix_hscroll - d).clamp(0.0, max_scroll);
+        }
+    }
+    app.mix_hscroll = app.mix_hscroll.min(max_scroll);
+    let row_h = rows.height().max(160.0);
+    for t in 0..app.n_tracks {
+        let x = rows.min.x + t as f32 * (MIX_COL_W + MIX_COL_GAP) - app.mix_hscroll;
+        let col = egui::Rect::from_min_size(
+            egui::pos2(x, rows.min.y),
+            egui::vec2(MIX_COL_W, row_h),
+        );
+        if col.max.x < base.min.x || col.min.x > base.max.x {
+            // Scrolled out: geometry stays index-addressable for pins.
+            app.mix_geom.head.push(egui::Rect::NOTHING);
+            app.mix_geom.fader.push(egui::Rect::NOTHING);
+            app.mix_geom.gain.push(egui::Rect::NOTHING);
+            app.mix_geom.pan.push(egui::Rect::NOTHING);
+            continue;
+        }
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .id_salt(("mixcol", t))
+                .max_rect(col)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| mix_column(ui, app, t),
+        );
+    }
+    // Absolute-layout pass: nothing advanced the flow cursor, so claim
+    // the full area (pointer hit-testing + the wheel handler agree).
+    let _ = ui.allocate_exact_size(base.size(), Sense::hover());
+}
+
+/// One channel column of the mix page. All rows FIXED size and
+/// identical in every column → headers, faders and pan rows align
+/// across the page exactly (goal 4).
+fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
+    let rect = ui.max_rect();
+    ui.shrink_clip_rect(rect);
+    let sel = app.selected == t;
+    let rec = app.backend.engine.rec_state_of(t) == TR_REC;
+    let on = app.backend.engine.track_on(t);
+    // Header first (the color chip paints INSIDE it, v56-style: an
+    // allocated chip row would shift every lower row in colored
+    // columns and break the page-wide alignment).
+    let head = ui
+        .add_sized(
+            [MIX_COL_W - 4.0, 18.0],
+            egui::Button::selectable(sel, RichText::new(format!("Ch {}", t + 1)).strong()),
+        )
+        .on_hover_text(
+            "Channel strip: click selects the track \u{b7} right-click for \
+             the track menu (color, templates)",
+        );
+    let chip = app
+        .trk_color
+        .get(t)
+        .copied()
+        .flatten()
+        .and_then(|i| CLIP_PALETTE.get(i as usize).copied());
+    if let Some(sw) = chip {
+        let cr = egui::Rect::from_min_size(head.rect.min + egui::vec2(3.0, 5.5), egui::vec2(7.0, 7.0));
+        ui.painter().rect_filled(cr, 0.0, sw);
+    }
+    if head.clicked() {
+        app.selected = t;
+    }
+    // v68: IDENTICAL menu to the dock strip (shared helper).
+    head.context_menu(|ui| track_head_menu(ui, app, t));
+    // Record + mute — same labels, commands and hovers as the strip.
+    let any_rec = rec || app.midi_rec[t].armed || app.auto_rec[t].armed;
+    let rec_lbl = if any_rec { "STOP" } else { "REC" };
+    ui.horizontal(|ui| {
+        // All responses are consumed INSIDE this closure: egui 0.36
+        // Response has no public constructor, so nothing may escape to
+        // an uninitialized outer binding.
+
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let rec_btn = egui::Button::new(RichText::new(rec_lbl).color(if any_rec {
+            Color32::from_rgb(255, 90, 90)
+        } else {
+            Color32::from_rgb(220, 180, 120)
+        }))
+        .small()
+        .min_size(egui::vec2(56.0, 0.0));
+        if ui
+            .add_sized([56.0, 18.0], rec_btn)
+            .on_hover_text(
+                "Record: arms every ticked source (audio take, MIDI take, \
+                 write automation) on this track \u{b7} choose sources in \
+                 the Mixer dock strip. Stop bounces the takes to assets + \
+                 clips at the playhead.",
+            )
+            .clicked()
+        {
+            app.toggle_record_all(t);
+        }
+        let mute_resp = ui
+            .add_sized(
+                [56.0, 18.0],
+                egui::Button::new(if on { "on" } else { "mute" }).small(),
+            )
+            .on_hover_text(
+                "While the transport runs, a muted track contributes nothing \
+                 (its clips stay on the timeline). Right-click for automation.",
+            );
+        mute_resp.context_menu(|ui| {
+            auto_menu(
+                ui,
+                app,
+                t,
+                crate::automation::TARGET_TRACK_MUTE,
+                if on { 0.0 } else { 1.0 },
+            );
+        });
+        if mute_resp.clicked() {
+            // Same contract as the strip (v0.11 R5): record the value
+            // the click MOVES TO (1 = muted).
+            app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 1.0 } else { 0.0 });
+            app.backend.cmd(Cmd::ToggleTrackOn { i: t });
+        }
+    });
+    // Fader labels above (auto-state marker parity with the strip).
+    let (vshow, vauto) = level_shown(app, t, KIND_VOL);
+    let (gshow, gauto) = level_shown(app, t, KIND_GAIN);
+    let auto_col = Color32::from_rgb(120, 210, 140);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_sized(
+            [52.0, 12.0],
+            egui::Label::new(
+                RichText::new(if vauto { "auto" } else { "vol" })
+                    .monospace()
+                    .small()
+                    .color(if vauto {
+                        auto_col
+                    } else {
+                        ui.visuals().noninteractive().text_color()
+                    }),
+            )
+            .selectable(false),
+        );
+        ui.add_sized(
+            [36.0, 12.0],
+            egui::Label::new(
+                RichText::new(if gauto { "auto" } else { "gain" })
+                    .monospace()
+                    .small()
+                    .color(if gauto {
+                        auto_col
+                    } else {
+                        ui.visuals().noninteractive().text_color()
+                    }),
+            )
+            .selectable(false),
+        );
+    });
+    // Reserve the rows that come AFTER the faders: dB readouts (14) +
+    // pan slider (18) + pan readout (14) + chips (20) + spacing slack.
+    let fh = (ui.available_height() - 96.0).clamp(56.0, 360.0);
+    let vv0 = vshow;
+    let gg0 = gshow;
+    let (vv_now, gg_now, rv, rg) = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let mut vv = vv0;
+            let mut gg = gg0;
+            let r1 = ui
+                .add_sized(
+                    [52.0, fh],
+                    Slider::new(&mut vv, 0..=127).vertical().show_value(false),
+                )
+                .on_hover_text(level_hover(KIND_VOL));
+            let r2 = ui
+                .add_sized(
+                    [36.0, fh],
+                    Slider::new(&mut gg, 0..=127).vertical().show_value(false),
+                )
+                .on_hover_text(level_hover(KIND_GAIN));
+            (vv, gg, r1, r2)
+        })
+        .inner;
+    let mut vv = vv_now;
+    let mut gg = gg_now;
+    // Write-through EXACTLY like level_row: fader owns the frame,
+    // shared setter, mirror flag dirty.
+    if p_changed(&rv, vshow, &mut vv) {
+        app.fader_live = Some((t, KIND_VOL));
+        app.set_trk_vol(t, vv);
+        app.levels_dirty = true;
+    }
+    if p_changed(&rg, gshow, &mut gg) {
+        app.fader_live = Some((t, KIND_GAIN));
+        app.set_trk_gain(t, gg);
+        app.levels_dirty = true;
+    }
+    let tcol = ui.visuals().noninteractive().text_color();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let vtxt = if vauto {
+            "auto".to_string()
+        } else {
+            format!("{:>5}", db_num(vol_amp(vshow)))
+        };
+        let gtxt = if gauto {
+            "auto".to_string()
+        } else {
+            format!("{:>3}", db_num(gain_amp(gshow)))
+        };
+        ui.add_sized(
+            [52.0, 14.0],
+            egui::Label::new(
+                RichText::new(vtxt)
+                    .monospace()
+                    .small()
+                    .color(if vauto { auto_col } else { tcol }),
+            )
+            .selectable(false),
+        );
+        ui.add_sized(
+            [36.0, 14.0],
+            egui::Label::new(
+                RichText::new(gtxt)
+                    .monospace()
+                    .small()
+                    .color(if gauto { auto_col } else { tcol }),
+            )
+            .selectable(false),
+        );
+    });
+    let (pshow, pauto) = level_shown(app, t, KIND_PAN);
+    let mut pv = pshow;
+    let rp = ui
+        .add_sized(
+            [MIX_COL_W - 4.0, 18.0],
+            Slider::new(&mut pv, 0..=127).show_value(false),
+        )
+        .on_hover_text(level_hover(KIND_PAN));
+    if p_changed(&rp, pshow, &mut pv) {
+        app.fader_live = Some((t, KIND_PAN));
+        app.set_trk_pan(t, pv);
+        app.levels_dirty = true;
+    }
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [100.0, 14.0],
+            egui::Label::new(
+                RichText::new(if pauto {
+                    "pan auto".to_string()
+                } else {
+                    format!("pan {:>4}", pan_text(pshow))
+                })
+                .monospace()
+                .small()
+                .color(if pauto { auto_col } else { tcol }),
+            )
+            .selectable(false),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if ui
+            .small_button("FX")
+            .on_hover_text(
+                "This track's mixer chain: effects scripts and VST plugins \
+                 in one ordered list",
+            )
+            .clicked()
+        {
+            app.fx_window = Some(t);
+        }
+        if ui
+            .small_button(RichText::new("\u{266a} synth"))
+            .on_hover_text("This track's synthesizer \u{b7} opens the synth picker")
+            .clicked()
+        {
+            app.synth_pick = Some(t);
+        }
+    });
+    // Geometry for pins (index = track; the v63 SeGeom pattern).
+    app.mix_geom.head.push(head.rect);
+    app.mix_geom.fader.push(rv.rect);
+    app.mix_geom.gain.push(rg.rect);
+    app.mix_geom.pan.push(rp.rect);
+}
+
 fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
     // v30-batch-2: the dock/window header carries the title, so
     // the old in-panel MIXER heading is gone (it double-stacked).
@@ -22098,7 +22503,9 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
     // even when that anchor lived in a completely different part
     // of the window, so the bottom/floating mixer seemed welded to
     // the main GUI's scroll and layout).
-    let tied = !mixer_independent(app);
+    // v68: while the mix page is open there is NO grid to be level
+    // with — the (stale) grid anchor must never drive strip y.
+    let tied = !mixer_independent(app) && !app.mix_tab;
     let mut free_scroll = 0.0;
     if !tied {
         let over = ui.rect_contains_pointer(base);
@@ -22231,24 +22638,9 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // v59: right-click opens the SAME Track color submenu the grid
         // menu carries (shared helper — the two menus cannot drift).
         // v61: the strip menu is also the entry point for track templates.
-        head.context_menu(|ui| {
-            if track_color_submenu(ui, app, t) {
-                ui.close();
-            }
-            if ui
-                .button("Track templates\u{2026}")
-                .on_hover_text(
-                    "save this track's instrument, effects chain, mixer and \
-                     color as a named template, or re-apply a saved one",
-                )
-                .clicked()
-            {
-                app.tpl_track = t;
-                app.tpl_name = format!("Track {}", t + 1);
-                app.show_tpl = true;
-                ui.close();
-            }
-        });
+        // v68: the menu body moved into the shared track_head_menu —
+        // the mix-page columns show the IDENTICAL menu.
+        head.context_menu(|ui| track_head_menu(ui, app, t));
         // v29: ONE record button + source checkboxes. REC arms every
         // ticked source on this track at once; STOP bounces them all.
         let any_rec = rec || app.midi_rec[t].armed || app.auto_rec[t].armed;
@@ -22796,6 +23188,25 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 });
             app.open_auto_editor(edit);
         }
+        // v68 (S4): the FL-style view switch, EARLY in the row on
+        // purpose — the toolbar is unwrapped and clips its tail in wide
+        // dock states (v30 trap), so a view-level control must not live
+        // at the end. A TOGGLE so the ON state reads in the toolbar
+        // itself (accent fill); F9 is the key equivalent.
+        let mut mt = app.mix_tab;
+        if ui
+            .toggle_value(&mut mt, RichText::new("MIX").strong())
+            .on_hover_text(
+                "Switch the main view to the full-page mixer (key: F9): \
+                 one channel column per track \u{b7} faders, pan, mute, \
+                 record, FX. The Mixer dock stays live and the grid is \
+                 untouched \u{b7} everything is where you left it.",
+            )
+            .clicked()
+        {
+            app.mix_tab = mt;
+            app.echo_mix_page();
+        }
         if ui
             .button(RichText::new("\u{266b} Piano roll").strong())
             .on_hover_text(
@@ -22974,12 +23385,21 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             grid_toolbar(ui, app);
         });
-        let start2 = ui.cursor().min;
-        let rect2 = egui::Rect::from_min_max(start2, fence.max);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(rect2), |ui| {
-            clip_props_strip(ui, app);
-        });
+        if !app.mix_tab {
+            let start2 = ui.cursor().min;
+            let rect2 = egui::Rect::from_min_max(start2, fence.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect2), |ui| {
+                clip_props_strip(ui, app);
+            });
+        }
         ui.separator();
+        // v68 (S4): the mix page takes the whole center area (FL's
+        // Mixing tab). Toolbar + top transport stay visible — the
+        // toggle and every keyboard shortcut keep working.
+        if app.mix_tab {
+            mix_page(ui, app);
+            return;
+        }
         let sr = app.sample_rate.max(1) as f64;
         let total = app.total_len().max(1);
         let px = app.px_per_sec as f64;
@@ -25411,18 +25831,19 @@ fn gain_midi_from_amp(a: f32) -> u8 {
     lo
 }
 
-fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
-    let label = ["vol ", "gain", "pan "][kind as usize];
+/// v68: the 0..=127 value the vol/gain/pan control for track `i` must
+/// DISPLAY (the live automation value while a curve drives the target,
+/// else the manual value) + whether automation owns it right now.
+/// v34 R11 semantics: the manual value underneath is untouched and the
+/// control falls back the moment no clip drives the target. SHARED by
+/// `level_row` (dock strips) and the mix-page columns (v68 S4) so the
+/// two views can never show different numbers (goal 3 parity).
+fn level_shown(app: &App, i: usize, kind: u8) -> (u8, bool) {
     let midi = match kind {
         KIND_VOL => app.trk_vol[i],
         KIND_GAIN => app.trk_gain[i],
         _ => app.trk_pan[i],
     };
-    // v34 R11: while automation drives this target, the fader DISPLAYS
-    // the live automation value (the slider and its dB readout move with
-    // the curve). The manual value underneath is untouched: automation
-    // rides on top of it, and the moment no clip drives the target the
-    // control falls back to it.
     let live = app.backend.engine.auto_live(i);
     let amp = live[kind as usize];
     let automated = amp.is_finite();
@@ -25438,11 +25859,28 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
         }
         .clamp(0, 127)
     };
-    let hover = match kind {
+    (shown, automated)
+}
+
+/// Hover copy for the three track level controls — ONE source for the
+/// dock strip rows and the mix-page columns (goal 2: one design voice).
+fn level_hover(kind: u8) -> &'static str {
+    match kind {
         KIND_VOL => "Track playback volume: -inf…+6 dB (0 dB = three-quarters). Right-click for exact entry and automation.",
         KIND_GAIN => "Track gain trim: 0 = silence, 80 = 0 dB, 127 = +10 dB. Right-click creates an automation asset; double-click sets an exact value.",
         _ => "Track pan: -100 = hard left, 0 = centre, +100 = hard right. Right-click for exact entry and automation.",
+    }
+}
+
+fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
+    let label = ["vol ", "gain", "pan "][kind as usize];
+    let midi = match kind {
+        KIND_VOL => app.trk_vol[i],
+        KIND_GAIN => app.trk_gain[i],
+        _ => app.trk_pan[i],
     };
+    let (shown, automated) = level_shown(app, i, kind);
+    let hover = level_hover(kind);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         // v0.15: the editable text box is GONE — right-click (slider OR
@@ -27194,6 +27632,17 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.status = "bindings reset to defaults".into();
                 }
             });
+            // v68: the mix-page hotkey is intentionally NOT a slot row
+            // (see the F9 comment in `handle_shortcuts`) — say so here.
+            ui.label(
+                RichText::new(
+                    "F9 flips the main view between the grid and the \
+                     full-page MIX PAGE (mixer) \u{b7} like the Ctrl +/- \
+                     zoom keys, it is not a rebindable slot.",
+                )
+                .weak()
+                .small(),
+            );
             ui.label(
                 RichText::new(
                     "Click a MIDI cell, then send a NOTE ON / CC / PROGRAM \
@@ -48809,6 +49258,294 @@ mod tests {
         assert!(
             App::list_param_presets("v67clap").is_empty(),
             "delete removed the preset file"
+        );
+    }
+
+    // ---- v68 (S4): FL-style full-page mix page ---------------------------
+
+    /// Toggle button: flips the view (grid galleys replaced by channel
+    /// columns and back), echoes the status, and the page carries one
+    /// column per track in its geometry table.
+    #[test]
+    fn v68_mix_tab_toggle_button_swaps_views() {
+        let mut app = headless_app("v68toggle");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.mix_tab, "starts on the grid");
+        assert!(
+            galley_at(&mut app, &ctx, "T1 track").is_some(),
+            "grid lane tag painted before the toggle"
+        );
+        click_exact(&mut app, &ctx, "MIX");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.mix_tab, "toggle flipped");
+        assert!(
+            app.status.contains("mix page: on"),
+            "status echoed: {:?}",
+            app.status
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "T1 track").is_none(),
+            "grid replaced while the page is open"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "Ch 1").is_some(),
+            "first column painted"
+        );
+        assert_eq!(app.mix_geom.fader.len(), app.n_tracks, "one column per track");
+        click_exact(&mut app, &ctx, "MIX");
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.mix_tab, "toggle back");
+        assert!(app.status.contains("mix page: off"));
+        assert!(
+            galley_at(&mut app, &ctx, "T1 track").is_some(),
+            "grid returned"
+        );
+    }
+
+    /// F9 opens the page and closes it again, with a status echo either
+    /// way (the toolbar toggle is the pointer route; both echo alike).
+    #[test]
+    fn v68_mix_tab_f9_hotkey() {
+        let mut app = headless_app("v68f9");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                // release: without it egui considers F9 still held and
+                // reclassifies the NEXT press as auto-repeat.
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(app.mix_tab, "F9 opens the mix page");
+        assert!(app.status.contains("mix page: on"), "{:?}", app.status);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                // release: without it egui considers F9 still held and
+                // reclassifies the NEXT press as auto-repeat.
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(!app.mix_tab, "F9 closes it again");
+        assert!(app.status.contains("mix page: off"));
+    }
+
+    /// Alignment (goal 4): every PAINTED column shares the header line,
+    /// the fader top/height, and the pan row line. Off-screen columns
+    /// carry Rect::NOTHING (index-addressable, skipped here).
+    #[test]
+    fn v68_mix_tab_columns_aligned() {
+        let mut app = headless_app("v68geom");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                // release: without it egui considers F9 still held and
+                // reclassifies the NEXT press as auto-repeat.
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.mix_geom.fader.len(), app.n_tracks);
+        assert_eq!(app.mix_geom.gain.len(), app.n_tracks);
+        let drawn: Vec<(egui::Rect, egui::Rect, egui::Rect, egui::Rect)> = app
+            .mix_geom
+            .head
+            .iter()
+            .zip(&app.mix_geom.fader)
+            .zip(&app.mix_geom.gain)
+            .zip(&app.mix_geom.pan)
+            .map(|(((h, f), g), p)| (*h, *f, *g, *p))
+            .filter(|(_, f, _, _)| f.height() > 0.0)
+            .collect();
+        assert!(drawn.len() >= 2, "several columns visible: {drawn:?}",);
+        let (h0, f0, g0, p0) = drawn[0];
+        assert!(f0.height() > 60.0, "faders are usable height: {f0:?}");
+        for (i, (h, f, g, p)) in drawn.iter().enumerate() {
+            assert!((f.top() - f0.top()).abs() < 0.5, "col {i} vol top: {f:?} vs {f0:?}");
+            assert!((f.height() - f0.height()).abs() < 0.5, "col {i} vol height");
+            assert!((g.top() - g0.top()).abs() < 0.5, "col {i} gain top");
+            assert!((g.height() - g0.height()).abs() < 0.5, "col {i} gain height");
+            assert!((h.center().y - h0.center().y).abs() < 0.5, "col {i} header line");
+            assert!((p.center().y - p0.center().y).abs() < 0.5, "col {i} pan line");
+        }
+    }
+
+    /// Faders write through the SHARED setters: a vertical drag toward
+    /// the top raises the volume table, toward the bottom lowers the
+    /// gain table (the same set_trk_* calls the dock strips make).
+    #[test]
+    fn v68_mix_tab_fader_writes_shared_setter() {
+        let mut app = headless_app("v68fader");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                // release: without it egui considers F9 still held and
+                // reclassifies the NEXT press as auto-repeat.
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        let r = app.mix_geom.fader[1];
+        assert!(r.height() > 0.0, "column 2 visible");
+        app.trk_vol[1] = 100; // out of the way of the drag target
+        let from = egui::pos2(r.center().x, r.max.y - 4.0); // bottom = silence
+        let to = egui::pos2(r.center().x, r.min.y + 2.0); // top = max
+        drag_pt(&mut app, &ctx, from, to);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.trk_vol[1] > 118,
+            "vertical drag toward the TOP raised the volume (now {})",
+            app.trk_vol[1]
+        );
+        let r2 = app.mix_geom.gain[1];
+        assert!(r2.height() > 0.0);
+        app.trk_gain[1] = 100;
+        drag_pt(
+            &mut app,
+            &ctx,
+            egui::pos2(r2.center().x, r2.min.y + 2.0),
+            egui::pos2(r2.center().x, r2.max.y - 4.0),
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.trk_gain[1] < 10,
+            "gain fader drags down too (now {})",
+            app.trk_gain[1]
+        );
+    }
+
+    /// A column header's RMB opens the SAME menu the dock strip carries
+    /// (shared track_head_menu): the color submenu works and echoes.
+    #[test]
+    fn v68_mix_tab_head_menu_shared() {
+        let mut app = headless_app("v68menu");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                // release: without it egui considers F9 still held and
+                // reclassifies the NEXT press as auto-repeat.
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        let h = app.mix_geom.head[2];
+        assert!(h.height() > 0.0, "column 3 visible");
+        rmb(&mut app, &ctx, h.center());
+        let tc = galley_at_last(&mut app, &ctx, "Track color")
+            .expect("shared menu carries the color submenu");
+        click_pt(&mut app, &ctx, tc.center());
+        let sw = galley_centers(&mut app, &ctx, "\u{25a0} teal", true);
+        assert_eq!(sw.len(), 1, "submenu lists the teal swatch");
+        click_pt(&mut app, &ctx, sw[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.trk_color[2], Some(4), "track 3 colored from the page");
+        assert_eq!(app.status, "track 3 color: teal", "status echoes");
+    }
+
+    /// With the page open, the docked mixer must NOT follow the (now
+    /// meaningless) grid scroll: strips hold their place when vscroll
+    /// changes. (The tied mode is exactly the lane this severs.)
+    #[test]
+    fn v68_mix_tab_dock_strips_ignore_grid_scroll() {
+        let mut app = headless_app("v68dock");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                // release: without it egui considers F9 still held and
+                // reclassifies the NEXT press as auto-repeat.
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let strip_y = |app: &mut App, ctx: &egui::Context| -> f32 {
+            galley_centers(app, ctx, "Track 1", false)
+                .into_iter()
+                .filter(|c| c.x > 1000.0 && c.y < 853.0) // mixer dock band
+                .min_by(|a, b| a.y.total_cmp(&b.y))
+                .expect("docked mixer strip painted")
+                .y
+        };
+        let y1 = strip_y(&mut app, &ctx);
+        app.vscroll = 500.0;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let y2 = strip_y(&mut app, &ctx);
+        assert!(
+            (y1 - y2).abs() < 0.5,
+            "docked strips drifted with the grid scroll while the mix \
+             page was open: {y1} -> {y2}"
         );
     }
 }
