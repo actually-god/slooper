@@ -4151,6 +4151,8 @@ impl App {
         self.fx_registry.rescan();
         self.prune_dead_script_rows();
         self.save_config();
+        let ok = self.fx_registry.stems().len();
+        self.status = format!("effects folder applied \u{b7} {ok} effect(s)");
     }
 
     /// Drop chain rows pointing at scripts the registry no longer loads.
@@ -7818,6 +7820,8 @@ impl App {
                     }
                     self.meter_i = None;
                     self.meter_lra = None;
+                    self.status =
+                        "integrated loudness reset \u{2014} new measurement started".into();
                 }
                 let (peak_l, peak_r, clip) = match self.meter_state.as_ref() {
                     Some(ms) => (db_of(ms.l_hold), db_of(ms.r_hold), ms.clip),
@@ -17636,6 +17640,9 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                                     {
                                         app.win_layouts.remove(n);
                                         app.save_config();
+                                        app.status = format!(
+                                            "window layout \u{201c}{name}\u{201d} deleted"
+                                        );
                                     }
                                 });
                             }
@@ -19206,6 +19213,7 @@ fn reset_window_layout(app: &mut App) {
     }
     app.side_dirty = true;
     app.save_config();
+    app.status = "window layout reset \u{2014} stock arrangement restored".into();
 }
 
 // ---- v47 R2: named window-layout templates --------------------------------
@@ -27139,6 +27147,7 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             {
                 app.vst_dirs.remove(i);
                 app.vst_scanned = false;
+                app.status = format!("plugin folder removed \u{b7} {d} \u{b7} rescanning");
             }
         });
     }
@@ -27156,6 +27165,8 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 app.note_dir("vst", &p);
                 let d = p.to_string_lossy().into_owned();
                 if !app.vst_dirs.contains(&d) {
+                    app.status =
+                        format!("plugin folder added \u{b7} {d} \u{b7} rescanning");
                     app.vst_dirs.push(d);
                     app.vst_scanned = false;
                 }
@@ -28003,6 +28014,8 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         .collect();
                     outs.sort();
                     app.applied_ports = Some((ins.clone(), outs.clone()));
+                    app.status =
+                        format!("audio: applied {} in / {} out", ins.len(), outs.len());
                     app.backend.cmd(Cmd::Apply { ins, outs });
                     app.save_config();
                 }
@@ -50234,6 +50247,111 @@ mod tests {
         assert!(
             texts2.iter().any(|t| t.contains("re-scan the JACK port list")),
             "ports Refresh must tooltip its rescan; galleys: {texts2:?}"
+        );
+    }
+
+    /// v72 R1: status-echo inventory (goal 1 sweep 2). Every action the
+    /// v72 audit flagged as silent now echoes — either AT the click site
+    /// or INSIDE the seam fn (which is how the fix covers every entry
+    /// point at once). (anchor, echo needle) pairs; the needle must appear
+    /// within 600 chars AFTER the anchor. Legit-skip classes (documented
+    /// in scratch/slooper-v72/REQUIREMENTS.md): dialog open/cancel,
+    /// direct manipulation with same-view repaint (row add/remove, canvas
+    /// edits, drag-dock, toggle repaints), and callees that already echo
+    /// internally (preset save/apply/delete family, do_save, finish_load,
+    /// rack_rename, apply_param_preset, win-layout capture/apply).
+    #[test]
+    fn v72_action_echo_inventory() {
+        let srcs = include_str!("ui.rs");
+        // NOTE: `mod tests` sits at COLUMN 0 in this file — the indented
+        // cut that older pins use finds nothing and silently scans the
+        // whole file (the anchors below then count their own pin literals).
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        const SITES: [(&str, &str); 7] = [
+            ("self.meter_i = None;", "new measurement started"),
+            ("app.win_layouts.remove(n);", "window layout"),
+            ("fn reset_window_layout", "stock arrangement restored"),
+            ("fn apply_fx_dir", "effects folder applied"),
+            ("app.vst_dirs.remove(i);", "plugin folder removed"),
+            ("if !app.vst_dirs.contains(&d) {", "plugin folder added"),
+            (
+                "app.applied_ports = Some((ins.clone(), outs.clone()));",
+                "audio: applied",
+            ),
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for (anchor, needle) in SITES {
+            let hits = prod.matches(anchor).count();
+            if hits != 1 {
+                offenders.push(format!("anchor {anchor:?} matched {hits} times (want 1)"));
+                continue;
+            }
+            let a = prod.find(anchor).unwrap();
+            // Seam anchors are fn headers: the echo sits at the body end.
+            let span = if anchor.starts_with("fn ") { 3000 } else { 600 };
+            let win = &prod[a..(a + span).min(prod.len())];
+            if !win.contains(needle) {
+                offenders.push(format!("{anchor:?} no longer echoes ({needle:?})"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "v72 echo inventory broken:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// v72 R2: the audio-ports Apply Selection echo is REAL — run the
+    /// click, read the status the app now carries. (MIDI + Stop echoed
+    /// already; this completes the port-dialog set.)
+    #[test]
+    fn v72_ports_apply_echoes() {
+        let mut app = headless_app("v72ports");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.sett_filter = "audio ports".into();
+        app.sel_in.insert("system:capture_1".into());
+        app.sel_out.insert("system:playback_1".into(), 1);
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "Apply Selection");
+        assert!(
+            app.status.contains("audio: applied 1 in / 1 out"),
+            "Apply Selection must echo the applied counts; status was {:?}",
+            app.status
+        );
+    }
+
+    /// v72 R3: the plugin-folder row × echoes the removal (the row just
+    /// vanishing from a popup list is no lasting trace, and the removal
+    /// silently changes what the next scan can load).
+    #[test]
+    fn v72_chain_dir_remove_echoes() {
+        let mut app = headless_app("v72vstdir");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_window = Some(0);
+        app.vst_dirs = vec!["/tmp/v72x".into()];
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "/tmp/v72x")
+            .expect("the seeded plugin folder row paints in the chain window");
+        let p = egui::pos2(r.max.x + 9.0, r.center().y);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.vst_dirs.len(), 0, "the × removed the folder");
+        assert!(
+            app.status.contains("plugin folder removed")
+                && app.status.contains("/tmp/v72x"),
+            "row × must echo which folder left; status was {:?}",
+            app.status
         );
     }
 }
