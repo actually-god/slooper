@@ -284,8 +284,8 @@ pub static DESC4: EffectInfoV4 = EffectInfoV4 {
     create,
     destroy,
     process,
-    process_sc,
-    process_st,
+    process_sc: Some(process_sc),
+    process_st: Some(process_st),
     // Mono by design: process_st above is the documented graceful fallback.
     stereo: 0,
     set_sync: None,

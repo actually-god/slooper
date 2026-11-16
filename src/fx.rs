@@ -33,7 +33,9 @@ pub use api::{
     EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectInfoV3, EffectInfoV4, EffectParamV1, GuiApiV1,
     GuiFrameV1, ParamMetaV1, SyncInfoV1, SLOOPER_EFFECT_ABI, SLOOPER_EFFECT_ABI_V2,
     SLOOPER_EFFECT_ABI_V3, SLOOPER_EFFECT_ABI_V4, SLOOPER_EFFECT_GUI_ABI, SLOOPER_MAX_PARAMS,
-    SLOOPER_SYNC_ABI, SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_MS,
+    SLOOPER_SYNC_ABI, SLOOPER_UNIT_BEATS, SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_MS,
+    SLOOPER_UNIT_PERCENT, SLOOPER_UNIT_SAMPLES, SLOOPER_UNIT_SEMITONES, SLOOPER_UNIT_SECONDS,
+    SLOOPER_UNIT_TIMES,
 };
 
 /// Param count cap mirrors the ABI (RT param snapshots are fixed-size).
@@ -1094,6 +1096,12 @@ impl Instance {
             }
             SLOOPER_UNIT_DB => format!("{:.1} dB", v),
             SLOOPER_UNIT_MS => format!("{:.1} ms", v),
+            SLOOPER_UNIT_PERCENT => format!("{:.1} %", v),
+            SLOOPER_UNIT_SEMITONES => format!("{:.1} st", v),
+            SLOOPER_UNIT_TIMES => format!("{:.2}x", v),
+            SLOOPER_UNIT_SECONDS => format!("{:.2} s", v),
+            SLOOPER_UNIT_SAMPLES => format!("{:.0} smp", v),
+            SLOOPER_UNIT_BEATS => format!("{:.2} beats", v),
             _ => format!("{:.3}", v),
         }
     }
@@ -1572,8 +1580,8 @@ unsafe fn validate(
                     v4.abi
                 ));
             }
-            process_sc = Some(v4.process_sc);
-            process_st = Some(v4.process_st);
+            process_sc = v4.process_sc;
+            process_st = v4.process_st;
             set_sync = v4.set_sync;
             stereo_decl = Some(v4.stereo != 0);
             param_meta = v4.param_meta;
