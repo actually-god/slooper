@@ -148,6 +148,36 @@ pub static DESC2: EffectInfoV2 = EffectInfoV2 {
     process_sc,
 };
 
+// ---------------------------------------------------------------------------
+// PARAM DISPLAY METADATA (ABI v4). Units drive the auto window + v53 kit
+// tooltips; steps/pickers mirror the quantization `process` already applies.
+// ---------------------------------------------------------------------------
+static META: [ParamMetaV1; 6] = [
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_TIMES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_DB, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+];
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: NAME.as_ptr(),
+    author: AUTHOR.as_ptr(),
+    description: DESC_TEXT.as_ptr(),
+    n_params: PARAMS.len() as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc: Some(process_sc),
+    process_st: None,
+    stereo: 0,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
@@ -156,4 +186,9 @@ pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 {
     &DESC2
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }
