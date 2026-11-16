@@ -155,12 +155,6 @@ impl VstKind {
     }
 }
 
-/// One live plugin (any format) behind one control/audio surface. The VST2
-/// and VST3 backends live in `RtStageEntry`; CLAP in `claphost::
-/// ClapStageEntry`. Chains, synth handles and the UI all traffic in
-/// `Arc<dyn StageEntry>` so a new plugin format is a new implementor, never
-/// a new chain-row variant.
-
 /// v67: a plugin-initiated preset-load report. The CLAP v1 ABI has NO
 /// host-side preset enumeration - `clap.preset-load/2` is instead the
 /// plugin's way to tell the host "I loaded a preset through my own
@@ -179,6 +173,11 @@ pub enum PresetLoadEvent {
     },
 }
 
+/// One live plugin (any format) behind one control/audio surface. The VST2
+/// and VST3 backends live in `RtStageEntry`; CLAP in `claphost::
+/// ClapStageEntry`. Chains, synth handles and the UI all traffic in
+/// `Arc<dyn StageEntry>` so a new plugin format is a new implementor, never
+/// a new chain-row variant.
 pub trait StageEntry: Send + Sync {
     fn name(&self) -> &str;
     fn path(&self) -> &std::path::Path;
