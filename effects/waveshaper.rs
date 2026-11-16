@@ -289,6 +289,49 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     process,
 };
 
+// ---------------------------------------------------------------------------
+// PARAM DISPLAY METADATA (ABI v4). Units drive the auto window + v53 kit
+// tooltips; steps/pickers mirror the quantization `process` already applies.
+// ---------------------------------------------------------------------------
+// Labels for the `dc remove` toggle (ABI v4 meta): process gates at
+// > 0.5, so the two equally-spaced picker slots {0, 1} are exact.
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+unsafe impl<const N: usize> Sync for Labels<N> {}
+static DC_LABELS: Labels<2> = Labels([c"off".as_ptr(), c"on".as_ptr()]);
+
+static META: [ParamMetaV1; NPARAMS] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_TIMES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_TIMES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: DC_LABELS.0.as_ptr(), n_labels: 2 },
+];
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"Wave Shaper".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description: c"Draw your own distortion curve: nine draggable points + drive/mix/out. Tube, fuzz, hard-clip, step and fold presets included.".as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc: None,
+    process_st: None,
+    stereo: 0,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
@@ -297,4 +340,9 @@ pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 {
     &GUI
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }

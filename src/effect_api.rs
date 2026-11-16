@@ -367,19 +367,29 @@ pub struct EffectInfoV4 {
     pub destroy: extern "C" fn(state: *mut core::ffi::c_void),
     pub process:
         extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32) -> f32,
+    /// v4: NULLABLE (v3 required both). null = the host's documented
+    /// fallback — `process` on the mid sample — exactly what a v1/v2
+    /// effect ran through before it grew a v4 table. An effect MUST NOT
+    /// hand in a stub here to fake capability: declare the fn or null.
     pub process_sc:
-        extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32,
-    pub process_st: extern "C" fn(
-        state: *mut core::ffi::c_void,
-        l: f32,
-        r: f32,
-        params: *const f32,
-        sc: f32,
-        out_r: *mut f32,
-    ) -> f32,
+        Option<extern "C" fn(state: *mut core::ffi::c_void, input: f32, params: *const f32, sc: f32) -> f32>,
+    /// v4: NULLABLE, same rule. null keeps the slot on the mono path
+    /// (`is_stereo()` stays false; the mix gets mid-in / both-sides-out).
+    pub process_st: Option<
+        extern "C" fn(
+            state: *mut core::ffi::c_void,
+            l: f32,
+            r: f32,
+            params: *const f32,
+            sc: f32,
+            out_r: *mut f32,
+        ) -> f32,
+    >,
     /// 1 = `process_st` really processes the pair (the mixer/UI shows
     /// the (ST) tag, the bundle gate checks decorrelation); 0 = the mono
     /// graceful fallback (no tag — do not claim stereo you do not do).
+    /// v3-era effects promoted to v4 must declare 1: they already ran
+    /// the stereo path through their v3 table.
     pub stereo: u32,
     /// Block-rate transport push, called on the audio thread BEFORE any
     /// sample call of the block (null = no sync; metadata-only v4 is a

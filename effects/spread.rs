@@ -305,6 +305,44 @@ pub static DESC3: EffectInfoV3 = EffectInfoV3 {
     process_st,
 };
 
+// ---------------------------------------------------------------------------
+// PARAM DISPLAY METADATA (ABI v4). Units drive the auto window + v53 kit
+// tooltips; steps/pickers mirror the quantization `process` already applies.
+// ---------------------------------------------------------------------------
+// Labels for the `flip R` toggle (ABI v4 meta): process gates at >= 0.5,
+// so the two equally-spaced picker slots {0, 1} are the exact quantizer.
+struct Labels<const N: usize>([*const core::ffi::c_char; N]);
+unsafe impl<const N: usize> Sync for Labels<N> {}
+static FLIP_LABELS: Labels<2> = Labels([c"off".as_ptr(), c"flip R".as_ptr()]);
+
+static META: [ParamMetaV1; NPARAMS] = [
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_MS, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_HZ, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: FLIP_LABELS.0.as_ptr(), n_labels: 2 },
+    ParamMetaV1 { unit: 0, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+    ParamMetaV1 { unit: SLOOPER_UNIT_TIMES, flags: 0, step: 0.0, labels: core::ptr::null(), n_labels: 0 },
+];
+
+pub static DESC4: EffectInfoV4 = EffectInfoV4 {
+    abi: SLOOPER_EFFECT_ABI_V4,
+    name: c"stereo spread".as_ptr(),
+    author: c"slooper".as_ptr(),
+    description:
+        c"Haas-comb stereo widener with image rotation. ABI v3: real L/R to the track pan.".as_ptr(),
+    n_params: NPARAMS as u32,
+    params: PARAMS.as_ptr(),
+    create,
+    destroy,
+    process,
+    process_sc: Some(process_sc),
+    process_st: Some(process_st),
+    stereo: 1,
+    set_sync: None,
+    param_meta: META.as_ptr(),
+};
+
 #[no_mangle]
 pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 {
     &DESC
@@ -323,4 +361,9 @@ pub extern "C" fn slooper_effect_info_v3() -> *const EffectInfoV3 {
 #[no_mangle]
 pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 {
     &GUI
+}
+
+#[no_mangle]
+pub extern "C" fn slooper_effect_info_v4() -> *const EffectInfoV4 {
+    &DESC4
 }
