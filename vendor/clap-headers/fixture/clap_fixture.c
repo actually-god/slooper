@@ -38,6 +38,8 @@ typedef struct fixture_plugin {
 
    double                    gain; // plain 0..1 (effect)
    double                    amp;  // plain 0..1 (synth)
+   bool                      load_armed;    // v67: fixload latch
+   bool                      load_reported; // v67: sink answered loaded()
 
    double                    sample_rate;
    bool                      active;
@@ -96,6 +98,26 @@ static void fx_apply_param(const clap_plugin_t *p, const clap_event_param_value_
    fixture_plugin_t *f = selfp(p);
    if (v->param_id == 1) f->gain = v->value;
    else if (v->param_id == 2) f->amp = v->value;
+   else if (v->param_id == 3 && v->value >= 0.5 && !f->load_armed) {
+      // v67: "load one of my presets" - report through the host's
+      // clap.preset-load sink, then mutate our own gain so a chunk
+      // harvest proves the host captured a plugin-side change.
+      // Spec says loaded() runs on the MAIN thread; the fixture fires
+      // from the param event because that is our deterministic hook,
+      // and the slooper sink is a mutex store (thread-safe by design).
+      f->load_armed = true;
+      const clap_host_preset_load_t *pl = NULL;
+      if (f->host && f->host->get_extension)
+         pl = (const clap_host_preset_load_t *)f->host->get_extension(
+             f->host, CLAP_EXT_PRESET_LOAD);
+      if (pl && pl->loaded) {
+         // location_kind 1 = PLUGIN_PRESET (the clap.preset-discovery/2
+         // enum lives in a factory header this fixture does not include).
+         pl->loaded(f->host, 1, "slooper-fixture-factory-preset", NULL);
+         f->load_reported = true;
+      }
+      f->gain = 0.75;
+   }
 }
 
 static clap_process_status fx_process(const clap_plugin_t *p, const clap_process_t *proc) {
@@ -170,7 +192,7 @@ static clap_process_status fx_process(const clap_plugin_t *p, const clap_process
 
 //////////////////////////  params  ///////////////////////////////////////
 
-#define PARAM_COUNT 2
+#define PARAM_COUNT 3
 
 static uint32_t pm_count(const clap_plugin_t *p) { (void)p; return PARAM_COUNT; }
 
@@ -182,10 +204,18 @@ static bool pm_get_info(const clap_plugin_t *p, uint32_t idx, clap_param_info_t 
       info->id = 1;
       snprintf(info->name, CLAP_NAME_SIZE, "%s", "fixgain");
       info->min_value = 0.0; info->max_value = 1.0; info->default_value = 1.0;
-   } else {
+   } else if (idx == 1) {
       info->id = 2;
       snprintf(info->name, CLAP_NAME_SIZE, "%s", "fixamp");
       info->min_value = 0.0; info->max_value = 1.0; info->default_value = 1.0;
+   } else {
+      // v67: preset-load trigger. Reaching >= 0.5 makes the plugin call
+      // the host's clap.preset-load sink ONCE and then mutate its own
+      // gain - a deterministic stand-in for a preset loaded through the
+      // plugin's own machinery.
+      info->id = 3;
+      snprintf(info->name, CLAP_NAME_SIZE, "%s", "fixload");
+      info->min_value = 0.0; info->max_value = 1.0; info->default_value = 0.0;
    }
    return true;
 }
@@ -194,6 +224,7 @@ static bool pm_get_value(const clap_plugin_t *p, clap_id id, double *out) {
    fixture_plugin_t *f = selfp(p);
    if (id == 1) { *out = f->gain; return true; }
    if (id == 2) { *out = f->amp; return true; }
+   if (id == 3) { *out = f->load_reported ? 1.0 : 0.0; return true; }
    return false;
 }
 
