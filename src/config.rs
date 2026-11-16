@@ -122,6 +122,21 @@ fn default_sampler_vel() -> u8 {
     127
 }
 
+/// v65: a named slider-value snapshot of one script synth — the preset
+/// bar of the synth window (goal-5 parity with FX/hosted-plugin/sampler
+/// presets). `values` are POSITIONAL into the synth's param list (same
+/// shape as Config `track_synth_params` and the v61 templates); the
+/// loader seeds them through the live desc, so a preset written against
+/// an older/newer script layout degrades to desc defaults instead of
+/// bricking the instrument (the fx.rs preset rule).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct SynthPresetSave {
+    pub synth: String,
+    pub name: String,
+    #[serde(default)]
+    pub values: Vec<f32>,
+}
+
 /// v51: one track's multi-sample keyboard map for the bundled sampler.
 /// `mode`: 0 = hard cutoff — zones switch at the halfway point, a note
 /// exactly halfway plays the LOWER sample; 1 = crossfade — the two
