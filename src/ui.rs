@@ -1384,6 +1384,12 @@ pub struct App {
     /// track / left edge); paste re-places it at the playhead on the
     /// last-clicked track, opening a child lane when busy.
     clipboard: Option<Clipboard>,
+    /// v64 (S10): one-frame "don't steal" flag for the roll focus rule.
+    /// The click that OPENS or RETARGETS the roll (toolbar button / grid
+    /// dbl-click) must not immediately defocus it in the same frame —
+    /// that made "click Piano roll, Ctrl+V" paste a CLIP instead of the
+    /// copied notes. Consumed by the focus handler on its next pass.
+    roll_keep_focus: bool,
     /// v22: text staged for the OS clipboard after the next copy action.
     /// egui-winit DROPS Ctrl+V entirely (no event at all) when the OS
     /// clipboard is empty, so a copy must leave something there or the
@@ -2107,6 +2113,7 @@ impl App {
             sel_anchor: None,
             last_click_track: None,
             clipboard: None,
+            roll_keep_focus: false,
             os_clip_seed: None,
             clip_resize: None,
             marquee: None,
@@ -9704,55 +9711,28 @@ impl App {
                 )
             });
             if c {
-                let mut ns: Vec<crate::midipat::Note> = roll
-                    .sel_notes
-                    .iter()
-                    .filter_map(|i| roll.pat.notes.get(*i).copied())
-                    .collect();
-                if !ns.is_empty() {
-                    let m = ns.iter().map(|n| n.start).min().unwrap_or(0);
-                    for n in ns.iter_mut() {
-                        n.start -= m;
-                    }
-                    let k = ns.len();
-                    self.roll_clip = Some(ns);
-                    self.status =
-                        format!("copied {k} note(s) \u{b7} Ctrl+V pastes at the playhead");
-                    self.os_clip_seed = Some(format!("slooper: copied {k} note(s)"));
-                } else {
+                // v64: ONE copy implementation shared with the RMB menu row.
+                if roll.sel_notes.is_empty() {
                     // v21: the roll owning the keys used to be INVISIBLE —
                     // Ctrl+C with no selected notes silently did nothing and
                     // read as "clip copy/paste is broken".
                     self.status = "piano roll has the keyboard \u{b7} select notes to copy \
                                    (click outside the roll for clip copy)"
                         .into();
+                } else {
+                    self.roll_copy_notes(&mut roll);
                 }
             }
             if v {
-                if let Some(clip) = self.roll_clip.clone() {
-                    // Anchor the group's left edge at the playhead (the
-                    // same rule as the clip clipboard).
-                    let ph = (playhead as f64 / sr as f64
-                        * (roll.pat.bpm.max(20) as f64 / 60.0)
-                        * PPQ as f64)
-                        .round()
-                        .max(0.0) as u32;
-                    let mut idxs = Vec::with_capacity(clip.len());
-                    for n in clip.iter() {
-                        let mut n = *n;
-                        n.start += ph;
-                        roll.pat.notes.push(n);
-                        idxs.push(roll.pat.notes.len() - 1);
-                    }
-                    roll.sel_notes = idxs;
-                    roll.changed = true;
-                    self.status = format!("pasted {} note(s) at the playhead", clip.len());
-                } else {
-                    // v21: same silent-swallow fix as the roll copy above.
-                    self.status = "piano roll clipboard is empty \u{b7} select notes and Ctrl+C \
-                                   (click outside the roll to paste clips)"
-                        .into();
-                }
+                // Anchor the group's left edge at the playhead (the
+                // same rule as the clip clipboard).
+                let ph = (playhead as f64 / sr as f64
+                    * (roll.pat.bpm.max(20) as f64 / 60.0)
+                    * PPQ as f64)
+                    .round()
+                    .max(0.0) as u32;
+                // v64: ONE paste implementation shared with the RMB menu row.
+                self.roll_paste_notes(&mut roll, ph);
             }
             if a {
                 roll.sel_notes = (0..roll.pat.notes.len()).collect();
@@ -10024,7 +10004,13 @@ impl App {
                     None
                 }
             }) {
-                roll.focused = rect.contains(click);
+                // v64 (S10): the click that OPENED/retargeted the roll
+                // must not steal its keyboard focus in the same frame.
+                if self.roll_keep_focus {
+                    self.roll_keep_focus = false;
+                } else {
+                    roll.focused = rect.contains(click);
+                }
             }
         } else if docked {
             // Same focus rule against the dock panel's recorded rect.
@@ -10038,7 +10024,13 @@ impl App {
                     None
                 }
             }) {
-                roll.focused = rect.contains(click);
+                // v64 (S10): the click that OPENED/retargeted the roll
+                // must not steal its keyboard focus in the same frame.
+                if self.roll_keep_focus {
+                    self.roll_keep_focus = false;
+                } else {
+                    roll.focused = rect.contains(click);
+                }
             }
         }
         // A key in the piano strip was clicked: play it (deferred — the
@@ -11634,7 +11626,26 @@ impl App {
         {
             roll.menu_anchor = None;
         }
-        resp.context_menu(|ui| roll_rmb_menu(ui, roll, &mut self.status, rmb_hit));
+        let mut defer_clip = 0u8;
+        let clip_n = self.roll_clip.as_ref().map_or(0, |v| v.len());
+        resp.context_menu(|ui| {
+            roll_rmb_menu(ui, roll, &mut self.status, rmb_hit, clip_n, &mut defer_clip)
+        });
+        // v64 (S10): the menu's clipboard rows requested an op it cannot
+        // perform itself (the note clipboard and the playhead live on the
+        // App) — run it now that the closure dropped its borrows.
+        match defer_clip {
+            1 => self.roll_copy_notes(roll),
+            2 => {
+                let ph = (playhead as f64 / sr.max(1) as f64
+                    * (roll.pat.bpm.max(20) as f64 / 60.0)
+                    * PPQ as f64)
+                    .round()
+                    .max(0.0) as u32;
+                self.roll_paste_notes(roll, ph);
+            }
+            _ => {}
+        }
     }
 
     /// In-place edit-save: overwrite the MIDI asset the roll was opened
@@ -11658,6 +11669,204 @@ impl App {
         a.dirty = false;
         self.push_project();
         self.status = format!("piano roll: updated \u{201c}{name}\u{201d} in place");
+    }
+
+    /// v64 (S10): ONE source for the roll's Ctrl+C (keyboard path and the
+    /// RMB menu row): copy the selected notes with the group's left edge
+    /// normalized to 0, so a paste anchors it at any origin.
+    fn roll_copy_notes(&mut self, roll: &mut PianoRoll) {
+        let mut ns: Vec<crate::midipat::Note> = roll
+            .sel_notes
+            .iter()
+            .filter_map(|i| roll.pat.notes.get(*i).copied())
+            .collect();
+        if ns.is_empty() {
+            self.status = "copy: no notes selected \u{b7} click a note or ctrl+drag a box".into();
+            return;
+        }
+        let m = ns.iter().map(|n| n.start).min().unwrap_or(0);
+        for n in ns.iter_mut() {
+            n.start -= m;
+        }
+        let k = ns.len();
+        self.roll_clip = Some(ns);
+        self.status = format!("copied {k} note(s) \u{b7} Ctrl+V pastes at the playhead");
+        self.os_clip_seed = Some(format!("slooper: copied {k} note(s)"));
+    }
+
+    /// v64 (S10): ONE source for the roll's Ctrl+V: paste the note
+    /// clipboard into `roll`'s pattern anchored left-edge at the playhead
+    /// (`ph` ticks). The clipboard lives on the App, so a copy made in one
+    /// track's roll pastes into ANOTHER track's roll — copy notes, retarget
+    /// the roll, paste.
+    fn roll_paste_notes(&mut self, roll: &mut PianoRoll, ph: u32) {
+        let Some(clip) = self.roll_clip.clone() else {
+            // v21: same silent-swallow fix as the roll copy above.
+            self.status = "piano roll clipboard is empty \u{b7} select notes and Ctrl+C \
+                           (click outside the roll to paste clips)"
+                .into();
+            return;
+        };
+        let mut idxs = Vec::with_capacity(clip.len());
+        for n in clip.iter() {
+            let mut n = *n;
+            n.start += ph;
+            roll.pat.notes.push(n);
+            idxs.push(roll.pat.notes.len() - 1);
+        }
+        roll.sel_notes = idxs;
+        roll.changed = true;
+        self.status = format!("pasted {} note(s) at the playhead", clip.len());
+    }
+
+    /// v64 (S10): open the piano roll, or — when it is already open —
+    /// RETARGET it to the MIDI asset `edit` (was: the toolbar button was
+    /// gated on `piano_roll.is_none()`, so clicking it while a roll was
+    /// open was a SILENT no-op and editing a second track's notes meant
+    /// closing the roll first). A dirty buffer backed by an asset is
+    /// applied in place first (the SAVE path); a dirty FRESH (unbacked)
+    /// pattern refuses the switch rather than silently dropping the work.
+    /// Same target or no selection = focus the roll + echo (no silence).
+    /// Zoom/scroll survive the switch; selection and gestures reset; the
+    /// roll keeps keyboard focus so Ctrl+V lands in the new target.
+    fn roll_open_or_retarget(&mut self, edit: Option<u32>) {
+        let mut rb = match self.piano_roll.take() {
+            Some(r) => r,
+            None => {
+                // Open path (the v0.x toolbar contract): clone the target
+                // asset's pattern, or start a fresh 4-bar one.
+                let mut pat = match edit.and_then(|id| {
+                    self.assets
+                        .get(id as usize)
+                        .and_then(|a| a.pattern.clone())
+                }) {
+                    Some(p) => (*p).clone(),
+                    None => {
+                        let mut p =
+                            crate::midipat::Pattern::new(self.bpm().clamp(20, 999) as u16);
+                        p.len_ticks = 4 * PPQ as u32;
+                        p
+                    }
+                };
+                pat.bpm = self.bpm().clamp(20, 999) as u16;
+                if edit.is_some() {
+                    self.status =
+                        "piano roll: editing the selected MIDI asset \u{2014} save overwrites it"
+                            .into();
+                } else {
+                    self.status = "piano roll: fresh pattern \u{b7} save creates a new asset + clip"
+                        .into();
+                }
+                self.piano_roll = Some(Box::new(PianoRoll {
+                    pat,
+                    px_per_beat: 90.0,
+                    row_h: 11.0,
+                    vscroll_px: 396.0,
+                    scroll_sec: 0.0,
+                    changed: false,
+                    gesture: RollGesture::None,
+                    canvas_rect: None,
+                    new_vel: 100,
+                    sel_notes: Vec::new(),
+                    sel_anchor: None,
+                    drag_notes: Vec::new(),
+                    focused: true,
+                    win_rect: None,
+                    edit_asset: edit,
+                    sel_bend: None,
+                    bend_live: None,
+                    menu_anchor: None,
+                }));
+                self.roll_keep_focus = true;
+                return;
+            }
+        };
+        // Already open — focus, retarget, or refuse with a reason.
+        let same = matches!((rb.edit_asset, edit), (Some(a), Some(b)) if a == b)
+            || (rb.edit_asset.is_none() && edit.is_none());
+        if same {
+            rb.focused = true;
+            self.status = match rb.edit_asset {
+                Some(id) => format!(
+                    "piano roll: already editing \u{201c}{}\u{201d}",
+                    self.assets
+                        .get(id as usize)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| "\u{b7}gone".into())
+                ),
+                None => "piano roll: already open \u{b7} fresh pattern".into(),
+            };
+            self.piano_roll = Some(rb);
+            self.roll_keep_focus = true;
+            return;
+        }
+        if edit.is_none() {
+            // Button pressed with no MIDI selection: NEVER downgrade an
+            // open editor to a fresh pattern — focus + explain.
+            rb.focused = true;
+            self.status = match rb.edit_asset {
+                Some(id) => format!(
+                    "piano roll: still editing \u{201c}{}\u{201d} \u{b7} select a MIDI clip or \
+                     rack asset to switch to",
+                    self.assets
+                        .get(id as usize)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| "\u{b7}gone".into())
+                ),
+                None => "piano roll: fresh pattern already open \u{b7} select a MIDI clip to \
+                         switch"
+                    .into(),
+            };
+            self.piano_roll = Some(rb);
+            return;
+        }
+        let id = edit.unwrap();
+        let name = match self
+            .assets
+            .get(id as usize)
+            .and_then(|a| a.pattern.as_ref().map(|_| a.name.clone()))
+        {
+            Some(n) => n,
+            None => {
+                self.status =
+                    "piano roll: that selection is no longer a MIDI asset \u{b7} nothing changed"
+                        .into();
+                self.piano_roll = Some(rb);
+                return;
+            }
+        };
+        if rb.changed {
+            match rb.edit_asset {
+                // Backed buffer: apply in place first, exactly the SAVE
+                // button's path (asset + engine + undo all follow it).
+                Some(aid) => self.update_piano_roll_asset(&mut rb.pat, aid),
+                None => {
+                    self.status = "piano roll: unsaved fresh pattern \u{b7} SAVE it (or close \
+                                   the roll) before switching"
+                        .into();
+                    self.piano_roll = Some(rb);
+                    return;
+                }
+            }
+        }
+        let mut pat = (**self.assets[id as usize].pattern.as_ref().unwrap()).clone();
+        pat.bpm = self.bpm().clamp(20, 999) as u16;
+        rb.pat = pat;
+        rb.edit_asset = Some(id);
+        rb.changed = false;
+        rb.sel_notes.clear();
+        rb.sel_anchor = None;
+        rb.drag_notes.clear();
+        rb.gesture = RollGesture::None;
+        rb.sel_bend = None;
+        rb.bend_live = None;
+        rb.menu_anchor = None;
+        rb.focused = true;
+        self.status = format!(
+            "piano roll: now editing \u{201c}{name}\u{201d} \u{b7} save overwrites it"
+        );
+        self.piano_roll = Some(rb);
+        self.roll_keep_focus = true;
     }
 
     /// Bounce the piano roll: unique .mid in the primary folder, new asset,
@@ -16142,6 +16351,10 @@ impl App {
         // v47 R3: the command palette rides above the slot menu (only one
         // is ever open, but the z-order must match the intent).
         palette_pass(ui, self);
+        // v64: the roll keep-focus flag lives exactly one frame — whatever
+        // pass order a click took this frame, no stale suppression may
+        // reach the user's NEXT click.
+        self.roll_keep_focus = false;
     }
 
     /// v35 R5: get-or-create the dock registry slot for a dynamic window.
@@ -22315,10 +22528,11 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 "Open the piano-roll editor. With a MIDI clip selected (or a \
                  MIDI asset picked in the rack) the roll OPENS THAT for \
                  editing — save overwrites it in place. Otherwise it starts a \
-                 fresh pattern; save then creates a new asset + clip.",
+                 fresh pattern; save then creates a new asset + clip. While \
+                 the roll is OPEN this button SWITCHES it to the current \
+                 selection (a dirty backed buffer is saved in place first).",
             )
             .clicked()
-            && app.piano_roll.is_none()
         {
             // Edit target: the single selected clip's asset, else the
             // rack-selected asset — and only when it is a MIDI (pattern)
@@ -22338,40 +22552,11 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                         .and_then(|a| a.pattern.as_ref())
                         .is_some()
                 });
-            let mut pat = match edit {
-                Some(id) => (**app.assets[id as usize].pattern.as_ref().unwrap()).clone(),
-                None => {
-                    let mut p = Pattern::new(app.bpm().clamp(20, 999) as u16);
-                    p.len_ticks = 4 * PPQ as u32;
-                    p
-                }
-            };
-            pat.bpm = app.bpm().clamp(20, 999) as u16;
-            if edit.is_some() {
-                app.status =
-                    "piano roll: editing the selected MIDI asset \u{2014} save overwrites it"
-                        .into();
-            }
-            app.piano_roll = Some(Box::new(PianoRoll {
-                pat,
-                px_per_beat: 90.0,
-                row_h: 11.0,
-                vscroll_px: 396.0,
-                scroll_sec: 0.0,
-                changed: false,
-                gesture: RollGesture::None,
-                canvas_rect: None,
-                new_vel: 100,
-                sel_notes: Vec::new(),
-                sel_anchor: None,
-                drag_notes: Vec::new(),
-                focused: true,
-                win_rect: None,
-                edit_asset: edit,
-                sel_bend: None,
-                bend_live: None,
-                menu_anchor: None,
-            }));
+            // v64 (S10): the same call also RETARGETS an open roll — the
+            // old `&& app.piano_roll.is_none()` gate made a second click a
+            // silent no-op, so editing another track's notes meant closing
+            // the roll first.
+            app.roll_open_or_retarget(edit);
         }
         ui.label(RichText::new("grid:").strong());
         if ui
@@ -23107,22 +23292,44 @@ fn lane_row(
         .collect();
     // v0.11 R5: double-clicking a red automation clip opens its curve in
     // the automation manager (like double-clicking a MIDI clip region).
+    // v64: the MIDI half of that promise is now real too — dbl-click a
+    // MIDI clip and the piano roll opens/retargets on that clip's asset.
     if resp.double_clicked() {
         let pt = ui
             .input(|i| i.pointer.interact_pos())
             .unwrap_or(rect.center());
-        for (c, _name) in clips.iter() {
+        let mut midi_hit: Option<(usize, u32)> = None;
+        for (ci, (c, _name)) in clips.iter().enumerate() {
             let alen = app.asset_len(c.asset);
+            if pt.x < x_of(x0, c.pos, sr, px) || pt.x > x_of(x0, c.end(alen), sr, px) {
+                continue;
+            }
             if app
                 .assets
                 .get(c.asset as usize)
                 .is_some_and(|a| a.is_auto())
-                && pt.x >= x_of(x0, c.pos, sr, px)
-                && pt.x <= x_of(x0, c.end(alen), sr, px)
             {
                 app.open_auto_editor(Some(c.asset as usize));
                 break;
             }
+            if app
+                .assets
+                .get(c.asset as usize)
+                .and_then(|a| a.pattern.as_ref())
+                .is_some()
+            {
+                midi_hit = Some((ci, c.asset));
+                break;
+            }
+            // Plain audio: keep scanning — the old automation pass looked
+            // at EVERY clip, so an audio body must not shadow a later
+            // overlapping auto/MIDI clip.
+        }
+        if let Some((ci, asset)) = midi_hit {
+            // The dbl's first click usually already selected it; pin the
+            // single-selection so the retarget resolves the SAME clip.
+            app.select_one((t, k, ci));
+            app.roll_open_or_retarget(Some(asset));
         }
     }
     // Edge zones become trim/extend handles on ANY clip (grabbing an edge
@@ -24214,6 +24421,44 @@ const ROLL_LEN_TRIP: [(&str, u32); 5] = [
     ("trip 1/64 \u{b7} 20t", 20),
 ];
 
+/// v64 (S10): the Copy/Paste rows shared by BOTH branches of the roll's
+/// RMB menu — one builder so the two entry points cannot drift from each
+/// other or from the keyboard. The rows only REQUEST the op (`defer`):
+/// the note clipboard and playhead live on the App, so `roll_inner`
+/// executes after the menu closure drops its `self` borrow.
+fn roll_clipboard_rows(ui: &mut egui::Ui, clip_n: usize, has_sel: bool, defer: &mut u8) {
+    // egui 0.36: Button has no `.enabled()` — gate with add_enabled_ui,
+    // whose disabled widgets still surface `on_disabled_hover_text`.
+    let mut cp = 0u8;
+    ui.add_enabled_ui(has_sel, |ui| {
+        if ui
+            .button("Copy notes  (Ctrl+C)")
+            .on_hover_text(
+                "Copy the selected note(s) \u{b7} the note clipboard is \
+                 GLOBAL \u{b7} paste into another track's roll",
+            )
+            .on_disabled_hover_text("no notes selected \u{b7} click a note or ctrl+drag a box first")
+            .clicked()
+        {
+            cp = 1;
+            ui.close();
+        }
+    });
+    let mut ps = 0u8;
+    ui.add_enabled_ui(clip_n > 0, |ui| {
+        if ui
+            .button("Paste at playhead  (Ctrl+V)")
+            .on_hover_text("Paste the note clipboard with its left edge at the playhead")
+            .on_disabled_hover_text("note clipboard is empty \u{b7} copy some notes first")
+            .clicked()
+        {
+            ps = 2;
+            ui.close();
+        }
+    });
+    *defer = cp | ps;
+}
+
 /// v55 (S2): the piano-roll right-click menu. Exact musical note lengths
 /// (whole..1/64 + dotted + triplet, double/halve), selection-aware, and
 /// the delete lives here as one row — plain RMB opened this menu, the
@@ -24221,12 +24466,15 @@ const ROLL_LEN_TRIP: [(&str, u32); 5] = [
 /// pattern-end contract in roll_pass (pattern end = last note tail).
 /// Conventions mirror the grid clip menu: frozen press anchor,
 /// select-on-open, one-shot rows self-close, destructive row answers on
-/// hover (v54 invariant).
+/// hover (v54 invariant). v64 adds the shared clipboard rows to both the
+/// note and the empty-canvas branch.
 fn roll_rmb_menu(
     ui: &mut egui::Ui,
     roll: &mut PianoRoll,
     status: &mut String,
     hit: Option<RollRmbHit>,
+    clip_n: usize,
+    defer: &mut u8,
 ) {
     // Shift+RMB deletes instantly instead of opening anything — if the
     // shift key is still down, refuse the menu (muscle-memory contract).
@@ -24357,6 +24605,10 @@ fn roll_rmb_menu(
                 *status = format!("deleted {} note(s)", ts.len());
                 ui.close();
             }
+            // v64 (S10): clipboard rows on the right-clicked note too —
+            // same builder the empty-canvas branch draws.
+            ui.separator();
+            roll_clipboard_rows(ui, clip_n, !roll.sel_notes.is_empty(), defer);
         }
         Some(RollRmbHit::Glide(i)) if i < roll.pat.bend_segs.len() => {
             let s = &roll.pat.bend_segs[i];
@@ -24380,7 +24632,9 @@ fn roll_rmb_menu(
             }
         }
         // Empty canvas (or a stale index mid-edit): the menu still
-        // answers with WHY — every action gets feedback.
+        // answers with WHY — every action gets feedback. v64 (S10): the
+        // branch is now ACTIONABLE, not explanation-only — the clipboard
+        // rows carry notes to/from another track's roll from here too.
         _ => {
             ui.label(RichText::new("no note under the cursor").weak());
             ui.label(
@@ -24388,6 +24642,8 @@ fn roll_rmb_menu(
                     .weak()
                     .small(),
             );
+            ui.separator();
+            roll_clipboard_rows(ui, clip_n, !roll.sel_notes.is_empty(), defer);
         }
     }
 }
@@ -47205,6 +47461,490 @@ mod tests {
         assert!(
             galley_at_last(&mut app, &ctx, "play").is_some(),
             "editor offers a play button"
+        );
+    }
+
+    // ================= v64: roll retarget + note clipboard across tracks ====
+
+    /// v64 rig: two MIDI assets, one clip each — track 0 on a 2-note
+    /// pattern ("v64song-a"), track 1 on an empty one ("v64song-b").
+    /// Real temp paths so the in-place apply can write the .mid.
+    /// Returns the asset ids.
+    fn v64_two_midi(app: &mut App) -> (u32, u32) {
+        let mk = |app: &mut App, name: &str, notes: Vec<crate::midipat::Note>| -> u32 {
+            let id = app.assets.len() as u32;
+            let mut q = Pattern::new(120);
+            q.len_ticks = 4 * PPQ as u32;
+            q.notes = notes;
+            let dir = std::env::temp_dir().join("slooper-v64-pins");
+            let _ = std::fs::create_dir_all(&dir);
+            app.assets.push(crate::assets::Asset::midi(
+                id,
+                name.into(),
+                dir.join(format!("{name}.mid")),
+                q.into(),
+                false,
+            ));
+            id
+        };
+        let n = |note: u8, start: u32| crate::midipat::Note {
+            ch: 0,
+            note,
+            vel: 100,
+            press: 0,
+            start,
+            len: 240,
+        };
+        let a1 = mk(
+            app,
+            "v64song-a",
+            vec![n(60, 0), n(64, 480)],
+        );
+        let a2 = mk(app, "v64song-b", vec![]);
+        app.arr.insert(0, 0, Clip::new(a1, 0));
+        app.arr.insert(1, 0, Clip::new(a2, 0));
+        (a1, a2)
+    }
+
+    /// Click the "Piano roll" toolbar button (galley-anchored).
+    fn v64_click_roll_button(app: &mut App, ctx: &egui::Context) {
+        let b = galley_at(app, ctx, "Piano roll").expect("piano roll toolbar button");
+        let p = b.center();
+        click_pt(app, ctx, p);
+    }
+
+    /// S10 e2e: copy notes in track A's roll, retarget the roll to track
+    /// B's clip with the toolbar button (was a silent no-op), paste, save
+    /// — B's ASSET holds the notes, A's is untouched.
+    #[test]
+    fn v64_roll_retarget_to_other_midi_clip() {
+        let mut app = headless_app("v64xtk");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (a1, a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.edit_asset, Some(a1), "opened on clip A's asset");
+            assert_eq!(r.pat.notes.len(), 2, "shows A's pattern");
+        }
+        // Keyboard copy while the roll owns the keys (real gesture path).
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::A, egui::Modifiers::COMMAND),
+            ],
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(
+            app.roll_clip.as_ref().map(|v| v.len()),
+            Some(2),
+            "Ctrl+C copies A's notes"
+        );
+        // The silent no-op is what this pin kills: select clip B, click the
+        // SAME button while the roll is open.
+        app.select_one((1, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.edit_asset, Some(a2), "retargeted to clip B's asset");
+            assert!(r.pat.notes.is_empty(), "shows B's (empty) pattern");
+        }
+        assert!(
+            app.status.contains("v64song-b"),
+            "retarget echoes the new target: {}",
+            app.status
+        );
+        // Paste into B's buffer at the playhead, then save into the asset.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().pat.notes.len(),
+            2,
+            "Ctrl+V pastes into B's buffer"
+        );
+        let sv = galley_at_last(&mut app, &ctx, "save").expect("roll save button");
+        let p = sv.center();
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let pa = app.assets[a2 as usize].pattern.clone().unwrap();
+            assert_eq!(pa.notes.len(), 2, "save wrote the notes into B's asset");
+            let pb = app.assets[a1 as usize].pattern.clone().unwrap();
+            assert_eq!(pb.notes.len(), 2, "A's asset untouched");
+            assert_eq!(pb.notes[0].note, 60);
+        }
+    }
+
+    /// Retarget safety: a dirty buffer backed by an asset is applied IN
+    /// PLACE before the switch (the SAVE path), so a retarget can never
+    /// silently drop edited notes.
+    #[test]
+    fn v64_roll_retarget_applies_dirty_backed() {
+        let mut app = headless_app("v64dirty");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (a1, a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        for _ in 0..24 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let c = painted_rect(&mut app, &ctx, (22, 22, 26)).expect("roll canvas");
+        // Draw a fresh note on the canvas (real gesture): buffer goes dirty.
+        let g = egui::pos2(c.min.x + 300.0, c.min.y + 60.0);
+        frame(&mut app, &ctx, vec![moved(g), btn(g, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(g + egui::vec2(60.0, 0.0))],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(g + egui::vec2(60.0, 0.0)),
+                btn(g + egui::vec2(60.0, 0.0), egui::PointerButton::Primary, false),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.piano_roll.as_ref().unwrap().changed,
+            "the drawn note dirtied the buffer"
+        );
+        // Retarget to B: A's drawn note must land in A's asset first.
+        app.select_one((1, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.edit_asset, Some(a2), "switched to B");
+            assert!(!r.changed, "fresh buffer for the new target");
+        }
+        let pa = app.assets[a1 as usize].pattern.clone().unwrap();
+        assert_eq!(
+            pa.notes.len(),
+            3,
+            "the dirty buffer was applied in place before switching"
+        );
+    }
+
+    /// Retarget refusal: a dirty FRESH (unbacked) pattern refuses the
+    /// switch with an echo — retargeting must never silently eat it.
+    #[test]
+    fn v64_roll_retarget_refuses_unsaved_fresh() {
+        let mut app = headless_app("v64refuse");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (_a1, _a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let _c = open_roll_headless(&mut app, &ctx); // fresh pattern, no selection
+        // Draw a note so the fresh buffer is dirty.
+        let c = painted_rect(&mut app, &ctx, (22, 22, 26)).expect("roll canvas");
+        let g = egui::pos2(c.min.x + 300.0, c.min.y + 60.0);
+        frame(&mut app, &ctx, vec![moved(g), btn(g, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(g + egui::vec2(60.0, 0.0))]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(g + egui::vec2(60.0, 0.0)),
+                btn(g + egui::vec2(60.0, 0.0), egui::PointerButton::Primary, false),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.piano_roll.as_ref().unwrap().changed
+                && app.piano_roll.as_ref().unwrap().edit_asset.is_none(),
+            "dirty fresh buffer armed"
+        );
+        app.select_one((1, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert!(r.edit_asset.is_none(), "refused: still the fresh buffer");
+            assert_eq!(r.pat.notes.len(), 1, "the fresh work survived the click");
+        }
+        assert!(
+            app.status.contains("unsaved fresh pattern"),
+            "refusal echoes the WHY: {}",
+            app.status
+        );
+    }
+
+    /// No silent no-ops: pressing the button on the SAME target echoes
+    /// what is already being edited.
+    #[test]
+    fn v64_roll_button_refocus_echo() {
+        let mut app = headless_app("v64echo");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (a1, _a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().edit_asset,
+            Some(a1),
+            "same target keeps the buffer"
+        );
+        assert!(
+            app.status.contains("already editing") && app.status.contains("v64song-a"),
+            "second press echoes the state: {}",
+            app.status
+        );
+    }
+
+    /// The dbl-click promise (v0.11 comment): double-clicking a MIDI clip
+    /// opens the roll on that clip's asset — automation obeyed, MIDI did
+    /// not. Headless dbl must be the FIRST click (v20 trap).
+    #[test]
+    fn v64_dbl_midi_clip_opens_roll() {
+        let mut app = headless_app("v64dblmid");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (a1, _a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        }
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app
+                .piano_roll
+                .as_ref()
+                .expect("dbl-click on a MIDI clip opens the roll");
+            assert_eq!(r.edit_asset, Some(a1), "opened on the dbl'd clip's asset");
+            assert_eq!(r.pat.notes.len(), 2, "shows that asset's pattern");
+        }
+    }
+
+    /// S11b contract: Ctrl+C/Ctrl+V of a clip SHARES the asset — the
+    /// asset table never grows and both clips point at the same id.
+    #[test]
+    fn v64_clip_paste_shares_asset() {
+        let mut app = headless_app("v64share");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (a1, _a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        let assets_before = app.assets.len();
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(
+            app.status.contains("copied 1 clip"),
+            "clip copy echoes: {}",
+            app.status
+        );
+        // Target track 1: primary press there arms paste_track.
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) + TRACK_SEP_HIT + app.track_h(1) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.assets.len(),
+            assets_before,
+            "paste must NOT mint a duplicate asset"
+        );
+        let mut found = 0;
+        for (lane, ln) in app.arr.tracks[1].lanes.iter().enumerate() {
+            for (ci, cl) in ln.clips.iter().enumerate() {
+                if cl.asset == a1 {
+                    found += 1;
+                    let _ = (lane, ci);
+                }
+            }
+        }
+        assert_eq!(found, 1, "the pasted clip shares asset A on track 1");
+    }
+
+    /// The RMB menu carries the note clipboard: copy from A's roll via
+    /// the menu, retarget to B, paste via the menu (B's asset untouched
+    /// until save).
+    #[test]
+    fn v64_roll_menu_copy_paste_notes() {
+        let mut app = headless_app("v64menuctl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (_a1, a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        for _ in 0..24 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let c = painted_rect(&mut app, &ctx, (22, 22, 26)).expect("roll canvas");
+        // Click the note at tick 0 (px_per_beat 90: body at +20 px).
+        let note_p = egui::pos2(
+            c.min.x + 58.0 + 20.0,
+            c.max.y - 10.0 + 396.0 - 11.0 * 60.5,
+        );
+        click_pt(&mut app, &ctx, note_p);
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().sel_notes.len(),
+            1,
+            "canvas click selects the note"
+        );
+        // Empty-canvas RMB: the branch is actionable, not explain-only.
+        let empty = egui::pos2(c.min.x + 300.0, c.min.y + 30.0);
+        rmb(&mut app, &ctx, empty);
+        assert!(
+            galley_at_last(&mut app, &ctx, "Copy notes").is_some(),
+            "empty-canvas menu carries the clipboard rows"
+        );
+        click_last(&mut app, &ctx, "Copy notes");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.roll_clip.as_ref().map(|v| v.len()),
+            Some(1),
+            "menu Copy copied the selection"
+        );
+        // Retarget to B's empty clip, then paste through the menu.
+        app.select_one((1, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        for _ in 0..24 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let _c2 = painted_rect(&mut app, &ctx, (22, 22, 26)).expect("canvas after retarget");
+        let empty2 = egui::pos2(c.min.x + 300.0, c.min.y + 30.0);
+        rmb(&mut app, &ctx, empty2);
+        click_last(&mut app, &ctx, "Paste at playhead");
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.edit_asset, Some(a2), "still editing B");
+            assert_eq!(r.pat.notes.len(), 1, "menu paste landed in B's buffer");
+        }
+        let pb = app.assets[a2 as usize].pattern.clone().unwrap();
+        assert!(pb.notes.is_empty(), "buffer paste does not touch the asset");
+    }
+
+    /// v64 guard scope: keep-focus lives EXACTLY the opening frame — the
+    /// next click outside the roll must unfocus it, so a later Ctrl+V
+    /// routes to the CLIP clipboard (never a stale note paste).
+    #[test]
+    fn v64_keep_focus_scope_one_frame() {
+        let mut app = headless_app("v64scope");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let (_a1, _a2) = v64_two_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        v64_click_roll_button(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![]);
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::A, egui::Modifiers::COMMAND),
+            ],
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::C, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert_eq!(
+            app.roll_clip.as_ref().map(|v| v.len()),
+            Some(2),
+            "the roll was keyboard-focused right after the opening click"
+        );
+        // The roll floats nearly fullscreen OVER the grid (v56) and egui
+        // clamps it inside the viewport — grid rows are unreachable while
+        // it floats, so the focus-steal is proven with a click on the
+        // TOOLBAR strip above the window rect.
+        let wr = app.piano_roll.as_ref().unwrap().win_rect.expect("win rect");
+        // A click inside the window (piano-key strip = focus without any
+        // draw risk) focuses...
+        let cp = egui::pos2(wr.min.x + 12.0, wr.min.y + 150.0);
+        click_pt(&mut app, &ctx, cp);
+        assert!(
+            app.piano_roll.as_ref().unwrap().focused,
+            "a click inside the roll focuses it: click {cp:?} win {wr:?}"
+        );
+        // ...and the NEXT click, outside the window, steals it.
+        let p = egui::pos2(500.0, (wr.min.y - 30.0).max(10.0));
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.piano_roll.as_ref().unwrap().focused,
+            "the NEXT click must steal focus again (outside {p:?} vs win {wr:?})"
+        );
+        // Ctrl+V now goes to the CLIP clipboard (empty) — NOT the notes.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::V, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(
+            app.status.contains("clipboard is empty"),
+            "Ctrl+V routed to the clip clipboard: {}",
+            app.status
+        );
+        assert_eq!(
+            app.piano_roll.as_ref().unwrap().pat.notes.len(),
+            2,
+            "no stale note paste happened"
         );
     }
 }
