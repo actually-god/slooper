@@ -2779,12 +2779,14 @@ mod tests {
                 name: "a".into(),
                 default: 0.0,
                 writable: true,
+                program_change: false,
             },
             VstParamDesc {
                 id: 9,
                 name: "b".into(),
                 default: 0.0,
                 writable: true,
+                program_change: false,
             },
         ];
         let params = VstParams::new(&descs);
