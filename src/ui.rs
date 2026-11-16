@@ -50172,8 +50172,7 @@ mod tests {
                 .map(|t| t.to_string())
                 .collect();
             let hit = WORDS.iter().any(|w| {
-                if let Some((head, tail)) = w.split_once(' ') {
-                    let _ = tail;
+                if w.contains(' ') {
                     return low.contains(w);
                 }
                 toks.iter().any(|t| t == w) || (w.len() >= 6 && low.contains(w))
