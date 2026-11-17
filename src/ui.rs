@@ -20981,12 +20981,45 @@ fn rack_file_row(
             } else {
                 w
             };
-            // v76 R4b: one line, ellipsis-free hard truncation (wrap would
-            // clip a second line inside the 20 px row); the row hover
+            // v76 R4b: one line, HARD truncation. Button::truncate() and
+            // RichText wrapping are BOTH word-based and Button overwrites
+            // any job wrap (widget_text.rs into_layout_job), so a 70-char
+            // space-less name survives them whole (v76 pin proved it).
+            // Cut the string here using egui's own metrics; the row hover
             // carries the FULL path.
+            let short = {
+                let fid = egui::TextStyle::Small.resolve(ui.style());
+                let col = ui.visuals().widgets.noninteractive.fg_stroke.color;
+                let max_w = (rw - 28.0).max(60.0);
+                let wide = name.chars().count() > 10;
+                ui.ctx().fonts_mut(|fb| {
+                    let mk = |s: &str| {
+                        let mut j = egui::epaint::text::LayoutJob::simple(
+                            s.to_string(),
+                            fid.clone(),
+                            col,
+                            f32::INFINITY,
+                        );
+                        j.wrap.max_rows = 1;
+                        fb.layout_job(j).size().x
+                    };
+                    if !wide || mk(name) <= max_w {
+                        return name.to_string();
+                    }
+                    let mut cs: Vec<char> = name.chars().collect();
+                    loop {
+                        cs.pop();
+                        let cand: String =
+                            cs.iter().collect::<String>() + "\u{2026}";
+                        if cs.len() < 3 || mk(&cand) <= max_w {
+                            return cand;
+                        }
+                    }
+                })
+            };
             ui.add_sized(
                 egui::vec2(rw, 20.0),
-                egui::Button::selectable(sel, RichText::new(name).small()).truncate(),
+                egui::Button::selectable(sel, RichText::new(short).small()),
             )
         })
         .inner;
@@ -21461,12 +21494,23 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 // v76 R4a: child headers START indented
                                 // (+12 = the parent's file-row column), not
                                 // merely narrower — depth reads as x,
-                                // matching the 12/24 file-row steps.
-                                if child {
-                                    ui.add_space(12.0);
-                                }
-                                let hw = ui.available_width().max(24.0);
-                                let hr = ui.add_sized(
+                                // matching the 12/24 file-row steps. In a
+                                // vertical flow add_space would move y, so
+                                // the row is reserved full-width and the
+                                // content drawn into an x-shifted child ui.
+                                let ind = if child { 12.0 } else { 0.0 };
+                                let avail_w = ui.available_width().max(48.0);
+                                let hw = (avail_w - ind).max(24.0);
+                                let slot = ui.allocate_space(egui::vec2(avail_w, 18.0)).1;
+                                let mut hchild = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(egui::Rect::from_min_size(
+                                            slot.min + egui::vec2(ind, 0.0),
+                                            egui::vec2(hw, 18.0),
+                                        ))
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                );
+                                let hr = hchild.add_sized(
                                     egui::vec2(hw, 18.0),
                                     egui::Button::new(
                                         // ASCII +/- only (tofu trap).
@@ -50770,6 +50814,349 @@ mod tests {
         assert!(
             !fx_src.contains(&old_fmt.replace(' ', "")),
             "unit formatting must live once in fmt_param_value, not in fmt_param"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // v76 — TS-004: plugin rack / browser GUI pass. Scan/load state
+    // honesty (no silent async, failed probes visible), rack action
+    // echoes + hover, tree-row alignment + truncation.
+    // ---------------------------------------------------------------------
+
+    /// One fake scan entry (no dlopen — the UI filters on `error`).
+    fn v76_entry(name: &str, err: Option<&str>) -> crate::vsthost::VstEntry {
+        crate::vsthost::VstEntry {
+            path: std::path::PathBuf::from(format!("/vst76/{name}.vst3")),
+            kind: crate::vsthost::VstKind::V3,
+            name: name.to_string(),
+            vendor: "v76test".into(),
+            instrument: false,
+            plugin_id: None,
+            error: err.map(str::to_string),
+        }
+    }
+
+    /// v76 R1: both plugin browsers tell the truth. A probe-FAILED file
+    /// is LISTED (dimmed + explained) in the chain window's + VST popup,
+    /// and an in-flight rescan shows its status row even while the cached
+    /// list is painted. The synth picker shows the scanning row and a
+    /// failed-file footer.
+    #[test]
+    fn v76_browser_scan_states_visible() {
+        let mut app = headless_app("v76scan");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_window = Some(0);
+        app.vst_scanned = true;
+        app.vst_scan = vec![
+            v76_entry("GoodFx", None),
+            v76_entry("BrokenFx", Some("dlopen said no")),
+        ];
+        frame(&mut app, &ctx, vec![]);
+        let combo = painted_text_rect(&ctx, &mut app, "+ VST plugin").expect("combo painted");
+        click_pt(&mut app, &ctx, combo.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            painted_text_rect(&ctx, &mut app, "BrokenFx").is_some(),
+            "a probe-failed file must be LISTED dimmed (VstEntry.error contract), never hidden"
+        );
+        // Rescan in flight while the cached list is painted: the popup
+        // must say the list is stale, not silently keep showing it.
+        let (_tx, rx) = std::sync::mpsc::channel::<Vec<crate::vsthost::VstEntry>>();
+        app.vst_scan_rx = Some(rx);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            painted_text_rect(&ctx, &mut app, "(list = previous scan)").is_some(),
+            "in-flight rescan must announce itself over the cached popup list"
+        );
+        // Synth picker: scanning row despite cached rows, + failed footer.
+        let mut app2 = headless_app("v76scan2");
+        let ctx2 = egui::Context::default();
+        frame(&mut app2, &ctx2, vec![]);
+        app2.vst_scanned = true;
+        app2.vst_scan = vec![v76_entry("BrokenFx", Some("no vst3 entry"))];
+        let (_tx2, rx2) = std::sync::mpsc::channel::<Vec<crate::vsthost::VstEntry>>();
+        app2.vst_scan_rx = Some(rx2);
+        app2.synth_pick = Some(0);
+        frame(&mut app2, &ctx2, vec![]);
+        frame(&mut app2, &ctx2, vec![]);
+        assert!(
+            painted_text_rect(&ctx2, &mut app2, "instruments appear as they are found").is_some(),
+            "synth picker must show the in-flight scan even with cached rows"
+        );
+        assert!(
+            painted_text_rect(&ctx2, &mut app2, "failed to open").is_some(),
+            "synth picker must foot the count of failed plugin files"
+        );
+    }
+
+    /// v76 R1d: scan start AND completion reach the status bar — the
+    /// async round-trip must be observable without any window open.
+    #[test]
+    fn v76_scan_status_echoes() {
+        let mut app = headless_app("v76stat");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.vst_rescan();
+        assert!(
+            app.status.contains("scanning") && app.status.contains("folder(s)"),
+            "plugin rescan must echo into the status bar; status was {:?}",
+            app.status
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.vst_scan_rx = Some(rx);
+        tx.send(vec![v76_entry("GoodFx", None), v76_entry("BrokenFx", Some("x"))])
+            .unwrap();
+        let _ = app.poll_vst_opens();
+        assert_eq!(
+            app.status,
+            "1 plugin(s) ready",
+            "completion must echo the OK count (broken files are not 'ready')"
+        );
+        assert_eq!(app.vst_scan.len(), 2, "entries land; the UI filters them");
+    }
+
+    /// v76 R2: rack actions echo. The scan button reports what it found;
+    /// a reorder at the edge of the list REFUSES with an echo; a real
+    /// reorder echoes the move.
+    #[test]
+    fn v76_rack_ops_echo() {
+        let mut app = headless_app("v76echo");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let sc = painted_text_rect(&ctx, &mut app, "scan").expect("folder scan button");
+        click_pt(&mut app, &ctx, sc.center());
+        assert!(
+            app.status.starts_with("scanned \u{201c}") && app.status.ends_with("file(s)"),
+            "folder rescan must echo what it scanned; status {:?}",
+            app.status
+        );
+        // One sub-folder: "up" at the top of a one-item list must refuse.
+        let root = app.rack[0].path.clone();
+        let q = std::path::Path::new(&root).join("solo");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("s.wav"), b"RIFFx").unwrap();
+        app.rack[0].rescan();
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "- solo (", false);
+        assert_eq!(h.len(), 1, "solo header paints once");
+        rmb(&mut app, &ctx, h[0]);
+        let up = galley_centers(&mut app, &ctx, "up", true);
+        assert!(!up.is_empty(), "header menu offers up");
+        click_pt(&mut app, &ctx, up[0]);
+        assert!(
+            app.status.contains("already at the top"),
+            "edge reorder must refuse with an echo; status {:?}",
+            app.status
+        );
+        // Fresh apps (one popup per header anchor, v50-e): the bottom
+        // edge refuses, a real swap echoes success.
+        for (tag, item, want) in [
+            ("v76echo2", "down", "already at the bottom"),
+            ("v76echo3", "up", "bbb moved up"),
+        ] {
+            let mut a = headless_app(tag);
+            let c = egui::Context::default();
+            frame(&mut a, &c, vec![]);
+            let r = a.rack[0].path.clone();
+            for d in ["aaa", "bbb"] {
+                std::fs::create_dir_all(std::path::Path::new(&r).join(d)).unwrap();
+                std::fs::write(
+                    std::path::Path::new(&r).join(d).join("x.wav"),
+                    b"RIFFx",
+                )
+                .unwrap();
+            }
+            a.rack[0].rescan();
+            frame(&mut a, &c, vec![]);
+            let hb = galley_centers(&mut a, &c, "- bbb (", false);
+            assert_eq!(hb.len(), 1);
+            rmb(&mut a, &c, hb[0]);
+            let m = galley_centers(&mut a, &c, item, true);
+            assert!(!m.is_empty(), "header menu offers {item}");
+            click_pt(&mut a, &c, m[0]);
+            assert!(
+                a.status.contains(want),
+                "reorder {item} must echo {want:?}; status {:?}",
+                a.status
+            );
+        }
+    }
+
+    /// v76 R3 + R2 source half: the v71 hover audit EXTENDED to the rack
+    /// tree, where short labels ("scan", "x", "up", "down") defeat a
+    /// word-list scan. Every string-labelled button/small_button inside
+    /// rack_file_row + rack_body carries hover copy in its own statement.
+    /// The move-to SUBMENU buttons are exempt by design: their items
+    /// explain themselves (the audit reads their hovers too — see the
+    /// "(folder root)" / "(primary root)" buttons, which pass normally).
+    #[test]
+    fn v76_rack_hover_source_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let regions = [
+            ("fn rack_file_row(", "fn rack_kind_badge("),
+            ("fn rack_body(", "fn paint_stereo_meters("),
+        ];
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (a0, a1) in regions {
+            let s = prod.find(a0).expect("region anchor start");
+            let e = prod.find(a1).expect("region anchor end");
+            assert!(s < e, "region order {a0}..{a1}");
+            let lines: Vec<&str> = prod[s..e].lines().collect();
+            for (n, l) in lines.iter().enumerate() {
+                let s0 = l.trim_start();
+                if s0.starts_with("//") || !s0.contains(".button(") {
+                    continue;
+                }
+                if s0.starts_with("ui.menu_button(") {
+                    continue; // submenu items are the explanation
+                }
+                let Some(a) = l.find('"') else { continue };
+                let rest = &l[a + 1..];
+                let Some(b) = rest.find('"') else { continue };
+                let _ = &rest[..b]; // label present (dynamic ones still pass through)
+                let mut end = (n + 12).min(lines.len() - 1);
+                for (k, row) in lines[n..=end].iter().enumerate() {
+                    if row.contains("clicked()") || row.contains("clicked_by") {
+                        end = n + k;
+                        break;
+                    }
+                }
+                let win: String = lines[n..=end].join(" ").to_lowercase();
+                if win.contains("on_hover") {
+                    checked += 1;
+                } else {
+                    offenders.push(format!("{a0} region: {}", s0.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "rack buttons without hover:\n{}",
+            offenders.join("\n")
+        );
+        assert!(checked >= 14, "rack region scan found only {checked} buttons \u{b7} broken scan");
+    }
+
+    /// v76 R2 source half: the refusal seams echo (all entry points —
+    /// drag drops and menus share them). v72-style anchor/needle pairs.
+    #[test]
+    fn v76_rack_echo_source_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let samesite = concat!("move: already ", "in this folder");
+        let nest = concat!("move: cannot nest a folder inside ", "itself");
+        let stclone = concat!("self.status = self.vst_note", ".clone();");
+        let s: [(&str, &str, usize); 4] = [
+            ("fn rack_move(", samesite, 2000),
+            ("fn rack_dir_move(", nest, 3000),
+            (concat!("scanning {} ", "folder(s)"), stclone, 600),
+            (concat!("{n} plugin(s) ", "ready"), stclone, 600),
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for (anchor, needle, span) in s {
+            let hits = prod.matches(anchor).count();
+            if hits != 1 {
+                offenders.push(format!("anchor {anchor:?} matched {hits} (want 1)"));
+                continue;
+            }
+            let a = prod.find(anchor).unwrap();
+            let win = &prod[a..(a + span).min(prod.len())];
+            if !win.contains(needle) {
+                offenders.push(format!("{anchor:?} no longer echoes {needle:?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "v76 echo inventory broken:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// v76 R4a: tree rows ALIGN — a child header starts at the parent's
+    /// file-row column (+12 rect shift \u2248 +6 galley center, labels
+    /// center in their full-width buttons) and its file rows sit deeper.
+    #[test]
+    fn v76_tree_rows_indent() {
+        let mut app = headless_app("v76align");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let root = app.rack[0].path.clone();
+        for rel in ["top.wav", "kringel/own.wav", "kringel/dry/deeptrack.wav"] {
+            let q = std::path::Path::new(&root).join(rel);
+            std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+            std::fs::write(&q, b"RIFFx").unwrap();
+        }
+        app.rack[0].rescan();
+        app.rack_group_by_dir = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = galley_centers(&mut app, &ctx, "- kringel (2)", false);
+        let c = galley_centers(&mut app, &ctx, "- kringel/dry (", false);
+        assert_eq!(p.len(), 1, "parent header");
+        assert_eq!(c.len(), 1, "child header");
+        assert!(
+            c[0].x - p[0].x >= 3.0,
+            "child header must indent its column, not just its glyph: \u{201c}{}\u{201d} vs \u{201c}{}\u{201d}",
+            c[0].x,
+            p[0].x
+        );
+        let f = galley_centers(&mut app, &ctx, "deeptrack", true);
+        assert_eq!(f.len(), 1, "child file row");
+        assert!(
+            f[0].x > c[0].x + 2.0,
+            "child file rows sit deeper than the child header: {} vs {}",
+            f[0].x,
+            c[0].x
+        );
+    }
+
+    /// v76 R4b: a 70-char name must NOT wrap-clip in the 20 px row: the
+    /// galley is hard-truncated (full-name galley absent, prefix shown)
+    /// and the row hover carries the FULL path (TS-013 affordance here).
+    #[test]
+    fn v76_long_name_row_truncates() {
+        let mut app = headless_app("v76trunc");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let root = app.rack[0].path.clone();
+        let long = "MIXERCHAINTESTSUPERLONGNAME-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-9999";
+        std::fs::write(std::path::Path::new(&root).join(format!("{long}.wav")), b"RIFFx")
+            .unwrap();
+        app.rack[0].rescan();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            painted_text_rect(&ctx, &mut app, long).is_none(),
+            "a 70-char label must be truncated, not laid out whole (the old wrap clipped its tail out of the row)"
+        );
+        let pre = painted_text_rect(&ctx, &mut app, "MIXERCHAINTEST").expect("prefix galley paints");
+        let texts = hover_until_tip(&mut app, &ctx, pre.center(), &[long]);
+        assert!(
+            texts.iter().any(|t| t.contains(long)),
+            "the row hover must carry the full path; galleys: {texts:?}"
+        );
+    }
+
+    /// v76 R3a: the folder-row scan button's tooltip RENDERS (v71
+    /// runtime pattern — tooltips must paint, not just compile).
+    #[test]
+    fn v76_scan_button_tip() {
+        let mut app = headless_app("v76scantip");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let sc = painted_text_rect(&ctx, &mut app, "scan").expect("scan button painted");
+        let texts = hover_until_tip(&mut app, &ctx, sc.center(), &["scan this folder from disk"]);
+        assert!(
+            texts.iter().any(|t| t.contains("scan this folder from disk")),
+            "folder scan button must tooltip what it does; galleys: {texts:?}"
         );
     }
 }
