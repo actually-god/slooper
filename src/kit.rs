@@ -31,6 +31,11 @@ pub(crate) const EDGE: Color32 = Color32::from_gray(58);
 /// Bridge caption text (dark theme). Light mode resolves through `Kit`.
 pub(crate) const TEXT: Color32 = Color32::from_gray(170);
 pub(crate) const MUTED: Color32 = Color32::from_gray(110);
+/// v80 (TS-005): the ONE danger/error text token — "this thing is broken
+/// or bypassed" labels (not-loaded chain rows, dead plugin bridges).
+/// Frozen at the historical chain-window error red; a local `from_rgb`
+/// for error text is a drift bug, import this instead.
+pub(crate) const DANGER: Color32 = Color32::from_rgb(220, 120, 120);
 
 /// Theme-resolved kit chrome for the bridge widgets. Dark mode returns
 /// the historical constants byte-for-byte (pins freeze them); light mode
@@ -92,6 +97,14 @@ mod tests {
         assert_eq!(EDGE, Color32::from_gray(58));
         assert_eq!(TEXT, Color32::from_gray(170));
         assert_eq!(MUTED, Color32::from_gray(110));
+    }
+
+    #[test]
+    fn v80_kit_danger_token_frozen() {
+        // v80: error-text token — frozen at the red the chain window
+        // hand-wrote before v80 (zero visual drift); local error-reds
+        // are pinned-out by v80_chain_chrome_kit_only.
+        assert_eq!(DANGER, Color32::from_rgb(220, 120, 120));
     }
 
     #[test]

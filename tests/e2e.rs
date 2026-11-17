@@ -4721,3 +4721,144 @@ fn e2e_automation_follows_seek_while_stopped() {
         vol0()
     );
 }
+
+/// v80 (TS-005): the MIXER CHAIN per-slot MUTE is a real RT bypass — the
+/// stock compressor ducks the live square wave, and muting the SAME slot
+/// in the SAME chain publishes it as pass-through again (the RT render
+/// mirrors the offline/export identity pinned in the lib test).
+#[test]
+fn v80_rt_bypass_passthrough() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    // Compile/load the stock compressor through the REAL registry.
+    let dir = std::env::temp_dir().join(format!("slooper-e2e-v80byp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    // threshold -13 dB (0.55 square sits ~7 dB over it -> ~9 dB of
+    // reduction, landing near 0.25), ratio 20, fast attack, 100 ms
+    // release, no knee, unity makeup, FULL wet (7 params — the stock
+    // compressor's declared set). Margins: ducked ~0.25 (assert <0.40,
+    // >0.05), pass-through 0.55 (assert >0.45).
+    let vals = [-13.0f32, 20.0, 1.0, 100.0, 0.0, 1.0, 1.0];
+    let desc = reg.desc("compressor").expect("stock compressor present").clone();
+    let mk_inst = || {
+        reg.create_instance("compressor", sr as f64, &vals)
+            .expect("compressor compiles and instantiates")
+    };
+
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("v80bypass", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let _active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    let a: Arc<[f32]> = Arc::from(
+        (0..(sr as usize))
+            .map(|k| if (k / 80) % 2 == 0 { 0.55f32 } else { -0.55 })
+            .collect::<Vec<f32>>(),
+    );
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![a]),
+        arr: Arc::new(arr),
+        len: sr as u64,
+    });
+
+    let run_peak = |b: &Backend| -> f32 {
+        b.cmd(Cmd::Seek { pos: 0 });
+        std::thread::sleep(Duration::from_millis(150));
+        b.cmd(Cmd::PlayAll);
+        let mut peak = 0.0f32;
+        // The envelope needs ~1 ms attack per fresh instance — measure
+        // the STEADY-STATE peak, not the first blocks' dry ramp.
+        for i in 0..80 {
+            std::thread::sleep(Duration::from_millis(30));
+            if i >= 15 {
+                peak = peak.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+            }
+        }
+        b.cmd(Cmd::StopAll);
+        std::thread::sleep(Duration::from_millis(150));
+        peak
+    };
+
+    // DRY reference first (AC3 shape): proves the clip + capture rig work.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.4)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "dry clip audible at full level",
+    );
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Pass 1: live compressor — the mix is audibly DUCKED.
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: slooper::audio::TrackFx {
+            slots: std::sync::Arc::new(vec![slooper::audio::FxSlot::scripted(
+                mk_inst(),
+                desc.clone(),
+            )]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let ducked = run_peak(&b);
+    assert!(
+        ducked > 0.05 && ducked < 0.40,
+        "live compressor must duck the 0.55 square well below 0.4 (got {ducked})"
+    );
+
+    // Pass 2: IDENTICAL chain, slot muted — pass-through at full level.
+    b.cmd(Cmd::SetTrackEffects {
+        i: 0,
+        chain: slooper::audio::TrackFx {
+            slots: std::sync::Arc::new(vec![slooper::audio::FxSlot::scripted(
+                mk_inst(),
+                desc.clone(),
+            )
+            .with_bypass(true)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let through = run_peak(&b);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        through > 0.45,
+        "muted slot must pass the dry 0.55 square (got {through}; ducked was {ducked})"
+    );
+}
