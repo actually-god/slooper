@@ -207,6 +207,10 @@ pub enum ChainSave {
         stem: String,
         #[serde(default)]
         params: Vec<f32>,
+        /// v80 (TS-005): per-slot mute. Additive key — old files load
+        /// un-muted.
+        #[serde(default)]
+        bypass: bool,
     },
     /// In-process hosted plugin (VST2/VST3/CLAP).
     Vst {
@@ -229,6 +233,9 @@ pub enum ChainSave {
         /// Additive serde key — old files load unchanged.
         #[serde(default)]
         program: Option<i32>,
+        /// v80 (TS-005): per-slot mute (additive, like `program`).
+        #[serde(default)]
+        bypass: bool,
     },
 }
 
