@@ -51019,7 +51019,9 @@ mod tests {
             let lines: Vec<&str> = prod[s..e].lines().collect();
             for (n, l) in lines.iter().enumerate() {
                 let s0 = l.trim_start();
-                if s0.starts_with("//") || !s0.contains(".button(") {
+                if s0.starts_with("//")
+                    || !(s0.contains(".button(") || s0.contains("_button("))
+                {
                     continue;
                 }
                 if s0.starts_with("ui.menu_button(") {
