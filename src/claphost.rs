@@ -57,6 +57,9 @@ mod ffi {
     pub const CLAP_EVENT_MIDI: u16 = 10;
     pub const CLAP_PARAM_IS_READONLY: u32 = 1 << 3;
     pub const CLAP_PARAM_IS_HIDDEN: u32 = 1 << 2;
+    /// v74: `CLAP_PARAM_IS_ENUM` — the plugin declares an integer choice
+    /// parameter spanning min..=max; the row renders as a picker.
+    pub const CLAP_PARAM_IS_ENUM: u32 = 1 << 4;
     pub const CLAP_PROCESS_ERROR: i32 = 0;
 
     pub const CLAP_NAME_SIZE: usize = 256;
@@ -1345,12 +1348,56 @@ pub(crate) fn open_unlocked(
                 ((*params_ext).get_value)(plugin, info.id, &mut cur);
             }
             ids.push(info.id);
+            // v74: bridge-kit metadata. The ABI hands us the PLAIN range
+            // (with the documented linear default normalization), and
+            // IS_ENUM declares an integer picker; choice labels are
+            // SAMPLED from the plugin's own value_to_text — at most 64
+            // read-only calls at load, never during a drag.
+            let steps = if info.flags & ffi::CLAP_PARAM_IS_ENUM != 0 {
+                clap_enum_steps(info.min_value, info.max_value)
+            } else {
+                0
+            };
+            let enum_labels = if steps > 0 {
+                crate::vsthost::sample_step_labels(steps, false, |i| {
+                    let mut buf = [0 as c_char; 256];
+                    let ok = unsafe {
+                        ((*params_ext).value_to_text)(
+                            plugin,
+                            info.id,
+                            info.min_value + i as f64,
+                            buf.as_mut_ptr(),
+                            buf.len() as u32,
+                        )
+                    };
+                    if !ok {
+                        return None;
+                    }
+                    let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                        .to_string_lossy()
+                        .trim()
+                        .to_string();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+            } else {
+                Vec::new()
+            };
             descs.push(VstParamDesc {
                 id: info.id,
                 name,
                 default,
                 writable,
                 program_change: false,
+                unit: 0,
+                unit_text: String::new(),
+                plain_min: info.min_value as f32,
+                plain_max: info.max_value as f32,
+                steps,
+                enum_labels,
             });
             ranges.push((info.min_value, info.max_value));
             cur_vals.push(default_from_plain(cur, &info));
@@ -1527,6 +1574,21 @@ pub(crate) fn open_unlocked(
     Ok(e)
 }
 
+/// v74: CLAP declared-enum → discrete value count. An enum is an integer
+/// parameter spanning `min..=max`; the picker cap is 64 CHOICES (must
+/// match `sample_step_labels`' accepted range) and both bounds must be
+/// whole numbers, otherwise treat it as continuous (0).
+pub(crate) fn clap_enum_steps(min: f64, max: f64) -> u32 {
+    let span = max - min;
+    if !(1.0..=63.0).contains(&span) {
+        return 0;
+    }
+    if span.fract().abs() > 1e-6 || min.fract().abs() > 1e-6 || max.fract().abs() > 1e-6 {
+        return 0;
+    }
+    span as u32 + 1
+}
+
 fn default_from_plain(cur: f64, info: &ffi::ClapParamInfo) -> f32 {
     let span = info.max_value - info.min_value;
     if span.abs() > f64::EPSILON {
@@ -1541,6 +1603,21 @@ fn default_from_plain(cur: f64, info: &ffi::ClapParamInfo) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// v74 (TS-002 R4): the pure CLAP enum math. Only integer min/max
+    /// within the shared 64-choice cap become stepped descriptors; the
+    /// IS_ENUM bit rides the real ABI value.
+    #[test]
+    fn v74_clap_enum_steps_pure() {
+        assert_eq!(ffi::CLAP_PARAM_IS_ENUM, 1 << 4, "CLAP ABI bit position");
+        assert_eq!(clap_enum_steps(0.0, 3.0), 4, "0..=3 = four choices");
+        assert_eq!(clap_enum_steps(10.0, 13.0), 4, "non-zero whole min");
+        assert_eq!(clap_enum_steps(0.0, 0.5), 0, "non-integer span = continuous");
+        assert_eq!(clap_enum_steps(0.1, 3.0), 0, "non-integer min rejected");
+        assert_eq!(clap_enum_steps(0.0, 100.0), 0, "above the cap = continuous");
+        assert_eq!(clap_enum_steps(0.0, 63.0), 64, "cap edge matches the sampler");
+        assert_eq!(clap_enum_steps(0.0, 64.0), 0, "one past the cap declines");
+    }
 
     /// Compile the repo's fixture plugin into `target/clap-fixture/`
     /// (skipping gracefully when no C compiler is available). Returns the

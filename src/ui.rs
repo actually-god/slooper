@@ -3708,30 +3708,66 @@ impl App {
             }
         }
         let ql = new_filter.trim().to_lowercase();
-        let rows: Vec<(usize, String)> = entry
+        // v74: carry the FULL descriptor — every row renders through the
+        // ONE kit renderer (`fxgui::param_row`) the stock auto grid uses:
+        // same chrome, same formatter, hover tips, and pickers where the
+        // plugin declared steps. program_change params stay filtered out
+        // of the knob list (v66 contract — the program combo owns them).
+        let rows: Vec<(usize, crate::vsthost::VstParamDesc)> = entry
             .descs()
             .iter()
             .enumerate()
             .filter(|(_, d)| d.writable && !d.program_change)
             .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
             .take(400)
-            .map(|(k, d)| (k, d.name.clone()))
+            .map(|(k, d)| (k, d.clone()))
             .collect();
+        let mut echo: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (k, name) in rows {
+                for (k, d) in rows {
                     let mut v = entry.params().get(k);
                     let before = v;
-                    let s = ui.add(
-                        egui::Slider::new(&mut v, 0.0..=1.0)
-                            .text(name.chars().take(24).collect::<String>()),
-                    );
-                    if p_changed(&s, before, &mut v) {
+                    let spec = crate::fxgui::ParamRowSpec {
+                        label: &d.name,
+                        v_min: 0.0,
+                        v_max: 1.0,
+                        disp_min: d.plain_min,
+                        disp_max: d.plain_max,
+                        unit: d.unit,
+                        raw_unit: &d.unit_text,
+                        log_scale: false,
+                        step: if d.steps > 1 {
+                            1.0 / (d.steps - 1) as f32
+                        } else {
+                            0.0
+                        },
+                        labels: &d.enum_labels,
+                        gestures: false,
+                        echo_hint: "changes apply live",
+                    };
+                    let out =
+                        crate::fxgui::param_row(ui, ui.id().with(("v74param", k)), &spec, &mut v);
+                    if p_changed(&out.r, before, &mut v) {
                         entry.set_param(k, v);
+                    }
+                    // Goal 1 echo: a picker pick (or any non-drag commit)
+                    // answers at once; a drag answers when the pointer
+                    // LIFTS — `changed()` and the stop land on different
+                    // frames, so the release is its own trigger (and a
+                    // secondary-button drag, reverted by p_changed above,
+                    // must not echo).
+                    if out.r.drag_stopped_by(egui::PointerButton::Primary)
+                        || (!out.r.dragged() && out.r.changed())
+                    {
+                        echo = Some(format!("{} \u{2192} {} (live)", d.name, out.readout));
                     }
                 }
             });
+        if let Some(e) = echo {
+            self.status = e;
+        }
         self.params_filter = new_filter;
         // v60: apply the program picked this frame (deferred so the row
         // closed before we touch self.status).
@@ -36574,9 +36610,17 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         app.open_fx_editor(0, 0);
         frame(&mut app, &ctx, vec![]);
-        let lab = galley_at(&mut app, &ctx, "rate").expect("auto grid painted 'rate'");
-        // The row is [150 px slider][8 gap][label]: aim mid-slider.
-        let p = egui::pos2(lab.center().x - 85.0, lab.center().y);
+        // v74: the auto grid row now comes from the SHARED kit renderer —
+        // aim at the kit-probed slider rect (geometry-independent; the old
+        // aim derived from the retired [slider][8][label] grid layout).
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let _lab = galley_at(&mut app, &ctx, "rate").expect("auto grid painted 'rate'");
+        let sl = kit_probe("rate")
+            .first()
+            .copied()
+            .expect("chorus rate row renders through the kit renderer");
+        let p = sl.center();
         let n0 = app.assets.len();
         rmb(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
@@ -49467,6 +49511,7 @@ mod tests {
                     default: 0.5,
                     writable: true,
                     program_change: false,
+                ..Default::default()
                 }]
             })
         }
@@ -50352,6 +50397,265 @@ mod tests {
                 && app.status.contains("/tmp/v72x"),
             "row × must echo which folder left; status was {:?}",
             app.status
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // v74 — TS-002: hosted plugin params join the bridge-kit standard.
+    // One renderer (fxgui::param_row) for stock AND hosted rows, hover
+    // tips + status echoes on hosted interactions, and pickers/steps
+    // where the plugin declares them.
+    // ---------------------------------------------------------------------
+
+    /// A fake hosted entry whose descriptors carry v74 kit metadata:
+    /// one Hz-unit param (CLAP-style plain range), one plugin-declared
+    /// enum, one program-change param that must NEVER render as a knob.
+    struct V74Host {
+        descs: Vec<crate::vsthost::VstParamDesc>,
+        params: std::sync::Arc<crate::vsthost::VstParams>,
+    }
+    impl crate::vsthost::StageEntry for V74Host {
+        fn name(&self) -> &str {
+            "v74host"
+        }
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("/")
+        }
+        fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+            static S: std::sync::OnceLock<(std::path::PathBuf, crate::vsthost::VstKind)> =
+                std::sync::OnceLock::new();
+            S.get_or_init(|| (std::path::PathBuf::from("/"), crate::vsthost::VstKind::V2))
+        }
+        fn kind(&self) -> crate::vsthost::VstKind {
+            crate::vsthost::VstKind::V2
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+            &self.descs
+        }
+        fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+            &self.params
+        }
+        fn has_editor(&self) -> bool {
+            false
+        }
+        fn set_param(&self, i: usize, v: f32) {
+            self.params.set(i, v);
+        }
+        fn set_param_rt(&self, i: usize, v: f32) {
+            self.params.set(i, v);
+        }
+        fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+        fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+        fn all_notes_off(&self) {}
+        fn flush(&self) {}
+        fn midi_drops(&self) -> u64 {
+            0
+        }
+    }
+
+    fn v74_host_entry() -> std::sync::Arc<V74Host> {
+        let descs = vec![
+            crate::vsthost::VstParamDesc {
+                id: 7,
+                name: "V74hz".into(),
+                default: 0.25,
+                writable: true,
+                program_change: false,
+                unit: crate::fx::SLOOPER_UNIT_HZ,
+                unit_text: "Hz".into(),
+                plain_min: 20.0,
+                plain_max: 440.0,
+                steps: 0,
+                enum_labels: Vec::new(),
+            },
+            crate::vsthost::VstParamDesc {
+                id: 8,
+                name: "V74mode".into(),
+                default: 0.0,
+                writable: true,
+                program_change: false,
+                unit: 0,
+                unit_text: String::new(),
+                plain_min: 0.0,
+                plain_max: 1.0,
+                steps: 3,
+                enum_labels: vec!["V74lo".into(), "V74mid".into(), "V74hi".into()],
+            },
+            crate::vsthost::VstParamDesc {
+                id: 9,
+                name: "V74prog".into(),
+                default: 0.0,
+                writable: true,
+                program_change: true,
+                ..Default::default()
+            },
+        ];
+        let params = crate::vsthost::VstParams::new(&descs);
+        std::sync::Arc::new(V74Host { descs, params })
+    }
+
+    /// R2/R3/R4 as one UI loop: the hosted window paints its rows THROUGH
+    /// the kit (KIT_PROBE sees them), formats the value like stock
+    /// (`fmt_param_value`: 0.25 over 20..440 Hz → "125.0 Hz"), hovers
+    /// every row with value+range+live hint, echoes a drag on release and
+    /// a picker pick at once, and keeps the program-change param OUT of
+    /// the knob list.
+    #[test]
+    fn v74_hosted_param_row_hover_echo() {
+        use crate::vsthost::StageEntry;
+        let mut app = headless_app("v74host");
+        let ctx = egui::Context::default();
+        let entry = v74_host_entry();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: "/v74".into(),
+            kind: crate::vsthost::VstKind::V2,
+            plugin_id: None,
+            name: "v74host".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        // R2: hosted rows render through the SAME kit renderer (the
+        // probe is recorded only inside fxgui::param_row).
+        assert!(!kit_probe("V74hz").is_empty(), "kit renderer drove the hosted slider row");
+        assert!(!kit_probe("V74mode").is_empty(), "kit renderer drove the hosted enum picker");
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("125.0 Hz")),
+            "readout formats the plugin's plain range like the stock kit; galleys: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("V74lo")),
+            "enum row reads out the plugin's chosen label"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("V74prog")),
+            "the program-change param must never render as a knob (v66 contract)"
+        );
+        // R3 hover: value + range + the live hint on the slider row.
+        // The needle must be TOOLTIP-UNIQUE — "changes apply live" alone
+        // also rides the window's static info label and would satisfy
+        // hover_until_tip before egui's 0.3 s tooltip delay elapses.
+        let row = *kit_probe("V74hz").first().unwrap();
+        let tips = hover_until_tip(&mut app, &ctx, row.center(), &["value from the plugin"]);
+        assert!(
+            tips.iter()
+                .any(|t| t.contains("V74hz") && t.contains("Hz") && t.contains("range")),
+            "hosted hover states value, unit and range; galleys: {tips:?}"
+        );
+        // R3 echo on drag END (not mid-drag): press, move, lift.
+        let p0 = row.center();
+        let v_before = entry.params().get(0);
+        frame(&mut app, &ctx, vec![moved(p0)]);
+        frame(&mut app, &ctx, vec![btn(p0, egui::PointerButton::Primary, true)]);
+        let pm = egui::pos2(p0.x + 60.0, p0.y);
+        frame(&mut app, &ctx, vec![moved(pm), btn(pm, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(pm, egui::PointerButton::Primary, false)]);
+        let v_after = entry.params().get(0);
+        assert!(
+            v_after > v_before + 0.05,
+            "the drag landed on the plugin cell ({v_before} → {v_after})"
+        );
+        assert!(
+            app.status.contains("V74hz") && app.status.contains("(live)"),
+            "drag release echoes through the status bar; status was {:?}",
+            app.status
+        );
+        // R4 enum pick: the picker answers at once with the plugin's
+        // snapped value and its own label in the echo.
+        let combo = *kit_probe("V74mode").first().unwrap();
+        let cp = combo.center();
+        frame(&mut app, &ctx, vec![moved(cp)]);
+        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let hi = galley_at(&mut app, &ctx, "V74hi")
+            .expect("declared enum opens a picker with the plugin's labels")
+            .center();
+        frame(&mut app, &ctx, vec![moved(hi)]);
+        frame(&mut app, &ctx, vec![btn(hi, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(hi, egui::PointerButton::Primary, false)]);
+        assert!(
+            entry.params().get(1) > 0.9,
+            "the pick snapped to the top choice: {}",
+            entry.params().get(1)
+        );
+        assert!(
+            app.status.contains("V74mode")
+                && app.status.contains("V74hi")
+                && app.status.contains("(live)"),
+            "picker pick echoes immediately; status was {:?}",
+            app.status
+        );
+    }
+
+    /// Goal 2 as a machine-checked invariant: ONE param-row renderer.
+    /// Both call sites must be live (active_call polarity guard — the
+    /// v12e commented-out trap) and the retired forked chrome must be
+    /// gone from BOTH files. Needles are concat!-split so the pin can
+    /// never match its own literal inside the tests module.
+    #[test]
+    fn v74_shared_param_row_single_renderer() {
+        fn prod_window(src: &str) -> String {
+            // Cut at the tests module however it is indented — an
+            // uncut fx.rs (tests at column 0) would scan this very
+            // file's concat! literals.
+            let cut = ["\nmod tests", "\n    mod tests", "\npub(crate) mod tests"]
+                .iter()
+                .filter_map(|p| src.find(p))
+                .min()
+                .unwrap_or(src.len());
+            src[..cut]
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+                .collect::<Vec<_>>()
+                .join("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        }
+        let ui_src = prod_window(include_str!("ui.rs"));
+        let gui_src = prod_window(include_str!("fxgui.rs"));
+        // Positive: the hosted window calls the shared renderer.
+        let needle_hosted =
+            concat!("fxgui::param_row(ui, ui.id().with((\"v74", "param\", k)), &spec, &mut v)");
+        assert!(
+            ui_src.contains(&needle_hosted.replace(' ', "")),
+            "params_body must render rows through fxgui::param_row"
+        );
+        // Positive: the stock auto grid calls the SAME function.
+        let needle_stock = concat!("param_row(ui, ui.id().with((\"fxauto", "-row\", k))");
+        assert!(
+            gui_src.contains(&needle_stock.replace(' ', "")),
+            "the auto grid must render through the same param_row"
+        );
+        // Negative: the retired hosted naked slider is gone…
+        let old_hosted = concat!(".text(name.char", "s().take(24)");
+        assert!(
+            !ui_src.contains(&old_hosted.replace(' ', "")),
+            "the hosted window must not fork a naked Slider row anymore"
+        );
+        // …nor the retired 3-column grid nor the in-Instance unit match.
+        let old_grid = concat!("Grid::new((\"fxa", "uto\"");
+        assert!(
+            !gui_src.contains(&old_grid.replace(' ', "")),
+            "the forked auto-grid chrome must be retired"
+        );
+        let fx_src = prod_window(include_str!("fx.rs"));
+        let old_fmt = concat!("match m.unit", " {");
+        assert!(
+            !fx_src.contains(&old_fmt.replace(' ', "")),
+            "unit formatting must live once in fmt_param_value, not in fmt_param"
         );
     }
 }
