@@ -173,6 +173,31 @@ pub enum PresetLoadEvent {
     },
 }
 
+/// v79: `clap_preset_discovery_location_kind` — what `kind` means in
+/// [`PresetLocation`] and what `load_preset_location` forwards as the
+/// extension's `location_kind`. Values are ABI; do not renumber.
+pub const PRESET_KIND_FILE: u32 = 0;
+pub const PRESET_KIND_PLUGIN: u32 = 1;
+
+/// v79: one preset the host *discovered* and can command the plugin to
+/// load (`clap_plugin_preset_load::from_location(kind, location,
+/// load_key)`). Produced by the CLAP preset-discovery handshake; every
+/// other backend reports none. `location=None` + kind PLUGIN means the
+/// plugin DSO itself is the container (only `load_key` addresses).
+#[derive(Debug, Clone)]
+pub struct PresetLocation {
+    /// Display name as the plugin reported it.
+    pub name: String,
+    /// Container key; None = the location file IS the whole preset.
+    pub load_key: Option<String>,
+    /// `PRESET_KIND_FILE` or `PRESET_KIND_PLUGIN` (ABI u32).
+    pub kind: u32,
+    /// File path for kind FILE; None for kind PLUGIN.
+    pub location: Option<String>,
+    /// True when flagged factory content (vs user/discovered files).
+    pub factory: bool,
+}
+
 /// One live plugin (any format) behind one control/audio surface. The VST2
 /// and VST3 backends live in `RtStageEntry`; CLAP in `claphost::
 /// ClapStageEntry`. Chains, synth handles and the UI all traffic in
@@ -234,6 +259,44 @@ pub trait StageEntry: Send + Sync {
     /// writes, the control thread reads).
     fn take_preset_report(&self) -> Option<PresetLoadEvent> {
         None
+    }
+    /// v79: true when the plugin hosts `clap_plugin_preset_load` and the
+    /// host may command loads ([`Self::load_preset_location`]). CLAP-only
+    /// surface; false for every other backend and any CLAP plugin that
+    /// does not implement the extension.
+    fn supports_preset_load(&self) -> bool {
+        false
+    }
+    /// v79: presets discovered through the plugin's preset-discovery
+    /// provider (factory presets bundled in the DSO + presets found in
+    /// the locations the provider declared). Computed once per entry and
+    /// cached; empty when nothing was discovered. Control thread only
+    /// (plugin provider code runs under `vst_loader_lock`).
+    fn preset_locations(&self) -> Vec<PresetLocation> {
+        Vec::new()
+    }
+    /// v79: command the LIVE instance to load the preset at
+    /// (`kind`, `location`, `load_key`) — `clap_plugin_preset_load::from_
+    /// location`. Ok = the plugin accepted it; Err carries the plugin's
+    /// own refusal message when it reported one. Any `loaded`/`on_error`
+    /// report the command provokes is DRAINED here (the caller's return
+    /// value is authoritative — the PARAMETERS pump must not echo our own
+    /// command back later). Control thread only, under
+    /// `vst_loader_lock` (same discipline class as the CLAP open path).
+    fn load_preset_location(
+        &self,
+        _kind: u32,
+        _location: Option<&str>,
+        _load_key: Option<&str>,
+    ) -> Result<(), String> {
+        Err("this plugin format hosts no preset loading".into())
+    }
+    /// v79: file entry point for [`Self::load_preset_location`] — kind
+    /// FILE, whole file is the preset (no container key). The OS file
+    /// dialog and the headless pins share this ONE seam (v69 doctrine:
+    /// entry points cannot drift).
+    fn load_preset_file(&self, path: &std::path::Path) -> Result<(), String> {
+        self.load_preset_location(PRESET_KIND_FILE, path.to_str(), None)
     }
     /// One engine block, mono in/out, internally chunked to `VST_BLOCK`.
     /// Audio thread only.
