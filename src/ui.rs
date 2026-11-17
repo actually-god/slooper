@@ -21083,7 +21083,9 @@ fn rack_file_row(
                         ui.close();
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("pick a folder to move this file into");
             if let Some(dest) = mv {
                 app.rack_move(&fp_disp, &dest);
             }
@@ -21911,6 +21913,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 if dlt < 0 { "top" } else { "bottom" }
                             );
                         }
+                    }
 
                     // Project-only assets: recordings with no rack folder,
                     // dirty edits, and files whose folder was removed.
@@ -22051,7 +22054,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                                     ui.close();
                                                 }
                                             }
-                                        });
+                                        })
+                                        .response
+                                        .on_hover_text("pick a folder to move this file into");
                                         if let Some(dest) = mv {
                                             app.rack_move(&apdisp, &dest);
                                         }
@@ -27172,8 +27177,8 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                                 // VstEntry.error contract (previously a
                                 // silent skip).
                                 let lbl = format!("\u{d7} {} \u{b7} failed to open", e.name);
-                                let rr = ui
-                                    .add_enabled(false, egui::SelectableLabel::new(false, lbl));
+                                // A plain weak label: dimmed, inert.
+                                let rr = ui.label(RichText::new(lbl).weak().small());
                                 rr.on_hover_text(format!("{} \u{b7} {err}", e.path.display()));
                                 continue;
                             }
