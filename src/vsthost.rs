@@ -3117,7 +3117,10 @@ struct RtParts {
     program0: i32,
     /// v66: desc index of the wired VST3 program-change parameter (None =
     /// no runtime select path: VST2 uses the dispatcher, CLAP has no
-    /// factory presets, multi-list VST3 stays open-time restore only).
+    /// factory presets, and a VST3 whose probe found no settable cell per
+    /// unit-0 stays open-time restore only — see the v78 probe in
+    /// `open_v3`). v78: multi-program-param plugins resolve through it
+    /// too — the probe identifies the enumerated unit's own cell.
     program_param: Option<usize>,
 }
 
@@ -3246,18 +3249,104 @@ fn open_v3(
         })
         .unwrap_or_default();
     // Runtime selection writes the ONE program-change cell through the
-    // mirror; with several program-change params (multi-part plugins) the
-    // cell for the enumerated unit is ambiguous, so runtime select stays
-    // refused there — while open-time restore still works, because the
-    // crate's select_program resolves unit -> param itself.
-    let program_param_id: Option<u32> = if pcand.len() == 1 { Some(pcand[0]) } else { None };
-    if !programs.is_empty() {
-        if let Some(sp) = patch
-            .and_then(|p| p.program)
-            .filter(|p| *p >= 0)
-            .map(|p| p as usize)
-            .filter(|p| *p < programs.len())
-        {
+    // mirror. v66 refused multi-part plugins (several kIsProgramChange
+    // params) because the cell for the enumerated unit looked ambiguous;
+    // v78 resolves it anyway WITHOUT the `unitId` the crate's param
+    // report hides, by probing the plugin's OWN select path (its internal
+    // ProgramChangeMapping already knows param.unitId -> unit -> list):
+    // `select_program(unit, t)` writes exactly that unit's cell to
+    // norm(t), so the one candidate that MOVED to t IS the unit's cell.
+    // A program cannot rest at two distinct indices, so the second probe
+    // index lands on any cell the first one left alone — no movement
+    // through BOTH probes proves this unit has no settable cell, and the
+    // entry keeps v66's behavior then (no runtime wiring, "(unknown)"
+    // combo; plugins that ignore program changes are a chunk-rebuild
+    // story, and a live entry's save_state is exclusive-access only).
+    let mut program_param_id: Option<u32> = if pcand.len() == 1 { Some(pcand[0]) } else { None };
+    let mut program_resolved: Option<i32> = None; // v78: multi-part read-back
+    let saved_program = patch
+        .and_then(|p| p.program)
+        .filter(|p| *p >= 0)
+        .map(|p| p as usize)
+        .filter(|p| *p < programs.len());
+    if !programs.is_empty() && pcand.len() > 1 {
+        let count = programs.len();
+        let unit_id = program_unit.map(|u| u.id).unwrap_or(0);
+        if count == 1 {
+            // One entry in the list: nothing to probe — index 0 is the
+            // truth for any cell, wired or not.
+            program_resolved = Some(0);
+        } else {
+            let snap: Vec<(u32, f64)> = plugin
+                .get_parameters()
+                .map(|ps| {
+                    ps.iter()
+                        .filter(|p| pcand.contains(&p.id))
+                        .map(|p| (p.id, p.value))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut cell: Option<u32> = None;
+            for t in 0..2i32 {
+                if plugin.select_program(unit_id, t).is_err() {
+                    break;
+                }
+                if let Ok(ps) = plugin.get_parameters() {
+                    // Exactly one candidate must have moved, and TO t.
+                    // Zero moved = rest try at the other index; more than
+                    // one = a relayed multi-write we refuse to guess.
+                    let moved: Vec<u32> = ps
+                        .iter()
+                        .filter(|p| pcand.contains(&p.id))
+                        .filter(|p| {
+                            let orig = snap.iter().find(|(id, _)| *id == p.id).map(|(_, v)| *v);
+                            let shifted =
+                                !matches!(orig, Some(v) if (v - p.value).abs() < f64::EPSILON);
+                            shifted && norm_to_program(p.value, count) == t
+                        })
+                        .map(|p| p.id)
+                        .collect();
+                    if moved.len() == 1 {
+                        cell = Some(moved[0]);
+                        break;
+                    }
+                    if moved.len() > 1 {
+                        break;
+                    }
+                }
+            }
+            if let Some(cid) = cell {
+                let orig_norm = snap
+                    .iter()
+                    .find(|(id, _)| *id == cid)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0);
+                let orig_idx = norm_to_program(orig_norm, count).max(0) as usize;
+                // The final write rides the same crate path (controller
+                // AND processor): either the project's saved program, or
+                // the plugin's own boot program the probe snapshot
+                // revealed — a fresh open must land where it started.
+                let target = saved_program.unwrap_or(orig_idx);
+                if plugin.select_program(unit_id, target as i32).is_ok() {
+                    program_param_id = Some(cid);
+                    program_resolved = plugin
+                        .get_parameters()
+                        .ok()
+                        .and_then(|ps| {
+                            ps.iter()
+                                .find(|p| p.id == cid)
+                                .map(|p| norm_to_program(p.value, count))
+                        })
+                        .or(Some(target as i32));
+                }
+            }
+        }
+    }
+    if !programs.is_empty() && pcand.len() <= 1 {
+        // v66 open-time restore for the single-candidate (and zero-cell)
+        // cases — byte-identical path; multi-part entries were finalized
+        // by the probe above.
+        if let Some(sp) = saved_program {
             let _ = plugin.select_program(program_unit.map(|u| u.id).unwrap_or(0), sp as i32);
         }
     }
@@ -3282,12 +3371,15 @@ fn open_v3(
             desc_from_vst3_param(p, enum_labels)
         })
         .collect();
-    // v66 snapshot: read the wired program cell back. With several
-    // program-change params (multi-part plugin) the cell belonging to the
-    // enumerated list is ambiguous — report -1 ("(unknown)" in the combo)
-    // rather than guess from a foreign unit's cell.
+    // v66 snapshot: read the wired program cell back. v78: the multi-part
+    // probe already read its mapped cell back after the final select —
+    // that resolved index wins. Only a plugin whose probe found NO cell
+    // still reports -1 ("(unknown)" in the combo); a foreign unit's cell
+    // is never guessed from.
     let program0: i32 = if programs.is_empty() {
         -1
+    } else if let Some(idx) = program_resolved {
+        idx
     } else if let Some(pid) = program_param_id {
         ps.iter()
             .find(|p| p.id == pid)
@@ -6691,6 +6783,191 @@ mod tests {
         assert!(e.select_program(0));
         e.refresh_program();
         assert_eq!(e.current_program(), Some(0));
+    }
+
+    // ---- v78 (TS-015): multi-part runtime program change ----------------
+    //
+    // Fixture: scripts/porting/v78_multi_fixture.c — TWO units, each with
+    // its OWN program list + kIsProgramChange parameter (unit 0 "drums"
+    // param 1000: kit-a/kit-b/kit-c; unit 1 "synth" param 1001:
+    // warm/bright). The state stream is [i32 kit, i32 patch, f64 level],
+    // so save_state proves WHICH unit's cell moved: a host that wired the
+    // foreign unit's cell (or skipped the probe restore) fails the
+    // `patch == 0` half or the boot-program asserts, loudly.
+
+    fn v78_fixture() -> PathBuf {
+        let file = if cfg!(windows) {
+            "v78-vst3-multi.dll"
+        } else {
+            "v78-vst3-multi.so"
+        };
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/v78")
+            .join(file);
+        assert!(
+            p.is_file(),
+            "V78 fixture missing: {} (run scripts/porting/v78_build_fixtures.sh)",
+            p.display()
+        );
+        p
+    }
+
+    /// Envelope unwrap identical to v66_state, then parse the v78 payload
+    /// [i32 kit, i32 patch, f64 level] (16 bytes). Same explicit shape
+    /// guards — a foreign or truncated stream can never false-pass.
+    fn v78_programs(save: &[u8]) -> Option<(i32, i32)> {
+        if save.len() < 44 || &save[0..16] != b"VST3HOST_STATE\0\0" {
+            return None;
+        }
+        if u32::from_le_bytes(save[16..20].try_into().ok()?) != 1 {
+            return None;
+        }
+        if u32::from_le_bytes(save[20..24].try_into().ok()?) != 16 {
+            return None;
+        }
+        let level = f64::from_le_bytes(save[36..44].try_into().ok()?);
+        if (level - 0.5).abs() > f64::EPSILON {
+            return None;
+        }
+        Some((
+            i32::from_le_bytes(save[28..32].try_into().ok()?),
+            i32::from_le_bytes(save[32..36].try_into().ok()?),
+        ))
+    }
+
+    /// Acceptance 3 (entry half): a multi-part plugin's program surface
+    /// resolves — the unit-0 list names, a RESOLVED current program (not
+    /// the v66 -1/"(unknown)"), and both program-change cells present in
+    /// the descriptor list (the UI hides them from the knob grid; the
+    /// mapped one drives the mirror).
+    #[test]
+    fn v78_vst3_multi_unit_programs_resolved() {
+        let load = open(v78_fixture().as_path(), VstKind::V3, 48_000, None)
+            .expect("v78 fixture opens");
+        let e = &load.entry;
+        assert_eq!(
+            e.programs(),
+            vec!["kit-a", "kit-b", "kit-c"],
+            "the enumerated unit is the unit-0 (drums) list — never the foreign unit's"
+        );
+        assert_eq!(
+            e.current_program(),
+            Some(0),
+            "the combo resolves a name for a multi-part plugin (v66 reported None / \"(unknown)\")"
+        );
+        let pc: Vec<u32> = e
+            .descs()
+            .iter()
+            .filter(|d| d.program_change)
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(pc, vec![1000, 1001], "both units' cells are in the mirror");
+        assert!(e.select_program(2), "runtime select is ACCEPTED for the mapped unit");
+        assert_eq!(e.current_program(), Some(2));
+        assert!(!e.select_program(3), "out-of-range stays refused host-side");
+        assert_eq!(e.current_program(), Some(2), "a refusal leaves state alone");
+        e.refresh_program();
+        assert_eq!(e.current_program(), Some(2), "refresh re-reads the mapped cell");
+    }
+
+    /// Acceptance 2: the runtime change must land INSIDE the LIBRARY on
+    /// the unit whose list the combo shows — and must NOT touch the
+    /// foreign unit's program (that half is the foreign-cell sabotage
+    /// tripwire: wire param 1001 instead of 1000 and `patch` moves).
+    #[test]
+    fn v78_vst3_multi_unit_select_reaches_own_unit() {
+        let load = open(v78_fixture().as_path(), VstKind::V3, 48_000, None)
+            .expect("v78 fixture opens");
+        let e = &load.entry;
+        assert!(e.select_program(2));
+        // Drive the process pump so the mirror change relays through the
+        // runner ring (offline shape of the RT block loop, v66 doctrine).
+        let inp = vec![0.0f32; 8192];
+        let mut outp = vec![0.0f32; 8192];
+        for _ in 0..4 {
+            e.process(&inp, &mut outp);
+        }
+        let save = e
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry")
+            .save_state()
+            .expect("fixture state save");
+        assert_eq!(
+            v78_programs(&save),
+            Some((2, 0)),
+            "kit 2 landed in the library; the synth unit's cell stayed put (state = {save:?})"
+        );
+    }
+
+    /// The probe must leave NOTHING behind on a fresh open: it moves the
+    /// mapped cell to discover it, learns the boot program from the value
+    /// snapshot, and re-selects that program before the snapshot is taken
+    /// (fresh-open doctrine: the plugin ends where it started). Strip the
+    /// final restore write and `kit` stays at the probe index — red.
+    #[test]
+    fn v78_vst3_multi_unit_probe_restores_boot_program() {
+        let load = open(v78_fixture().as_path(), VstKind::V3, 48_000, None)
+            .expect("v78 fixture opens");
+        let save = load
+            .entry
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry")
+            .save_state()
+            .expect("state save");
+        assert_eq!(
+            v78_programs(&save),
+            Some((0, 0)),
+            "no probe residue: both units rest on their boot program (state = {save:?})"
+        );
+        assert_eq!(load.entry.current_program(), Some(0));
+    }
+
+    /// Save/load round-trip on a multi-part entry: the project's saved
+    /// program is applied through the plugin's own select path during the
+    /// open (after the probe mapped the cell) and read back; an
+    /// out-of-range value leaves the plugin on its boot program.
+    #[test]
+    fn v78_vst3_multi_unit_saved_program_restored() {
+        let load = open_with_state(
+            v78_fixture().as_path(),
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(1),
+            }),
+        )
+        .expect("restore open");
+        assert_eq!(load.entry.current_program(), Some(1), "cache reflects restore");
+        let save = load
+            .entry
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry")
+            .save_state()
+            .expect("state save");
+        assert_eq!(
+            v78_programs(&save),
+            Some((1, 0)),
+            "the kit cell really moved inside the plugin; foreign unit untouched"
+        );
+        let load2 = open_with_state(
+            v78_fixture().as_path(),
+            VstKind::V3,
+            48_000,
+            None,
+            Some(&VstPatch {
+                chunk: Vec::new(),
+                params: Vec::new(),
+                program: Some(99),
+            }),
+        )
+        .expect("out-of-range restore open");
+        assert_eq!(load2.entry.current_program(), Some(0), "bogus value ignored");
     }
 
     /// v73 (S8) end-to-end verdict pin: an editor probe of a plugin
