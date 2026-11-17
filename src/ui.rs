@@ -7841,7 +7841,7 @@ impl App {
                                             .map(|k| (format!("fx:{r}:{k}"), format!("param {k}")))
                                             .collect(),
                                     ),
-                                    ChainRow::Script { stem, params } => {
+                                    ChainRow::Script { stem, params, .. } => {
                                         match self.fx_registry.desc(stem) {
                                             Some(d) => {
                                                 let nm = d.name.clone();
@@ -15156,7 +15156,7 @@ impl App {
                 fx: self.fx_rows[t]
                     .iter()
                     .filter_map(|r| match r {
-                        ChainRow::Script { stem, params } => Some(TrackFxSave {
+                        ChainRow::Script { stem, params, .. } => Some(TrackFxSave {
                             stem: stem.clone(),
                             params: params.clone(),
                         }),
@@ -15495,13 +15495,22 @@ impl App {
                     .map(|s| ChainSave::Fx {
                         stem: s.stem.clone(),
                         params: s.params.clone(),
+                        bypass: false, // legacy fx list predate per-slot mute
                     })
                     .collect()
             };
             self.fx_rows[t] = chain_src
                 .into_iter()
                 .filter_map(|s| match s {
-                    ChainSave::Fx { stem, params } => Some(ChainRow::Script { stem, params }),
+                    ChainSave::Fx {
+                        stem,
+                        params,
+                        bypass,
+                    } => Some(ChainRow::Script {
+                        stem,
+                        params,
+                        bypass,
+                    }),
                     ChainSave::Vst {
                         path,
                         kind,
@@ -15510,6 +15519,7 @@ impl App {
                         params,
                         state,
                         program,
+                        bypass,
                     } => {
                         let kind = crate::vsthost::VstKind::parse(&kind)?;
                         Some(ChainRow::Vst {
@@ -15521,6 +15531,7 @@ impl App {
                             entry: None,
                             open_rx: None,
                             program,
+                            bypass,
                             state: state.as_deref().and_then(crate::config::b64_decode),
                         })
                     }
@@ -20933,7 +20944,7 @@ fn auto_targets(app: &App, t: usize) -> Vec<(String, String)> {
                         out.push((format!("fx:{r}:{k}"), format!("{name} \u{b7} param {k}")));
                     }
                 }
-                ChainRow::Script { stem, params } => {
+                ChainRow::Script { stem, params, .. } => {
                     let d = app.fx_registry.desc(stem);
                     match d {
                         Some(d) => {
@@ -21517,7 +21528,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                         if let Some(e) = err {
                             ui.label(
                                 RichText::new(format!("\u{d7} {}", e))
-                                    .color(Color32::from_rgb(220, 120, 120))
+                                    .color(crate::kit::DANGER)
                                     .small(),
                             );
                         }
@@ -23598,7 +23609,7 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 "{failed} plugin file(s) failed to open \u{2014} the MIXER CHAIN \
                  window\u{2019}s \"+ VST plugin\" list names them"
             ))
-            .color(Color32::from_rgb(220, 120, 120))
+            .color(crate::kit::DANGER)
             .small(),
         );
     }
@@ -27068,14 +27079,18 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
 fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
     // --- chain (audio order, top first) ---------------------------
     ui.label(RichText::new("Chain (top = first):").strong());
-    let mut act: Option<(u8, usize)> = None; // 0 open, 1 up, 2 down, 3 remove
+    let mut act: Option<(u8, usize)> = None; // 0 open, 1 up, 2 down, 3 remove, 4 bypass
     let rows = app.fx_rows[loop_i].clone();
+    let n_rows = rows.len();
     egui::ScrollArea::vertical()
         .max_height(210.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for (k, row) in rows.iter().enumerate() {
-                let (tag, label, ok) = match row {
+                // v80: the row knows its FULL state: tag, name, loaded,
+                // muted (v80), and whether its plugin bridge died (v42
+                // parked entry — the RT already passes audio around it).
+                let (tag, label, dead) = match row {
                     ChainRow::Script { stem, .. } => {
                         let d = app.fx_registry.desc(stem);
                         let tag = match d {
@@ -27087,16 +27102,39 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                         (
                             tag,
                             d.map(|d| d.name.clone()).unwrap_or_else(|| stem.clone()),
-                            d.is_some(),
+                            false,
                         )
                     }
                     ChainRow::Vst {
                         kind, name, entry, ..
-                    } => (kind.tag(), name.clone(), entry.is_some()),
+                    } => (
+                        kind.tag(),
+                        name.clone(),
+                        entry.as_ref().is_some_and(|e| e.is_dead()),
+                    ),
                 };
+                let bypassed = match row {
+                    ChainRow::Script { bypass, .. } | ChainRow::Vst { bypass, .. } => *bypass,
+                };
+                let loaded = match row {
+                    ChainRow::Script { stem, .. } => app.fx_registry.desc(stem).is_some(),
+                    ChainRow::Vst { entry, .. } => entry.is_some(),
+                };
+                // v80: is THIS row's editor window live right now?
+                let editor_open = match row {
+                    ChainRow::Script { .. } => app
+                        .fx_editor
+                        .as_ref()
+                        .is_some_and(|e| e.loop_i == loop_i && e.slot == k),
+                    ChainRow::Vst { .. } => app
+                        .fx_vst_editors
+                        .get(&(loop_i, k))
+                        .is_some_and(|w| !w.is_closed()),
+                };
+                let inert = dead || !loaded; // v80: dead never looks live
                 ui.horizontal(|ui| {
                     ui.monospace(format!("[{tag}]"));
-                    let txt = if ok {
+                    let txt = if loaded && !dead && !bypassed {
                         RichText::new(&label).strong()
                     } else {
                         RichText::new(&label).weak()
@@ -27105,14 +27143,44 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                     // NOT clickable — its click used to do nothing
                     // while the button still looked live. It now
                     // paints dimmed and explains itself on hover.
-                    let resp = ui.add_enabled(ok, egui::Button::new(txt).frame(false));
-                    let resp = resp.on_hover_text(if ok {
-                        "click to open controls"
+                    // v80: a dead bridge joins that family — parked by
+                    // the firewall, its window can never open, so the
+                    // row must not pretend otherwise.
+                    let resp = ui.add_enabled(!inert, egui::Button::new(txt).frame(false));
+                    let resp = if inert {
+                        resp.on_disabled_hover_text(if dead {
+                            "bridge lost — the plugin stopped responding and the firewall \
+                             parks it (audio passes through). Remove or replace this slot."
+                        } else {
+                            "not loaded — fix the folder or rescan below"
+                        })
+                    } else if editor_open {
+                        resp.on_hover_text("its editor window is open — click to close it")
                     } else {
-                        "not loaded — fix the folder or rescan below"
-                    });
+                        resp.on_hover_text("click to open controls")
+                    };
                     if resp.clicked() {
                         act = Some((0, k));
+                    }
+                    // v80: per-slot MUTE — the chain counterpart of the
+                    // v68 mixer mute: same word pair, reserved slot
+                    // (v32 rule: the label swap must not reflow), hover
+                    // explains the semantics, click echoes in status.
+                    let mb = ui
+                        .add(
+                            egui::Button::new(if bypassed { "mute" } else { "on" })
+                                .small()
+                                .min_size(egui::vec2(38.0, 0.0)),
+                        )
+                        .on_hover_text(if bypassed {
+                            "muted — audio passes through this slot while its settings \
+                             are kept; click to un-mute"
+                        } else {
+                            "mute this slot — the effect is skipped and audio passes \
+                             through, its settings stay; click to un-mute"
+                        });
+                    if mb.clicked() {
+                        act = Some((4, k));
                     }
                     if matches!(
                         row,
@@ -27126,18 +27194,30 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                         // UI stayed live; the entry lands via
                         // `poll_vst_opens` and repaints.
                         ui.label(RichText::new("loading…").weak().small());
+                    } else if dead {
+                        // v80: the parked bridge names itself — a row is
+                        // never silently wrong (v76 honesty doctrine).
+                        ui.label(
+                            RichText::new("× bridge lost — firewall-muted (remove or replace)")
+                                .color(crate::kit::DANGER)
+                                .small(),
+                        );
                     } else if matches!(row, ChainRow::Vst { entry: None, .. }) {
                         ui.label(
                             RichText::new("× not loaded (Rescan Plugins below)")
-                                .color(Color32::from_rgb(220, 120, 120))
+                                .color(crate::kit::DANGER)
                                 .small(),
                         );
-                    } else if !ok {
+                    } else if !loaded {
                         ui.label(
                             RichText::new("× script missing (Rescan effects below)")
-                                .color(Color32::from_rgb(220, 120, 120))
+                                .color(crate::kit::DANGER)
                                 .small(),
                         );
+                    } else if bypassed {
+                        ui.label(RichText::new("muted — audio passes through").weak().small());
+                    } else if editor_open {
+                        ui.label(RichText::new("editor open").weak().small());
                     } else {
                         ui.label(RichText::new("click to open controls").weak().small());
                     }
@@ -27149,10 +27229,12 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                         {
                             act = Some((3, k));
                         }
-                        if arrow_button(ui, false).clicked() {
+                        // v80: an arrow at the chain edge is DISABLED with
+                        // an explanation — a dead-end click never hides.
+                        if arrow_button(ui, false, k + 1 < n_rows).clicked() {
                             act = Some((2, k));
                         }
-                        if arrow_button(ui, true).clicked() {
+                        if arrow_button(ui, true, k > 0).clicked() {
                             act = Some((1, k));
                         }
                     });
@@ -27179,6 +27261,7 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
         Some((1, k)) => app.move_fx_row(loop_i, k, -1),
         Some((2, k)) => app.move_fx_row(loop_i, k, 1),
         Some((3, k)) => app.remove_fx_row(loop_i, k),
+        Some((4, k)) => app.toggle_fx_bypass(loop_i, k),
         _ => {}
     }
     ui.separator();
@@ -27385,7 +27468,7 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             let short: String = t.chars().take(140).collect();
             ui.label(
                 RichText::new(format!("× {}", short.replace('\n', " · ")))
-                    .color(Color32::from_rgb(220, 120, 120))
+                    .color(crate::kit::DANGER)
                     .small(),
             )
             .on_hover_text(t);
@@ -27467,16 +27550,28 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
 /// (Ubuntu-Light/NotoEmoji/emoji-icon-font) has no arrow or triangle glyphs
 /// at all — "▲"/"▼" (and even "↑"/"↓") render as hollow tofu boxes — so the
 /// icon is vector-painted into the button rect instead.
-fn arrow_button(ui: &mut egui::Ui, up: bool) -> egui::Response {
+/// v80: `enabled=false` (chain edge) dims the button AND explains itself —
+/// an edge click is never a silent dead end.
+fn arrow_button(ui: &mut egui::Ui, up: bool, enabled: bool) -> egui::Response {
     let resp = ui
-        .add(egui::Button::new(" ").min_size(egui::vec2(20.0, 16.0)))
+        .add_enabled(
+            enabled,
+            egui::Button::new(" ").min_size(egui::vec2(20.0, 16.0)),
+        )
         .on_hover_text(if up {
             "Move earlier in the chain"
         } else {
             "Move later in the chain"
+        })
+        .on_disabled_hover_text(if up {
+            "already first in the chain"
+        } else {
+            "already last in the chain"
         });
     let c = resp.rect.center();
-    let col = if resp.hovered() {
+    let col = if !enabled {
+        ui.visuals().widgets.inactive.fg_stroke.color.gamma_multiply(0.4)
+    } else if resp.hovered() {
         ui.visuals().widgets.active.fg_stroke.color
     } else {
         ui.visuals().widgets.noninteractive.fg_stroke.color
@@ -37729,6 +37824,7 @@ mod tests {
                 .expect("w6 fixture opens");
         let entry = load.entry;
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: fixture.display().to_string(),
             kind: crate::vsthost::VstKind::V2,
             plugin_id: None,
@@ -37802,6 +37898,7 @@ mod tests {
             .expect("v66 fixture opens");
         let entry = load.entry;
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: fixture.display().to_string(),
             kind: crate::vsthost::VstKind::V3,
             plugin_id: None,
@@ -37883,6 +37980,7 @@ mod tests {
         let entry = crate::claphost::open(&p, Some("com.slooper.fixture-gain"), 48_000, None, None)
             .expect("fixture opens");
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: p.display().to_string(),
             kind: crate::vsthost::VstKind::Clap,
             plugin_id: Some("com.slooper.fixture-gain".into()),
@@ -38007,6 +38105,7 @@ mod tests {
         let m = App::plugin_mtime(&wolf).expect("mtime");
         app.editor_probe.insert(App::probe_key(&wolf), (m, false));
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: wolf.clone(),
             kind: crate::vsthost::VstKind::V3,
             plugin_id: None,
@@ -38426,6 +38525,7 @@ mod tests {
         let mut app = headless_app("v36claprow");
         let ctx = egui::Context::default();
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: path.display().to_string(),
             kind: crate::vsthost::VstKind::Clap,
             plugin_id: Some("com.slooper.fixture-gain".into()),
@@ -38480,6 +38580,7 @@ mod tests {
         let m = App::plugin_mtime(&wolf).expect("mtime");
         app.editor_probe.insert(App::probe_key(&wolf), (m, true));
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: wolf.clone(),
             kind: crate::vsthost::VstKind::V3,
             plugin_id: None,
@@ -40465,6 +40566,7 @@ mod tests {
         // Session has one script-FX row on track 0 (2 params), no synth
         // on track 7, stock mixer.
         app.fx_rows[0] = vec![ChainRow::Script {
+            bypass: false,
             stem: "LowPass".into(),
             params: vec![0.5, 0.5],
         }];
@@ -48358,6 +48460,7 @@ mod tests {
         assert!(entry.select_program(2), "fixture accepts program 2");
         let mk_row = |path: String, entry: Option<std::sync::Arc<dyn crate::vsthost::StageEntry>>, program: Option<i32>| {
             ChainRow::Vst {
+                bypass: false,
                 path,
                 kind: crate::vsthost::VstKind::V2,
                 plugin_id: None,
@@ -48499,6 +48602,7 @@ mod tests {
             .expect("w6 fixture opens");
         let entry = load.entry;
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: fixture.display().to_string(),
             kind: crate::vsthost::VstKind::V2,
             plugin_id: None,
@@ -49815,6 +49919,7 @@ mod tests {
             pending: AtomicBool::new(true),
         });
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: "/dev/null".into(),
             kind: crate::vsthost::VstKind::Clap,
             plugin_id: Some("com.slooper.fixture-gain".into()),
@@ -49917,6 +50022,7 @@ mod tests {
             params: crate::vsthost::VstParams::new(d67()),
         });
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: "/dev/null".into(),
             kind: crate::vsthost::VstKind::Clap,
             plugin_id: None,
@@ -50900,6 +51006,7 @@ mod tests {
         let entry = v74_host_entry();
         frame(&mut app, &ctx, vec![]);
         app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
             path: "/v74".into(),
             kind: crate::vsthost::VstKind::V2,
             plugin_id: None,
@@ -51674,6 +51781,484 @@ mod tests {
         assert!(
             j > i && prod[i..j].contains("crate::presetbar::render("),
             "the v34 params surface must render its bar via presetbar"
+        );
+    }
+
+    // =================================================================
+    // v80 — TS-005: MIXER CHAIN window GUI states & affordances.
+    // Per-slot mute (v68 word pair), honest dead/editor states, edge
+    // arrows, kit-token chrome, hover+echo on every chain operation.
+    // =================================================================
+
+    /// Chain window open with `stems` seeded as script rows (rebuild so
+    /// fx_live/instances match what the row chrome reads).
+    fn v80_chain_with(app: &mut App, ctx: &egui::Context, stems: &[&str]) {
+        frame(app, ctx, vec![]);
+        for s in stems {
+            app.fx_rows[0].push(ChainRow::Script {
+                stem: (*s).to_string(),
+                params: Vec::new(),
+                bypass: false,
+            });
+        }
+        app.rebuild_fx(0);
+        app.fx_window = Some(0);
+        frame(app, ctx, vec![]);
+    }
+
+    /// Viewport y of every row × button in the open chain window
+    /// (top row first). Only chain rows paint × while no custom dirs
+    /// or failed scripts are seeded, so this is unambiguous.
+    fn v80_row_x_centers(app: &mut App, ctx: &egui::Context) -> Vec<egui::Pos2> {
+        let mut xs = galleys_all(app, ctx, "\u{d7}");
+        xs.sort_by(|a, b| a.y.total_cmp(&b.y));
+        xs
+    }
+
+    /// v80 R2: per-slot MUTE rides the v68 word pair, toggles the row
+    /// flag, marks the row state-honest, and echoes BOTH directions.
+    #[test]
+    fn v80_chain_bypass_toggle_echo() {
+        let mut app = headless_app("v80byp");
+        let ctx = egui::Context::default();
+        v80_chain_with(&mut app, &ctx, &["compressor"]);
+        let lab = painted_text_rect(&ctx, &mut app, "click to open controls")
+            .expect("loaded row invites a click");
+        frame(&mut app, &ctx, vec![moved(lab.center())]);
+        // The bypass button sits left of the state label in the row's
+        // horizontal: 8 px spacing + half of its reserved 38 px slot.
+        let p = egui::pos2(lab.min.x - 27.0, lab.center().y);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        assert!(
+            matches!(&app.fx_rows[0][0], ChainRow::Script { bypass: true, .. }),
+            "the click muted the slot"
+        );
+        assert!(
+            app.status.contains("muted \u{201c}compressor\u{201d}")
+                && app.status.contains("audio passes through"),
+            "mute echoes label + semantics; status {:?}",
+            app.status
+        );
+        // Row chrome follows: label swap + state text + dimmed label.
+        assert!(
+            !galleys_all(&mut app, &ctx, "mute").is_empty(),
+            "the button now reads mute"
+        );
+        assert!(
+            !galleys_all(&mut app, &ctx, "muted \u{2014} audio passes through").is_empty(),
+            "the muted row says so in place"
+        );
+        let lab2 = painted_text_rect(&ctx, &mut app, "muted \u{2014} audio passes through")
+            .expect("muted state label");
+        let p2 = egui::pos2(lab2.min.x - 27.0, lab2.center().y);
+        frame(&mut app, &ctx, vec![moved(p2)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p2), btn(p2, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(p2, egui::PointerButton::Primary, false)]);
+        assert!(
+            matches!(&app.fx_rows[0][0], ChainRow::Script { bypass: false, .. }),
+            "second click un-mutes"
+        );
+        assert!(
+            app.status.contains("unmuted \u{201c}compressor\u{201d}"),
+            "un-mute echoes too; status {:?}",
+            app.status
+        );
+        // v32 family: label swap must not reflow the row — the state
+        // label and the × keep their column across the toggle.
+        assert!(
+            !galleys_all(&mut app, &ctx, "click to open controls").is_empty(),
+            "un-muted row invites the click again"
+        );
+    }
+
+    /// v80 R2/R3: chain-edge reorder arrows are DISABLED and explain
+    /// themselves; the interior reorder click moves AND echoes.
+    #[test]
+    fn v80_chain_edge_arrows() {
+        let mut app = headless_app("v80edge");
+        let ctx = egui::Context::default();
+        v80_chain_with(&mut app, &ctx, &["compressor", "crush"]);
+        let xs = v80_row_x_centers(&mut app, &ctx);
+        assert_eq!(xs.len(), 2, "two seeded rows paint two removes");
+        // Row 2 (last): the DOWN arrow (~29 px left of the ×) is the
+        // edge direction. Hover must explain, click must do nothing.
+        let down = egui::pos2(xs[1].x - 29.0, xs[1].y);
+        let texts = hover_until_tip(&mut app, &ctx, down, &["already last"]);
+        assert!(
+            texts.iter().any(|t| t.contains("already last in the chain")),
+            "edge arrow tooltips its refusal; painted {texts:?}"
+        );
+        app.status = "sentinel".into();
+        frame(&mut app, &ctx, vec![moved(down)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(down), btn(down, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(down, egui::PointerButton::Primary, false)]);
+        assert_eq!(app.status, "sentinel", "a disabled arrow swallows the click");
+        assert_eq!(app.fx_rows[0].len(), 2, "and moves nothing");
+        // Row 1 (first): UP is the edge direction.
+        let up0 = egui::pos2(xs[0].x - 57.0, xs[0].y);
+        let texts = hover_until_tip(&mut app, &ctx, up0, &["already first"]);
+        assert!(
+            texts.iter().any(|t| t.contains("already first in the chain")),
+            "the top row's up arrow explains; painted {texts:?}"
+        );
+        // Interior: row 2 UP moves it first and echoes label + direction.
+        let up1 = egui::pos2(xs[1].x - 57.0, xs[1].y);
+        frame(&mut app, &ctx, vec![moved(up1)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(up1), btn(up1, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![btn(up1, egui::PointerButton::Primary, false)]);
+        match (&app.fx_rows[0][0], &app.fx_rows[0][1]) {
+            (
+                ChainRow::Script { stem: a, .. },
+                ChainRow::Script { stem: b, .. },
+            ) => {
+                assert_eq!((a.as_str(), b.as_str()), ("crush", "compressor"), "the swap landed")
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            app.status.contains("moved \u{201c}crush\u{201d} up the track 1 chain"),
+            "reorder echoes; status {:?}",
+            app.status
+        );
+    }
+
+    /// v80 R3: while a row's editor window is live the row says so and
+    /// the hover explains that a click CLOSES it; the marker tracks the
+    /// editor state, not the row index.
+    #[test]
+    fn v80_chain_editor_open_marker() {
+        let mut app = headless_app("v80edmark");
+        let ctx = egui::Context::default();
+        v80_chain_with(&mut app, &ctx, &["space_echo"]);
+        let name = app
+            .fx_registry
+            .desc("space_echo")
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "space_echo".into());
+        let r = painted_text_rect(&ctx, &mut app, &name).expect("row name paints");
+        let p = r.center();
+        for ev in [
+            vec![moved(p)],
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert!(
+            app.fx_editor.is_some(),
+            "clicking the loaded row opened its editor"
+        );
+        assert!(
+            !galleys_all(&mut app, &ctx, "editor open").is_empty(),
+            "the row marks its live editor"
+        );
+        app.fx_editor = None; // the editor's own X
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galleys_all(&mut app, &ctx, "editor open").is_empty(),
+            "closing the editor clears the marker"
+        );
+        assert!(
+            !galleys_all(&mut app, &ctx, "click to open controls").is_empty(),
+            "the row invites the click again"
+        );
+    }
+
+    /// v80 R3: a dead (firewall-parked) bridge is NEVER shown live:
+    /// dimmed name, inert click, DANGER-colored reason line.
+    #[test]
+    fn v80_dead_row_not_live() {
+        struct V80Dead;
+        impl crate::vsthost::StageEntry for V80Dead {
+            fn name(&self) -> &str {
+                "deadplug"
+            }
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("/")
+            }
+            fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+                static S: std::sync::OnceLock<(std::path::PathBuf, crate::vsthost::VstKind)> =
+                    std::sync::OnceLock::new();
+                S.get_or_init(|| (std::path::PathBuf::from("/"), crate::vsthost::VstKind::V2))
+            }
+            fn kind(&self) -> crate::vsthost::VstKind {
+                crate::vsthost::VstKind::V2
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+                &[]
+            }
+            fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+                static P: std::sync::OnceLock<std::sync::Arc<crate::vsthost::VstParams>> =
+                    std::sync::OnceLock::new();
+                P.get_or_init(|| crate::vsthost::VstParams::new(&[]))
+            }
+            fn has_editor(&self) -> bool {
+                false
+            }
+            fn is_dead(&self) -> bool {
+                true
+            }
+            fn set_param(&self, _i: usize, _v: f32) {}
+            fn set_param_rt(&self, _i: usize, _v: f32) {}
+            fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+            fn process_with_midi(&self, _i: &[f32], _o: &mut [f32], _e: &[(usize, [u8; 3])]) {}
+            fn all_notes_off(&self) {}
+            fn flush(&self) {}
+            fn midi_drops(&self) -> u64 {
+                0
+            }
+        }
+        let mut app = headless_app("v80dead");
+        let ctx = egui::Context::default();
+        // Colors freeze while reading them (Area fade-in premultiply trap).
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: "/dead/deadplug.so".into(),
+            kind: crate::vsthost::VstKind::V2,
+            plugin_id: None,
+            name: "deadplug".into(),
+            params: vec![],
+            entry: Some(std::sync::Arc::new(V80Dead)),
+            state: None,
+            open_rx: None,
+            program: None,
+            bypass: false,
+        });
+        app.fx_window = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        // The reason line paints AND carries the kit DANGER token.
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let danger = crate::kit::DANGER;
+        let hit = out.shapes.iter().find(|cs| {
+            matches!(&cs.shape, egui::epaint::Shape::Text(t)
+                if t.galley.text().contains("bridge lost"))
+        });
+        out.textures_delta.clear();
+        let cs = hit.expect("dead row explains itself in the window");
+        if let egui::epaint::Shape::Text(t) = &cs.shape {
+            assert!(
+                t.galley
+                    .job
+                    .sections
+                    .iter()
+                    .any(|sec| sec.format.color == danger),
+                "the dead-row reason rides kit::DANGER, got {:?}",
+                t.galley.job.sections.iter().map(|s| s.format.color).collect::<Vec<_>>()
+            );
+        }
+        // The name is inert: clicking it opens nothing and echoes nothing.
+        app.status = "sentinel".into();
+        let r = painted_text_rect(&ctx, &mut app, "deadplug")
+            .expect("the dead row still names itself");
+        let p = r.center();
+        for ev in [
+            vec![moved(p)],
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert!(app.fx_vst_editors.is_empty(), "a dead bridge never opens an editor");
+        assert_eq!(app.status, "sentinel", "and its click is silent");
+        assert!(
+            galleys_all(&mut app, &ctx, "click to open controls").is_empty(),
+            "a dead row never claims to be live"
+        );
+    }
+
+    /// v80 R2: ADD through the real "+ effect" combo echoes the landed
+    /// effect by name+track; the row × REMOVE echoes what left.
+    #[test]
+    fn v80_chain_add_combo_and_remove_echo() {
+        let mut app = headless_app("v80add");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_window = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        let c = galley_at(&mut app, &ctx, "+ effect")
+            .expect("add-effect combo")
+            .center();
+        for ev in [
+            vec![moved(c)],
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let item = painted_text_rect(&ctx, &mut app, "compressor)")
+            .expect("popup lists the compressor with its stem")
+            .center();
+        for ev in [
+            vec![moved(item)],
+            vec![moved(item), btn(item, egui::PointerButton::Primary, true)],
+            vec![btn(item, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(app.fx_rows[0].len(), 1, "the pick added exactly one row");
+        assert!(
+            app.status.contains("to track 1 chain")
+                && (app.status.contains("Compressor") || app.status.contains("compressor")),
+            "the add names what landed where; status {:?}",
+            app.status
+        );
+        // Remove via the row × (click feedback = row gone, echo = name).
+        let xs = v80_row_x_centers(&mut app, &ctx);
+        let p = xs[0];
+        for ev in [
+            vec![moved(p)],
+            vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            vec![btn(p, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert!(app.fx_rows[0].is_empty(), "the × removed the row");
+        assert!(
+            app.status.contains("removed") && app.status.contains("from track 1 chain"),
+            "the remove echoes what left; status {:?}",
+            app.status
+        );
+    }
+
+    /// v80 R1 source pin: every error-red the chain window paints rides
+    /// kit::DANGER — no local `from_rgb(220, 120, 120)` survives ANYWHERE
+    /// in production ui.rs (split literal: this pin must not contain the
+    /// needle as one contiguous token).
+    #[test]
+    fn v80_chain_chrome_kit_only() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor")];
+        let red = concat!("from_rgb(220", ", 120, 120)");
+        assert_eq!(
+            prod.matches(red).count(),
+            0,
+            "local error-red literals returned to ui.rs production — use kit::DANGER"
+        );
+        let s = prod.find("fn chain_win_body(").expect("chain body");
+        let e = prod.find("fn arrow_button(").expect("arrow helper");
+        assert!(s < e);
+        assert!(
+            prod[s..e].matches("kit::DANGER").count() >= 3,
+            "the chain body must color its three failure labels with kit::DANGER"
+        );
+    }
+
+    /// v80 R5: every string-labelled button the chain window paints
+    /// carries its own hover (v76 rack-scan shape, its own region).
+    #[test]
+    fn v80_chain_hover_source_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor")];
+        let s = prod.find("fn chain_win_body(").expect("region start");
+        let e = prod.find("fn arrow_button(").expect("region end");
+        let lines: Vec<&str> = prod[s..e].lines().collect();
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (n, l) in lines.iter().enumerate() {
+            let s0 = l.trim_start();
+            if s0.starts_with("//")
+                || s0.contains("arrow_button(") // the helper owns those hovers
+                || !(s0.contains(".button(") || s0.contains("_button("))
+            {
+                continue;
+            }
+            if s0.starts_with("ui.menu_button(") {
+                continue; // submenu items are the explanation
+            }
+            let mut end = (n + 14).min(lines.len() - 1);
+            for (k, row) in lines[n..=end].iter().enumerate() {
+                if row.contains("clicked()") || row.contains("clicked_by") {
+                    end = n + k;
+                    break;
+                }
+            }
+            let win: String = lines[n..=end].join(" ").to_lowercase();
+            if win.contains("on_hover") || win.contains("on_disabled_hover") {
+                checked += 1;
+            } else {
+                offenders.push(s0.trim().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "chain-window buttons without hover:\n{}",
+            offenders.join("\n")
+        );
+        assert!(checked >= 7, "chain region scan found only {checked} \u{b7} broken scan");
+    }
+
+    /// v80 contract scan (source): the v68 word pair + reserved slot,
+    /// the row→slot bypass ride, the refusal echoes, the plugin-load
+    /// status echoes — the behaviors runtime pins cannot each reach.
+    #[test]
+    fn v80_chain_bypass_contract_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor")];
+        let s = prod.find("fn chain_win_body(").expect("body");
+        let e = prod.find("fn arrow_button(").expect("arrow");
+        let body = &prod[s..e];
+        let mut offenders: Vec<String> = Vec::new();
+        // v68 word pair, reserved slot (v32 no-reflow rule).
+        if !body.contains(r#"if bypassed { "mute" } else { "on" }"#) {
+            offenders.push("bypass button left the on/mute word pair".into());
+        }
+        if !body.contains(concat!("min_size(egui::vec2(38.0", ", 0.0))")) {
+            offenders.push("bypass button lost its reserved 38 px slot".into());
+        }
+        // Row flag rides every slot build.
+        let ride = concat!(".with_bypass(", "*bypass)");
+        if prod.matches(ride).count() != 2 {
+            offenders.push("rebuild_fx must carry bypass for BOTH row kinds".into());
+        }
+        // Refusals and settles echo (fn-region needles, prod-only scan).
+        for (anchor, needle, span) in [
+            ("fn move_fx_row(", "already first in the track", 2000),
+            ("fn move_fx_row(", "already last in the track", 2000),
+            ("fn toggle_fx_bypass(", "unmuted", 2000),
+            ("fn add_fx_plugin(", "loading on the plugin thread", 2000),
+            ("fn poll_vst_opens(", "self.status = self.vst_note.clone();", 5000),
+            ("fn arrow_button(", "already last in the chain", 1500),
+        ] {
+            let a = prod.find(anchor).unwrap_or_else(|| panic!("anchor {anchor} gone"));
+            let win = &prod[a..(a + span).min(prod.len())];
+            if !win.contains(needle) {
+                offenders.push(format!("{anchor} no longer carries {needle:?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "v80 chain contract scan:\n{}",
+            offenders.join("\n")
         );
     }
 }
