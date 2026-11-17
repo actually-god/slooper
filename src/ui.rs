@@ -51883,6 +51883,9 @@ mod tests {
 
     /// v80 R2/R3: chain-edge reorder arrows are DISABLED and explain
     /// themselves; the interior reorder click moves AND echoes.
+    /// Button geometry is CALIBRATED (hover-probe finds the real arrow
+    /// offsets left of the ×) — no hardcoded pixel guesses survive the
+    /// egui padding family.
     #[test]
     fn v80_chain_edge_arrows() {
         let mut app = headless_app("v80edge");
@@ -51890,14 +51893,21 @@ mod tests {
         v80_chain_with(&mut app, &ctx, &["compressor", "crush"]);
         let xs = v80_row_x_centers(&mut app, &ctx);
         assert_eq!(xs.len(), 2, "two seeded rows paint two removes");
-        // Row 2 (last): the DOWN arrow (~29 px left of the ×) is the
-        // edge direction. Hover must explain, click must do nothing.
-        let down = egui::pos2(xs[1].x - 29.0, xs[1].y);
-        let texts = hover_until_tip(&mut app, &ctx, down, &["already last"]);
-        assert!(
-            texts.iter().any(|t| t.contains("already last in the chain")),
-            "edge arrow tooltips its refusal; painted {texts:?}"
-        );
+        // Hover-probe: first leftward offset whose tooltip answers.
+        let find_off = |app: &mut App, ctx: &egui::Context, row: usize, needle: &str| -> f32 {
+            for off in [24.0, 28.0, 32.0, 44.0, 48.0, 52.0, 56.0, 20.0, 36.0, 60.0] {
+                let p = egui::pos2(xs[row].x - off, xs[row].y);
+                let texts = hover_until_tip(app, ctx, p, &[needle]);
+                if texts.iter().any(|t| t.contains(needle)) {
+                    return off;
+                }
+            }
+            panic!("no arrow at any offset explains {needle:?} (row {row})");
+        };
+        // Row 2 (last): the DOWN arrow is the edge direction — it must
+        // explain its refusal from wherever it actually sits.
+        let off_down = find_off(&mut app, &ctx, 1, "already last");
+        let down = egui::pos2(xs[1].x - off_down, xs[1].y);
         app.status = "sentinel".into();
         frame(&mut app, &ctx, vec![moved(down)]);
         frame(
@@ -51908,15 +51918,10 @@ mod tests {
         frame(&mut app, &ctx, vec![btn(down, egui::PointerButton::Primary, false)]);
         assert_eq!(app.status, "sentinel", "a disabled arrow swallows the click");
         assert_eq!(app.fx_rows[0].len(), 2, "and moves nothing");
-        // Row 1 (first): UP is the edge direction.
-        let up0 = egui::pos2(xs[0].x - 57.0, xs[0].y);
-        let texts = hover_until_tip(&mut app, &ctx, up0, &["already first"]);
-        assert!(
-            texts.iter().any(|t| t.contains("already first in the chain")),
-            "the top row's up arrow explains; painted {texts:?}"
-        );
-        // Interior: row 2 UP moves it first and echoes label + direction.
-        let up1 = egui::pos2(xs[1].x - 57.0, xs[1].y);
+        // Row 1 (first): UP is the edge direction and explains itself.
+        let off_up = find_off(&mut app, &ctx, 0, "already first");
+        // Interior: row 2's UP arrow (same x family) moves it first.
+        let up1 = egui::pos2(xs[1].x - off_up, xs[1].y);
         frame(&mut app, &ctx, vec![moved(up1)]);
         frame(
             &mut app,
