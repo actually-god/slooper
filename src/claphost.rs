@@ -2406,6 +2406,171 @@ pub(crate) mod tests {
         );
     }
 
+    // ============================ v79: host-commanded preset load =======
+
+    /// v79: temp preset dir with a deterministic file set:
+    /// multi.fxp (container: 2 keyed presets), single.fxp (whole-file
+    /// preset, no key), bad.fxp (yields nothing — the negative control
+    /// that must NOT poison the rest of the crawl), decoy.txt (wrong
+    /// extension — must be filtered by the declared filetype).
+    fn v79_preset_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v79-presets-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("multi.fxp"),
+            "FIXPRESET FA Contained One\nFIXPRESET FB Contained Two\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("single.fxp"), "FIXPRESET DEFAULT\n").unwrap();
+        std::fs::write(dir.join("bad.fxp"), "not a preset file\n").unwrap();
+        std::fs::write(dir.join("decoy.txt"), "FIXPRESET FA Should Not Appear\n").unwrap();
+        dir
+    }
+
+    /// v79 (R1): the extension surface is per-plugin — the gain fixture
+    /// hosts `clap_plugin_preset_load`, the sine fixture is the negative
+    /// control and must answer "unsupported" everywhere.
+    #[test]
+    fn v79_clap_preset_load_supported_by_gain_only() {
+        let g = fixture_entry("gain");
+        assert!(g.supports_preset_load(), "fixture-gain hosts the extension");
+        let s = fixture_entry("sine");
+        assert!(
+            !s.supports_preset_load(),
+            "fixture-sine is the negative-polarity control"
+        );
+        assert!(s.preset_locations().is_empty(), "unsupported entries discover nothing");
+        assert!(
+            s.load_preset_file(Path::new("/nonexistent.fxp")).is_err(),
+            "unsupported entries refuse loads"
+        );
+    }
+
+    /// v79 (R2): the discovery handshake — provider created + init'd with
+    /// OUR indexer vtable, declared locations recorded, the PLUGIN-kind
+    /// container read through the metadata receiver. Env-free run: only
+    /// the plugin-internal factory presets exist.
+    #[test]
+    fn v79_clap_discover_plugin_container() {
+        std::env::remove_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR");
+        let e = fixture_entry("gain");
+        let locs = e.preset_locations();
+        let names: Vec<&str> = locs.iter().map(|l| l.name.as_str()).collect();
+        assert!(
+            names.contains(&"Fix Factory A") && names.contains(&"Fix Factory B"),
+            "factory presets discovered: {names:?}"
+        );
+        for l in &locs {
+            assert_eq!(l.kind, crate::vsthost::PRESET_KIND_PLUGIN, "kind rides the ABI enum");
+            assert!(l.location.is_none(), "plugin container carries no path");
+            assert!(l.factory, "location declared FACTORY_CONTENT");
+        }
+        let a = locs.iter().find(|l| l.name == "Fix Factory A").unwrap();
+        assert_eq!(a.load_key.as_deref(), Some("FA"), "container entries carry load keys");
+        // Cached: the second call must not re-enter plugin code (same vec,
+        // and a plugin that would add on re-init cannot — the cache wins).
+        assert_eq!(e.preset_locations().len(), locs.len());
+    }
+
+    /// v79 (R2): FILE locations from the provider are crawled by the
+    /// host — declared-filetype filter, container + whole-file entries,
+    /// and a yielding-failure file that must NOT break the crawl.
+    #[test]
+    fn v79_clap_discover_file_dir_skips_bad() {
+        let dir = v79_preset_dir();
+        std::env::set_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR", &dir);
+        let locs = fixture_entry("gain").preset_locations();
+        std::env::remove_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR");
+        let names: Vec<String> = locs.iter().map(|l| l.name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "Contained One") && names.iter().any(|n| n == "Contained Two"),
+            "container entries discovered: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "Preset DEFAULT"), "whole-file preset discovered: {names:?}");
+        assert!(names.iter().any(|n| n == "Fix Factory A"), "plugin container still included");
+        assert!(
+            !names.iter().any(|n| n.contains("Should Not Appear")),
+            "decoy.txt must be filtered by the declared filetype: {names:?}"
+        );
+        let files: Vec<&PresetLocation> =
+            locs.iter().filter(|l| l.kind == crate::vsthost::PRESET_KIND_FILE).collect();
+        assert_eq!(files.len(), 3, "multi.fxp yields 2, single.fxp 1, bad.fxp 0");
+        let dir_s = dir.display().to_string();
+        for l in &files {
+            assert!(
+                l.location.as_deref().map(|p| p.starts_with(&dir_s)).unwrap_or(false),
+                "file preset carries its crawled path: {:?}",
+                l.location
+            );
+            assert!(!l.factory, "FILE location was declared USER_CONTENT");
+        }
+        let two = locs.iter().find(|l| l.name == "Contained Two").unwrap();
+        assert_eq!(two.load_key.as_deref(), Some("FB"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v79 (R3): picking a discovered PLUGIN-container preset switches
+    /// the LIVE instance (proven through the state chunk) and the
+    /// plugin's own `loaded` report is DRAINED by the loader — the
+    /// PARAMETERS pump must not echo our own command back later.
+    #[test]
+    fn v79_clap_host_load_factory_preset_changes_state() {
+        let e = fixture_entry("gain");
+        let locs = e.preset_locations();
+        let b = locs.iter().find(|l| l.name == "Fix Factory B").expect("B discovered");
+        assert_eq!(e.load_preset_location(b.kind, b.location.as_deref(), b.load_key.as_deref()), Ok(()));
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.500"),
+            "live instance switched: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        assert!(e.take_preset_report().is_none(), "loader drained the report the command provoked");
+    }
+
+    /// v79 (R4): the file entry point — whole-file preset, no load key.
+    /// The plugin parsed the file itself AND reported; both land.
+    #[test]
+    fn v79_clap_host_load_file_plain() {
+        let dir = v79_preset_dir();
+        let e = fixture_entry("gain");
+        assert_eq!(e.load_preset_file(&dir.join("single.fxp")), Ok(()));
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.375"),
+            "parsed file preset applied: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        assert!(e.take_preset_report().is_none(), "success report drained");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v79 (R5): refusals surface the plugin's own `on_error` message
+    /// through Err, drain the slot, and leave the instance untouched.
+    #[test]
+    fn v79_clap_host_load_refused_reports_message() {
+        let dir = v79_preset_dir();
+        let e = fixture_entry("gain");
+        let err = e.load_preset_file(&dir.join("bad.fxp")).expect_err("bad file must refuse");
+        assert!(err.contains("no preset"), "plugin's own message rides Err: {err}");
+        assert!(e.take_preset_report().is_none(), "refusal report drained by the loader");
+        let err2 = e
+            .load_preset_location(crate::vsthost::PRESET_KIND_PLUGIN, None, Some("ZZ"))
+            .expect_err("unknown key must refuse");
+        assert!(err2.contains("unknown preset key"), "key refusal: {err2}");
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 1.000"),
+            "refusals changed nothing: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn v34_clap_gain_effect_scales_audio() {
         let e = fixture_entry("gain");
