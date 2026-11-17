@@ -10,6 +10,9 @@
 // Both implement clap.params, clap.audio-ports, clap.state so scan, param
 // relay, audio and state round-trips are all pinned against known output.
 // State is plain text: "F1 <gain> <amp>" (load tolerates missing fields).
+// v79: the GAIN plugin additionally implements clap_plugin_preset_load
+// (from_location) and the DSO exports a preset-discovery factory; the
+// sine plugin deliberately does NOT (negative-polarity control).
 //
 // This file is test infrastructure for src/claphost.rs; MIT like the host.
 
@@ -325,14 +328,188 @@ static const clap_plugin_state_t s_state = { .save = st_save, .load = st_load };
 static uint32_t lat_get(const clap_plugin_t *p) { (void)p; return 0; }
 static const clap_plugin_latency_t s_latency = { .get = lat_get };
 
+////////////////////  preset-load + discovery (v79)  ///////////////////////
+//
+// Host-commanded preset load (clap_plugin_preset-load/2.from_location)
+// plus a minimal preset-discovery provider so the host has locations to
+// load from. Preset-file grammar (fixture-defined): lines
+// "FIXPRESET <key> [name...]" — a bare key (no name) is a single-file
+// preset (reported with load_key NULL); key+name is a container entry.
+// Keys: FA=0.25  FB=0.5  DEFAULT=0.375. A file with no FIXPRESET line
+// must make the discovery receiver report on_error (the refusal path).
+
+#define FIXPRESET_DIR_ENV "SLOOPER_CLAP_FIXTURE_PRESET_DIR"
+
+static bool fix_apply_key(fixture_plugin_t *f, const char *key) {
+   if (strcmp(key, "FA") == 0) f->gain = 0.25;
+   else if (strcmp(key, "FB") == 0) f->gain = 0.5;
+   else if (strcmp(key, "DEFAULT") == 0) f->gain = 0.375;
+   else return false;
+   return true;
+}
+
+static const clap_host_preset_load_t *fix_pl_sink(const fixture_plugin_t *f) {
+   if (!f->host || !f->host->get_extension) return NULL;
+   return (const clap_host_preset_load_t *)f->host->get_extension(
+       f->host, CLAP_EXT_PRESET_LOAD);
+}
+
+// [main-thread] per spec: the host calls this on its control thread.
+static bool pl_from_location(const clap_plugin_t *p, uint32_t kind,
+                             const char *location, const char *load_key) {
+   fixture_plugin_t *f = selfp(p);
+   const char *key = (load_key && *load_key) ? load_key : NULL;
+   bool ok = false;
+   if (key) {
+      ok = fix_apply_key(f, key);
+   } else if (kind == 0 /*FILE*/ && location && *location) {
+      FILE *fp = fopen(location, "rb");
+      if (fp) {
+         char line[256];
+         while (fgets(line, sizeof(line), fp)) {
+            char k[32];
+            if (strncmp(line, "FIXPRESET ", 10) == 0 &&
+                sscanf(line + 10, "%31s", k) == 1 && fix_apply_key(f, k)) {
+               ok = true;
+               break;
+            }
+         }
+         fclose(fp);
+      }
+   }
+   const clap_host_preset_load_t *pl = fix_pl_sink(f);
+   // PLUGIN-kind success reports location=NULL (spec: plugin container).
+   if (ok && pl && pl->loaded) pl->loaded(f->host, kind, location, key);
+   if (!ok && pl && pl->on_error)
+      pl->on_error(f->host, kind, location, key, 0,
+                   key ? "fixture: unknown preset key"
+                       : "fixture: no preset at location");
+   return ok;
+}
+
+static const clap_plugin_preset_load_t s_preset_load = { pl_from_location };
+
+static bool prov_init(const clap_preset_discovery_provider_t *prov) {
+   const clap_preset_discovery_indexer_t *ix =
+      (const clap_preset_discovery_indexer_t *)prov->provider_data;
+   if (!ix || !ix->declare_filetype || !ix->declare_location) return false;
+   clap_preset_discovery_filetype_t ft = { "fixture preset", "slooper fixture", "fxp" };
+   ix->declare_filetype(ix, &ft);
+   clap_preset_discovery_location_t loc_plugin = {
+      CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT, "Fix Factory",
+      CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, NULL };
+   ix->declare_location(ix, &loc_plugin);
+   const char *dir = getenv(FIXPRESET_DIR_ENV);
+   if (dir && *dir) {
+      clap_preset_discovery_location_t loc_files = {
+         CLAP_PRESET_DISCOVERY_IS_USER_CONTENT, "Fixture files",
+         CLAP_PRESET_DISCOVERY_LOCATION_FILE, dir };
+      ix->declare_location(ix, &loc_files);
+   }
+   return true;
+}
+
+static void prov_destroy(const clap_preset_discovery_provider_t *prov) {
+   free((void *)prov);
+}
+
+static bool prov_get_metadata(const clap_preset_discovery_provider_t *prov,
+                              uint32_t kind, const char *location,
+                              const clap_preset_discovery_metadata_receiver_t *recv) {
+   (void)prov;
+   if (!recv || !recv->begin_preset) return false;
+   if (kind == CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN) {
+      clap_universal_plugin_id_t pid = { "clap", "com.slooper.fixture-gain" };
+      if (recv->begin_preset(recv, "Fix Factory A", "FA")) {
+         if (recv->add_plugin_id) recv->add_plugin_id(recv, &pid);
+         if (recv->set_flags) recv->set_flags(recv, CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT);
+      }
+      if (recv->begin_preset(recv, "Fix Factory B", "FB")) {
+         if (recv->add_plugin_id) recv->add_plugin_id(recv, &pid);
+      }
+      return true;
+   }
+   FILE *fp = location ? fopen(location, "rb") : NULL;
+   if (!fp) {
+      if (recv->on_error) recv->on_error(recv, 2, "fixture: cannot open preset file");
+      return false;
+   }
+   int found = 0;
+   char line[256];
+   while (fgets(line, sizeof(line), fp)) {
+      char key[32], name[192], rest[160];
+      if (strncmp(line, "FIXPRESET ", 10) != 0) continue;
+      // "FIXPRESET <key> <name...>" -> container entry; bare key -> single
+      if (sscanf(line + 10, "%31s %159[^\n]", key, rest) == 2) {
+         snprintf(name, sizeof(name), "%s", rest);
+         if (!recv->begin_preset(recv, name, key)) break;
+      } else if (sscanf(line + 10, "%31s", key) == 1) {
+         snprintf(name, sizeof(name), "Preset %s", key);
+         if (!recv->begin_preset(recv, name, NULL)) break;
+      } else {
+         continue;
+      }
+      found++;
+   }
+   fclose(fp);
+   if (!found) {
+      if (recv->on_error) recv->on_error(recv, 0, "fixture: no presets in file");
+      return false;
+   }
+   return true;
+}
+
+static const void *prov_get_ext(const clap_preset_discovery_provider_t *prov,
+                                const char *id) {
+   (void)prov; (void)id;
+   return NULL;
+}
+
+static const clap_preset_discovery_provider_descriptor_t s_prov_desc = {
+   CLAP_VERSION_INIT, "com.slooper.fixture-gain.presets",
+   "Fixture preset provider", "slooper" };
+
+static const clap_preset_discovery_provider_t *prov_create(
+      const clap_preset_discovery_factory_t *factory,
+      const clap_preset_discovery_indexer_t *indexer, const char *provider_id) {
+   (void)factory;
+   if (!provider_id || strcmp(provider_id, s_prov_desc.id) != 0) return NULL;
+   clap_preset_discovery_provider_t *prov =
+      (clap_preset_discovery_provider_t *)calloc(1, sizeof(*prov));
+   if (!prov) return NULL;
+   prov->desc = &s_prov_desc;
+   prov->provider_data = (void *)indexer;
+   prov->init = prov_init;
+   prov->destroy = prov_destroy;
+   prov->get_metadata = prov_get_metadata;
+   prov->get_extension = prov_get_ext;
+   return prov;
+}
+
+static uint32_t prov_factory_count(const clap_preset_discovery_factory_t *f) {
+   (void)f; return 1;
+}
+
+static const clap_preset_discovery_provider_descriptor_t *prov_factory_desc(
+      const clap_preset_discovery_factory_t *f, uint32_t i) {
+   (void)f; return i == 0 ? &s_prov_desc : NULL;
+}
+
+static const clap_preset_discovery_factory_t s_discovery_factory = {
+   prov_factory_count, prov_factory_desc, prov_create };
+
 //////////////////////////  extension dispatch  ///////////////////////////
 
 static const void *fx_get_extension(const clap_plugin_t *p, const char *id) {
-   (void)p;
    if (strcmp(id, CLAP_EXT_PARAMS) == 0) return &s_params;
    if (strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) return &s_audio_ports;
    if (strcmp(id, CLAP_EXT_STATE) == 0) return &s_state;
    if (strcmp(id, CLAP_EXT_LATENCY) == 0) return &s_latency;
+   // v79: ONLY the gain plugin implements host-commanded preset load -
+   // the sine is the negative-polarity control (supports_preset_load
+   // must be false for it).
+   if (!selfp(p)->is_sine && strcmp(id, CLAP_EXT_PRESET_LOAD) == 0)
+      return &s_preset_load;
    return NULL;
 }
 
@@ -433,6 +610,11 @@ static bool entry_init(const char *plugin_path) {
 static void entry_deinit(void) { g_inited = false; }
 static const void *entry_get_factory(const char *id) {
    if (strcmp(id, CLAP_PLUGIN_FACTORY_ID) == 0) return &s_factory;
+   // v79: preset-discovery factory (primary + compat ids) so the host can
+   // index locations and command loads through clap_plugin_preset_load.
+   if (strcmp(id, CLAP_PRESET_DISCOVERY_FACTORY_ID) == 0 ||
+       strcmp(id, CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT) == 0)
+      return &s_discovery_factory;
    return NULL;
 }
 
