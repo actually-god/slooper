@@ -51150,6 +51150,9 @@ mod tests {
         let dir2 = crate::paths::data_dir().join("drum-kits");
         std::fs::create_dir_all(&dir2).unwrap();
         std::fs::write(dir2.join("survivor.json"), "{}").unwrap();
+        // The kit list is a REFRESH-GATED cache (one-shot at first paint);
+        // files planted behind it need the same refresh the save path runs.
+        app2.kit_preset_refresh();
         frame(&mut app2, &ctx2, vec![]);
         click_last_exact(&mut app2, &ctx2, "load kit");
         frame(&mut app2, &ctx2, vec![]); // popup paints (delete row present)
@@ -51248,8 +51251,10 @@ mod tests {
     }
 
     /// R4: the v56 sampler bar keeps its gating — the sampler window
-    /// stacks exactly ONE bar, and saving a track WITHOUT a key map
-    /// refuses with an echo and writes nothing.
+    /// stacks exactly ONE bar, saving with an empty box refuses through
+    /// the real widgets, and the "no key map" guard (backend seam: the
+    /// window's paint seeds a map on first open, so a map-less track
+    /// never reaches the live button) refuses without touching disk.
     #[test]
     fn v77_sampler_gating() {
         let (mut app, ctx) = v56_open_sampler_map("v77samgate");
@@ -51266,15 +51271,21 @@ mod tests {
         );
         assert!(galley_at(&mut app, &ctx, "kit preset").is_none(), "no kit bar here");
         assert!(galley_at(&mut app, &ctx, "user preset").is_none(), "no v65 bar here");
-        // Rip the key map out, then save through the real widgets.
-        app.sampler_maps[0] = None;
-        frame(&mut app, &ctx, vec![]);
-        let ed = galley_at(&mut app, &ctx, "preset name").expect("name box").center();
-        click_pt(&mut app, &ctx, ed);
-        type_into_focused(&mut app, &ctx, "ghostmap");
+        // Widget half: save with the box EMPTY (fresh window, nothing
+        // typed) must refuse through the real button with an echo.
         app.status = String::new();
         click_exact(&mut app, &ctx, "save");
         frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("sampler preset: type a name first"),
+            "empty-box save must echo: {}",
+            app.status
+        );
+        // Seam half: a track that never opened the window has no key map;
+        // the guard must refuse and write nothing (defence in depth).
+        app.status = String::new();
+        app.smap_preset_name = "ghostmap".into();
+        app.sampler_preset_save(7);
         assert!(
             app.status.contains("sampler preset: this track has no key map"),
             "map-less save must echo: {}",
@@ -51282,6 +51293,7 @@ mod tests {
         );
         let dir = crate::paths::data_dir().join("sampler-presets");
         assert!(!dir.join("ghostmap.json").exists(), "the refusal wrote nothing");
+        assert!(!dir.join(".json").exists(), "the empty-box refusal wrote nothing either");
     }
 
     /// R5 (goal-5 parity audit): every plugin/synth surface paints the
@@ -51312,6 +51324,10 @@ mod tests {
         clear_canvas(&mut app3);
         app3.show_master = false;
         v61_open_template_window(&mut app3, &ctx3);
+        // The window arrives with "Track N" in the box — the hint (and
+        // the box's identity as the preset bar's) is visible when empty.
+        app3.tpl_name = String::new();
+        frame(&mut app3, &ctx3, vec![]);
         assert!(
             galley_at(&mut app3, &ctx3, "template name").is_some(),
             "template bar carries the name box"
