@@ -47822,14 +47822,18 @@ mod tests {
         let dir = crate::paths::data_dir().join("track-templates");
         assert!(dir.to_string_lossy().contains("sp-uity"), "sandboxed data dir: {dir:?}");
         assert!(dir.join("Track-1.json").is_file(), "template file landed");
-        // Strip the track down, then restore it with the list's "apply".
+        // Strip the track down, then restore it through the picker row.
         app.fx_rows[0].clear();
         app.rebuild_fx(0);
         app.track_synth[0] = None;
         app.rebuild_track_synth(0);
         frame(&mut app, &ctx, vec![]);
         app.status = String::new();
-        click_exact(&mut app, &ctx, "apply");
+        // v77 retarget: the per-row "apply" became the shared picker —
+        // open it and click the preset row.
+        click_exact(&mut app, &ctx, "templates");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        click_last_exact(&mut app, &ctx, "Track-1");
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.track_synth[0].as_deref(), Some("piano"), "synth binding restored");
         let stems: Vec<&str> = app.fx_rows[0]
@@ -47870,7 +47874,10 @@ mod tests {
         app.set_trk_color(0, None);
         frame(&mut app, &ctx, vec![]);
         app.status = String::new();
-        click_exact(&mut app, &ctx, "apply");
+        // v77 retarget: apply rides the shared picker row.
+        click_exact(&mut app, &ctx, "templates");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        click_last_exact(&mut app, &ctx, "Track-1");
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.trk_vol[0], 90, "volume restored");
         assert_eq!(app.trk_pan[0], 40, "pan restored");
@@ -47909,13 +47916,16 @@ mod tests {
             galley_at(&mut app, &ctx, "no saved templates yet").is_some(),
             "empty-list hint shows"
         );
-        // A template appearing on disk is listed on the next frame.
+        // A template appearing on disk is offered by the picker.
         let dir = crate::paths::data_dir().join("track-templates");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("handdrum.json"), "{}").unwrap();
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(galley_centers(&mut app, &ctx, "handdrum", true).len(), 1, "list row appears");
         assert!(galley_at(&mut app, &ctx, "no saved templates yet").is_none(), "hint gone");
+        // v77 retarget: the list lives inside the picker — open it.
+        click_exact(&mut app, &ctx, "templates");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        assert_eq!(galleys_all(&mut app, &ctx, "handdrum").len(), 1, "picker row appears");
     }
 
     /// R4: hostile names sanitize to single-component files; the live
@@ -47956,27 +47966,36 @@ mod tests {
         std::fs::write(dir.join("aa.json"), "{}").unwrap();
         std::fs::write(dir.join("bb.json"), "{}").unwrap();
         v61_open_template_window(&mut app, &ctx);
-        let aa = galley_centers(&mut app, &ctx, "aa", true);
-        assert_eq!(aa.len(), 1, "row aa paints");
-        assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "row bb paints");
-        // Delete the AA row: the delete button NEAREST the label's y
-        // (v58 lesson — common labels resolve by anchor, never [0]).
-        let aa_y = aa[0].y;
-        let del = galley_centers(&mut app, &ctx, "delete", true)
-            .into_iter()
-            .min_by(|a, b| (a.y - aa_y).total_cmp(&(b.y - aa_y)))
-            .expect("a delete button per row");
-        let tips = hover_until_tip(&mut app, &ctx, del, &["for good"]);
+        // v77 retarget: delete is the shared picker's in-list button acting
+        // on the NAME IN THE BOX (the kit bar's contract). The box holds
+        // "Track 1" from open — clear it and type the target via the widget.
+        app.tpl_name = String::new();
+        frame(&mut app, &ctx, vec![]);
+        let ed = galley_at(&mut app, &ctx, "template name").expect("name TextEdit (hint visible)");
+        click_pt(&mut app, &ctx, ed.center());
+        type_into_focused(&mut app, &ctx, "aa");
+        click_exact(&mut app, &ctx, "templates");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        assert!(galley_at_last(&mut app, &ctx, "aa").is_some(), "row aa paints in picker");
+        assert_eq!(galleys_all(&mut app, &ctx, "bb").len(), 1, "row bb paints");
+        let del = galley_at_last(&mut app, &ctx, "delete template")
+            .expect("delete button lives inside the picker");
+        let tips = hover_until_tip(&mut app, &ctx, del.center(), &["for good"]);
         assert!(tips.iter().any(|t| t.contains("for good")), "delete explains on hover");
-        click_pt(&mut app, &ctx, del);
+        click_pt(&mut app, &ctx, del.center());
         frame(&mut app, &ctx, vec![]);
         assert!(!dir.join("aa.json").exists(), "file removed");
         assert!(dir.join("bb.json").is_file(), "other template untouched");
         assert!(app.status.contains("track template deleted: aa"), "{}", app.status);
         app.status = String::new();
+        // Reopen (box emptied so no galley shadows the row reads): the
+        // deleted name is gone from the picker, bb remains.
+        app.tpl_name = String::new();
         frame(&mut app, &ctx, vec![]);
-        assert!(galley_centers(&mut app, &ctx, "aa", true).is_empty(), "row dropped from list");
-        assert_eq!(galley_centers(&mut app, &ctx, "bb", true).len(), 1, "bb row remains");
+        click_exact(&mut app, &ctx, "templates");
+        frame(&mut app, &ctx, vec![]); // popup repaints with the fresh list
+        assert!(galleys_all(&mut app, &ctx, "aa").is_empty(), "row dropped from picker");
+        assert_eq!(galleys_all(&mut app, &ctx, "bb").len(), 1, "bb row remains");
     }
 
 /// v62 R1/R6: the selection persists through the ONE row\u2192save
@@ -49362,9 +49381,11 @@ mod tests {
         );
     }
 
-    /// v65 R6 (goal 1): every new affordance carries a hover tooltip.
-    /// Source-scan invariant in the v54 style: each button statement,
-    /// windowed to its OWN clicked(), must contain on_hover_text.
+    /// v65 R8 (bar hovers) — RETARGETED v77: the bar's copy lives in its
+    /// PresetBarSpec; hover ATTACHMENT lives in the ONE renderer
+    /// (crate::presetbar::render). Positive: every control's hover field
+    /// carries real copy and the renderer wires each of them. Negative:
+    /// no per-site on_hover_text markup survives in the bar window.
     #[test]
     fn v65_synth_preset_bar_hovers() {
         let srcs = include_str!("ui.rs");
@@ -49372,48 +49393,35 @@ mod tests {
             .find("v65: user-preset bar for SCRIPT synths")
             .expect("bar present");
         let end = srcs[start..]
-            .find("let vals = inst.values();")
+            .find("let cur = vals.first()")
             .map(|i| start + i)
             .expect("bar block ends");
         let bar = &srcs[start..end];
-        let lines: Vec<&str> = bar.lines().collect();
-        let mut checked = 0usize;
-        for label in ["\"save\"", "\"delete named preset\"", "\"defaults\""] {
-            let n = lines
-                .iter()
-                .position(|l| l.contains(".button(") && l.contains(label))
-                .unwrap_or_else(|| panic!("button {label} vanished from the bar"));
-            let mut stop = lines.len() - 1;
-            for (k, row) in lines[n..].iter().enumerate() {
-                if row.contains("clicked()") {
-                    stop = n + k;
-                    break;
-                }
-            }
-            let win: String = lines[n..=stop].join(" ");
-            assert!(
-                win.contains("on_hover_text"),
-                "preset bar button {label} carries no hover explanation"
-            );
-            checked += 1;
+        for field in ["save_hover", "load_hover", "row_hover", "delete_hover", "reset_hover"] {
+            let i = bar
+                .find(field)
+                .unwrap_or_else(|| panic!("{field} vanished from the v65 spec"));
+            let t = &bar[i..];
+            let q1 = t.find('"').unwrap_or_else(|| panic!("{field} carries no literal"));
+            let q2 = t[q1 + 1..]
+                .find('"')
+                .unwrap_or_else(|| panic!("{field} literal unterminated"));
+            assert!(q2 > 4, "{field} carries empty/placeholder hover copy");
         }
-        // The picker itself: from the ComboBox line through the
-        // on_hover_text attached to its response.
-        let combo = lines
-            .iter()
-            .position(|l| l.contains("from_id_salt((\"synth_preset_pick\""))
-            .expect("picker vanished");
-        let tail: String = lines[combo..].join(" ");
-        let resp = tail
-            .find("pick.response")
-            .expect("combo response must be captured");
-        let seg = &tail[resp..resp + 120.min(tail.len() - resp)];
         assert!(
-            seg.contains(".on_hover_text("),
-            "picker hover must attach to the ComboBox response"
+            !bar.contains("on_hover_text"),
+            "hover markup must stay retired from per-site bars (TS-003)"
         );
-        checked += 1;
-        assert_eq!(checked, 4, "broken scan");
+        let renderer = include_str!("presetbar.rs");
+        for attach in [
+            "on_hover_text(spec.save_hover)",
+            "on_hover_text(spec.row_hover)",
+            "on_hover_text(spec.delete_hover)",
+            "on_hover_text(spec.reset_hover)",
+            "on_hover_text(h)",
+        ] {
+            assert!(renderer.contains(attach), "renderer lost {attach}");
+        }
     }
 
     /// v67 (goal 1, UI half): a CLAP plugin's own preset load must ECHO
@@ -49942,10 +49950,12 @@ mod tests {
         );
     }
 
+    /// v69 R5 (kit bar hovers) — RETARGETED v77: the kit copy lives in
+    /// the kit's PresetBarSpec, hover ATTACHMENT in the ONE renderer
+    /// (same shape as the v65 retarget). The per-pad "wav" import button
+    /// still lives in ui.rs and keeps its own statement-window check.
     #[test]
     fn v69_kit_bar_hovers() {
-        // Source-scan invariant (v54/v65 style): each new button's OWN
-        // statement, windowed to its clicked(), carries on_hover_text.
         let srcs = include_str!("ui.rs");
         let start = srcs
             .find("v69: named kit presets")
@@ -49954,38 +49964,33 @@ mod tests {
             .find("let audio_rows: Vec<(String, String)>")
             .map(|i| start + i)
             .expect("kit bar block ends");
-        let lines: Vec<&str> = srcs[start..end].lines().collect();
-        let mut checked = 0usize;
-        for label in ["\"save kit\"", "\"delete kit\"", "\"stock kit\""] {
-            let n = lines
-                .iter()
-                .position(|l| l.contains(".button(") && l.contains(label))
-                .unwrap_or_else(|| panic!("button {label} vanished from the kit bar"));
-            let mut stop = lines.len() - 1;
-            for (k, row) in lines[n..].iter().enumerate() {
-                if row.contains("clicked()") {
-                    stop = n + k;
-                    break;
-                }
-            }
-            let win: String = lines[n..=stop].join(" ");
-            assert!(
-                win.contains("on_hover_text"),
-                "kit bar button {label} carries no hover explanation"
-            );
-            checked += 1;
+        let bar = &srcs[start..end];
+        for field in ["save_hover", "load_hover", "row_hover", "delete_hover", "reset_hover"] {
+            let i = bar
+                .find(field)
+                .unwrap_or_else(|| panic!("{field} vanished from the kit spec"));
+            let t = &bar[i..];
+            let q1 = t.find('"').unwrap_or_else(|| panic!("{field} carries no literal"));
+            let q2 = t[q1 + 1..]
+                .find('"')
+                .unwrap_or_else(|| panic!("{field} literal unterminated"));
+            assert!(q2 > 4, "{field} carries empty/placeholder hover copy");
         }
-        // The picker: hover must attach to the ComboBox response.
-        let tail: String = lines.join(" ");
-        let resp = tail
-            .find("pick.response")
-            .expect("combo response must be captured");
-        let seg = &tail[resp..resp + 120.min(tail.len() - resp)];
         assert!(
-            seg.contains(".on_hover_text("),
-            "kit picker hover must attach to the ComboBox response"
+            !bar.contains("on_hover_text"),
+            "hover markup must stay retired from per-site bars (TS-003)"
         );
-        checked += 1;
+        let renderer = include_str!("presetbar.rs");
+        for attach in [
+            "on_hover_text(spec.save_hover)",
+            "on_hover_text(spec.row_hover)",
+            "on_hover_text(spec.delete_hover)",
+            "on_hover_text(spec.reset_hover)",
+            "on_hover_text(h)",
+        ] {
+            assert!(renderer.contains(attach), "renderer lost {attach}");
+        }
+        let mut checked = 1usize; // spec + renderer verified above
         // The per-pad import button: hover between its creation and its
         // clicked() (its statement lives in the pad-row loop, not here).
         let w = srcs
@@ -49998,7 +50003,7 @@ mod tests {
             "wav import button carries no hover explanation"
         );
         checked += 1;
-        assert_eq!(checked, 5, "broken scan");
+        assert_eq!(checked, 2, "broken scan");
     }
 
     #[test]
@@ -50269,6 +50274,45 @@ mod tests {
                 checked += 1;
             } else {
                 offenders.push(format!("src/ui.rs:{}: {}", n + 1, s));
+            }
+        }
+        // v77 (TS-003): the spec-driven preset bars — labels are
+        // PresetBarSpec fields and the ONE renderer attaches the hover,
+        // invisible to the line scan above. Count each bar's save/load
+        // label when the spec carries matching hover copy (load counts
+        // only where the surface declares one — v34/v56 never had a
+        // picker-caption hover).
+        {
+            let carries = |block: &str, key: &str| -> bool {
+                let Some(i) = block.find(key) else { return false };
+                let t = &block[i + key.len()..];
+                match t.find('"') {
+                    Some(q) => !t[q + 1..].starts_with('"'),
+                    None => false,
+                }
+            };
+            let mut from = 0usize;
+            while let Some(rel) = prod[from..].find("save_text: \"") {
+                let i = from + rel;
+                from = i + 1;
+                let block = &prod[i..(i + 600).min(prod.len())];
+                if carries(block, "save_hover:") {
+                    checked += 1;
+                } else {
+                    offenders.push(format!(
+                        "src/ui.rs:{}: preset bar save_text without hover",
+                        prod[..i].lines().count()
+                    ));
+                }
+            }
+            let mut from = 0usize;
+            while let Some(rel) = prod[from..].find("load_text: \"") {
+                let i = from + rel;
+                from = i + 1;
+                let block = &prod[i..(i + 600).min(prod.len())];
+                if carries(block, "load_hover: Some(") {
+                    checked += 1;
+                }
             }
         }
         assert!(
@@ -51018,6 +51062,274 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("scan this folder from disk")),
             "folder scan button must tooltip what it does; galleys: {texts:?}"
+        );
+    }
+
+    // ---- v77 (TS-003): the ONE preset bar ---------------------------------
+
+    /// R1/R2: the shared renderer has exactly five production call sites
+    /// and NO per-surface picker markup survives. Scanned on the
+    /// PRODUCTION slice only (mod tests is column 0, per the v72 lesson).
+    #[test]
+    fn v77_preset_bar_single_renderer() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => panic!("mod tests anchor vanished \u{2014} scan would eat its own literals"),
+        };
+        assert_eq!(
+            prod.matches("crate::presetbar::render(").count(),
+            5,
+            "the ONE renderer must have exactly five call sites (v34 params, v56 sampler, v61 templates, v65 synth, v69 kit)"
+        );
+        assert_eq!(
+            prod.matches("PresetBarSpec {").count(),
+            5,
+            "exactly one PresetBarSpec per surface"
+        );
+        // Negative polarity: the retired per-site ComboBox markup must
+        // not resurrect at any of the four historical salts.
+        for salt in [
+            "from_id_salt(\"slooper_param_presets\")",
+            "from_id_salt((\"smap_preset\"",
+            "from_id_salt((\"synth_preset_pick\"",
+            "from_id_salt((\"kit_preset_pick\"",
+        ] {
+            assert!(
+                !prod.contains(salt),
+                "per-site picker markup resurrected: {salt}"
+            );
+        }
+        // Sanitizer single home: its BODY exists once, in presetbar.rs;
+        // ui.rs keeps only the (pinned) thin alias forwarding to it.
+        let renderer = include_str!("presetbar.rs");
+        assert_eq!(renderer.matches("pub fn sanitize(").count(), 1);
+        assert!(
+            renderer.contains("while s.contains(\"--\")"),
+            "sanitizer body moved out of presetbar?"
+        );
+        assert!(
+            !prod.contains("while s.contains(\"--\")"),
+            "sanitizer body duplicated back into ui.rs"
+        );
+        assert_eq!(
+            prod.matches("crate::presetbar::sanitize(name)").count(),
+            1,
+            "the thin sanitizer alias must stay the single forwarder"
+        );
+    }
+
+    /// R4: empty-name refusal THROUGH the shared widgets: template-bar
+    /// save with an empty box refuses with an echo and writes nothing;
+    /// the kit picker's delete with an empty box refuses and keeps files.
+    #[test]
+    fn v77_empty_name_refusal() {
+        // (a) template save with an empty box.
+        let mut app = headless_app("v77emptytpl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        v61_open_template_window(&mut app, &ctx);
+        app.tpl_name = String::new();
+        frame(&mut app, &ctx, vec![]);
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("track template: type a name first"),
+            "empty template save must echo the refusal: {}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("track-templates");
+        assert!(
+            !dir.join(".json").exists() && !dir.join("-.json").exists(),
+            "an empty name must not produce a file"
+        );
+        // (b) kit delete via the picker with an empty box (a saved kit
+        // exists so the delete row paints at all).
+        let (mut app2, ctx2) = v65_synth_win("v77emptykit");
+        let dir2 = crate::paths::data_dir().join("drum-kits");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("survivor.json"), "{}").unwrap();
+        frame(&mut app2, &ctx2, vec![]);
+        click_last_exact(&mut app2, &ctx2, "load kit");
+        frame(&mut app2, &ctx2, vec![]); // popup paints (delete row present)
+        click_last_exact(&mut app2, &ctx2, "delete kit");
+        frame(&mut app2, &ctx2, vec![]);
+        assert!(
+            app2.status
+                .contains("drum kit preset: type the kit name to delete first"),
+            "empty-box kit delete must refuse: {}",
+            app2.status
+        );
+        assert!(
+            dir2.join("survivor.json").is_file(),
+            "a refusal must not touch files"
+        );
+    }
+
+    /// R4: sanitizer traversal THROUGH the shared component — store math
+    /// is single-component for hostile names, and a hostile name typed
+    /// into the real kit bar lands as a sanitized file, never an escape.
+    #[test]
+    fn v77_sanitizer_traversal_bar() {
+        // Unit half: every store shape maps hostile names to ONE
+        // sanitized component inside its own dir (dirs are never created
+        // by file(), so this leaves nothing behind).
+        let tmp = std::env::temp_dir().join(format!("v77san-{}", std::process::id()));
+        for sub in [
+            "drum-kits",
+            "sampler-presets",
+            "track-templates",
+            "synth-presets",
+            "plugin-presets",
+        ] {
+            let store = crate::presetbar::PresetStore::json(tmp.join(sub));
+            let f = store.file("../evil name");
+            assert_eq!(
+                f.file_name().unwrap().to_string_lossy(),
+                "evil-name.json",
+                "sanitized single-component file name"
+            );
+            assert_eq!(f.parent().unwrap(), tmp.join(sub));
+            assert!(!f.to_string_lossy().contains(".."), "no traversal: {f:?}");
+        }
+        // Widget half: the hostile name goes through the REAL kit bar.
+        let (mut app, ctx) = v65_synth_win("v77sanbar");
+        v69_type_and_save(&mut app, &ctx, "../evil name");
+        assert!(
+            app.status.contains("drum kit preset saved: evil-name"),
+            "echo: {}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("drum-kits");
+        assert!(dir.join("evil-name.json").is_file(), "file written single-component");
+        assert!(
+            !crate::paths::data_dir().join("evil-name.json").exists(),
+            "no parent escape"
+        );
+        assert!(
+            !std::path::Path::new("evil-name.json").exists(),
+            "no CWD dropping"
+        );
+    }
+
+    /// R4: the kit picker's delete removes EXACTLY the boxed file; a
+    /// second kit is untouched and the cached list refreshes.
+    #[test]
+    fn v77_delete_exact_file() {
+        let (mut app, ctx) = v65_synth_win("v77delexact");
+        v69_type_and_save(&mut app, &ctx, "doomed");
+        app.kit_preset_name.clear();
+        frame(&mut app, &ctx, vec![]);
+        v69_type_and_save(&mut app, &ctx, "keeper");
+        let dir = crate::paths::data_dir().join("drum-kits");
+        assert!(
+            dir.join("doomed.json").is_file() && dir.join("keeper.json").is_file(),
+            "setup saves landed"
+        );
+        // Retype the doomed name into the box, then delete via the picker.
+        app.kit_preset_name.clear();
+        frame(&mut app, &ctx, vec![]);
+        let ed = galley_at(&mut app, &ctx, "kit name").expect("kit box (hint visible)").center();
+        click_pt(&mut app, &ctx, ed);
+        type_into_focused(&mut app, &ctx, "doomed");
+        click_last_exact(&mut app, &ctx, "load kit");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        click_last_exact(&mut app, &ctx, "delete kit");
+        frame(&mut app, &ctx, vec![]);
+        assert!(!dir.join("doomed.json").exists(), "the boxed file was removed");
+        assert!(dir.join("keeper.json").is_file(), "the other kit is untouched");
+        assert_eq!(app.kit_presets, vec!["keeper".to_string()], "cached list refreshed");
+        assert!(
+            app.status.contains("drum kit preset deleted: doomed"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    /// R4: the v56 sampler bar keeps its gating — the sampler window
+    /// stacks exactly ONE bar, and saving a track WITHOUT a key map
+    /// refuses with an echo and writes nothing.
+    #[test]
+    fn v77_sampler_gating() {
+        let (mut app, ctx) = v56_open_sampler_map("v77samgate");
+        // Exactly one bar in this window (v65/v69 bars are gated off).
+        assert_eq!(
+            galleys_all(&mut app, &ctx, "save").len(),
+            1,
+            "one save button \u{b7} bar stacking regression?"
+        );
+        assert_eq!(
+            galleys_all(&mut app, &ctx, "load").len(),
+            1,
+            "one picker caption \u{b7} bar stacking regression?"
+        );
+        assert!(galley_at(&mut app, &ctx, "kit preset").is_none(), "no kit bar here");
+        assert!(galley_at(&mut app, &ctx, "user preset").is_none(), "no v65 bar here");
+        // Rip the key map out, then save through the real widgets.
+        app.sampler_maps[0] = None;
+        frame(&mut app, &ctx, vec![]);
+        let ed = galley_at(&mut app, &ctx, "preset name").expect("name box").center();
+        click_pt(&mut app, &ctx, ed);
+        type_into_focused(&mut app, &ctx, "ghostmap");
+        app.status = String::new();
+        click_exact(&mut app, &ctx, "save");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("sampler preset: this track has no key map"),
+            "map-less save must echo: {}",
+            app.status
+        );
+        let dir = crate::paths::data_dir().join("sampler-presets");
+        assert!(!dir.join("ghostmap.json").exists(), "the refusal wrote nothing");
+    }
+
+    /// R5 (goal-5 parity audit): every plugin/synth surface paints the
+    /// shared bar — the piano window BOTH the v65 and the kit bar, the
+    /// sampler window its single v56 bar, the template window its own;
+    /// the v34 hosted-params bar is asserted at the source level (the
+    /// window needs a live plugin entry, impossible in this harness).
+    #[test]
+    fn v77_preset_bar_parity() {
+        let (mut app, ctx) = v65_synth_win("v77parity");
+        for needle in ["user preset", "defaults", "save kit", "stock kit"] {
+            assert!(
+                !galleys_all(&mut app, &ctx, needle).is_empty(),
+                "piano window lost the shared bar control {needle:?} (status {:?})",
+                app.status
+            );
+        }
+        // Sampler window: its v56 bar, and only it.
+        let (mut app2, ctx2) = v56_open_sampler_map("v77paritysam");
+        assert_eq!(
+            galleys_all(&mut app2, &ctx2, "save").len(),
+            1,
+            "sampler window: exactly one shared bar"
+        );
+        // Template window: its own bar through the same renderer.
+        let mut app3 = headless_app("v77paritytpl");
+        let ctx3 = egui::Context::default();
+        clear_canvas(&mut app3);
+        app3.show_master = false;
+        v61_open_template_window(&mut app3, &ctx3);
+        assert!(
+            galley_at(&mut app3, &ctx3, "template name").is_some(),
+            "template bar carries the name box"
+        );
+        assert!(!galleys_all(&mut app3, &ctx3, "templates").is_empty(), "template picker caption");
+        assert!(!galleys_all(&mut app3, &ctx3, "save").is_empty(), "template save button");
+        // v34 hosted-params bar: source-level (no real plugin headless).
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor")];
+        let i = prod
+            .find("v77 (TS-003): ONE preset bar renderer")
+            .expect("v34 params site marker");
+        let j = prod
+            .find("Id::new(\"slooper_param_presets\")")
+            .expect("v34 picker salt");
+        assert!(
+            j > i && prod[i..j].contains("crate::presetbar::render("),
+            "the v34 params surface must render its bar via presetbar"
         );
     }
 }
