@@ -1792,6 +1792,11 @@ pub struct App {
     params_prog_sync_at: f64,
     /// v67: throttle for the plugin-side preset-load report pump.
     params_preset_sync_at: f64,
+    /// v79: discovered host-loadable presets for the entry the PARAMETERS
+    /// window shows (cached per entry name — plugin code runs once, like
+    /// the v60 program snapshot).
+    params_preset_locs: Vec<crate::vsthost::PresetLocation>,
+    params_preset_locs_for: String,
     /// v62: per-track selected VST2 factory program (-1 = none). Seeded
     /// from config, pushed by the PARAMETERS combo, captured on save.
     track_synth_program: Vec<i32>,
@@ -2355,6 +2360,8 @@ impl App {
             params_programs_for: String::new(),
             params_prog_sync_at: 0.0,
             params_preset_sync_at: 0.0,
+            params_preset_locs: Vec::new(),
+            params_preset_locs_for: String::new(),
             track_synth_program: (0..MAX_LOOPS)
                 .map(|t| cfg.track_synth_programs.get(t).copied().unwrap_or(-1))
                 .collect(),
@@ -3412,6 +3419,25 @@ impl App {
     fn list_param_presets(plugin: &str) -> Vec<String> {
         Self::param_preset_store(plugin).list()
     }
+    /// v79: run a host-commanded FILE preset load on a live entry and
+    /// echo the verdict. The OS dialog callback and the headless pins
+    /// share this ONE seam (v69 `assign_pad_file` doctrine: the entry
+    /// points cannot drift apart).
+    fn clap_preset_file_action(
+        &mut self,
+        entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
+        path: &std::path::Path,
+    ) {
+        let shown = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match entry.load_preset_file(path) {
+            Ok(()) => self.status = format!("preset \u{2192} \u{201c}{shown}\u{201d} (live)"),
+            Err(e) => self.status = format!("preset load FAILED: {e}"),
+        }
+    }
+
     /// v34 R2: snapshot the plugin's current parameter values to a named
     /// user preset. Works for EVERY hosted plugin — the values ride the
     /// same host-side cell mirror the sliders and the persistence tick
@@ -3700,6 +3726,83 @@ impl App {
                         );
                     }
                 }
+            }
+        }
+        // v79: host-commanded preset load (CLAP `clap_plugin_preset_load`).
+        // An entry that answers the extension gets the presets its own
+        // discovery provider published (combo) plus a whole-file entry
+        // point (button); both feed the entry through ONE loader seam and
+        // echo the verdict (goal 1). Every other backend never sees the
+        // row (`supports_preset_load` is false there). Discovery runs
+        // once per entry, on this control thread, under vst_loader_lock.
+        let can_pl = entry.supports_preset_load();
+        if can_pl && self.params_preset_locs_for != entry.name() {
+            self.params_preset_locs_for = entry.name().to_string();
+            self.params_preset_locs = entry.preset_locations();
+        }
+        if can_pl {
+            let locs = self.params_preset_locs.clone();
+            let mut pick_loc: Option<usize> = None;
+            let mut file_pick: Option<std::path::PathBuf> = None;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("slooper_v79_preset_locs")
+                    .selected_text("factory presets")
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        if locs.is_empty() {
+                            ui.label("(none discovered)");
+                        }
+                        for (i, l) in locs.iter().enumerate() {
+                            let mut disp = l.name.chars().take(40).collect::<String>();
+                            if let Some(k) = l.location.as_deref() {
+                                if let Some(b) = std::path::Path::new(k).file_name() {
+                                    disp.push_str(&format!(" \u{b7} {}", b.to_string_lossy()));
+                                }
+                            }
+                            let tip = if l.factory {
+                                "preset built into the plugin \u{b7} loading changes the sound immediately"
+                            } else {
+                                "preset file the plugin discovered \u{b7} loading changes the sound immediately"
+                            };
+                            if ui
+                                .selectable_label(false, disp)
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                pick_loc = Some(i);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "presets this plugin exposes for host-commanded loading \u{b7} \
+                         the list is read from the plugin itself",
+                    );
+                if ui
+                    .button("preset from file")
+                    .on_hover_text("load any preset file this plugin can read")
+                    .clicked()
+                {
+                    file_pick = rfd::FileDialog::new()
+                        .set_title("Load preset file")
+                        .add_filter("Plugin presets", &["fxp", "fxb", "fset", "preset"])
+                        .pick_file();
+                }
+            });
+            if let Some(i) = pick_loc {
+                let l = &self.params_preset_locs[i];
+                let nm = l.name.clone();
+                match entry.load_preset_location(
+                    l.kind,
+                    l.location.as_deref(),
+                    l.load_key.as_deref(),
+                ) {
+                    Ok(()) => self.status = format!("preset \u{2192} \u{201c}{nm}\u{201d} (live)"),
+                    Err(e) => self.status = format!("preset load FAILED: {e}"),
+                }
+            }
+            if let Some(p) = file_pick {
+                self.clap_preset_file_action(entry, &p);
             }
         }
         let ql = new_filter.trim().to_lowercase();
@@ -37652,6 +37755,121 @@ mod tests {
             "combo now leads with the switched-to program"
         );
         std::mem::forget(entry);
+    }
+
+    /// v79 (R6, UI half): a CLAP row hosting the preset-load extension
+    /// shows the discovered-preset picker and the file button in the
+    /// PARAMETERS window; picking a discovered row switches the LIVE
+    /// plugin (proven through its state chunk) and the status echo
+    /// closes the loop. Quick tier: same pure-C fixture class as the
+    /// v60/v66 combo pins.
+    #[test]
+    fn v79_clap_presets_combo_loads() {
+        use crate::vsthost::StageEntry as _; // for entry.chunk() on the concrete Arc
+        std::env::remove_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR");
+        let mut app = headless_app("v79combo");
+        app.show_master = false;
+        let p = crate::claphost::tests::fixture_clap().expect("fixture compiled");
+        let entry = crate::claphost::open(&p, Some("com.slooper.fixture-gain"), 48_000, None, None)
+            .expect("fixture opens");
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: p.display().to_string(),
+            kind: crate::vsthost::VstKind::Clap,
+            plugin_id: Some("com.slooper.fixture-gain".into()),
+            name: "fixgain".into(),
+            params: vec![],
+            entry: Some(entry.clone() as std::sync::Arc<dyn crate::vsthost::StageEntry>),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.params_preset_locs.iter().any(|l| l.name == "Fix Factory B"),
+            "preset cache fills from the entry"
+        );
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        let combo = galley_at(&mut app, &ctx, "factory presets")
+            .expect("preset combo paints")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "Fix Factory B")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert!(
+            app.status.contains("Fix Factory B") && app.status.contains("preset"),
+            "status echo closes the loop: {}",
+            app.status
+        );
+        let chunk = entry.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.500"),
+            "the pick reached the live plugin: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        // Read the button AFTER clearing the echo (v56 first-match shadow
+        // trap: echo text must not outrank widget galleys).
+        app.status = String::new();
+        assert!(
+            galley_at(&mut app, &ctx, "preset from file").is_some(),
+            "file entry point paints on the CLAP row"
+        );
+        std::mem::forget(entry);
+    }
+
+    /// v79 (R6, seam half): exactly what the OS file-dialog callback calls
+    /// — a host-commanded FILE load on a live entry with both echo
+    /// polarities. The dialog cannot run headless, so pins drive the SAME
+    /// seam the dialog lands in (v69 `assign_pad_file` doctrine).
+    #[test]
+    fn v79_clap_presets_file_seam_echo() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v79-seam-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("single.fxp"), "FIXPRESET DEFAULT\n").unwrap();
+        std::fs::write(dir.join("bad.fxp"), "junk\n").unwrap();
+        let mut app = headless_app("v79seam");
+        app.show_master = false;
+        let p = crate::claphost::tests::fixture_clap().expect("fixture compiled");
+        let entry: std::sync::Arc<dyn crate::vsthost::StageEntry> =
+            crate::claphost::open(&p, Some("com.slooper.fixture-gain"), 48_000, None, None)
+                .expect("fixture opens");
+        app.status = String::new();
+        app.clap_preset_file_action(&entry, &dir.join("single.fxp"));
+        assert!(
+            app.status.contains("single.fxp") && app.status.contains("(live)"),
+            "success echo: {}",
+            app.status
+        );
+        let chunk = entry.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.375"),
+            "file load applied live: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        app.clap_preset_file_action(&entry, &dir.join("bad.fxp"));
+        assert!(
+            app.status.contains("FAILED") && app.status.contains("no preset"),
+            "failure echo carries the plugin message: {}",
+            app.status
+        );
+        std::mem::forget(entry);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// v23 gate pin (issue 3, UI half): a plugin with a CACHED-BAN verdict
