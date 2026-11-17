@@ -8577,4 +8577,87 @@ mod w12g_tests {
         });
         assert_eq!(b.set_project_pushes.load(Ordering::Relaxed), base + 1, "SetProject ticks once");
     }
+
+    /// v80 (TS-005): a muted slot is a real offline pass-through — the
+    /// render must mirror the live mix byte-identically (export identity
+    /// rule) — and the mute flag rides the published fx table.
+    #[test]
+    fn v80_offline_bypass_identity_and_table() {
+        // Deterministic quarter-gain script (negative control: an
+        // UN-muted render must visibly move, else identity proves nothing).
+        const V80_QUARTER_SRC: &str = r#"include!("effect_api.rs");
+
+extern "C" fn create(_sr: f64) -> *mut core::ffi::c_void {
+    Box::into_raw(Box::new(0usize)) as *mut core::ffi::c_void
+}
+extern "C" fn destroy(_s: *mut core::ffi::c_void) {
+    if !_s.is_null() { drop(unsafe { Box::from_raw(_s as *mut usize) }); }
+}
+extern "C" fn process(_s: *mut core::ffi::c_void, input: f32, _p: *const f32) -> f32 {
+    input * 0.25
+}
+
+static PARAMS: [EffectParamV1; 0] = [];
+pub static DESC: EffectInfoV1 = EffectInfoV1 {
+abi: SLOOPER_EFFECT_ABI,
+name: c"V80 Quarter".as_ptr(),
+author: core::ptr::null(),
+description: core::ptr::null(),
+n_params: 0,
+params: PARAMS.as_ptr(),
+create,
+destroy,
+process,
+};
+#[no_mangle]
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 { &DESC }
+"#;
+// Self-contained registry (the v48_reg helper lives in another
+// test module — same recipe, 4 lines, keep this pin standalone).
+let dir = std::env::temp_dir().join(format!("slooper-v80quarter-{}", std::process::id()));
+let _ = std::fs::remove_dir_all(&dir);
+std::fs::create_dir_all(&dir).unwrap();
+std::fs::write(dir.join("v80quarter.rs"), V80_QUARTER_SRC).unwrap();
+let mut reg = crate::fx::Registry::open(dir.clone());
+reg.rescan();
+assert!(reg.desc("v80quarter").is_some(), "test effect must load");
+let desc = reg.desc("v80quarter").unwrap().clone();
+        let mk_slot = |bypass: bool| {
+            FxSlot::scripted(
+                reg.create_instance("v80quarter", 48000.0, &[]).unwrap(),
+                desc.clone(),
+            )
+            .with_bypass(bypass)
+        };
+        let e = Engine::new();
+        let inp: Vec<f32> = vec![0.8f32; 2048];
+        // Muted: byte-identical pass-through.
+        let chain_on = TrackFx {
+            slots: Arc::new(vec![mk_slot(true)]),
+        };
+        let mut buf = inp.clone();
+        run_chain_over(&chain_on, 48000, &mut buf, &offline_sync(&e, 48000, 0), &[]);
+        assert!(
+            buf.iter().all(|v| (*v - 0.8).abs() < 1e-6),
+            "a muted slot must pass audio through untouched; got {buf:?}"
+        );
+        // Same chain, un-muted: the effect DOES move the signal (contrast
+        // — without it the identity assert above could pass vacuously).
+        let chain_off = TrackFx {
+            slots: Arc::new(vec![mk_slot(false)]),
+        };
+        let mut buf2 = inp.clone();
+        run_chain_over(&chain_off, 48000, &mut buf2, &offline_sync(&e, 48000, 0), &[]);
+        assert!(
+            (buf2[1000] - 0.2).abs() < 1e-4,
+            "un-muted quarter-gain renders 0.2 from 0.8; got {}",
+            buf2[1000]
+        );
+        // The flag rides the published table (what the RT refresh reads).
+        e.set_track_fx(0, chain_off);
+        assert!(!e.fx_table()[0].slots[0].bypass, "table carries un-muted");
+        e.set_track_fx(1, chain_on);
+        assert!(e.fx_table()[1].slots[0].bypass, "table carries the mute");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
