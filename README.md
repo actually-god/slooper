@@ -146,11 +146,13 @@ step-by-step tutorials.
   drag anywhere). The playhead
   draws as one unbroken line across all tracks, and with looping off it
   parks at the region end.
-- **Bundled TR-808 pack** — fourteen one-shots sampled from a real Roland
-  TR-808 (kick, sub, snares, clap, closed/open hats, crash, cowbell, three
-  toms, rimshot, clave) seed themselves into the app data dir and open as
-  the default rack folder on a fresh install (public-domain lineage; see
-  `samples/808/CREDITS.md`).
+- **Bundled TR-808 pack** — twenty-four one-shots sampled from a real
+  Roland TR-808 (kicks, sub, snares, clap, closed/open hats, crash,
+  cymbal, cowbell, three toms, rimshot, clave, maracas, congas) seed
+  themselves into the app data dir and open as the default rack folder on
+  a fresh install; a 16-pad **808-Kit** preset ships alongside so a drum
+  track arms with real sounds in one click of the kit bar's picker
+  (public-domain lineage; see `samples/808/CREDITS.md`).
 - **Settings menu** — hamburger (top-left): input/output port picker (per
   output **L** / **R** / both), projects folder, latency
   compensation, track count (1–16), GUI scale, MIDI + keyboard bindings for

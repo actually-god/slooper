@@ -1,7 +1,7 @@
 # TR-808 starter pack — provenance & licensing
 
-Fourteen mono 16-bit / 44.1 kHz WAV one-shots sampled **directly from a real
-Roland TR-808 Rhythm Composer (serial no. 103852)** by Michael Fischer
+Twenty-four mono 16-bit / 44.1 kHz WAV one-shots sampled **directly from a
+real Roland TR-808 Rhythm Composer (serial no. 103852)** by Michael Fischer
 (Technopolis, fischer1@student.msu.edu) in September 1994 — the legendary
 "TR808WAV" sample set, originally published on
 `machines.hyperreal.org` with the author's own note that the samples are
@@ -31,8 +31,21 @@ knob positions 0/2.5/5/7.5/10):
 | `808-tom-high.wav`   | `HT50.WAV`    | Hi tom                             |
 | `808-rimshot.wav`    | `RS.WAV`      | Rim shot                           |
 | `808-clave.wav`      | `CL.WAV`      | Claves                             |
+| `808-kick-tight.wav` | `BD5025.WAV`  | Bass drum, hi tuning / short decay |
+| `808-sub-deep.wav`   | `BD0075.WAV`  | Bass drum, low tuning / long decay |
+| `808-snare-tight.wav`| `SD5025.WAV`  | Snare drum, mid tone / short snappy|
+| `808-snare-lo.wav`   | `SD2550.WAV`  | Snare drum, low tone / mid snappy  |
+| `808-hat-open-long.wav` | `OH75.WAV` | Open hi-hat, long decay            |
+| `808-cym-ping.wav`   | `CY7525.WAV`  | Cymbal, hi tuning / short decay    |
+| `808-maracas.wav`    | `MA.WAV`      | Maracas                            |
+| `808-conga-lo.wav`   | `LC50.WAV`    | Low conga                          |
+| `808-conga-mid.wav`  | `MC50.WAV`    | Mid conga                          |
+| `808-conga-hi.wav`   | `HC50.WAV`    | Hi conga                           |
 
 The app embeds these files and seeds them to
-`$XDG_DATA_HOME/slooper/samples/808` on first launch.
+`$XDG_DATA_HOME/slooper/samples/808` on first launch, alongside the
+**808-Kit** drum-kit preset (`slooper/drum-kits/808-Kit.json`) that
+pre-arms 16 of the sounds as named pads on the drum machine's pattern
+builder.
 
 With thanks to Michael Fischer — and to every 808 track since 1980.
