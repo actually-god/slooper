@@ -3402,21 +3402,15 @@ impl App {
                 slug
             })
     }
+    /// v77 (TS-003): every v34 preset file op rides the ONE shared
+    /// traversal-safe store (crate::presetbar::PresetStore) — the per-
+    /// surface read_dir/join twins are gone.
+    fn param_preset_store(plugin: &str) -> crate::presetbar::PresetStore {
+        crate::presetbar::PresetStore::json(Self::param_preset_dir(plugin))
+    }
     /// v34 R2: preset file names shown in the picker (sorted, .json).
     fn list_param_presets(plugin: &str) -> Vec<String> {
-        let dir = Self::param_preset_dir(plugin);
-        let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
-                    if let Some(stem) = e.path().file_stem() {
-                        out.push(stem.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
-        out.sort();
-        out
+        Self::param_preset_store(plugin).list()
     }
     /// v34 R2: snapshot the plugin's current parameter values to a named
     /// user preset. Works for EVERY hosted plugin — the values ride the
@@ -3437,16 +3431,16 @@ impl App {
             .filter(|(_, d)| d.writable && !d.program_change)
             .map(|(k, _)| (k, entry.params().get(k)))
             .collect();
-        let json: String = serde_json::to_string(
-            &vals
-                .iter()
-                .map(|(k, v)| (*k as i64, *v as f64))
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| e.to_string())?;
-        let dir = Self::param_preset_dir(entry.name());
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join(format!("{name}.json")), json).map_err(|e| e.to_string())?;
+        let rec: Vec<(i64, f64)> = vals
+            .iter()
+            .map(|(k, v)| (*k as i64, *v as f64))
+            .collect();
+        // v77: v34 keeps its STRICTER refusal (path chars error out rather
+        // than sanitize away — pinned by v34_param_preset_storage_roundtrip),
+        // then the shared store does the file math.
+        Self::param_preset_store(entry.name())
+            .write_json(name, &rec)
+            .map_err(|e| e.to_string())?;
         Ok(vals.len())
     }
     /// v34 R2: restore a named user preset (writes each value through the
@@ -3455,9 +3449,9 @@ impl App {
         let entry = self
             .target_entry(target)
             .ok_or_else(|| "plugin is gone".to_string())?;
-        let p = Self::param_preset_dir(entry.name()).join(format!("{name}.json"));
-        let raw = std::fs::read_to_string(p).map_err(|e| format!("load preset: {e}"))?;
-        let vals: Vec<(i64, f64)> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let vals: Vec<(i64, f64)> = Self::param_preset_store(entry.name())
+            .load_json(name)
+            .map_err(|e| format!("load preset: {e}"))?;
         let n_des = entry.descs().len();
         let mut n = 0;
         for (k, v) in vals {
@@ -3473,8 +3467,10 @@ impl App {
         let entry = self
             .target_entry(target)
             .ok_or_else(|| "plugin is gone".to_string())?;
-        let p = Self::param_preset_dir(entry.name()).join(format!("{name}.json"));
-        std::fs::remove_file(p).map_err(|e| format!("delete preset: {e}"))
+        Self::param_preset_store(entry.name())
+            .delete(name)
+            .map(|_| ())
+            .map_err(|e| format!("delete preset: {e}"))
     }
 
     /// v23: the stand-in parameter window for a plugin whose own window is
@@ -3585,40 +3581,39 @@ impl App {
             self.params_presets_for = nm.clone();
             self.params_presets = Self::list_param_presets(&nm);
         }
-        ui.horizontal(|ui| {
-            ui.label("user preset");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.params_preset_name)
-                    .hint_text("preset name")
-                    .desired_width(130.0),
-            );
-            if ui.button("Save")
-                .on_hover_text("save the current values as a named preset")
-                .clicked()
-            {
-                do_save = true;
+        // v77 (TS-003): ONE preset bar renderer — copy stays here, every
+        // click runs through crate::presetbar (no per-site markup).
+        let spec = crate::presetbar::PresetBarSpec {
+            label: Some("user preset"),
+            hint: "preset name",
+            name_width: 130.0,
+            save_text: "Save",
+            save_hover: "save the current values as a named preset",
+            load_text: "Load",
+            load_width: 150.0,
+            load_hover: None,
+            row_hover: "load this preset",
+            empty_text: None,
+            delete_text: Some("delete named preset"),
+            delete_hover: "delete the preset whose name is in the box",
+            reset_text: None,
+            reset_hover: "",
+            compact: false,
+        };
+        if let Some(act) = crate::presetbar::render(
+            ui,
+            egui::Id::new("slooper_param_presets"),
+            &spec,
+            &mut self.params_preset_name,
+            &self.params_presets,
+        ) {
+            match act {
+                crate::presetbar::PresetBarAction::Save => do_save = true,
+                crate::presetbar::PresetBarAction::Load(nm) => load_name = Some(nm),
+                crate::presetbar::PresetBarAction::Delete => do_del = true,
+                crate::presetbar::PresetBarAction::Reset => {}
             }
-            egui::ComboBox::from_id_salt("slooper_param_presets")
-                .selected_text("Load")
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    let list = self.params_presets.clone();
-                    for p in list {
-                        if ui.selectable_label(false, &p).on_hover_text("load this preset").clicked() {
-                            load_name = Some(p);
-                        }
-                    }
-                    if !self.params_presets.is_empty() {
-                        ui.separator();
-                        if ui.button("delete named preset")
-                            .on_hover_text("delete the preset whose name is in the box")
-                            .clicked()
-                        {
-                            do_del = true;
-                        }
-                    }
-                });
-        });
+        }
         // v60: factory-program row — the plugin's OWN shipped patches.
         // One surface for instruments AND chain FX (this window serves
         // every GuiTarget); backends/plugins reporting no programs skip
@@ -12131,45 +12126,17 @@ impl App {
     fn sampler_preset_dir() -> std::path::PathBuf {
         crate::paths::data_dir().join("sampler-presets")
     }
-    /// Collapse anything filesystem-hostile: keep [A-Za-z0-9-_], map spaces
-    /// and stray chars to '-', collapse runs, trim, cap at 48 chars.
-    /// "../evil" -> "evil" (no traversal by construction).
+    /// v77 (TS-003): the v56 sanitizer moved to its single home,
+    /// crate::presetbar::sanitize. This thin alias keeps the (pinned)
+    /// sampler name while forwarding ALL logic to the shared one.
     fn sampler_preset_sanitize(name: &str) -> String {
-        let mut s: String = name
-            .trim()
-            .chars()
-            .map(|c| {
-                if c == ' ' {
-                    '-'
-                } else if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        while s.contains("--") {
-            s = s.replace("--", "-");
-        }
-        s.trim_matches('-').chars().take(48).collect()
+        crate::presetbar::sanitize(name)
+    }
+    fn sampler_preset_store() -> crate::presetbar::PresetStore {
+        crate::presetbar::PresetStore::json(Self::sampler_preset_dir())
     }
     fn sampler_preset_list() -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(Self::sampler_preset_dir())
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let p = e.path();
-                        if p.extension().is_some_and(|x| x == "json") {
-                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.sort();
-        v
+        Self::sampler_preset_store().list()
     }
     fn sampler_preset_save(&mut self, t: usize) {
         let name = Self::sampler_preset_sanitize(&self.smap_preset_name.clone());
@@ -12181,26 +12148,17 @@ impl App {
             self.status = "sampler preset: this track has no key map".into();
             return;
         };
-        let dir = Self::sampler_preset_dir();
-        let res = std::fs::create_dir_all(&dir).and_then(|()| {
-            let js = serde_json::to_string_pretty(&m)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            std::fs::write(dir.join(format!("{name}.json")), js)
-        });
+        // v77: the shared store owns the mkdir + traversal-safe write.
+        let res = Self::sampler_preset_store().write_json(&name, &m);
         self.status = match res {
-            Ok(()) => format!("sampler preset saved: {name}"),
+            Ok(nm) => format!("sampler preset saved: {nm}"),
             Err(e) => format!("sampler preset save failed: {e}"),
         };
     }
     fn sampler_preset_load(&mut self, t: usize, name: &str) {
         let name = Self::sampler_preset_sanitize(name);
-        let path = Self::sampler_preset_dir().join(format!("{name}.json"));
-        let parsed = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                serde_json::from_str::<crate::config::SamplerMapSave>(&s)
-                    .map_err(|e| e.to_string())
-            });
+        let parsed = Self::sampler_preset_store()
+            .load_json::<crate::config::SamplerMapSave>(&name);
         match parsed {
             Ok(m) => {
                 let n = m.slots.len();
@@ -12234,23 +12192,11 @@ impl App {
             slug
         })
     }
+    fn synth_preset_store(stem: &str) -> crate::presetbar::PresetStore {
+        crate::presetbar::PresetStore::json(Self::synth_preset_dir(stem))
+    }
     fn list_synth_presets(stem: &str) -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(Self::synth_preset_dir(stem))
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let p = e.path();
-                        if p.extension().is_some_and(|x| x == "json") {
-                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.sort();
-        v
+        Self::synth_preset_store(stem).list()
     }
     /// The (stem, desc) pair a synth-preset action needs, or None when
     /// the track has no SCRIPT synth (no binding / hosted instrument —
@@ -12293,14 +12239,9 @@ impl App {
             name: name.clone(),
             values: vals.clone(),
         };
-        let dir = Self::synth_preset_dir(&stem);
-        let res = std::fs::create_dir_all(&dir).and_then(|()| {
-            let js = serde_json::to_string_pretty(&rec)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            std::fs::write(dir.join(format!("{name}.json")), js)
-        });
+        let res = Self::synth_preset_store(&stem).write_json(&name, &rec);
         match res {
-            Ok(()) => {
+            Ok(_) => {
                 self.synth_presets = Self::list_synth_presets(&stem);
                 self.synth_presets_for = stem;
                 self.status = format!("synth preset saved: {name} ({} params)", vals.len());
@@ -12315,15 +12256,9 @@ impl App {
             return;
         };
         // The picker rows are file stems — re-sanitize so a hand-built
-        // call can never escape the stem folder either.
-        let p = Self::synth_preset_dir(&stem)
-            .join(format!("{}.json", Self::sampler_preset_sanitize(&name)));
-        let parsed = std::fs::read_to_string(&p)
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                serde_json::from_str::<crate::config::SynthPresetSave>(&s)
-                    .map_err(|e| e.to_string())
-            });
+        // call can never escape the stem folder either (v65 rule, now
+        // enforced inside PresetStore::load_json — v77).
+        let parsed = Self::synth_preset_store(&stem).load_json::<crate::config::SynthPresetSave>(&name);
         match parsed {
             Ok(rec) => {
                 let vals = synth::seed_values(&rec.values, &desc);
@@ -12353,8 +12288,8 @@ impl App {
             self.status = Self::NO_SCRIPT_SYNTH.into();
             return;
         };
-        let p = Self::synth_preset_dir(&stem).join(format!("{name}.json"));
-        match std::fs::remove_file(&p) {
+        let p = Self::synth_preset_store(&stem).delete(&name).map(|_| ());
+        match p {
             Ok(()) => {
                 self.synth_presets = Self::list_synth_presets(&stem);
                 self.synth_presets_for = stem;
@@ -12395,23 +12330,11 @@ impl App {
     fn kit_preset_dir() -> PathBuf {
         crate::paths::data_dir().join("drum-kits")
     }
+    fn kit_preset_store() -> crate::presetbar::PresetStore {
+        crate::presetbar::PresetStore::json(Self::kit_preset_dir())
+    }
     fn list_kit_presets() -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(Self::kit_preset_dir())
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let p = e.path();
-                        if p.extension().is_some_and(|x| x == "json") {
-                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.sort();
-        v
+        Self::kit_preset_store().list()
     }
     fn kit_preset_refresh(&mut self) {
         self.kit_presets = Self::list_kit_presets();
@@ -12429,14 +12352,9 @@ impl App {
             name: name.clone(),
             pads,
         };
-        let dir = Self::kit_preset_dir();
-        let res = std::fs::create_dir_all(&dir).and_then(|()| {
-            let js = serde_json::to_string_pretty(&rec)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            std::fs::write(dir.join(format!("{name}.json")), js)
-        });
+        let res = Self::kit_preset_store().write_json(&name, &rec);
         match res {
-            Ok(()) => {
+            Ok(_) => {
                 self.kit_preset_refresh();
                 self.status = format!("drum kit preset saved: {name} ({n} pads)");
             }
@@ -12446,16 +12364,9 @@ impl App {
     fn kit_preset_apply(&mut self, t: usize, preset: &str) {
         let name = preset.to_string();
         // The picker rows are file stems — re-sanitize so a hand-built
-        // call can never escape the folder either (v65 rule).
-        let p = Self::kit_preset_dir().join(format!(
-            "{}.json",
-            Self::sampler_preset_sanitize(&name)
-        ));
-        let parsed = std::fs::read_to_string(&p)
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                serde_json::from_str::<crate::config::DrumKitSave>(&s).map_err(|e| e.to_string())
-            });
+        // call can never escape the folder either (v65 rule; the store
+        // sanitizes internally — v77).
+        let parsed = Self::kit_preset_store().load_json::<crate::config::DrumKitSave>(&name);
         match parsed {
             Ok(rec) if !rec.pads.is_empty() => {
                 *self.kit_mut(t) = rec.pads.iter().map(pad_from_save).collect();
@@ -12475,8 +12386,8 @@ impl App {
             self.status = "drum kit preset: type the kit name to delete first".into();
             return;
         }
-        let p = Self::kit_preset_dir().join(format!("{name}.json"));
-        match std::fs::remove_file(&p) {
+        let p = Self::kit_preset_store().delete(&name).map(|_| ());
+        match p {
             Ok(()) => {
                 self.kit_preset_refresh();
                 self.status = format!("drum kit preset deleted: {name}");
@@ -12525,23 +12436,11 @@ impl App {
     fn track_template_dir() -> PathBuf {
         crate::paths::data_dir().join("track-templates")
     }
+    fn track_template_store() -> crate::presetbar::PresetStore {
+        crate::presetbar::PresetStore::json(Self::track_template_dir())
+    }
     fn track_template_list() -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(Self::track_template_dir())
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let p = e.path();
-                        if p.extension().is_some_and(|x| x == "json") {
-                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.sort();
-        v
+        Self::track_template_store().list()
     }
     fn track_template_save(&mut self, t: usize) {
         let name = Self::sampler_preset_sanitize(&self.tpl_name.clone());
@@ -12561,26 +12460,15 @@ impl App {
             gain: self.trk_gain[t],
             color: self.trk_color[t],
         };
-        let dir = Self::track_template_dir();
-        let res = std::fs::create_dir_all(&dir).and_then(|()| {
-            let js = serde_json::to_string_pretty(&tpl)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            std::fs::write(dir.join(format!("{name}.json")), js)
-        });
+        let res = Self::track_template_store().write_json(&name, &tpl);
         self.status = match res {
-            Ok(()) => format!("track template saved: {name}"),
+            Ok(nm) => format!("track template saved: {nm}"),
             Err(e) => format!("track template save failed: {e}"),
         };
     }
     fn track_template_apply(&mut self, t: usize, name: &str) {
         let name = Self::sampler_preset_sanitize(name);
-        let path = Self::track_template_dir().join(format!("{name}.json"));
-        let parsed = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                serde_json::from_str::<crate::config::TrackTemplateSave>(&s)
-                    .map_err(|e| e.to_string())
-            });
+        let parsed = Self::track_template_store().load_json::<crate::config::TrackTemplateSave>(&name);
         match parsed {
             Ok(tpl) => {
                 // Synth: fields first, then the SAME rebuild path a project
@@ -12614,9 +12502,8 @@ impl App {
     }
     fn track_template_delete(&mut self, name: &str) {
         let name = Self::sampler_preset_sanitize(name);
-        let path = Self::track_template_dir().join(format!("{name}.json"));
-        self.status = match std::fs::remove_file(&path) {
-            Ok(()) => format!("track template deleted: {name}"),
+        self.status = match Self::track_template_store().delete(&name) {
+            Ok(_) => format!("track template deleted: {name}"),
             Err(e) => format!("track template delete failed: {e}"),
         };
     }
@@ -12807,46 +12694,41 @@ impl App {
             // "\u{d7}", so a second, selection-dependent delete only confused
             // which row it would hit.
             ui.separator();
-            ui.label(RichText::new("preset \u{b7}").weak().small());
-            let mut load_pick: Option<String> = None;
-            egui::ComboBox::from_id_salt(("smap_preset", t))
-                .width(90.0)
-                .selected_text(RichText::new("load").small())
-                .show_ui(ui, |ui| {
-                    let names = Self::sampler_preset_list();
-                    if names.is_empty() {
-                        ui.label(
-                            RichText::new("no presets yet \u{2014} save one first")
-                                .weak()
-                                .small(),
-                        );
+            // v77 (TS-003): the ONE preset bar renderer (compact style —
+            // the v56 toolbar shape). No delete/reset here: every preset
+            // row is rewritten, never removed.
+            let spec = crate::presetbar::PresetBarSpec {
+                label: Some("preset \u{b7}"),
+                hint: "preset name",
+                name_width: 130.0,
+                save_text: "save",
+                save_hover: "save this track\u{2019}s key map as a named preset",
+                load_text: "load",
+                load_width: 90.0,
+                load_hover: None,
+                row_hover: "use this preset",
+                empty_text: Some("no presets yet \u{2014} save one first"),
+                delete_text: None,
+                delete_hover: "",
+                reset_text: None,
+                reset_hover: "",
+                compact: true,
+            };
+            let presets = Self::sampler_preset_list();
+            if let Some(act) = crate::presetbar::render(
+                ui,
+                egui::Id::new(("smap_preset", t)),
+                &spec,
+                &mut self.smap_preset_name,
+                &presets,
+            ) {
+                match act {
+                    crate::presetbar::PresetBarAction::Save => self.sampler_preset_save(t),
+                    crate::presetbar::PresetBarAction::Load(nm) => {
+                        self.sampler_preset_load(t, &nm)
                     }
-                    for nm in names {
-                        if ui.selectable_label(false, &nm).on_hover_text("use this preset").clicked() {
-                            load_pick = Some(nm);
-                        }
-                    }
-                });
-            let mut ename = self.smap_preset_name.clone();
-            let er = ui.add_sized(
-                [130.0, 18.0],
-                egui::TextEdit::singleline(&mut ename)
-                    .hint_text("preset name")
-                    .char_limit(48usize),
-            );
-            if er.changed() {
-                self.smap_preset_name = ename.clone();
-            }
-            if ui
-                .add_sized([44.0, 18.0], egui::Button::new(RichText::new("save").small()))
-                .on_hover_text("save this track\u{2019}s key map as a named preset")
-                .clicked()
-            {
-                self.smap_preset_name = ename.clone();
-                self.sampler_preset_save(t);
-            }
-            if let Some(nm) = load_pick {
-                self.sampler_preset_load(t, &nm);
+                    _ => {}
+                }
             }
         });
         ui.label(
@@ -13381,54 +13263,43 @@ impl App {
                 self.synth_presets_for = stem.clone();
                 self.synth_presets = Self::list_synth_presets(&stem);
             }
-            ui.horizontal(|ui| {
-                ui.label("user preset");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.synth_preset_name)
-                        .hint_text("preset name")
-                        .desired_width(110.0),
-                );
-                if ui
-                    .button("save")
-                    .on_hover_text("save the current slider values as a named preset for this synth")
-                    .clicked()
-                {
-                    self.synth_preset_save(t);
+            // v77 (TS-003): the ONE preset bar renderer (v34 shape:
+            // delete inside the picker, plus this surface's defaults).
+            let spec = crate::presetbar::PresetBarSpec {
+                label: Some("user preset"),
+                hint: "preset name",
+                name_width: 110.0,
+                save_text: "save",
+                save_hover: "save the current slider values as a named preset for this synth",
+                load_text: "load",
+                load_width: 110.0,
+                load_hover: Some(
+                    "load a saved preset \u{2014} it lands on the live instrument",
+                ),
+                row_hover: "apply this preset to the synth",
+                empty_text: Some("no presets saved yet"),
+                delete_text: Some("delete named preset"),
+                delete_hover: "delete the preset whose name is in the box",
+                reset_text: Some("defaults"),
+                reset_hover: "set every slider back to this synth's built-in defaults",
+                compact: false,
+            };
+            if let Some(act) = crate::presetbar::render(
+                ui,
+                egui::Id::new(("synth_preset_pick", t)),
+                &spec,
+                &mut self.synth_preset_name,
+                &self.synth_presets,
+            ) {
+                match act {
+                    crate::presetbar::PresetBarAction::Save => self.synth_preset_save(t),
+                    crate::presetbar::PresetBarAction::Load(p) => {
+                        self.synth_preset_apply(t, &p)
+                    }
+                    crate::presetbar::PresetBarAction::Delete => self.synth_preset_delete(t),
+                    crate::presetbar::PresetBarAction::Reset => self.synth_preset_defaults(t),
                 }
-                let pick = egui::ComboBox::from_id_salt(("synth_preset_pick", t))
-                    .selected_text("load")
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        let list = self.synth_presets.clone();
-                        if list.is_empty() {
-                            ui.label(RichText::new("no presets saved yet").weak().small());
-                        }
-                        for p in list {
-                            if ui.selectable_label(false, &p).on_hover_text("apply this preset to the synth").clicked() {
-                                self.synth_preset_apply(t, &p);
-                            }
-                        }
-                        if !self.synth_presets.is_empty() {
-                            ui.separator();
-                            if ui
-                                .button("delete named preset")
-                                .on_hover_text("delete the preset whose name is in the box")
-                                .clicked()
-                            {
-                                self.synth_preset_delete(t);
-                            }
-                        }
-                    });
-                pick.response
-                    .on_hover_text("load a saved preset \u{2014} it lands on the live instrument");
-                if ui
-                    .button("defaults")
-                    .on_hover_text("set every slider back to this synth's built-in defaults")
-                    .clicked()
-                {
-                    self.synth_preset_defaults(t);
-                }
-            });
+            }
         }
         if sampler {
             let cur = vals.first().copied().unwrap_or(0.0).round() as usize;
@@ -13586,57 +13457,39 @@ impl App {
         if !self.kit_presets_ready {
             self.kit_preset_refresh();
         }
-        ui.horizontal(|ui| {
-            ui.label("kit preset");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.kit_preset_name)
-                    .hint_text("kit name")
-                    .desired_width(100.0),
-            );
-            if ui
-                .button("save kit")
-                .on_hover_text(
-                    "save this track's whole kit — every pad's name, \
-                     sound, velocity and mute — as a named preset",
-                )
-                .clicked()
-            {
-                self.kit_preset_save(t);
+        // v77 (TS-003): the ONE preset bar renderer (identical shape to
+        // the v34/v65 bars; the v69 copy grew from the same template).
+        let spec = crate::presetbar::PresetBarSpec {
+            label: Some("kit preset"),
+            hint: "kit name",
+            name_width: 100.0,
+            save_text: "save kit",
+            save_hover: "save this track's whole kit — every pad's name, sound, velocity and mute — as a named preset",
+            load_text: "load kit",
+            load_width: 100.0,
+            load_hover: Some("load a saved kit onto this track (replaces the pads)"),
+            row_hover: "replace the kit with this preset",
+            empty_text: Some("no kits saved yet"),
+            delete_text: Some("delete kit"),
+            delete_hover: "delete the kit whose name is in the box",
+            reset_text: Some("stock kit"),
+            reset_hover: "replace this track's kit with the built-in 8-pad stock kit",
+            compact: false,
+        };
+        if let Some(act) = crate::presetbar::render(
+            ui,
+            egui::Id::new(("kit_preset_pick", t)),
+            &spec,
+            &mut self.kit_preset_name,
+            &self.kit_presets,
+        ) {
+            match act {
+                crate::presetbar::PresetBarAction::Save => self.kit_preset_save(t),
+                crate::presetbar::PresetBarAction::Load(k) => self.kit_preset_apply(t, &k),
+                crate::presetbar::PresetBarAction::Delete => self.kit_preset_delete(),
+                crate::presetbar::PresetBarAction::Reset => self.kit_preset_stock(t),
             }
-            let pick = egui::ComboBox::from_id_salt(("kit_preset_pick", t))
-                .selected_text("load kit")
-                .width(100.0)
-                .show_ui(ui, |ui| {
-                    let list = self.kit_presets.clone();
-                    if list.is_empty() {
-                        ui.label(RichText::new("no kits saved yet").weak().small());
-                    }
-                    for k in list {
-                        if ui.selectable_label(false, &k).on_hover_text("replace the kit with this preset").clicked() {
-                            self.kit_preset_apply(t, &k);
-                        }
-                    }
-                    if !self.kit_presets.is_empty() {
-                        ui.separator();
-                        if ui
-                            .button("delete kit")
-                            .on_hover_text("delete the kit whose name is in the box")
-                            .clicked()
-                        {
-                            self.kit_preset_delete();
-                        }
-                    }
-                });
-            pick.response
-                .on_hover_text("load a saved kit onto this track (replaces the pads)");
-            if ui
-                .button("stock kit")
-                .on_hover_text("replace this track's kit with the built-in 8-pad stock kit")
-                .clicked()
-            {
-                self.kit_preset_stock(t);
-            }
-        });
+        }
         let audio_rows: Vec<(String, String)> = self
             .assets
             .iter()
@@ -28465,48 +28318,46 @@ fn track_template_window(ui: &mut egui::Ui, app: &mut App) {
                 "Track {} - a template keeps the instrument, effects chain, mixer and clip color",
                 t + 1
             ));
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [190.0, 20.0],
-                    egui::TextEdit::singleline(&mut app.tpl_name).hint_text("template name"),
-                );
-                if ui
-                    .button("save")
-                    .on_hover_text(
-                        "capture this track's instrument, effects, mixer and \
-                         color into a new named template",
-                    )
-                    .clicked()
-                {
-                    save_now = true;
-                }
-            });
-            ui.separator();
+            // v77 (TS-003): the ONE preset bar renderer. The v61 row-list
+            // (an apply/delete button pair per template) becomes the
+            // standard picker: rows apply, "delete template" removes the
+            // name in the box — same shape as the kit bar.
             let names = App::track_template_list();
+            let spec = crate::presetbar::PresetBarSpec {
+                label: None,
+                hint: "template name",
+                name_width: 190.0,
+                save_text: "save",
+                save_hover: "capture this track's instrument, effects, mixer and color into a new named template",
+                load_text: "templates",
+                load_width: 150.0,
+                load_hover: Some("apply a saved template to this track"),
+                row_hover: "replace this track's instrument, effects, mixer and color with the template",
+                empty_text: None,
+                delete_text: Some("delete template"),
+                delete_hover: "remove this template file for good",
+                reset_text: None,
+                reset_hover: "",
+                compact: false,
+            };
+            if let Some(act) = crate::presetbar::render(
+                ui,
+                egui::Id::new("slooper_track_templates"),
+                &spec,
+                &mut app.tpl_name,
+                &names,
+            ) {
+                match act {
+                    crate::presetbar::PresetBarAction::Save => save_now = true,
+                    crate::presetbar::PresetBarAction::Load(n) => apply = Some(n),
+                    crate::presetbar::PresetBarAction::Delete => {
+                        del = Some(app.tpl_name.clone())
+                    }
+                    crate::presetbar::PresetBarAction::Reset => {}
+                }
+            }
             if names.is_empty() {
                 ui.label("no saved templates yet");
-            }
-            for n in names {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&n).strong());
-                    if ui
-                        .button("apply")
-                        .on_hover_text(
-                            "replace this track's instrument, effects, mixer \
-                             and color with the template",
-                        )
-                        .clicked()
-                    {
-                        apply = Some(n.clone());
-                    }
-                    if ui
-                        .button("delete")
-                        .on_hover_text("remove this template file for good")
-                        .clicked()
-                    {
-                        del = Some(n.clone());
-                    }
-                });
             }
         });
     // Actions fire OUTSIDE the pass (rows read a snapshot of the list;
