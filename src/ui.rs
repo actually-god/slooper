@@ -20993,7 +20993,7 @@ fn rack_file_row(
                 let max_w = (rw - 28.0).max(60.0);
                 let wide = name.chars().count() > 10;
                 ui.ctx().fonts_mut(|fb| {
-                    let mk = |s: &str| {
+                    let mut mk = |s: &str| {
                         let mut j = egui::epaint::text::LayoutJob::simple(
                             s.to_string(),
                             fid.clone(),
@@ -21035,6 +21035,14 @@ fn rack_file_row(
         ui.id().with(("rackdrag", fi, fp)),
         Sense::click_and_drag(),
     );
+    // v76 R4c: full-path affordance — the label truncates, so the row
+    // hover carries the entire on-disk path (TS-013). Response builders
+    // consume self, so re-shadow `dr` (same widget id, hover attached).
+    let dr = dr.on_hover_text(format!(
+        "{}\n{} \u{b7} click to audition \u{b7} drag to a lane strip",
+        fp.display(),
+        if kind == 1 { "MIDI file" } else { "audio file" }
+    ));
     if dr.clicked() {
         // Click = select + audition (asset preview).
         if let Some(k) = app.ensure_asset(fp) {
