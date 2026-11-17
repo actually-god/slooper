@@ -46,17 +46,12 @@ pub mod vsthost;
 
 pub use midi::{MidiAction, MidiBind, MidiMsg};
 
-/// Test helper: vendored plugins can trap at PROCESS EXIT — sfizz 1.2.3
-/// leaks one `Layer` per synth and its LeakDetector `__builtin_trap()`s
-/// from a static destructor, long after all assertions ran (SIGTRAP
-/// after "test result: ok", outcome a static-destruction order lottery).
-/// Called once from every test-side plugin open: an end-of-process trap
-/// from vendor teardown becomes a clean exit(0) — the tests themselves
-/// already reported. Mid-run traps after results printed still surface:
-/// without a `test result:` line the chunk protocol FAILS the run.
-#[cfg(test)]
-pub fn test_hush_vendor_exit_trap() {
-    static SET: std::sync::Once = std::sync::Once::new();
+/// Arm the vendor-teardown hush (v73/S8, shared body): SIGTRAP becomes
+/// `_exit(0)`. Built for the production Unix path (below) and, as before,
+/// for every test build on both OSes (`any(unix, test)` keeps Windows
+/// release binaries free of it).
+#[cfg(any(unix, test))]
+fn arm_trap_handler() {
     const SIGTRAP: i32 = 5; // glibc/x86-64
     extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
@@ -65,9 +60,38 @@ pub fn test_hush_vendor_exit_trap() {
     extern "C" fn exit_on_trap(_sig: i32) {
         unsafe { _exit(0) }
     }
-    SET.call_once(|| unsafe {
+    unsafe {
         signal(SIGTRAP, exit_on_trap as *const () as usize);
-    });
+    }
+}
+
+/// Vendored plugins can trap at PROCESS EXIT: sfizz 1.2.3 leaks one
+/// `Layer` per synth and its LeakDetector `__builtin_trap()`s from a
+/// static destructor (sfizz-ui LeakDetector.h:60) — long after the
+/// editor session ran perfectly, and long after our own last statement.
+/// The user saw this as "slooper dies with Trace/breakpoint trap on
+/// quit" whenever sfizz was resident (the S8 report class). Called by
+/// `main` once the event loop has RETURNED: every slooper-side end
+/// task (config saves on change, project autosave) is already done, so
+/// the only thing left standing between us and a clean exit is vendor
+/// static destruction. Mid-session SIGTRAPs stay fully fatal — the
+/// handler is armed only after `eframe::run_native` returns. Built for
+/// Windows TEST builds too (the suite-side helper below shares it; only
+/// the Unix release binary leaves it out).
+#[cfg(any(unix, test))]
+pub fn hush_vendor_exit_trap() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    SET.call_once(arm_trap_handler);
+}
+
+/// Test helper: the same hush, armed from every test-side plugin open
+/// (the suite's own process exit would otherwise SIGTRAP after
+/// "test result: ok", an outcome a static-destruction order lottery).
+/// Mid-run traps after results printed still surface: without a
+/// `test result:` line the chunk protocol FAILS the run.
+#[cfg(test)]
+pub fn test_hush_vendor_exit_trap() {
+    hush_vendor_exit_trap();
 }
 
 /// Test helper: the REAL account home, immune to the `HOME` swaps that

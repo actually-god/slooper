@@ -2094,6 +2094,22 @@ pub fn x11_available() -> bool {
 
 /// Exit-code protocol: 0 = survived (or nothing to test), 2 = plugin did
 /// not load in the child (not an editor verdict). Crashes exit by signal.
+/// v73 (S8): the probe child is disposable the moment its verdict is
+/// decided — exit IMMEDIATELY, bypassing every vendor teardown path.
+/// sfizz 1.2.3's LeakDetector `__builtin_trap()`s from a static
+/// destructor at process exit (it leaks one `Layer` per synth): the
+/// editor session ran perfectly, yet the parent read that SIGTRAP as
+/// "its plugin window crashed the test process" and the crash guard
+/// BANNED a healthy editor FOREVER (mtime-keyed cache). `_exit` runs no
+/// atexit handlers and no static destructors — the same discipline as
+/// `vsthost::probe_child_main` (W7 scan probe). A crash BEFORE a
+/// milestone is reached still kills the child by signal/exception, and
+/// the guard still bans real crash classes (the ADLplug idle-pump
+/// SIGSEGV repros green under this scheme).
+fn probe_exit(code: i32) -> ! {
+    unsafe { libc::_exit(code) }
+}
+
 pub fn probe_child(spec: &str) -> i32 {
     // v24: every window this process creates is throwaway — park it
     // off-screen and WM-invisible so the safety check is never seen
@@ -2103,7 +2119,7 @@ pub fn probe_child(spec: &str) -> i32 {
     // may legally contain tabs — `SLOOPER_EDITOR_PROBE` carries only the
     // kind token, `SLOOPER_EDITOR_PROBE_PATH` the plugin path.
     let Ok(path) = std::env::var("SLOOPER_EDITOR_PROBE_PATH") else {
-        return 0;
+        probe_exit(0);
     };
     let kind = if spec == "V3" {
         crate::vsthost::VstKind::V3
@@ -2111,7 +2127,7 @@ pub fn probe_child(spec: &str) -> i32 {
         crate::vsthost::VstKind::V2
     };
     if !x11_available() {
-        return 0; // nothing testable; parent only probes with DISPLAY set
+        probe_exit(0); // nothing testable; parent only probes with DISPLAY set
     }
     let path = std::path::Path::new(&path);
     let name = path
@@ -2120,11 +2136,12 @@ pub fn probe_child(spec: &str) -> i32 {
         .unwrap_or_default();
     let load = match crate::vsthost::open(path, kind, 48_000, None) {
         Ok(l) => l,
-        Err(_) => return 2,
+        // Load failure is NOT an editor verdict (parent maps 2 → Safe).
+        Err(_) => probe_exit(2),
     };
     let entry = load.entry;
     if !entry.has_editor() {
-        return 0;
+        probe_exit(0);
     }
     let mut win = if let Some(h) = entry.vst2_handle() {
         match open_editor(
@@ -2135,12 +2152,13 @@ pub fn probe_child(spec: &str) -> i32 {
             entry.descs().len(),
         ) {
             Ok(w) => w,
-            Err(_) => return 0, // honest refusal: the app path reports it
+            // Honest refusal: the app path reports it.
+            Err(_) => probe_exit(0),
         }
     } else {
         match entry.open_vst3_editor(48_000) {
             Ok(w) => w,
-            Err(_) => return 0,
+            Err(_) => probe_exit(0),
         }
     };
     // Verify window is 3 s; allow slack for the toolkit's own bootstrap.
@@ -2161,7 +2179,8 @@ pub fn probe_child(spec: &str) -> i32 {
             break;
         }
     }
-    0
+    // Verified session over: verdict Safe, leave NOW (see probe_exit).
+    probe_exit(0);
 }
 
 /// Child count on the thread's own connection (XQueryTree needs no round
