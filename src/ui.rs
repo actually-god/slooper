@@ -968,8 +968,13 @@ pub fn target_search_box(ui: &mut egui::Ui, placeholder: &str) -> String {
 /// so a plugin can sit anywhere in the chain and a track can host as many
 /// as the user likes.
 pub enum ChainRow {
-    /// Bundled/user effect script.
-    Script { stem: String, params: Vec<f32> },
+    /// Bundled/user effect script. `bypass` (v80) mutes the slot: the
+    /// instance stays installed but the RT/offline passes skip it.
+    Script {
+        stem: String,
+        params: Vec<f32>,
+        bypass: bool,
+    },
     /// Hosted plugin. `entry` is None until it is opened at the engine
     /// sample rate (startup/Ready) or until an async load started by
     /// `add_fx_plugin` lands; `params` carries the latest snapshot
@@ -995,6 +1000,8 @@ pub enum ChainRow {
         /// entry's cached program wins at save (see `chain_row_to_save`);
         /// this is the fallback for rows that never opened this session.
         program: Option<i32>,
+        /// v80 (TS-005): per-slot mute (see `ChainRow::Script::bypass`).
+        bypass: bool,
     },
 }
 
@@ -1005,9 +1012,14 @@ pub enum ChainRow {
 impl Clone for ChainRow {
     fn clone(&self) -> Self {
         match self {
-            ChainRow::Script { stem, params } => ChainRow::Script {
+            ChainRow::Script {
+                stem,
+                params,
+                bypass,
+            } => ChainRow::Script {
                 stem: stem.clone(),
                 params: params.clone(),
+                bypass: *bypass,
             },
             ChainRow::Vst {
                 path,
@@ -1018,6 +1030,7 @@ impl Clone for ChainRow {
                 entry,
                 state,
                 program,
+                bypass,
                 ..
             } => ChainRow::Vst {
                 path: path.clone(),
@@ -1028,9 +1041,20 @@ impl Clone for ChainRow {
                 entry: entry.clone(),
                 state: state.clone(),
                 program: *program,
+                bypass: *bypass,
                 open_rx: None,
             },
         }
+    }
+}
+
+/// v80 (TS-005): the row's display name for status echoes — the same
+/// string the chain row paints (script STEM as fallback; the row chrome
+/// upgrades it to the registry desc name when present).
+fn chain_row_label(row: &ChainRow) -> String {
+    match row {
+        ChainRow::Script { stem, .. } => stem.clone(),
+        ChainRow::Vst { name, .. } => name.clone(),
     }
 }
 
@@ -1039,9 +1063,14 @@ impl Clone for ChainRow {
 /// never drift between entry points.
 fn chain_row_to_save(row: &ChainRow) -> ChainSave {
     match row {
-        ChainRow::Script { stem, params } => ChainSave::Fx {
+        ChainRow::Script {
+            stem,
+            params,
+            bypass,
+        } => ChainSave::Fx {
             stem: stem.clone(),
             params: params.clone(),
+            bypass: *bypass,
         },
         ChainRow::Vst {
             path,
@@ -1053,6 +1082,7 @@ fn chain_row_to_save(row: &ChainRow) -> ChainSave {
             open_rx: _,
             state,
             program,
+            bypass,
         } => ChainSave::Vst {
             path: path.clone(),
             kind: kind.tag().to_string(),
@@ -1068,6 +1098,7 @@ fn chain_row_to_save(row: &ChainRow) -> ChainSave {
                 .and_then(|e| e.current_program())
                 .map(|p| p as i32)
                 .or(*program),
+            bypass: *bypass,
         },
     }
 }
@@ -1078,9 +1109,14 @@ fn chain_row_to_save(row: &ChainRow) -> ChainSave {
 /// opens it lazily like every other loaded row.
 fn chain_row_from_save(s: &ChainSave) -> Option<ChainRow> {
     match s {
-        ChainSave::Fx { stem, params } => Some(ChainRow::Script {
+        ChainSave::Fx {
+            stem,
+            params,
+            bypass,
+        } => Some(ChainRow::Script {
             stem: stem.clone(),
             params: params.clone(),
+            bypass: *bypass,
         }),
         ChainSave::Vst {
             path,
@@ -1090,6 +1126,7 @@ fn chain_row_from_save(s: &ChainSave) -> Option<ChainRow> {
             params,
             state,
             program,
+            bypass,
         } => {
             let kind = crate::vsthost::VstKind::parse(kind)?;
             Some(ChainRow::Vst {
@@ -1101,6 +1138,7 @@ fn chain_row_from_save(s: &ChainSave) -> Option<ChainRow> {
                 entry: None,
                 open_rx: None,
                 program: *program,
+                bypass: *bypass,
                 // v22: decode the persisted chunk so the first rebuild
                 // boots the plugin in the exact state the user saved.
                 state: state.as_deref().and_then(crate::config::b64_decode),
@@ -3028,7 +3066,11 @@ impl App {
         let mut slots: Vec<FxSlot> = Vec::new();
         for row in self.fx_rows[i].iter_mut() {
             match row {
-                ChainRow::Script { stem, params } => {
+                ChainRow::Script {
+                    stem,
+                    params,
+                    bypass,
+                } => {
                     if slots.len() >= fx::MAX_FX_PER_TRACK {
                         continue; // scripted slots share the historic cap; plugins are uncapped
                     }
@@ -3041,7 +3083,9 @@ impl App {
                         self.fx_registry
                             .create_instance(stem, self.sample_rate as f64, &vals)
                     {
-                        slots.push(FxSlot::scripted(inst.clone(), desc));
+                        // v80: the row's mute flag rides into the slot —
+                        // the RT/offline passes read it per block.
+                        slots.push(FxSlot::scripted(inst.clone(), desc).with_bypass(*bypass));
                         live.push(Some(inst));
                     } else {
                         live.push(None);
@@ -3057,6 +3101,7 @@ impl App {
                     open_rx,
                     state,
                     program,
+                    bypass,
                 } => {
                     // Open lazily (first rebuild after load, or after the
                     // folder rescan dropped a failed load). v16: rows with
@@ -3104,7 +3149,7 @@ impl App {
                     }
                     match entry {
                         Some(e) => {
-                            slots.push(FxSlot::vst(e.clone()));
+                            slots.push(FxSlot::vst(e.clone()).with_bypass(*bypass));
                             live.push(None);
                         }
                         None => live.push(None), // keep row/instance alignment
@@ -3127,10 +3172,18 @@ impl App {
         self.fx_rows[i].push(ChainRow::Script {
             stem: stem.to_string(),
             params: Vec::new(),
+            bypass: false,
         });
         self.rebuild_fx(i);
         self.fx_save_pending = true;
         self.save_config();
+        // v80: a chain edit is never silent — name what landed where.
+        let name = self
+            .fx_registry
+            .desc(stem)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| stem.to_string());
+        self.status = format!("added \u{201c}{name}\u{201d} to track {} chain", i + 1);
     }
 
     /// v0.12: open a hosted plugin's own editor window, generation-aware.
@@ -3943,6 +3996,13 @@ impl App {
         let rx =
             crate::vsthost::open_async_pid(&e.path, e.kind, e.plugin_id.as_deref(), sr, None, None);
         self.vst_note = format!("{}: loading…", e.name);
+        // v80: started-echo in the status bar (the vst_note alone sits
+        // only inside the picker popup — the v76 "never silent" rule).
+        self.status = format!(
+            "{}: loading on the plugin thread \u{2014} track {} chain",
+            e.name,
+            i + 1
+        );
         self.fx_rows[i].push(ChainRow::Vst {
             state: None,
             path: e.path.to_string_lossy().into_owned(),
@@ -3953,6 +4013,7 @@ impl App {
             entry: None,
             open_rx: Some(rx),
             program: None,
+            bypass: false,
         });
         let row = self.fx_rows[i].len() - 1;
         self.vst_pending_gui.push((i, row));
@@ -4016,16 +4077,21 @@ impl App {
                                 } else {
                                     format!("{name}: loaded")
                                 };
+                                // v80: the settle-echo rides the status bar
+                                // too (started-echo lands in add_fx_plugin).
+                                self.status = self.vst_note.clone();
                                 opened = true;
                             }
                             Ok(Err(err)) => {
                                 self.vst_note = format!("{name}: {err}");
+                                self.status = self.vst_note.clone();
                                 opened = true;
                             }
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                 // Loader job vanished (row removed while
                                 // loading) — treat as not loaded.
                                 self.vst_note = format!("{name}: loader gone");
+                                self.status = self.vst_note.clone();
                                 opened = true;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -4121,9 +4187,13 @@ impl App {
 
     fn remove_fx_row(&mut self, i: usize, k: usize) {
         if k < self.fx_rows[i].len() {
+            // v80: echo what left the chain (the held/reaped plugin teardown
+            // is invisible by design — the status line is its announcement).
+            let label = chain_row_label(&self.fx_rows[i][k]);
             self.fx_rows[i].remove(k);
             self.rebuild_fx(i);
             self.save_config();
+            self.status = format!("removed \u{201c}{label}\u{201d} from track {} chain", i + 1);
         }
     }
 
@@ -4135,11 +4205,51 @@ impl App {
         }
         let j = if dir < 0 { k.wrapping_sub(1) } else { k + 1 };
         if j >= n {
+            // v80: an edge request that somehow arrives still answers —
+            // the row chrome disables the arrow, but never swallow a click.
+            self.status = if dir < 0 {
+                format!("already first in the track {} chain", i + 1)
+            } else {
+                format!("already last in the track {} chain", i + 1)
+            };
             return;
         }
+        let label = chain_row_label(&self.fx_rows[i][k]);
         self.fx_rows[i].swap(k, j);
         self.rebuild_fx(i);
         self.save_config();
+        self.status = format!(
+            "moved \u{201c}{label}\u{201d} {} the track {} chain",
+            if dir < 0 { "up" } else { "down" },
+            i + 1
+        );
+    }
+
+    /// v80 (TS-005): per-slot MUTE toggle — the chain's counterpart of the
+    /// v68 mixer mute. The slot stays installed (instance/bridge and all
+    /// its state persist, the editor still opens); the RT and offline
+    /// passes simply skip it. Echoes both directions (v72/v76 doctrine).
+    fn toggle_fx_bypass(&mut self, i: usize, k: usize) {
+        let Some(row) = self.fx_rows[i].get_mut(k) else {
+            return;
+        };
+        let now = match row {
+            ChainRow::Script { bypass, .. } | ChainRow::Vst { bypass, .. } => {
+                *bypass = !*bypass;
+                *bypass
+            }
+        };
+        let label = chain_row_label(row);
+        self.rebuild_fx(i);
+        self.save_config();
+        self.status = if now {
+            format!(
+                "muted \u{201c}{label}\u{201d} on track {} \u{b7} audio passes through",
+                i + 1
+            )
+        } else {
+            format!("unmuted \u{201c}{label}\u{201d} on track {}", i + 1)
+        };
     }
 
     /// Open (or reopen) the child editor window for loop `i`'s chain slot

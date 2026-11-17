@@ -139,18 +139,31 @@ pub enum FxKind {
 /// A chain slot; see [`FxKind`].
 pub struct FxSlot {
     pub kind: FxKind,
+    /// v80 (TS-005): per-slot MUTE. A bypassed slot stays INSTALLED
+    /// (its instance/bridge keeps state and its editor still opens) but
+    /// the RT and offline passes skip it, so audio passes through —
+    /// the same semantic the RT already applies to a dead/parked plugin.
+    /// It rides the whole-chain republish like every other slot edit.
+    pub bypass: bool,
 }
 
 impl FxSlot {
     pub fn scripted(inst: Arc<crate::fx::Instance>, desc: crate::fx::EffectDesc) -> Self {
         Self {
             kind: FxKind::Scripted { inst, desc },
+            bypass: false,
         }
     }
     pub fn vst(entry: Arc<dyn crate::vsthost::StageEntry>) -> Self {
         Self {
             kind: FxKind::Vst(entry),
+            bypass: false,
         }
+    }
+    /// v80: builder for a slot born muted (chain rebuild from rows).
+    pub fn with_bypass(mut self, bypass: bool) -> Self {
+        self.bypass = bypass;
+        self
     }
     pub fn is_vst(&self) -> bool {
         matches!(self.kind, FxKind::Vst(_))
@@ -2735,6 +2748,11 @@ fn run_chain_over(
     sc: &[f32],
 ) {
     for slot in chain.slots() {
+        // v80: export identity — a muted slot is skipped offline exactly
+        // as the live bus skips it (the render must mirror the mix).
+        if slot.bypass {
+            continue;
+        }
         match &slot.kind {
             FxKind::Scripted { inst, desc } => {
                 if let Some(f) = inst.spawn_fresh(desc) {
@@ -4401,6 +4419,12 @@ impl Proc {
         let mut pair = (x, x);
         let sg = self.sync_gen;
         for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
+            // v80: a muted slot passes audio through untouched. The
+            // fx_rt row stays (zip alignment) — the mute flag is read,
+            // the snapshot simply goes unused while bypassed.
+            if slot.bypass {
+                continue;
+            }
             let FxKind::Scripted { inst, .. } = &slot.kind else {
                 continue;
             };
@@ -4445,6 +4469,10 @@ impl Proc {
             ..
         } = self;
         for (k, slot) in fx_cache[t].slots().iter().enumerate() {
+            // v80: muted slot = pass-through (same skip fx_mix applies).
+            if slot.bypass {
+                continue;
+            }
             match &slot.kind {
                 FxKind::Scripted { inst, .. } => {
                     let rt = &mut fx_rt[t][k];
