@@ -112,11 +112,21 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    // v73 (S8): the event loop is over — every slooper-side end task is
+    // done (config saves on change, project autosave; nothing of ours
+    // runs after this point). Arm the vendor-teardown hush so a resident
+    // plugin's PROCESS-EXIT trap (sfizz 1.2.3's LeakDetector SIGTRAPs
+    // from a static destructor it can never be talked out of) cannot
+    // murder the quit. Mid-session SIGTRAPs stay fatal: the handler
+    // exists only in this last sliver of process life.
+    let out = eframe::run_native(
         "slooper",
         options,
         Box::new(move |_cc| Ok(Box::new(slooper::ui::App::new(backend)))),
-    )
+    );
+    #[cfg(unix)]
+    slooper::hush_vendor_exit_trap();
+    out
 }
 
 /// v41: main-window backend policy (see `main` for the why). True =

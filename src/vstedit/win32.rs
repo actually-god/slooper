@@ -2189,13 +2189,32 @@ pub fn x11_available() -> bool {
 /// Exit-code protocol: 0 = survived (or nothing to test), 2 = plugin did
 /// not load in the child (not an editor verdict). Crashes exit as
 /// exceptions (the W7 NTSTATUS labelling converts those in the parent).
+/// v73 (S8) twin of the x11 `probe_exit`: every verdict is announced by
+/// IMMEDIATE process termination. `TerminateProcess` skips CRT atexit
+/// handlers and DLL detach notifications, so a vendor teardown trap
+/// (sfizz's LeakDetector class) can never speak after a healthy session
+/// was verified; crashes before a milestone still surface to the parent
+/// as exception exit codes.
+fn probe_exit(code: u32) -> ! {
+    unsafe {
+        let _ = windows::Win32::System::Threading::TerminateProcess(
+            windows::Win32::System::Threading::GetCurrentProcess(),
+            code,
+        );
+    }
+    // TerminateProcess only "fails" if the handle is invalid — ours is
+    // the current process. Never fall through to a normal CRT exit:
+    // that reopens the teardown window this helper exists to close.
+    std::process::abort()
+}
+
 pub fn probe_child(spec: &str) -> i32 {
     enter_probe_mode();
     // Two env vars on purpose: env strings are NUL-terminated, and paths
     // may legally contain tabs — `SLOOPER_EDITOR_PROBE` carries only the
     // kind token, `SLOOPER_EDITOR_PROBE_PATH` the plugin path.
     let Ok(path) = std::env::var("SLOOPER_EDITOR_PROBE_PATH") else {
-        return 0;
+        probe_exit(0);
     };
     let kind = if spec == "V3" {
         crate::vsthost::VstKind::V3
@@ -2203,7 +2222,7 @@ pub fn probe_child(spec: &str) -> i32 {
         crate::vsthost::VstKind::V2
     };
     if !x11_available() {
-        return 0; // unreachable on Windows; kept for twin symmetry
+        probe_exit(0); // unreachable on Windows; kept for twin symmetry
     }
     let path = std::path::Path::new(&path);
     let name = path
@@ -2212,11 +2231,11 @@ pub fn probe_child(spec: &str) -> i32 {
         .unwrap_or_default();
     let load = match crate::vsthost::open(path, kind, 48_000, None) {
         Ok(l) => l,
-        Err(_) => return 2,
+        Err(_) => probe_exit(2),
     };
     let entry = load.entry;
     if !entry.has_editor() {
-        return 0;
+        probe_exit(0);
     }
     let mut win = if let Some(h) = entry.vst2_handle() {
         match open_editor(
@@ -2227,12 +2246,12 @@ pub fn probe_child(spec: &str) -> i32 {
             entry.descs().len(),
         ) {
             Ok(w) => w,
-            Err(_) => return 0, // honest refusal: the app path reports it
+            Err(_) => probe_exit(0), // honest refusal: the app path reports it
         }
     } else {
         match entry.open_vst3_editor(48_000) {
             Ok(w) => w,
-            Err(_) => return 0,
+            Err(_) => probe_exit(0),
         }
     };
     // Verify window is 3 s; allow slack for the toolkit's own bootstrap.
@@ -2252,7 +2271,8 @@ pub fn probe_child(spec: &str) -> i32 {
             break;
         }
     }
-    0
+    // Verified session over: verdict Safe, leave NOW (see probe_exit).
+    probe_exit(0);
 }
 
 // ------------------------------------------------------------ W8b embed tests
