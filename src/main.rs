@@ -351,4 +351,36 @@ mod tests {
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
+
+    /// v73 (S8): `main` must arm the vendor-teardown hush AFTER the
+    /// event loop returns — a resident sfizz SIGTRAPs the process from
+    /// its LeakDetector static destructor, so without the hush every
+    /// quit after an sfizz session dies as "Trace/breakpoint trap".
+    /// The pin lives in main.rs itself, so the scanned literal is
+    /// split with concat! (a naked literal would self-satisfy the
+    /// self-include scan); the `let out =` binding anchor and exact
+    /// trimmed-line equality keep comments and prose out.
+    #[test]
+    fn v73_main_arms_vendor_exit_hush() {
+        let src = include_str!("main.rs");
+        let needle = concat!("slooper::hush_vendor_", "exit_trap();");
+        let lines: Vec<&str> = src.lines().collect();
+        // Exact trimmed-line equality: a comment-prefixed survivor
+        // ("//    slooper::hush…") never matches (w12e active-call trap).
+        let ai = lines
+            .iter()
+            .position(|l| l.trim() == needle)
+            .expect("v73: main must arm the vendor-exit hush after \
+                     run_native — sfizz sessions SIGTRAP the quit");
+        let rn = lines
+            .iter()
+            .position(|l| l.contains("let out = eframe::run_native"))
+            .expect("run_native result must be bound (v73)");
+        assert!(ai > rn, "the hush must be armed AFTER the event loop returns");
+        assert_eq!(
+            lines[ai - 1].trim(),
+            "#[cfg(unix)]",
+            "the hush arm must be cfg(unix)-gated (Windows release stays raw)"
+        );
+    }
 }

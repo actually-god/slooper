@@ -6397,4 +6397,78 @@ mod tests {
         e.refresh_program();
         assert_eq!(e.current_program(), Some(0));
     }
+
+    /// v73 (S8) end-to-end verdict pin: an editor probe of a plugin
+    /// whose TEARDOWN traps must come back Safe. sfizz 1.2.3 — the S8
+    /// rig — opens its editor perfectly, then `__builtin_trap()`s at
+    /// process exit (LeakDetector.h:60); pre-v73 the parent read that
+    /// SIGTRAP as an editor crash (exit 133 measured on the user rig)
+    /// and BANNED the healthy editor forever. Spawns the real app
+    /// binary as the probe child: production build, so the suite-side
+    /// hush is NOT armed there — the child survives ONLY on the v73
+    /// `_exit`-at-the-milestone path. Skips without sfizz or without
+    /// an X display (CI-safe; Windows-safe via cfg).
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "slow-tier: spawns an app probe child that dlopens sfizz against a live X server"]
+    fn v73_sfizz_probe_survives_vendor_teardown() {
+        use std::process::{Command, Stdio};
+        const SFIZZ: &str = "/usr/lib/vst3/sfizz.vst3";
+        if !std::path::Path::new(SFIZZ).exists() {
+            eprintln!("SKIP: no sfizz on this host");
+            return;
+        }
+        if std::env::var_os("DISPLAY").is_none() {
+            eprintln!("SKIP: the editor probe needs an X display");
+            return;
+        }
+        // SAME-PROFILE resolver: the profile-correct app binary is the
+        // sibling of OUR OWN deps dir (`target/<profile>/slooper`), so it
+        // is by construction built from the tree under test. The
+        // build.rs-baked SLOOPER_EXE_PATH is NOT usable here: it carries
+        // whichever profile was built LAST in this target dir (measured:
+        // a citest run happily spawned a stale release/slooper and passed
+        // vacuously off another build's binary). The current_exe-derived
+        // path is also the W12e-recursion-safe choice (never the harness).
+        let self_exe = std::env::current_exe().expect("current_exe");
+        let exe = self_exe
+            .parent() // target/<profile>/deps
+            .and_then(|d| d.parent()) // target/<profile>
+            .map(|d| d.join("slooper"))
+            .expect("derive app path");
+        assert!(
+            exe.is_file(),
+            "v73 pin needs the same-profile app binary at {exe:?} — \
+             run it through `cargo test` (bin target built), not a raw harness"
+        );
+        let mut child = Command::new(&exe)
+            .env("SLOOPER_EDITOR_PROBE", "V3")
+            .env("SLOOPER_EDITOR_PROBE_PATH", SFIZZ)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn probe child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let st = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(st) => break st,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("probe child exceeded 90 s (hang class)");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(250)),
+            }
+        };
+        // Pre-fix this was None(signal SIGTRAP). Exit 0 is the ONLY
+        // survivable success (2 = load failure would also dodge the
+        // trap without proving anything — it must be 0: editor opened).
+        assert_eq!(
+            st.code(),
+            Some(0),
+            "sfizz editor probe must be Safe despite the teardown trap (v73); \
+             status = {st:?}"
+        );
+    }
 }

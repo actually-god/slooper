@@ -552,4 +552,64 @@ mod seam_tests {
             "the embed passes must keep their Linux early-return"
         );
     }
+
+    /// v73 (S8): the editor-probe child must announce EVERY verdict by a
+    /// teardown-immune process exit. sfizz 1.2.3's LeakDetector
+    /// `__builtin_trap()`s from a static destructor at process exit after
+    /// a perfectly healthy editor session; if the child RETURNS from
+    /// probe_child, that trap lands in process teardown, the parent reads
+    /// SIGTRAP as "editor crashes", and the crash guard caches a BAN
+    /// forever (mtime key). Pinned twin invariant: zero plain returns
+    /// left inside probe_child, a fixed milestone-exit count, and the
+    /// helper itself bypasses teardown (`_exit` / `TerminateProcess`).
+    /// code_lines() already cuts comment lines and the test tail.
+    #[test]
+    fn v73_probe_child_exits_are_teardown_immune() {
+        for os in ["x11", "win32"] {
+            let code = code_lines(&twin_path(os));
+            let helper_start = code
+                .find("fn probe_exit")
+                .unwrap_or_else(|| panic!("{os}: probe_exit helper missing (v73)"));
+            let helper_end = code[helper_start..]
+                .find("\n}\n")
+                .expect("probe_exit close")
+                + helper_start
+                + 3;
+            let helper = &code[helper_start..helper_end];
+            let start = code
+                .find("pub fn probe_child")
+                .expect("probe_child twin");
+            let end = code[start..].find("\n}\n").expect("probe_child close") + start + 3;
+            let body = &code[start..end];
+            assert_eq!(
+                body.matches("return 0").count() + body.matches("return 2").count(),
+                0,
+                "{os}: probe_child leaked a plain return — vendor teardown \
+                 (sfizz LeakDetector class) would speak before process exit"
+            );
+            assert_eq!(
+                body.matches("probe_exit(0)").count(),
+                6,
+                "{os}: probe_exit(0) milestone count drifted (7 exits, one non-zero)"
+            );
+            assert_eq!(
+                body.matches("probe_exit(2)").count(),
+                1,
+                "{os}: load-failure milestone (probe_exit(2)) missing"
+            );
+            // The helper itself must bypass the teardown window, per OS.
+            if os == "x11" {
+                assert!(
+                    helper.contains("libc::_exit"),
+                    "x11: probe_exit is not _exit-based (atexit/static dtors reachable)"
+                );
+            } else {
+                assert!(
+                    helper.contains("TerminateProcess"),
+                    "win32: probe_exit is not TerminateProcess-based \
+                     (CRT atexit/DLL detach reachable)"
+                );
+            }
+        }
+    }
 }
