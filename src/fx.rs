@@ -893,6 +893,31 @@ pub struct Instance {
 unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
+/// v74: THE shared param-value formatter of the bridge kit — stock
+/// scripts (via `Instance::fmt_param`) and hosted plugin rows (via
+/// `fxgui::param_row`) read out through this one function, so a dB read
+/// is a dB read everywhere. `unit` is a `SLOOPER_UNIT_*` code.
+pub fn fmt_param_value(v: f32, unit: u32) -> String {
+    match unit {
+        SLOOPER_UNIT_HZ => {
+            if v >= 1000.0 {
+                format!("{:.2} kHz", v / 1000.0)
+            } else {
+                format!("{:.1} Hz", v)
+            }
+        }
+        SLOOPER_UNIT_DB => format!("{:.1} dB", v),
+        SLOOPER_UNIT_MS => format!("{:.1} ms", v),
+        SLOOPER_UNIT_PERCENT => format!("{:.1} %", v),
+        SLOOPER_UNIT_SEMITONES => format!("{:.1} st", v),
+        SLOOPER_UNIT_TIMES => format!("{:.2}x", v),
+        SLOOPER_UNIT_SECONDS => format!("{:.2} s", v),
+        SLOOPER_UNIT_SAMPLES => format!("{:.0} smp", v),
+        SLOOPER_UNIT_BEATS => format!("{:.2} beats", v),
+        _ => format!("{:.3}", v),
+    }
+}
+
 impl Instance {
     /// Create via the effect's `create`. `values` seeds the sliders
     /// (missing entries fall back to the defaults in `desc`).
@@ -1086,24 +1111,7 @@ impl Instance {
             return m.labels[i.min(m.labels.len() - 1)].to_string();
         }
         let v = lo + norm * (hi - lo);
-        match m.unit {
-            SLOOPER_UNIT_HZ => {
-                if v >= 1000.0 {
-                    format!("{:.2} kHz", v / 1000.0)
-                } else {
-                    format!("{:.1} Hz", v)
-                }
-            }
-            SLOOPER_UNIT_DB => format!("{:.1} dB", v),
-            SLOOPER_UNIT_MS => format!("{:.1} ms", v),
-            SLOOPER_UNIT_PERCENT => format!("{:.1} %", v),
-            SLOOPER_UNIT_SEMITONES => format!("{:.1} st", v),
-            SLOOPER_UNIT_TIMES => format!("{:.2}x", v),
-            SLOOPER_UNIT_SECONDS => format!("{:.2} s", v),
-            SLOOPER_UNIT_SAMPLES => format!("{:.0} smp", v),
-            SLOOPER_UNIT_BEATS => format!("{:.2} beats", v),
-            _ => format!("{:.3}", v),
-        }
+        fmt_param_value(v, m.unit)
     }
 
     /// `call_sample_sc` for the stereo chain bus. v3 scripts receive the

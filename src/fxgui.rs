@@ -305,6 +305,163 @@ pub(crate) static KIT_PROBE: std::sync::Mutex<
     std::cell::RefCell<Vec<(String, egui::Rect)>>,
 > = std::sync::Mutex::new(std::cell::RefCell::new(Vec::new()));
 
+// ---------------------------------------------------------------------------
+// v74: ONE shared param row (goal 2 of the params unification).
+// ---------------------------------------------------------------------------
+//
+// The stock auto grid (scripts without a custom GUI) and the hosted-plugin
+// PARAMETERS window (VST2/VST3/CLAP) used to fork this row: stock had a
+// 3-column grid with kit tooltips, hosted had naked knobs. Both now render
+// through `param_row` — one chrome, one hover voice, one formatter
+// (`fx::fmt_param_value`), one probe registration, and the same
+// enum-picker/stepped-slider branch for whatever the SCRIPT (v70 META) or
+// the PLUGIN (v74 VstParamDesc metadata) declares.
+
+/// Everything `param_row` needs about one parameter. `v_min`/`v_max` are
+/// the space the CALLER's value lives in (stock: engineering units;
+/// hosted: normalized 0..=1 cells). `disp_min`/`disp_max` map that space
+/// for the READOUT only — hosted backends whose ABI guarantees the
+/// linear norm↔plain default (CLAP) fill them with the plain range;
+/// everyone else keeps them equal to `v_min`/`v_max` so the readout never
+/// invents an engineering value the plugin did not hand us.
+pub struct ParamRowSpec<'a> {
+    pub label: &'a str,
+    pub v_min: f32,
+    pub v_max: f32,
+    pub disp_min: f32,
+    pub disp_max: f32,
+    /// `SLOOPER_UNIT_*` code (0 = plain number).
+    pub unit: u32,
+    /// Raw unit text the plugin reported, shown in the hover tip when the
+    /// kit has no code for it ("" = none).
+    pub raw_unit: &'a str,
+    pub log_scale: bool,
+    /// Value-space snap step (0 = free). Ignored by enum pickers.
+    pub step: f32,
+    /// Plugin/script-declared choices: non-empty renders a picker.
+    pub labels: &'a [String],
+    /// Stock editors: double-click = set value, right-click = automation.
+    /// Hosted windows pass false (their menus live elsewhere).
+    pub gestures: bool,
+    /// Hosted hint line, e.g. "changes apply live". "" = none.
+    pub echo_hint: &'a str,
+}
+
+/// `param_row` verdict: the widget Response (drive change detection with
+/// `crate::ui::p_changed` on it) plus the gesture hits and the readout
+/// text currently on screen — status echoes reuse it verbatim.
+pub struct ParamRowOut {
+    pub r: egui::Response,
+    pub secondary: bool,
+    pub dbl: bool,
+    pub readout: String,
+}
+
+/// The single param-row renderer. Callers own persistence: detect a
+/// change with `p_changed(&out.r, before, &mut v)` (the revert guard is
+/// part of the contract) and push `v` where it belongs.
+pub fn param_row(ui: &mut Ui, row_id: egui::Id, spec: &ParamRowSpec, v: &mut f32) -> ParamRowOut {
+    let span = (spec.v_max - spec.v_min).max(1e-9);
+    let u = unit_suffix(spec.unit);
+    let readout_of = |val: f32| -> String {
+        let disp = spec.disp_min + (spec.disp_max - spec.disp_min) * ((val - spec.v_min) / span);
+        crate::fx::fmt_param_value(disp, spec.unit)
+    };
+    let n = spec.labels.len();
+    if n > 0 {
+        let pos = (*v - spec.v_min) / span;
+        let cur = (pos * (n - 1) as f32)
+            .round()
+            .clamp(0.0, (n - 1) as f32) as usize;
+        let mut idx = cur;
+        let rc = ComboBox::from_id_salt(row_id)
+            .width(150.0)
+            .show_index(ui, &mut idx, n, |i| spec.labels[i].clone());
+        probe_record(spec.label, rc.rect);
+        // `secondary_clicked` FIRST — `on_hover_text` MOVES the Response
+        // (egui 0.36: Response is not Copy; the v53 original kept this
+        // order for exactly that reason).
+        let secondary = rc.secondary_clicked();
+        let tip = if spec.gestures {
+            "pick a choice \u{b7} right-click: automation for this param".to_string()
+        } else {
+            format!("{}: {}", spec.label, spec.labels[cur])
+        };
+        let r = rc.on_hover_text(tip);
+        let mut shown = cur;
+        if idx != cur && idx < n {
+            *v = spec.v_min + span * idx as f32 / (n - 1) as f32;
+            shown = idx;
+        }
+        let readout = spec.labels[shown].clone();
+        ui.label(RichText::new(&readout).monospace().small());
+        ParamRowOut {
+            secondary,
+            dbl: false,
+            readout,
+            r,
+        }
+    } else {
+        let mut sl = Slider::new(v, spec.v_min..=spec.v_max);
+        if spec.log_scale {
+            sl = sl.logarithmic(true);
+        }
+        if spec.step > 0.0 {
+            sl = sl.step_by(spec.step as f64);
+        }
+        // v29/v53 contract: fixed-width slider, kit tooltip, raw click
+        // gestures instead of the drag-killing same-id click union.
+        let r = ui.add_sized(Vec2::new(150.0, 0.0), sl.text(spec.label));
+        probe_record(spec.label, r.rect);
+        let tip = if spec.gestures {
+            kit_tip(spec.label, *v, spec.v_min, spec.v_max, spec.unit)
+        } else {
+            let raw = if spec.unit == 0 && !spec.raw_unit.is_empty() {
+                format!(" \u{b7} plugin unit: {}", spec.raw_unit)
+            } else {
+                String::new()
+            };
+            let hint = if spec.echo_hint.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", spec.echo_hint)
+            };
+            format!(
+                "{}: {} \u{b7} range {:.2}\u{2026}{:.2}{}{}\u{b7} value from the plugin{}",
+                spec.label,
+                readout_of(*v),
+                spec.disp_min,
+                spec.disp_max,
+                u,
+                raw,
+                hint
+            )
+        };
+        let r = r.on_hover_text(tip);
+        let (rmb, dbl) = if r.hovered() {
+            ui.input(|i| {
+                (
+                    i.pointer.button_clicked(egui::PointerButton::Secondary),
+                    i.pointer
+                        .button_double_clicked(egui::PointerButton::Primary),
+                )
+            })
+        } else {
+            (false, false)
+        };
+        let secondary = r.secondary_clicked() || rmb;
+        let dbl = r.double_clicked() || dbl;
+        let readout = readout_of(*v);
+        ui.label(RichText::new(readout.clone()).monospace().small());
+        ParamRowOut {
+            secondary,
+            dbl,
+            readout,
+            r,
+        }
+    }
+}
+
 fn probe_record(label: &str, rect: egui::Rect) {
     #[cfg(test)]
     if let Ok(m) = KIT_PROBE.lock() {
@@ -1142,112 +1299,48 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
         ui.label(RichText::new("This effect has no parameters.").weak());
         return;
     }
-    egui::Grid::new(("fxauto", ed.loop_i, ed.slot))
-        .num_columns(3)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            for (k, p) in ed.desc.params.iter().enumerate() {
-                let mut v = ed.inst.param(k);
-                let before = v;
-                // Tier-6 ABI v4: enum params get a picker (values snap to
-                // equally spaced points min..max, readout shows the
-                // label); step params get a snapped slider; units ride
-                // the value readout. v1..v3 scripts have neither and
-                // render exactly as before.
-                if !p.labels.is_empty() {
-                    let n = p.labels.len();
-                    let val_of = |i: usize| {
-                        if n <= 1 || p.max.partial_cmp(&p.min) != Some(core::cmp::Ordering::Greater)
-                        {
-                            p.min
-                        } else {
-                            p.min + (p.max - p.min) * i as f32 / (n - 1) as f32
-                        }
-                    };
-                    let cur = if p.max > p.min && n > 1 {
-                        (((v - p.min) / (p.max - p.min)) * (n - 1) as f32)
-                            .round()
-                            .clamp(0.0, (n - 1) as f32) as usize
-                    } else {
-                        0
-                    };
-                    let mut idx = cur;
-                    let rc = ComboBox::from_id_salt(("fxenum", ed.loop_i, ed.slot, k))
-                        .width(150.0)
-                        .show_index(ui, &mut idx, n, |i| p.labels[i].clone());
-                    // v53: the auto grid states its gestures too, and enum
-                    // rows now open the SAME value menu the slider rows get
-                    // on right-click (automation for any param kind).
-                    probe_record(&p.label, rc.rect);
-                    // `secondary_clicked` first — on_hover_text moves the Response.
-                    let sec = rc.secondary_clicked();
-                    let _ = rc
-                        .on_hover_text("pick a choice · right-click: automation for this param");
-                    if sec {
-                        if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
-                            ed.ctx_menu = Some((k, v, pp));
-                        }
-                    }
-                    if idx != cur {
-                        v = val_of(idx);
-                    }
-                    ui.label(&p.label);
-                    ui.label(RichText::new(p.labels[cur].clone()).monospace().small());
-                    if (v - before).abs() > f32::EPSILON {
-                        ed.inst.set_param(k, v);
-                        ed.pending.push((k, v));
-                    }
-                    ui.end_row();
-                    continue;
-                }
-                let mut sl = Slider::new(&mut v, p.min..=p.max);
-                if p.min > 0.0 && p.max / p.min > 50.0 {
-                    sl = sl.logarithmic(true);
-                }
-                if p.step > 0.0 {
-                    sl = sl.step_by(p.step as f64);
-                }
-                // v29: raw click gestures instead of the drag-killing
-                // same-id click union (see the bridge slider above).
-                let r = ui.add_sized(Vec2::new(150.0, 0.0), sl);
-                // v53: same kit tooltip the bridge widgets hand out
-                // (value, range with unit, both click gestures).
-                probe_record(&p.label, r.rect);
-                let r = r.on_hover_text(kit_tip(&p.label, v, p.min, p.max, p.unit));
-                let (rmb, dbl) = if r.hovered() {
-                    ui.input(|i| {
-                        (
-                            i.pointer.button_clicked(egui::PointerButton::Secondary),
-                            i.pointer
-                                .button_double_clicked(egui::PointerButton::Primary),
-                        )
-                    })
-                } else {
-                    (false, false)
-                };
-                // v0.15: right-click hands the request to the UI layer, which
-                // shows Set value / Create automation asset for `fx:<row>:<k>`.
-                if r.secondary_clicked() || rmb {
-                    if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
-                        ed.ctx_menu = Some((k, v, pp));
-                    }
-                }
-                if r.double_clicked() || dbl {
-                    ed.dbl_set = Some((k, v));
-                }
-                ui.label(&p.label);
-                ui.label(
-                    RichText::new(format!("{v:.2}{}", unit_suffix(p.unit)))
-                        .monospace()
-                        .small(),
-                );
-                if crate::ui::p_changed(&r, before, &mut v) {
-                    ed.inst.set_param(k, v);
-                    ed.pending.push((k, v));
-                }
-                ui.end_row();
+    // v74: rows stack through the SHARED renderer — the very same
+    // `param_row` the hosted PARAMETERS window drives, so stock and
+    // hosted params are pixel- and format-identical (the retired
+    // 3-column grid was forked chrome). Tier-6 ABI v4 semantics are
+    // unchanged: enum params pick, step params snap, units ride the
+    // readout; v1..v3 scripts declare neither and render as plain
+    // sliders.
+    for (k, p) in ed.desc.params.iter().enumerate() {
+        let mut v = ed.inst.param(k);
+        let before = v;
+        let spec = ParamRowSpec {
+            label: &p.label,
+            v_min: p.min,
+            v_max: p.max,
+            disp_min: p.min,
+            disp_max: p.max,
+            unit: p.unit,
+            raw_unit: "",
+            // Same log rule the pre-v74 auto grid used.
+            log_scale: p.min > 0.0 && p.max / p.min > 50.0,
+            step: p.step,
+            labels: &p.labels,
+            gestures: true,
+            echo_hint: "",
+        };
+        let out = param_row(ui, ui.id().with(("fxauto-row", k)), &spec, &mut v);
+        // v0.15/v53: right-click hands the request to the UI layer (Set
+        // value / Create automation asset), double-click opens the
+        // inline value box — for ANY param kind.
+        if out.secondary {
+            if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
+                ed.ctx_menu = Some((k, v, pp));
             }
-        });
+        }
+        if out.dbl {
+            ed.dbl_set = Some((k, v));
+        }
+        if crate::ui::p_changed(&out.r, before, &mut v) {
+            ed.inst.set_param(k, v);
+            ed.pending.push((k, v));
+        }
+    }
 }
 
 /// Tier-6: short readout suffix for `ParamMetaV1::unit` codes.
