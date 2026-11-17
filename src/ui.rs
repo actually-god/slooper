@@ -3875,6 +3875,8 @@ impl App {
                 self.vst_scanned = true;
                 self.vst_scan_rx = None;
                 self.vst_note = format!("{n} plugin(s) ready");
+                // v76 R1d: completion lands in the status bar as well.
+                self.status = self.vst_note.clone();
                 changed = true;
             }
         }
@@ -5234,6 +5236,9 @@ impl App {
             }
         }
         self.vst_note = format!("scanning {} folder(s)…", dirs.len());
+        // v76 R1d: the status bar knows too — the scan must not be silent
+        // outside the one window that renders vst_note.
+        self.status = self.vst_note.clone();
         self.vst_scan_rx = Some(crate::vsthost::scan_async(dirs));
     }
 
@@ -5488,8 +5493,15 @@ impl App {
         let src = PathBuf::from(from_root).join(from_dir.replace('/', sep));
         let name = from_dir.rsplit('/').next().unwrap_or(from_dir);
         let np = dest_dir.join(name);
-        if np == src || np.starts_with(&src) {
-            return; // already there, or nesting a folder into itself
+        // v76 R2f: both guards echo — a silent drop-back looked identical
+        // to a successful move.
+        if np == src {
+            self.status = "move: folder already there".into();
+            return;
+        }
+        if np.starts_with(&src) {
+            self.status = "move: cannot nest a folder inside itself".into();
+            return;
         }
         if !src.exists() {
             self.status = "move: folder not found on disk".into();
@@ -6274,6 +6286,9 @@ impl App {
         };
         let np = dest_dir.join(file);
         if np == oldp {
+            // v76 R2f: a drop onto the file's OWN folder is a no-op —
+            // echo it, don't leave the user doubting the drop landed.
+            self.status = "move: already in this folder".into();
             return;
         }
         if np.exists() {
@@ -20966,9 +20981,12 @@ fn rack_file_row(
             } else {
                 w
             };
+            // v76 R4b: one line, ellipsis-free hard truncation (wrap would
+            // clip a second line inside the 20 px row); the row hover
+            // carries the FULL path.
             ui.add_sized(
                 egui::vec2(rw, 20.0),
-                egui::Button::selectable(sel, RichText::new(name).small()),
+                egui::Button::selectable(sel, RichText::new(name).small()).truncate(),
             )
         })
         .inner;
@@ -21136,6 +21154,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                 app.note_dir("rack", &p);
                 let mut f = RackFolder::new(p.to_string_lossy().into_owned());
                 f.rescan();
+                // v76: the new folder appears in the tree — the status
+                // line names which one (goal 1: no silent actions).
+                app.status = format!("rack folder added \u{b7} {}", p.display());
                 app.rack.push(f);
                 app.save_config();
             }
@@ -21284,7 +21305,13 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 ))
                                 .interact(egui::Sense::click_and_drag()),
                             );
-                            if ui.small_button("scan").clicked() {
+                            if ui
+                                .small_button("scan")
+                                .on_hover_text(
+                                    "re-scan this folder from disk \u{2014} files added outside slooper appear",
+                                )
+                                .clicked()
+                            {
                                 rescan = Some(fi);
                             }
                             if ui
@@ -21429,8 +21456,14 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                              -> bool {
                                 let key = format!("{path}\u{1}{key_tail}");
                                 let open = !app.rack_collapsed.contains(&key);
-                                let hw = (ui.available_width() - if child { 14.0 } else { 0.0 })
-                                    .max(24.0);
+                                // v76 R4a: child headers START indented
+                                // (+12 = the parent's file-row column), not
+                                // merely narrower — depth reads as x,
+                                // matching the 12/24 file-row steps.
+                                if child {
+                                    ui.add_space(12.0);
+                                }
+                                let hw = ui.available_width().max(24.0);
                                 let hr = ui.add_sized(
                                     egui::vec2(hw, 18.0),
                                     egui::Button::new(
@@ -21445,7 +21478,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         ))
                                         .small()
                                         .strong(),
-                                    ),
+                                    )
+                                    .truncate(),
                                 );
                                 // v50 R4: ONE click_and_drag response owns
                                 // the header — click toggles collapse, a
@@ -21461,14 +21495,16 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 // renders once per kind section, and an
                                 // unsalted shared id made every click
                                 // resolve to the last section's instance.
+                                // v76 R3b: ONE hover copy owns this response —
+                                // the old second on_hover_text (below, at the
+                                // end of header()) silently replaced this
+                                // one, killing the drag hint.
                                 let hg = ui.interact(
                                     hr.rect,
                                     ui.id()
                                         .with(("rackdirg", &key, hr.rect.min.y as i32)),
                                     Sense::click_and_drag(),
-                                )
-                                .on_hover_text(if open { "click to collapse · drag to move · right-click for the menu" }
-                                    else { "click to expand · drag to move · right-click for the menu" });
+                                );
                                 if hg.clicked() {
                                     if open {
                                         app.rack_collapsed.insert(key.clone());
@@ -21608,8 +21644,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     fold = Some((path.clone(), fold_dir, m));
                                 }
                                 hg.on_hover_text(format!(
-                                    "sub-folder {label} \u{2014} click to {} \u{b7} right-click \
-                                     to re-order{}",
+                                    "sub-folder {label} \u{2014} click to {} \u{b7} drag onto \
+                                     another header to move \u{b7} right-click to re-order{}",
                                     if open { "collapse" } else { "expand" },
                                     if marker {
                                         " \u{b7} '*' = recordings land here"
@@ -21735,6 +21771,12 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                     if let Some(fi) = rescan {
                         if let Some(f) = app.rack.get_mut(fi) {
                             f.rescan();
+                            // v76 R2a: the rescan says what it found.
+                            app.status = format!(
+                                "scanned \u{201c}{}\u{201d} \u{b7} {} file(s)",
+                                base_name(&f.path),
+                                f.files.len()
+                            );
                         }
                     }
                     if let Some(fi) = browse {
@@ -21746,6 +21788,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             app.note_dir("rack-browse", &p);
                             app.rack[fi].path = p.to_string_lossy().into_owned();
                             app.rack[fi].rescan();
+                            // v76 R2c: which folder the slot now points at.
+                            app.status = format!("rack folder now \u{b7} {}", p.display());
                             app.save_config();
                         }
                     }
@@ -21754,11 +21798,18 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                         app.rack_newsub = Some((fi, String::new()));
                     }
                     if let Some(fi) = rm {
+                        let gone = app
+                            .rack
+                            .get(fi)
+                            .map(|f| base_name(&f.path))
+                            .unwrap_or_default();
                         if app.rack.len() > 1 || fi != 0 {
                             app.rack.remove(fi);
                         } else {
                             app.rack.clear();
                         }
+                        // v76 R2d: which folder left the rack.
+                        app.status = format!("rack folder removed \u{b7} {gone}");
                         app.save_config();
                     }
                     // v29: apply a sub-folder reorder and persist it — this
@@ -21834,6 +21885,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             }
                         }
                         if moved {
+                            let label = dir.clone();
                             if let Some(row) = app
                                     .rack_dir_order
                                     .iter_mut()
@@ -21847,7 +21899,17 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     });
                                 }
                             app.save_config();
-                            }
+                            // v76 R2e: the reorder confirms itself.
+                            app.status = format!(
+                                "folder order \u{b7} {label} {}",
+                                if dlt < 0 { "moved up" } else { "moved down" }
+                            );
+                        } else {
+                            // v76 R2e: at the edge nothing moved — say so.
+                            app.status = format!(
+                                "folder order \u{b7} {dir} already at the {}",
+                                if dlt < 0 { "top" } else { "bottom" }
+                            );
                         }
 
                     // Project-only assets: recordings with no rack folder,
@@ -21890,7 +21952,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         if dirty { " *" } else { "" }
                                     ))
                                     .small(),
-                                ),
+                                )
+                                .truncate(),
                             );
                             rack_kind_badge(ui, row.rect, kind);
                             // Merged click+drag response (see rack rows above).
@@ -22007,9 +22070,17 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                 });
                             }
-                            row.on_hover_text(
-                                "part of this project (not a rack file) \u{2014} draggable \u{b7} right-click to rename / move / delete",
-                            );
+                            row.on_hover_text(format!(
+                                "{}part of this project (not a rack file) \u{2014} draggable \
+                                 \u{b7} right-click to rename / move / delete",
+                                if apath.as_os_str().is_empty() {
+                                    String::new()
+                                } else {
+                                    // v76 R4b: same full-path affordance
+                                    // the rack rows have.
+                                    format!("{} \u{b7} ", apath.display())
+                                }
+                            ));
                         }
                     }
 
@@ -23308,6 +23379,15 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
     }
     let cur = app.track_synth[t].clone().unwrap_or_default();
     ui.label(RichText::new("Synthesizers (click binds to this track):").strong());
+    // v76 R1a: an in-flight scan says so even when cached rows already
+    // fill the list.
+    if app.vst_scan_rx.is_some() {
+        ui.label(
+            RichText::new("scanning plugin folders\u{2026} instruments appear as they are found")
+                .weak()
+                .small(),
+        );
+    }
     // (tag, label, stem-to-bind) for every choice: the default,
     // every script synth, every scanned plugin instrument.
     let mut rows: Vec<(&'static str, String, String)> =
@@ -23386,6 +23466,19 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 app.set_track_synth_stem(t, &stem);
             }
         });
+    // v76 R1c: a failed probe is never invisible — count it here, name
+    // it in the MIXER CHAIN window's + VST list.
+    let failed = app.vst_scan.iter().filter(|e| e.error.is_some()).count();
+    if failed > 0 {
+        ui.label(
+            RichText::new(format!(
+                "{failed} plugin file(s) failed to open \u{2014} the MIXER CHAIN \
+                 window\u{2019}s \"+ VST plugin\" list names them"
+            ))
+            .color(Color32::from_rgb(220, 120, 120))
+            .small(),
+        );
+    }
     ui.label(
         RichText::new(
             "[rust] native synth script (compiled Rust, in the script folder) \u{2014} \
@@ -27048,15 +27141,23 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             .selected_text("+ VST plugin")
             .width(320.0)
             .show_ui(ui, |ui| {
-                if app.vst_scan.is_empty() {
+                // v76 R1a: a rescan is never silent — the row shows even
+                // while a cached list is painted below it.
+                if app.vst_scan_rx.is_some() {
                     ui.label(
-                        RichText::new(if app.vst_scan_rx.is_some() {
-                            "scanning plugin folders\u{2026}"
-                        } else {
+                        RichText::new(
+                            "scanning plugin folders\u{2026} (list = previous scan)",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else if app.vst_scan.is_empty() {
+                    ui.label(
+                        RichText::new(
                             "no plugins found \u{2014} add the folder your plugins live \
                                      in (drag-and-drop installs included) and press \
-                                     Rescan Plugins below"
-                        })
+                                     Rescan Plugins below",
+                        )
                         .weak()
                         .small(),
                     );
@@ -27065,7 +27166,15 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                     .max_height(240.0)
                     .show(ui, |ui| {
                         for e in app.vst_scan.clone() {
-                            if e.error.is_some() {
+                            if let Some(err) = e.error.as_ref() {
+                                // v76 R1b: broken files are LISTED, dimmed
+                                // and explain themselves — the documented
+                                // VstEntry.error contract (previously a
+                                // silent skip).
+                                let lbl = format!("\u{d7} {} \u{b7} failed to open", e.name);
+                                let rr = ui
+                                    .add_enabled(false, egui::SelectableLabel::new(false, lbl));
+                                rr.on_hover_text(format!("{} \u{b7} {err}", e.path.display()));
                                 continue;
                             }
                             // v0.19: an instrument is NOT an effect.
