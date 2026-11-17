@@ -1983,6 +1983,154 @@ pub struct VstParamDesc {
     /// editor's own program edits stay index-aligned and the runtime
     /// selection write has a slot to push through the RT ring.
     pub program_change: bool,
+    /// v74: display unit as a bridge-kit `SLOOPER_UNIT_*` code (0 = plain
+    /// number). Mapped from the plugin's own unit report; the row renderer
+    /// (fxgui::param_row) formats the readout through the same formatter
+    /// the stock v70 kit uses, so stock and hosted rows read identically.
+    pub unit: u32,
+    /// v74: raw unit text as the plugin reports it (VST3
+    /// `ParameterInfo::unit`). Kept verbatim for the hover tip when the
+    /// text maps to no known code — never invented by the host.
+    pub unit_text: String,
+    /// v74: engineering range the readout maps the normalized cell into
+    /// (0.0..=1.0 = identity). Only backends whose ABI guarantees the
+    /// linear norm↔plain default fill this — CLAP today; VST3 keeps the
+    /// plain range private inside the plugin, so it honestly stays 0..=1.
+    pub plain_min: f32,
+    /// v74: see `plain_min`.
+    pub plain_max: f32,
+    /// v74: declared discrete VALUE count (2 = toggle, 3 = three-way …);
+    /// 0 = continuous knob. VST3 `stepCount` counts the gaps between the
+    /// values, so reported `n` becomes `n + 1` here. Renderers snap the
+    /// knob to equally spaced points and pick a picker when labels exist.
+    pub steps: u32,
+    /// v74: choice labels SAMPLED FROM THE PLUGIN at load (VST3
+    /// `format_parameter` at the step centers, CLAP `value_to_text` at
+    /// each step). Empty = no sampled labels (continuous knob, or the
+    /// plugin refused to format). Never host-invented except the documented
+    /// VST3 two-state Off/On fallback.
+    pub enum_labels: Vec<String>,
+}
+
+/// v74: identity defaults so backend/test literals state only what they
+/// actually know (`..Default::default()`).
+impl Default for VstParamDesc {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            default: 0.0,
+            writable: true,
+            program_change: false,
+            unit: 0,
+            unit_text: String::new(),
+            plain_min: 0.0,
+            plain_max: 1.0,
+            steps: 0,
+            enum_labels: Vec::new(),
+        }
+    }
+}
+
+/// v74: map a plugin-reported unit string to the kit's `SLOOPER_UNIT_*`
+/// code. Exact-ish text match (case-insensitive, trimmed); anything the
+/// kit cannot render stays 0 and rides through as raw `unit_text`.
+pub fn unit_code_from_text(text: &str) -> u32 {
+    use crate::fx::{
+        SLOOPER_UNIT_BEATS, SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_MS,
+        SLOOPER_UNIT_PERCENT, SLOOPER_UNIT_SAMPLES, SLOOPER_UNIT_SEMITONES,
+        SLOOPER_UNIT_SECONDS, SLOOPER_UNIT_TIMES,
+    };
+    let t = text.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "%" | "percent" => SLOOPER_UNIT_PERCENT,
+        "db" => SLOOPER_UNIT_DB,
+        "hz" => SLOOPER_UNIT_HZ,
+        "ms" | "millis" | "milliseconds" => SLOOPER_UNIT_MS,
+        "s" | "sec" | "secs" | "seconds" => SLOOPER_UNIT_SECONDS,
+        "st" | "st." | "semitone" | "semitones" => SLOOPER_UNIT_SEMITONES,
+        "x" | "times" | "ratio" => SLOOPER_UNIT_TIMES,
+        "beats" => SLOOPER_UNIT_BEATS,
+        "samples" | "smp" => SLOOPER_UNIT_SAMPLES,
+        _ => 0,
+    }
+}
+
+/// v74: VST3 `ParameterInfo::stepCount` counts the GAPS between discrete
+/// values (crate docs: 0 = continuous, 1 = toggle, n = n+1 values).
+/// Saturate at the picker cap so a runaway plugin cannot build a giant
+/// combo; above the cap the knob still snaps by `steps` minus sampling.
+pub(crate) fn vst3_steps_from_report(step_count: i32) -> u32 {
+    if step_count < 1 {
+        return 0;
+    }
+    (step_count as u64 + 1).min(64) as u32
+}
+
+/// v74: sample one label per discrete position. `sample(i)` must return
+/// the PLUGIN's own text for position `i` (None = refusal/error, which
+/// abandons sampling — half a label set is worse than a snapped knob).
+/// A failed two-state read falls back to the industry Off/On pair.
+pub(crate) fn sample_step_labels(
+    steps: u32,
+    fallback_on_off: bool,
+    mut sample: impl FnMut(usize) -> Option<String>,
+) -> Vec<String> {
+    if !(2..=64).contains(&steps) {
+        return Vec::new();
+    }
+    let mut labels = Vec::with_capacity(steps as usize);
+    for i in 0..steps as usize {
+        match sample(i) {
+            Some(t) if !t.trim().is_empty() => labels.push(t.trim().to_string()),
+            _ => {
+                if fallback_on_off && steps == 2 {
+                    return vec!["Off".into(), "On".into()];
+                }
+                return Vec::new();
+            }
+        }
+    }
+    labels
+}
+
+/// v74: normalized value at the CENTER of discrete position `i` of
+/// `steps` — matches the vst3-host crate's `step_index` bucketing
+/// (`norm*(n+1)` bucketed), whose bucket i spans [i/n, (i+1)/n).
+pub(crate) fn step_center_norm(i: usize, steps: u32) -> f64 {
+    if steps <= 1 {
+        return 0.0;
+    }
+    (i as f64 + 0.5) / steps as f64
+}
+
+/// v74: the pure VST3 descriptor mapping (label sampling happens at the
+/// call site — it is the only plugin round trip). `enum_labels` must come
+/// from `sample_step_labels` with the plugin's own `format_parameter`.
+pub(crate) fn desc_from_vst3_param(
+    id: u32,
+    name: String,
+    default: f32,
+    is_read_only: bool,
+    flags: u32,
+    unit_text: String,
+    step_count: i32,
+    enum_labels: Vec<String>,
+) -> VstParamDesc {
+    let steps = vst3_steps_from_report(step_count);
+    VstParamDesc {
+        id,
+        name,
+        default,
+        writable: !is_read_only,
+        program_change: flags & VST3_K_IS_PROGRAM_CHANGE != 0,
+        unit: unit_code_from_text(&unit_text),
+        unit_text,
+        plain_min: 0.0,
+        plain_max: 1.0,
+        steps,
+        enum_labels,
+    }
 }
 
 /// VST3 `ParameterInfo::kIsProgramChange` (ivsteditcontroller.h, 1 << 15).
@@ -3059,15 +3207,31 @@ fn open_v3(
     let ps = plugin
         .get_parameters()
         .map_err(|e| format!("params: {e}"))?;
+    // v74: bridge-kit metadata. Stepped params get the plugin's OWN
+    // labels sampled once at load (format_parameter at each step
+    // center — process-isolated IPC, so kept to <=64 calls on stepped
+    // params only); the unit text maps onto the kit's unit codes when
+    // the kit can render it.
     let descs: Vec<VstParamDesc> = ps
         .iter()
         .take(VST_MAX_PARAMS)
-        .map(|p| VstParamDesc {
-            id: p.id,
-            name: p.name.clone(),
-            default: p.default as f32,
-            writable: !p.is_read_only,
-            program_change: p.flags & VST3_K_IS_PROGRAM_CHANGE != 0,
+        .map(|p| {
+            let steps = vst3_steps_from_report(p.step_count);
+            let enum_labels = sample_step_labels(steps, true, |i| {
+                plugin
+                    .format_parameter(p.id, step_center_norm(i, steps))
+                    .ok()
+            });
+            desc_from_vst3_param(
+                p.id,
+                p.name.clone(),
+                p.default as f32,
+                p.is_read_only,
+                p.flags,
+                p.unit.clone(),
+                p.step_count,
+                enum_labels,
+            )
         })
         .collect();
     // v66 snapshot: read the wired program cell back. With several
@@ -3289,6 +3453,9 @@ fn open_v2(
                 default: params_obj.get_parameter(i as i32),
                 writable: true,
                 program_change: false,
+                // v74: VST2 declares no units/steps in the vendored
+                // wrapper — honest plain knob via identity defaults.
+                ..Default::default()
             }
         })
         .collect();
@@ -4054,6 +4221,7 @@ mod tests {
                 default: 0.0, // the bogus metadata Dexed reports
                 writable: true,
                 program_change: false,
+                ..Default::default()
             },
             VstParamDesc {
                 id: 1,
@@ -4061,6 +4229,7 @@ mod tests {
                 default: 0.0,
                 writable: true,
                 program_change: false,
+                ..Default::default()
             },
         ];
         // Plugin's actual state on fresh load: full output, filter open.
@@ -4083,6 +4252,7 @@ mod tests {
                 default: 0.25,
                 writable: true,
                 program_change: false,
+                ..Default::default()
             },
             VstParamDesc {
                 id: 1,
@@ -4090,6 +4260,7 @@ mod tests {
                 default: 0.75,
                 writable: true,
                 program_change: false,
+                ..Default::default()
             },
         ];
         let p = VstParams::new(&descs);

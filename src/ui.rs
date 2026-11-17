@@ -3708,30 +3708,61 @@ impl App {
             }
         }
         let ql = new_filter.trim().to_lowercase();
-        let rows: Vec<(usize, String)> = entry
+        // v74: carry the FULL descriptor — every row renders through the
+        // ONE kit renderer (`fxgui::param_row`) the stock auto grid uses:
+        // same chrome, same formatter, hover tips, and pickers where the
+        // plugin declared steps. program_change params stay filtered out
+        // of the knob list (v66 contract — the program combo owns them).
+        let rows: Vec<(usize, crate::vsthost::VstParamDesc)> = entry
             .descs()
             .iter()
             .enumerate()
             .filter(|(_, d)| d.writable && !d.program_change)
             .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
             .take(400)
-            .map(|(k, d)| (k, d.name.clone()))
+            .map(|(k, d)| (k, d.clone()))
             .collect();
+        let mut echo: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (k, name) in rows {
+                for (k, d) in rows {
                     let mut v = entry.params().get(k);
                     let before = v;
-                    let s = ui.add(
-                        egui::Slider::new(&mut v, 0.0..=1.0)
-                            .text(name.chars().take(24).collect::<String>()),
-                    );
-                    if p_changed(&s, before, &mut v) {
+                    let spec = crate::fxgui::ParamRowSpec {
+                        label: &d.name,
+                        v_min: 0.0,
+                        v_max: 1.0,
+                        disp_min: d.plain_min,
+                        disp_max: d.plain_max,
+                        unit: d.unit,
+                        raw_unit: &d.unit_text,
+                        log_scale: false,
+                        step: if d.steps > 1 {
+                            1.0 / (d.steps - 1) as f32
+                        } else {
+                            0.0
+                        },
+                        labels: &d.enum_labels,
+                        gestures: false,
+                        echo_hint: "changes apply live",
+                    };
+                    let out =
+                        crate::fxgui::param_row(ui, ui.id().with(("v74param", k)), &spec, &mut v);
+                    if p_changed(&out.r, before, &mut v) {
                         entry.set_param(k, v);
+                        // Goal 1 echo: a picker pick answers at once; a
+                        // drag answers when the pointer LIFTS (no flood
+                        // of status lines mid-drag).
+                        if out.r.drag_stopped() || !d.enum_labels.is_empty() {
+                            echo = Some(format!("{} \u{2192} {} (live)", d.name, out.readout));
+                        }
                     }
                 }
             });
+        if let Some(e) = echo {
+            self.status = e;
+        }
         self.params_filter = new_filter;
         // v60: apply the program picked this frame (deferred so the row
         // closed before we touch self.status).
@@ -49467,6 +49498,7 @@ mod tests {
                     default: 0.5,
                     writable: true,
                     program_change: false,
+                ..Default::default()
                 }]
             })
         }
