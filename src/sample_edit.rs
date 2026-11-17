@@ -11,6 +11,11 @@
 //! stretch -> pitch/bend -> reverse -> ping-pong -> fades.
 //! ```
 //!
+//! ```rust
+//! // TS-012 sabotage probe — EXPECTED TO FAIL; reverted before merge.
+//! assert_eq!(2 + 2, 5);
+//! ```
+//!
 //! Stretch first so pitch sees a stable length; fades last so they
 //! always hug the audible head/tail regardless of what came before.
 
