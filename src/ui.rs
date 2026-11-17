@@ -3875,6 +3875,8 @@ impl App {
                 self.vst_scanned = true;
                 self.vst_scan_rx = None;
                 self.vst_note = format!("{n} plugin(s) ready");
+                // v76 R1d: completion lands in the status bar as well.
+                self.status = self.vst_note.clone();
                 changed = true;
             }
         }
@@ -5234,6 +5236,9 @@ impl App {
             }
         }
         self.vst_note = format!("scanning {} folder(s)…", dirs.len());
+        // v76 R1d: the status bar knows too — the scan must not be silent
+        // outside the one window that renders vst_note.
+        self.status = self.vst_note.clone();
         self.vst_scan_rx = Some(crate::vsthost::scan_async(dirs));
     }
 
@@ -5488,8 +5493,15 @@ impl App {
         let src = PathBuf::from(from_root).join(from_dir.replace('/', sep));
         let name = from_dir.rsplit('/').next().unwrap_or(from_dir);
         let np = dest_dir.join(name);
-        if np == src || np.starts_with(&src) {
-            return; // already there, or nesting a folder into itself
+        // v76 R2f: both guards echo — a silent drop-back looked identical
+        // to a successful move.
+        if np == src {
+            self.status = "move: folder already there".into();
+            return;
+        }
+        if np.starts_with(&src) {
+            self.status = "move: cannot nest a folder inside itself".into();
+            return;
         }
         if !src.exists() {
             self.status = "move: folder not found on disk".into();
@@ -6274,6 +6286,9 @@ impl App {
         };
         let np = dest_dir.join(file);
         if np == oldp {
+            // v76 R2f: a drop onto the file's OWN folder is a no-op —
+            // echo it, don't leave the user doubting the drop landed.
+            self.status = "move: already in this folder".into();
             return;
         }
         if np.exists() {
@@ -20966,9 +20981,45 @@ fn rack_file_row(
             } else {
                 w
             };
+            // v76 R4b: one line, HARD truncation. Button::truncate() and
+            // RichText wrapping are BOTH word-based and Button overwrites
+            // any job wrap (widget_text.rs into_layout_job), so a 70-char
+            // space-less name survives them whole (v76 pin proved it).
+            // Cut the string here using egui's own metrics; the row hover
+            // carries the FULL path.
+            let short = {
+                let fid = egui::TextStyle::Small.resolve(ui.style());
+                let col = ui.visuals().widgets.noninteractive.fg_stroke.color;
+                let max_w = (rw - 28.0).max(60.0);
+                let wide = name.chars().count() > 10;
+                ui.ctx().fonts_mut(|fb| {
+                    let mut mk = |s: &str| {
+                        let mut j = egui::epaint::text::LayoutJob::simple(
+                            s.to_string(),
+                            fid.clone(),
+                            col,
+                            f32::INFINITY,
+                        );
+                        j.wrap.max_rows = 1;
+                        fb.layout_job(j).size().x
+                    };
+                    if !wide || mk(name) <= max_w {
+                        return name.to_string();
+                    }
+                    let mut cs: Vec<char> = name.chars().collect();
+                    loop {
+                        cs.pop();
+                        let cand: String =
+                            cs.iter().collect::<String>() + "\u{2026}";
+                        if cs.len() < 3 || mk(&cand) <= max_w {
+                            return cand;
+                        }
+                    }
+                })
+            };
             ui.add_sized(
                 egui::vec2(rw, 20.0),
-                egui::Button::selectable(sel, RichText::new(name).small()),
+                egui::Button::selectable(sel, RichText::new(short).small()),
             )
         })
         .inner;
@@ -20984,6 +21035,14 @@ fn rack_file_row(
         ui.id().with(("rackdrag", fi, fp)),
         Sense::click_and_drag(),
     );
+    // v76 R4c: full-path affordance — the label truncates, so the row
+    // hover carries the entire on-disk path (TS-013). Response builders
+    // consume self, so re-shadow `dr` (same widget id, hover attached).
+    let dr = dr.on_hover_text(format!(
+        "{}\n{} \u{b7} click to audition \u{b7} drag to a lane strip",
+        fp.display(),
+        if kind == 1 { "MIDI file" } else { "audio file" }
+    ));
     if dr.clicked() {
         // Click = select + audition (asset preview).
         if let Some(k) = app.ensure_asset(fp) {
@@ -21065,7 +21124,9 @@ fn rack_file_row(
                         ui.close();
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("pick a folder to move this file into");
             if let Some(dest) = mv {
                 app.rack_move(&fp_disp, &dest);
             }
@@ -21136,6 +21197,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                 app.note_dir("rack", &p);
                 let mut f = RackFolder::new(p.to_string_lossy().into_owned());
                 f.rescan();
+                // v76: the new folder appears in the tree — the status
+                // line names which one (goal 1: no silent actions).
+                app.status = format!("rack folder added \u{b7} {}", p.display());
                 app.rack.push(f);
                 app.save_config();
             }
@@ -21284,7 +21348,13 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 ))
                                 .interact(egui::Sense::click_and_drag()),
                             );
-                            if ui.small_button("scan").clicked() {
+                            if ui
+                                .small_button("scan")
+                                .on_hover_text(
+                                    "re-scan this folder from disk \u{2014} files added outside slooper appear",
+                                )
+                                .clicked()
+                            {
                                 rescan = Some(fi);
                             }
                             if ui
@@ -21429,9 +21499,26 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                              -> bool {
                                 let key = format!("{path}\u{1}{key_tail}");
                                 let open = !app.rack_collapsed.contains(&key);
-                                let hw = (ui.available_width() - if child { 14.0 } else { 0.0 })
-                                    .max(24.0);
-                                let hr = ui.add_sized(
+                                // v76 R4a: child headers START indented
+                                // (+12 = the parent's file-row column), not
+                                // merely narrower — depth reads as x,
+                                // matching the 12/24 file-row steps. In a
+                                // vertical flow add_space would move y, so
+                                // the row is reserved full-width and the
+                                // content drawn into an x-shifted child ui.
+                                let ind = if child { 12.0 } else { 0.0 };
+                                let avail_w = ui.available_width().max(48.0);
+                                let hw = (avail_w - ind).max(24.0);
+                                let slot = ui.allocate_space(egui::vec2(avail_w, 18.0)).1;
+                                let mut hchild = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(egui::Rect::from_min_size(
+                                            slot.min + egui::vec2(ind, 0.0),
+                                            egui::vec2(hw, 18.0),
+                                        ))
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                );
+                                let hr = hchild.add_sized(
                                     egui::vec2(hw, 18.0),
                                     egui::Button::new(
                                         // ASCII +/- only (tofu trap).
@@ -21445,7 +21532,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         ))
                                         .small()
                                         .strong(),
-                                    ),
+                                    )
+                                    .truncate(),
                                 );
                                 // v50 R4: ONE click_and_drag response owns
                                 // the header — click toggles collapse, a
@@ -21461,14 +21549,16 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 // renders once per kind section, and an
                                 // unsalted shared id made every click
                                 // resolve to the last section's instance.
+                                // v76 R3b: ONE hover copy owns this response —
+                                // the old second on_hover_text (below, at the
+                                // end of header()) silently replaced this
+                                // one, killing the drag hint.
                                 let hg = ui.interact(
                                     hr.rect,
                                     ui.id()
                                         .with(("rackdirg", &key, hr.rect.min.y as i32)),
                                     Sense::click_and_drag(),
-                                )
-                                .on_hover_text(if open { "click to collapse · drag to move · right-click for the menu" }
-                                    else { "click to expand · drag to move · right-click for the menu" });
+                                );
                                 if hg.clicked() {
                                     if open {
                                         app.rack_collapsed.insert(key.clone());
@@ -21608,8 +21698,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     fold = Some((path.clone(), fold_dir, m));
                                 }
                                 hg.on_hover_text(format!(
-                                    "sub-folder {label} \u{2014} click to {} \u{b7} right-click \
-                                     to re-order{}",
+                                    "sub-folder {label} \u{2014} click to {} \u{b7} drag onto \
+                                     another header to move \u{b7} right-click to re-order{}",
                                     if open { "collapse" } else { "expand" },
                                     if marker {
                                         " \u{b7} '*' = recordings land here"
@@ -21735,6 +21825,12 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                     if let Some(fi) = rescan {
                         if let Some(f) = app.rack.get_mut(fi) {
                             f.rescan();
+                            // v76 R2a: the rescan says what it found.
+                            app.status = format!(
+                                "scanned \u{201c}{}\u{201d} \u{b7} {} file(s)",
+                                base_name(&f.path),
+                                f.files.len()
+                            );
                         }
                     }
                     if let Some(fi) = browse {
@@ -21746,6 +21842,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             app.note_dir("rack-browse", &p);
                             app.rack[fi].path = p.to_string_lossy().into_owned();
                             app.rack[fi].rescan();
+                            // v76 R2c: which folder the slot now points at.
+                            app.status = format!("rack folder now \u{b7} {}", p.display());
                             app.save_config();
                         }
                     }
@@ -21754,11 +21852,18 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                         app.rack_newsub = Some((fi, String::new()));
                     }
                     if let Some(fi) = rm {
+                        let gone = app
+                            .rack
+                            .get(fi)
+                            .map(|f| base_name(&f.path))
+                            .unwrap_or_default();
                         if app.rack.len() > 1 || fi != 0 {
                             app.rack.remove(fi);
                         } else {
                             app.rack.clear();
                         }
+                        // v76 R2d: which folder left the rack.
+                        app.status = format!("rack folder removed \u{b7} {gone}");
                         app.save_config();
                     }
                     // v29: apply a sub-folder reorder and persist it — this
@@ -21834,6 +21939,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             }
                         }
                         if moved {
+                            let label = dir.clone();
                             if let Some(row) = app
                                     .rack_dir_order
                                     .iter_mut()
@@ -21847,8 +21953,19 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     });
                                 }
                             app.save_config();
-                            }
+                            // v76 R2e: the reorder confirms itself.
+                            app.status = format!(
+                                "folder order \u{b7} {label} {}",
+                                if dlt < 0 { "moved up" } else { "moved down" }
+                            );
+                        } else {
+                            // v76 R2e: at the edge nothing moved — say so.
+                            app.status = format!(
+                                "folder order \u{b7} {dir} already at the {}",
+                                if dlt < 0 { "top" } else { "bottom" }
+                            );
                         }
+                    }
 
                     // Project-only assets: recordings with no rack folder,
                     // dirty edits, and files whose folder was removed.
@@ -21890,7 +22007,8 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         if dirty { " *" } else { "" }
                                     ))
                                     .small(),
-                                ),
+                                )
+                                .truncate(),
                             );
                             rack_kind_badge(ui, row.rect, kind);
                             // Merged click+drag response (see rack rows above).
@@ -21988,7 +22106,9 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                                     ui.close();
                                                 }
                                             }
-                                        });
+                                        })
+                                        .response
+                                        .on_hover_text("pick a folder to move this file into");
                                         if let Some(dest) = mv {
                                             app.rack_move(&apdisp, &dest);
                                         }
@@ -22007,9 +22127,17 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                 });
                             }
-                            row.on_hover_text(
-                                "part of this project (not a rack file) \u{2014} draggable \u{b7} right-click to rename / move / delete",
-                            );
+                            row.on_hover_text(format!(
+                                "{}part of this project (not a rack file) \u{2014} draggable \
+                                 \u{b7} right-click to rename / move / delete",
+                                if apath.as_os_str().is_empty() {
+                                    String::new()
+                                } else {
+                                    // v76 R4b: same full-path affordance
+                                    // the rack rows have.
+                                    format!("{} \u{b7} ", apath.display())
+                                }
+                            ));
                         }
                     }
 
@@ -23308,6 +23436,15 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
     }
     let cur = app.track_synth[t].clone().unwrap_or_default();
     ui.label(RichText::new("Synthesizers (click binds to this track):").strong());
+    // v76 R1a: an in-flight scan says so even when cached rows already
+    // fill the list.
+    if app.vst_scan_rx.is_some() {
+        ui.label(
+            RichText::new("scanning plugin folders\u{2026} instruments appear as they are found")
+                .weak()
+                .small(),
+        );
+    }
     // (tag, label, stem-to-bind) for every choice: the default,
     // every script synth, every scanned plugin instrument.
     let mut rows: Vec<(&'static str, String, String)> =
@@ -23386,6 +23523,19 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 app.set_track_synth_stem(t, &stem);
             }
         });
+    // v76 R1c: a failed probe is never invisible — count it here, name
+    // it in the MIXER CHAIN window's + VST list.
+    let failed = app.vst_scan.iter().filter(|e| e.error.is_some()).count();
+    if failed > 0 {
+        ui.label(
+            RichText::new(format!(
+                "{failed} plugin file(s) failed to open \u{2014} the MIXER CHAIN \
+                 window\u{2019}s \"+ VST plugin\" list names them"
+            ))
+            .color(Color32::from_rgb(220, 120, 120))
+            .small(),
+        );
+    }
     ui.label(
         RichText::new(
             "[rust] native synth script (compiled Rust, in the script folder) \u{2014} \
@@ -27048,15 +27198,23 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             .selected_text("+ VST plugin")
             .width(320.0)
             .show_ui(ui, |ui| {
-                if app.vst_scan.is_empty() {
+                // v76 R1a: a rescan is never silent — the row shows even
+                // while a cached list is painted below it.
+                if app.vst_scan_rx.is_some() {
                     ui.label(
-                        RichText::new(if app.vst_scan_rx.is_some() {
-                            "scanning plugin folders\u{2026}"
-                        } else {
+                        RichText::new(
+                            "scanning plugin folders\u{2026} (list = previous scan)",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else if app.vst_scan.is_empty() {
+                    ui.label(
+                        RichText::new(
                             "no plugins found \u{2014} add the folder your plugins live \
                                      in (drag-and-drop installs included) and press \
-                                     Rescan Plugins below"
-                        })
+                                     Rescan Plugins below",
+                        )
                         .weak()
                         .small(),
                     );
@@ -27065,7 +27223,15 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                     .max_height(240.0)
                     .show(ui, |ui| {
                         for e in app.vst_scan.clone() {
-                            if e.error.is_some() {
+                            if let Some(err) = e.error.as_ref() {
+                                // v76 R1b: broken files are LISTED, dimmed
+                                // and explain themselves — the documented
+                                // VstEntry.error contract (previously a
+                                // silent skip).
+                                let lbl = format!("\u{d7} {} \u{b7} failed to open", e.name);
+                                // A plain weak label: dimmed, inert.
+                                let rr = ui.label(RichText::new(lbl).weak().small());
+                                rr.on_hover_text(format!("{} \u{b7} {err}", e.path.display()));
                                 continue;
                             }
                             // v0.19: an instrument is NOT an effect.
@@ -50656,6 +50822,351 @@ mod tests {
         assert!(
             !fx_src.contains(&old_fmt.replace(' ', "")),
             "unit formatting must live once in fmt_param_value, not in fmt_param"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // v76 — TS-004: plugin rack / browser GUI pass. Scan/load state
+    // honesty (no silent async, failed probes visible), rack action
+    // echoes + hover, tree-row alignment + truncation.
+    // ---------------------------------------------------------------------
+
+    /// One fake scan entry (no dlopen — the UI filters on `error`).
+    fn v76_entry(name: &str, err: Option<&str>) -> crate::vsthost::VstEntry {
+        crate::vsthost::VstEntry {
+            path: std::path::PathBuf::from(format!("/vst76/{name}.vst3")),
+            kind: crate::vsthost::VstKind::V3,
+            name: name.to_string(),
+            vendor: "v76test".into(),
+            instrument: false,
+            plugin_id: None,
+            error: err.map(str::to_string),
+        }
+    }
+
+    /// v76 R1: both plugin browsers tell the truth. A probe-FAILED file
+    /// is LISTED (dimmed + explained) in the chain window's + VST popup,
+    /// and an in-flight rescan shows its status row even while the cached
+    /// list is painted. The synth picker shows the scanning row and a
+    /// failed-file footer.
+    #[test]
+    fn v76_browser_scan_states_visible() {
+        let mut app = headless_app("v76scan");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_window = Some(0);
+        app.vst_scanned = true;
+        app.vst_scan = vec![
+            v76_entry("GoodFx", None),
+            v76_entry("BrokenFx", Some("dlopen said no")),
+        ];
+        frame(&mut app, &ctx, vec![]);
+        let combo = painted_text_rect(&ctx, &mut app, "+ VST plugin").expect("combo painted");
+        click_pt(&mut app, &ctx, combo.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            painted_text_rect(&ctx, &mut app, "BrokenFx").is_some(),
+            "a probe-failed file must be LISTED dimmed (VstEntry.error contract), never hidden"
+        );
+        // Rescan in flight while the cached list is painted: the popup
+        // must say the list is stale, not silently keep showing it.
+        let (_tx, rx) = std::sync::mpsc::channel::<Vec<crate::vsthost::VstEntry>>();
+        app.vst_scan_rx = Some(rx);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            painted_text_rect(&ctx, &mut app, "(list = previous scan)").is_some(),
+            "in-flight rescan must announce itself over the cached popup list"
+        );
+        // Synth picker: scanning row despite cached rows, + failed footer.
+        let mut app2 = headless_app("v76scan2");
+        let ctx2 = egui::Context::default();
+        frame(&mut app2, &ctx2, vec![]);
+        app2.vst_scanned = true;
+        app2.vst_scan = vec![v76_entry("BrokenFx", Some("no vst3 entry"))];
+        let (_tx2, rx2) = std::sync::mpsc::channel::<Vec<crate::vsthost::VstEntry>>();
+        app2.vst_scan_rx = Some(rx2);
+        app2.synth_pick = Some(0);
+        frame(&mut app2, &ctx2, vec![]);
+        frame(&mut app2, &ctx2, vec![]);
+        assert!(
+            painted_text_rect(&ctx2, &mut app2, "instruments appear as they are found").is_some(),
+            "synth picker must show the in-flight scan even with cached rows"
+        );
+        assert!(
+            painted_text_rect(&ctx2, &mut app2, "failed to open").is_some(),
+            "synth picker must foot the count of failed plugin files"
+        );
+    }
+
+    /// v76 R1d: scan start AND completion reach the status bar — the
+    /// async round-trip must be observable without any window open.
+    #[test]
+    fn v76_scan_status_echoes() {
+        let mut app = headless_app("v76stat");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.vst_rescan();
+        assert!(
+            app.status.contains("scanning") && app.status.contains("folder(s)"),
+            "plugin rescan must echo into the status bar; status was {:?}",
+            app.status
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.vst_scan_rx = Some(rx);
+        tx.send(vec![v76_entry("GoodFx", None), v76_entry("BrokenFx", Some("x"))])
+            .unwrap();
+        let _ = app.poll_vst_opens();
+        assert_eq!(
+            app.status,
+            "1 plugin(s) ready",
+            "completion must echo the OK count (broken files are not 'ready')"
+        );
+        assert_eq!(app.vst_scan.len(), 2, "entries land; the UI filters them");
+    }
+
+    /// v76 R2: rack actions echo. The scan button reports what it found;
+    /// a reorder at the edge of the list REFUSES with an echo; a real
+    /// reorder echoes the move.
+    #[test]
+    fn v76_rack_ops_echo() {
+        let mut app = headless_app("v76echo");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let sc = painted_text_rect(&ctx, &mut app, "scan").expect("folder scan button");
+        click_pt(&mut app, &ctx, sc.center());
+        assert!(
+            app.status.starts_with("scanned \u{201c}") && app.status.ends_with("file(s)"),
+            "folder rescan must echo what it scanned; status {:?}",
+            app.status
+        );
+        // One sub-folder: "up" at the top of a one-item list must refuse.
+        let root = app.rack[0].path.clone();
+        let q = std::path::Path::new(&root).join("solo");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("s.wav"), b"RIFFx").unwrap();
+        app.rack[0].rescan();
+        frame(&mut app, &ctx, vec![]);
+        let h = galley_centers(&mut app, &ctx, "- solo (", false);
+        assert_eq!(h.len(), 1, "solo header paints once");
+        rmb(&mut app, &ctx, h[0]);
+        let up = galley_centers(&mut app, &ctx, "up", true);
+        assert!(!up.is_empty(), "header menu offers up");
+        click_pt(&mut app, &ctx, up[0]);
+        assert!(
+            app.status.contains("already at the top"),
+            "edge reorder must refuse with an echo; status {:?}",
+            app.status
+        );
+        // Fresh apps (one popup per header anchor, v50-e): the bottom
+        // edge refuses, a real swap echoes success.
+        for (tag, item, want) in [
+            ("v76echo2", "down", "already at the bottom"),
+            ("v76echo3", "up", "bbb moved up"),
+        ] {
+            let mut a = headless_app(tag);
+            let c = egui::Context::default();
+            frame(&mut a, &c, vec![]);
+            let r = a.rack[0].path.clone();
+            for d in ["aaa", "bbb"] {
+                std::fs::create_dir_all(std::path::Path::new(&r).join(d)).unwrap();
+                std::fs::write(
+                    std::path::Path::new(&r).join(d).join("x.wav"),
+                    b"RIFFx",
+                )
+                .unwrap();
+            }
+            a.rack[0].rescan();
+            frame(&mut a, &c, vec![]);
+            let hb = galley_centers(&mut a, &c, "- bbb (", false);
+            assert_eq!(hb.len(), 1);
+            rmb(&mut a, &c, hb[0]);
+            let m = galley_centers(&mut a, &c, item, true);
+            assert!(!m.is_empty(), "header menu offers {item}");
+            click_pt(&mut a, &c, m[0]);
+            assert!(
+                a.status.contains(want),
+                "reorder {item} must echo {want:?}; status {:?}",
+                a.status
+            );
+        }
+    }
+
+    /// v76 R3 + R2 source half: the v71 hover audit EXTENDED to the rack
+    /// tree, where short labels ("scan", "x", "up", "down") defeat a
+    /// word-list scan. Every string-labelled button/small_button inside
+    /// rack_file_row + rack_body carries hover copy in its own statement.
+    /// The move-to SUBMENU buttons are exempt by design: their items
+    /// explain themselves (the audit reads their hovers too — see the
+    /// "(folder root)" / "(primary root)" buttons, which pass normally).
+    #[test]
+    fn v76_rack_hover_source_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let regions = [
+            ("fn rack_file_row(", "fn rack_kind_badge("),
+            ("fn rack_body(", "fn paint_stereo_meters("),
+        ];
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (a0, a1) in regions {
+            let s = prod.find(a0).expect("region anchor start");
+            let e = prod.find(a1).expect("region anchor end");
+            assert!(s < e, "region order {a0}..{a1}");
+            let lines: Vec<&str> = prod[s..e].lines().collect();
+            for (n, l) in lines.iter().enumerate() {
+                let s0 = l.trim_start();
+                if s0.starts_with("//")
+                    || !(s0.contains(".button(") || s0.contains("_button("))
+                {
+                    continue;
+                }
+                if s0.starts_with("ui.menu_button(") {
+                    continue; // submenu items are the explanation
+                }
+                let Some(a) = l.find('"') else { continue };
+                let rest = &l[a + 1..];
+                let Some(b) = rest.find('"') else { continue };
+                let _ = &rest[..b]; // label present (dynamic ones still pass through)
+                let mut end = (n + 12).min(lines.len() - 1);
+                for (k, row) in lines[n..=end].iter().enumerate() {
+                    if row.contains("clicked()") || row.contains("clicked_by") {
+                        end = n + k;
+                        break;
+                    }
+                }
+                let win: String = lines[n..=end].join(" ").to_lowercase();
+                if win.contains("on_hover") {
+                    checked += 1;
+                } else {
+                    offenders.push(format!("{a0} region: {}", s0.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "rack buttons without hover:\n{}",
+            offenders.join("\n")
+        );
+        assert!(checked >= 14, "rack region scan found only {checked} buttons \u{b7} broken scan");
+    }
+
+    /// v76 R2 source half: the refusal seams echo (all entry points —
+    /// drag drops and menus share them). v72-style anchor/needle pairs.
+    #[test]
+    fn v76_rack_echo_source_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let samesite = concat!("move: already ", "in this folder");
+        let nest = concat!("move: cannot nest a folder inside ", "itself");
+        let stclone = concat!("self.status = self.vst_note", ".clone();");
+        let s: [(&str, &str, usize); 4] = [
+            ("fn rack_move(", samesite, 2000),
+            ("fn rack_dir_move(", nest, 3000),
+            (concat!("scanning {} ", "folder(s)"), stclone, 600),
+            (concat!("{n} plugin(s) ", "ready"), stclone, 600),
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for (anchor, needle, span) in s {
+            let hits = prod.matches(anchor).count();
+            if hits != 1 {
+                offenders.push(format!("anchor {anchor:?} matched {hits} (want 1)"));
+                continue;
+            }
+            let a = prod.find(anchor).unwrap();
+            let win = &prod[a..(a + span).min(prod.len())];
+            if !win.contains(needle) {
+                offenders.push(format!("{anchor:?} no longer echoes {needle:?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "v76 echo inventory broken:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// v76 R4a: tree rows ALIGN — a child header starts at the parent's
+    /// file-row column (+12 rect shift \u2248 +6 galley center, labels
+    /// center in their full-width buttons) and its file rows sit deeper.
+    #[test]
+    fn v76_tree_rows_indent() {
+        let mut app = headless_app("v76align");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let root = app.rack[0].path.clone();
+        for rel in ["top.wav", "kringel/own.wav", "kringel/dry/deeptrack.wav"] {
+            let q = std::path::Path::new(&root).join(rel);
+            std::fs::create_dir_all(q.parent().unwrap()).unwrap();
+            std::fs::write(&q, b"RIFFx").unwrap();
+        }
+        app.rack[0].rescan();
+        app.rack_group_by_dir = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = galley_centers(&mut app, &ctx, "- kringel (2)", false);
+        let c = galley_centers(&mut app, &ctx, "- kringel/dry (", false);
+        assert_eq!(p.len(), 1, "parent header");
+        assert_eq!(c.len(), 1, "child header");
+        assert!(
+            c[0].x - p[0].x >= 3.0,
+            "child header must indent its column, not just its glyph: \u{201c}{}\u{201d} vs \u{201c}{}\u{201d}",
+            c[0].x,
+            p[0].x
+        );
+        let f = galley_centers(&mut app, &ctx, "deeptrack", true);
+        assert_eq!(f.len(), 1, "child file row");
+        assert!(
+            f[0].x > c[0].x + 2.0,
+            "child file rows sit deeper than the child header: {} vs {}",
+            f[0].x,
+            c[0].x
+        );
+    }
+
+    /// v76 R4b: a 70-char name must NOT wrap-clip in the 20 px row: the
+    /// galley is hard-truncated (full-name galley absent, prefix shown)
+    /// and the row hover carries the FULL path (TS-013 affordance here).
+    #[test]
+    fn v76_long_name_row_truncates() {
+        let mut app = headless_app("v76trunc");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let root = app.rack[0].path.clone();
+        let long = "MIXERCHAINTESTSUPERLONGNAME-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-9999";
+        std::fs::write(std::path::Path::new(&root).join(format!("{long}.wav")), b"RIFFx")
+            .unwrap();
+        app.rack[0].rescan();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            painted_text_rect(&ctx, &mut app, long).is_none(),
+            "a 70-char label must be truncated, not laid out whole (the old wrap clipped its tail out of the row)"
+        );
+        let pre = painted_text_rect(&ctx, &mut app, "MIXERCHAINTEST").expect("prefix galley paints");
+        let texts = hover_until_tip(&mut app, &ctx, pre.center(), &[long]);
+        assert!(
+            texts.iter().any(|t| t.contains(long)),
+            "the row hover must carry the full path; galleys: {texts:?}"
+        );
+    }
+
+    /// v76 R3a: the folder-row scan button's tooltip RENDERS (v71
+    /// runtime pattern — tooltips must paint, not just compile).
+    #[test]
+    fn v76_scan_button_tip() {
+        let mut app = headless_app("v76scantip");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let sc = painted_text_rect(&ctx, &mut app, "scan").expect("scan button painted");
+        let texts = hover_until_tip(&mut app, &ctx, sc.center(), &["scan this folder from disk"]);
+        assert!(
+            texts.iter().any(|t| t.contains("scan this folder from disk")),
+            "folder scan button must tooltip what it does; galleys: {texts:?}"
         );
     }
 }
