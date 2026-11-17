@@ -2108,24 +2108,18 @@ pub(crate) fn step_center_norm(i: usize, steps: u32) -> f64 {
 /// call site — it is the only plugin round trip). `enum_labels` must come
 /// from `sample_step_labels` with the plugin's own `format_parameter`.
 pub(crate) fn desc_from_vst3_param(
-    id: u32,
-    name: String,
-    default: f32,
-    is_read_only: bool,
-    flags: u32,
-    unit_text: String,
-    step_count: i32,
+    p: &vst3_host::parameters::Parameter,
     enum_labels: Vec<String>,
 ) -> VstParamDesc {
-    let steps = vst3_steps_from_report(step_count);
+    let steps = vst3_steps_from_report(p.step_count);
     VstParamDesc {
-        id,
-        name,
-        default,
-        writable: !is_read_only,
-        program_change: flags & VST3_K_IS_PROGRAM_CHANGE != 0,
-        unit: unit_code_from_text(&unit_text),
-        unit_text,
+        id: p.id,
+        name: p.name.clone(),
+        default: p.default as f32,
+        writable: !p.is_read_only,
+        program_change: p.flags & VST3_K_IS_PROGRAM_CHANGE != 0,
+        unit: unit_code_from_text(&p.unit),
+        unit_text: p.unit.clone(),
         plain_min: 0.0,
         plain_max: 1.0,
         steps,
@@ -3222,16 +3216,7 @@ fn open_v3(
                     .format_parameter(p.id, step_center_norm(i, steps))
                     .ok()
             });
-            desc_from_vst3_param(
-                p.id,
-                p.name.clone(),
-                p.default as f32,
-                p.is_read_only,
-                p.flags,
-                p.unit.clone(),
-                p.step_count,
-                enum_labels,
-            )
+            desc_from_vst3_param(p, enum_labels)
         })
         .collect();
     // v66 snapshot: read the wired program cell back. With several
@@ -4235,16 +4220,21 @@ mod tests {
             sample_step_labels(65, true, |_| Some("x".into())).is_empty(),
             "above the picker cap: no labels"
         );
-        let d = desc_from_vst3_param(
-            41,
-            "Cutoff".into(),
-            0.5,
-            true,
-            VST3_K_IS_PROGRAM_CHANGE,
-            "Hz".into(),
-            3,
-            vec![],
-        );
+        let mut p = vst3_host::parameters::Parameter {
+            id: 41,
+            name: "Cutoff".into(),
+            value: 0.5,
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+            unit: "Hz".into(),
+            step_count: 3,
+            can_automate: true,
+            is_read_only: true,
+            is_bypass: false,
+            flags: VST3_K_IS_PROGRAM_CHANGE,
+        };
+        let d = desc_from_vst3_param(&p, vec![]);
         assert_eq!(d.unit, SLOOPER_UNIT_HZ);
         assert_eq!(d.unit_text, "Hz");
         assert_eq!(d.steps, 4, "3 gaps = 4 values");
@@ -4255,6 +4245,11 @@ mod tests {
             (0.0, 1.0),
             "VST3 keeps the plain range private — no invented engineering values"
         );
+        p.is_read_only = false;
+        p.flags = 0;
+        let d2 = desc_from_vst3_param(&p, vec!["a".into(), "b".into()]);
+        assert!(d2.writable && !d2.program_change);
+        assert_eq!(d2.enum_labels, vec!["a", "b"], "labels ride through");
         assert!((step_center_norm(0, 4) - 0.125).abs() < 1e-6);
         assert!((step_center_norm(3, 4) - 0.875).abs() < 1e-6);
     }

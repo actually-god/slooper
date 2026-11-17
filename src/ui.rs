@@ -50634,25 +50634,25 @@ mod tests {
             "params_body must render rows through fxgui::param_row"
         );
         // Positive: the stock auto grid calls the SAME function.
-        let needle_stock = concat!("param_row(ui, ui.id().with((\"fxauto-row\", k))");
+        let needle_stock = concat!("param_row(ui, ui.id().with((\"fxauto", "-row\", k))");
         assert!(
             gui_src.contains(&needle_stock.replace(' ', "")),
             "the auto grid must render through the same param_row"
         );
         // Negative: the retired hosted naked slider is gone…
-        let old_hosted = concat!(".text(name.chars().take(24)");
+        let old_hosted = concat!(".text(name.char", "s().take(24)");
         assert!(
             !ui_src.contains(&old_hosted.replace(' ', "")),
             "the hosted window must not fork a naked Slider row anymore"
         );
         // …nor the retired 3-column grid nor the in-Instance unit match.
-        let old_grid = concat!("Grid::new((\"fxauto\"");
+        let old_grid = concat!("Grid::new((\"fxa", "uto\"");
         assert!(
             !gui_src.contains(&old_grid.replace(' ', "")),
             "the forked auto-grid chrome must be retired"
         );
         let fx_src = prod_window(include_str!("fx.rs"));
-        let old_fmt = concat!("match m.unit {");
+        let old_fmt = concat!("match m.unit", " {");
         assert!(
             !fx_src.contains(&old_fmt.replace(' ', "")),
             "unit formatting must live once in fmt_param_value, not in fmt_param"
