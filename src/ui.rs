@@ -2028,6 +2028,10 @@ impl App {
         // record into the primary folder root, and every 808 voice is still
         // one drag away (under "808").
         crate::samples808::seed_pack();
+        // v81 (TS-010): the pack sounds pre-armed as the "808-Kit" drum-kit
+        // preset — content-diff seeded into data_dir()/drum-kits (a drifted
+        // user copy is kept as .bak, never silently discarded).
+        crate::samples808::seed_stock_kit();
         let mut rack: Vec<RackFolder> = cfg
             .rack_folders
             .iter()
@@ -50343,9 +50347,20 @@ mod tests {
             "echo: {}",
             app.status
         );
-        assert!(
-            !crate::paths::data_dir().join("drum-kits").exists(),
-            "a refused save must not create the kits folder"
+        // v81: the boot seed pre-creates the folder (stock 808-Kit), so
+        // "refused save" is now pinned as NO NEW FILES (was: no folder).
+        let mut names: Vec<String> = std::fs::read_dir(crate::paths::data_dir().join("drum-kits"))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["808-Kit.json".to_string()],
+            "a refused save must not create kit files"
         );
     }
 
@@ -50359,12 +50374,19 @@ mod tests {
             "sanitized name must land INSIDE drum-kits: {:?}",
             app.status
         );
+        // v81: the folder also carries the boot-seeded stock kit — the
+        // traversal guard is that evil.json landed HERE (inside the
+        // folder), so the exact-set pin moves to contains-checks.
         let names: Vec<String> = std::fs::read_dir(&dir)
             .expect("kits dir")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["evil.json".to_string()], "{names:?}");
+        assert!(names.contains(&"evil.json".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"808-Kit.json".to_string()),
+            "stock kit must be seeded alongside: {names:?}"
+        );
         assert!(
             !crate::paths::data_dir().join("evil.json").exists(),
             "the sanitizer must not escape the kits folder"
@@ -50433,8 +50455,14 @@ mod tests {
             !dir.join("doomed.json").exists(),
             "delete must remove exactly that file"
         );
+        // v81: a fresh sandbox now ships the stock 808-Kit — the refresh
+        // pin becomes "doomed is gone, the stock kit survived", not "empty".
         assert!(
-            app.kit_presets.is_empty(),
+            !app.kit_presets.iter().any(|k| k == "doomed")
+                && app
+                    .kit_presets
+                    .iter()
+                    .any(|k| k == crate::samples808::STOCK_KIT_NAME),
             "cached list must refresh after delete: {:?}",
             app.kit_presets
         );
@@ -50459,6 +50487,65 @@ mod tests {
         assert!(kit_is_stock(app.kit(0)), "kit must equal the stock set");
         assert!(
             app.status.contains("restored to the 8-pad stock kit"),
+            "echo: {}",
+            app.status
+        );
+    }
+
+    /// v81 (TS-010 S1): the fresh-install shape end to end — boot seeded
+    /// the 24-file pack AND the stock kit preset; the kit bar's picker
+    /// lists "808-Kit" and loading it arms all 16 real 808 pads on the
+    /// track (drives the real popup, per the v69 pattern).
+    #[test]
+    fn v81_stock_kit_ui_load() {
+        let (mut app, ctx) = v65_synth_win("v81kitload");
+        // First paint of the kit page refreshed the cache → stock kit is
+        // listed without any user save.
+        assert!(
+            app.kit_presets
+                .iter()
+                .any(|k| k == crate::samples808::STOCK_KIT_NAME),
+            "stock kit not listed: {:?}",
+            app.kit_presets
+        );
+        assert!(
+            crate::samples808::stock_kit_path().is_file()
+                && crate::samples808::pack_dir().join("808-kick.wav").is_file(),
+            "boot seed landed in the sandbox: {:?}",
+            crate::samples808::stock_kit_path()
+        );
+        // Wreck the live 2-pad kit so the load assert discriminates.
+        app.kit_mut(0).truncate(2);
+        app.drum.ensure_rows(2);
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "load kit");
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "808-Kit")
+            .expect("808-Kit row in the picker")
+            .center();
+        click_pt(&mut app, &ctx, row);
+        let kit = app.kit(0);
+        assert_eq!(kit.len(), 16, "load replaces the pad table with 16 pads");
+        assert_eq!(kit[0].name, "Kick");
+        assert_eq!(
+            kit[0].asset_path,
+            crate::samples808::pack_dir()
+                .join("808-kick.wav")
+                .to_string_lossy(),
+            "pad asset is the seeded pack path"
+        );
+        assert!(
+            kit.iter().all(|p| !p.asset_path.is_empty()),
+            "no silent pads in the stock kit"
+        );
+        assert!(
+            app.drum.grid.len() >= 16,
+            "the pattern grid must carry a row per pad: {}",
+            app.drum.grid.len()
+        );
+        assert!(
+            app.status.contains("drum kit preset loaded: 808-Kit (16 pads)"),
             "echo: {}",
             app.status
         );
