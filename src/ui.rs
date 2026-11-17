@@ -37986,6 +37986,7 @@ mod tests {
             kind: crate::vsthost::VstKind::V3,
             plugin_id: None,
             name: "v78".into(),
+            bypass: false,
             params: vec![],
             entry: Some(entry.clone()),            state: None,
             open_rx: None,
