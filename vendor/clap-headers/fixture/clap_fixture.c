@@ -23,6 +23,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+// Windows parity fix (v79 CI run 44160764104): the host pins set
+// SLOOPER_CLAP_FIXTURE_PRESET_DIR via Rust set_var -> SetEnvironmentVariableW
+// (Win32 env). UCRT getenv() here would read the CRT _environ SNAPSHOT taken
+// at process start and NEVER see it. Query the live Win32 env instead.
+static char fix_env_buf[4096];
+static const char *fix_getenv(const char *name) {
+   DWORD n = GetEnvironmentVariableA(name, fix_env_buf, (DWORD)sizeof(fix_env_buf) - 1);
+   if (n == 0 || n >= sizeof(fix_env_buf) - 1) return NULL;
+   fix_env_buf[n] = '\0';
+   return fix_env_buf;
+}
+#else
+static const char *fix_getenv(const char *name) { return getenv(name); }
+#endif
+
 #include <clap/clap.h>
 
 #define SINE_VOICES 8
@@ -399,7 +416,7 @@ static bool prov_init(const clap_preset_discovery_provider_t *prov) {
       CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT, "Fix Factory",
       CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, NULL };
    ix->declare_location(ix, &loc_plugin);
-   const char *dir = getenv(FIXPRESET_DIR_ENV);
+   const char *dir = fix_getenv(FIXPRESET_DIR_ENV);
    if (dir && *dir) {
       clap_preset_discovery_location_t loc_files = {
          CLAP_PRESET_DISCOVERY_IS_USER_CONTENT, "Fixture files",
