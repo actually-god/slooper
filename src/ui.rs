@@ -37803,6 +37803,90 @@ mod tests {
         std::mem::forget(entry);
     }
 
+    /// v78 (TS-015, UI half of acceptance 3): a MULTI-PART plugin (two
+    /// units, two program lists) must get a fully working program combo:
+    /// the unit-0 list fills it, the selected text resolves to the boot
+    /// program name — never the v66 "(unknown)" — both program cells stay
+    /// out of the knob grid, and picking a row switches the live plugin.
+    #[test]
+    fn v78_params_window_program_combo_resolves_multi_unit() {
+        let mut app = headless_app("v78prog");
+        app.show_master = false;
+        let file = if cfg!(windows) { "v78-vst3-multi.dll" } else { "v78-vst3-multi.so" };
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/v78")
+            .join(file);
+        assert!(fixture.is_file(), "v78 fixture missing (build script)");
+        let load = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("v78 fixture opens");
+        let entry = load.entry;
+        app.fx_rows[0].push(ChainRow::Vst {
+            path: fixture.display().to_string(),
+            kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
+            name: "v78".into(),
+            params: vec![],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.params_programs,
+            vec!["kit-a", "kit-b", "kit-c"],
+            "the enumerated unit-0 (drums) list fills the combo, never the foreign unit's"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "(unknown)").is_none(),
+            "acceptance 3: a multi-part plugin must NOT fall back to \"(unknown)\""
+        );
+        // Neither unit's program-change cell may render as a knob row
+        // (v66 goal 4 extended: the combo owns BOTH cells; titles "kit"
+        // and "patch" appear ONLY if a knob leaked into the grid).
+        for title in ["kit", "patch"] {
+            assert_eq!(
+                galley_centers(&mut app, &ctx, title, true).len(),
+                0,
+                "program-change param {title} hidden from the knob list"
+            );
+        }
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        // The combo leads with the RESOLVED boot program name.
+        let combo = galley_at(&mut app, &ctx, "kit-a")
+            .expect("combo shows the resolved current program")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "kit-b")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert_eq!(entry.current_program(), Some(1), "the live plugin switched");
+        assert!(
+            app.status.contains("kit-b") && app.status.contains("program"),
+            "status echo closes the loop: {}",
+            app.status
+        );
+        app.status = String::new();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "kit-b").is_some(),
+            "combo now leads with the switched-to program"
+        );
+        std::mem::forget(entry);
+    }
+
     /// v23 gate pin (issue 3, UI half): a plugin with a CACHED-BAN verdict
     /// never opens its vendor window; it opens the stand-in parameter
     /// window, announces itself in the status line, and its sliders feed
