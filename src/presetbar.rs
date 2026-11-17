@@ -200,7 +200,7 @@ pub fn render(
             act = Some(PresetBarAction::Save);
         }
         let caption = if spec.compact {
-            egui::RichText::new(spec.load_text).small().into()
+            egui::RichText::new(spec.load_text).small()
         } else {
             egui::RichText::new(spec.load_text)
         };
