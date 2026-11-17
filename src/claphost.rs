@@ -38,8 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::vsthost::{
-    vst_loader_lock, FxRing, StageEntry, VstKind, VstParamDesc, VstParams, MIDI_QUEUE_CAP,
-    VST_BLOCK,
+    vst_loader_lock, FxRing, PresetLoadEvent, PresetLocation, StageEntry, VstKind, VstParamDesc,
+    VstParams, MIDI_QUEUE_CAP, PRESET_KIND_FILE, PRESET_KIND_PLUGIN, VST_BLOCK,
 };
 
 // ================================================================ FFI ====
@@ -74,6 +74,13 @@ mod ffi {
     /// 1.2.2 header ships primary + compat ids - answer both.
     pub static CLAP_EXT_PRESET_LOAD_C: &CStr = c"clap.preset-load/2";
     pub static CLAP_EXT_PRESET_LOAD_COMPAT_C: &CStr = c"clap.preset-load.draft/2";
+    /// v79: entry-level preset-discovery factory ids (primary + compat).
+    pub static CLAP_PRESET_DISCOVERY_FACTORY_ID_C: &CStr =
+        c"clap.preset-discovery-factory/2";
+    pub static CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT_C: &CStr =
+        c"clap.preset-discovery-factory/draft-2";
+    /// v79: `clap_preset_discovery_flags` (only what the crawl reads).
+    pub const CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT: u32 = 1 << 0;
 
     #[repr(C)]
     pub struct ClapVersion {
@@ -229,7 +236,7 @@ mod ffi {
         ) -> bool,
     }
 
-    /// Host sink for `clap.preset-load/2` (v67). The plugin reports a
+    /// v67: host sink for `clap.preset-load/2` (v67). The plugin reports a
     /// preset it loaded through its own machinery (`loaded`), or a failed
     /// load location (`on_error`).
     #[repr(C)]
@@ -248,6 +255,169 @@ mod ffi {
             location: *const c_char,
             load_key: *const c_char,
         ),
+    }
+
+    /// v79: plugin side of `clap.preset-load/2` — host-commanded load
+    /// ([`crate::vsthost::StageEntry::load_preset_location`]).
+    #[repr(C)]
+    pub struct ClapPluginPresetLoad {
+        pub from_location: unsafe extern "C" fn(
+            plugin: *const ClapPlugin,
+            location_kind: u32,
+            location: *const c_char,
+            load_key: *const c_char,
+        ) -> bool,
+    }
+
+    // ---- v79: preset-discovery family (factory/preset-discovery.h) ----
+    // Entry-level factory ("clap.preset-discovery-factory/2"): the host
+    // creates a provider, becomes its indexer (declare_* callbacks land
+    // here), crawls the declared FILE locations and reads each file's
+    // presets through a metadata receiver — then feeds the collected
+    // (kind, location, load_key) triples into ClapPluginPresetLoad.
+
+    #[repr(C)]
+    pub struct ClapUniversalPluginId {
+        pub abi: *const c_char,
+        pub id: *const c_char,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryProviderDescriptor {
+        pub clap_version: ClapVersion,
+        pub id: *const c_char,
+        pub name: *const c_char,
+        pub vendor: *const c_char,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryFiletype {
+        pub name: *const c_char,
+        pub description: *const c_char,
+        pub file_extension: *const c_char,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryLocation {
+        pub flags: u32,
+        pub name: *const c_char,
+        pub kind: u32,
+        pub location: *const c_char,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoverySoundpack {
+        pub flags: u32,
+        pub id: *const c_char,
+        pub name: *const c_char,
+        pub description: *const c_char,
+        pub homepage_url: *const c_char,
+        pub vendor: *const c_char,
+        pub image_path: *const c_char,
+        pub release_timestamp: u64,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryMetadataReceiver {
+        pub receiver_data: *mut c_void,
+        pub on_error: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            os_error: i32,
+            error_message: *const c_char,
+        ),
+        pub begin_preset: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            name: *const c_char,
+            load_key: *const c_char,
+        ) -> bool,
+        pub add_plugin_id: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            plugin_id: *const ClapUniversalPluginId,
+        ),
+        pub set_soundpack_id: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            soundpack_id: *const c_char,
+        ),
+        pub add_creator: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            creator: *const c_char,
+        ),
+        pub set_description: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            description: *const c_char,
+        ),
+        pub set_timestamps: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            creation_time: u64,
+            modification_time: u64,
+        ),
+        pub add_feature: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            feature: *const c_char,
+        ),
+        pub add_extra_info: unsafe extern "C" fn(
+            receiver: *const ClapPresetDiscoveryMetadataReceiver,
+            key: *const c_char,
+            value: *const c_char,
+        ),
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryProvider {
+        pub desc: *const ClapPresetDiscoveryProviderDescriptor,
+        pub provider_data: *mut c_void,
+        pub init: unsafe extern "C" fn(provider: *const ClapPresetDiscoveryProvider) -> bool,
+        pub destroy: unsafe extern "C" fn(provider: *const ClapPresetDiscoveryProvider),
+        pub get_metadata: unsafe extern "C" fn(
+            provider: *const ClapPresetDiscoveryProvider,
+            location_kind: u32,
+            location: *const c_char,
+            metadata_receiver: *const ClapPresetDiscoveryMetadataReceiver,
+        ) -> bool,
+        pub get_extension: unsafe extern "C" fn(
+            provider: *const ClapPresetDiscoveryProvider,
+            extension_id: *const c_char,
+        ) -> *const c_void,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryIndexer {
+        pub clap_version: ClapVersion,
+        pub name: *const c_char,
+        pub vendor: *const c_char,
+        pub url: *const c_char,
+        pub version: *const c_char,
+        pub indexer_data: *mut c_void,
+        pub declare_filetype: unsafe extern "C" fn(
+            indexer: *const ClapPresetDiscoveryIndexer,
+            filetype: *const ClapPresetDiscoveryFiletype,
+        ) -> bool,
+        pub declare_location: unsafe extern "C" fn(
+            indexer: *const ClapPresetDiscoveryIndexer,
+            location: *const ClapPresetDiscoveryLocation,
+        ) -> bool,
+        pub declare_soundpack: unsafe extern "C" fn(
+            indexer: *const ClapPresetDiscoveryIndexer,
+            soundpack: *const ClapPresetDiscoverySoundpack,
+        ) -> bool,
+        pub get_extension: unsafe extern "C" fn(
+            indexer: *const ClapPresetDiscoveryIndexer,
+            extension_id: *const c_char,
+        ) -> *const c_void,
+    }
+
+    #[repr(C)]
+    pub struct ClapPresetDiscoveryFactory {
+        pub count: unsafe extern "C" fn(factory: *const ClapPresetDiscoveryFactory) -> u32,
+        pub get_descriptor: unsafe extern "C" fn(
+            factory: *const ClapPresetDiscoveryFactory,
+            index: u32,
+        ) -> *const ClapPresetDiscoveryProviderDescriptor,
+        pub create: unsafe extern "C" fn(
+            factory: *const ClapPresetDiscoveryFactory,
+            indexer: *const ClapPresetDiscoveryIndexer,
+            provider_id: *const c_char,
+        ) -> *const ClapPresetDiscoveryProvider,
     }
 
     #[repr(C)]
@@ -455,6 +625,246 @@ unsafe extern "C" fn host_preset_error(
                 unsafe { cstr_to_string(msg) }
             },
         });
+    }
+}
+
+// ======================================== v79 preset discovery ======
+//
+// The host's INDEXER role for `clap.preset-discovery-factory/2`: record
+// what each provider declares (filetypes + locations), crawl the FILE
+// locations, and read each candidate file's presets through a per-file
+// metadata receiver. Everything here runs on the control thread under
+// `vst_loader_lock` (entered once by `preset_locations`), never against
+// a processing plugin. Providers and indexers are NEVER destroyed — the
+// indexer must outlive its provider, and the standing leak policy makes
+// that cheap (entries are never destroyed either).
+
+/// Per-provider recording context (lives as `indexer_data`).
+#[derive(Default)]
+struct IndexCtx {
+    /// Declared filetype extensions, lowercased; `""` = match every file.
+    filetypes: Mutex<Vec<String>>,
+    /// `(kind, flags, location)` per declared clap_preset_discovery_location_t.
+    locations: Mutex<Vec<(u32, u32, Option<String>)>>,
+}
+
+/// Per-file collection context (lives as `receiver_data`, stack-bound to
+/// one `get_metadata` call).
+struct RunCtx {
+    kind: u32,
+    location: Option<String>,
+    factory: bool,
+    out: Vec<PresetLocation>,
+    errors: Vec<String>,
+}
+
+const DISCOVERY_MAX_PROVIDERS: u32 = 8;
+const DISCOVERY_MAX_FILES: usize = 512;
+const DISCOVERY_MAX_PRESETS: usize = 1024;
+
+unsafe fn index_ctx_of(ix: *const ffi::ClapPresetDiscoveryIndexer) -> Option<&'static IndexCtx> {
+    if ix.is_null() {
+        return None;
+    }
+    let d = unsafe { (*ix).indexer_data };
+    if d.is_null() {
+        return None;
+    }
+    Some(unsafe { &*(d as *const IndexCtx) })
+}
+
+unsafe fn run_ctx_of<'a>(
+    recv: *const ffi::ClapPresetDiscoveryMetadataReceiver,
+) -> Option<&'a mut RunCtx> {
+    if recv.is_null() {
+        return None;
+    }
+    let d = unsafe { (*recv).receiver_data };
+    if d.is_null() {
+        return None;
+    }
+    Some(unsafe { &mut *(d as *mut RunCtx) })
+}
+
+unsafe extern "C" fn idx_declare_filetype(
+    ix: *const ffi::ClapPresetDiscoveryIndexer,
+    ft: *const ffi::ClapPresetDiscoveryFiletype,
+) -> bool {
+    let Some(ctx) = (unsafe { index_ctx_of(ix) }) else {
+        return false;
+    };
+    if ft.is_null() {
+        return false;
+    }
+    let ext = unsafe { cstr_to_string((*ft).file_extension) }.to_lowercase();
+    if let Ok(mut v) = ctx.filetypes.lock() {
+        if v.len() < 64 {
+            v.push(ext);
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn idx_declare_location(
+    ix: *const ffi::ClapPresetDiscoveryIndexer,
+    loc: *const ffi::ClapPresetDiscoveryLocation,
+) -> bool {
+    let Some(ctx) = (unsafe { index_ctx_of(ix) }) else {
+        return false;
+    };
+    if loc.is_null() {
+        return false;
+    }
+    let (kind, flags) = unsafe { ((*loc).kind, (*loc).flags) };
+    let location = unsafe {
+        if (*loc).location.is_null() {
+            None
+        } else {
+            Some(cstr_to_string((*loc).location))
+        }
+    };
+    if let Ok(mut v) = ctx.locations.lock() {
+        if v.len() < 32 {
+            v.push((kind, flags, location));
+        }
+    }
+    true
+}
+
+unsafe extern "C" fn idx_declare_soundpack(
+    _ix: *const ffi::ClapPresetDiscoveryIndexer,
+    _sp: *const ffi::ClapPresetDiscoverySoundpack,
+) -> bool {
+    true // sound packs are display metadata; the crawl does not need them
+}
+
+unsafe extern "C" fn idx_get_extension(
+    _ix: *const ffi::ClapPresetDiscoveryIndexer,
+    _id: *const c_char,
+) -> *const c_void {
+    std::ptr::null() // no indexer extensions offered (invalidation etc. unhosted)
+}
+
+unsafe extern "C" fn recv_on_error(
+    recv: *const ffi::ClapPresetDiscoveryMetadataReceiver,
+    _os_error: i32,
+    msg: *const c_char,
+) {
+    if let Some(ctx) = unsafe { run_ctx_of(recv) } {
+        if ctx.errors.len() < 16 {
+            ctx.errors.push(unsafe { cstr_to_string(msg) });
+        }
+    }
+}
+
+unsafe extern "C" fn recv_begin_preset(
+    recv: *const ffi::ClapPresetDiscoveryMetadataReceiver,
+    name: *const c_char,
+    load_key: *const c_char,
+) -> bool {
+    let Some(ctx) = (unsafe { run_ctx_of(recv) }) else {
+        return false;
+    };
+    if name.is_null() {
+        return true; // name is mandatory; ignore incomplete entries
+    }
+    if ctx.out.len() >= DISCOVERY_MAX_PRESETS {
+        return false; // tells the provider to stop calling back
+    }
+    ctx.out.push(PresetLocation {
+        name: unsafe { cstr_to_string(name) },
+        load_key: unsafe {
+            if load_key.is_null() {
+                None
+            } else {
+                Some(cstr_to_string(load_key))
+            }
+        },
+        kind: ctx.kind,
+        location: ctx.location.clone(),
+        factory: ctx.factory,
+    });
+    true
+}
+
+unsafe extern "C" fn recv_pid(
+    _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
+    _pid: *const ffi::ClapUniversalPluginId,
+) {
+}
+unsafe extern "C" fn recv_str1(
+    _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
+    _s: *const c_char,
+) {
+}
+unsafe extern "C" fn recv_ts(_r: *const ffi::ClapPresetDiscoveryMetadataReceiver, _a: u64, _b: u64) {
+}
+unsafe extern "C" fn recv_str2(
+    _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
+    _a: *const c_char,
+    _b: *const c_char,
+) {
+}
+
+/// One `get_metadata` call against one file (or the plugin container).
+fn discovery_run(
+    prov: *const ffi::ClapPresetDiscoveryProvider,
+    kind: u32,
+    location: Option<&str>,
+    factory: bool,
+    out: &mut Vec<PresetLocation>,
+) {
+    let mut run = RunCtx {
+        kind,
+        location: location.map(|s| s.to_string()),
+        factory,
+        out: Vec::new(),
+        errors: Vec::new(),
+    };
+    let recv = ffi::ClapPresetDiscoveryMetadataReceiver {
+        receiver_data: std::ptr::from_mut(&mut run).cast::<c_void>(),
+        on_error: recv_on_error,
+        begin_preset: recv_begin_preset,
+        add_plugin_id: recv_pid,
+        set_soundpack_id: recv_str1,
+        add_creator: recv_str1,
+        set_description: recv_str1,
+        set_timestamps: recv_ts,
+        add_feature: recv_str1,
+        add_extra_info: recv_str2,
+    };
+    let loc_c = location.and_then(|s| CString::new(s).ok());
+    let ok = unsafe {
+        ((*prov).get_metadata)(
+            prov,
+            kind,
+            loc_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            &recv,
+        )
+    };
+    // A false verdict means "this file yielded nothing" — its on_error
+    // (if any) is collected in run.errors; valid files still contribute.
+    if run.out.is_empty() && (!ok || !run.errors.is_empty()) {
+        eprintln!(
+            "[clap:discovery] {} (\"{}\")",
+            run.errors
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("provider declined the location"),
+            location.unwrap_or("(plugin)")
+        );
+    }
+    out.append(&mut run.out);
+}
+
+/// Declared filetype filter: no (or empty) declarations match anything.
+fn filetype_match(exts: &[String], path: &Path) -> bool {
+    if exts.is_empty() || exts.iter().any(|e| e.is_empty()) {
+        return true;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => exts.contains(&ext.to_lowercase()),
+        None => false,
     }
 }
 
@@ -788,6 +1198,15 @@ pub struct ClapStageEntry {
     /// destroyed (leak policy).
     plugin: *const ffi::ClapPlugin,
     state_ext: *const ffi::ClapPluginState,
+    /// v79: plugin side of `clap.preset-load/2` (null = unsupported —
+    /// `supports_preset_load` answers false). Queried once at open.
+    preset_load: *const ffi::ClapPluginPresetLoad,
+    /// v79: entry-level preset-discovery factory (null = plugin ships
+    /// none; the UI then offers only the file entry point).
+    discovery_factory: *const ffi::ClapPresetDiscoveryFactory,
+    /// v79: `preset_locations()` result, computed once per entry under
+    /// `vst_loader_lock` (never plugin code per call afterwards).
+    preset_cache: std::sync::Mutex<Option<Vec<PresetLocation>>>,
     /// 0 = plugin declares no audio input ports (an instrument).
     in_ports: u32,
     midi_drops: std::sync::Arc<AtomicU64>,
@@ -1071,6 +1490,100 @@ impl ClapStageEntry {
 
 // ====================================================== StageEntry impl ===
 
+impl ClapStageEntry {
+    /// v79: full discovery-provider handshake — provider create + init,
+    /// declared-location crawl, per-file metadata reads. Caller MUST
+    /// hold `vst_loader_lock` (via [`StageEntry::preset_locations`]).
+    /// File locations are crawled ONE level (files only, sorted, capped)
+    /// and filtered by the provider's declared filetypes.
+    unsafe fn discover_unlocked(&self) -> Vec<PresetLocation> {
+        let f = self.discovery_factory;
+        if f.is_null() {
+            return Vec::new();
+        }
+        let mut out: Vec<PresetLocation> = Vec::new();
+        let n = std::cmp::min(unsafe { ((*f).count)(f) }, DISCOVERY_MAX_PROVIDERS);
+        for i in 0..n {
+            let d = unsafe { ((*f).get_descriptor)(f, i) };
+            if d.is_null() || unsafe { (*d).id.is_null() } {
+                continue;
+            }
+            let idc = match unsafe { CStr::from_ptr((*d).id).to_str() } {
+                Ok(s) => match CString::new(s) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let ctx = Box::leak(Box::new(IndexCtx::default()));
+            let indexer = Box::leak(Box::new(ffi::ClapPresetDiscoveryIndexer {
+                clap_version: ffi::ClapVersion {
+                    major: 1,
+                    minor: 2,
+                    revision: 0,
+                },
+                name: HOST.name.as_ptr(),
+                vendor: HOST.vendor.as_ptr(),
+                url: HOST.url.as_ptr(),
+                version: HOST.version.as_ptr(),
+                indexer_data: ctx as *const IndexCtx as *mut c_void,
+                declare_filetype: idx_declare_filetype,
+                declare_location: idx_declare_location,
+                declare_soundpack: idx_declare_soundpack,
+                get_extension: idx_get_extension,
+            }));
+            let prov = unsafe { ((*f).create)(f, indexer, idc.as_ptr()) };
+            if prov.is_null() {
+                continue;
+            }
+            if !unsafe { ((*prov).init)(prov) } {
+                continue;
+            }
+            let exts: Vec<String> = ctx.filetypes.lock().map(|v| v.clone()).unwrap_or_default();
+            let locs: Vec<(u32, u32, Option<String>)> =
+                ctx.locations.lock().map(|v| v.clone()).unwrap_or_default();
+            for (kind, flags, loc) in locs {
+                if out.len() >= DISCOVERY_MAX_PRESETS {
+                    break;
+                }
+                let factory = flags & ffi::CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT != 0;
+                match kind {
+                    PRESET_KIND_PLUGIN => {
+                        discovery_run(prov, kind, None, factory, &mut out);
+                    }
+                    PRESET_KIND_FILE => {
+                        let Some(l) = loc else { continue };
+                        let p = PathBuf::from(&l);
+                        if p.is_file() {
+                            discovery_run(prov, kind, Some(&l), factory, &mut out);
+                        } else if let Ok(rd) = std::fs::read_dir(&p) {
+                            let mut files: Vec<PathBuf> = rd
+                                .filter_map(|e| e.ok())
+                                .map(|e| e.path())
+                                .filter(|ep| ep.is_file())
+                                .collect();
+                            files.sort();
+                            files.truncate(DISCOVERY_MAX_FILES);
+                            for fp in files {
+                                if !filetype_match(&exts, &fp) {
+                                    continue;
+                                }
+                                let Some(s) = fp.to_str() else { continue };
+                                discovery_run(prov, kind, Some(s), factory, &mut out);
+                                if out.len() >= DISCOVERY_MAX_PRESETS {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // unknown location kind: nothing safe to crawl
+                }
+            }
+        }
+        out
+    }
+}
+
 impl StageEntry for ClapStageEntry {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1117,6 +1630,86 @@ impl StageEntry for ClapStageEntry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+    }
+
+    /// v79: true for CLAP entries whose plugin hosts `clap_plugin_preset_load`.
+    fn supports_preset_load(&self) -> bool {
+        !self.preset_load.is_null()
+    }
+
+    /// v79: run the preset-discovery handshake once (provider create +
+    /// init, declared-location crawl, per-file metadata), cache forever.
+    /// The provider/indexer stay alive for the process lifetime — spec
+    /// requires the indexer to outlive the provider and entries are
+    /// never destroyed (standing leak policy). Takes `vst_loader_lock`
+    /// itself, so callers (UI thread) hold nothing.
+    fn preset_locations(&self) -> Vec<PresetLocation> {
+        if self.preset_load.is_null() {
+            return Vec::new();
+        }
+        let mut cache = self.preset_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = cache.as_ref() {
+            return v.clone();
+        }
+        let _loader = vst_loader_lock();
+        let v = unsafe { self.discover_unlocked() };
+        *cache = Some(v.clone());
+        v
+    }
+
+    /// v79: command the LIVE instance — `from_location(kind, location,
+    /// load_key)` under `vst_loader_lock` (control thread = the plugin's
+    /// spec-defined main thread; same discipline class as the CLAP open
+    /// and chunk paths). The report this command provokes is DRAINED
+    /// here: our verdict is authoritative, and the PARAMETERS pump must
+    /// not echo our own command back as a plugin-side change later.
+    fn load_preset_location(
+        &self,
+        kind: u32,
+        location: Option<&str>,
+        load_key: Option<&str>,
+    ) -> Result<(), String> {
+        if self.preset_load.is_null() {
+            return Err("plugin does not host clap_plugin_preset_load".into());
+        }
+        let loc_c = match location {
+            Some(s) => Some(
+                CString::new(s).map_err(|_| "preset location contains a NUL byte".to_string())?,
+            ),
+            None => None,
+        };
+        let key_c = match load_key {
+            Some(s) => Some(
+                CString::new(s).map_err(|_| "preset load_key contains a NUL byte".to_string())?,
+            ),
+            None => None,
+        };
+        let _loader = vst_loader_lock();
+        let ok = unsafe {
+            ((*self.preset_load).from_location)(
+                self.plugin,
+                kind,
+                loc_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                key_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            )
+        };
+        let report = self
+            .preset_slot
+            .report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if ok {
+            if let Some(PresetLoadEvent::Failed { message, .. }) = report {
+                return Err(message); // accepted, then contradicted: error wins
+            }
+            Ok(())
+        } else {
+            Err(match report {
+                Some(PresetLoadEvent::Failed { message, .. }) => message,
+                _ => "the plugin refused the preset load".to_string(),
+            })
+        }
     }
 
     fn all_notes_off(&self) {
@@ -1317,6 +1910,23 @@ pub(crate) fn open_unlocked(
     let params_ext = get_ext(ffi::CLAP_EXT_PARAMS_C) as *const ffi::ClapPluginParams;
     let ports_ext = get_ext(ffi::CLAP_EXT_AUDIO_PORTS_C) as *const ffi::ClapPluginAudioPorts;
     let state_ext = get_ext(ffi::CLAP_EXT_STATE_C) as *const ffi::ClapPluginState;
+    // v79: plugin side of host-commanded preset load (primary id, compat
+    // fallback for draft-era plugins). Null = plugin declines loads.
+    let mut preset_load = get_ext(ffi::CLAP_EXT_PRESET_LOAD_C) as *const ffi::ClapPluginPresetLoad;
+    if preset_load.is_null() {
+        preset_load = get_ext(ffi::CLAP_EXT_PRESET_LOAD_COMPAT_C) as *const ffi::ClapPluginPresetLoad;
+    }
+    // v79: entry-level preset-discovery factory pointer probed under the
+    // open lock; the handshake itself is LAZY (first `preset_locations()`).
+    let get_factory = entry.get_factory;
+    let mut discovery_factory =
+        unsafe { get_factory(ffi::CLAP_PRESET_DISCOVERY_FACTORY_ID_C.as_ptr()) }
+            as *const ffi::ClapPresetDiscoveryFactory;
+    if discovery_factory.is_null() {
+        discovery_factory =
+            unsafe { get_factory(ffi::CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT_C.as_ptr()) }
+                as *const ffi::ClapPresetDiscoveryFactory;
+    }
 
     // ---- parameter descriptors (PLAIN min/max; cells stay normalized) ----
     let mut descs = Vec::new();
@@ -1546,6 +2156,9 @@ pub(crate) fn open_unlocked(
         plugin_id,
         plugin,
         state_ext,
+        preset_load,
+        discovery_factory,
+        preset_cache: std::sync::Mutex::new(None),
         in_ports,
         midi_drops: std::sync::Arc::new(AtomicU64::new(0)),
         preset_slot,
@@ -1791,6 +2404,171 @@ pub(crate) mod tests {
             "no plugin-side load expected: {:?}",
             String::from_utf8_lossy(&chunk)
         );
+    }
+
+    // ============================ v79: host-commanded preset load =======
+
+    /// v79: temp preset dir with a deterministic file set:
+    /// multi.fxp (container: 2 keyed presets), single.fxp (whole-file
+    /// preset, no key), bad.fxp (yields nothing — the negative control
+    /// that must NOT poison the rest of the crawl), decoy.txt (wrong
+    /// extension — must be filtered by the declared filetype).
+    fn v79_preset_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v79-presets-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("multi.fxp"),
+            "FIXPRESET FA Contained One\nFIXPRESET FB Contained Two\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("single.fxp"), "FIXPRESET DEFAULT\n").unwrap();
+        std::fs::write(dir.join("bad.fxp"), "not a preset file\n").unwrap();
+        std::fs::write(dir.join("decoy.txt"), "FIXPRESET FA Should Not Appear\n").unwrap();
+        dir
+    }
+
+    /// v79 (R1): the extension surface is per-plugin — the gain fixture
+    /// hosts `clap_plugin_preset_load`, the sine fixture is the negative
+    /// control and must answer "unsupported" everywhere.
+    #[test]
+    fn v79_clap_preset_load_supported_by_gain_only() {
+        let g = fixture_entry("gain");
+        assert!(g.supports_preset_load(), "fixture-gain hosts the extension");
+        let s = fixture_entry("sine");
+        assert!(
+            !s.supports_preset_load(),
+            "fixture-sine is the negative-polarity control"
+        );
+        assert!(s.preset_locations().is_empty(), "unsupported entries discover nothing");
+        assert!(
+            s.load_preset_file(Path::new("/nonexistent.fxp")).is_err(),
+            "unsupported entries refuse loads"
+        );
+    }
+
+    /// v79 (R2): the discovery handshake — provider created + init'd with
+    /// OUR indexer vtable, declared locations recorded, the PLUGIN-kind
+    /// container read through the metadata receiver. Env-free run: only
+    /// the plugin-internal factory presets exist.
+    #[test]
+    fn v79_clap_discover_plugin_container() {
+        std::env::remove_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR");
+        let e = fixture_entry("gain");
+        let locs = e.preset_locations();
+        let names: Vec<&str> = locs.iter().map(|l| l.name.as_str()).collect();
+        assert!(
+            names.contains(&"Fix Factory A") && names.contains(&"Fix Factory B"),
+            "factory presets discovered: {names:?}"
+        );
+        for l in &locs {
+            assert_eq!(l.kind, crate::vsthost::PRESET_KIND_PLUGIN, "kind rides the ABI enum");
+            assert!(l.location.is_none(), "plugin container carries no path");
+            assert!(l.factory, "location declared FACTORY_CONTENT");
+        }
+        let a = locs.iter().find(|l| l.name == "Fix Factory A").unwrap();
+        assert_eq!(a.load_key.as_deref(), Some("FA"), "container entries carry load keys");
+        // Cached: the second call must not re-enter plugin code (same vec,
+        // and a plugin that would add on re-init cannot — the cache wins).
+        assert_eq!(e.preset_locations().len(), locs.len());
+    }
+
+    /// v79 (R2): FILE locations from the provider are crawled by the
+    /// host — declared-filetype filter, container + whole-file entries,
+    /// and a yielding-failure file that must NOT break the crawl.
+    #[test]
+    fn v79_clap_discover_file_dir_skips_bad() {
+        let dir = v79_preset_dir();
+        std::env::set_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR", &dir);
+        let locs = fixture_entry("gain").preset_locations();
+        std::env::remove_var("SLOOPER_CLAP_FIXTURE_PRESET_DIR");
+        let names: Vec<String> = locs.iter().map(|l| l.name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "Contained One") && names.iter().any(|n| n == "Contained Two"),
+            "container entries discovered: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "Preset DEFAULT"), "whole-file preset discovered: {names:?}");
+        assert!(names.iter().any(|n| n == "Fix Factory A"), "plugin container still included");
+        assert!(
+            !names.iter().any(|n| n.contains("Should Not Appear")),
+            "decoy.txt must be filtered by the declared filetype: {names:?}"
+        );
+        let files: Vec<&PresetLocation> =
+            locs.iter().filter(|l| l.kind == crate::vsthost::PRESET_KIND_FILE).collect();
+        assert_eq!(files.len(), 3, "multi.fxp yields 2, single.fxp 1, bad.fxp 0");
+        let dir_s = dir.display().to_string();
+        for l in &files {
+            assert!(
+                l.location.as_deref().map(|p| p.starts_with(&dir_s)).unwrap_or(false),
+                "file preset carries its crawled path: {:?}",
+                l.location
+            );
+            assert!(!l.factory, "FILE location was declared USER_CONTENT");
+        }
+        let two = locs.iter().find(|l| l.name == "Contained Two").unwrap();
+        assert_eq!(two.load_key.as_deref(), Some("FB"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v79 (R3): picking a discovered PLUGIN-container preset switches
+    /// the LIVE instance (proven through the state chunk) and the
+    /// plugin's own `loaded` report is DRAINED by the loader — the
+    /// PARAMETERS pump must not echo our own command back later.
+    #[test]
+    fn v79_clap_host_load_factory_preset_changes_state() {
+        let e = fixture_entry("gain");
+        let locs = e.preset_locations();
+        let b = locs.iter().find(|l| l.name == "Fix Factory B").expect("B discovered");
+        assert_eq!(e.load_preset_location(b.kind, b.location.as_deref(), b.load_key.as_deref()), Ok(()));
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.500"),
+            "live instance switched: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        assert!(e.take_preset_report().is_none(), "loader drained the report the command provoked");
+    }
+
+    /// v79 (R4): the file entry point — whole-file preset, no load key.
+    /// The plugin parsed the file itself AND reported; both land.
+    #[test]
+    fn v79_clap_host_load_file_plain() {
+        let dir = v79_preset_dir();
+        let e = fixture_entry("gain");
+        assert_eq!(e.load_preset_file(&dir.join("single.fxp")), Ok(()));
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 0.375"),
+            "parsed file preset applied: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        assert!(e.take_preset_report().is_none(), "success report drained");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v79 (R5): refusals surface the plugin's own `on_error` message
+    /// through Err, drain the slot, and leave the instance untouched.
+    #[test]
+    fn v79_clap_host_load_refused_reports_message() {
+        let dir = v79_preset_dir();
+        let e = fixture_entry("gain");
+        let err = e.load_preset_file(&dir.join("bad.fxp")).expect_err("bad file must refuse");
+        assert!(err.contains("no preset"), "plugin's own message rides Err: {err}");
+        assert!(e.take_preset_report().is_none(), "refusal report drained by the loader");
+        let err2 = e
+            .load_preset_location(crate::vsthost::PRESET_KIND_PLUGIN, None, Some("ZZ"))
+            .expect_err("unknown key must refuse");
+        assert!(err2.contains("unknown preset key"), "key refusal: {err2}");
+        let chunk = e.chunk().expect("state saved");
+        assert!(
+            chunk.starts_with(b"F1 1.000"),
+            "refusals changed nothing: {:?}",
+            String::from_utf8_lossy(&chunk)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
