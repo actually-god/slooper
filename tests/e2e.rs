@@ -4738,10 +4738,12 @@ fn v80_rt_bypass_passthrough() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut reg = slooper::fx::Registry::open(dir.clone());
     reg.rescan();
-    // mode 0 (compressor), threshold -48 dB (far below the signal), ratio
-    // 20, fast attack, 100 ms release, unity output → a 0.55 square ducks
-    // to roughly 0.2: a fat margin around the 0.4 threshold below.
-    let vals = [0.0f32, -48.0, 20.0, 0.05, 100.0, 1.0];
+    // threshold -13 dB (0.55 square sits ~7 dB over it -> ~9 dB of
+    // reduction, landing near 0.25), ratio 20, fast attack, 100 ms
+    // release, no knee, unity makeup, FULL wet (7 params — the stock
+    // compressor's declared set). Margins: ducked ~0.25 (assert <0.40,
+    // >0.05), pass-through 0.55 (assert >0.45).
+    let vals = [-13.0f32, 20.0, 1.0, 100.0, 0.0, 1.0, 1.0];
     let desc = reg.desc("compressor").expect("stock compressor present").clone();
     let mk_inst = || {
         reg.create_instance("compressor", sr as f64, &vals)
@@ -4797,14 +4799,32 @@ fn v80_rt_bypass_passthrough() {
         std::thread::sleep(Duration::from_millis(150));
         b.cmd(Cmd::PlayAll);
         let mut peak = 0.0f32;
-        for _ in 0..80 {
+        // The envelope needs ~1 ms attack per fresh instance — measure
+        // the STEADY-STATE peak, not the first blocks' dry ramp.
+        for i in 0..80 {
             std::thread::sleep(Duration::from_millis(30));
-            peak = peak.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+            if i >= 15 {
+                peak = peak.max(ring_peak(&ring, &widx, 4800).unwrap_or(0.0));
+            }
         }
         b.cmd(Cmd::StopAll);
         std::thread::sleep(Duration::from_millis(150));
         peak
     };
+
+    // DRY reference first (AC3 shape): proves the clip + capture rig work.
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 4800)
+                .map(|p| p > 0.4)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+        "dry clip audible at full level",
+    );
+    b.cmd(Cmd::StopAll);
+    std::thread::sleep(Duration::from_millis(150));
 
     // Pass 1: live compressor — the mix is audibly DUCKED.
     b.cmd(Cmd::SetTrackEffects {
