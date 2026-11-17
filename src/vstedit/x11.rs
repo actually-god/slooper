@@ -2799,6 +2799,7 @@ mod tests {
                 default: 0.0,
                 writable: true,
                 program_change: false,
+                ..Default::default()
             },
             VstParamDesc {
                 id: 9,
@@ -2806,6 +2807,7 @@ mod tests {
                 default: 0.0,
                 writable: true,
                 program_change: false,
+                ..Default::default()
             },
         ];
         let params = VstParams::new(&descs);
