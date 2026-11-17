@@ -4197,6 +4197,72 @@ impl vst2::host::Host for StubHost {
 mod tests {
     use super::*;
 
+    /// v74 (TS-002 R4): the pure VST3 metadata mapping. Steps come from
+    /// the crate's gap-count convention, units from the kit's text table,
+    /// and the label sampler abandons on ANY plugin refusal (half a label
+    /// set is worse than a snapped knob) — with the single documented
+    /// host-invented fallback, the two-state Off/On pair.
+    #[test]
+    fn v74_vst3_metadata_mapping() {
+        use crate::fx::{SLOOPER_UNIT_DB, SLOOPER_UNIT_HZ, SLOOPER_UNIT_SECONDS};
+        assert_eq!(unit_code_from_text(" Hz "), SLOOPER_UNIT_HZ);
+        assert_eq!(unit_code_from_text("dB"), SLOOPER_UNIT_DB);
+        assert_eq!(unit_code_from_text("seconds"), SLOOPER_UNIT_SECONDS);
+        assert_eq!(unit_code_from_text("RoomSize"), 0, "unknown text stays 0");
+        assert_eq!(vst3_steps_from_report(0), 0, "continuous");
+        assert_eq!(vst3_steps_from_report(1), 2, "toggle: 1 gap = 2 values");
+        assert_eq!(vst3_steps_from_report(2), 3, "three-way: 2 gaps");
+        assert_eq!(v74_steps_cap_check(), (i32::MAX, 64), "runaway cap");
+        let ok = sample_step_labels(3, false, |i| Some(format!(" l{i} ")));
+        assert_eq!(ok, vec!["l0", "l1", "l2"], "labels trimmed");
+        let bad = sample_step_labels(3, false, |i| {
+            if i == 1 {
+                None
+            } else {
+                Some("x".into())
+            }
+        });
+        assert!(bad.is_empty(), "one refusal abandons sampling");
+        let blank = sample_step_labels(2, false, |_| Some("   ".into()));
+        assert!(blank.is_empty(), "whitespace-only text is a refusal");
+        let tog = sample_step_labels(2, true, |_| None);
+        assert_eq!(tog, vec!["Off", "On"], "toggle fallback");
+        assert!(
+            sample_step_labels(3, true, |_| None).is_empty(),
+            "no invented labels beyond the toggle"
+        );
+        assert!(
+            sample_step_labels(65, true, |_| Some("x".into())).is_empty(),
+            "above the picker cap: no labels"
+        );
+        let d = desc_from_vst3_param(
+            41,
+            "Cutoff".into(),
+            0.5,
+            true,
+            VST3_K_IS_PROGRAM_CHANGE,
+            "Hz".into(),
+            3,
+            vec![],
+        );
+        assert_eq!(d.unit, SLOOPER_UNIT_HZ);
+        assert_eq!(d.unit_text, "Hz");
+        assert_eq!(d.steps, 4, "3 gaps = 4 values");
+        assert!(d.program_change);
+        assert!(!d.writable, "read-only stays read-only");
+        assert_eq!(
+            (d.plain_min, d.plain_max),
+            (0.0, 1.0),
+            "VST3 keeps the plain range private — no invented engineering values"
+        );
+        assert!((step_center_norm(0, 4) - 0.125).abs() < 1e-6);
+        assert!((step_center_norm(3, 4) - 0.875).abs() < 1e-6);
+    }
+
+    fn v74_steps_cap_check() -> (i32, u32) {
+        (i32::MAX, vst3_steps_from_report(i32::MAX))
+    }
+
     /// Test entries open as concrete VST stage entries; several tests
     /// (measure/note_on/field access) need the concrete type.
     fn rt(e: &Arc<dyn StageEntry>) -> &RtStageEntry {

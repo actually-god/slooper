@@ -1575,11 +1575,12 @@ pub(crate) fn open_unlocked(
 }
 
 /// v74: CLAP declared-enum → discrete value count. An enum is an integer
-/// parameter spanning `min..=max`; the picker cap is 64 choices and both
-/// bounds must be whole numbers, otherwise treat it as continuous (0).
+/// parameter spanning `min..=max`; the picker cap is 64 CHOICES (must
+/// match `sample_step_labels`' accepted range) and both bounds must be
+/// whole numbers, otherwise treat it as continuous (0).
 pub(crate) fn clap_enum_steps(min: f64, max: f64) -> u32 {
     let span = max - min;
-    if !(1.0..=64.0).contains(&span) {
+    if !(1.0..=63.0).contains(&span) {
         return 0;
     }
     if span.fract().abs() > 1e-6 || min.fract().abs() > 1e-6 || max.fract().abs() > 1e-6 {
@@ -1602,6 +1603,21 @@ fn default_from_plain(cur: f64, info: &ffi::ClapParamInfo) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// v74 (TS-002 R4): the pure CLAP enum math. Only integer min/max
+    /// within the shared 64-choice cap become stepped descriptors; the
+    /// IS_ENUM bit rides the real ABI value.
+    #[test]
+    fn v74_clap_enum_steps_pure() {
+        assert_eq!(ffi::CLAP_PARAM_IS_ENUM, 1 << 4, "CLAP ABI bit position");
+        assert_eq!(clap_enum_steps(0.0, 3.0), 4, "0..=3 = four choices");
+        assert_eq!(clap_enum_steps(10.0, 13.0), 4, "non-zero whole min");
+        assert_eq!(clap_enum_steps(0.0, 0.5), 0, "non-integer span = continuous");
+        assert_eq!(clap_enum_steps(0.1, 3.0), 0, "non-integer min rejected");
+        assert_eq!(clap_enum_steps(0.0, 100.0), 0, "above the cap = continuous");
+        assert_eq!(clap_enum_steps(0.0, 63.0), 64, "cap edge matches the sampler");
+        assert_eq!(clap_enum_steps(0.0, 64.0), 0, "one past the cap declines");
+    }
 
     /// Compile the repo's fixture plugin into `target/clap-fixture/`
     /// (skipping gracefully when no C compiler is available). Returns the
