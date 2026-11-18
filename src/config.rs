@@ -207,6 +207,10 @@ pub enum ChainSave {
         stem: String,
         #[serde(default)]
         params: Vec<f32>,
+        /// v80 (TS-005): per-slot mute. Additive key — old files load
+        /// un-muted.
+        #[serde(default)]
+        bypass: bool,
     },
     /// In-process hosted plugin (VST2/VST3/CLAP).
     Vst {
@@ -229,6 +233,9 @@ pub enum ChainSave {
         /// Additive serde key — old files load unchanged.
         #[serde(default)]
         program: Option<i32>,
+        /// v80 (TS-005): per-slot mute (additive, like `program`).
+        #[serde(default)]
+        bypass: bool,
     },
 }
 
@@ -929,6 +936,7 @@ impl Config {
                     .map(|s| {
                         s.iter()
                             .map(|f| ChainSave::Fx {
+                                bypass: false, // legacy single-fx rows were never muted
                                 stem: f.stem.clone(),
                                 params: f.params.clone(),
                             })
@@ -937,6 +945,7 @@ impl Config {
                     .unwrap_or_default();
                 if let Some(Some(vs)) = self.track_vst.get(i) {
                     v.push(ChainSave::Vst {
+                        bypass: false, // legacy single-VST rows were never muted
                         plugin_id: None,
                         path: vs.path.clone(),
                         kind: vs.kind.clone(),
@@ -1600,6 +1609,7 @@ mod tests {
     #[test]
     fn v34_chainsave_clap_carries_plugin_id() {
         let c = ChainSave::Vst {
+            bypass: false,
             path: "/home/u/.clap/Camshaft.clap".into(),
             kind: "CLAP".into(),
             plugin_id: Some("com.azuriteid.camshaft.comppressor".into()),
@@ -1646,6 +1656,7 @@ mod tests {
     #[test]
     fn v22_chainsave_vst_state_roundtrip() {
         let c = ChainSave::Vst {
+            bypass: false,
             plugin_id: None,
             path: "/host/thing.vst3".into(),
             kind: "VST3".into(),
@@ -1679,6 +1690,7 @@ mod tests {
     #[test]
     fn v62_program_config_serde() {
         let c = ChainSave::Vst {
+            bypass: false,
             path: "/p/x.so".into(),
             kind: "VST2".into(),
             plugin_id: None,
@@ -1714,5 +1726,44 @@ mod tests {
         v.as_object_mut().unwrap().remove("track_synth_programs");
         let old: Config = serde_json::from_str(&v.to_string()).unwrap();
         assert!(old.track_synth_programs.is_empty(), "old configs load empty");
+    }
+
+    /// v80 (TS-005): per-slot mute persists as an ADDITIVE key on both
+    /// ChainSave shapes — round-trip keeps it; legacy files (key absent)
+    /// load un-muted, no format bump.
+    #[test]
+    fn v80_bypass_serde_roundtrip() {
+        let c = ChainSave::Vst {
+            plugin_id: None,
+            path: "/p/mute.vst3".into(),
+            kind: "VST3".into(),
+            name: "MuteMe".into(),
+            params: vec![0.5],
+            state: None,
+            program: None,
+            bypass: true,
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"bypass\":true"), "muted lands in JSON: {j}");
+        match serde_json::from_str::<ChainSave>(&j).unwrap() {
+            ChainSave::Vst { bypass, .. } => assert!(bypass, "round-trip keeps the mute"),
+            _ => unreachable!(),
+        }
+        // Legacy shape: strip the key — old files load un-muted.
+        let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        v.as_object_mut().unwrap().remove("bypass");
+        match serde_json::from_str::<ChainSave>(&v.to_string()).unwrap() {
+            ChainSave::Vst { bypass, .. } => assert!(!bypass, "old files load un-muted"),
+            _ => unreachable!(),
+        }
+        let f = ChainSave::Fx {
+            stem: "crush".into(),
+            params: vec![],
+            bypass: true,
+        };
+        match serde_json::from_str::<ChainSave>(&serde_json::to_string(&f).unwrap()).unwrap() {
+            ChainSave::Fx { bypass, .. } => assert!(bypass, "fx variant round-trips too"),
+            _ => unreachable!(),
+        }
     }
 }
