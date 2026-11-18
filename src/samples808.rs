@@ -314,11 +314,11 @@ mod tests {
             let end = start.checked_add(size)?.min(data.len());
             if id == b"data" {
                 let samples = &data[start..end];
-                if samples.len() % 2 != 0 || samples.is_empty() {
+                if !samples.len().is_multiple_of(2) || samples.is_empty() {
                     return None;
                 }
                 let mut peak: i32 = 0;
-                for s in samples.chunks_exact(2) {
+                for s in samples.as_chunks::<2>().0 {
                     let v = i16::from_le_bytes([s[0], s[1]]).unsigned_abs() as i32;
                     if v > peak {
                         peak = v;
@@ -330,7 +330,7 @@ mod tests {
                 return Some(20.0 * (peak as f64 / 32768.0).log10());
             }
             // Chunks pad to even sizes.
-            i = start + size + (size % 2);
+            i = start + size + usize::from(!size.is_multiple_of(2));
         }
         None
     }
@@ -356,7 +356,7 @@ mod tests {
                     u16::from_le_bytes([f[14], f[15]]),
                 ));
             }
-            i = start + size + (size % 2);
+            i = start + size + usize::from(!size.is_multiple_of(2));
         }
         None
     }

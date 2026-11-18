@@ -51626,7 +51626,13 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert!(!dir.join("doomed.json").exists(), "the boxed file was removed");
         assert!(dir.join("keeper.json").is_file(), "the other kit is untouched");
-        assert_eq!(app.kit_presets, vec!["keeper".to_string()], "cached list refreshed");
+        // v81: the fresh sandbox ships 808-Kit — the refreshed exact list
+        // now includes it (sorted: "808-Kit" < "keeper").
+        assert_eq!(
+            app.kit_presets,
+            vec!["808-Kit".to_string(), "keeper".to_string()],
+            "cached list refreshed"
+        );
         assert!(
             app.status.contains("drum kit preset deleted: doomed"),
             "echo: {}",
