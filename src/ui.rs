@@ -1993,6 +1993,18 @@ fn smap_note_at(x0: f32, x: f32) -> u8 {
     SMAP_WHITE_KEYS[wi as usize]
 }
 
+/// v90: which mapping target a rack-asset drop hit inside the key-map
+/// window — see `App::sampler_map_drop_asset` for the rule each carries.
+enum SmapDrop {
+    /// A specific velocity-layer row (replace just that layer).
+    Layer(usize),
+    /// The piano strip at the key under the cursor (replace every layer
+    /// on the note / add one to an empty key).
+    Key(u8),
+    /// The "no samples mapped" area (create the first layer at C3).
+    Empty,
+}
+
 impl App {
     pub fn new(backend: Backend) -> Self {
         // v34 R10: export-status channel for the off-thread render.
@@ -7519,6 +7531,97 @@ impl App {
                 if rejected == 1 { "" } else { "s" }
             );
         }
+    }
+
+    /// v90 (user report 2026-11-18): the ONE seam for a rack-asset drop
+    /// landing on the key-map window. Payload = the rack's `usize` asset
+    /// index (v28/v34 drag payload; the same one drum pads consume).
+    /// Velocity-layer rule (deliberate, and both zones' hover tooltips
+    /// state it): `Layer(i)` replaces JUST the layer under the cursor;
+    /// `Key(note)` replaces the WHOLE mapping of the key under the cursor
+    /// — every layer on that note adopts the asset, a key without layers
+    /// gets one (vel 127); `Empty` (the "no samples mapped" area) creates
+    /// the first layer at C3. MIDI/automation assets or a stale index are
+    /// refused with an echo and ZERO state change. Success pushes the map
+    /// to the live synth (so the next — and this, automatic — audition
+    /// plays the NEW sample), persists config, and echoes.
+    fn sampler_map_drop_asset(&mut self, t: usize, target: SmapDrop, a: usize) {
+        let Some(asset) = self.assets.get(a) else {
+            return; // asset table changed mid-drag: silently stale
+        };
+        let name = asset.name.clone();
+        let sp = asset.path.to_string_lossy().into_owned();
+        if asset.is_midi() || asset.is_auto() {
+            self.status =
+                format!("sampler map: \"{name}\" is not an audio asset \u{2014} drop ignored");
+            return;
+        }
+        if !matches!(self.sampler_maps.get(t), Some(Some(_))) {
+            self.sampler_maps[t] =
+                Some(crate::config::SamplerMapSave { slots: Vec::new(), mode: 0 });
+        }
+        // Field-borrowed (self.status writes inside stay legal — same
+        // shape sampler_map_files_dropped already compiles with).
+        let m = self.sampler_maps[t].as_mut().expect("seeded");
+        let full = m.slots.len() >= crate::synth::MAX_MAP_SLOTS;
+        let root: u8;
+        match target {
+            SmapDrop::Layer(i) => {
+                let Some(s) = m.slots.get_mut(i) else {
+                    self.status =
+                        format!("sampler map: layer #{i} is gone \u{2014} drop ignored");
+                    return;
+                };
+                s.asset = sp;
+                root = s.root;
+                self.status = format!("sampler map: layer #{} <- \"{name}\"", i + 1);
+            }
+            SmapDrop::Key(note) => {
+                let mut hit = 0usize;
+                for s in m.slots.iter_mut() {
+                    if s.root == note {
+                        s.asset = sp.clone();
+                        hit += 1;
+                    }
+                }
+                if hit == 0 {
+                    if full {
+                        self.status = "sampler map: full (64 slots)".into();
+                        return;
+                    }
+                    m.slots.push(crate::config::SamplerSlotSave {
+                        vel: 127,
+                        asset: sp,
+                        root: note,
+                    });
+                    hit = 1;
+                }
+                root = note;
+                self.status = format!(
+                    "sampler map: key {} <- \"{name}\" ({} layer{})",
+                    note_name(note),
+                    hit,
+                    if hit == 1 { "" } else { "s" }
+                );
+            }
+            SmapDrop::Empty => {
+                if full {
+                    self.status = "sampler map: full (64 slots)".into();
+                    return;
+                }
+                m.slots.push(crate::config::SamplerSlotSave {
+                    vel: 127,
+                    asset: sp,
+                    root: 48,
+                });
+                root = 48;
+                self.status =
+                    format!("sampler map: added layer at {} <- \"{name}\"", note_name(48));
+            }
+        }
+        self.push_sampler_map(t);
+        self.save_config();
+        self.smap_audition(t, root);
     }
 
     /// v29 R5: audition a pad impulse at velocity (scaled copy — the
@@ -13233,7 +13336,8 @@ impl App {
                  \u{b7} key clicks preview the sample \u{b7} full range C-1\u{2026}G8 (scroll \
                  below) \u{b7} cutoff: zones switch at the midpoint, ties go DOWN \u{b7} \
                  crossfade: the two nearest samples mix by inverse distance \u{b7} several \
-                 lanes on ONE key = velocity layers (the v value)",
+                 lanes on ONE key = velocity layers (the v value) \u{b7} drag a RACK sample \
+                 onto a lane to replace that layer, or onto a key to replace the whole key",
             )
             .weak()
             .small(),
@@ -13464,6 +13568,32 @@ impl App {
                         dirty_order = false;
                     }
                 }
+                // v90: the lane strip is a rack-drop target. Hover sense
+                // LAST (the kit-pad idiom — never steals lresp/bresp
+                // clicks); releases the v28/v34 `usize` asset payload.
+                let dz = ui.interact(
+                    lr,
+                    ui.id().with(("smapdrop", t, i)),
+                    egui::Sense::hover(),
+                );
+                if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx()) {
+                    ui.painter().rect_stroke(
+                        lr,
+                        2.0,
+                        egui::Stroke::new(1.0, crate::kit::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if let Some(a) = dz.dnd_release_payload::<usize>() {
+                    let a = *a;
+                    self.sampler_map_drop_asset(t, SmapDrop::Layer(i), a);
+                }
+                dz.on_hover_text(format!(
+                    "velocity layer v{} \u{2014} drop a rack sample here to\n\
+                     replace JUST this layer. Drop onto the piano keys\n\
+                     below to replace EVERY layer of the key under the cursor.",
+                    cur_vel
+                ));
             });
             if let Some(sp) = new_asset {
                 if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
@@ -13487,13 +13617,31 @@ impl App {
             }
         }
         if n == 0 {
-            ui.label(
+            let lbl = ui.label(
                 RichText::new(
-                    "no samples mapped \u{2014} click \u{201c}+ add sample\u{201d} or drop \
-                     WAV files onto this window",
+                    "no samples mapped \u{2014} click \u{201c}+ add sample\u{201d}, drag a rack \
+                     sample onto this row, or drop WAV files onto this window",
                 )
                 .weak()
                 .small(),
+            );
+            // v90: the empty area is a drop target too — first layer at C3.
+            let ez = lbl.interact(egui::Sense::hover());
+            if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx()) {
+                ui.painter().rect_stroke(
+                    lbl.rect,
+                    2.0,
+                    egui::Stroke::new(1.0, crate::kit::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some(a) = ez.dnd_release_payload::<usize>() {
+                let a = *a;
+                self.sampler_map_drop_asset(t, SmapDrop::Empty, a);
+            }
+            ez.on_hover_text(
+                "drop a rack sample here to create the first layer at C3 \
+                 \u{2014} or drop onto a piano key below to place it there",
             );
         }
         // ---- piano keyboard strip (full MIDI range, piano layout) ----
@@ -13608,6 +13756,35 @@ impl App {
                 // v56 R3: audible tail so even the fastest click previews.
                 self.smap_aud_tail(ui);
             }
+            // v90: piano-strip drop zone — the WHOLE-KEY half of the rule
+            // (hover sense LAST; see `sampler_map_drop_asset`).
+            let kz = ui.interact(
+                kr,
+                ui.id().with(("smapdropkey", t)),
+                egui::Sense::hover(),
+            );
+            if egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx()) {
+                ui.painter().rect_stroke(
+                    kr,
+                    2.0,
+                    egui::Stroke::new(1.0, crate::kit::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some(a) = kz.dnd_release_payload::<usize>() {
+                let a = *a;
+                let x = kz
+                    .interact_pointer_pos()
+                    .or_else(|| ui.ctx().input(|i| i.pointer.hover_pos()))
+                    .map_or(kr.center().x, |p| p.x);
+                let note = smap_note_at(kr.min.x, x);
+                self.sampler_map_drop_asset(t, SmapDrop::Key(note), a);
+            }
+            kz.on_hover_text(
+                "drop a rack sample here to replace the WHOLE mapping of \
+                 the key under the cursor \u{2014} every velocity layer on \
+                 that note (a key with no layers gets one)",
+            );
         });
     }
 
