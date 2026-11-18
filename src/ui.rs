@@ -53097,4 +53097,392 @@ mod tests {
         );
         std::mem::forget(entry);
     }
+
+    // =====================================================================
+    // v86 (TS-008): plugin-surface hover + echo completeness audit.
+    // Extends the v54/v71/v72 invariant families over the FOUR plugin
+    // surfaces (chain window incl. rack menu, synth picker, params window,
+    // editor chrome). The word-list scans cannot see ComboBox/checkbox/
+    // glyph affordances or format!-built labels, and their statement
+    // windows leak a later widget's hover onto an earlier one — the two
+    // "+" add-combos shipped hovered-free under exactly that false green.
+    // =====================================================================
+
+    /// Extract one fn's full text from prod source: from `anchor` to the
+    /// next fn header at the SAME indentation (impl methods included).
+    fn v86_fn_region<'a>(prod: &'a str, anchor: &str) -> &'a str {
+        let s = prod
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor {anchor:?} gone from prod"));
+        let ls = prod[..s].rfind('\n').map_or(0, |i| i + 1);
+        let indent: String = prod[ls..s].chars().take_while(|c| *c == ' ').collect();
+        let needle = format!("\n{indent}fn ");
+        let rel = prod[s + anchor.len()..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no next fn after {anchor:?}"));
+        &prod[s..s + anchor.len() + rel]
+    }
+
+    /// v86 R1 (hover family): EVERY affordance statement inside a
+    /// plugin-surface fn carries its own hover — buttons, checkboxes and
+    /// selectable labels, whatever the label (glyph, format!, variable).
+    /// Statement window = start line through the affordance's OWN
+    /// clicked()/changed(), so a neighbour's tooltip cannot leak in from
+    /// past the click (the v80 scan's join rule, kept).
+    #[test]
+    fn v86_plugin_hover_region_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        const REGIONS: [&str; 8] = [
+            "fn chain_win_body(",
+            "fn arrow_button(",
+            "fn synth_pick_body(",
+            "fn strip_synth_row(",
+            "fn fx_buttons(",
+            "fn params_body(",
+            "fn embed_body(",
+            "fn window_slot_menu(",
+        ];
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for anchor in REGIONS {
+            assert_eq!(
+                prod.matches(anchor).count(),
+                1,
+                "region anchor {anchor:?} not unique"
+            );
+            let region = v86_fn_region(prod, anchor);
+            let lines: Vec<&str> = region.lines().collect();
+            for (n, l) in lines.iter().enumerate() {
+                let s0 = l.trim_start();
+                if s0.starts_with("//") {
+                    continue;
+                }
+                let is_aff = (s0.contains(".button(")
+                    || s0.contains("_button(")
+                    || s0.contains("Button::new(")
+                    || s0.contains(".checkbox(")
+                    || s0.contains("selectable_label(")
+                    || s0.contains("selectable_value("))
+                    && !s0.contains("arrow_button(ui"); // helper owns its hovers
+                if !is_aff || s0.starts_with("ui.menu_button(") {
+                    continue; // submenu items ARE the explanation
+                }
+                let mut end = (n + 18).min(lines.len() - 1);
+                for (k, row) in lines[n..=end].iter().enumerate() {
+                    if k > 0
+                        && (row.contains("clicked()")
+                            || row.contains("clicked_by")
+                            || row.contains("changed()"))
+                    {
+                        end = n + k;
+                        break;
+                    }
+                }
+                let win: String = lines[n..=end].join(" ").to_lowercase();
+                if win.contains("on_hover") || win.contains("on_disabled_hover") {
+                    checked += 1;
+                } else {
+                    offenders.push(format!("{anchor} region line {}: {s0}", n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "plugin-surface affordances without their own hover:\n{}",
+            offenders.join("\n")
+        );
+        assert!(
+            checked >= 30,
+            "scan found only {checked} plugin affordances \u{b7} broken scan"
+        );
+    }
+
+    /// v86 R2 (hover family, combo extension): every action ComboBox in a
+    /// plugin surface explains itself while CLOSED. The popup items'
+    /// per-row hovers do NOT count — they are invisible until the menu is
+    /// open, and line scans joined them onto the combo statement (the
+    /// false green this audit caught). Rule: a `.response` chain carrying
+    /// `on_hover_text` directly (<= 80 chars gap) between the salt and
+    /// the next salt/end anchor, plus the hover's copy needle.
+    #[test]
+    fn v86_plugin_combo_hover_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        const COMBOS: [(&str, &str, &str); 4] = [
+            (
+                "from_id_salt((\"addfx\", loop_i))",
+                "\"addvst\"",
+                "pick an effect script",
+            ),
+            (
+                "from_id_salt((\"addvst\", loop_i))",
+                "// --- effects script folder",
+                "picking one appends",
+            ),
+            (
+                "from_id_salt(\"slooper_v60_programs\")",
+                "from_id_salt(\"slooper_v79_preset_locs\")",
+                "factory patches",
+            ),
+            (
+                "from_id_salt(\"slooper_v79_preset_locs\")",
+                "if let Some(i) = pick_loc {",
+                "host-commanded",
+            ),
+        ];
+        for (salt, end_anchor, needle) in COMBOS {
+            let s = prod
+                .find(salt)
+                .unwrap_or_else(|| panic!("combo salt gone: {salt}"));
+            let rel = prod[s + salt.len()..]
+                .find(end_anchor)
+                .unwrap_or_else(|| panic!("end anchor {end_anchor:?} after {salt} gone"));
+            let win = &prod[s..s + salt.len() + rel];
+            let resp = win
+                .find(".response")
+                .unwrap_or_else(|| panic!("{salt}: closed combo carries no .response chain"));
+            let tail = &win[resp..];
+            let gap = tail
+                .find("on_hover_text")
+                .unwrap_or_else(|| panic!("{salt}: .response chain has no on_hover_text"));
+            assert!(
+                gap <= 80,
+                "{salt}: on_hover_text is not the .response chain's OWN call (gap {gap})"
+            );
+            assert!(
+                tail.contains(needle),
+                "{salt}: closed-combo hover copy {needle:?} missing"
+            );
+        }
+    }
+
+    /// v86 R3 (echo family): family-wide inventory of plugin state-change
+    /// seams — every handler that mutates chain/preset/synth state echoes
+    /// its named message through a LIVE `self.status = ` write. Comment
+    /// lines are stripped first: a needle (or an echo!) parked in a
+    /// comment must not keep the pin green — the v80 contract scan's
+    /// add_fx_plugin needle was comment-safe only by accident, and the
+    /// "main must call X" trap class (skill lore) is exactly this.
+    #[test]
+    fn v86_plugin_echo_inventory_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        const SEAMS: [(&str, &[&str]); 10] = [
+            ("fn add_fx_script(", &["self.status = ", "to track {} chain"]),
+            (
+                "fn add_fx_plugin(",
+                &["self.status = ", "loading on the plugin thread"],
+            ),
+            (
+                "fn remove_fx_row(",
+                &["self.status = ", "removed \\u{201c}"],
+            ),
+            (
+                "fn move_fx_row(",
+                &[
+                    "self.status = ",
+                    "moved \\u{201c}",
+                    "already first in the track",
+                ],
+            ),
+            ("fn toggle_fx_bypass(", &["self.status = ", "unmuted \\u{201c}"]),
+            ("fn set_track_synth_stem(", &["self.status = ", "track {}: synth"]),
+            ("fn vst_rescan(", &["self.status = ", "scanning"]),
+            ("fn poll_vst_opens(", &["self.status = ", "loader gone"]),
+            ("fn poll_editor_probes(", &["self.status = ", "crash guard"]),
+            ("fn vst_row_gui(", &["self.status = ", "plugin window closed"]),
+        ];
+        for (anchor, needles) in SEAMS {
+            assert_eq!(
+                prod.matches(anchor).count(),
+                1,
+                "seam anchor {anchor:?} not unique in prod"
+            );
+            let region = v86_fn_region(prod, anchor);
+            let live: Vec<&str> = region
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            let body = live.join("\n");
+            for needle in needles.iter().copied() {
+                assert!(
+                    body.contains(needle),
+                    "echo seam {anchor} lost live {needle:?} (comment-stripped scan)"
+                );
+            }
+        }
+        // The params-window preset trio echoes at the action dispatch
+        // (the helper fns return Result — the caller names the outcome).
+        let pb = v86_fn_region(prod, "fn params_body(");
+        let live: Vec<&str> = pb
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let body = live.join("\n");
+        for needle in [
+            "saved ({n} params)",
+            "loaded ({n} params)",
+            "deleted\"",
+            "refused by the plugin",
+        ] {
+            assert!(
+                body.contains(needle),
+                "params preset/preset-bar echo lost {needle:?}"
+            );
+        }
+    }
+
+    /// v86 R5: the two chain-window add-combos TOOLTIP while closed —
+    /// the runtime proof behind the R2 source contract.
+    #[test]
+    fn v86_chain_add_combos_tip() {
+        let mut app = headless_app("v86combos");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_window = Some(0);
+        app.vst_scanned = true;
+        app.vst_scan = vec![v76_entry("AuditFx", None)];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]); // settle the freshly-opened window
+        let c = galley_at(&mut app, &ctx, "+ effect")
+            .expect("add-effect combo painted")
+            .center();
+        let texts = hover_until_tip(&mut app, &ctx, c, &["pick an effect script"]);
+        assert!(
+            texts.iter().any(|t| t.contains("pick an effect script")),
+            "+ effect must explain itself while closed; galleys: {texts:?}"
+        );
+        let c2 = galley_at(&mut app, &ctx, "+ VST plugin")
+            .expect("add-vst combo painted")
+            .center();
+        let texts2 = hover_until_tip(&mut app, &ctx, c2, &["picking one appends"]);
+        assert!(
+            texts2.iter().any(|t| t.contains("picking one appends")),
+            "+ VST plugin must explain itself while closed; galleys: {texts2:?}"
+        );
+    }
+
+    /// v86 R6: chain-window primaries tooltip for real — row remove ×,
+    /// the mute/on pair, Rescan Plugins, and a plugin-folder row ×.
+    #[test]
+    fn v86_chain_widget_tips_paint() {
+        let mut app = headless_app("v86tips");
+        let ctx = egui::Context::default();
+        v80_chain_with(&mut app, &ctx, &["compressor"]);
+        frame(&mut app, &ctx, vec![]);
+        let xs = v80_row_x_centers(&mut app, &ctx);
+        let texts = hover_until_tip(&mut app, &ctx, xs[0], &["Remove from chain"]);
+        assert!(
+            texts.iter().any(|t| t.contains("Remove from chain")),
+            "row × must name the removal affordance; galleys: {texts:?}"
+        );
+        // The mute/on button sits left of the state label (v80 geometry:
+        // 8 px spacing + half its reserved 38 px slot = 27 px).
+        let lab = painted_text_rect(&ctx, &mut app, "click to open controls")
+            .expect("loaded row invites a click");
+        let p = egui::pos2(lab.min.x - 27.0, lab.center().y);
+        let texts = hover_until_tip(&mut app, &ctx, p, &["mute this slot"]);
+        assert!(
+            texts.iter().any(|t| t.contains("mute this slot")),
+            "the live mute button must explain the bypass contract; galleys: {texts:?}"
+        );
+        let rp = painted_text_rect(&ctx, &mut app, "Rescan Plugins")
+            .expect("plugin rescan button")
+            .center();
+        let texts = hover_until_tip(&mut app, &ctx, rp, &["re-scan the plugin folders"]);
+        assert!(
+            texts.iter().any(|t| t.contains("re-scan the plugin folders")),
+            "Rescan Plugins must tooltip its scope; galleys: {texts:?}"
+        );
+        // Plugin-folder row × (seed one dir; settle before probing).
+        app.vst_dirs = vec!["/tmp/v86tip".into()];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "/tmp/v86tip")
+            .expect("the seeded folder row paints");
+        let p = egui::pos2(r.max.x + 9.0, r.center().y);
+        let texts = hover_until_tip(&mut app, &ctx, p, &["Remove this folder"]);
+        assert!(
+            texts.iter().any(|t| t.contains("Remove this folder")),
+            "folder × must explain the removal; galleys: {texts:?}"
+        );
+    }
+
+    /// v86 R7: the ♪ synth picker's primaries tooltip — browser rows and
+    /// its Rescan Plugins.
+    #[test]
+    fn v86_synth_picker_tips_paint() {
+        let mut app = headless_app("v86spick");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.synth_pick = Some(0);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // Rows carry "[rust]  <name>" as ONE galley — probe the default
+        // row by substring (painted_text_rect), not galleys_all (==).
+        let rowr = painted_text_rect(&ctx, &mut app, "piano \u{2014} default")
+            .expect("the default synth row paints in the picker");
+        let texts = hover_until_tip(&mut app, &ctx, rowr.center(), &["switch this track"]);
+        assert!(
+            texts.iter().any(|t| t.contains("switch this track")),
+            "picker rows must state the bind action; galleys: {texts:?}"
+        );
+        // The picker's Rescan scripts / Rescan Plugins pair sits BELOW
+        // the 853-px fold in this float state (measured via DIAG 11-18:
+        // both absent from the viewport) — no runtime hover arm is
+        // reachable there. Their own-hover statements are pinned by
+        // v86_plugin_hover_region_scan (synth_pick_body region), and the
+        // IDENTICAL Rescan Plugins hover copies paint for real in
+        // v86_chain_widget_tips_paint.
+    }
+
+    /// v86 R8: picking a plugin in the "+ VST plugin" popup echoes the
+    /// STARTED load (name, track, chain) — not only the settle later.
+    /// Asserted right after the release frame: `poll_vst_opens` runs at
+    /// the NEXT frame, so the loader thread cannot have overwritten the
+    /// started-echo yet (the async error for the fake path would).
+    #[test]
+    fn v86_add_fx_plugin_echoes() {
+        let mut app = headless_app("v86fxadd");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.fx_window = Some(0);
+        app.vst_scanned = true;
+        app.vst_scan = vec![v76_entry("AuditFx", None)];
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let c = galley_at(&mut app, &ctx, "+ VST plugin")
+            .expect("add-vst combo")
+            .center();
+        for ev in [
+            vec![moved(c)],
+            vec![moved(c), btn(c, egui::PointerButton::Primary, true)],
+            vec![btn(c, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let item = painted_text_rect(&ctx, &mut app, "AuditFx")
+            .expect("popup lists the seeded plugin")
+            .center();
+        for ev in [
+            vec![moved(item)],
+            vec![moved(item), btn(item, egui::PointerButton::Primary, true)],
+            vec![btn(item, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        assert_eq!(app.fx_rows[0].len(), 1, "the pick added exactly one row");
+        assert!(
+            matches!(&app.fx_rows[0][0], ChainRow::Vst { name, .. } if name == "AuditFx"),
+            "the new row carries the picked plugin"
+        );
+        assert!(
+            app.status.contains("AuditFx: loading on the plugin thread")
+                && app.status.contains("track 1 chain"),
+            "the add names what started where; status {:?}",
+            app.status
+        );
+    }
 }
