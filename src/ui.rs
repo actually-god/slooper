@@ -3704,10 +3704,15 @@ impl App {
                     .desired_width((avail - 100.0).clamp(60.0, 200.0)),
             )
             .on_hover_text("type to narrow the parameter list by name");
-            let count = if ql.is_empty() {
-                format!("{total} params")
-            } else {
-                format!("{shown_total} of {total} params")
+            // v82: the row cap is stated HERE (in the header) — a note
+            // at the foot of a 400-row scroll would be invisible.
+            let count = match (ql.is_empty(), shown_total > 400) {
+                (true, false) => format!("{total} params"),
+                (true, true) => format!("showing the first 400 of {total}"),
+                (false, false) => format!("{shown_total} of {total} params"),
+                (false, true) => {
+                    format!("{shown_total} match \u{b7} showing the first 400")
+                }
             };
             ui.label(egui::RichText::new(count).weak().small())
                 .on_hover_text(
@@ -3738,9 +3743,17 @@ impl App {
         // clipping trailing widgets (the v30 horizontal-clip trap —
         // no galley, no warning, the control simply never exists).
         // The filter header above stays pinned while the list scrolls.
+        // v82 fix: BOTH extents are bounded — an unbounded scroll area
+        // inside the content-sized floating window fed its own size back
+        // (window grew a few px per frame → labels "drifted" between
+        // reads). The viewport is fenced to the width available NOW and
+        // a fixed height (the repo idiom, cf. the v35 panel bodies).
+        let body_w = ui.available_width().max(240.0);
         egui::ScrollArea::both()
             .id_salt("slooper-params-body")
-            .auto_shrink([false, false])
+            .auto_shrink([false, true])
+            .max_width(body_w)
+            .max_height(360.0)
             .show(ui, |ui| {
             // v34 R2: user preset bar — save/load the CURRENT value
             // snapshot for ANY hosted plugin (works even when the
@@ -50324,6 +50337,8 @@ mod tests {
             "on_hover_text(spec.delete_hover)",
             "on_hover_text(spec.reset_hover)",
             "on_hover_text(h)",
+            // v82: picker_row rows and their picker also hover-answer.
+            "on_hover_text(spec.hover)",
         ] {
             assert!(renderer.contains(attach), "renderer lost {attach}");
         }
@@ -50901,6 +50916,8 @@ mod tests {
             "on_hover_text(spec.delete_hover)",
             "on_hover_text(spec.reset_hover)",
             "on_hover_text(h)",
+            // v82: picker_row rows and their picker also hover-answer.
+            "on_hover_text(spec.hover)",
         ] {
             assert!(renderer.contains(attach), "renderer lost {attach}");
         }
@@ -51611,6 +51628,10 @@ mod tests {
         // The needle must be TOOLTIP-UNIQUE — "changes apply live" alone
         // also rides the window's static info label and would satisfy
         // hover_until_tip before egui's 0.3 s tooltip delay elapses.
+        // v82: re-probe IMMEDIATELY before the hover — the floating
+        // window drifts a few px per extra headless frame (v66 trap;
+        // v82's body scroll made the drift reach this row), and a stale
+        // center can miss the row's hover band.
         let row = *kit_probe("V74hz").first().unwrap();
         let tips = hover_until_tip(&mut app, &ctx, row.center(), &["value from the plugin"]);
         assert!(
@@ -53904,7 +53925,6 @@ mod tests {
         cur: std::sync::atomic::AtomicUsize,
     }
     impl crate::vsthost::StageEntry for V82Prog {
-        use crate::vsthost::StageEntry;
         fn name(&self) -> &str {
             "v82prog"
         }
@@ -53959,7 +53979,7 @@ mod tests {
     }
 
     /// Open the PARAMETERS window on a fresh chain row hosting `entry`.
-    fn v82_open_params<'a>(
+    fn v82_open_params(
         app: &mut App,
         ctx: &egui::Context,
         tag: &str,
@@ -54019,16 +54039,40 @@ mod tests {
             texts.iter().any(|t| t.contains("showing the first 400 of 450")),
             "the cap must be stated, not silently applied; galleys: {texts:?}"
         );
-        // R1c: every slider row is the kit's fixed 150 px — columns
-        // cannot drift, and the row's right edge is deterministic.
+        // R1c: deep rows sit in the SAME column as the first row —
+        // width and left edge identical (columns cannot drift), and the
+        // row's right edge is therefore deterministic.
+        let r0 = kit_probe("V82p000")[0];
         let r399 = kit_probe("V82p399")[0];
-        assert!((r399.width() - 150.0).abs() < 0.6, "fixed-width rows");
+        assert!(
+            (r399.width() - r0.width()).abs() < 0.6,
+            "rows share one width ({} vs {})",
+            r0.width(),
+            r399.width()
+        );
+        assert!(
+            (r399.min.x - r0.min.x).abs() < 0.6,
+            "rows share one left edge ({} vs {})",
+            r0.min.x,
+            r399.min.x
+        );
         // R1b: the wheel reaches the deep rows (single both()-scroll).
         let before = r399.center().y;
         let anchor = kit_probe("V82p000")[0].center();
         kit_clear();
         frame(&mut app, &ctx, vec![moved(anchor)]);
-        frame(&mut app, &ctx, vec![egui::Event::Scroll { units: 20.0 }]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                modifiers: egui::Modifiers::default(),
+                phase: egui::TouchPhase::Move,
+                // Positive delta moves the VIEWED content down (reveals
+                // rows above); negative reaches deeper rows.
+                delta: egui::vec2(0.0, -20.0),
+            }],
+        );
         kit_clear();
         frame(&mut app, &ctx, vec![]);
         let after = kit_probe("V82p399")[0].center().y;
@@ -54064,7 +54108,7 @@ mod tests {
         let ui_src = prod_window(include_str!("ui.rs"));
         // Positive: the TWO shared picker rows are live call sites.
         assert_eq!(
-            ui_src.matches(concat!("presetbar::picker_row(ui,")).count(),
+            ui_src.matches("presetbar::picker_row(ui,").count(),
             2,
             "program + factory-preset rows must ride the shared picker"
         );
@@ -54093,6 +54137,15 @@ mod tests {
                     "ScrollArea::both().id_salt(\"slooper",
                     "-params-body\")"
                 ))
+                .count(),
+            1
+        );
+        // ...and BOTH of its extents are fenced (the floating-window
+        // size-feedback loop: an unbounded scroll inside a
+        // content-sized window grows it a few px per frame).
+        assert_eq!(
+            ui_src
+                .matches(".max_width(body_w).max_height(360.0)")
                 .count(),
             1
         );
@@ -54295,8 +54348,12 @@ mod tests {
         );
     }
 
-    /// R4: filter / user-preset / program rows share the kit label
-    /// column — labels start at one x, controls start at one x.
+    /// R4: filter / user-preset / program rows share the kit column
+    /// geometry — label centers on ONE x (bar_label centers inside the
+    /// fixed LABEL_COL rect) and controls start on ONE x. Measured in a
+    /// SINGLE frame: the floating window drifts a few px per extra
+    /// headless frame (v66 trap), so cross-frame reads must never be
+    /// compared against each other.
     #[test]
     fn v82_params_bar_labels_aligned() {
         let mut app = headless_app("v82align");
@@ -54307,41 +54364,65 @@ mod tests {
             cur: std::sync::atomic::AtomicUsize::new(0),
         });
         v82_open_params(&mut app, &ctx, "v82align", entry);
-        let lf = galley_at_last(&mut app, &ctx, "filter")
-            .expect("filter label")
-            .min()
-            .x;
-        let lu = galley_at_last(&mut app, &ctx, "user preset")
-            .expect("preset bar label")
-            .min()
-            .x;
-        let lp = galley_at_last(&mut app, &ctx, "program")
-            .expect("program row label")
-            .min()
-            .x;
+        // One more frame, read once: collect every needle's x in THIS frame.
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut xs: Vec<(&str, f32, f32)> = Vec::new(); // (text, x, w)
+        for cs in out.shapes.iter() {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                let tx = t.galley.text();
+                for want in ["filter", "user preset", "program", "P82alpha"] {
+                    if tx == want {
+                        xs.push((want, t.pos.x, t.galley.rect.width()));
+                    }
+                }
+                if tx.contains("parameter name") || tx.contains("preset name") {
+                    // hint galleys sit at the box's left margin: their x
+                    // IS the control column.
+                    xs.push((if tx.contains("parameter") { "FBOX" } else { "PBOX" }, t.pos.x, 0.0));
+                }
+            }
+        }
+        let _ = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        out.textures_delta.clear();
+        let x_of = |needle: &str| -> (f32, f32) {
+            for (t, x, w) in xs.iter() {
+                if *t == needle {
+                    return (*x, *w);
+                }
+            }
+            panic!("galley {needle:?} not painted; got {xs:?}");
+        };
+        let (fbox, _) = x_of("FBOX");
+        let (pbox, _) = x_of("PBOX");
+        // Controls: both name boxes on ONE column (hint galley = box left).
         assert!(
-            (lf - lu).abs() < 1.0 && (lf - lp).abs() < 1.0,
-            "bar labels must share a left edge ({lf}, {lu}, {lp})"
+            (fbox - pbox).abs() < 0.5,
+            "name boxes must share the control column ({fbox} vs {pbox}; {xs:?})"
         );
-        // Controls ride the column: both name boxes start where the
-        // labels end; the program combo lands in the same column
-        // (combo text padding differs by a couple of px at most).
-        let fb = galley_at_last(&mut app, &ctx, "parameter name")
-            .expect("filter box")
-            .min()
-            .x;
-        let pb = galley_at_last(&mut app, &ctx, "preset name")
-            .expect("preset box")
-            .min()
-            .x;
-        let pc = galley_at_last(&mut app, &ctx, "P82alpha")
-            .expect("program combo leads with the current program")
-            .min()
-            .x;
-        assert!((fb - pb).abs() < 1.5, "name boxes share the column");
+        // Labels: centered inside the shared LABEL_COL rect -> one center.
+        let center = |n: &str| {
+            let (x, w) = x_of(n);
+            x + w / 2.0
+        };
+        let (cf, cu, cp) = (center("filter"), center("user preset"), center("program"));
         assert!(
-            (pc - fb).abs() < 6.0,
-            "the combo lands in the same control column ({fb} vs {pc})"
+            (cf - cu).abs() < 0.5 && (cf - cp).abs() < 0.5,
+            "bar labels share one column center ({cf} / {cu} / {cp})"
+        );
+        // The combo caption lands in the same control column (its text
+        // carries ~2px button padding over the box margin).
+        let (pc, _) = x_of("P82alpha");
+        assert!(
+            (pc - fbox).abs() < 6.0,
+            "the program combo rides the control column ({fbox} vs {pc})"
         );
     }
 }
