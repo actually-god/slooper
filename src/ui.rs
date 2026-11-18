@@ -3623,16 +3623,14 @@ impl App {
         };
         // v35: PARAMETERS window joins the dock system — registry slot,
         // shared body, floating chrome (with carry) owned here.
-        let idx = self.dyn_reg(
-            DynKind::Params,
-            format!("{} \u{2014} parameters", entry.name()),
-        );
+        // v82: the title string has ONE home (registry slot + window).
+        let idx = self.dyn_reg(DynKind::Params, Self::params_title(entry.name()));
         if self.dyn_dock_skip(idx) {
             return;
         }
         let dragging = self.free_drag.map(|(i, _)| i == idx).unwrap_or(false);
         let mut open = true;
-        let mut w = egui::Window::new(format!("{} \u{2014} parameters", entry.name()))
+        let mut w = egui::Window::new(Self::params_title(entry.name()))
             .id(egui::Id::new("slooper_params_win"))
             .default_pos([420.0, 140.0])
             .default_width(460.0)
@@ -3660,6 +3658,11 @@ impl App {
         }
     }
 
+    /// v82: the ONE title of the PARAMETERS window / dock registry slot.
+    fn params_title(name: &str) -> String {
+        format!("{name} \u{2014} parameters")
+    }
+
     /// v35: PARAMETERS body — ONE body shared by the floating window and
     /// the docked panel: filter, preset bar and the slider mirror all
     /// behave identically either way.
@@ -3678,18 +3681,38 @@ impl App {
         // after the row closes — same deferred-action shape as preset).
         let mut pick_prog: Option<usize> = None;
         let total = entry.descs().iter().filter(|d| d.writable && !d.program_change).count();
+        let ql = new_filter.trim().to_lowercase();
+        // v82: the count label echoes the filter LIVE (goal 1: every
+        // state change answers in the header before you hunt the list).
+        let shown_total = if ql.is_empty() {
+            total
+        } else {
+            entry
+                .descs()
+                .iter()
+                .filter(|d| d.writable && !d.program_change && d.name.to_lowercase().contains(&ql))
+                .count()
+        };
         ui.horizontal(|ui| {
-            ui.label("filter");
+            crate::presetbar::bar_label(ui, "filter", crate::presetbar::LABEL_COL, false);
+            let avail = ui.available_width();
             ui.add(
                 egui::TextEdit::singleline(&mut new_filter)
                     .hint_text("parameter name")
-                    .desired_width(200.0),
-            );
-            ui.label(
-                egui::RichText::new(format!("{total} params"))
-                    .weak()
-                    .small(),
-            );
+                    // v82: the box shrinks with the window (docked narrow
+                    // panels clip NOTHING at the row's right edge).
+                    .desired_width((avail - 100.0).clamp(60.0, 200.0)),
+            )
+            .on_hover_text("type to narrow the parameter list by name");
+            let count = if ql.is_empty() {
+                format!("{total} params")
+            } else {
+                format!("{shown_total} of {total} params")
+            };
+            ui.label(egui::RichText::new(count).weak().small())
+                .on_hover_text(
+                    "writable plugin parameters \u{b7} factory patches use the program picker",
+                );
         });
         ui.label(
             egui::RichText::new(if entry.has_editor() {
@@ -3706,234 +3729,257 @@ impl App {
             .small(),
         );
         ui.separator();
-        // v34 R2: user preset bar — save/load the CURRENT value
-        // snapshot for ANY hosted plugin (works even when the
-        // plugin has no usable window of its own).
-        if self.params_presets_for != entry.name() {
-            let nm = entry.name().to_string();
-            self.params_presets_for = nm.clone();
-            self.params_presets = Self::list_param_presets(&nm);
-        }
-        // v87 (TS-013): clipped picker rows hover their preset file.
-        let pdir = Self::param_preset_dir(&self.params_presets_for);
-        // v77 (TS-003): ONE preset bar renderer — copy stays here, every
-        // click runs through crate::presetbar (no per-site markup).
-        let spec = crate::presetbar::PresetBarSpec {
-            label: Some("user preset"),
-            hint: "preset name",
-            name_width: 130.0,
-            save_text: "Save",
-            save_hover: "save the current values as a named preset",
-            load_text: "Load",
-            load_width: 150.0,
-            load_hover: None,
-            row_hover: "load this preset",
-            row_dir: Some(&pdir),
-            empty_text: None,
-            delete_text: Some("delete named preset"),
-            delete_hover: "delete the preset whose name is in the box",
-            reset_text: None,
-            reset_hover: "",
-            compact: false,
-        };
-        if let Some(act) = crate::presetbar::render(
-            ui,
-            egui::Id::new("slooper_param_presets"),
-            &spec,
-            &mut self.params_preset_name,
-            &self.params_presets,
-        ) {
-            match act {
-                crate::presetbar::PresetBarAction::Save => do_save = true,
-                crate::presetbar::PresetBarAction::Load(nm) => load_name = Some(nm),
-                crate::presetbar::PresetBarAction::Delete => do_del = true,
-                crate::presetbar::PresetBarAction::Reset => {}
-            }
-        }
-        // v60: factory-program row — the plugin's OWN shipped patches.
-        // One surface for instruments AND chain FX (this window serves
-        // every GuiTarget); backends/plugins reporting no programs skip
-        // the row entirely. VST2 since v60, VST3 since v66 (IUnitInfo
-        // program lists + the program-change parameter, the documented
-        // gap now closed). CLAP has NO factory enumeration in the v1 ABI
-        // by design — its user presets ride the value bar above, and a
-        // preset the PLUGIN loads itself surfaces as the v67 echo below.
-        if self.params_programs_for != entry.name() {
-            let nm = entry.name().to_string();
-            self.params_programs_for = nm.clone();
-            let ps = entry.programs();
-            self.params_programs = if ps.len() > 1 { ps } else { Vec::new() };
-        }
-        if !self.params_programs.is_empty() {
-            // v62: the plugin may change its program INSIDE its own
-            // editor — re-read the live value (throttled ~1 s, one
-            // GUI-thread hop) while this window shows the entry, so the
-            // combo and the persistence tables follow the plugin's truth.
-            let now = ui.ctx().input(|i| i.time);
-            if now >= self.params_prog_sync_at {
-                self.params_prog_sync_at = now + 1.0;
-                entry.refresh_program();
-                if let GuiTarget::Synth(t) = target {
-                    if t < MAX_LOOPS {
-                        if let Some(p) = entry.current_program() {
-                            self.track_synth_program[t] = p as i32;
-                        }
-                    }
-                }
-            }
-            let cur = entry.current_program();
-            let sel = cur
-                .and_then(|i| self.params_programs.get(i).cloned())
-                .unwrap_or_else(|| "(unknown)".to_string());
-            ui.horizontal(|ui| {
-                ui.label("program");
-                egui::ComboBox::from_id_salt("slooper_v60_programs")
-                    .selected_text(sel)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        let list = self.params_programs.clone();
-                        for (i, p) in list.iter().enumerate() {
-                            if ui
-                                .selectable_label(cur == Some(i), p.chars().take(40).collect::<String>())
-                                .on_hover_text(p.clone())
-                                .clicked()
-                            {
-                                pick_prog = Some(i);
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "factory patches built into the plugin \u{b7} picking one \
-                         changes the sound immediately",
-                    );
-            });
-        }
-        // v67: surface plugin-side preset-load reports (CLAP
-        // `clap.preset-load`) while this window shows the entry - same
-        // throttled-pump shape as the v62 program sync. A plugin that
-        // loaded one of its OWN presets would otherwise change the sound
-        // with no host-side trace; the echo closes that feedback loop
-        // (goal 1) and the save-time chunk harvest persists the state.
-        let now = ui.ctx().input(|i| i.time);
-        if now >= self.params_preset_sync_at {
-            self.params_preset_sync_at = now + 1.0;
-            if let Some(r) = entry.take_preset_report() {
-                match r {
-                    crate::vsthost::PresetLoadEvent::Loaded { location, load_key } => {
-                        self.status = match load_key {
-                            Some(k) => format!(
-                                "preset loaded \u{201c}{location}\u{201d} [{k}] (from the plugin)"
-                            ),
-                            None => format!(
-                                "preset loaded \u{201c}{location}\u{201d} (from the plugin)"
-                            ),
-                        };
-                    }
-                    crate::vsthost::PresetLoadEvent::Failed { location, message, .. } => {
-                        self.status = format!(
-                            "preset load FAILED \u{201c}{location}\u{201d}: {message}"
-                        );
-                    }
-                }
-            }
-        }
-        // v79: host-commanded preset load (CLAP `clap_plugin_preset_load`).
-        // An entry that answers the extension gets the presets its own
-        // discovery provider published (combo) plus a whole-file entry
-        // point (button); both feed the entry through ONE loader seam and
-        // echo the verdict (goal 1). Every other backend never sees the
-        // row (`supports_preset_load` is false there). Discovery runs
-        // once per entry, on this control thread, under vst_loader_lock.
-        let can_pl = entry.supports_preset_load();
-        if can_pl && self.params_preset_locs_for != entry.name() {
-            self.params_preset_locs_for = entry.name().to_string();
-            self.params_preset_locs = entry.preset_locations();
-        }
-        if can_pl {
-            let locs = self.params_preset_locs.clone();
-            let mut pick_loc: Option<usize> = None;
-            let mut file_pick: Option<std::path::PathBuf> = None;
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("slooper_v79_preset_locs")
-                    .selected_text("factory presets")
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        if locs.is_empty() {
-                            ui.label("(none discovered)");
-                        }
-                        for (i, l) in locs.iter().enumerate() {
-                            let mut disp = l.name.chars().take(40).collect::<String>();
-                            if let Some(k) = l.location.as_deref() {
-                                if let Some(b) = std::path::Path::new(k).file_name() {
-                                    disp.push_str(&format!(" \u{b7} {}", b.to_string_lossy()));
-                                }
-                            }
-                            let tip = if l.factory {
-                                "preset built into the plugin \u{b7} loading changes the sound immediately"
-                            } else {
-                                "preset file the plugin discovered \u{b7} loading changes the sound immediately"
-                            };
-                            if ui
-                                .selectable_label(false, disp)
-                                .on_hover_text(tip)
-                                .clicked()
-                            {
-                                pick_loc = Some(i);
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "presets this plugin exposes for host-commanded loading \u{b7} \
-                         the list is read from the plugin itself",
-                    );
-                if ui
-                    .button("preset from file")
-                    .on_hover_text("load any preset file this plugin can read")
-                    .clicked()
-                {
-                    file_pick = rfd::FileDialog::new()
-                        .set_title("Load preset file")
-                        .add_filter("Plugin presets", &["fxp", "fxb", "fset", "preset"])
-                        .pick_file();
-                }
-            });
-            if let Some(i) = pick_loc {
-                let l = &self.params_preset_locs[i];
-                let nm = l.name.clone();
-                match entry.load_preset_location(
-                    l.kind,
-                    l.location.as_deref(),
-                    l.load_key.as_deref(),
-                ) {
-                    Ok(()) => self.status = format!("preset \u{2192} \u{201c}{nm}\u{201d} (live)"),
-                    Err(e) => self.status = format!("preset load FAILED: {e}"),
-                }
-            }
-            if let Some(p) = file_pick {
-                self.clap_preset_file_action(entry, &p);
-            }
-        }
-        let ql = new_filter.trim().to_lowercase();
-        // v74: carry the FULL descriptor — every row renders through the
-        // ONE kit renderer (`fxgui::param_row`) the stock auto grid uses:
-        // same chrome, same formatter, hover tips, and pickers where the
-        // plugin declared steps. program_change params stay filtered out
-        // of the knob list (v66 contract — the program combo owns them).
-        let rows: Vec<(usize, crate::vsthost::VstParamDesc)> = entry
-            .descs()
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.writable && !d.program_change)
-            .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
-            .take(400)
-            .map(|(k, d)| (k, d.clone()))
-            .collect();
+        // v82: row echoes are collected inside the scroll body and
+        // written to the status bar after it (v34 deferred-action rule).
         let mut echo: Option<String> = None;
-        egui::ScrollArea::vertical()
+        // v82 (TS-006): bars and the parameter list share ONE scroll
+        // region, and it is `both()`: a narrow docked panel scrolls
+        // overflowing rows horizontally INTO view instead of silently
+        // clipping trailing widgets (the v30 horizontal-clip trap —
+        // no galley, no warning, the control simply never exists).
+        // The filter header above stays pinned while the list scrolls.
+        egui::ScrollArea::both()
+            .id_salt("slooper-params-body")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+            // v34 R2: user preset bar — save/load the CURRENT value
+            // snapshot for ANY hosted plugin (works even when the
+            // plugin has no usable window of its own).
+            if self.params_presets_for != entry.name() {
+                let nm = entry.name().to_string();
+                self.params_presets_for = nm.clone();
+                self.params_presets = Self::list_param_presets(&nm);
+            }
+            // v87 (TS-013): clipped picker rows hover their preset file.
+            let pdir = Self::param_preset_dir(&self.params_presets_for);
+            // v77 (TS-003): ONE preset bar renderer — copy stays here, every
+            // click runs through crate::presetbar (no per-site markup).
+            let spec = crate::presetbar::PresetBarSpec {
+                label: Some("user preset"),
+                hint: "preset name",
+                name_width: 130.0,
+                save_text: "Save",
+                save_hover: "save the current values as a named preset",
+                load_text: "Load",
+                load_width: 150.0,
+                load_hover: Some("pick a saved preset from the list to load it"),
+                row_hover: "load this preset",
+                row_dir: Some(&pdir),
+                empty_text: None,
+                delete_text: Some("delete named preset"),
+                delete_hover: "delete the preset whose name is in the box",
+                reset_text: None,
+                reset_hover: "",
+                compact: false,
+                label_width: crate::presetbar::LABEL_COL,
+            };
+            if let Some(act) = crate::presetbar::render(
+                ui,
+                egui::Id::new("slooper_param_presets"),
+                &spec,
+                &mut self.params_preset_name,
+                &self.params_presets,
+            ) {
+                match act {
+                    crate::presetbar::PresetBarAction::Save => do_save = true,
+                    crate::presetbar::PresetBarAction::Load(nm) => load_name = Some(nm),
+                    crate::presetbar::PresetBarAction::Delete => do_del = true,
+                    crate::presetbar::PresetBarAction::Reset => {}
+                }
+            }
+            // v60: factory-program row — the plugin's OWN shipped patches.
+            // One surface for instruments AND chain FX (this window serves
+            // every GuiTarget); backends/plugins reporting no programs skip
+            // the row entirely. VST2 since v60, VST3 since v66 (IUnitInfo
+            // program lists + the program-change parameter, the documented
+            // gap now closed). CLAP has NO factory enumeration in the v1 ABI
+            // by design — its user presets ride the value bar above, and a
+            // preset the PLUGIN loads itself surfaces as the v67 echo below.
+            if self.params_programs_for != entry.name() {
+                let nm = entry.name().to_string();
+                self.params_programs_for = nm.clone();
+                let ps = entry.programs();
+                self.params_programs = if ps.len() > 1 { ps } else { Vec::new() };
+            }
+            if !self.params_programs.is_empty() {
+                // v62: the plugin may change its program INSIDE its own
+                // editor — re-read the live value (throttled ~1 s, one
+                // GUI-thread hop) while this window shows the entry, so the
+                // combo and the persistence tables follow the plugin's truth.
+                let now = ui.ctx().input(|i| i.time);
+                if now >= self.params_prog_sync_at {
+                    self.params_prog_sync_at = now + 1.0;
+                    entry.refresh_program();
+                    if let GuiTarget::Synth(t) = target {
+                        if t < MAX_LOOPS {
+                            if let Some(p) = entry.current_program() {
+                                self.track_synth_program[t] = p as i32;
+                            }
+                        }
+                    }
+                }
+                let cur = entry.current_program();
+                let sel = cur
+                    .and_then(|i| self.params_programs.get(i).cloned())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                // v82 (TS-006): the row renders through the shared TS-003
+                // picker — same popup rows as the preset bar, same label
+                // column as the filter row (no per-site combo markup).
+                let items: Vec<crate::presetbar::PickerItem> = self
+                    .params_programs
+                    .iter()
+                    .map(|p| crate::presetbar::PickerItem {
+                        display: p.chars().take(40).collect::<String>(),
+                        hover: p.clone(),
+                        clip_dir: None,
+                    })
+                    .collect();
+                ui.horizontal(|ui| {
+                    if let Some(i) = crate::presetbar::picker_row(
+                        ui,
+                        egui::Id::new("slooper_v60_programs"),
+                        &crate::presetbar::PickerRowSpec {
+                            label: Some("program"),
+                            label_width: crate::presetbar::LABEL_COL,
+                            caption: &sel,
+                            width: 150.0,
+                            hover: "factory patches built into the plugin \u{b7} picking \
+                                    one changes the sound immediately",
+                            empty_text: None,
+                        },
+                        &items,
+                        cur,
+                    ) {
+                        pick_prog = Some(i);
+                    }
+                });
+            }
+            // v67: surface plugin-side preset-load reports (CLAP
+            // `clap.preset-load`) while this window shows the entry - same
+            // throttled-pump shape as the v62 program sync. A plugin that
+            // loaded one of its OWN presets would otherwise change the sound
+            // with no host-side trace; the echo closes that feedback loop
+            // (goal 1) and the save-time chunk harvest persists the state.
+            let now = ui.ctx().input(|i| i.time);
+            if now >= self.params_preset_sync_at {
+                self.params_preset_sync_at = now + 1.0;
+                if let Some(r) = entry.take_preset_report() {
+                    match r {
+                        crate::vsthost::PresetLoadEvent::Loaded { location, load_key } => {
+                            self.status = match load_key {
+                                Some(k) => format!(
+                                    "preset loaded \u{201c}{location}\u{201d} [{k}] (from the plugin)"
+                                ),
+                                None => format!(
+                                    "preset loaded \u{201c}{location}\u{201d} (from the plugin)"
+                                ),
+                            };
+                        }
+                        crate::vsthost::PresetLoadEvent::Failed { location, message, .. } => {
+                            self.status = format!(
+                                "preset load FAILED \u{201c}{location}\u{201d}: {message}"
+                            );
+                        }
+                    }
+                }
+            }
+            // v79: host-commanded preset load (CLAP `clap_plugin_preset_load`).
+            // An entry that answers the extension gets the presets its own
+            // discovery provider published (combo) plus a whole-file entry
+            // point (button); both feed the entry through ONE loader seam and
+            // echo the verdict (goal 1). Every other backend never sees the
+            // row (`supports_preset_load` is false there). Discovery runs
+            // once per entry, on this control thread, under vst_loader_lock.
+            let can_pl = entry.supports_preset_load();
+            if can_pl && self.params_preset_locs_for != entry.name() {
+                self.params_preset_locs_for = entry.name().to_string();
+                self.params_preset_locs = entry.preset_locations();
+            }
+            if can_pl {
+                let locs = self.params_preset_locs.clone();
+                let mut pick_loc: Option<usize> = None;
+                let mut file_pick: Option<std::path::PathBuf> = None;
+                // v82 (TS-006): same shared picker as the program row (the
+                // preset bar's Load list rides the same row painter). The
+                // file button keeps the row's right-hand control.
+                let items: Vec<crate::presetbar::PickerItem> = locs
+                    .iter()
+                    .map(|l| {
+                        let mut disp = l.name.chars().take(40).collect::<String>();
+                        if let Some(k) = l.location.as_deref() {
+                            if let Some(b) = std::path::Path::new(k).file_name() {
+                                disp.push_str(&format!(" \u{b7} {}", b.to_string_lossy()));
+                            }
+                        }
+                        let hover = if l.factory {
+                            "preset built into the plugin \u{b7} loading changes the sound immediately"
+                        } else {
+                            "preset file the plugin discovered \u{b7} loading changes the sound immediately"
+                        }
+                        .to_string();
+                        crate::presetbar::PickerItem { display: disp, hover, clip_dir: None }
+                    })
+                    .collect();
+                ui.horizontal(|ui| {
+                    if let Some(i) = crate::presetbar::picker_row(
+                        ui,
+                        egui::Id::new("slooper_v79_preset_locs"),
+                        &crate::presetbar::PickerRowSpec {
+                            label: None,
+                            label_width: 0.0,
+                            caption: "factory presets",
+                            width: 150.0,
+                            hover: "presets this plugin exposes for host-commanded loading \u{b7} \
+                                    the list is read from the plugin itself",
+                            empty_text: Some("(none discovered)"),
+                        },
+                        &items,
+                        None,
+                    ) {
+                        pick_loc = Some(i);
+                    }
+                    if ui
+                        .button("preset from file")
+                        .on_hover_text("load any preset file this plugin can read")
+                        .clicked()
+                    {
+                        file_pick = rfd::FileDialog::new()
+                            .set_title("Load preset file")
+                            .add_filter("Plugin presets", &["fxp", "fxb", "fset", "preset"])
+                            .pick_file();
+                    }
+                });
+                if let Some(i) = pick_loc {
+                    let l = &self.params_preset_locs[i];
+                    let nm = l.name.clone();
+                    match entry.load_preset_location(
+                        l.kind,
+                        l.location.as_deref(),
+                        l.load_key.as_deref(),
+                    ) {
+                        Ok(()) => self.status = format!("preset \u{2192} \u{201c}{nm}\u{201d} (live)"),
+                        Err(e) => self.status = format!("preset load FAILED: {e}"),
+                    }
+                }
+                if let Some(p) = file_pick {
+                    self.clap_preset_file_action(entry, &p);
+                }
+            }
+            // v74: carry the FULL descriptor — every row renders through the
+            // ONE kit renderer (`fxgui::param_row`) the stock auto grid uses:
+            // same chrome, same formatter, hover tips, and pickers where the
+            // plugin declared steps. program_change params stay filtered out
+            // of the knob list (v66 contract — the program combo owns them).
+            let rows: Vec<(usize, crate::vsthost::VstParamDesc)> = entry
+                .descs()
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.writable && !d.program_change)
+                .filter(|(_, d)| ql.is_empty() || d.name.to_lowercase().contains(&ql))
+                .take(400)
+                .map(|(k, d)| (k, d.clone()))
+                .collect();
+            let n_rows = rows.len();
                 for (k, d) in rows {
                     let mut v = entry.params().get(k);
                     let before = v;
@@ -3954,25 +4000,71 @@ impl App {
                         labels: &d.enum_labels,
                         gestures: false,
                         echo_hint: "changes apply live",
+                        gesture_note: "double-click: set value \u{b7} right-click: automation",
                     };
                     let out =
                         crate::fxgui::param_row(ui, ui.id().with(("v74param", k)), &spec, &mut v);
                     if p_changed(&out.r, before, &mut v) {
                         entry.set_param(k, v);
                     }
+                    // v82 (TS-006): hosted rows carry the SAME automation
+                    // affordance as the stock editor, through the ONE
+                    // gesture pair every automatable control uses. The
+                    // target id is exactly what `auto_targets` publishes
+                    // for this param, over the normalized 0..=1 domain
+                    // the row edits: right-click opens the value mini-
+                    // menu ("Create automation clip" / "Set value"),
+                    // double-click opens Set value.
+                    let (auto_track, auto_target) = match target {
+                        GuiTarget::Chain(t, s) => (t, format!("fx:{s}:{k}")),
+                        GuiTarget::Synth(t) => (t, format!("synth:{k}")),
+                    };
+                    let mut rr = out.r;
+                    bind_value_controls(&mut rr, self, Some(auto_track), &auto_target, v);
                     // Goal 1 echo: a picker pick (or any non-drag commit)
                     // answers at once; a drag answers when the pointer
                     // LIFTS — `changed()` and the stop land on different
                     // frames, so the release is its own trigger (and a
                     // secondary-button drag, reverted by p_changed above,
                     // must not echo).
-                    if out.r.drag_stopped_by(egui::PointerButton::Primary)
-                        || (!out.r.dragged() && out.r.changed())
+                    if rr.drag_stopped_by(egui::PointerButton::Primary)
+                        || (!rr.dragged() && rr.changed())
                     {
                         echo = Some(format!("{} \u{2192} {} (live)", d.name, out.readout));
                     }
                 }
-            });
+                // v82: honesty footers — an empty filtered list and a
+                // capped list both SAY what happened (a silent blank
+                // reads as a broken plugin).
+                if n_rows == 0 {
+                    if total == 0 {
+                        ui.label(
+                            egui::RichText::new("this plugin exposes no adjustable parameters")
+                                .weak()
+                                .small(),
+                        );
+                    } else if !ql.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "no parameter matches \u{201c}{}\u{201d} \u{b7} clear the \
+                                 filter to see all {total}",
+                                new_filter.trim()
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                } else if shown_total > n_rows {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "showing the first {n_rows} of {shown_total} \u{b7} use the \
+                             filter to narrow",
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+        });
         if let Some(e) = echo {
             self.status = e;
         }
@@ -13103,6 +13195,7 @@ impl App {
                 reset_text: None,
                 reset_hover: "",
                 compact: true,
+                label_width: 0.0,
             };
             let presets = Self::sampler_preset_list();
             if let Some(act) = crate::presetbar::render(
@@ -13676,6 +13769,7 @@ impl App {
                 reset_text: Some("defaults"),
                 reset_hover: "set every slider back to this synth's built-in defaults",
                 compact: false,
+                label_width: 0.0,
             };
             if let Some(act) = crate::presetbar::render(
                 ui,
@@ -13871,6 +13965,7 @@ impl App {
             reset_text: Some("stock kit"),
             reset_hover: "replace this track's kit with the built-in 8-pad stock kit",
             compact: false,
+            label_width: 0.0,
         };
         if let Some(act) = crate::presetbar::render(
             ui,
@@ -28944,6 +29039,7 @@ fn track_template_window(ui: &mut egui::Ui, app: &mut App) {
                 reset_text: None,
                 reset_hover: "",
                 compact: false,
+                label_width: 0.0,
             };
             if let Some(act) = crate::presetbar::render(
                 ui,
@@ -53790,5 +53886,462 @@ mod tests {
         assert_eq!(pb.matches("kit::row_clipped(").count(), 1);
         let kit = include_str!("kit.rs");
         assert_eq!(kit.matches("clip_rect().max.x").count(), 1);
+    }
+
+    // =================================================================
+    // v82 — TS-006: PARAMETERS window GUI pass. Shared TS-003 picker
+    // rows (program + factory presets), scroll/cap honesty for param-
+    // dense plugins, the ONE automation gesture seam on hosted rows,
+    // aligned label columns, filter echo + empty states.
+    // =================================================================
+
+    /// v82: a hosted entry that reports FACTORY PROGRAMS (delegates the
+    /// rest to the v74 fixture) so the program picker row paints without
+    /// a real plugin file.
+    struct V82Prog {
+        e: std::sync::Arc<V74Host>,
+        progs: Vec<String>,
+        cur: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::vsthost::StageEntry for V82Prog {
+        use crate::vsthost::StageEntry;
+        fn name(&self) -> &str {
+            "v82prog"
+        }
+        fn path(&self) -> &std::path::Path {
+            self.e.path()
+        }
+        fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+            self.e.spec()
+        }
+        fn kind(&self) -> crate::vsthost::VstKind {
+            self.e.kind()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+            self.e.descs()
+        }
+        fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+            self.e.params()
+        }
+        fn has_editor(&self) -> bool {
+            false
+        }
+        fn programs(&self) -> Vec<String> {
+            self.progs.clone()
+        }
+        fn current_program(&self) -> Option<usize> {
+            Some(self.cur.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn select_program(&self, i: usize) -> bool {
+            self.cur.store(i, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        fn set_param(&self, i: usize, v: f32) {
+            self.e.set_param(i, v);
+        }
+        fn set_param_rt(&self, i: usize, v: f32) {
+            self.e.set_param_rt(i, v);
+        }
+        fn process(&self, i: &[f32], o: &mut [f32]) {
+            self.e.process(i, o);
+        }
+        fn process_with_midi(&self, i: &[f32], o: &mut [f32], e: &[(usize, [u8; 3])]) {
+            self.e.process_with_midi(i, o, e);
+        }
+        fn all_notes_off(&self) {}
+        fn flush(&self) {}
+        fn midi_drops(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Open the PARAMETERS window on a fresh chain row hosting `entry`.
+    fn v82_open_params<'a>(
+        app: &mut App,
+        ctx: &egui::Context,
+        tag: &str,
+        entry: std::sync::Arc<dyn crate::vsthost::StageEntry>,
+    ) {
+        app.show_master = false;
+        frame(app, ctx, vec![]);
+        app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
+            path: format!("/{tag}"),
+            kind: crate::vsthost::VstKind::V2,
+            plugin_id: None,
+            name: tag.to_string(),
+            params: vec![],
+            entry: Some(entry),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        app.params_win = Some(GuiTarget::Chain(0, 0));
+        frame(app, ctx, vec![]);
+    }
+
+    /// Idle frames to move the shared test clock (gesture pacing).
+    fn v82_idle(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..25 {
+            frame(app, ctx, vec![]);
+        }
+    }
+
+    /// R1: a 450-parameter plugin renders through the 400-row cap AND
+    /// says so; the deep rows are scroll-reachable; slider rows are
+    /// fixed-width so nothing drifts or clips at the row's right edge.
+    #[test]
+    fn v82_params_dense_plugin_scrolls_unclipped() {
+        let mut app = headless_app("v82dense");
+        let ctx = egui::Context::default();
+        let descs: Vec<crate::vsthost::VstParamDesc> = (0..450)
+            .map(|i| crate::vsthost::VstParamDesc {
+                name: format!("V82p{i:03}"),
+                default: 0.2,
+                writable: true,
+                ..Default::default()
+            })
+            .collect();
+        let params = crate::vsthost::VstParams::new(&descs);
+        let entry = std::sync::Arc::new(V74Host { descs, params });
+        v82_open_params(&mut app, &ctx, "v82dense", entry);
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        // R1a: the cap keeps row 401 off the renderer — and paints an
+        // honest footer instead of a silent truncation.
+        assert_eq!(kit_probe("V82p399").len(), 1, "the 400th row renders");
+        assert!(kit_probe("V82p400").is_empty(), "row 401 is withheld");
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("showing the first 400 of 450")),
+            "the cap must be stated, not silently applied; galleys: {texts:?}"
+        );
+        // R1c: every slider row is the kit's fixed 150 px — columns
+        // cannot drift, and the row's right edge is deterministic.
+        let r399 = kit_probe("V82p399")[0];
+        assert!((r399.width() - 150.0).abs() < 0.6, "fixed-width rows");
+        // R1b: the wheel reaches the deep rows (single both()-scroll).
+        let before = r399.center().y;
+        let anchor = kit_probe("V82p000")[0].center();
+        kit_clear();
+        frame(&mut app, &ctx, vec![moved(anchor)]);
+        frame(&mut app, &ctx, vec![egui::Event::Scroll { units: 20.0 }]);
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let after = kit_probe("V82p399")[0].center().y;
+        assert!(
+            after < before - 10.0,
+            "the deep rows scroll UP into view ({before} -> {after})"
+        );
+    }
+
+    /// R2: no local copies — the program row and the v79 preset row
+    /// render through presetbar::picker_row, the automation wiring rides
+    /// the ONE bind_value_controls seam, and the window title has ONE
+    /// home. Needles are concat!-split and the scan cuts the tests mod
+    /// so a polarity can never match its own literal.
+    #[test]
+    fn v82_params_window_shared_components_source() {
+        fn prod_window(src: &str) -> String {
+            let cut = ["\nmod tests", "\n    mod tests", "\npub(crate) mod tests"]
+                .iter()
+                .filter_map(|p| src.find(p))
+                .min()
+                .unwrap_or(src.len());
+            src[..cut]
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+                .collect::<Vec<_>>()
+                .join("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        }
+        let ui_src = prod_window(include_str!("ui.rs"));
+        // Positive: the TWO shared picker rows are live call sites.
+        assert_eq!(
+            ui_src.matches(concat!("presetbar::picker_row(ui,")).count(),
+            2,
+            "program + factory-preset rows must ride the shared picker"
+        );
+        assert!(
+            ui_src.contains(&concat!(
+                "bind_value_controls(&mutrr,self,Some(auto",
+                "_track),&auto_target,v)"
+            )
+            .replace(' ', "")),
+            "hosted rows must bind through the ONE automation gesture seam"
+        );
+        // The title has ONE home (def + 2 calls, and the format literal
+        // exists exactly once in the whole production scan).
+        assert_eq!(ui_src.matches("params_title(").count(), 3);
+        assert_eq!(
+            ui_src
+                .matches(&concat!(r#"format!("{name}\u{2014}"#, r#"parameters")"#).replace(' ', ""))
+                .count(),
+            1,
+            "the title string must not fork again"
+        );
+        // The list scroll is the honest both()-scroll with a stable id.
+        assert_eq!(
+            ui_src
+                .matches(concat!(
+                    "ScrollArea::both().id_salt(\"slooper",
+                    "-params-body\")"
+                ))
+                .count(),
+            1
+        );
+        // Negative polarity: the retired per-site combo markup must not
+        // resurrect at either historical salt.
+        for salt in [
+            concat!("ComboBox::from_id_salt(\"slooper_", "v60_programs\")"),
+            concat!("ComboBox::from_id_salt(\"slooper_", "v79_preset_locs\")"),
+        ] {
+            assert!(
+                !ui_src.contains(&salt.replace(' ', "")),
+                "per-site picker markup resurrected: {salt}"
+            );
+        }
+        // presetbar.rs: ONE picker_row + ONE popup-row painter, shared
+        // by render()'s Load list AND picker_row (two in-body calls).
+        let bar = include_str!("presetbar.rs");
+        assert_eq!(bar.matches("pub fn picker_row(").count(), 1);
+        assert_eq!(bar.matches("fn picker_rows(").count(), 1);
+        let bar_nospace: String = bar
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            bar_nospace.matches("picker_rows(ui,items,current)").count(),
+            1,
+            "picker_row paints through the shared row painter"
+        );
+        assert_eq!(
+            bar_nospace.matches("picker_rows(ui,&items,None)").count(),
+            1,
+            "the Load picker paints through the shared row painter"
+        );
+    }
+
+    /// R3c: a hosted slider right-click opens the value mini-menu bound
+    /// to the PUBLISHED plugin target (chain `fx:<slot>:<k>`), double-
+    /// click opens Set value, an enum row binds too, and a synth target
+    /// reads `synth:<k>`. The row tooltip states both gestures.
+    #[test]
+    fn v82_params_row_automation_gestures() {
+        let mut app = headless_app("v82auto");
+        let ctx = egui::Context::default();
+        let entry = v74_host_entry();
+        v82_open_params(&mut app, &ctx, "v82auto", entry.clone());
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let row = *kit_probe("V74hz").first().unwrap();
+        let p = row.center();
+        // (1) double-click = Set value, bound to fx:0:<param 0>.
+        for _ in 0..2 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            );
+        }
+        let dlg = app
+            .value_dialog
+            .clone()
+            .expect("hosted row double-click opens Set value");
+        assert_eq!(dlg.1, "fx:0:0", "chain target id matches auto_targets");
+        app.value_dialog = None;
+        v82_idle(&mut app, &ctx);
+        // (2) right-click = the value mini-menu, same target, and the
+        // menu answers with its automation item.
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Secondary, false)]);
+        let menu = app.value_menu.clone();
+        let (_, tgt, _, _) = menu.expect("hosted row right-click opens the value menu");
+        assert_eq!(tgt, "fx:0:0");
+        frame(&mut app, &ctx, vec![]);
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("automation")),
+            "the menu offers the automation route; galleys: {texts:?}"
+        );
+        app.value_menu = None;
+        v82_idle(&mut app, &ctx);
+        // (3) the enum picker row binds too (param 1).
+        let combo = *kit_probe("V74mode").first().unwrap();
+        let cp = combo.center();
+        frame(&mut app, &ctx, vec![moved(cp)]);
+        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![btn(cp, egui::PointerButton::Secondary, false)]);
+        let menu = app.value_menu.clone();
+        let (_, tgt, _, _) = menu.expect("enum row right-click opens the value menu");
+        assert_eq!(tgt, "fx:0:1");
+        app.value_menu = None;
+        v82_idle(&mut app, &ctx);
+        // (4) the row tooltip states the gestures (hover audit).
+        kit_clear();
+        let tips = hover_until_tip(&mut app, &ctx, p, &["right-click: automation"]);
+        assert!(
+            tips.iter().any(|t| t.contains("double-click: set value")),
+            "hosted tooltip tells both gestures; tips: {tips:?}"
+        );
+        // (5) a SYNTH-hosted entry binds the `synth:<k>` target.
+        let mut app2 = headless_app("v82autosyn");
+        let ctx2 = egui::Context::default();
+        app2.show_master = false;
+        frame(&mut app2, &ctx2, vec![]);
+        app2.track_synth_inst[0] = Some(std::sync::Arc::new(crate::audio::SynthHandle::Vst(
+            v74_host_entry() as std::sync::Arc<dyn crate::vsthost::StageEntry>,
+        )));
+        app2.params_win = Some(GuiTarget::Synth(0));
+        frame(&mut app2, &ctx2, vec![]);
+        kit_clear();
+        frame(&mut app2, &ctx2, vec![]);
+        let sp = *kit_probe("V74hz").first().unwrap();
+        let sp = sp.center();
+        frame(&mut app2, &ctx2, vec![moved(sp)]);
+        frame(&mut app2, &ctx2, vec![btn(sp, egui::PointerButton::Secondary, true)]);
+        frame(&mut app2, &ctx2, vec![btn(sp, egui::PointerButton::Secondary, false)]);
+        let menu = app2.value_menu.clone();
+        let (_, tgt, _, _) = menu.expect("synth row right-click opens the value menu");
+        assert_eq!(tgt, "synth:0", "synth target id matches auto_targets");
+    }
+
+    /// R3a/R3b + R4: the filter hover explains, the count label echoes
+    /// the live match count, an unmatched filter says so IN THE WINDOW,
+    /// a parameter-less plugin says so too — and filter / preset /
+    /// program rows share one label column (goal 4).
+    #[test]
+    fn v82_params_filter_echo_and_empty_state() {
+        let mut app = headless_app("v82filter");
+        let ctx = egui::Context::default();
+        let entry = v74_host_entry();
+        v82_open_params(&mut app, &ctx, "v82filter", entry);
+        // hover audit on the filter box
+        let box_hint = galley_at_last(&mut app, &ctx, "parameter name")
+            .expect("filter box")
+            .center();
+        let tips = hover_until_tip(&mut app, &ctx, box_hint, &["narrow"]);
+        assert!(
+            tips.iter().any(|t| t.contains("parameter name")),
+            "filter box hover explains; tips: {tips:?}"
+        );
+        // type a query: the header echoes the match count, the list
+        // keeps only the match.
+        for ev in [
+            vec![moved(box_hint)],
+            vec![moved(box_hint), btn(box_hint, egui::PointerButton::Primary, true)],
+            vec![btn(box_hint, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app, &ctx, ev);
+        }
+        for c in "V74hz".chars() {
+            frame(&mut app, &ctx, vec![egui::Event::Text(c.to_string())]);
+        }
+        frame(&mut app, &ctx, vec![]);
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("1 of 2 params")),
+            "the count label echoes the filter; galleys: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("V74mode")),
+            "the unmatched row is out of the list"
+        );
+        // unmatched filter -> honest in-window empty state (not a blank)
+        app.params_filter = "zzz".into();
+        frame(&mut app, &ctx, vec![]);
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("no parameter matches")),
+            "an empty filter result must say so; galleys: {texts:?}"
+        );
+        // clear -> back to the plain count
+        app.params_filter = String::new();
+        frame(&mut app, &ctx, vec![]);
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("2 params") && !t.contains(" of ")),
+            "clearing the filter restores the plain count; galleys: {texts:?}"
+        );
+        // a plugin with no adjustable parameters says so.
+        let mut app2 = headless_app("v82noparams");
+        let ctx2 = egui::Context::default();
+        let e0 = std::sync::Arc::new(V74Host {
+            descs: vec![],
+            params: crate::vsthost::VstParams::new(&[]),
+        });
+        v82_open_params(&mut app2, &ctx2, "v82noparams", e0);
+        let texts = painted_texts(&mut app2, &ctx2);
+        assert!(
+            texts.iter().any(|t| t.contains("no adjustable parameters")),
+            "a param-less plugin must say so; galleys: {texts:?}"
+        );
+    }
+
+    /// R4: filter / user-preset / program rows share the kit label
+    /// column — labels start at one x, controls start at one x.
+    #[test]
+    fn v82_params_bar_labels_aligned() {
+        let mut app = headless_app("v82align");
+        let ctx = egui::Context::default();
+        let entry = std::sync::Arc::new(V82Prog {
+            e: v74_host_entry(),
+            progs: vec!["P82alpha".into(), "P82beta".into()],
+            cur: std::sync::atomic::AtomicUsize::new(0),
+        });
+        v82_open_params(&mut app, &ctx, "v82align", entry);
+        let lf = galley_at_last(&mut app, &ctx, "filter")
+            .expect("filter label")
+            .min()
+            .x;
+        let lu = galley_at_last(&mut app, &ctx, "user preset")
+            .expect("preset bar label")
+            .min()
+            .x;
+        let lp = galley_at_last(&mut app, &ctx, "program")
+            .expect("program row label")
+            .min()
+            .x;
+        assert!(
+            (lf - lu).abs() < 1.0 && (lf - lp).abs() < 1.0,
+            "bar labels must share a left edge ({lf}, {lu}, {lp})"
+        );
+        // Controls ride the column: both name boxes start where the
+        // labels end; the program combo lands in the same column
+        // (combo text padding differs by a couple of px at most).
+        let fb = galley_at_last(&mut app, &ctx, "parameter name")
+            .expect("filter box")
+            .min()
+            .x;
+        let pb = galley_at_last(&mut app, &ctx, "preset name")
+            .expect("preset box")
+            .min()
+            .x;
+        let pc = galley_at_last(&mut app, &ctx, "P82alpha")
+            .expect("program combo leads with the current program")
+            .min()
+            .x;
+        assert!((fb - pb).abs() < 1.5, "name boxes share the column");
+        assert!(
+            (pc - fb).abs() < 6.0,
+            "the combo lands in the same control column ({fb} vs {pc})"
+        );
     }
 }

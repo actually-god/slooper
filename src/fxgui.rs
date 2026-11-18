@@ -345,6 +345,13 @@ pub struct ParamRowSpec<'a> {
     pub gestures: bool,
     /// Hosted hint line, e.g. "changes apply live". "" = none.
     pub echo_hint: &'a str,
+    /// v82: an extra gesture line appended to the hosted row's hover tip,
+    /// e.g. the automation gestures the OWNER wires through
+    /// `ui::bind_value_controls`. "" = none. (Stock rows get the gestures
+    /// from `gestures`/`kit_tip` instead — this field exists so the
+    /// hosted tip keeps its plain-range wording AND tells the truth
+    /// about the gestures that work there.)
+    pub gesture_note: &'a str,
 }
 
 /// `param_row` verdict: the widget Response (drive change detection with
@@ -385,7 +392,11 @@ pub fn param_row(ui: &mut Ui, row_id: egui::Id, spec: &ParamRowSpec, v: &mut f32
         let tip = if spec.gestures {
             "pick a choice \u{b7} right-click: automation for this param".to_string()
         } else {
-            format!("{}: {}", spec.label, spec.labels[cur])
+            let mut tip = format!("{}: {}", spec.label, spec.labels[cur]);
+            if !spec.gesture_note.is_empty() {
+                tip.push_str(&format!("\n{}", spec.gesture_note));
+            }
+            tip
         };
         let r = rc.on_hover_text(tip);
         let mut shown = cur;
@@ -426,15 +437,21 @@ pub fn param_row(ui: &mut Ui, row_id: egui::Id, spec: &ParamRowSpec, v: &mut f32
             } else {
                 format!("\n{}", spec.echo_hint)
             };
+            let gestures = if spec.gesture_note.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", spec.gesture_note)
+            };
             format!(
-                "{}: {} \u{b7} range {:.2}\u{2026}{:.2}{}{}\u{b7} value from the plugin{}",
+                "{}: {} \u{b7} range {:.2}\u{2026}{:.2}{}{}\u{b7} value from the plugin{}{}",
                 spec.label,
                 readout_of(*v),
                 spec.disp_min,
                 spec.disp_max,
                 u,
                 raw,
-                hint
+                hint,
+                gestures
             )
         };
         let r = r.on_hover_text(tip);
@@ -1323,6 +1340,7 @@ fn auto_ui(ui: &mut Ui, ed: &mut FxEditor) {
             labels: &p.labels,
             gestures: true,
             echo_hint: "",
+            gesture_note: "",
         };
         let out = param_row(ui, ui.id().with(("fxauto-row", k)), &spec, &mut v);
         // v0.15/v53: right-click hands the request to the UI layer (Set
