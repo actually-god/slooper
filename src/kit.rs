@@ -82,6 +82,41 @@ impl Kit {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v87 (TS-013): truncated-row detection — the ONE measurement home.
+//
+// A row counts as truncated only when its painted label actually loses
+// glyphs: it runs past the container's right clip edge (a long unbreakable
+// token — the v76 "70-char space-less filename" class), or wrapped rows
+// exceed a FIXED row height (the ♪ picker's `add_sized([w, 24])` class).
+// Never guess truncation from character counts, and never attach a
+// full-identity tooltip to a row that is not truncated (TS-013).
+// ---------------------------------------------------------------------------
+
+/// Post-paint right-overflow test: the row painted wider than the enclosing
+/// clip allows, so its tail is silently cropped by the container.
+pub(crate) fn row_clipped(resp: &Response, ui: &Ui) -> bool {
+    resp.rect.max.x > ui.clip_rect().max.x + 0.5
+}
+
+/// Pre-paint test for a row that will lay its label out inside
+/// `avail_w` (and an optional fixed height `max_h`): is `text` truncated —
+/// a laid-out row wider than the space (no break point), or taller than
+/// the fixed row (wrapped rows vanish below the clip)? Text that fits, or
+/// wraps into fully-visible space, is NOT truncated: no tooltip grows for
+/// it (TS-013 negative polarity).
+pub(crate) fn label_clipped(ui: &Ui, text: &str, avail_w: f32, style: TextStyle, max_h: Option<f32>) -> bool {
+    let fid = style.resolve(ui.style());
+    let col = ui.visuals().widgets.noninteractive.fg_stroke.color;
+    let (over_w, h) = ui.ctx().fonts_mut(|fb| {
+        let j = egui::epaint::text::LayoutJob::simple(text.to_string(), fid, col, avail_w);
+        let g = fb.layout_job(j);
+        let over = g.rows.iter().any(|pr| pr.row.size.x > avail_w + 0.5);
+        (over, g.size().y)
+    });
+    over_w || max_h.is_some_and(|hmax| h > hmax + 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,39 +166,4 @@ mod tests {
         assert_eq!(light.text, v.weak_text_color());
         assert_eq!(light.accent, v.hyperlink_color);
     }
-}
-
-// ---------------------------------------------------------------------------
-// v87 (TS-013): truncated-row detection — the ONE measurement home.
-//
-// A row counts as truncated only when its painted label actually loses
-// glyphs: it runs past the container's right clip edge (a long unbreakable
-// token — the v76 "70-char space-less filename" class), or wrapped rows
-// exceed a FIXED row height (the ♪ picker's `add_sized([w, 24])` class).
-// Never guess truncation from character counts, and never attach a
-// full-identity tooltip to a row that is not truncated (TS-013).
-// ---------------------------------------------------------------------------
-
-/// Post-paint right-overflow test: the row painted wider than the enclosing
-/// clip allows, so its tail is silently cropped by the container.
-pub(crate) fn row_clipped(resp: &Response, ui: &Ui) -> bool {
-    resp.rect.max.x > ui.clip_rect().max.x + 0.5
-}
-
-/// Pre-paint test for a row that will lay its label out inside
-/// `avail_w` (and an optional fixed height `max_h`): is `text` truncated —
-/// a laid-out row wider than the space (no break point), or taller than
-/// the fixed row (wrapped rows vanish below the clip)? Text that fits, or
-/// wraps into fully-visible space, is NOT truncated: no tooltip grows for
-/// it (TS-013 negative polarity).
-pub(crate) fn label_clipped(ui: &Ui, text: &str, avail_w: f32, style: TextStyle, max_h: Option<f32>) -> bool {
-    let fid = style.resolve(ui.style());
-    let col = ui.visuals().widgets.noninteractive.fg_stroke.color;
-    let (over_w, h) = ui.ctx().fonts_mut(|fb| {
-        let j = egui::epaint::text::LayoutJob::simple(text.to_string(), fid, col, avail_w);
-        let g = fb.layout_job(j);
-        let over = g.rows.iter().any(|pr| pr.row.size.x > avail_w + 0.5);
-        (over, g.size().y)
-    });
-    over_w || max_h.is_some_and(|hmax| h > hmax + 1.0)
 }

@@ -27316,6 +27316,22 @@ fn effects_window(ui: &mut egui::Ui, app: &mut App) {
     }
 }
 
+/// v87 (TS-013): identity prefix for a clipped MIXER CHAIN row — empty when
+/// the label is fully visible (no tooltip grows), else `"{full label}\n{path}\n"`
+/// so the row recovers its name + on-disk file on hover. The chain list clips
+/// at its edge; only a name that ran past it loses glyphs (kit::row_clipped).
+fn chain_row_ident(ui: &egui::Ui, resp: &egui::Response, row: &ChainRow, label: &str, fx_dir: &std::path::Path) -> String {
+    if !crate::kit::row_clipped(resp, ui) {
+        return String::new();
+    }
+    let path = match row {
+        ChainRow::Vst { path, .. } => path.clone(),
+        ChainRow::Script { stem, .. } =>
+            fx_dir.join(format!("{stem}.rs")).to_string_lossy().into_owned(),
+    };
+    format!("{label}\n{path}\n")
+}
+
 /// v35 R5: MIXER CHAIN body — ONE body shared by the floating window and
 /// the docked panel, so the two can never drift apart.
 fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
@@ -27389,25 +27405,10 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                     // the firewall, its window can never open, so the
                     // row must not pretend otherwise.
                     let resp = ui.add_enabled(!inert, egui::Button::new(txt).frame(false));
-                    // v87 (TS-013): the chain list clips at its edge — a name
-                    // that ran past it (long unbreakable token) recovers its
-                    // full identity on hover: name line + on-disk path, then
-                    // the state/action copy. A fully-visible row keeps its
-                    // plain hover, nothing new grows.
-                    let ident = if crate::kit::row_clipped(&resp, ui) {
-                        let path = match row {
-                            ChainRow::Vst { path, .. } => path.clone(),
-                            ChainRow::Script { stem, .. } => app
-                                .fx_registry
-                                .dir()
-                                .join(format!("{stem}.rs"))
-                                .to_string_lossy()
-                                .into_owned(),
-                        };
-                        format!("{label}\n{path}\n")
-                    } else {
-                        String::new()
-                    };
+                    // v87 (TS-013): a name clipped by the list's edge hovers
+                    // its identity (name + file) ABOVE the state copy; a
+                    // fully-visible row keeps its plain hover verbatim.
+                    let ident = chain_row_ident(ui, &resp, row, &label, app.fx_registry.dir());
                     let resp = if inert {
                         resp.on_disabled_hover_text(if dead {
                             format!(
@@ -50223,13 +50224,20 @@ mod tests {
         let renderer = include_str!("presetbar.rs");
         for attach in [
             "on_hover_text(spec.save_hover)",
-            "on_hover_text(spec.row_hover)",
+            "on_hover_text(tip)", // v87: row copy now rides the composed tip
             "on_hover_text(spec.delete_hover)",
             "on_hover_text(spec.reset_hover)",
             "on_hover_text(h)",
         ] {
             assert!(renderer.contains(attach), "renderer lost {attach}");
         }
+        // v87 (TS-013): the row copy now flows through the composed tooltip
+        // (`tip` = optional identity prefix + spec.row_hover) — the copy and
+        // its attach both still have to exist in the ONE renderer.
+        assert!(
+            renderer.contains("spec.row_hover"),
+            "renderer dropped the spec.row_hover copy entirely"
+        );
     }
 
     /// v67 (goal 1, UI half): a CLAP plugin's own preset load must ECHO
@@ -50793,13 +50801,20 @@ mod tests {
         let renderer = include_str!("presetbar.rs");
         for attach in [
             "on_hover_text(spec.save_hover)",
-            "on_hover_text(spec.row_hover)",
+            "on_hover_text(tip)", // v87: row copy now rides the composed tip
             "on_hover_text(spec.delete_hover)",
             "on_hover_text(spec.reset_hover)",
             "on_hover_text(h)",
         ] {
             assert!(renderer.contains(attach), "renderer lost {attach}");
         }
+        // v87 (TS-013): the row copy now flows through the composed tooltip
+        // (`tip` = optional identity prefix + spec.row_hover) — the copy and
+        // its attach both still have to exist in the ONE renderer.
+        assert!(
+            renderer.contains("spec.row_hover"),
+            "renderer dropped the spec.row_hover copy entirely"
+        );
         let mut checked = 1usize; // spec + renderer verified above
         // The per-pad import button: hover between its creation and its
         // clicked() (its statement lives in the pad-row loop, not here).
