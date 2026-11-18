@@ -3311,7 +3311,10 @@ mod tests {
             &mut n,
             &mut after,
             &mut data,
-        ) != 0
+        ) == 0
+            // Success is 0 — and an ABSENT property also returns Success
+            // with actual_type None + null data, so check all three.
+            && at != 0
             && !data.is_null()
         {
             let bytes = std::slice::from_raw_parts(data, n as usize).to_vec();
