@@ -24,6 +24,129 @@
 
 use std::path::{Path, PathBuf};
 
+/// v82 (TS-006): the ONE label-column width for the preset/param bar
+/// rows. The PARAMETERS window stacks "filter", "user preset" and
+/// "program" rows; with natural-width labels the controls start at
+/// three different x and the readouts never line up. One shared column
+/// makes every row's control start at the same x (goal 4). `0.0` in a
+/// spec keeps the natural width (the four older bar sites unchanged).
+pub const LABEL_COL: f32 = 72.0;
+
+/// Draw one bar-row label in the shared column (width `LABEL_COL`; `0.0`
+/// = natural width, unchanged pre-v82 behavior). `add_sized` — never
+/// `Ui::put`, which justifies and collapses narrow rects.
+pub fn bar_label(ui: &mut egui::Ui, text: &str, width: f32, compact: bool) {
+    let rich = if compact {
+        egui::RichText::new(text).weak().small()
+    } else {
+        egui::RichText::new(text)
+    };
+    if width > 0.0 {
+        ui.add_sized(
+            [width, 0.0],
+            egui::Label::new(rich).selectable(false),
+        );
+    } else if compact {
+        ui.label(egui::RichText::new(text).weak().small());
+    } else {
+        ui.label(text);
+    }
+}
+
+/// One row inside a picker popup (v82): text plus its hover text. The
+/// shared bar's Load picker and `picker_row` render these through the
+/// SAME private row painter, so popup rows are one chrome everywhere.
+pub struct PickerItem {
+    pub display: String,
+    pub hover: String,
+    /// v87 (TS-013) clip identity: when set, a row whose text runs past the
+    /// popup's width recovers its full identity on hover (name + on-disk
+    /// file in this directory); `None` = no file identity to recover.
+    pub clip_dir: Option<PathBuf>,
+}
+
+/// Everything a shared picker row says about itself (copy stays at the
+/// site, like `PresetBarSpec`).
+pub struct PickerRowSpec<'a> {
+    /// Leading column label; `None` = the caption already names it
+    /// (the v79 "factory presets" row has no leading label).
+    pub label: Option<&'a str>,
+    /// Label-column width (`LABEL_COL`, or 0.0 for natural).
+    pub label_width: f32,
+    /// Combo caption when the popup is closed.
+    pub caption: &'a str,
+    /// Combo width in points.
+    pub width: f32,
+    /// Hover text on the combo itself.
+    pub hover: &'a str,
+    /// Line painted when `items` is empty; `None` = say nothing.
+    pub empty_text: Option<&'a str>,
+}
+
+/// The shared picker row (v82, TS-006): `[label @ column] [combo]`, rows
+/// painted by the SAME painter the preset bar's Load picker uses. Drawn
+/// INLINE — wrap in `ui.horizontal` when the caller needs trailing
+/// controls on the row (the v79 row appends its file button). Returns
+/// the row index picked this frame, `None` otherwise; `current` is the
+/// check-marked row (`None` = no check state).
+pub fn picker_row(
+    ui: &mut egui::Ui,
+    salt: egui::Id,
+    spec: &PickerRowSpec<'_>,
+    items: &[PickerItem],
+    current: Option<usize>,
+) -> Option<usize> {
+    if let Some(l) = spec.label {
+        bar_label(ui, l, spec.label_width, false);
+    }
+    let caption = egui::RichText::new(spec.caption);
+    let pick = egui::ComboBox::from_id_salt(salt)
+        .selected_text(caption)
+        .width(spec.width)
+        .show_ui(ui, |ui| {
+            if items.is_empty() {
+                if let Some(e) = spec.empty_text {
+                    ui.label(egui::RichText::new(e).weak().small());
+                }
+            }
+            picker_rows(ui, items, current)
+        });
+    pick.response.on_hover_text(spec.hover);
+    // show_ui only runs the contents closure while the popup is open,
+    // so inner arrives Option-wrapped.
+    pick.inner.flatten()
+}
+
+/// The ONE popup-row painter: selectable text + hover, shared by the
+/// preset bar's Load picker and every `picker_row`.
+fn picker_rows(
+    ui: &mut egui::Ui,
+    items: &[PickerItem],
+    current: Option<usize>,
+) -> Option<usize> {
+    let mut pick: Option<usize> = None;
+    for (i, it) in items.iter().enumerate() {
+        // The v87 (TS-013) contract lives INSIDE this painter: a row that
+        // runs past the popup's fixed width recovers its full identity on
+        // hover (name + on-disk file); a fully-visible row keeps the plain
+        // action copy, nothing new grows.
+        let resp = ui.selectable_label(current == Some(i), &it.display);
+        let tip = match &it.clip_dir {
+            Some(dir) if crate::kit::row_clipped(&resp, ui) => format!(
+                "{}\n{}\n{}",
+                it.display,
+                dir.join(format!("{}.json", it.display)).display(),
+                it.hover
+            ),
+            _ => it.hover.clone(),
+        };
+        if resp.on_hover_text(tip).clicked() {
+            pick = Some(i);
+        }
+    }
+    pick
+}
+
 /// The v56 sanitizer: collapse anything filesystem-hostile.
 /// Keep `[A-Za-z0-9-_]`, map spaces and stray chars to '-', collapse
 /// runs, trim, cap at 48 chars. `"../evil"` -> `"evil"`.
@@ -153,6 +276,9 @@ pub struct PresetBarSpec<'a> {
     pub reset_hover: &'a str,
     /// Compact = the small weak toolbar style (the v56 sampler bar).
     pub compact: bool,
+    /// v82: shared label-column width (`LABEL_COL`) so this bar aligns
+    /// with sibling rows in the same window; `0.0` = natural width.
+    pub label_width: f32,
 }
 
 /// What the user just did. Returned, never executed here.
@@ -178,11 +304,7 @@ pub fn render(
     let mut act: Option<PresetBarAction> = None;
     ui.horizontal(|ui| {
         if let Some(l) = spec.label {
-            if spec.compact {
-                ui.label(egui::RichText::new(l).weak().small());
-            } else {
-                ui.label(l);
-            }
+            bar_label(ui, l, spec.label_width, spec.compact);
         }
         ui.add(
             egui::TextEdit::singleline(name)
@@ -217,23 +339,20 @@ pub fn render(
                         ui.label(egui::RichText::new(e).weak().small());
                     }
                 }
-                for p in presets {
-                    // v87 (TS-013): the popup clips at its fixed width — a
-                    // row that runs past it recovers its full identity on
-                    // hover (name + on-disk file); a fully-visible row
-                    // keeps the plain action copy, nothing new grows.
-                    let resp = ui.selectable_label(false, p);
-                    let tip = match spec.row_dir {
-                        Some(dir) if crate::kit::row_clipped(&resp, ui) => format!(
-                            "{p}\n{}\n{}",
-                            dir.join(format!("{p}.json")).display(),
-                            spec.row_hover
-                        ),
-                        _ => spec.row_hover.to_string(),
-                    };
-                    if resp.on_hover_text(tip).clicked() {
-                        act = Some(PresetBarAction::Load(p.clone()));
-                    }
+                // v82: rows ride the ONE popup-row painter (shared with
+                // picker_row) so every picker in the kit hovers alike;
+                // the v87 clip-identity hover rides inside it via
+                // PickerItem::clip_dir.
+                let items: Vec<PickerItem> = presets
+                    .iter()
+                    .map(|p| PickerItem {
+                        display: p.clone(),
+                        hover: spec.row_hover.to_string(),
+                        clip_dir: spec.row_dir.map(|d| d.to_path_buf()),
+                    })
+                    .collect();
+                if let Some(i) = picker_rows(ui, &items, None) {
+                    act = Some(PresetBarAction::Load(items[i].display.clone()));
                 }
                 if let Some(dt) = spec.delete_text {
                     if !presets.is_empty() {
