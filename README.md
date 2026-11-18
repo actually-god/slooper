@@ -20,9 +20,10 @@ tarball.
   playhead, colors — all non-destructive.
 - **Record audio and MIDI** — each take is written as a WAV / `.mid` asset
   into your rack's primary folder and auto-placed as a clip at the playhead.
-- **Instruments** — bundled grand piano, sampler (8-slot key map for drums
-  and multisampling), drums kit and pad synth, or any hosted VSTi/CLAP
-  instrument — native plugin editor windows included.
+- **Instruments** — bundled grand piano, sampler (piano-style key map with
+  velocity layers, for drums and multisampling), drums kit and pad synth,
+  or any hosted VSTi/CLAP instrument — native plugin editor windows
+  included.
 - **Piano roll** — draw and edit notes on the snap grid, one-click quantize,
   velocity and glide lanes; previews through the target track's synth + FX
   chain.
