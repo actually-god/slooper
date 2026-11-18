@@ -20,9 +20,10 @@ tarball.
   playhead, colors — all non-destructive.
 - **Record audio and MIDI** — each take is written as a WAV / `.mid` asset
   into your rack's primary folder and auto-placed as a clip at the playhead.
-- **Instruments** — bundled grand piano, sampler (8-slot key map for drums
-  and multisampling), drums kit and pad synth, or any hosted VSTi/CLAP
-  instrument — native plugin editor windows included.
+- **Instruments** — bundled grand piano, sampler (piano-style key map with
+  velocity layers, for drums and multisampling), drums kit and pad synth,
+  or any hosted VSTi/CLAP instrument — native plugin editor windows
+  included.
 - **Piano roll** — draw and edit notes on the snap grid, one-click quantize,
   velocity and glide lanes; previews through the target track's synth + FX
   chain.
@@ -30,7 +31,12 @@ tarball.
   distortion, pitch and spectral tools, all runtime-compiled, hot-reloadable
   Rust scripts. Write your own with the same ABI.
 - **One chain per track** — scripted effects and binary VST2 / VST3 / CLAP
-  plugins interleaved in a single ordered list, live and in export.
+  plugins interleaved in a single ordered list, live and in export; any
+  slot can be bypassed without removing it.
+- **Presets everywhere** — one preset bar across script synths, drum
+  kits, sampler key maps and track templates; hosted plugins load their
+  factory programs (VST2/VST3) or preset files (CLAP), and the choice
+  persists with the project.
 - **Mixer** — per-track vol/gain/pan, play gate, record groups, and a master
   fader with peak/RMS/LUFS meters and a spectrum view; full-page MIX console
   on `F9`.
@@ -53,11 +59,9 @@ tarball.
 (Fedora/openSUSE), or a `tar.zst` that installs on any x86_64 Linux.
 Each package carries the binary, desktop entry, icon and bundled samples.
 
-**Arch Linux** — the AUR package:
-
-```sh
-yay -S slooper        # or paru -S slooper
-```
+**Arch Linux** — the AUR package is pending publication; until then the
+`tar.zst` above installs on Arch the same way (binary + desktop entry +
+icon). Current status and PKGBUILD notes: [docs/INSTALL.md](docs/INSTALL.md).
 
 **Build from source** (needs stable Rust, `pkgconf`, and JACK dev headers —
 `pipewire-jack` or libjack):
