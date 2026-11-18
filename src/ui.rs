@@ -52674,6 +52674,11 @@ mod tests {
         for p in mids {
             frame(app, ctx, vec![moved(*p)]);
         }
+        // Land the FINAL position in a frame where the button is still
+        // down: on the release frame egui ends the drag before the lane
+        // row sees dragged_by, so a lone release frame would lose the
+        // last row delta.
+        frame(app, ctx, vec![moved(drop)]);
         frame(
             app,
             ctx,
@@ -52727,7 +52732,11 @@ mod tests {
             .collect();
         want.sort();
         assert_eq!(app.sel_clips, want, "selection ids follow the table");
-        assert_eq!(app.sel_anchor, Some((1, 0, 0)), "anchor follows its member");
+        assert_eq!(
+            app.sel_anchor,
+            Some((2, 0, 0)),
+            "anchor follows the LAST-CLICKED member (B: row 1 -> row 2)"
+        );
         assert!(app.drag_clip.is_none(), "gesture released");
     }
 
@@ -52742,7 +52751,8 @@ mod tests {
         let a = v83_shared_midi(&mut app);
         frame(&mut app, &ctx, vec![]);
         let y1 = v83_row_y(&app, 1);
-        click_pt(&mut app, &ctx, egui::pos2(250.0, v83_row_y(&app, 0)));
+        let y0s = v83_row_y(&app, 0);
+        click_pt(&mut app, &ctx, egui::pos2(250.0, y0s));
         v83_ctrl_click(&mut app, &ctx, egui::pos2(250.0, y1));
         let assets_before = app.assets.len();
         let grab = egui::pos2(250.0, y1);
