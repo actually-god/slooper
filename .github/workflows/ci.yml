@@ -9,8 +9,10 @@
 #                   Catches Linux-side regressions that break Windows.
 #   windows-native  Real test execution on Windows: the #[cfg(windows)] pin
 #                   set (W2/W3/W6/W7/W8) that cross-checks can never run,
-#                   plus a report-only full-suite triage pass to grow the
-#                   green list from.
+#                   plus the FULL lib suite — BLOCKING, and since v84 its
+#                   verdict comes from the guard-parsed local log (the
+#                   runner's stored log loses the tail; cargo's rc can be
+#                   hushed to 0 — see scripts/ci-suite-guard.sh).
 #
 # Test builds use the `citest` profile (Cargo.toml): release codegen without
 # fat LTO — `cargo test --release` would compile tests through LTO because
@@ -56,14 +58,19 @@ jobs:
       # order + fxgui::drop_order_tests pin. The pair now runs IN the
       # monolith (10/10 green on the floor distro where it aborted 3/10);
       # the isolated steps stay as defense-in-depth, now fully BLOCKING.
+      # v84 (t_dc8d6666): every lib-suite run is wrapped by scripts/
+      # ci-suite-guard.sh — the tee'd workspace-local log is the verdict,
+      # NOT cargo's exit code: the v35/v73 vendor exit-hush (lib.rs
+      # hush_vendor_exit_trap, armed in test builds on BOTH OSes) can force
+      # exit 0 after libtest printed `test result: FAILED`. The hush stays.
       - name: Lib suite, fast tier (headless, citest profile)
         # Quick-tier pins = what scripts/test-quick.sh runs locally.
-        run: cargo test --profile citest --lib --locked
+        run: bash scripts/ci-suite-guard.sh linux-fast-tier target/test-logs/ci-linux-fast.log cargo test --profile citest --lib --locked
       - name: Lib suite, slow tier (plugin dlopen + heavy pins, isolated)
         # The #[ignore = "slow-tier: …"] set in its OWN process — same
         # isolation the old manual 3-chunk filter protocol provided against
         # the dlopen deadlock class, now mechanism-based.
-        run: cargo test --profile citest --lib --locked -- --ignored
+        run: bash scripts/ci-suite-guard.sh linux-slow-tier target/test-logs/ci-linux-slow.log cargo test --profile citest --lib --locked -- --ignored
       - name: Doctests
         run: cargo test --profile citest --doc --locked
       - name: Script-editor pair in isolated processes
@@ -126,6 +133,10 @@ jobs:
       - name: Compile lib tests
         run: cargo test --profile citest --lib --no-run --locked
       - name: Port pins w2..w8 (incl. the #[cfg(windows)] set)
+        # v84 (t_dc8d6666): bash so the same log-guard (scripts/
+        # ci-suite-guard.sh) wraps the run on both OSes — verdict from the
+        # tee'd local log, never cargo's exit code / pwsh propagation.
+        shell: bash
         env:
           SLOOPER_PROBE_EXE: ${{ github.workspace }}\target\citest\slooper-probe.exe
         # NOTE: the filter is SUBSTRING-matched — `w8_` does NOT match the
@@ -134,17 +145,26 @@ jobs:
         # covers the whole W12 polish family: w12a_, w12b_, …)
         # --include-ignored: tier-2 (slow-tier) port pins live in the ignored
         # set — a bare filter run would silently skip them.
-        run: cargo test --profile citest --lib --locked -- --include-ignored w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12 w14_
+        run: bash scripts/ci-suite-guard.sh win-port-pins target/test-logs/ci-win-portpins.log cargo test --profile citest --lib --locked -- --include-ignored w2_ w3_ w4_ w5_ w6_ w7_ w8_ w8b_ w8c_ w9_ w11_ w12 w14_
       - name: Release build proof (shipping profile = winrel, W12e)
         # `winrel` IS what ships (release.yml builds the zip with it):
         # release minus strip, plus minimal debuginfo, so the minidumps
         # src/crash.rs writes resolve to module+function names. Prove the
         # real profile builds, not a look-alike.
         run: cargo build --profile winrel --locked
-      - name: Full lib suite (BLOCKING since W14 — 589/0 on f658ac5, 13-Nov)
+      - name: Full lib suite (BLOCKING — verdict = tee'd-log guard, v84)
         # --include-ignored: run the slow tier too (Linux splits it into a
         # second step for the dlopen-deadlock class; the Windows loader is
         # not affected, one monolithic run is proven green here).
+        # v84 (t_dc8d6666): this step FALSE-GREENED a FAILED pin on the v79
+        # run (44160764104 / job 134313627789) — the vendor exit-hush forced
+        # cargo's rc to 0. The guard now tees to a runner-local file and
+        # fails on any `... FAILED` line, any `test result:` line with a
+        # nonzero failed count, or NO summary line at all (truncation/abort).
+        # The stored job log is NOT the verdict source — its tail is
+        # deterministically lost on this runner (~68KB). SUMMARY-GUARD marker
+        # + failing lines are echoed and mirrored to GITHUB_STEP_SUMMARY.
+        shell: bash
         env:
           SLOOPER_PROBE_EXE: ${{ github.workspace }}\target\citest\slooper-probe.exe
-        run: cargo test --profile citest --lib --locked --no-fail-fast -- --include-ignored
+        run: bash scripts/ci-suite-guard.sh win-full-suite target/test-logs/ci-win-fullsuite.log cargo test --profile citest --lib --locked --no-fail-fast -- --include-ignored
