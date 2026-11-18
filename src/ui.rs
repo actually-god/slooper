@@ -930,6 +930,20 @@ pub enum GuiTarget {
     Chain(usize, usize),
 }
 
+/// v85 (TS-007): the ONE identity a native plugin editor window carries —
+/// the plugin name plus the slot it belongs to, in the same house style as
+/// the script-FX chrome title (`{name} — track N`, pinned since v25). The
+/// VST2 container and the VST3 shadow editor both receive it as their
+/// window title, and every status echo about a window (opened / failed /
+/// refused / closed) uses it as its subject — the same plugin bound to two
+/// tracks must never answer with two anonymous windows.
+fn editor_window_title(target: GuiTarget, name: &str) -> String {
+    match target {
+        GuiTarget::Synth(t) => format!("{name} \u{2014} track {}", t + 1),
+        GuiTarget::Chain(t, r) => format!("{name} \u{2014} track {} fx {}", t + 1, r + 1),
+    }
+}
+
 /// Filter used by every list that enumerates automation targets. Plugins
 /// can publish THOUSANDS of parameters (Surge XT: ~2.9 k), so a raw list
 /// is both slow to lay out and impossible to read; a shared search string
@@ -3207,6 +3221,7 @@ impl App {
     /// so reaping and toggling never care which generation is behind.
     fn plugin_window_open(
         &mut self,
+        target: GuiTarget,
         entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) -> Result<crate::vstedit::EditorWindow, String> {
         // W8b: in embed mode (Windows only — `embed_hwnd` never becomes
@@ -3230,9 +3245,18 @@ impl App {
             // reported persistence bug).
             let cells = entry.params().clone();
             let n = entry.descs().len();
-            crate::vstedit::open_editor(&h, &pth, entry.name(), cells, n)
+            crate::vstedit::open_editor(
+                &h,
+                &pth,
+                &editor_window_title(target, entry.name()),
+                cells,
+                n,
+            )
         } else {
-            entry.open_vst3_editor(self.sample_rate.max(48_000))
+            entry.open_vst3_editor(
+                self.sample_rate.max(48_000),
+                &editor_window_title(target, entry.name()),
+            )
         };
         if parent.is_some() {
             crate::vstedit::set_embed_parent(0);
@@ -3357,7 +3381,11 @@ impl App {
                     .iter()
                     .any(|(_, p, _, _)| p.display().to_string() == path)
                 {
-                    self.status = "plugin window still being checked \u{2014} one moment".into();
+                    // v85: even the "still checking" hold answers with WHO.
+                    self.status = format!(
+                        "{}: window check still running \u{2014} one moment",
+                        entry.name()
+                    );
                     return;
                 }
                 let pth = std::path::PathBuf::from(&path);
@@ -3367,10 +3395,13 @@ impl App {
                     let _ = tx.send(crate::vsthost::probe_editor(&pth, kind));
                 });
                 self.editor_probes
-                    .push((target, std::path::PathBuf::from(&path), rx, entry));
-                self.status =
-                    "first window for this plugin is safety-checked in a child process \u{2014} one moment"
-                        .into();
+                    .push((target, std::path::PathBuf::from(&path), rx, entry.clone()));
+                // v85: the deferral names the plugin too (v21 rule: a
+                // deferred answer must say what it defers).
+                self.status = format!(
+                    "{}: first window safety-checked in a child process \u{2014} one moment",
+                    entry.name()
+                );
             }
         }
     }
@@ -3381,7 +3412,7 @@ impl App {
         target: GuiTarget,
         entry: &std::sync::Arc<dyn crate::vsthost::StageEntry>,
     ) {
-        match self.plugin_window_open(entry) {
+        match self.plugin_window_open(target, entry) {
             Ok(w) => {
                 match target {
                     GuiTarget::Synth(t) => {
@@ -3391,9 +3422,18 @@ impl App {
                         self.fx_vst_editors.insert((t, r), w);
                     }
                 }
-                self.status = format!("{}: plugin window opened", entry.name());
+                self.status = format!(
+                    "{}: plugin window opened",
+                    editor_window_title(target, entry.name())
+                );
             }
-            Err(err) => self.status = format!("plugin GUI: {err} \u{2014} closed"),
+            // v85: the failure echo must name WHO failed and WHY — the old
+            // "plugin GUI: {err} — closed" carried no plugin, so a user who
+            // clicked Edit on two plugins could never tell which died.
+            Err(err) => self.status = format!(
+                "{}: plugin window failed to open \u{2014} {err}",
+                editor_window_title(target, entry.name())
+            ),
         }
     }
 
@@ -14147,7 +14187,11 @@ impl App {
         if self.fx_vst_editors.contains_key(&(t, row)) {
             if let Some(w) = self.fx_vst_editors.get_mut(&(t, row)) {
                 if !w.is_closed() {
+                    // v85: synth-family parity — a close must echo, and it
+                    // echoes with the window's identity, not a bare row.
+                    let ident = w.identity().to_string();
                     w.close();
+                    self.status = format!("{ident}: plugin window closed");
                     return;
                 }
             }
@@ -14188,7 +14232,10 @@ impl App {
     /// no longer hosts the plugin they were opened for.
     fn reap_vst_editors(&mut self) {
         let mut closed: Vec<usize> = Vec::new();
-        let mut refused = false;
+        // v85: WHO refused to draw — the echo must name every dead editor
+        // (was one anonymous generic sentence for an app that can host
+        // many windows at once).
+        let mut refused: Vec<String> = Vec::new();
         // Chain-slot editors: drop when the window dies, when the plugin
         // refused to draw, or when the row moved/no longer holds it.
         let mut fx_closed: Vec<(usize, usize)> = Vec::new();
@@ -14197,6 +14244,9 @@ impl App {
                 Some(ChainRow::Vst { path, .. }) => Some(path.as_str()),
                 _ => None,
             };
+            if w.open_failed() {
+                refused.push(w.identity().to_string());
+            }
             if w.is_closed() || w.open_failed() || cur != Some(w.path()) {
                 fx_closed.push((*t, *r));
             }
@@ -14223,7 +14273,7 @@ impl App {
                 None => None,
             };
             if w.open_failed() {
-                refused = true;
+                refused.push(w.identity().to_string());
             }
             if w.is_closed() || w.open_failed() || cur.as_deref() != Some(w.path()) {
                 closed.push(*t);
@@ -14242,10 +14292,12 @@ impl App {
                 }
             }
         }
-        if refused {
-            self.status = "plugin editor could not draw \u{2014} its own window is the only \
-                 parameter surface, so close and re-open it to retry"
-                .into();
+        if !refused.is_empty() {
+            self.status = format!(
+                "{}: plugin editor could not draw \u{2014} its own window is the only \
+                 parameter surface, so close and re-open it to retry",
+                refused.join(", ")
+            );
         }
     }
 
@@ -52891,5 +52943,147 @@ mod tests {
             app.sel_clips
         );
         assert!(app.drag_clip.is_none(), "no stuck gesture");
+    }
+
+    // =====================================================================
+    // v85 (TS-007): native plugin editor window management — identity,
+    // echoes, front-on-open raise. REQUIREMENTS.md: ~/.hermes/cache/
+    // scratch/slooper-v85/REQUIREMENTS.md
+    // =====================================================================
+
+    /// R1: the ONE identity string identifies plugin AND slot, in the
+    /// house style of the script-FX chrome title (`{name} — track N`).
+    #[test]
+    fn v85_editor_title_identities_target() {
+        assert_eq!(
+            editor_window_title(GuiTarget::Synth(2), "wolf"),
+            "wolf \u{2014} track 3"
+        );
+        assert_eq!(
+            editor_window_title(GuiTarget::Chain(0, 1), "delay"),
+            "delay \u{2014} track 1 fx 2"
+        );
+        // The same plugin on two slots never collapses to one label.
+        assert_ne!(
+            editor_window_title(GuiTarget::Synth(0), "dly"),
+            editor_window_title(GuiTarget::Synth(1), "dly")
+        );
+        // And never the dead pre-v0.2 wording.
+        assert!(!editor_window_title(GuiTarget::Synth(0), "x").contains("loop"));
+    }
+
+    /// R1+R2+R3 wiring: both generations compose the identity through
+    /// the ONE helper, every echo (opened / failed / refused / closed /
+    /// probe-deferred) carries it, and the old anonymous strings are
+    /// GONE. Production window only (`\nmod tests` is column 0).
+    #[test]
+    fn v85_editor_echoes_carry_identity() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        // Helper wiring: 4 call sites (VST2 open, VST3 open, ok echo,
+        // err echo) — a lower bound so a regex drift can't vacuate this.
+        assert_eq!(
+            prod.matches("editor_window_title(target, entry.name())").count(),
+            4,
+            "identity must be composed in exactly the open/echo sites"
+        );
+        // Echoes (positive polarity).
+        for needle in [
+            "\"{}: plugin window opened\"",
+            "\"{}: plugin window failed to open \\u{2014} {err}\"",
+            "\"{ident}: plugin window closed\"",
+            "refused.push(w.identity().to_string())",
+            "\"{}: window check still running \\u{2014} one moment\"",
+            "\"{}: first window safety-checked in a child process \\u{2014} one moment\"",
+        ] {
+            assert!(prod.contains(needle), "echo lost its identity carrier: {needle}");
+        }
+        assert_eq!(prod.matches("refused.push(w.identity().to_string())").count(), 2,
+            "BOTH reapers (chain + synth) must name refused editors");
+        // Absence polarity: the pre-v85 anonymous strings must not return.
+        for gone in [
+            "plugin GUI: {err} \\u{2014} closed",
+            // (the quote-prefixed form: the NEW echo carries a "{}: "
+            // subject, so only the old anonymous literal matches this)
+            "\"plugin editor could not draw",
+            "plugin window still being checked",
+            "first window for this plugin is safety-checked",
+        ] {
+            assert!(!prod.contains(gone), "anonymous echo is back: {gone}");
+        }
+        // The refused echo still EXISTS (with its new subject) — else the
+        // absence check above would pass by deleting the feature.
+        assert!(prod.contains("{}: plugin editor could not draw"),
+            "refused echo must survive with an identity subject");
+    }
+
+    /// R1+R3 end-to-end (X11 + real plugin, slow tier — mirrors the v23
+    /// cached-safe pattern): chain-slot open echoes the identity, the
+    /// handle carries it, and the second click closes AND echoes.
+    #[test]
+    #[ignore = "slow-tier: dlopens + opens a real plugin editor window"]
+    fn v85_ui_open_close_echo_round_trip() {
+        if !crate::vstedit::x11_available() {
+            eprintln!("skip: no X display");
+            return;
+        }
+        let home = real_home();
+        let wolf = format!("{home}/.vst3/wolf-shaper.vst3");
+        let p = std::path::Path::new(&wolf);
+        if !p.is_dir() {
+            eprintln!("skip: wolf-shaper not installed");
+            return;
+        }
+        let mut app = headless_app("v85echo");
+        let load = crate::vsthost::open(p, crate::vsthost::VstKind::V3, 48_000, None)
+            .expect("wolf-shaper opens");
+        let entry = load.entry;
+        let m = App::plugin_mtime(&wolf).expect("mtime");
+        app.editor_probe.insert(App::probe_key(&wolf), (m, true));
+        app.fx_rows[0].push(ChainRow::Vst {
+            bypass: false,
+            path: wolf.clone(),
+            kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
+            name: "wolf".into(),
+            params: vec![0.0; entry.descs().len()],
+            entry: Some(entry.clone()),
+            state: None,
+            open_rx: None,
+            program: None,
+        });
+        // Open: cached-safe routes straight through to the real window.
+        app.vst_row_gui(0, 0);
+        assert!(
+            app.status.contains(" \u{2014} track 1 fx 1: plugin window opened"),
+            "open echo must carry the slot identity: {}",
+            app.status
+        );
+        assert_eq!(
+            app.fx_vst_editors
+                .get(&(0, 0))
+                .expect("window handle")
+                .identity()
+                .rsplit_once(" \u{2014} ")
+                .map(|(_, s)| s),
+            Some("track 1 fx 1"),
+            "the handle carries the composed identity for every later echo"
+        );
+        // Second click closes it (v0.11 R3 contract) — and now echoes.
+        app.vst_row_gui(0, 0);
+        assert!(
+            app.status.contains(" \u{2014} track 1 fx 1: plugin window closed"),
+            "close echo must carry the slot identity: {}",
+            app.status
+        );
+        // Close happened IN PLACE (the reaper harvests the dying window).
+        assert!(
+            app.fx_vst_editors.contains_key(&(0, 0)),
+            "toggle-close keeps the handle for harvest"
+        );
+        std::mem::forget(entry);
     }
 }

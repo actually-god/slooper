@@ -51,7 +51,7 @@ fn main() {
     if !only.contains("v2") {
         if let Some(e) = pick(VstKind::V3) {
             let l = open(&e.path, e.kind, 48_000, None).expect("open v3");
-            if let Ok(w) = l.entry.open_vst3_editor(48_000) {
+            if let Ok(w) = l.entry.open_vst3_editor(48_000, l.entry.name()) {
                 let t = Instant::now();
                 while !w.painted() && t.elapsed().as_secs() < 6 {
                     std::thread::sleep(Duration::from_millis(20));

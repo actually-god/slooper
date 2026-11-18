@@ -84,10 +84,21 @@ extern "C" {
     fn XDestroyWindow(d: *mut Display, w: XWindow) -> c_int;
     fn XDestroySubwindows(d: *mut Display, w: XWindow) -> c_int;
     fn XMapWindow(d: *mut Display, w: XWindow) -> c_int;
+    fn XRaiseWindow(d: *mut Display, w: XWindow) -> c_int;
     fn XSelectInput(d: *mut Display, w: XWindow, mask: u64) -> c_int;
     fn XStoreName(d: *mut Display, w: XWindow, name: *const i8) -> c_int;
     fn XInternAtom(d: *mut Display, name: *const i8, only_if_exists: c_int) -> Atom;
     fn XSetWMProtocols(d: *mut Display, w: XWindow, protocols: *mut Atom, count: c_int) -> c_int;
+    fn XChangeProperty(
+        d: *mut Display,
+        w: XWindow,
+        property: Atom,
+        type_: Atom,
+        format: c_int,
+        mode: c_int,
+        data: *const u8,
+        nelements: c_int,
+    ) -> c_int;
     fn XSync(d: *mut Display, discard: c_int) -> c_int;
     fn XFlush(d: *mut Display) -> c_int;
     fn XPending(d: *mut Display) -> c_int;
@@ -646,6 +657,10 @@ impl Shared {
 /// bind their event loop to that thread and nowhere else.
 pub struct EditorWindow {
     path: String,
+    /// v85: the identity string the window was opened with
+    /// (`{plugin} — track N [fx M]`) — every status echo about THIS
+    /// window (open, refused-to-draw, close) must name it.
+    identity: String,
     stop: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     open_failed: Arc<AtomicBool>,
@@ -704,6 +719,12 @@ impl EditorWindow {
     /// Plugin path this editor was opened for (stale-editor detection).
     pub fn path(&self) -> &str {
         &self.path
+    }
+    /// v85: identity the window carries (plugin name + track/slot) — the
+    /// honest subject for status echoes; empty only for handles created
+    /// before this field existed (there are none).
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
     /// True once the editor has retired (user closed the window, the
     /// plugin refused to open, or [`Self::close`] completed).
@@ -784,6 +805,9 @@ pub fn open_editor(
     let shared = Shared::new();
     let ae = *handle;
     let title = title.to_string();
+    // v85: the handle keeps its own copy — the GUI thread closure moves
+    // `title`, and status echoes need the identity after the open returns.
+    let identity = title.clone();
     let s2 = shared.clone();
     // Creation (container window + effEditOpen) happens ON the GUI
     // thread; blocking here means the returned handle already has an
@@ -799,6 +823,7 @@ pub fn open_editor(
     })?;
     Ok(EditorWindow {
         path: path.to_string(),
+        identity,
         stop: shared.stop.clone(),
         closed: shared.closed.clone(),
         open_failed: shared.open_failed.clone(),
@@ -1228,11 +1253,36 @@ impl Editor {
             self.win,
             STRUCTURE_NOTIFY_MASK | KEY_PRESS_MASK | KEY_RELEASE_MASK | FOCUS_CHANGE_MASK,
         );
-        if let Ok(cname) = CString::new(format!("slooper \u{2014} {}", self.title)) {
+        // v85 (TS-007): the identity title. WM_NAME goes through Xlib's
+        // Latin-1 conversion, which mangles the em dash in a taskbar;
+        // modern WMs read _NET_WM_NAME (UTF-8_STRING) first — set BOTH,
+        // same bytes: XStoreName for legacy WMs, the property for truth.
+        let title_full = format!("slooper \u{2014} {}", self.title);
+        if let Ok(cname) = CString::new(title_full.as_str()) {
             XStoreName(self.d, self.win, cname.as_ptr());
         }
+        let net_wm_name = XInternAtom(self.d, c"_NET_WM_NAME".as_ptr(), 0);
+        let utf8_string = XInternAtom(self.d, c"UTF8_STRING".as_ptr(), 0);
+        let tb = title_full.as_bytes();
+        XChangeProperty(
+            self.d,
+            self.win,
+            net_wm_name,
+            utf8_string,
+            8,
+            0, // PropModeReplace
+            tb.as_ptr(),
+            tb.len() as c_int,
+        );
         let mut protocols = [self.wm_delete];
         XSetWMProtocols(self.d, self.win, protocols.as_mut_ptr(), 1);
+        // v85: surface the editor in front, like every slooper floating
+        // window does on open. kwin's focus-steal prevention can otherwise
+        // map the container BEHIND the main window and the user never sees
+        // the "opened" window. Safe exactly here: decorate runs only AFTER
+        // the editor proved itself — the bare-container-before-effEditOpen
+        // rule (make_editor) is untouched.
+        XRaiseWindow(self.d, self.win);
         // v36: does the plugin reflow when its window changes size?
         // `effEditCanSizeWindow` (VST2.4) is the vendor's word on it —
         // and if the answer is no, pin the frame to the editor rect so
@@ -1391,6 +1441,7 @@ pub fn open_vst3_editor(
     }
     let shared = Shared::new();
     let title = title.to_string();
+    let identity = title.clone(); // v85: same reason as open_editor
     let path_h = path.to_string();
     let path_j = path.to_string();
     let s2 = shared.clone();
@@ -1417,6 +1468,7 @@ pub fn open_vst3_editor(
     })?;
     Ok(EditorWindow {
         path: path_h,
+        identity,
         stop: shared.stop.clone(),
         closed: shared.closed.clone(),
         open_failed: shared.open_failed.clone(),
@@ -1903,11 +1955,29 @@ impl Editor3 {
             self.win,
             STRUCTURE_NOTIFY_MASK | KEY_PRESS_MASK | KEY_RELEASE_MASK | FOCUS_CHANGE_MASK,
         );
-        if let Ok(cname) = CString::new(format!("slooper \u{2014} {}", self.title)) {
+        // v85: identity title — _NET_WM_NAME (UTF-8) + WM_NAME (legacy),
+        // identical bytes (see the VST2 `decorate` note).
+        let title_full = format!("slooper \u{2014} {}", self.title);
+        if let Ok(cname) = CString::new(title_full.as_str()) {
             XStoreName(self.d, self.win, cname.as_ptr());
         }
+        let net_wm_name = XInternAtom(self.d, c"_NET_WM_NAME".as_ptr(), 0);
+        let utf8_string = XInternAtom(self.d, c"UTF8_STRING".as_ptr(), 0);
+        let tb = title_full.as_bytes();
+        XChangeProperty(
+            self.d,
+            self.win,
+            net_wm_name,
+            utf8_string,
+            8,
+            0,
+            tb.as_ptr(),
+            tb.len() as c_int,
+        );
         let mut protocols = [self.wm_delete];
         XSetWMProtocols(self.d, self.win, protocols.as_mut_ptr(), 1);
+        // v85: front-on-open parity (see the VST2 `decorate` note).
+        XRaiseWindow(self.d, self.win);
         XFlush(self.d);
     }
 
@@ -2156,7 +2226,7 @@ pub fn probe_child(spec: &str) -> i32 {
             Err(_) => probe_exit(0),
         }
     } else {
-        match entry.open_vst3_editor(48_000) {
+        match entry.open_vst3_editor(48_000, entry.name()) {
             Ok(w) => w,
             Err(_) => probe_exit(0),
         }
@@ -2521,7 +2591,7 @@ mod tests {
             .iter()
             .position(|d| d.writable)
             .expect("writable param");
-        let mut win = match entry.open_vst3_editor(48_000) {
+        let mut win = match entry.open_vst3_editor(48_000, entry.name()) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("skip: shadow editor refused ({e})");
@@ -2607,7 +2677,7 @@ mod tests {
             let load = crate::vsthost::open(&wolf, crate::vsthost::VstKind::V3, 48_000, None)
                 .expect("wolf loads");
             let entry = load.entry;
-            let mut win = match entry.open_vst3_editor(48_000) {
+            let mut win = match entry.open_vst3_editor(48_000, entry.name()) {
                 Ok(w) => w,
                 Err(e) => {
                     eprintln!("skip: shadow editor refused ({e})");
@@ -2645,7 +2715,7 @@ mod tests {
             let load = crate::vsthost::open(&wolf, crate::vsthost::VstKind::V3, 48_000, None)
                 .expect("wolf loads in probe mode");
             let entry = load.entry;
-            let mut win = match entry.open_vst3_editor(48_000) {
+            let mut win = match entry.open_vst3_editor(48_000, entry.name()) {
                 Ok(w) => w,
                 Err(e) => {
                     set_probe_mode(prev);
@@ -2857,7 +2927,7 @@ mod tests {
             .expect("wolf-shaper VST3 loads");
         let entry = &load.entry;
         assert!(entry.has_editor(), "wolf-shaper VST3 advertises an editor");
-        let mut win = entry.open_vst3_editor(48_000).expect("shadow editor opens");
+        let mut win = entry.open_vst3_editor(48_000, entry.name()).expect("shadow editor opens");
         let mut waited = 0u32;
         while !win.painted() && !win.is_closed() && waited < 8_000 {
             std::thread::sleep(Duration::from_millis(100));
@@ -2882,7 +2952,7 @@ mod tests {
         let load =
             crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None).expect("loads");
         let entry = &load.entry;
-        let win = entry.open_vst3_editor(48_000).expect("opens");
+        let win = entry.open_vst3_editor(48_000, entry.name()).expect("opens");
         let mut waited = 0u32;
         while !win.painted() && !win.is_closed() && waited < 8_000 {
             std::thread::sleep(Duration::from_millis(100));
@@ -2913,7 +2983,7 @@ mod tests {
             crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None).expect("loads");
         let entry = &load.entry;
         for cycle in 0..3 {
-            let mut win = entry.open_vst3_editor(48_000).expect("open cycle");
+            let mut win = entry.open_vst3_editor(48_000, entry.name()).expect("open cycle");
             let mut waited = 0u32;
             while !win.painted() && !win.is_closed() && waited < 8_000 {
                 std::thread::sleep(Duration::from_millis(100));
@@ -3166,7 +3236,7 @@ mod tests {
         let load = crate::vsthost::open(&path, crate::vsthost::VstKind::V3, 48_000, None)
             .expect("wolf-shaper VST3 loads");
         let entry = &load.entry;
-        let mut win = entry.open_vst3_editor(48_000).expect("shadow editor opens");
+        let mut win = entry.open_vst3_editor(48_000, entry.name()).expect("shadow editor opens");
         let mut waited = 0u32;
         while !win.painted() && !win.is_closed() && waited < 8_000 {
             std::thread::sleep(Duration::from_millis(100));
@@ -3188,5 +3258,116 @@ mod tests {
             eprintln!("[v36] VST3 view can resize (or size unknown) — unpinned by design");
         }
         win.close();
+    }
+
+    // ================= v85 (TS-007): identity + WM-close pins ==========
+
+    /// Read a window TEXT property from a SECOND connection, the way the
+    /// window manager sees it — raw property bytes, no Xlib charset
+    /// conversion. `None` = property absent (same short-lived-probe
+    /// pattern as `wm_normal_hints`).
+    unsafe fn prop_text(xid: u64, prop_name: &str, type_name: &str) -> Option<String> {
+        #[link(name = "X11")]
+        extern "C" {
+            fn XGetWindowProperty(
+                d: *mut Display,
+                w: XWindow,
+                property: Atom,
+                long_offset: c_long,
+                long_length: c_long,
+                delete: c_int,
+                req_type: Atom,
+                actual_type: *mut Atom,
+                actual_format: *mut c_int,
+                nitems: *mut c_ulong,
+                bytes_after: *mut c_ulong,
+                prop: *mut *mut u8,
+            ) -> c_int;
+        }
+        let d = XOpenDisplay(ptr::null());
+        if d.is_null() {
+            return None;
+        }
+        XSetErrorHandler(Some(x_error_noop));
+        let pn = std::ffi::CString::new(prop_name).unwrap();
+        let tn = std::ffi::CString::new(type_name).unwrap();
+        let prop = XInternAtom(d, pn.as_ptr(), 0);
+        let want = XInternAtom(d, tn.as_ptr(), 0);
+        let mut at: Atom = 0;
+        let mut fmt: c_int = 0;
+        let mut n: c_ulong = 0;
+        let mut after: c_ulong = 0;
+        let mut data: *mut u8 = ptr::null_mut();
+        let out = if XGetWindowProperty(
+            d,
+            xid,
+            prop,
+            0,
+            512,
+            0,
+            want, // AnyPropertyType semantics for our probe
+            &mut at,
+            &mut fmt,
+            &mut n,
+            &mut after,
+            &mut data,
+        ) == 0
+            // Success is 0 — and an ABSENT property also returns Success
+            // with actual_type None + null data, so check all three.
+            && at != 0
+            && !data.is_null()
+        {
+            let bytes = std::slice::from_raw_parts(data, n as usize).to_vec();
+            XFree(data as *mut c_void);
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            None
+        };
+        XCloseDisplay(d);
+        out
+    }
+
+    /// v85 (SMOKE, R1+R3): a real editor container must carry its
+    /// identity WHERE THE WM READS IT — `_NET_WM_NAME` byte-exact UTF-8
+    /// (em dash intact; WM_NAME alone went through Latin-1 and mangled
+    /// it), WM_NAME still set for legacy WMs — and the WM close route
+    /// (WM_DELETE_WINDOW, exactly the title-bar ✕) must retire it.
+    /// Raise itself is WM policy (kwin re-centers whatever it likes);
+    /// the REQUEST is pinned by `v85_decorate_raises_front_after_proof`.
+    #[test]
+    fn v85_editor_wm_title_is_identity_and_wm_delete_closes() {
+        let tag = "v85-pin \u{2014} track 2 fx 1";
+        let Some(mut w) = v16_editor(tag) else {
+            return;
+        };
+        assert_eq!(w.identity(), tag, "handle carries the composed identity");
+        // decorate lands at the Verify->Live transition; the property
+        // read rides a SECOND connection, so poll a little.
+        let mut got = None;
+        for _ in 0..40 {
+            if let Some(t) = unsafe { prop_text(w.xid(), "_NET_WM_NAME", "UTF8_STRING") } {
+                got = Some(t);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("slooper \u{2014} {tag}").as_str()),
+            "_NET_WM_NAME must be the byte-exact identity title"
+        );
+        assert!(
+            unsafe { prop_text(w.xid(), "WM_NAME", "STRING") }.is_some(),
+            "WM_NAME stays set for legacy window managers"
+        );
+        // User-close route: WM_DELETE -> pump teardown -> retired.
+        assert!(request_wm_delete(w.xid()), "delete message sent");
+        let mut closed = 0u32;
+        while !w.is_closed() && closed < 5_000 {
+            std::thread::sleep(Duration::from_millis(50));
+            closed += 50;
+        }
+        assert!(w.is_closed(), "WM close ignored after {closed} ms");
+        w.close();
     }
 }
