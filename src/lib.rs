@@ -123,3 +123,15 @@ pub fn test_real_home() -> String {
     })
     .clone()
 }
+
+/// TEMPORARY v84 sabotage probe — board card t_dc8d6666. Proves the CI
+/// full-suite step is really blocking after the log-guard landed: this pin
+/// fails deterministically, cfg(windows)-only (Linux/gnullvm stay green to
+/// show the verdict discriminates), and matches no CI w*-filter so the red
+/// step must be the guarded `Full lib suite` itself.
+/// REVERTED IN THE VERY NEXT COMMIT — must never reach main.
+#[cfg(all(test, target_os = "windows"))]
+#[test]
+fn v84_ci_guard_sabotage_probe() {
+    assert_eq!(2 + 2, 5, "v84 SABOTAGE: intentional failure — guard-blocking proof");
+}
