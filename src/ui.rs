@@ -3714,6 +3714,8 @@ impl App {
             self.params_presets_for = nm.clone();
             self.params_presets = Self::list_param_presets(&nm);
         }
+        // v87 (TS-013): clipped picker rows hover their preset file.
+        let pdir = Self::param_preset_dir(&self.params_presets_for);
         // v77 (TS-003): ONE preset bar renderer — copy stays here, every
         // click runs through crate::presetbar (no per-site markup).
         let spec = crate::presetbar::PresetBarSpec {
@@ -3726,6 +3728,7 @@ impl App {
             load_width: 150.0,
             load_hover: None,
             row_hover: "load this preset",
+            row_dir: Some(&pdir),
             empty_text: None,
             delete_text: Some("delete named preset"),
             delete_hover: "delete the preset whose name is in the box",
@@ -13081,6 +13084,8 @@ impl App {
             // v77 (TS-003): the ONE preset bar renderer (compact style —
             // the v56 toolbar shape). No delete/reset here: every preset
             // row is rewritten, never removed.
+            // v87 (TS-013): clipped picker rows hover their preset file.
+            let sdir = Self::sampler_preset_dir();
             let spec = crate::presetbar::PresetBarSpec {
                 label: Some("preset \u{b7}"),
                 hint: "preset name",
@@ -13091,6 +13096,7 @@ impl App {
                 load_width: 90.0,
                 load_hover: None,
                 row_hover: "use this preset",
+                row_dir: Some(&sdir),
                 empty_text: Some("no presets yet \u{2014} save one first"),
                 delete_text: None,
                 delete_hover: "",
@@ -13647,6 +13653,8 @@ impl App {
                 self.synth_presets_for = stem.clone();
                 self.synth_presets = Self::list_synth_presets(&stem);
             }
+            // v87 (TS-013): clipped picker rows hover their preset file.
+            let sdir = Self::synth_preset_dir(&stem);
             // v77 (TS-003): the ONE preset bar renderer (v34 shape:
             // delete inside the picker, plus this surface's defaults).
             let spec = crate::presetbar::PresetBarSpec {
@@ -13661,6 +13669,7 @@ impl App {
                     "load a saved preset \u{2014} it lands on the live instrument",
                 ),
                 row_hover: "apply this preset to the synth",
+                row_dir: Some(&sdir),
                 empty_text: Some("no presets saved yet"),
                 delete_text: Some("delete named preset"),
                 delete_hover: "delete the preset whose name is in the box",
@@ -13841,6 +13850,8 @@ impl App {
         if !self.kit_presets_ready {
             self.kit_preset_refresh();
         }
+        // v87 (TS-013): clipped picker rows hover their preset file.
+        let kdir = Self::kit_preset_dir();
         // v77 (TS-003): the ONE preset bar renderer (identical shape to
         // the v34/v65 bars; the v69 copy grew from the same template).
         let spec = crate::presetbar::PresetBarSpec {
@@ -13853,6 +13864,7 @@ impl App {
             load_width: 100.0,
             load_hover: Some("load a saved kit onto this track (replaces the pads)"),
             row_hover: "replace the kit with this preset",
+            row_dir: Some(&kdir),
             empty_text: Some("no kits saved yet"),
             delete_text: Some("delete kit"),
             delete_hover: "delete the kit whose name is in the box",
@@ -23705,13 +23717,25 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 .small(),
         );
     }
-    // (tag, label, stem-to-bind) for every choice: the default,
-    // every script synth, every scanned plugin instrument.
-    let mut rows: Vec<(&'static str, String, String)> =
-        vec![("rust", "piano \u{2014} default".to_string(), String::new())];
+    // (tag, label, stem-to-bind, on-disk file for the row's identity) for
+    // every choice: the default, every script synth, every scanned plugin
+    // instrument. v87 (TS-013): the path line rides into a clipped row's
+    // tooltip only (see the row loop below).
+    let sdir = app.synth_registry.dir().to_path_buf();
+    let mut rows: Vec<(&'static str, String, String, String)> = vec![(
+        "rust",
+        "piano \u{2014} default".to_string(),
+        String::new(),
+        sdir.join("piano.rs").to_string_lossy().into_owned(),
+    )];
     for stem in app.synth_registry.stems() {
         if stem != "piano" {
-            rows.push(("rust", stem.clone(), stem));
+            rows.push((
+                "rust",
+                stem.clone(),
+                stem.clone(),
+                sdir.join(format!("{stem}.rs")).to_string_lossy().into_owned(),
+            ));
         }
     }
     for e in app.vst_scan.iter() {
@@ -23727,6 +23751,7 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
             tag,
             format!("{} \u{2014} plugin instrument", e.name),
             vst_synth_encode(e.kind, &e.path.to_string_lossy(), e.plugin_id.as_deref()),
+            e.path.to_string_lossy().into_owned(),
         ));
     }
     let scanning = !app.vst_scanned || app.vst_scan_rx.is_some();
@@ -23741,15 +23766,29 @@ fn synth_pick_body(ui: &mut egui::Ui, app: &mut App, t: usize) {
             let full_w = ui.available_width();
             let n_rows = rows.len();
             let mut pick: Option<String> = None;
-            for (tag, label, stem) in rows {
+            for (tag, label, stem, path) in rows {
                 let active = stem == cur;
-                let txt = if active {
-                    RichText::new(format!("[{tag}]  {label}")).strong()
+                let txt = format!("[{tag}]  {label}");
+                // v87 (TS-013): these rows are FIXED-height buttons, so a
+                // long name silently loses its wrapped tail — the only clip
+                // class a post-paint rect test cannot see. Pre-measure the
+                // label against the row (width AND the 24 px height); only a
+                // measured-clipped row hovers its full text + file.
+                let clipped = crate::kit::label_clipped(
+                    ui, &txt, full_w - 14.0, egui::TextStyle::Body, Some(24.0),
+                );
+                let rich = if active {
+                    RichText::new(txt.clone()).strong()
                 } else {
-                    RichText::new(format!("[{tag}]  {label}"))
+                    RichText::new(txt.clone())
                 };
-                let resp = ui.add_sized([full_w, 24.0], egui::Button::new(txt).frame(false))
-                    .on_hover_text("switch this track to this instrument");
+                let resp = ui.add_sized([full_w, 24.0], egui::Button::new(rich).frame(false));
+                let tip = if clipped {
+                    format!("{txt}\n{path}\nswitch this track to this instrument")
+                } else {
+                    "switch this track to this instrument".to_string()
+                };
+                let resp = resp.on_hover_text(tip);
                 if resp.clicked() && !active {
                     pick = Some(stem);
                 }
@@ -27350,17 +27389,41 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                     // the firewall, its window can never open, so the
                     // row must not pretend otherwise.
                     let resp = ui.add_enabled(!inert, egui::Button::new(txt).frame(false));
+                    // v87 (TS-013): the chain list clips at its edge — a name
+                    // that ran past it (long unbreakable token) recovers its
+                    // full identity on hover: name line + on-disk path, then
+                    // the state/action copy. A fully-visible row keeps its
+                    // plain hover, nothing new grows.
+                    let ident = if crate::kit::row_clipped(&resp, ui) {
+                        let path = match row {
+                            ChainRow::Vst { path, .. } => path.clone(),
+                            ChainRow::Script { stem, .. } => app
+                                .fx_registry
+                                .dir()
+                                .join(format!("{stem}.rs"))
+                                .to_string_lossy()
+                                .into_owned(),
+                        };
+                        format!("{label}\n{path}\n")
+                    } else {
+                        String::new()
+                    };
                     let resp = if inert {
                         resp.on_disabled_hover_text(if dead {
-                            "bridge lost — the plugin stopped responding and the firewall \
-                             parks it (audio passes through). Remove or replace this slot."
+                            format!(
+                                "{ident}bridge lost \u{2014} the plugin stopped responding and the \
+                                 firewall parks it (audio passes through). Remove or replace this \
+                                 slot."
+                            )
                         } else {
-                            "not loaded — fix the folder or rescan below"
+                            format!("{ident}not loaded \u{2014} fix the folder or rescan below")
                         })
                     } else if editor_open {
-                        resp.on_hover_text("its editor window is open — click to close it")
+                        resp.on_hover_text(format!(
+                            "{ident}its editor window is open \u{2014} click to close it"
+                        ))
                     } else {
-                        resp.on_hover_text("click to open controls")
+                        resp.on_hover_text(format!("{ident}click to open controls"))
                     };
                     if resp.clicked() {
                         act = Some((0, k));
@@ -27537,11 +27600,19 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                         .desc(s)
                         .map(|d| d.name.clone())
                         .unwrap_or_else(|| s.clone());
-                    if ui
-                        .selectable_label(false, format!("{name}  ({s})"))
-                        .on_hover_text("add this effect to the chain")
-                        .clicked()
-                    {
+                    // v87 (TS-013): a popup row clipped by the popup width
+                    // hovers its full text + the script file; a fully-visible
+                    // row keeps the plain action copy (kit::row_clipped).
+                    let resp = ui.selectable_label(false, format!("{name}  ({s})"));
+                    let tip = if crate::kit::row_clipped(&resp, ui) {
+                        format!(
+                            "{name}  ({s})\n{}\nadd this effect to the chain",
+                            app.fx_registry.dir().join(format!("{s}.rs")).display()
+                        )
+                    } else {
+                        "add this effect to the chain".to_string()
+                    };
+                    if resp.on_hover_text(tip).clicked() {
                         app.add_fx_script(loop_i, s);
                     }
                 }
@@ -27600,11 +27671,19 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                             }
                             let label =
                                 format!("[{}] {} \u{2014} {}", e.kind.tag(), e.name, e.vendor);
-                            if ui
-                                .selectable_label(false, &label)
-                                .on_hover_text("Effect plugin for this track's chain")
-                                .clicked()
-                            {
+                            // v87 (TS-013): clipped row -> full row text + the
+                            // plugin file it names (kit::row_clipped); the
+                            // visible row keeps only the action copy.
+                            let resp = ui.selectable_label(false, &label);
+                            let tip = if crate::kit::row_clipped(&resp, ui) {
+                                format!(
+                                    "{label}\n{}\nEffect plugin for this track's chain",
+                                    e.path.display()
+                                )
+                            } else {
+                                "Effect plugin for this track's chain".to_string()
+                            };
+                            if resp.on_hover_text(tip).clicked() {
                                 app.add_fx_plugin(loop_i, &e);
                             }
                         }
@@ -28845,6 +28924,8 @@ fn track_template_window(ui: &mut egui::Ui, app: &mut App) {
             // standard picker: rows apply, "delete template" removes the
             // name in the box — same shape as the kit bar.
             let names = App::track_template_list();
+            // v87 (TS-013): clipped picker rows hover their template file.
+            let tdir = App::track_template_dir();
             let spec = crate::presetbar::PresetBarSpec {
                 label: None,
                 hint: "template name",
@@ -28855,6 +28936,7 @@ fn track_template_window(ui: &mut egui::Ui, app: &mut App) {
                 load_width: 150.0,
                 load_hover: Some("apply a saved template to this track"),
                 row_hover: "replace this track's instrument, effects, mixer and color with the template",
+                row_dir: Some(&tdir),
                 empty_text: None,
                 delete_text: Some("delete template"),
                 delete_hover: "remove this template file for good",
