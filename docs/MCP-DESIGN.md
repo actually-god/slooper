@@ -21,7 +21,7 @@ native Rust plugins (e.g. pick sampler assets, set velocity/note values).
 | D2 | Security | **Off by default**; loopback-only bind hardcoded; bearer **token** auto-generated into `data_dir()/mcp-endpoint.json` (0600); Host allow-list + Origin check; `mcp_read_only` kill-switch latch. Threat model §3. | first-connection pairing; open 0.0.0.0 option; no-auth localhost |
 | D3 | Thread bridge | **Worker thread never touches App/engine.** Bounded `sync_channel(16)` command queue drained inside `App::logic` every frame; `ctx.request_repaint()` wake (production-proven); 5 s timeout → JSON-RPC error; `catch_unwind` firewall; **observed-then-ack** (write tools echo post-change state re-read through the same getters reads use). | published snapshot for reads (dual state = drift class); worker touching state under a mutex; per-tool timeouts |
 | D4 | Addressability | **Key strings, never roster indices.** Primary windows get stable keys mirroring `SideWins` fields (`rack`/`binds`/`monitor`/`mixer`); dynamic windows reuse `DynKind::key()`/`from_key()` verbatim (persisted since v35). Control args are flat 0-based ids (`track`, `row`, `pad`, `asset_id`, `key_note`, `param`). Packed sampler words and roster indices never surface. | roster indices (`win_count` slots shift on open/close); free-text titles as addresses |
-| D5 | Naming & schema | `verb_noun` snake_case tools; `get_`/`list_` are **guaranteed read-only**; every tool carries `annotations` (readOnly/destructive/idempotent hints); domain failures = `isError` payload, protocol failures = JSON-RPC codes (table §6); params **normalized 0..1** with `ParamMetaV1` units/labels exposed via descriptor tools (`x-slooper-unit` + human string via the existing `fmt_param`); **tools-only surface — no resources namespace**; serverInfo.version = `CARGO_PKG_VERSION`. | MCP resources for config/project; non-normalized raw param ints; name-based addressing |
+| D5 | Naming & schema | **dotted `domain.verb`** names exactly as the cards' ACs speak them (`settings.*`, `windows.*`, `mixer.*`, `chain.*`, `assets.*`, `plugin.*`, `sampler.*`); read/write is a **declared per-tool flag** (readOnlyHint = the latch's source of truth), not a name heuristic; units = **native currency of each setter seam** (mixer u8 0..=255, plugin params normalized 0..1, MIDI ints); `ParamMetaV1` exposed via descriptor tools (`x-slooper-unit` + human string via the existing `fmt_param`); **tools-only surface — no resources namespace**; serverInfo.version = `CARGO_PKG_VERSION`. | snake_case `get_*` flat names; name-prefix read detection; float-coerced integer seams; MCP resources for config/project |
 | D6 | Tests | Quick-tier pins call `mcp::dispatch(req, &mut App)` headlessly (no sockets, real frame loop via `frame()`); slow-tier `#[ignore = "slow-tier: real socket"]` for full socket round-trips + the bridge child process (`CARGO_BIN_EXE_slooper`, bounded wait — W12e rule); **port 0 + endpoint-discovery file everywhere, never a fixed port**; windows-native full suite (existing BLOCKING step) runs every pin — no new CI step. | fixed test ports; a Linux-only socket suite; vendoring an MCP client crate into prod deps |
 | D7 | Parity | `std::net` + `std::thread` only; all paths via `crate::paths` with **chained single-component `.join()`** (mixed-separator trap); endpoint file atomic tmp+rename; stdio bridge frames with `\n` only; accept loop = nonblocking poll + sleep (no self-connect trick, identical on Windows); Windows verdict = windows-native full suite + gnullvm `--all-targets` check. | unix sockets; `/tmp` discovery; SO_REUSE tricks; `std::os::unix` anything |
 
@@ -174,11 +174,11 @@ Gate order per request (fixed, so pins can pin each refusal):
 Backpressure & blast radius: accept loop caps at 8 live connections; the
 command queue is bounded 16 (`-32001 busy` on overflow, retry-friendly);
 every write tool is `destructiveHint:false` only where it cannot break
-music (e.g. `set_track_volume`); destructive ones (delete track/asset,
+music (e.g. `mixer.set`); destructive ones (delete track/asset,
 clear map, reset config) MUST carry `destructiveHint:true` so clients can
-gate them. `mcp_read_only=true` refuses every non-`get_`/`list_` call with
-`-32003 access-denied` (the user yanks the lever without touching the agent's
-connection). Off-by-default + explicit Settings opt-in + visible status echo
+gate them. `mcp_read_only=true` refuses every tool whose declared `read`
+flag is false with `-32003 access-denied` (the user yanks the lever without
+touching the agent's connection). Off-by-default + explicit Settings opt-in + visible status echo
 on every applied MCP write (goal-1 parity: the user always SEES what the
 agent did).
 
@@ -261,24 +261,43 @@ every schema description says "0-based"; GUI labels stay 1-based):
 | `track` | 0..track count | arrangement |
 | `row` | FX/chain row on a track | chain table |
 | `pad`, `pad_layer` | drum machine | kit table |
-| `asset_id` | asset rack | engine asset table — MUST come from `list_assets` in the same session; ids remap on removal (hard rule) |
+| `asset_id` | asset rack | engine asset table — MUST come from `assets.list` in the same session; ids remap on removal (hard rule) |
 | `key_note` (0..=127), `layer` | sampler key map | v51 map, v52 layers — the **packed `(asset<<16)\|(vel<<8)\|root` word never surfaces**; tools take/return decomposed fields so the packing can change |
 | `param` | plugin/script param index | `ParamMetaV1`/desc index |
 | `note`, `step` | piano-roll / MIDI pattern | pattern grid |
 
 Convention that kills an entire bug class: **read tools return the canonical
-ids** (`list_windows`, `list_assets`, `list_tracks`, `describe_synth`…) and
+ids** (`windows.list`, `assets.list`, `mixer.list`, `plugin.describe`…) and
 **write tools accept only ids** (names as *selection filters* only where the
 underlying UI is name-addressed, e.g. rack folder names).
 
 ## 6. D5 — Tool/resource naming, schemas, errors, ParamMetaV1
 
-**Naming.** `verb_noun`, snake_case, versionless names. Verb budget:
-`list_*`/`get_*` (read-only, guaranteed — a pin proves each touches nothing),
-`set_*`, `add_*`, `remove_*`, `apply_*` (multi-field), `open_*`/`close_*`
-(windows), `move_*`/`resize_*` (layout). Read/write split is enforced
-mechanically: `mcp_read_only` refuses by name prefix (`get_`/`list_` allow),
-so a future tool can't accidentally sneak a write past the latch.
+**Naming: dotted `domain.verb`, versionless.** The series cards' acceptance
+criteria already speak these names (MCP-02 `settings.*`, MCP-03
+`windows.*`, MCP-04 `mixer.*`/`chain.*`/`assets.*`, MCP-05
+`plugin.*`/`sampler.*`) — the spine adopts them verbatim; **no card invents
+aliases.** Domain budget: `settings.` `windows.` `mixer.` `chain.`
+`assets.` `plugins.` `plugin.` `sampler.` `drum.` + core-level `echo`
+(MCP-01 demo). Verbs within a domain: `list`, `get`, `set`, `add`, `remove`,
+`open`, `close`, `move`, `resize`, `dock`, `undock`, `save`, `load`, `pick`,
+`import`, `describe`. A pin asserts every registered name matches
+`^[a-z_]+\.[a-z_.]+$` with a budget verb tail.
+
+**Read/write split is a declared property, not a name heuristic.** Each
+tool row in `tools.rs` carries `read: bool` (rendered as `readOnlyHint`),
+and `mcp_read_only` refuses every tool whose flag is false — a future tool
+cannot sneak a write past the latch by naming. Read-only tools are
+additionally pinned to touch nothing (frame-diff pin).
+
+**Units convention — each control speaks the native currency of its setter
+seam; the schema states `minimum`/`maximum`/unit in the description.** No
+float normalization on top of integer seams (round-trip loss is a bug
+magnet): mixer vol/gain/pan = **u8 0..=255** exactly as `set_trk_vol/gain/
+pan` take them; plugin/script params = **normalized f32 0.0..=1.0** (the
+engine's own currency, `set_param`); sampler velocity and note/root =
+**u8 0..=127** MIDI integers; asset/track/row/slot ids = 0-based ints.
+MCP-04..05 must not re-pick these.
 
 **Annotations** (all tools, every call): `readOnlyHint`, `destructiveHint`,
 `idempotentHint`; `openWorldHint:false` always (localhost, no network fan-out).
@@ -295,9 +314,9 @@ wrong_kind, read_only, busy}` + human text, so the agent sees a fixable
 message instead of a transport error.
 
 **Schemas.** `inputSchema` = plain static `json!` tables in `tools.rs`
-(spik-verified shape). Param-value convention: **normalized `0.0..=1.0`**
-everywhere (the engine's own currency) plus a per-synth/plugin
-`describe_*` read tool emitting, per param: index, name, min/max,
+(spik-verified shape). Param values follow the seam-currency rule above —
+plugin/script params in **normalized `0.0..=1.0`** — plus a per-synth/plugin
+`plugin.describe` read tool emitting, per param: index, name, min/max,
 `x-slooper-unit` (the `SLOOPER_UNIT_*` code), enum labels (where
 `ParamMetaV1` declares steps/labels), and a **human string** produced by the
 same `fmt_param` formatter the GUI uses (v70) — one formatter, no drift;
@@ -311,11 +330,12 @@ pins show friction.
 **Versions.** `serverInfo.version` = `CARGO_PKG_VERSION`; tool-set is
 additive within the series; a removal/renumbering is a breaking change → new
 name + deprecation comment in `tools.rs` (we ship fast; clients cache
-`tools/list` with our `ttlMs`). **No MCP resources namespace** in v1 —
-`get_config` (full `Config` serde dump — it already `Serialize`s) +
-`get_project` cover the read surface; resources were rejected to avoid a
-second read path. If a future client demands resources, this is a pure-add
-decision for MCP-06+.
+`tools/list` with our `ttlMs`). **No MCP resources namespace** in v1 — the
+config read surface is `settings.list`/`settings.get` (full `Config` serde
+reflection — it already
+`Serialize`s); project-state reads ride the domain `*.list` tools. The MCP
+resources namespace was rejected to avoid a second read path. If a future
+client demands resources, this is a pure-add decision for MCP-06+.
 
 ## 7. D6 — Test strategy
 
@@ -373,33 +393,46 @@ idle wake.
 
 ## 10. Series map & forced scope changes
 
-Assumed card mapping (scrum-master owns relabels; ids in the header):
+Actual card mapping (verified from card bodies 2026-11-18; ids in the
+header — titles/assignees are the board's):
 
-- **MCP-01** — server core: `src/mcp/` + the `--mcp-bridge` flag in main.rs
-  + Config fields + Settings section + lazy start/stop + this document's
-  gate order. *Forced now:* bridge ships with the core (not deferred —
-  stdio-only clients are the primary user); endpoint discovery file exists
-  from card 1 (tests need it, so it is not a later "feature"); token file +
-  gate order exactly §3.
-- **MCP-02** — settings & config tools (`get_config`/`set_config` dotted
-  path w/ allow-list, `get_project` snapshot reads) + **status echo of every
-  MCP write** (goal 1 — the user always sees agent actions in the status
-  line) + `mcp_read_only` enforcement pin.
-- **MCP-03** — window registry: `PrimKind` keys + `Params` key extension
-  (back-compat pinned, §5) + `list_windows/open_window/close_window/
-  set_window_rect/set_dock/move_window` on the dock table (`SideWins.dock`
-  and `dyn_wins.dock` share the `[docked, edge, order]` encoding — reuse
-  `apply_win_layout`'s conversions, no new encoding).
-- **MCP-04** — subwindow controls: mixer (`set_trk_*` seams), plugin
-  selection (synth/fx pickers incl. `Registry::open(...).create_instance`
-  paths and chain rows), asset-rack controls. Every setter through the
-  table in §5; every ack observed (§4).
-- **MCP-05** — native-plugin functions: `describe_*` + `get_/set_plugin_
-  param` (ParamMetaV1 → §6 mapping), sampler map read/write decomposed +
-  velocity layers, MIDI note get/set (writes rebuild patterns and go via
-  `set_midi_assets`; `MidiAction::ALL` append-only rule respected).
-- **MCP-06** — docs/USAGE.md + README + wiki + CHANGELOG once the live
-  surface exists, incl. the `mcp.json` snippet §1 and inspector recipes.
+- **MCP-01** (t_56b24d75, feature-creator) — server core: `src/mcp/` + the
+  `--mcp-bridge` mode in main.rs + Config fields + Settings section +
+  **hot start/stop** (the card requires a live Settings toggle — §2's lazy
+  start must therefore be a start/STOP pair, not start-once) + tool registry
+  that MCP-02..05 register onto without touching the core + demo `echo`
+  tool. *Forced now:* bridge ships with the core (not deferred — stdio-only
+  clients are the primary user); endpoint discovery file exists from card 1
+  (tests need it, so it is not a later "feature"); token file + gate order
+  exactly §3; port-busy keeps booting with a status echo (card AC).
+- **MCP-02** (t_377dcec9, feature-creator) — `settings.list/get/set` over
+  **serde reflection of `Config`** (card AC: no hand-maintained list; parity
+  pin over every serialized field) + requires-restart fields surfaced, not
+  half-applied + **status echo of every MCP write** (goal 1). *Decision
+  here:* the card's "consider an MCP resource" is declined — §6 tools-only.
+- **MCP-03** (t_5cd0d1e5, **ui-designer**) — window registry: `PrimKind`
+  keys + the `params` key extension (back-compat pinned, §5) +
+  `windows.list/open/close/move/resize/dock/undock/save/restore` on the dock
+  table (`SideWins.dock` and `dyn_wins.dock` share the `[docked, edge,
+  order]` encoding — reuse `apply_win_layout`'s conversions, no new
+  encoding); plugin-editor windows list/move/close minimum per the card.
+- **MCP-04** (t_e0c0ad5e, **ui-designer**) — `mixer.list/get/set` (u8 seam
+  currency, §6), `chain.list/pick/remove` — **pick is async like the GUI's
+  load path: ack immediately with state `loading`, ready-ness observable via
+  `chain.list`, never block the MCP call for a probe** — `assets.list/
+  import/remove` + assign-equivalents via `crate::paths` validation. All
+  writes through the §5 setter-seam table, acks observed (§4).
+- **MCP-05** (t_3f374341, **plugin-designer**) — `plugins.list`,
+  `plugin.params/describe`, `plugin.param.get/set`, `plugin.preset.*` on the
+  shared preset-bar storage (sanitize honored), `sampler.map.get/set` +
+  `sampler.layers.add/remove` **decomposed** (§5) with seam-currency MIDI
+  ints, drum-kit pads same spirit; MIDI note get/set rebuilds patterns and
+  goes via `set_midi_assets` (`MidiAction::ALL` append-only respected);
+  `ParamMetaV1` → schema mapping per §6 (`fmt_param` human strings).
+- **MCP-06** (t_af0fa70f, **product-services**) — docs/MCP.md derived from
+  the live registry + README/USAGE/wiki + verified client configs once the
+  surface is live; CHANGELOG coordinated with the REL chain (REL-3 is
+  running as of this writing — do not touch).
 
 Cross-card rules this spine forces on ALL of the above: pin names
 `vNN_mcp_<behavior>` with each card claiming the next free vNN at dispatch
