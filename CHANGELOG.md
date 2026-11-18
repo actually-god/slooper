@@ -4,6 +4,115 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
+## [0.23.0] — unreleased
+
+The **workflow release**: every sound gets a preset shelf, hosted plugins
+expose their factory programs, the mixer grows a full-page console, the
+grid grows color — and nearly every click now answers back. 129 commits
+since 0.22.0, CI-green on Linux **and** Windows throughout.
+
+### Presets for everything
+
+- **One preset bar, same shape everywhere**: a name box, **save**, a
+  **load** picker (delete right inside it), and a reset to defaults.
+- New preset kinds since 0.22: **script-synth presets** (per synth),
+  **drum kits** (all 16 pad assignments as one named kit), **sampler
+  key-map presets**, and **track templates** — a track's instrument +
+  FX chain + mixer levels + color, saved once and applied to any track
+  from the mixer strip's right-click menu.
+- **VST2 / VST3 factory programs**: the plugin's PARAMETERS window grew
+  a **program** picker for the plugin's own presets. Your pick saves
+  with the project, is re-applied on load, and stays in sync both ways
+  (pick it in the plugin's own editor → the picker follows). Multi-part
+  VST3 instruments included.
+- **CLAP presets**: a plugin loading a preset on its own is now echoed
+  to the status line and persisted with the project, and the PARAMETERS
+  window gained a **load preset…** file picker.
+- **Per-slot chain bypass**: silence one effect or plugin inside a
+  track's chain without removing it — live and in export alike.
+
+### Mix page, color, and grid workflow
+
+- **MIX page** (`F9` or the MIX toggle on the grid toolbar): the center
+  area flips to a full-page mixer console — one channel column per
+  track with color chip, record/mute, vertical faders, pan, and chain
+  chips.
+- **Clip & track colors**: right-click a clip or an empty lane for the
+  **Color** submenu (named swatches). Tracks carry a default that their
+  clips inherit, and a chip marks colored lanes and mixer headers.
+  Colors ride copy/paste, duplicate, split, and the save file.
+- **Record groups**: `grp` on any strip adds that track to the record
+  group; the top-bar **REC GROUP** master arms and captures every
+  member at once.
+- **Vertical group drag**: dragging a multi-clip selection now moves it
+  across lanes as well as sideways.
+- **Mixer layout choice**: the *mixer follows tracks* setting toggles
+  between strips mirroring the timeline's track heights and a uniform
+  mixer-owned layout.
+- **Piano roll upgrades**: right-click a note for the **length menu**
+  (whole … 1/64, dotted and triplet columns, double/halve, delete);
+  its own **snap** switch on the roll toolbar; **glide notes** — draw
+  on the glide lane, or Z-drag from a note to chain slide-to-note;
+  a **velocity lane** (bar height = velocity); note **copy/paste across
+  tracks**; and double-clicking a MIDI clip opens it straight in the
+  roll.
+
+### Sampler & sample editor
+
+- The **key map now lives inside the sampler window**: the full
+  128-note range in a real piano layout, key clicks audition the track,
+  per-row sample slots with **velocity layers**, and named map presets.
+- **Velocity means recorded dynamic**: a layer's `v` value says "this
+  sample was recorded at that dynamic" — harder hits push up to ×4
+  louder instead of just re-firing the same amplitude.
+- **Sample editor, built around the waveform**: a live waveform canvas
+  with playhead and click-to-scrub, fades as draggable **curve handles
+  right on the wave**, pitch/bend/stretch controls on the canvas — and
+  every edit is **audible immediately** while you drag.
+- The bundled **TR-808 pack grew to 24 one-shots**, and a ready-made
+  **808-Kit** drum preset boots on first run — one click loads 16 pads.
+  Any drum pad can also import its own `.wav`.
+
+### Knobs that say what they mean
+
+- All **23 bundled effects** now ship full parameter metadata: real
+  **units** (Hz, ms, dB, ×, %) in readouts and tooltips, integer
+  steppers where the effect snaps to steps, and **dropdown pickers**
+  where a parameter is really a switch or a list.
+- **Hosted plugins get the same treatment**: the host reads VST3/CLAP
+  parameter metadata, so their sliders show true units and enum
+  pickers.
+- Plugin editors show **live value readouts** on knobs and follow the
+  app theme (including the light theme).
+
+### Everything answers you
+
+- A hover-feedback pass across the app: dialogs, menus, pickers and
+  action buttons explain themselves, and destructive actions
+  (delete/clear/reset) always carry a warning tooltip.
+- Every state-changing action echoes to the status line — rack, chain,
+  windows, presets — with counts where they matter.
+- The asset rack got honest: scan progress shows inside the browsers,
+  plugins that failed to load are listed with the reason, and
+  truncated names carry full-path tooltips.
+- Plugin editor windows are **titled** (`Name — track N`), raise
+  themselves when opened, and report failures with the plugin and slot
+  named.
+
+### Stability & correctness
+
+- **Windows**: VST2 plugins' refusal codes were misread as success (a
+  32/64-bit ABI gap) — fixed, so failed program and parameter writes
+  now correctly report and refuse.
+- Plugins whose GUI library tears down the probe child at exit (sfizz
+  is the known case) are **no longer falsely banned** from opening
+  editors, and the app no longer aborts at quit because of them.
+- **Time-stretch fixes**: short one-shots no longer stall or stretch
+  the wrong way, and periodic signals stop creeping backwards.
+- Drum-machine commits outline exactly the clips they stamped and
+  explain empty/silent attempts in a dialog instead of one quiet
+  status line.
+
 ## [0.22.0] — 2026-11-13
 
 The **public-release** build: slooper now ships fully native on
