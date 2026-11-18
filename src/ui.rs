@@ -3761,7 +3761,7 @@ impl App {
         // reads). The viewport is fenced to the width available NOW and
         // a fixed height (the repo idiom, cf. the v35 panel bodies).
         let body_w = ui.available_width().max(240.0);
-        egui::ScrollArea::horizontal()
+        egui::ScrollArea::both()
             .id_salt("slooper-params-body")
             .auto_shrink([false, true])
             .max_width(body_w)
