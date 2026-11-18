@@ -53427,7 +53427,7 @@ mod tests {
     fn v86_plugin_combo_hover_scan() {
         let srcs = include_str!("ui.rs");
         let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
-        const COMBOS: [(&str, &str, &str); 4] = [
+        const COMBOS: [(&str, &str, &str); 2] = [
             (
                 "from_id_salt((\"addfx\", loop_i))",
                 "\"addvst\"",
@@ -53437,16 +53437,6 @@ mod tests {
                 "from_id_salt((\"addvst\", loop_i))",
                 "// --- effects script folder",
                 "picking one appends",
-            ),
-            (
-                "from_id_salt(\"slooper_v60_programs\")",
-                "from_id_salt(\"slooper_v79_preset_locs\")",
-                "factory patches",
-            ),
-            (
-                "from_id_salt(\"slooper_v79_preset_locs\")",
-                "if let Some(i) = pick_loc {",
-                "host-commanded",
             ),
         ];
         for (salt, end_anchor, needle) in COMBOS {
@@ -53473,6 +53463,37 @@ mod tests {
                 "{salt}: closed-combo hover copy {needle:?} missing"
             );
         }
+        // v82 (TS-006): the two factory-preset combos moved onto the
+        // shared picker_row renderer. The contract keeps its two halves:
+        // the hover COPY stays at the call site (the PickerRowSpec), the
+        // ATTACHMENT lives exactly once in presetbar::picker_row.
+        const PICKERS: [(&str, &str); 2] = [
+            ("Id::new(\"slooper_v60_programs\")", "factory patches"),
+            ("Id::new(\"slooper_v79_preset_locs\")", "host-commanded"),
+        ];
+        for (salt, needle) in PICKERS {
+            let s = prod
+                .find(salt)
+                .unwrap_or_else(|| panic!("picker salt gone: {salt}"));
+            let win = &prod[s..prod[s..]
+                .find("&items")
+                .map(|i| s + i)
+                .expect("picker call passes &items")];
+            assert!(
+                win.contains("hover:") && win.contains(needle),
+                "{salt}: spec hover copy {needle:?} missing at the call site"
+            );
+        }
+        let pb = include_str!("presetbar.rs");
+        assert!(
+            pb.contains("pick.response.on_hover_text(spec.hover);"),
+            "picker_row must attach the spec hover once (.response chain)"
+        );
+        assert_eq!(
+            pb.matches("on_hover_text(spec.hover)").count(),
+            1,
+            "the shared picker hover attachment must not fork"
+        );
     }
 
     /// v86 R3 (echo family): family-wide inventory of plugin state-change
