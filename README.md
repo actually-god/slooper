@@ -61,8 +61,8 @@ step-by-step tutorials.
   boundaries, and trimming snaps even when grid snap is off.
 - **Group editing** — click selects, **Ctrl + click** toggles, **Shift +
   click** takes a same-lane run, **Ctrl + A** selects everything; a group
-  drags sideways as one unit, and dragging a single clip across lane lines
-  moves it lanes. **Ctrl + C / Ctrl + V** copies and pastes the whole
+  drags as one unit — sideways **and** vertically across lanes — and
+  dragging a single clip across lane lines moves it lanes. **Ctrl + C / Ctrl + V** copies and pastes the whole
   selection **with trims and relative offsets intact** — the paste lands at
   the playhead on the last-clicked track and the view scrolls to it.
   **Ctrl + D** duplicates; **Delete** removes the group.
@@ -85,11 +85,23 @@ step-by-step tutorials.
   note names — its **key map** slots route up to 8 rack samples across the
   keyboard for drums and multisampling), the bundled **drums** kit and
   **pad** synth, or **any scanned VSTi**. Parameters open in a sliders window;
-  VST2 instruments can open their native editor window (see
-  [docs/PLUGINS.md](docs/PLUGINS.md)).
+  VST2 **and** VST3 instruments can open their native editor windows (see
+  [docs/PLUGINS.md](docs/PLUGINS.md)). Script synths, sampler key maps,
+  drum kits and **track templates** (a whole track: instrument + FX
+  chain + mixer levels + color) all save as named presets, and hosted
+  plugins expose their **factory programs** in a picker that persists
+  with the project.
 - **Clip polish** — one click on a clip opens its property row: per-clip
   **gain** (dB), **fade in / out** (ms, drawn as wedges on the clip),
   and **✂ split** (`S`) cuts clips at the playhead into seamless halves.
+  Right-click a clip for **Duplicate**, **Color** (named swatches) and
+  **Edit sample**; tracks carry a color too (the default for their
+  clips), and colors ride copy/paste, duplicate, split and the save file.
+- **Sample editor** — opens from the rack or from any audio clip's menu:
+  a live **waveform canvas** (playhead + click-to-scrub), reverse /
+  ping-pong, fades as draggable **curve handles on the wave**, pitch,
+  bend and time-stretch — every edit audible while you drag, saved per
+  asset, never touching the source file.
 
 - **Piano roll** — the grid toolbar's **♫ Piano roll** opens a full-window
   note editor: with a MIDI clip or rack asset selected it **opens that
@@ -98,7 +110,13 @@ step-by-step tutorials.
   marquee / Ctrl / Shift select, Ctrl + C/V/A, one-click **quantize**.
   Preview routes through the picked track's *synth + effects chain*; the
   tempo follows the metronome. **save** writes the pattern as a MIDI asset
-  (primary folder) and places a clip at the playhead.
+  (primary folder) and places a clip at the playhead. **Double-click a
+  MIDI clip** opens it in the roll, and the toolbar button re-targets an
+  open roll to the current selection. Right-click a note for the grid
+  **length menu** (whole … 1/64, dotted + triplet columns, double/halve);
+  the roll carries its own **snap** switch, a **glide lane** (Z-drag from
+  a note to chain slides note-to-note), a **velocity lane**, and note
+  copy/paste that travels across tracks.
 - **Asset rack** — a panel on the left of the main window listing audio
   folders (add any number with **+ folder**, reorder, remove with `x`,
   re-scan with `...`). The **first folder is the primary folder**: all
@@ -125,12 +143,22 @@ step-by-step tutorials.
   written next to the project and missing files are re-found by name.
 - **Mixer dock & effects** — a **Mixer** panel docked right of the timeline
   holds every track's full strip, each one pixel-aligned to its track block:
-  name, REC, play gate, **MREC**, child-lane buttons, **vol** (−∞…+6 dB),
+  name, REC, play gate, **MREC**, child-lane buttons, **grp** (adds the
+  track to the **record group** — the top-bar **REC GROUP** master arms
+  and captures every member at once), **vol** (−∞…+6 dB),
   **gain**, **pan** (−100…+100, equal power; editable dB / position text
   boxes, raw MIDI readout and a **0** reset button), the **FX** chain chip
   and the **synth** picker — all scrolling in lockstep with the timeline.
   The **master volume** (peak meter + one-row fader at the top of the mixer
-  dock, above Track 1) spans the same −∞…+6 dB range.
+  dock, above Track 1) spans the same −∞…+6 dB range. A strip's
+  right-click menu also holds the **Track color** submenu and
+  **Track templates…**.
+- **MIX page (`F9`)** — the **MIX** toggle on the grid toolbar (or `F9`)
+  flips the center area to a full-page mixer console: one channel column
+  per track with color chip, select, rec/mute, vertical vol/gain faders,
+  pan, and FX + synth chips. The *mixer follows tracks* setting chooses
+  whether dock strips mirror the timeline's track heights or keep their
+  own uniform layout.
 - **One chain per track — scripts *and* plugins** — each track's mixer
   chain is a single ordered list mixing runtime-compiled **Rust effect
   scripts** (hot-compiled with rustc, per-effect sliders, scripted custom
@@ -155,7 +183,9 @@ step-by-step tutorials.
   (public-domain lineage; see `samples/808/CREDITS.md`).
 - **Settings menu** — hamburger (top-left): input/output port picker (per
   output **L** / **R** / both), projects folder, latency
-  compensation, track count (1–16), GUI scale, MIDI + keyboard bindings for
+  compensation, track count (1–16), GUI scale, *mixer follows tracks*,
+  the audio backend (Windows: WASAPI / native JACK — swaps live without
+  losing the session) and MIDI devices, MIDI + keyboard bindings for
   every action.
 - **MIDI binding** — every action — per-track record / **MIDI record** /
   clear / play-gate, track select, **play all** / **stop all**, metronome,
@@ -238,8 +268,10 @@ Each track owns one **ordered mixer chain** — effect scripts and binary VST
 plugins interleaved in one list. Click a track's **FX** chip:
 
 - **The chain** — one row per slot, top-to-bottom *is* audio order; ↑↓
-  reorder, `×` remove. A slot whose plugin/script failed to load stays
-  visible as *not loaded* until the next rescan.
+  reorder, `×` remove, and a **bypass** toggle per slot silences one
+  effect or plugin without removing it (live and in export). A slot
+  whose plugin/script failed to load stays visible as *not loaded*
+  until the next rescan.
 - **+ effect** — script effects from the effects folder; default
   `~/.local/share/slooper/effects`, created and seeded with `template.rs`
   + the ABI contract on first run; **Rescan effects** compiles edited
@@ -295,6 +327,9 @@ undo/redo — are dropped).
 | `Ctrl+A` | select all clips (then drag / copy / delete as a group) |
 | `Ctrl+S` | save project (asks for a name the first time) |
 | `Ctrl+Shift+S` | save under a new name |
+| `S` | split clip(s) at the playhead |
+| `F9` | toggle the full-page MIX mixer |
+| `Ctrl+K` | command palette (every window & setting) |
 
 Every key is rebindable; keys are ignored while you type in any text box.
 
@@ -505,4 +540,9 @@ included, as long as the copyright notice travels with substantial copies.
       (fade/trim/normalize, in place)
 - [x] Windows 10/11 native: WASAPI backend, native plugin editors, CI
       matrix on both OSes
+- [x] Preset everywhere: one preset bar (synth / key map / drum kit /
+      track template), VST2/VST3 program pickers, CLAP preset load,
+      per-slot chain bypass
+- [x] Full-page MIX page, clip & track colors, record groups,
+      piano-roll glide/velocity lanes + note clipboard across tracks
 - [ ] macOS backend
