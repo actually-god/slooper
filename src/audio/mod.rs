@@ -139,18 +139,31 @@ pub enum FxKind {
 /// A chain slot; see [`FxKind`].
 pub struct FxSlot {
     pub kind: FxKind,
+    /// v80 (TS-005): per-slot MUTE. A bypassed slot stays INSTALLED
+    /// (its instance/bridge keeps state and its editor still opens) but
+    /// the RT and offline passes skip it, so audio passes through —
+    /// the same semantic the RT already applies to a dead/parked plugin.
+    /// It rides the whole-chain republish like every other slot edit.
+    pub bypass: bool,
 }
 
 impl FxSlot {
     pub fn scripted(inst: Arc<crate::fx::Instance>, desc: crate::fx::EffectDesc) -> Self {
         Self {
             kind: FxKind::Scripted { inst, desc },
+            bypass: false,
         }
     }
     pub fn vst(entry: Arc<dyn crate::vsthost::StageEntry>) -> Self {
         Self {
             kind: FxKind::Vst(entry),
+            bypass: false,
         }
+    }
+    /// v80: builder for a slot born muted (chain rebuild from rows).
+    pub fn with_bypass(mut self, bypass: bool) -> Self {
+        self.bypass = bypass;
+        self
     }
     pub fn is_vst(&self) -> bool {
         matches!(self.kind, FxKind::Vst(_))
@@ -2735,6 +2748,11 @@ fn run_chain_over(
     sc: &[f32],
 ) {
     for slot in chain.slots() {
+        // v80: export identity — a muted slot is skipped offline exactly
+        // as the live bus skips it (the render must mirror the mix).
+        if slot.bypass {
+            continue;
+        }
         match &slot.kind {
             FxKind::Scripted { inst, desc } => {
                 if let Some(f) = inst.spawn_fresh(desc) {
@@ -4401,6 +4419,12 @@ impl Proc {
         let mut pair = (x, x);
         let sg = self.sync_gen;
         for (slot, rt) in chain.slots().iter().zip(self.fx_rt[t].iter_mut()) {
+            // v80: a muted slot passes audio through untouched. The
+            // fx_rt row stays (zip alignment) — the mute flag is read,
+            // the snapshot simply goes unused while bypassed.
+            if slot.bypass {
+                continue;
+            }
             let FxKind::Scripted { inst, .. } = &slot.kind else {
                 continue;
             };
@@ -4445,6 +4469,10 @@ impl Proc {
             ..
         } = self;
         for (k, slot) in fx_cache[t].slots().iter().enumerate() {
+            // v80: muted slot = pass-through (same skip fx_mix applies).
+            if slot.bypass {
+                continue;
+            }
             match &slot.kind {
                 FxKind::Scripted { inst, .. } => {
                     let rt = &mut fx_rt[t][k];
@@ -8548,5 +8576,88 @@ mod w12g_tests {
             len: 0,
         });
         assert_eq!(b.set_project_pushes.load(Ordering::Relaxed), base + 1, "SetProject ticks once");
+    }
+
+    /// v80 (TS-005): a muted slot is a real offline pass-through — the
+    /// render must mirror the live mix byte-identically (export identity
+    /// rule) — and the mute flag rides the published fx table.
+    #[test]
+    fn v80_offline_bypass_identity_and_table() {
+        // Deterministic quarter-gain script (negative control: an
+        // UN-muted render must visibly move, else identity proves nothing).
+        const V80_QUARTER_SRC: &str = r#"include!("effect_api.rs");
+
+extern "C" fn create(_sr: f64) -> *mut core::ffi::c_void {
+    Box::into_raw(Box::new(0usize)) as *mut core::ffi::c_void
+}
+extern "C" fn destroy(_s: *mut core::ffi::c_void) {
+    if !_s.is_null() { drop(unsafe { Box::from_raw(_s as *mut usize) }); }
+}
+extern "C" fn process(_s: *mut core::ffi::c_void, input: f32, _p: *const f32) -> f32 {
+    input * 0.25
+}
+
+static PARAMS: [EffectParamV1; 0] = [];
+pub static DESC: EffectInfoV1 = EffectInfoV1 {
+abi: SLOOPER_EFFECT_ABI,
+name: c"V80 Quarter".as_ptr(),
+author: core::ptr::null(),
+description: core::ptr::null(),
+n_params: 0,
+params: PARAMS.as_ptr(),
+create,
+destroy,
+process,
+};
+#[no_mangle]
+pub extern "C" fn slooper_effect_info() -> *const EffectInfoV1 { &DESC }
+"#;
+// Self-contained registry (the v48_reg helper lives in another
+// test module — same recipe, 4 lines, keep this pin standalone).
+let dir = std::env::temp_dir().join(format!("slooper-v80quarter-{}", std::process::id()));
+let _ = std::fs::remove_dir_all(&dir);
+std::fs::create_dir_all(&dir).unwrap();
+std::fs::write(dir.join("v80quarter.rs"), V80_QUARTER_SRC).unwrap();
+let mut reg = crate::fx::Registry::open(dir.clone());
+reg.rescan();
+assert!(reg.desc("v80quarter").is_some(), "test effect must load");
+let desc = reg.desc("v80quarter").unwrap().clone();
+        let mk_slot = |bypass: bool| {
+            FxSlot::scripted(
+                reg.create_instance("v80quarter", 48000.0, &[]).unwrap(),
+                desc.clone(),
+            )
+            .with_bypass(bypass)
+        };
+        let e = Engine::new();
+        let inp: Vec<f32> = vec![0.8f32; 2048];
+        // Muted: byte-identical pass-through.
+        let chain_on = TrackFx {
+            slots: Arc::new(vec![mk_slot(true)]),
+        };
+        let mut buf = inp.clone();
+        run_chain_over(&chain_on, 48000, &mut buf, &offline_sync(&e, 48000, 0), &[]);
+        assert!(
+            buf.iter().all(|v| (*v - 0.8).abs() < 1e-6),
+            "a muted slot must pass audio through untouched; got {buf:?}"
+        );
+        // Same chain, un-muted: the effect DOES move the signal (contrast
+        // — without it the identity assert above could pass vacuously).
+        let chain_off = TrackFx {
+            slots: Arc::new(vec![mk_slot(false)]),
+        };
+        let mut buf2 = inp.clone();
+        run_chain_over(&chain_off, 48000, &mut buf2, &offline_sync(&e, 48000, 0), &[]);
+        assert!(
+            (buf2[1000] - 0.2).abs() < 1e-4,
+            "un-muted quarter-gain renders 0.2 from 0.8; got {}",
+            buf2[1000]
+        );
+        // The flag rides the published table (what the RT refresh reads).
+        e.set_track_fx(0, chain_off);
+        assert!(!e.fx_table()[0].slots[0].bypass, "table carries un-muted");
+        e.set_track_fx(1, chain_on);
+        assert!(e.fx_table()[1].slots[0].bypass, "table carries the mute");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
