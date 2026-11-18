@@ -138,6 +138,10 @@ pub struct PresetBarSpec<'a> {
     pub load_hover: Option<&'a str>,
     /// Hover shown on every preset row inside the picker.
     pub row_hover: &'a str,
+    /// v87 (TS-013): the preset folder. A row whose label is clipped by the
+    /// popup's fixed width gets its full name + `<dir>/<name>.json` prefixed
+    /// to `row_hover`; untruncated rows keep `row_hover` verbatim.
+    pub row_dir: Option<&'a std::path::Path>,
     /// Empty-list line inside the picker; `None` = say nothing.
     pub empty_text: Option<&'a str>,
     /// Delete-inside-picker button; `None` = the surface has no delete
@@ -214,11 +218,20 @@ pub fn render(
                     }
                 }
                 for p in presets {
-                    if ui
-                        .selectable_label(false, p)
-                        .on_hover_text(spec.row_hover)
-                        .clicked()
-                    {
+                    // v87 (TS-013): the popup clips at its fixed width — a
+                    // row that runs past it recovers its full identity on
+                    // hover (name + on-disk file); a fully-visible row
+                    // keeps the plain action copy, nothing new grows.
+                    let resp = ui.selectable_label(false, p);
+                    let tip = match spec.row_dir {
+                        Some(dir) if crate::kit::row_clipped(&resp, ui) => format!(
+                            "{p}\n{}\n{}",
+                            dir.join(format!("{p}.json")).display(),
+                            spec.row_hover
+                        ),
+                        _ => spec.row_hover.to_string(),
+                    };
+                    if resp.on_hover_text(tip).clicked() {
                         act = Some(PresetBarAction::Load(p.clone()));
                     }
                 }
