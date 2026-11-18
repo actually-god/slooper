@@ -683,6 +683,27 @@ pub fn preset_from_json(text: &str) -> Result<Vec<(String, f64)>, String> {
     Ok(out)
 }
 
+/// Stock effect names that were REPLACED under new names in an earlier
+/// release (v0.22.0 de-brand: echo3→delay, panmatic→autopan,
+/// goodizer→enhancer). They are no longer part of `EXAMPLES`, but old
+/// copies survive in upgraded installs: the effect scanner loads any
+/// `*.rs`, so the retired names reappear in the +Effect menu beside their
+/// replacements — branded duplicates in a de-branded product, and a hit
+/// for the release data-dir grep gate (release-build.md §1.6). `seed_api`
+/// purges OUR copies of these names (and their `.build` artifacts).
+const RETIRED_EXAMPLES: &[&str] = &["echo3", "panmatic", "goodizer"];
+
+/// True when script content is one of OUR copies: every bundled script
+/// (and every copy the seeder ever wrote) opens with the `slooper ==`
+/// header banner; an unstamped file with a stock name is a user edit
+/// (v0.12 seeding rule) and stays untouched.
+fn seeded_copy_marker(cur: &str) -> bool {
+    match cur.lines().next() {
+        Some(first) => first.starts_with("// =") && first.contains("slooper =="),
+        None => false,
+    }
+}
+
 /// Write `effect_api.rs` next to the scripts when absent or stale.
 fn seed_api(dir: &Path) {
     let p = dir.join(API_FILE);
@@ -718,6 +739,33 @@ fn seed_api(dir: &Path) {
             }
             Err(_) => {
                 let _ = std::fs::write(&p, src);
+            }
+        }
+    }
+    // v88: retire renamed stock effects. These names are app-owned (the
+    // loop above used to write them), so OUR copies are deleted outright —
+    // keeping them (or a .bak of them) would ship branded duplicates of
+    // delay/autopan/enhancer to every upgraded install and keep failing
+    // the release data-dir sweep (release-build.md §1.6: a retired-name
+    // hit in the data dir is a ship blocker). An old `<name>.rs.bak` was
+    // written BY US from old stock content, so it goes too, as do the
+    // `.build/<name>-*` compiled artifacts.
+    for retired in RETIRED_EXAMPLES {
+        let p = dir.join(format!("{retired}.rs"));
+        let ours = std::fs::read_to_string(&p)
+            .map(|cur| seeded_copy_marker(&cur))
+            .unwrap_or(false);
+        if !ours {
+            continue; // absent, or a user file wearing the name — never touch
+        }
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("rs.bak"));
+        if let Ok(rd) = std::fs::read_dir(dir.join(".build")) {
+            let prefix = format!("{retired}-");
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
     }
@@ -1999,6 +2047,78 @@ mod tests {
         std::fs::remove_file(&bak).unwrap();
         seed_api(&dir);
         assert!(!bak.exists(), "unchanged script must not be re-backed-up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn v88_banner_copy(name: &str) -> String {
+        format!("// ============================================================ slooper ==\n// {name}.rs — old stock copy\nfn nope() {{}}\n")
+    }
+
+    #[test]
+    fn v88_seed_purges_renamed_stock_effect_copies() {
+        // v0.22.0 renamed echo3/panmatic/goodizer to delay/autopan/enhancer;
+        // the scanner loads any *.rs, so surviving old copies reappear in
+        // the +Effect menu as branded duplicates beside their replacements
+        // and trip the release data-dir sweep. Seeding must purge OUR
+        // copies, their .bak, and their .build artifacts.
+        let dir = temp_dir("v88purge");
+        std::fs::create_dir_all(dir.join(".build")).unwrap();
+        for r in RETIRED_EXAMPLES {
+            std::fs::write(dir.join(format!("{r}.rs")), v88_banner_copy(r)).unwrap();
+            std::fs::write(dir.join(format!("{r}.rs.bak")), v88_banner_copy(r)).unwrap();
+            std::fs::write(
+                dir.join(".build").join(format!("{r}-00000000000000ff.so")),
+                b"stub",
+            )
+            .unwrap();
+        }
+        seed_api(&dir);
+        for r in RETIRED_EXAMPLES {
+            assert!(!dir.join(format!("{r}.rs")).exists(), "{r}.rs must be purged");
+            assert!(
+                !dir.join(format!("{r}.rs.bak")).exists(),
+                "{r}.rs.bak must be purged (retired-name data-dir hit)"
+            );
+            assert!(
+                !std::fs::read_dir(dir.join(".build"))
+                    .unwrap()
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with(&format!("{r}-"))),
+                ".build artifact of {r} must be purged"
+            );
+        }
+        // The stock refresh still happens in the same call.
+        for (name, src) in EXAMPLES {
+            assert_eq!(
+                std::fs::read_to_string(dir.join(name)).unwrap(),
+                *src,
+                "{name} not refreshed"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v88_seed_keeps_unstamped_files_named_like_retired_effects() {
+        // Unstamped with a retired name = a user file wearing the name
+        // (v0.12 seeding rule): never touched, never backed up. Other user
+        // scripts are irrelevant to the purge and stay untouched too.
+        let dir = temp_dir("v88keep");
+        std::fs::create_dir_all(dir.join(".build")).unwrap();
+        let mine = dir.join("echo3.rs");
+        let mine_txt = "// my hand-tuned delay, no slooper banner\nfn nope() {}\n";
+        std::fs::write(&mine, mine_txt).unwrap();
+        let foreign = dir.join("mydelay.rs");
+        std::fs::write(&foreign, "// a user effect under its own name\n").unwrap();
+        std::fs::write(dir.join(".build").join("echo3-00000000000000aa.so"), b"stub").unwrap();
+        seed_api(&dir);
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), mine_txt);
+        assert_eq!(
+            std::fs::read_to_string(&foreign).unwrap(),
+            "// a user effect under its own name\n"
+        );
+        assert!(dir.join(".build").join("echo3-00000000000000aa.so").exists());
+        assert!(!dir.join("echo3.rs.bak").exists(), "user file must not be backed up");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
