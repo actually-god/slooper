@@ -51628,10 +51628,14 @@ mod tests {
         // The needle must be TOOLTIP-UNIQUE — "changes apply live" alone
         // also rides the window's static info label and would satisfy
         // hover_until_tip before egui's 0.3 s tooltip delay elapses.
-        // v82: re-probe IMMEDIATELY before the hover — the floating
-        // window drifts a few px per extra headless frame (v66 trap;
-        // v82's body scroll made the drift reach this row), and a stale
-        // center can miss the row's hover band.
+        // v82: the scroll viewport settles one frame in (its scrollbar
+        // appears at frame 2 and shifts rows ~10px). Settle, clear,
+        // frame ONCE, and probe that sole frame — then hover at once:
+        // a probe from any earlier frame can already miss the row.
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
         let row = *kit_probe("V74hz").first().unwrap();
         let tips = hover_until_tip(&mut app, &ctx, row.center(), &["value from the plugin"]);
         assert!(
