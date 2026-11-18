@@ -699,20 +699,30 @@ struct SeGeom {
 
 /// A clip being dragged on the timeline. Dragging a clip that is part of a
 /// multi-selection drags the whole group: `items` lists every member
-/// (`(track, lane, clip index, timeline position at drag start)`, sorted,
-/// the earliest-position one first) and `base0` is the group's start
-/// position — the point every member moves relative to.
+/// (`(track, lane, clip index, timeline position at drag start, flattened
+/// lane-row index at drag start)`, sorted, the earliest-position one
+/// first) and `base0` is the group's start position — the point every
+/// member moves relative to.
 #[derive(Clone)]
 struct ClipDrag {
-    items: Vec<(usize, usize, usize, u64)>,
+    /// `(track, lane, clip index, pos at drag start, lane-row at drag
+    /// start)`. The first three entries stay CURRENT (remapped whenever a
+    /// move re-indexes a lane); the last two are drag-start history.
+    items: Vec<(usize, usize, usize, u64, usize)>,
     base0: u64,
     /// Samples between the group's start and the grab point, so the group
     /// does not jump when the drag begins.
     grab: u64,
+    /// v83: pointer Y at press. Group drags convert the pointer's travel
+    /// from here (in units of the grabbed lane's row height) into whole
+    /// row shifts.
+    grab_y: f32,
     /// Some(lane) for a SINGLE-clip drag: the pointer may then also move
-    /// the clip vertically between the track's lanes. Multi-clip groups
-    /// (any group, including several clips on one track) move horizontally
-    /// only.
+    /// the clip vertically between the track's lanes (v18/v29/v34).
+    /// Multi-clip groups (any group, including several clips on one
+    /// track) move vertically by ROW SHIFT (v83): the pointer moves the
+    /// whole group up/down the flattened (track, lane) grid of lane rows
+    /// in whole-row steps, preserving each member's relative row.
     lane0: Option<usize>,
 }
 
@@ -4730,6 +4740,123 @@ impl App {
         let nl = self.arr.tracks[t].lanes.len().max(1);
         let lh = (self.track_h(t) / nl as f32).max(1.0);
         (((y - top) / lh).floor().max(0.0) as usize).min(nl - 1)
+    }
+
+    /// v83: index of the `(track, lane)` lane row in the FLATTENED
+    /// arranger grid — track 0's lanes stack first, then track 1's, and
+    /// so on. Vertical group drags measure in these units.
+    fn clip_row(&self, t: usize, lane: usize) -> usize {
+        self.arr.tracks[..t.min(self.arr.tracks.len())]
+            .iter()
+            .map(|tr| tr.lanes.len())
+            .sum::<usize>()
+            + lane
+    }
+
+    /// v83: total number of lane rows across every track.
+    fn row_count(&self) -> usize {
+        self.arr.tracks.iter().map(|tr| tr.lanes.len()).sum()
+    }
+
+    /// v83: inverse of [`App::clip_row`] — which `(track, lane)` owns a
+    /// row (clamped to the grid).
+    fn row_at(&self, row: usize) -> (usize, usize) {
+        let mut left = row;
+        for (t, tr) in self.arr.tracks.iter().enumerate() {
+            if left < tr.lanes.len() {
+                return (t, left);
+            }
+            left -= tr.lanes.len();
+        }
+        let t = self.arr.tracks.len().saturating_sub(1);
+        (t, self.arr.tracks[t].lanes.len().saturating_sub(1))
+    }
+
+    /// v83: vertical GROUP drag. Shifts every member of the armed group
+    /// by `dr` rows of the flattened lane grid: each member's target row
+    /// is its DRAG-START row + dr, clamped to the grid. Recomputing from
+    /// the drag-start rows every frame makes the operation idempotent —
+    /// a member clamped at the grid edge this frame neither accumulates
+    /// nor drifts on later frames. Moving a clip removes and re-appends
+    /// it (lane indices after each removal shift down), so every tracked
+    /// id — drag items, `sel_clips`, `sel_anchor` — is remapped through
+    /// one pass. Asset ids are NEVER touched: moving a clip copies no
+    /// asset, so shared patterns/audios stay shared (S11b identity).
+    fn group_shift_rows(&mut self, dr: i64) {
+        let d = match self.drag_clip.clone() {
+            Some(d) if d.items.len() > 1 => d,
+            _ => return,
+        };
+        let total = self.row_count();
+        if total == 0 {
+            return;
+        }
+        // Current ids for every member; removals below rewrite them in
+        // place (ids ARE table indices). usize::MAX marks "lifted".
+        let mut cur: Vec<(usize, usize, usize)> =
+            d.items.iter().map(|(t, k, c, _, _)| (*t, *k, *c)).collect();
+        let dead = (usize::MAX, usize::MAX, usize::MAX);
+        // Movers: (member index, target row). A member already on its
+        // target row (e.g. clamped) stays and only needs id bookkeeping.
+        let mut movers: Vec<(usize, usize)> = Vec::new();
+        for (i, (t, k, _c, _, row0)) in d.items.iter().enumerate() {
+            let target = (*row0 as i64 + dr).clamp(0, total as i64 - 1) as usize;
+            if self.clip_row(*t, *k) != target {
+                movers.push((i, target));
+            }
+        }
+        if movers.is_empty() {
+            return;
+        }
+        // Phase A: lift every mover BEFORE inserting anything, in
+        // DESCENDING id order so a removal never shifts a pending
+        // removal's index. Every tracked id behind a removal in the same
+        // lane shifts down one.
+        movers.sort_by(|a, b| cur[b.0].cmp(&cur[a.0]));
+        let mut carry: Vec<(usize, crate::arrange::Clip, usize)> = Vec::new();
+        for &(i, target) in &movers {
+            let (t, k, c) = cur[i];
+            if let Some(cl) = self.arr.remove_clip(t, k, c) {
+                cur[i] = dead;
+                for id in cur.iter_mut() {
+                    if *id != dead && id.0 == t && id.1 == k && id.2 > c {
+                        id.2 -= 1;
+                    }
+                }
+                carry.push((i, cl, target));
+            }
+        }
+        // Phase B: append each lifted clip to its target row's lane —
+        // appends never shift existing indices, so stay-put members are
+        // safe. Deterministic order: target row, then member index.
+        carry.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)));
+        for (i, cl, target) in carry {
+            let (t, k) = self.row_at(target);
+            self.arr.insert(t, k, cl);
+            let n = self.arr.tracks[t].lanes[k].clips.len();
+            cur[i] = (t, k, n - 1);
+        }
+        // Remap: drag items keep their drag-start pos/row history.
+        if let Some(dd) = self.drag_clip.as_mut() {
+            for (item, id) in dd.items.iter_mut().zip(cur.iter()) {
+                item.0 = id.0;
+                item.1 = id.1;
+                item.2 = id.2;
+            }
+        }
+        let old: Vec<(usize, usize, usize)> =
+            d.items.iter().map(|(t, k, c, _, _)| (*t, *k, *c)).collect();
+        for id in self.sel_clips.iter_mut() {
+            if let Some(p) = old.iter().position(|o| o == id) {
+                *id = cur[p];
+            }
+        }
+        self.sel_clips.sort();
+        if let Some(a) = self.sel_anchor {
+            if let Some(p) = old.iter().position(|o| *o == a) {
+                self.sel_anchor = Some(cur[p]);
+            }
+        }
     }
 
     fn track_h(&self, t: usize) -> f32 {
@@ -25171,14 +25298,20 @@ fn lane_row(
                                 // delta of this strip's pointer.
                                 let mut ids = app.sel_clips.clone();
                                 ids.sort();
-                                let items: Vec<(usize, usize, usize, u64)> = ids
+                                let items: Vec<(usize, usize, usize, u64, usize)> = ids
                                     .iter()
                                     .filter_map(|(tt, kk, cc)| {
                                         let p = app.arr.tracks[*tt].lanes[*kk]
                                             .clips
                                             .get(*cc)
                                             .map(|c| c.pos)?;
-                                        Some((*tt, *kk, *cc, p))
+                                        Some((
+                                            *tt,
+                                            *kk,
+                                            *cc,
+                                            p,
+                                            app.clip_row(*tt, *kk),
+                                        ))
                                     })
                                     .collect();
                                 if !items.is_empty() {
@@ -25192,6 +25325,7 @@ fn lane_row(
                                         items,
                                         base0,
                                         grab: base0.saturating_sub(pos),
+                                        grab_y: pt.y,
                                         lane0,
                                     });
                                 }
@@ -25392,16 +25526,17 @@ fn lane_row(
                 let new_base = snap_start(s_at(x0, pt.x, sr, px).saturating_add(d.grab), snapu);
                 let dx = new_base as i64 - d.base0 as i64;
                 if dx != 0 {
-                    for (tt, kk, cc, p0) in &d.items {
+                    for (tt, kk, cc, p0, _) in &d.items {
                         let np = (*p0 as i64 + dx).max(0) as u64;
                         app.arr.move_clip(*tt, *kk, *cc, np);
                     }
                 }
                 // Single-clip drag: vertical pointer travel moves the clip
-                // between its track's lanes (groups stay horizontal-only).
+                // between its track's lanes (groups row-shift instead —
+                // v83, see the else branch below).
                 // v29: past the track's rows it moves to the NEXT TRACK.
                 if let Some(l0) = d.lane0 {
-                    let (tt, cur, cc, _) = d.items[0];
+                    let (tt, cur, cc, _, _) = d.items[0];
                     // `rect` is THIS LANE's row; the cross-track walk
                     // needs the owning track's whole vertical span.
                     let lanes = app.arr.tracks[t].lanes.len();
@@ -25425,7 +25560,7 @@ fn lane_row(
                             app.arr.move_clip_to(tt, cur, cc, target_t, Some(tgt_lane))
                         {
                             if let Some(dd) = app.drag_clip.as_mut() {
-                                dd.items[0] = (target_t, nl, ni, dd.items[0].3);
+                                dd.items[0] = (target_t, nl, ni, dd.items[0].3, dd.items[0].4);
                             }
                             let old = (tt, cur, cc);
                             let fresh = app
@@ -25466,6 +25601,18 @@ fn lane_row(
                             }
                         }
                     }
+                } else {
+                    // v83: multi-clip group — the pointer's vertical
+                    // travel moves the WHOLE group in whole LANE ROWS
+                    // of the flattened (track, lane) grid: each
+                    // member's target row is its drag-start row + the
+                    // rounded pointer-row delta, clamped to the grid
+                    // (recomputed from drag-start every frame, so a
+                    // clamp never drifts). Selection ids, which ARE
+                    // table indices, are remapped inside.
+                    let unit = rect.height().max(1.0);
+                    let dr = ((pt.y - d.grab_y) / unit).round() as i64;
+                    app.group_shift_rows(dr);
                 }
             }
         }
@@ -52438,5 +52585,301 @@ mod tests {
             "v80 chain contract scan:\n{}",
             offenders.join("\n")
         );
+    }
+
+    // =========== v83: vertical GROUP drag — flattened lane-row shift ==========
+
+    /// v83 rig: ONE MIDI asset carried by three clips — rows 0 and 1
+    /// (the draggable pair) plus a bystander on track 5. Every placement
+    /// shares the same asset id (the v64 S11b sharing identity).
+    /// Returns the shared asset id.
+    fn v83_shared_midi(app: &mut App) -> u32 {
+        let id = app.assets.len() as u32;
+        let mut q = Pattern::new(120);
+        q.len_ticks = 4 * PPQ as u32;
+        q.notes = vec![crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+        }];
+        let dir = std::env::temp_dir().join("slooper-v83-pins");
+        let _ = std::fs::create_dir_all(&dir);
+        app.assets.push(crate::assets::Asset::midi(
+            id,
+            "v83shared".into(),
+            dir.join("v83shared.mid"),
+            q.into(),
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(id, 0));
+        app.arr.insert(1, 0, Clip::new(id, 1000));
+        app.arr.insert(5, 0, Clip::new(id, 4000));
+        id
+    }
+
+    /// Viewport y at the middle of flattened lane row `r` (default
+    /// tracks all carry a single lane).
+    fn v83_row_y(app: &App, r: usize) -> f32 {
+        let mut y = app.grid_anchor - app.vscroll;
+        for t in 0..r {
+            y += app.track_h(t) + TRACK_SEP_HIT;
+        }
+        y + app.track_h(r) * 0.5
+    }
+
+    /// Ctrl+click — the real modifier gesture that ADDS to the selection.
+    fn v83_ctrl_click(app: &mut App, ctx: &egui::Context, p: egui::Pos2) {
+        frame(app, ctx, vec![moved(p)]);
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                moved(p),
+                btn(p, egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                btn(p, egui::PointerButton::Primary, false),
+            ],
+        );
+        frame(
+            app,
+            ctx,
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+        );
+    }
+
+    /// Press at `grab`, release at `drop` (button down across `mids`).
+    fn v83_drag(
+        app: &mut App,
+        ctx: &egui::Context,
+        grab: egui::Pos2,
+        mids: &[egui::Pos2],
+        drop: egui::Pos2,
+    ) {
+        frame(app, ctx, vec![moved(grab)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)],
+        );
+        for p in mids {
+            frame(app, ctx, vec![moved(*p)]);
+        }
+        frame(
+            app,
+            ctx,
+            vec![moved(drop), btn(drop, egui::PointerButton::Primary, false)],
+        );
+        frame(app, ctx, vec![]);
+    }
+
+    /// AC1+AC3: a two-clip group on rows 0 and 1 dragged one row down
+    /// lands BOTH members one row down, rigidly (relative positions
+    /// preserved), and every tracked id — selection and anchor — follows
+    /// the table indices.
+    #[test]
+    fn v83_group_drag_vertical_moves_rows() {
+        let mut app = headless_app("v83grow");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        v83_shared_midi(&mut app);
+        frame(&mut app, &ctx, vec![]); // settle grid geometry
+        let y0 = v83_row_y(&app, 0);
+        let y1 = v83_row_y(&app, 1);
+        click_pt(&mut app, &ctx, egui::pos2(250.0, y0));
+        v83_ctrl_click(&mut app, &ctx, egui::pos2(250.0, y1));
+        assert_eq!(app.sel_clips.len(), 2, "two clips selected");
+        let grab = egui::pos2(250.0, y1);
+        let drop = egui::pos2(250.0, v83_row_y(&app, 2));
+        v83_drag(
+            &mut app,
+            &ctx,
+            grab,
+            &[egui::pos2(250.0, (y1 + drop.y) * 0.5)],
+            drop,
+        );
+        let ids = clip_ids(&app);
+        let on = |t: usize| ids.iter().filter(|(tt, _, _, _)| *tt == t).count();
+        assert_eq!(on(0), 0, "left row 0: {ids:?}");
+        assert_eq!(on(1), 1, "A moved onto track 1: {ids:?}");
+        assert_eq!(on(2), 1, "B moved onto track 2: {ids:?}");
+        assert_eq!(on(5), 1, "bystander never dragged");
+        let pa = ids.iter().find(|(t, _, _, _)| *t == 1).unwrap().3.pos;
+        let pb = ids.iter().find(|(t, _, _, _)| *t == 2).unwrap().3.pos;
+        assert_eq!(
+            pb as i64 - pa as i64,
+            1000,
+            "group rode rigidly: relative position preserved"
+        );
+        let mut want: Vec<(usize, usize, usize)> = ids
+            .iter()
+            .filter(|(t, _, _, _)| *t == 1 || *t == 2)
+            .map(|(t, k, c, _)| (*t, *k, *c))
+            .collect();
+        want.sort();
+        assert_eq!(app.sel_clips, want, "selection ids follow the table");
+        assert_eq!(app.sel_anchor, Some((1, 0, 0)), "anchor follows its member");
+        assert!(app.drag_clip.is_none(), "gesture released");
+    }
+
+    /// AC2: vertical group drag must never split the asset — the moved
+    /// pair and the untouched bystander keep pointing at the ONE asset,
+    /// and the move mints nothing (the v64 S11b identity, drag edition).
+    #[test]
+    fn v83_group_drag_vertical_keeps_asset_shared() {
+        let mut app = headless_app("v83share");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let a = v83_shared_midi(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let y1 = v83_row_y(&app, 1);
+        click_pt(&mut app, &ctx, egui::pos2(250.0, v83_row_y(&app, 0)));
+        v83_ctrl_click(&mut app, &ctx, egui::pos2(250.0, y1));
+        let assets_before = app.assets.len();
+        let grab = egui::pos2(250.0, y1);
+        let drop = egui::pos2(250.0, v83_row_y(&app, 2));
+        v83_drag(&mut app, &ctx, grab, &[], drop);
+        assert_eq!(app.assets.len(), assets_before, "no asset was minted");
+        let ids = clip_ids(&app);
+        let shared = ids.iter().filter(|(_, _, _, c)| c.asset == a).count();
+        assert_eq!(shared, 3, "all three placements still share ONE asset");
+        let pair: Vec<u32> = ids
+            .iter()
+            .filter(|(t, _, _, _)| *t == 1 || *t == 2)
+            .map(|(_, _, _, c)| c.asset)
+            .collect();
+        assert_eq!(pair, vec![a, a], "the moved pair stayed shared");
+        let by = ids.iter().find(|(t, _, _, _)| *t == 5).unwrap();
+        assert_eq!(by.3.asset, a);
+        assert_eq!(by.3.pos, 4000, "bystander never moved");
+    }
+
+    /// AC3 (edge case): dragging the group off the TOP of the grid
+    /// clamps both members into row 0, and the clamp must NOT drift —
+    /// returning the pointer to the grab point restores the exact
+    /// original rows (target rows are recomputed from drag-start, every
+    /// frame).
+    #[test]
+    fn v83_group_drag_vertical_clamps_and_recovers() {
+        let mut app = headless_app("v83clamp");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(3, 0, Clip::new(a, 0));
+        app.arr.insert(4, 0, Clip::new(a, 5000));
+        frame(&mut app, &ctx, vec![]);
+        let y3 = v83_row_y(&app, 3);
+        let y4 = v83_row_y(&app, 4);
+        click_pt(&mut app, &ctx, egui::pos2(250.0, y3));
+        v83_ctrl_click(&mut app, &ctx, egui::pos2(250.0, y4));
+        assert_eq!(app.sel_clips.len(), 2);
+        let grab = egui::pos2(250.0, y4);
+        let up = egui::pos2(250.0, y4 - 4.0 * app.track_h(4));
+        frame(&mut app, &ctx, vec![moved(grab)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(grab), btn(grab, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(up)]);
+        let ids = clip_ids(&app);
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 0).count(),
+            2,
+            "both members clamped into row 0: {ids:?}"
+        );
+        // Back to the grab point: original rows come back UN-drifted.
+        frame(&mut app, &ctx, vec![moved(grab)]);
+        let ids = clip_ids(&app);
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 3).count(),
+            1,
+            "row 3 restored: {ids:?}"
+        );
+        assert_eq!(ids.iter().filter(|(t, _, _, _)| *t == 4).count(), 1);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(grab), btn(grab, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        let mut want: Vec<(usize, usize, usize)> = ids
+            .iter()
+            .filter(|(t, _, _, _)| *t == 3 || *t == 4)
+            .map(|(t, k, c, _)| (*t, *k, *c))
+            .collect();
+        want.sort();
+        assert_eq!(app.sel_clips, want, "selection rode the clamp intact");
+    }
+
+    /// AC1 (lane case): a group sitting on ONE track's parent and child
+    /// lanes shifts as a rigid block through the flattened grid — the
+    /// top member crosses over onto the PREVIOUS track's row.
+    #[test]
+    fn v83_group_drag_intrack_lanes() {
+        let mut app = headless_app("v83lanes");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(2, 0, Clip::new(a, 0));
+        let lane = app.arr.place_auto(2, Clip::new(a, 0), app.asset_len(a));
+        assert_eq!(lane, 1, "overlap opened the child lane");
+        frame(&mut app, &ctx, vec![]);
+        let mut top2 = app.grid_anchor - app.vscroll;
+        for t in 0..2 {
+            top2 += app.track_h(t) + TRACK_SEP_HIT;
+        }
+        let lh = app.track_h(2) / 2.0;
+        let ya = top2 + lh * 0.5; // flattened row 2 (track 2, parent)
+        let yb = top2 + lh * 1.5; // flattened row 3 (track 2, child)
+        click_pt(&mut app, &ctx, egui::pos2(250.0, ya));
+        v83_ctrl_click(&mut app, &ctx, egui::pos2(250.0, yb));
+        assert_eq!(app.sel_clips.len(), 2);
+        let grab = egui::pos2(250.0, yb);
+        let drop = egui::pos2(250.0, yb - lh); // exactly one row up
+        v83_drag(&mut app, &ctx, grab, &[], drop);
+        let ids = clip_ids(&app);
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 1).count(),
+            1,
+            "top member crossed onto track 1's row: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 2).count(),
+            1,
+            "bottom member slid onto the parent lane: {ids:?}"
+        );
+        assert!(ids.iter().any(|(t, k, _, _)| *t == 2 && *k == 0));
+        let mut want: Vec<(usize, usize, usize)> = ids
+            .iter()
+            .filter(|(t, _, _, _)| *t == 1 || *t == 2)
+            .map(|(t, k, c, _)| (*t, *k, *c))
+            .collect();
+        want.sort();
+        assert_eq!(app.sel_clips, want, "selection remapped with the move");
+        // The grid is alive after the gesture: a plain click on the clip
+        // that now lives on the parent lane keeps the (remapped) group
+        // valid rather than hitting dead indices.
+        click_pt(&mut app, &ctx, egui::pos2(250.0, ya));
+        assert_eq!(
+            app.sel_clips.len(),
+            2,
+            "click lands on the remapped group: {:?}",
+            app.sel_clips
+        );
+        assert!(app.drag_clip.is_none(), "no stuck gesture");
     }
 }
