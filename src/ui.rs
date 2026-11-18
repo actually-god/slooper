@@ -7619,7 +7619,6 @@ impl App {
                 echo = format!("sampler map: added layer at {} <- \"{name}\"", note_name(48));
             }
         }
-        drop(m);
         self.push_sampler_map(t);
         self.save_config();
         self.smap_audition(t, root);
