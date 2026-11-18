@@ -33,8 +33,8 @@ root `AGENTS.md`, this is it.)
 ## Install (headless-safe summary)
 
 ```sh
-# Arch: PKGBUILD lives in the AUR package repo, NOT here:
-git clone https://aur.archlinux.org/slooper.git && (cd slooper && makepkg -si)
+# Arch: the AUR package (slooper) is PENDING PUBLICATION — do not script
+# a `yay -S` against it yet; use the source build below (see INSTALL.md).
 
 # Any distro: needs stable Rust, cargo, pkgconf, JACK headers (see INSTALL.md)
 cargo build --release && ./target/release/slooper
