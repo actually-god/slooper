@@ -145,7 +145,7 @@ fn main() {
         .iter()
         .find(|l| l.entry.kind() == VstKind::V3 && l.entry.has_editor());
     if let Some(l) = v3 {
-        match l.entry.open_vst3_editor(48_000) {
+        match l.entry.open_vst3_editor(48_000, l.entry.name()) {
             Ok(mut w) => {
                 let mut waited = Duration::ZERO;
                 while !w.painted() && waited.as_secs() < 6 {
@@ -185,7 +185,7 @@ fn main() {
                 .ok()
             })
         } else {
-            l.entry.open_vst3_editor(48_000).ok()
+            l.entry.open_vst3_editor(48_000, l.entry.name()).ok()
         };
         if let Some(w) = w {
             keep.push(w);

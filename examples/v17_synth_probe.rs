@@ -43,7 +43,7 @@ fn main() {
     let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
     eprintln!("[probe] instance #1 processed, last-block peak {peak:.4}");
     eprintln!("[probe] opening editor (shadow instance #2)");
-    let mut win = entry.open_vst3_editor(48_000).expect("open editor");
+    let mut win = entry.open_vst3_editor(48_000, entry.name()).expect("open editor");
     eprintln!("[probe] editor requested; pumping audio + editor");
     let mut painted = false;
     for i in 0..100 {

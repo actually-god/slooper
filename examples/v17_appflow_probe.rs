@@ -53,7 +53,7 @@ fn main() {
     }
     std::thread::sleep(std::time::Duration::from_millis(600));
     eprintln!("[flow] opening plugin editor");
-    let mut win = entry.open_vst3_editor(48_000).expect("open editor");
+    let mut win = entry.open_vst3_editor(48_000, entry.name()).expect("open editor");
     let mut painted = false;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -319,7 +319,14 @@ pub trait StageEntry: Send + Sync {
         None
     }
     /// VST3 shadow-instance editor; error for every other format.
-    fn open_vst3_editor(&self, _sample_rate: u32) -> Result<crate::vstedit::EditorWindow, String> {
+    /// v85: `title` is the window identity the host wants the container
+    /// to carry (plugin name + track/slot — see ui.rs
+    /// `editor_window_title`); the default impl has no window to name.
+    fn open_vst3_editor(
+        &self,
+        _sample_rate: u32,
+        _title: &str,
+    ) -> Result<crate::vstedit::EditorWindow, String> {
         Err("this plugin format hosts no editor window".into())
     }
 }
@@ -392,8 +399,12 @@ impl StageEntry for RtStageEntry {
     fn vst2_handle(&self) -> Option<Vst2Handle> {
         RtStageEntry::vst2_handle(self)
     }
-    fn open_vst3_editor(&self, sample_rate: u32) -> Result<crate::vstedit::EditorWindow, String> {
-        RtStageEntry::open_vst3_editor(self, sample_rate)
+    fn open_vst3_editor(
+        &self,
+        sample_rate: u32,
+        title: &str,
+    ) -> Result<crate::vstedit::EditorWindow, String> {
+        RtStageEntry::open_vst3_editor(self, sample_rate, title)
     }
 }
 
@@ -3779,6 +3790,7 @@ impl RtStageEntry {
     pub fn open_vst3_editor(
         &self,
         sample_rate: u32,
+        title: &str,
     ) -> Result<crate::vstedit::EditorWindow, String> {
         if !matches!(self.spec.1, VstKind::V3) {
             return Err("not a VST3 plugin".into());
@@ -3801,9 +3813,17 @@ impl RtStageEntry {
         // v20: seed the shadow with THIS instance's state chunk when it was
         // (re)opened from one, so the reopened GUI shows the live patch.
         let state = self.editor_state.lock().unwrap().clone();
+        // v85: the caller's composed identity names the container (was
+        // the bare plugin name — the same plugin on two tracks produced
+        // two identically-titled windows).
+        let title = if title.is_empty() {
+            self.name.as_str()
+        } else {
+            title
+        };
         crate::vstedit::open_vst3_editor(
             &path,
-            &self.name,
+            title,
             sample_rate,
             initial,
             state,
