@@ -1,0 +1,19 @@
+    Checking slooper v0.22.0 (/home/admin/Projects/slooper-v83)
+warning: unused variable: `c`
+    --> src/ui.rs:4802:24
+     |
+4802 |         for (i, (t, k, c, _, row0)) in d.items.iter().enumerate() {
+     |                        ^ help: if this is intentional, prefix it with an underscore: `_c`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `slooper` (lib) generated 1 warning (run `cargo fix --lib -p slooper` to apply 1 suggestion)
+warning: `slooper` (lib test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.05s
+NATIVE_RC=0
+warning: unused variable: `c`
+warning: `slooper` (lib) generated 1 warning (run `cargo fix --lib -p slooper` to apply 1 suggestion)
+warning: `slooper` (lib test) generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.82s
+GNU_RC=0
+DONE
