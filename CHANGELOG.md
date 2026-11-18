@@ -4,11 +4,11 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
-## [0.23.0] — unreleased
+## [0.23.0] — 2026-11-18
 
 The **workflow release**: every sound gets a preset shelf, hosted plugins
 expose their factory programs, the mixer grows a full-page console, the
-grid grows color — and nearly every click now answers back. 129 commits
+grid grows color — and nearly every click now answers back. 139 commits
 since 0.22.0, CI-green on Linux **and** Windows throughout.
 
 ### Presets for everything
