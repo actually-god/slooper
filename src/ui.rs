@@ -3761,7 +3761,7 @@ impl App {
         // reads). The viewport is fenced to the width available NOW and
         // a fixed height (the repo idiom, cf. the v35 panel bodies).
         let body_w = ui.available_width().max(240.0);
-        egui::ScrollArea::both()
+        egui::ScrollArea::horizontal()
             .id_salt("slooper-params-body")
             .auto_shrink([false, true])
             .max_width(body_w)
@@ -13187,9 +13187,23 @@ impl App {
                 .strong()
                 .small(),
         );
-        egui::ScrollArea::horizontal()
+        // v89 (card t_3bee89a5): BOTH axes, with SOLID bars. One lane row
+        // per mapped sample (24px, cap 64) outgrows the clipped window body
+        // vertically too — with only horizontal enabled the lower samples
+        // were unreachable (no bar, no wheel), and the unbounded inner
+        // height also pushed the bottom scroll chrome off-screen. And the
+        // egui 0.36 DEFAULT floating style (2px, dormant opacity 0 until
+        // hovered) reads as "no scrollbar" — the acceptance bar is visible
+        // chrome; chrome still appears only when the content overflows
+        // (ScrollBarVisibility::VisibleWhenNeeded, the default). Vertical
+        // scroll follows the same live-scrolled-rect rule the horizontal
+        // drags already use.
+        let old_scroll_style = ui.spacing().scroll.clone();
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| self.smap_body(ui, t));
+        ui.spacing_mut().scroll = old_scroll_style;
     }
 
     /// The key-map window's body: header (mode/add/presets) + one lane
@@ -54692,6 +54706,30 @@ mod tests {
     // scrolled viewport (assign behavior unchanged = the pre-existing
     // v51/v52/v56/v57 assign pins).
 
+    /// v89 helper: sampler window opened (v56 helper) AND forced FLOATING
+    /// at a fixed on-screen rect. Two reasons: (a) the default docked/
+    /// remembered layout hangs the map's right edge past the 1440-px test
+    /// viewport, and egui's `is_rect_visible` then culls the scrollbar
+    /// shapes entirely — the pins could not see the chrome they assert;
+    /// (b) it makes the bar-corner geometry deterministic.
+    fn v89_open_map_app(tag: &str) -> (App, egui::Context) {
+        let (mut app, ctx) = v56_open_sampler_map(tag);
+        let n = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Synth(0))
+            .expect("synth window registered")
+            + 4;
+        app.dyn_wins[n - 4].dock = [0, 1, 0]; // float
+        app.dyn_remember(
+            n,
+            egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(1150.0, 520.0)),
+        );
+        frame(&mut app, &ctx, vec![]);
+        app.smap_probe.expect("map still painted after re-place");
+        (app, ctx)
+    }
+
     /// v89 helper: force the track-0 key map to `n` synthetic slots.
     fn v89_set_slots(app: &mut App, n: usize) {
         let slots = (0..n)
@@ -54981,7 +55019,7 @@ mod tests {
         for cs in &out.shapes {
             if let egui::epaint::Shape::Rect(rs) = &cs.shape {
                 let (w, h) = (rs.rect.width(), rs.rect.height());
-                if rs.fill.alpha() == 0 || rs.rect.is_negative() {
+                if rs.fill.a() == 0 || rs.rect.is_negative() {
                     continue;
                 }
                 if (4.0..=18.0).contains(&w) && h >= 60.0 {
@@ -55001,7 +55039,11 @@ mod tests {
     /// lanes; fitting content shows no bar and the wheel does nothing.
     #[test]
     fn v89_sampler_map_overflow_wheel_and_bar_scroll() {
-        let (mut app, ctx) = v56_open_sampler_map("v89-wheel");
+        let (mut app, ctx) = v89_open_map_app("v89-wheel");
+        // Scrollbar chrome fades in via animate_bool_responsive — which
+        // FOLLOWS animation_time — so kill it up front, not just at scan
+        // frames: every frame after this paints the bar at full width.
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
         // -- FIT phase: 3 slots -> no vertical bar, wheel is inert.
         v89_set_slots(&mut app, 3);
         for _ in 0..4 {
@@ -55011,7 +55053,7 @@ mod tests {
         // lane pitch, measured on the FITTING map: the keyboard row is the
         // direct sibling of the n lane rows in smap_body's vertical layout,
         // so ky - ly0 = n * pitch exactly (reused for scrolled clicks).
-        let (kx, ky, _, _, _) = app.smap_probe.expect("map painted");
+        let (_, ky, _, _, _) = app.smap_probe.expect("map painted");
         let pitch = (ky - ly0) / 3.0;
         assert!(
             (20.0..=40.0).contains(&pitch),
@@ -55019,7 +55061,7 @@ mod tests {
         );
         let (vb, hb) = v89_scroll_chrome(&mut app, &ctx);
         let fit_vbars: Vec<egui::Rect> =
-            vb.into_iter().filter(|v| hb.iter().any(|h| (h.max.x - v.max.x).abs() < 3.0 && h.width() >= 300.0)).collect();
+            vb.into_iter().filter(|v| hb.iter().any(|h| (h.max.x - v.max.x).abs() < 16.0 && h.width() >= 300.0)).collect();
         assert!(
             fit_vbars.is_empty(),
             "fitting map must show NO vertical bar: {fit_vbars:?}"
@@ -55060,7 +55102,11 @@ mod tests {
             .expect("horizontal bar exists (roll wider than viewport)");
         let paired: Vec<egui::Rect> = vb
             .into_iter()
-            .filter(|v| (h.max.x - v.max.x).abs() < 3.0)
+            // Solid bars reserve their 6px INSIDE the offered rect, so the
+            // vertical bar can sit up to one bar-width outside the
+            // horizontal bar's x-range (6px bar + 4px inner margin); 16px pairs
+            // the corner for either allocation order.
+            .filter(|v| (h.max.x - v.max.x).abs() < 16.0)
             .collect();
         assert!(
             !paired.is_empty(),
@@ -55097,7 +55143,8 @@ mod tests {
     /// v89 pin: dragging the scrollbar thumb moves the lane stack.
     #[test]
     fn v89_sampler_map_bar_drag_scrolls() {
-        let (mut app, ctx) = v56_open_sampler_map("v89-bardrag");
+        let (mut app, ctx) = v89_open_map_app("v89-bardrag");
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
         v89_set_slots(&mut app, 30);
         for _ in 0..4 {
             frame(&mut app, &ctx, vec![]);
@@ -55111,7 +55158,7 @@ mod tests {
             .expect("horizontal bar");
         let bar = *vb
             .iter()
-            .filter(|v| (h.max.x - v.max.x).abs() < 3.0)
+            .filter(|v| (h.max.x - v.max.x).abs() < 16.0)
             .max_by_key(|v| (v.height() * 10.0) as i64)
             .expect("vertical bar present");
         // Grab near the top of the bar (thumb sits at the top at offset 0)
@@ -55152,7 +55199,8 @@ mod tests {
     /// intact through the scrolled viewport).
     #[test]
     fn v89_sampler_map_scrolled_lane_click_selects() {
-        let (mut app, ctx) = v56_open_sampler_map("v89-clicksel");
+        let (mut app, ctx) = v89_open_map_app("v89-clicksel");
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
         // Measure the pitch on a fitting 3-slot map (see pin 1).
         v89_set_slots(&mut app, 3);
         for _ in 0..4 {
@@ -55185,6 +55233,11 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
         }
         let (_, _, lx, ly_now, _) = app.smap_probe.expect("map painted");
+        assert!(
+            ly0 - ly_now >= 50.0,
+            "wheel must actually scroll the overflowed map (the click below \
+             is only meaningful THROUGH the scrolled viewport): {ly0} -> {ly_now}"
+        );
         let mut hit = None;
         for k in 0..30usize {
             let y = ly_now + (k as f32 + 0.5) * pitch;
