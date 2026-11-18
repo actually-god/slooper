@@ -68,7 +68,9 @@ console, the grid grows color — and nearly every click now answers back.
 - **Sample editor, built around the waveform**: a live waveform canvas
   with playhead and click-to-scrub, fades as draggable **curve handles
   right on the wave**, pitch/bend/stretch controls on the canvas — and
-  every edit is **audible immediately** while you drag.
+  every edit is **audible immediately** while you drag. Any audio clip
+  on the grid opens it from its right-click menu; edits are per-clip
+  and never touch the source file.
 - The bundled **TR-808 pack grew to 24 one-shots**, and a ready-made
   **808-Kit** drum preset boots on first run — one click loads 16 pads.
   Any drum pad can also import its own `.wav`.
