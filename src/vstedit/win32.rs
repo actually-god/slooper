@@ -66,7 +66,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetParent, SetWindowLongW, SetWindowPos, SetWindowTextW, ShowWindow,
     TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_EXSTYLE,
     GWL_STYLE, GW_OWNER, HTCAPTION, IDC_ARROW, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, PM_REMOVE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, TPM_RETURNCMD,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_GETMINMAXINFO, WM_NCRBUTTONUP, WM_PAINT, WM_SIZE, WNDCLASSEXW, WNDCLASS_STYLES, WS_CHILD,
     WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -1056,6 +1057,10 @@ impl Shared {
 /// `vsthost::open`) — the same thread that instantiated the plugin.
 pub struct EditorWindow {
     path: String,
+    /// v85: the identity string the window was opened with
+    /// (`{plugin} — track N [fx M]`) — every status echo about THIS
+    /// window (open, refused-to-draw, close) must name it.
+    identity: String,
     stop: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     open_failed: Arc<AtomicBool>,
@@ -1104,6 +1109,12 @@ impl EditorWindow {
     /// Plugin path this editor was opened for (stale-editor detection).
     pub fn path(&self) -> &str {
         &self.path
+    }
+    /// v85: identity the window carries (plugin name + track/slot) — the
+    /// honest subject for status echoes; empty only for handles created
+    /// before this field existed (there are none).
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
     /// True once the editor has retired.
     pub fn is_closed(&self) -> bool {
@@ -1177,6 +1188,9 @@ pub fn open_editor(
     let shared = Shared::new();
     let ae = *handle;
     let title = title.to_string();
+    // v85: the handle keeps its own copy — the GUI thread closure moves
+    // `title`, and status echoes need the identity after the open returns.
+    let identity = title.clone();
     let s2 = shared.clone();
     // Creation (container window + effEditOpen) happens ON the GUI
     // thread; blocking here means the returned handle already has an HWND
@@ -1192,6 +1206,7 @@ pub fn open_editor(
     })?;
     Ok(EditorWindow {
         path: path.to_string(),
+        identity,
         stop: shared.stop.clone(),
         closed: shared.closed.clone(),
         open_failed: shared.open_failed.clone(),
@@ -1490,6 +1505,18 @@ impl Editor {
     unsafe fn decorate(&mut self) {
         let t = utf16(&format!("slooper \u{2014} {}", self.title));
         let _ = SetWindowTextW(self.win, PCWSTR(t.as_ptr()));
+        // v85: front-on-open parity with the X twin's XRaiseWindow (see
+        // its decorate note). HWND(0) insert-after = HWND_TOP; NOMOVE +
+        // NOSIZE keep the plugin's own rect exactly.
+        let _ = SetWindowPos(
+            self.win,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
     }
 
     /// `effEditClose`, destroy the container, mark retired. `refused`
@@ -1597,6 +1624,7 @@ pub fn open_vst3_editor(
     }
     let shared = Shared::new();
     let title = title.to_string();
+    let identity = title.clone(); // v85: same reason as open_editor
     let path_h = path.to_string();
     let path_j = path.to_string();
     let s2 = shared.clone();
@@ -1623,6 +1651,7 @@ pub fn open_vst3_editor(
     })?;
     Ok(EditorWindow {
         path: path_h,
+        identity,
         stop: shared.stop.clone(),
         closed: shared.closed.clone(),
         open_failed: shared.open_failed.clone(),
@@ -2028,6 +2057,8 @@ impl Editor3 {
     unsafe fn decorate(&mut self) {
         let t = utf16(&format!("slooper \u{2014} {}", self.title));
         let _ = SetWindowTextW(self.win, PCWSTR(t.as_ptr()));
+        // v85: front-on-open parity (see the VST2 `decorate` note).
+        let _ = SetWindowPos(self.win, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 
     /// v20/v22: serialize a shadow's component state into `shared.state`
@@ -2249,7 +2280,7 @@ pub fn probe_child(spec: &str) -> i32 {
             Err(_) => probe_exit(0), // honest refusal: the app path reports it
         }
     } else {
-        match entry.open_vst3_editor(48_000) {
+        match entry.open_vst3_editor(48_000, entry.name()) {
             Ok(w) => w,
             Err(_) => probe_exit(0),
         }

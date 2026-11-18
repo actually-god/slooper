@@ -612,4 +612,68 @@ mod seam_tests {
             }
         }
     }
+
+    /// v85 (TS-007): the decorate beat raises the proven editor to the
+    /// front (floating-window parity: kwin's focus-steal prevention can
+    /// otherwise map the container behind the main window) — exactly once
+    /// per decorate, per twin — and NONE of the decorate work may leak
+    /// into the pre-effEditOpen creation path (the bare-container rule:
+    /// any window property before effEditOpen breaks plugin mapping).
+    #[test]
+    fn v85_decorate_raises_front_after_proof() {
+        let x = code_lines(&twin_path("x11"));
+        assert_eq!(
+            x.matches("XRaiseWindow(self.d, self.win)").count(),
+            2,
+            "both decorate fns (VST2 + VST3) must raise the front"
+        );
+        assert_eq!(
+            x.matches("XChangeProperty").count(),
+            3,
+            "1 FFI declaration + 2 decorate sites publish _NET_WM_NAME"
+        );
+        assert_eq!(
+            x.matches("c\"_NET_WM_NAME\"").count(),
+            2,
+            "both decorates carry the UTF-8 identity title"
+        );
+        let w = code_lines(&twin_path("win32"));
+        assert_eq!(
+            w.matches("SWP_NOMOVE | SWP_NOSIZE").count(),
+            2,
+            "both Win32 decorate fns raise (front-on-open twin parity)"
+        );
+        assert!(
+            w.contains("SetWindowPos"),
+            "win32 raise must ride the existing SetWindowPos seam"
+        );
+        // The creation path stays BARE: make_editor/make_editor3 may not
+        // raise, title, or touch properties before effEditOpen proves.
+        for twin in ["x11", "win32"] {
+            let c = code_lines(&twin_path(twin));
+            for maker in ["unsafe fn make_editor(", "unsafe fn make_editor3("] {
+                let start = c.find(maker).unwrap_or_else(|| panic!("{twin}: {maker} gone"));
+                let body = &c[start..start + c[start..].find("\n}\n").unwrap()];
+                for forbidden in ["XRaiseWindow", "XChangeProperty", "XStoreName"] {
+                    assert!(
+                        !body.contains(forbidden),
+                        "{twin} {maker} grew a pre-effEditOpen window property: {forbidden}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// v85 (TS-007): both twins' EditorWindow carries the identity the
+    /// window was opened with, at BOTH open paths (VST2 + VST3), with the
+    /// accessor that ui.rs echoes use as their subject.
+    #[test]
+    fn v85_identity_field_is_carried_by_both_twins() {
+        for os in ["x11", "win32"] {
+            let c = code_lines(&twin_path(os));
+            assert_eq!(c.matches("pub fn identity(&self) -> &str").count(), 1, "{os}: identity accessor");
+            assert_eq!(c.matches("\n        identity,").count(), 2, "{os}: both constructors set it");
+            assert!(c.contains("let identity = title.clone();"), "{os}: handle must keep its own copy (title moves into the GUI-thread closure)");
+        }
+    }
 }
