@@ -27545,7 +27545,12 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                         app.add_fx_script(loop_i, s);
                     }
                 }
-            });
+            })
+            // v86 (TS-008): the CLOSED combo explains itself too — the
+            // popup items carrying hovers is not enough (the line scans
+            // joined their hovers onto the combo statement: false green).
+            .response
+            .on_hover_text("pick an effect script to append to this track's chain");
         egui::ComboBox::from_id_salt(("addvst", loop_i))
             .selected_text("+ VST plugin")
             .width(320.0)
@@ -27604,7 +27609,13 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                             }
                         }
                     });
-            });
+            })
+            // v86 (TS-008): closed-combo hover — see the addfx combo note.
+            .response
+            .on_hover_text(
+                "plugins found in your plugin folders \u{b7} picking one appends it to \
+                 this track's chain and starts loading it",
+            );
     });
     ui.separator();
 
