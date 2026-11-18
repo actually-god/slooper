@@ -219,7 +219,7 @@ fn chunk_roundtrip_v3(path: &Path) {
 fn editor_lifecycle(entry: &slooper::vsthost::RtStageEntry) {
     let opened = std::time::Instant::now();
     let win = if entry.kind() == VstKind::V3 {
-        match entry.open_vst3_editor(48_000) {
+        match entry.open_vst3_editor(48_000, entry.name()) {
             Ok(w) => w,
             Err(e) => {
                 println!("EDITOR openfail {e}");
