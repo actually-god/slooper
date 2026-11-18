@@ -53081,7 +53081,7 @@ mod tests {
         );
         // Close happened IN PLACE (the reaper harvests the dying window).
         assert!(
-            app.fx_vst_editors.get(&(0, 0)).is_some(),
+            app.fx_vst_editors.contains_key(&(0, 0)),
             "toggle-close keeps the handle for harvest"
         );
         std::mem::forget(entry);
