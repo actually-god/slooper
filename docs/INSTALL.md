@@ -12,24 +12,22 @@ notes see [AGENT-GUIDE.md](AGENT-GUIDE.md).
 
 ## Arch Linux (and Arch derivatives, e.g. CachyOS/Manjaro)
 
-Once published, slooper installs from the **AUR** like any other package:
+**AUR package: pending publication.** Once it is live, slooper installs
+from the **AUR** like any other package:
 
 ```sh
 yay -S slooper        # or: paru -S slooper
 ```
 
-To build the package yourself (or before the AUR package exists), the
-`PKGBUILD` lives in the AUR package repository
-(`https://aur.archlinux.org/slooper.git`) — **not** in this source repo:
+Until then, Arch users install the prebuilt tarball from
+[the GitHub Releases page](https://github.com/actually-god/slooper/releases)
+(next section) — it lands the same binary, desktop entry and icon, and
+its only runtime need (`libjack.so`, via `pipewire-jack`) is in the
+official repos.
 
-```sh
-git clone https://aur.archlinux.org/slooper.git
-cd slooper
-makepkg -si              # fetches the tagged source tarball from GitHub,
-                         # builds with cargo, installs binary + desktop entry + icon
-```
-
-Notes about that PKGBUILD:
+When published, the package will live at
+`https://aur.archlinux.org/slooper.git` — it is **not** kept in this
+source repo. Notes about the PKGBUILD:
 
 - It builds from the GitHub **tag tarball** `v<version>`, so the package always
   matches a released version (this is not a `-git` package).
@@ -53,8 +51,8 @@ sudo rm /usr/bin/slooper /usr/share/applications/slooper.desktop \
         /usr/share/pixmaps/slooper.png
 ```
 
-Per-distro runtime packages (see the contract below; Arch users should
-just use the AUR package above, which pulls everything):
+Per-distro runtime packages (see the contract below; Arch users: the
+tarball above is the install path until the AUR package lands):
 
 ```sh
 # Debian 12 / Ubuntu 22.04+:

@@ -4,12 +4,12 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
-## [0.23.0] — 2026-11-18
+## [0.23.0] — unreleased
 
-The **workflow release**: every sound gets a preset shelf, hosted plugins
-expose their factory programs, the mixer grows a full-page console, the
-grid grows color — and nearly every click now answers back. 139 commits
-since 0.22.0, CI-green on Linux **and** Windows throughout.
+The **workflow release**: every sound gets a preset shelf, hosted
+plugins expose their factory programs, the mixer grows a full-page
+console, the grid grows color — and nearly every click now answers back.
+146 commits since 0.22.0, CI-green on Linux **and** Windows throughout.
 
 ### Presets for everything
 
@@ -20,11 +20,11 @@ since 0.22.0, CI-green on Linux **and** Windows throughout.
   key-map presets**, and **track templates** — a track's instrument +
   FX chain + mixer levels + color, saved once and applied to any track
   from the mixer strip's right-click menu.
-- **VST2 / VST3 factory programs**: the plugin's PARAMETERS window grew
-  a **program** picker for the plugin's own presets. Your pick saves
-  with the project, is re-applied on load, and stays in sync both ways
-  (pick it in the plugin's own editor → the picker follows). Multi-part
-  VST3 instruments included.
+- **VST2 / VST3 factory programs**: the PARAMETERS window grew a
+  **program** picker for the plugin's own presets. Your pick saves
+  with the project, is re-applied on load, and stays in sync both
+  ways (pick it in the plugin's own editor → the picker follows).
+  Multi-part VST3 instruments included.
 - **CLAP presets**: a plugin loading a preset on its own is now echoed
   to the status line and persisted with the project, and the PARAMETERS
   window gained a **load preset…** file picker.
@@ -82,6 +82,14 @@ since 0.22.0, CI-green on Linux **and** Windows throughout.
 - **Hosted plugins get the same treatment**: the host reads VST3/CLAP
   parameter metadata, so their sliders show true units and enum
   pickers.
+- **The PARAMETERS window handles param-dense plugins**: the whole body
+  scrolls, so deep rows can never hide off-screen; a filter box
+  narrows the list with a live match count; and the list is honest
+  about what it shows — "showing the first 400 of N" on huge plugins,
+  an in-window "no parameters" on empty ones.
+- **Right-click a hosted parameter** for its automation menu — bind it
+  to an automation lane exactly like a stock effect parameter — and
+  **double-click** any value to type it in.
 - Plugin editors show **live value readouts** on knobs and follow the
   app theme (including the light theme).
 
@@ -95,6 +103,9 @@ since 0.22.0, CI-green on Linux **and** Windows throughout.
 - The asset rack got honest: scan progress shows inside the browsers,
   plugins that failed to load are listed with the reason, and
   truncated names carry full-path tooltips.
+- Truncation is honest **everywhere**, not just in the rack: shortened
+  names in the chain window, the +effect / +VST browsers, the synth
+  picker and the preset dropdowns reveal the full name on hover.
 - Plugin editor windows are **titled** (`Name — track N`), raise
   themselves when opened, and report failures with the plugin and slot
   named.
@@ -107,8 +118,10 @@ since 0.22.0, CI-green on Linux **and** Windows throughout.
 - Plugins whose GUI library tears down the probe child at exit (sfizz
   is the known case) are **no longer falsely banned** from opening
   editors, and the app no longer aborts at quit because of them.
-- **Time-stretch fixes**: short one-shots no longer stall or stretch
-  the wrong way, and periodic signals stop creeping backwards.
+- Upgrades finish the effect re-brand: our old-named stock copies
+  (echo3 / panmatic / goodizer) are purged from your effects folder
+  instead of cluttering the **+Effect** menu as duplicates — any file
+  of yours wearing those names is kept.
 - Drum-machine commits outline exactly the clips they stamped and
   explain empty/silent attempts in a dialog instead of one quiet
   status line.
