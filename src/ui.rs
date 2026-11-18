@@ -13198,7 +13198,7 @@ impl App {
         // (ScrollBarVisibility::VisibleWhenNeeded, the default). Vertical
         // scroll follows the same live-scrolled-rect rule the horizontal
         // drags already use.
-        let old_scroll_style = ui.spacing().scroll.clone();
+        let old_scroll_style = ui.spacing().scroll;
         ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::both()
             .auto_shrink([false, false])
