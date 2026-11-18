@@ -226,8 +226,53 @@ mod seam_tests {
         // Handle-shape pins on the null HWND: honest refusals, no panics.
         assert_eq!(crate::vstedit::container_is_viewable(0), None);
         assert!(!crate::vstedit::request_wm_delete(0));
-        // probe_child with no path env is the "nothing to test" verdict.
-        assert_eq!(crate::vstedit::probe_child("V2"), 0);
+        // v84 (t_dc8d6666): the "no path env = nothing-to-test verdict"
+        // assertion used to call probe_child IN-PROCESS. That was legal
+        // pre-v73 (plain `return 0`), but v73's d4b836c made every probe
+        // verdict announce itself by IMMEDIATE process death (probe_exit
+        // -> TerminateProcess(0) on the Win32 twin) — so since Nov 16 the
+        // call here KILLED THE HARNESS mid-suite with exit code 0 on
+        // every windows-native run, and the whole suite tail (vstedit's
+        // rest, all of vsthost) silently never ran while the step stayed
+        // green. Found because the v84 CI log-guard reddened the missing
+        // `test result:` line. probe_child's contract lives in a CHILD
+        // now — the only sanctioned host (W12e rule: CI-staged
+        // SLOOPER_PROBE_EXE, never the harness), bounded wait so a guard
+        // that never fires FAILS instead of hanging.
+        let exe = std::env::var_os("SLOOPER_PROBE_EXE").filter(|p| !p.is_empty());
+        let Some(exe) = exe else {
+            eprintln!(
+                "SKIP: SLOOPER_PROBE_EXE unset (CI sets it) — gate/shape \
+                 asserts above still ran; the probe verdict needs the child"
+            );
+            return;
+        };
+        let mut child = std::process::Command::new(&exe)
+            .env("SLOOPER_EDITOR_PROBE", "V2")
+            .env_remove("SLOOPER_EDITOR_PROBE_PATH")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn vstedit probe child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let st = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(st) => break st,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("probe child exceeded 60 s (a guard that never fires must FAIL)");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        };
+        assert_eq!(
+            st.code(),
+            Some(0),
+            "no-path editor-probe verdict must be exit 0 (TerminateProcess(0) \
+             per the v73 milestone-exit contract); status = {st:?}"
+        );
     }
 
     // ------------------------------------------------------------ W8b embed
