@@ -31009,11 +31009,87 @@ pub(crate) mod tests {
         app.poll_vst_opens();
     }
 
-    /// v94: the MCP half of `App::logic` for headless pins — the drain
-    /// runs the REAL `App::mcp_frame` (one code path with production,
-    /// doctrine v59), so pins execute tools exactly like the frame loop.
-    fn logic_tick_mcp(app: &mut App, ctx: &egui::Context) {
-        app.mcp_frame(ctx);
+    /// v94: the MCP half of `App::logic` for headless pins is
+    /// `App::mcp_frame` itself (pub(crate), one code path with production,
+    /// doctrine v59) — pins call it directly; the drain executes tools
+    /// exactly like the frame loop.
+
+    /// v94/MCP-01 AC (in-app visibility): Settings carries an AUTOMATION
+    /// section with the enable switch, the read-only latch, a live status
+    /// line, the endpoint-file path and the stdio-bridge hint — all found
+    /// by the section filter (user standing order: the user always sees
+    /// what the MCP surface is doing).
+    #[test]
+    fn v94_mcp_settings_automation_section_paints() {
+        let mut app = headless_app("v94setpaint");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.sett_filter = "automation".into();
+        frame(&mut app, &ctx, vec![]);
+        let sec = galley_at(&mut app, &ctx, "AUTOMATION (MCP)");
+        let boxx = galley_at(&mut app, &ctx, "MCP server (control this instance)");
+        let latch = galley_at(&mut app, &ctx, "read-only (the agent may not write)");
+        let status = galley_at(&mut app, &ctx, "status: off — no sockets are open");
+        let endpoint =
+            galley_at(&mut app, &ctx, &format!("endpoint: {}", crate::mcp::bridge::endpoint_path().display()));
+        let bridge_hint = galley_at(&mut app, &ctx, "slooper --mcp-bridge");
+        assert!(sec.is_some(), "AUTOMATION (MCP) section paints under the filter");
+        assert!(boxx.is_some(), "enable checkbox paints");
+        assert!(latch.is_some(), "read-only latch checkbox paints");
+        assert!(status.is_some(), "status line shows the OFF default (zero sockets)");
+        assert!(endpoint.is_some(), "endpoint-file path is shown");
+        assert!(bridge_hint.is_some(), "the stdio bridge usage line is shown");
+    }
+
+    /// v94/MCP-01 AC (hot toggle + persistence + echo): clicking the real
+    /// Settings checkbox starts the listener with NO restart, echoes the
+    /// status, persists the config, and clicking it off hot-stops the
+    /// server and deletes the endpoint file. Port 0 = ephemeral (D6).
+    #[test]
+    fn v94_mcp_settings_toggle_persists() {
+        let mut app = headless_app("v94tog");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.sett_filter = "automation".into();
+        app.mcp_port = 0; // pins never fight over fixed ports
+        frame(&mut app, &ctx, vec![]);
+        // Enable through the real checkbox (label_center = the widget).
+        let p = label_center(&mut app, &ctx, "MCP server (control this instance)")
+            .expect("enable checkbox paints");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.mcp_enabled, "checkbox flips the flag");
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"mcp_enabled\": true"), "enable persists: {cfg_txt}");
+        // The frame loop hot-starts it (mcp_frame is the real logic() path).
+        app.mcp_frame(&ctx);
+        let running = app.mcp.as_ref().unwrap().is_running();
+        assert!(running, "enable starts the listener with no restart");
+        let port = app.mcp.as_ref().unwrap().port().unwrap();
+        assert!(port > 0, "port 0 resolved to an ephemeral port");
+        assert!(app.status.contains("MCP server on"), "start echoes: {}", app.status);
+        frame(&mut app, &ctx, vec![]);
+        let shown = galley_at(&mut app, &ctx, &format!("status: listening on 127.0.0.1:{port}"));
+        assert!(shown.is_some(), "status line paints the live port");
+        // The read-only latch: click persists + echoes.
+        let p = label_center(&mut app, &ctx, "read-only (the agent may not write)")
+            .expect("latch checkbox paints");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.mcp_read_only, "latch flips");
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"mcp_read_only\": true"), "latch persists: {cfg_txt}");
+        // Disable: hot stop, endpoint file gone, config false.
+        let p = label_center(&mut app, &ctx, "MCP server (control this instance)")
+            .expect("enable checkbox again");
+        click_pt(&mut app, &ctx, p);
+        app.mcp_frame(&ctx);
+        let stopped = !app.mcp.as_ref().unwrap().is_running();
+        assert!(stopped, "disable hot-stops the listener");
+        assert!(!crate::mcp::bridge::endpoint_path().exists(), "stop removes the endpoint file");
+        assert!(app.status.contains("stopped"), "stop echoes: {}", app.status);
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"mcp_enabled\": false"), "disable persists");
     }
 
     /// The regression test for "Ctrl+C copies, Ctrl+V pastes nothing":
