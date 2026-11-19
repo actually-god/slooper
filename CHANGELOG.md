@@ -40,6 +40,19 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   gaps keep working as before), files save and reload with their curves
   intact, and every bend-less pattern and old project loads byte-
   identical. The in-roll curve editor for it shipped directly above.
+- **slooper can be driven over MCP (optional, off by default).** A new
+  Settings ▸ AUTOMATION (MCP) section hosts a built-in MCP server: when
+  enabled, an MCP client (Claude Desktop, coding agents) can connect to
+  THIS running instance and list/call tools that drive it live. It
+  binds 127.0.0.1 only; access needs the auto-generated token written
+  to `mcp-endpoint.json` in the data folder; a read-only latch refuses
+  every writing tool the moment you tick it; every enable/port/latch
+  change applies live — no restart — and echoes into the status line.
+  Stdio-only clients use `slooper --mcp-bridge`, which discovers port
+  and token from that same file, so no secret ever lands in a client
+  config. This is the first installment: the protocol core and a demo
+  echo tool are live; settings, window, mixer and plugin control tools
+  follow in later updates.
 
 ### Fixed
 
