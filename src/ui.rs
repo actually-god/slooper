@@ -56878,31 +56878,34 @@ mod tests {
     /// out-of-table entries are dropped; empty means default piano.
     #[test]
     fn v96_preview_set_mapping() {
-        let mut cfg = Config::default();
-        cfg.preview_track = Some(3);
+        let scalar = Config { preview_track: Some(3), ..Config::default() };
         assert_eq!(
-            preview_set_from_cfg(&cfg),
+            preview_set_from_cfg(&scalar),
             vec![3],
             "an OLD config with a scalar preview_track loads as a one-element set"
         );
-        cfg.preview_tracks = vec![1, 0, 1];
+        let both = Config {
+            preview_tracks: vec![1, 0, 1],
+            preview_track: Some(3),
+            ..Config::default()
+        };
         assert_eq!(
-            preview_set_from_cfg(&cfg),
+            preview_set_from_cfg(&both),
             vec![0, 1],
             "the set wins over the legacy scalar; sorted & deduped"
         );
-        cfg.preview_track = None;
-        cfg.preview_tracks = vec![7, 1];
-        assert_eq!(preview_set_from_cfg(&cfg), vec![1, 7]);
-        cfg.preview_tracks = vec![0, 9999];
+        let unsorted = Config { preview_tracks: vec![7, 1], ..Config::default() };
+        assert_eq!(preview_set_from_cfg(&unsorted), vec![1, 7]);
+        let stale = Config { preview_tracks: vec![0, 9999], ..Config::default() };
         assert_eq!(
-            preview_set_from_cfg(&cfg),
+            preview_set_from_cfg(&stale),
             vec![0],
             "out-of-table entries are dropped"
         );
-        cfg.preview_tracks.clear();
-        cfg.preview_track = None;
-        assert!(preview_set_from_cfg(&cfg).is_empty(), "empty = default piano");
+        assert!(
+            preview_set_from_cfg(&Config::default()).is_empty(),
+            "empty = default piano"
+        );
     }
 
     /// A1b + A2: a REAL multi-selection (Ctrl-click header, the v94 seam)
