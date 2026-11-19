@@ -7845,6 +7845,88 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         v48_tap(&o, 500, 1.0 - 0.9 * sc);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// v97 (sc-4): the receive-level table is unity everywhere on a fresh
+    /// engine — an untouched project sums its sends exactly like pre-v97.
+    #[test]
+    fn v97_engine_sc_recv_defaults_and_clamp() {
+        let e = Engine::new();
+        assert_eq!(e.sc_recv_gain(1, 0), 1.0, "unity default = pre-v97 sum");
+        assert_eq!(e.sc_recv_gain(7, 7), 1.0, "every slot exists");
+        e.set_sc_recv_gain(1, 0, 0.5);
+        assert!((e.sc_recv_gain(1, 0) - 0.5).abs() < 1e-6);
+        assert_eq!(e.sc_recv_gain(0, 1), 1.0, "the reverse pair is independent");
+        assert_eq!(e.sc_recv_gain(1, 2), 1.0, "neighbours untouched");
+        e.set_sc_recv_gain(3, 4, -2.0);
+        assert_eq!(e.sc_recv_gain(3, 4), 0.0, "negative clamps to silence");
+    }
+
+    /// v97 rig: TWO senders into target 1 (A = 0.25 DC on track 0, B = 0.5
+    /// DC on track 2), click 1.0 on the target at sample 500.
+    fn v97_sc_rig2(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
+        let (reg, dir) = v48_reg(tag, "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src_a: Arc<[f32]> = Arc::from(vec![0.25f32; 1500]);
+        let src_b: Arc<[f32]> = Arc::from(vec![0.5f32; 1500]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0)); // sender A
+        arr.insert(1, 0, Clip::new(1, 500)); // target: click at 500
+        arr.insert(2, 0, Clip::new(2, 0)); // sender B
+        e.set_project(Arc::new(vec![src_a, v48_click(1000), src_b]), Arc::new(arr), 1500);
+        let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+        let desc = reg.desc("v48sc").unwrap().clone();
+        e.set_track_fx(
+            1,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+        e.set_sc_send(1, (1 << 0) | (1 << 2));
+        (e, dir)
+    }
+
+    /// v97 (sc-4): per-(target, source) receive levels in the export mirror
+    /// — same mask, different pair levels, different ducks. Senders are
+    /// MUTED so their AUDIO cannot bias the tap (v95: mute keeps the key),
+    /// making out[500] a pure readout of the summed, levelled key:
+    ///   out[500] = 1 x (1 - 0.9 x sc),  sc = 0.25 x gA + 0.5 x gB.
+    #[test]
+    fn v97_sc_export_recv_gain_scales_pair() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (e, dir) = v97_sc_rig2("v97pair");
+        e.set_track_on(0, false);
+        e.set_track_on(2, false);
+        // A full, B silent: sc = 0.25 — exactly the v95 single-send duck.
+        e.set_sc_recv_gain(1, 0, 1.0);
+        e.set_sc_recv_gain(1, 2, 0.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.25);
+        // Swap the pair levels: now B (twice the material) drives the key.
+        e.set_sc_recv_gain(1, 0, 0.0);
+        e.set_sc_recv_gain(1, 2, 1.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.5);
+        // Half A + half B: linear blend of the two contributions.
+        e.set_sc_recv_gain(1, 0, 0.5);
+        e.set_sc_recv_gain(1, 2, 0.5);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * (0.125 + 0.25));
+        // Both zero: routed but silent key — the click rides unducked.
+        e.set_sc_recv_gain(1, 0, 0.0);
+        e.set_sc_recv_gain(1, 2, 0.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0);
+        // Unity again (the DEFAULT — deleting the pair state must restore
+        // the pre-v97 blend of 0.25 + 0.5).
+        e.set_sc_recv_gain(1, 0, 1.0);
+        e.set_sc_recv_gain(1, 2, 1.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.75);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// WINDOWS-PORT W4 contract pins: the RT core (`Proc::process_block`) must

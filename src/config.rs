@@ -1121,6 +1121,34 @@ mod tests {
         }
     }
 
+    /// v97 (sc-4): the sparse sidechain-receive table must be additive —
+    /// old files (missing key) load with NO entries (every route unity),
+    /// and non-unity pairs round-trip exactly.
+    #[test]
+    fn v97_config_sc_recv_gain_old_files_unity_roundtrip() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            old.sc_recv_gain.is_empty(),
+            "old files load with no route entries — unity everywhere"
+        );
+        let mut c = Config::default();
+        c.sc_recv_gain = vec![
+            ScRecvGain {
+                t: 1,
+                s: 0,
+                gain: 0.5,
+            },
+            ScRecvGain {
+                t: 3,
+                s: 2,
+                gain: 1.75,
+            },
+        ];
+        let j = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "round-trip exact");
+    }
+
     #[test]
     fn w8b_win_editor_embed_defaults_off_and_parses() {
         // W8b p2-a: the embed switch must be additive-safe for every
