@@ -55798,19 +55798,19 @@ mod tests {
             app.synth_registry.desc("sampler").is_some(),
             "sampler script synth compiled"
         );
-        if app.track_synth_inst.get(0).and_then(|o| o.as_ref()).is_none() {
+        if app.track_synth_inst.first().and_then(|o| o.as_ref()).is_none() {
             app.set_track_synth_stem(0, "sampler");
         }
         for _ in 0..1200 {
             frame(app, ctx, vec![]);
             logic_tick(app);
-            if app.track_synth_inst.get(0).and_then(|o| o.as_ref()).is_some() {
+            if app.track_synth_inst.first().and_then(|o| o.as_ref()).is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(
-            app.track_synth_inst.get(0).and_then(|o| o.as_ref()).is_some(),
+            app.track_synth_inst.first().and_then(|o| o.as_ref()).is_some(),
             "sampler bound on track 0"
         );
     }
