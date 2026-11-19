@@ -5102,3 +5102,193 @@ fn e2e_v95_sc_sender_gain_zero_kills_key() {
         "sender gain→0 must sink the key below threshold: open {open}, after {restored}"
     );
 }
+
+// ---- v97 (sc-4): per-receive sidechain send levels ---------------------
+// The "Sidechain in" sliders scale ONE route's tap into the target's summed
+// key. These pins reuse the v32/v95 rig (110 Hz key hard LEFT, target tone
+// hard RIGHT probed on the right bus — the probe hears ONLY the duck).
+
+/// v97: the receive level of a routed source scales ITS contribution:
+/// 0 un-keys, 1.0 restores, 0.5 shallows the duck, 2.0 deepens it.
+/// (Sabotage: drop the `* e_gain[k]` factor in the RT tap and the first
+/// assert goes red; freeze it at 1.0 and the 0.5/2.0 asserts go red.)
+#[test]
+fn e2e_v97_sc_send_gain_scales_duck() {
+    let _g = e2e_lock();
+    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v97scgain") else {
+        return;
+    };
+    let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(&ring, &widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    let measure = |ms: u64| -> f32 {
+        std::thread::sleep(Duration::from_millis(400));
+        rms(ms)
+    };
+    // Half level: a quarter of the key power left on the compressor's
+    // detector (ratio 4) means a clearly shallower duck.
+    b.engine.set_sc_recv_gain(1, 0, 0.5);
+    let half = measure(200);
+    assert!(
+        half > open * 0.7,
+        "half send level must raise the floor toward the open tone: open {open}, half {half}"
+    );
+    // Zero: the route is armed but silent — the tone rides unducked.
+    b.engine.set_sc_recv_gain(1, 0, 0.0);
+    let off = measure(200);
+    assert!(
+        off > open * 0.9,
+        "receive gain 0 must un-duck the target: open {open}, off {off}"
+    );
+    // Full: back under the table default's duck.
+    b.engine.set_sc_recv_gain(1, 0, 1.0);
+    let full = measure(200);
+    assert!(
+        full < open * 0.7,
+        "unity must restore the v95 duck: open {open}, full {full}"
+    );
+    // Boost: twice the key drives more gain reduction still.
+    b.engine.set_sc_recv_gain(1, 0, 2.0);
+    let boost = measure(200);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        boost < full * 0.9,
+        "2x send level must deepen the duck: full {full}, boost {boost}"
+    );
+}
+
+/// v97 setup: TWO hard-panned-left keys (110 Hz @ 0.3 = the strong key;
+/// 220 Hz @ 0.08 = the weak one) both routed into the tone track (hard
+/// right, stock sidechain_comp) — a 100/50 vs 50/100 send mix swaps the
+/// summed key and must move the audible duck.
+fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return None; // no audio server: skip
+    };
+    let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    let vals = [-30.0f32, 4.0, 2.0, 100.0, 6.0, 1.0];
+    let desc = reg
+        .desc("sidechain_comp")
+        .expect("stock sidechain_comp present")
+        .clone();
+    let inst = reg
+        .create_instance("sidechain_comp", sr as f64, &vals)
+        .expect("sidechain_comp compiles and instantiates");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 2)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+    let n = 24_000usize;
+    let sine = |freq: f32, amp: f32| -> Arc<[f32]> {
+        Arc::from(
+            (0..n)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr as f32).sin())
+                .collect::<Vec<f32>>(),
+        )
+    };
+    let tone: Arc<[f32]> = Arc::from(vec![0.02f32; n]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0)); // strong key 110 Hz on track 0
+    arr.insert(1, 0, Clip::new(3, 0)); // tone on track 1 (the target)
+    arr.insert(2, 0, Clip::new(1, 0)); // weak key 220 Hz on track 2
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![sine(110.0, 0.3), sine(220.0, 0.08), tone.clone(), tone]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.0); // strong key hard left
+    b.engine.set_loop_pan(2, 0.0); // weak key hard left
+    b.engine.set_loop_pan(1, 1.0); // tone hard right
+    b.cmd(Cmd::SetTrackEffects {
+        i: 1,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    Some((b, ring, widx, sr, active))
+}
+
+/// v97: two routed sources mixed 50/100 vs 100/50 (unequal keys!) differ
+/// measurably on the target's bus — the per-receive levels really mix into
+/// the summed key, per pair, not as a global post-fader multiplier.
+#[test]
+fn e2e_v97_sc_two_source_mix_swaps_duck() {
+    let _g = e2e_lock();
+    let Some((b, ring, widx, sr, _scope)) = v97_sc_setup2("v97scmix") else {
+        return;
+    };
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(&ring, &widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring, &widx, 480)
+                .map(|m| m > 0.005)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "target tone audible on the probe bus",
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    let open = rms(200);
+    assert!(open > 0.005, "tone must ride the probe bus (got {open})");
+    // Both sends armed; strong key at half, weak key full.
+    b.engine.set_sc_recv_gain(1, 0, 0.5);
+    b.engine.set_sc_recv_gain(1, 2, 1.0);
+    b.engine.set_sc_send(1, (1 << 0) | (1 << 2));
+    std::thread::sleep(Duration::from_millis(400));
+    let weak_lead = rms(200);
+    // Swap the pair levels: now the strong key dominates the row.
+    b.engine.set_sc_recv_gain(1, 0, 1.0);
+    b.engine.set_sc_recv_gain(1, 2, 0.5);
+    std::thread::sleep(Duration::from_millis(400));
+    let strong_lead = rms(200);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        strong_lead < open * 0.7 && weak_lead < open * 0.9,
+        "both mixes must duck the tone: open {open}, weak {weak_lead}, strong {strong_lead}"
+    );
+    assert!(
+        weak_lead > strong_lead * 1.15,
+        "the same mask at swapped send levels must sound different: weak {weak_lead} vs strong {strong_lead}"
+    );
+}

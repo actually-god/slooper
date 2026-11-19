@@ -56812,8 +56812,76 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v95\""),
-            "INTERNAL_VERSION must be bumped to v95"
+            librs.contains("INTERNAL_VERSION: &str = \"v97\""),
+            "INTERNAL_VERSION must be bumped to v97"
+        );
+    }
+
+    /// v97 (sc-4): a routed "Sidechain in" chip carries a per-send RECEIVE
+    /// slider; dragging it moves the App mirror, the engine atomic and the
+    /// status echo — for THAT pair only (R1/R2/R3).
+    #[test]
+    fn v97_ui_send_level_slider_paints_drag_and_echoes() {
+        let mut app = headless_app("v97screcv");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // Route track 0 into track 1's chain, then open that chain window.
+        app.sc_send[1] = 1 << 0;
+        app.backend.engine.set_sc_send(1, 1 << 0);
+        app.fx_window = Some(1);
+        frame(&mut app, &ctx, vec![]);
+        // Routed chip paints as [1]; its level slider paints at unity.
+        let chip = galley_at_last(&mut app, &ctx, "[1]").expect("routed chip paints");
+        let lv = galley_at_last(&mut app, &ctx, "100 %").expect("unity receive level paints");
+        assert!(
+            (lv.center().y - chip.center().y).abs() < 14.0,
+            "the level sits on its chip's row: {chip:?} vs {lv:?}"
+        );
+        assert_eq!(app.sc_recv_gain[1 * MAX_LOOPS + 0], 1.0, "unity until touched");
+        // Drag the level right: deeper send. (The value label rides inside
+        // the track, so its galley center is a legal slider grab.)
+        drag_steps(
+            &mut app,
+            &ctx,
+            lv.center(),
+            egui::pos2(lv.center().x + 48.0, lv.center().y),
+        );
+        let gi = 1 * MAX_LOOPS + 0;
+        assert!(
+            app.sc_recv_gain[gi] > 1.4,
+            "drag raises the receive level: {}",
+            app.sc_recv_gain[gi]
+        );
+        assert!(
+            (app.backend.engine.sc_recv_gain(1, 0) - app.sc_recv_gain[gi]).abs() < 1e-6,
+            "the engine atomic follows the slider"
+        );
+        assert_eq!(
+            app.sc_recv_gain[0 * MAX_LOOPS + 1],
+            1.0,
+            "the reverse (T1->T0) pair is untouched"
+        );
+        assert!(app.fx_save_pending, "a level edit schedules the save");
+        assert!(
+            app.status.contains("sidechain send T1 into T2:"),
+            "status echo lands on release: {:?}",
+            app.status
+        );
+    }
+
+    /// v97 (sc-4) source-scan (v72 doctrine): the hover copy the runtime
+    /// pin cannot observe must exist EXACTLY once in prod ui.rs (cut at the
+    /// column-0 `mod tests`, per the v72 trap record).
+    #[test]
+    fn v97_ui_send_level_hover_copy_present() {
+        let src = include_str!("ui.rs").replace("\r\n", "\n");
+        let cut = src.find("\nmod tests").expect("mod tests at column 0");
+        let prod = &src[..cut];
+        let needle = concat!("level of track {}'s key in this chain's sidechain row");
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "the receive-slider hover text must exist exactly once in prod"
         );
     }
 }
