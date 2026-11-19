@@ -1936,8 +1936,11 @@ const fn smap_is_black(n: u8) -> bool {
     matches!(n % 12, 1 | 3 | 6 | 8 | 10)
 }
 const fn smap_whites_below(n: u8) -> usize {
-    // whites strictly below pitch-class r inside one octave
-    const PRE: [usize; 12] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6];
+    // whites strictly below pitch-class r inside one octave. NOTE (v92):
+    // the black pitch-classes 6/8/10 count FOUR/FIVE/SIX whites (F# has
+    // C,D,E,F below) — a 3/4/5 here slides F#/G#/A# one boundary left and
+    // paints five black keys in a row (v92_ pins watch this table).
+    const PRE: [usize; 12] = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6];
     (n as usize / 12) * 7 + PRE[n as usize % 12]
 }
 const fn smap_white_keys_build() -> [u8; 74 + 1] {
@@ -48263,6 +48266,160 @@ mod tests {
             (blk.min.x - lx).abs() < 0.5,
             "root 0 (C-1) must paint at the roll's left edge: {blk:?} vs lx={lx}"
         );
+    }
+
+    // ---- v92 (t_027375fc): the PRE table in smap_whites_below set the
+    // whites-below count wrong for pc 6/8/10 (3/4/5 instead of 4/5/6), so
+    // F#/G#/A# painted ONE boundary too far left — five black keys in a
+    // row (oct*7+1..+5), a black key in the E-F gap, none at A-B/B-C.
+    // These pins encode piano truth independently of the helpers. ----
+
+    /// Black note `n` straddles boundary oct*7 + PRE_OK[pc] between its
+    /// white neighbours: C#/D# (group of 2) then F#/G#/A# (group of 3).
+    /// Boundary oct*7+3 (E|F) and oct*7 (B|C) never carry a black key.
+    const V92_PRE_OK: [i32; 12] = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6];
+
+    #[test]
+    fn v92_smap_black_keys_follow_piano_octave_pattern() {
+        let (mut app, ctx) = v56_open_sampler_map("v92pat");
+        let (kx, ky, _lx, _ly, _rw) = app.smap_probe.expect("map painted");
+        let rects = v56_rects(&mut app, &ctx);
+        let mut got: Vec<i32> = rects
+            .iter()
+            .filter(|(f, r)| {
+                *f == egui::Color32::from_gray(28)
+                    && (r.min.y - ky).abs() < 1.5
+                    && r.height() < 18.0
+                    && (r.width() - SMAP_BW).abs() < 0.01
+            })
+            .map(|(_, r)| ((r.min.x - kx + SMAP_BW / 2.0) / SMAP_WW).round() as i32)
+            .collect();
+        got.sort_unstable();
+        let mut want: Vec<i32> = Vec::new();
+        for n in 0..SMAP_NW as i32 {
+            let pc = (n % 12) as usize;
+            if matches!(pc, 1 | 3 | 6 | 8 | 10) {
+                want.push((n / 12) * 7 + V92_PRE_OK[pc]);
+            }
+        }
+        assert_eq!(
+            got, want,
+            "painted black keys must straddle boundaries oct*7+{{1,2,4,5,6}} \
+             (2+3 pattern, gaps at E-F and B-C) across MIDI 0..=127"
+        );
+        // Explicit gap witnesses: nothing sits on an E|F (3 mod 7) or a
+        // B|C (0 mod 7) boundary, and every full octave carries the pair
+        // plus the trio.
+        assert!(got.iter().all(|b| !matches!(b.rem_euclid(7), 0 | 3)));
+        for oct in 0..10 {
+            for k in [1, 2, 4, 5, 6] {
+                assert!(
+                    got.contains(&(oct * 7 + k)),
+                    "octave {oct} black key at boundary +{k} missing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v92_smap_black_straddles_white_boundary() {
+        let (app, _ctx) = v56_open_sampler_map("v92str");
+        let (kx, _ky, _lx, _ly, _rw) = app.smap_probe.expect("map painted");
+        // A black key always covers half of its white neighbour BELOW and
+        // half of the one ABOVE: its center is exactly the left edge of
+        // the white note above (black+1 is always white). Lane rects come
+        // from the same helper, so this pins keys AND lanes together.
+        for n in 0..SMAP_NW as u8 {
+            if !smap_is_black(n) || n + 1 >= SMAP_NW as u8 {
+                continue;
+            }
+            let (bx, bw) = smap_note_rect(kx, n);
+            let (wx, _ww) = smap_note_rect(kx, n + 1);
+            assert!(
+                (bx + bw / 2.0 - wx).abs() < 0.01,
+                "black {n}: center {} must equal white-above left edge {wx}",
+                bx + bw / 2.0
+            );
+        }
+        // And the pointer at every painted black center hits THAT note.
+        for n in 0..SMAP_NW as u8 {
+            if !smap_is_black(n) {
+                continue;
+            }
+            assert_eq!(
+                smap_note_at(kx, smap_note_center(kx, n)),
+                n,
+                "pointer at black {n}'s painted center must hit note {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn v92_smap_hit_test_round_trip_every_note() {
+        let (mut app, ctx) = v56_open_sampler_map("v92hit");
+        frame(&mut app, &ctx, vec![]);
+        let (kx, _ky, _lx, _ly, _rw) = app.smap_probe.expect("map painted");
+        for n in 0..SMAP_NW as u8 {
+            assert_eq!(
+                smap_note_at(kx, smap_note_center(kx, n)),
+                n,
+                "note {n}: pointer at its painted center must hit it"
+            );
+        }
+    }
+
+    #[test]
+    fn v92_smap_black_key_audition_plays_the_painted_note() {
+        let (mut app, ctx) = v56_open_sampler_map("v92aud");
+        app.sample_rate = 44100; // NULL engine: audition bookkeeping only
+        let (kx, ky, _lx, _ly, _rw) = app.smap_probe.expect("map painted");
+        app.smap_sel = None; // pure preview: must not move any root
+        for note in [37u8, 39, 42, 44, 46, 54, 66] {
+            let p = egui::pos2(smap_note_center(kx, note), ky + 5.0);
+            frame(&mut app, &ctx, vec![moved(p)]);
+            frame(
+                &mut app,
+                &ctx,
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+            );
+            // `drag_started` needs travel; an in-place click applies on
+            // the RELEASE frame via `clicked()` (v56 finding).
+            frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+            assert_eq!(
+                app.smap_hold,
+                Some(note),
+                "clicking black key {note}'s painted center arms it"
+            );
+            assert_eq!(
+                app.roll_hold,
+                Some(note),
+                "black key {note} sounds through the roll voice"
+            );
+        }
+    }
+
+    #[test]
+    fn v92_smap_octave_labels_land_on_c_keys() {
+        let (mut app, ctx) = v56_open_sampler_map("v92lbl");
+        let (kx, ky, _lx, _ly, _rw) = app.smap_probe.expect("map painted");
+        let items = v56_texts(&mut app, &ctx);
+        for wn in (0..=120u8).step_by(12) {
+            let label = note_name(wn);
+            let (x, w) = smap_note_rect(kx, wn);
+            let hits: Vec<egui::Pos2> = items
+                .iter()
+                .filter(|(s, p)| *s == label && p.y > ky && p.y < ky + 22.0)
+                .map(|(_, p)| *p)
+                .collect();
+            assert_eq!(hits.len(), 1, "exactly one {label} label in the key strip");
+            assert!(
+                hits[0].x > x + 1.0 && hits[0].x < x + w - 1.0,
+                "{label} label center {} must sit inside its C white key [{},{}]",
+                hits[0].x,
+                x,
+                x + w
+            );
+        }
     }
 
     #[test]
