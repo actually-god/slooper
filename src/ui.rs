@@ -1577,9 +1577,13 @@ pub struct App {
     preview_enabled: bool,
     /// Text box value for the preview length in seconds.
     preview_secs: String,
-    /// Track whose instrument + mixer chain auditions MIDI (piano-roll
-    /// "preview through track" picker); `None` = the default synth script.
-    preview_track: Option<usize>,
+    /// v96 (sc-2): TRACKS whose instruments + mixer chains audition MIDI
+    /// (piano-roll "preview through track" — a SET since sc-2: previewing
+    /// a multi-selection finally sounds the keying partner, which is how
+    /// sidechain ducking becomes audible in preview). Empty = the default
+    /// synth script. A multi-selection pushes itself here via the v94
+    /// click seam; the piano-roll picker edits it with toggle rows.
+    preview_tracks: Vec<usize>,
     /// Piano-roll note clipboard (Ctrl+C/V while the roll has focus).
     roll_clip: Option<Vec<crate::midipat::Note>>,
     /// v38 R1: cached instance of the DEFAULT audition synth (bundled
@@ -2043,6 +2047,24 @@ enum SmapDrop {
     Empty,
 }
 
+/// v96 (sc-2): fold a (possibly OLD) config into the preview routing
+/// set. A legacy scalar `preview_track` in an old config file loads as
+/// a ONE-ELEMENT set — that back-compat is the whole point; entries
+/// beyond the per-track tables are dropped, then sorted/deduped so the
+/// set is canonical for `selectable_label` comparisons.
+pub(crate) fn preview_set_from_cfg(cfg: &Config) -> Vec<usize> {
+    let mut set: Vec<usize> = cfg.preview_tracks.iter().map(|&t| t as usize).collect();
+    if set.is_empty() {
+        if let Some(t) = cfg.preview_track {
+            set.push(t as usize);
+        }
+    }
+    set.retain(|&t| t < crate::audio::MAX_LOOPS);
+    set.sort();
+    set.dedup();
+    set
+}
+
 impl App {
     pub fn new(backend: Backend) -> Self {
         // v34 R10: export-status channel for the off-thread render.
@@ -2314,7 +2336,7 @@ impl App {
             midi_live: cfg.midi_live,
             preview_enabled: cfg.preview_on,
             preview_secs: cfg.preview_secs.max(0.0).to_string(),
-            preview_track: cfg.preview_track.map(|t| t as usize),
+            preview_tracks: preview_set_from_cfg(&cfg),
             roll_clip: None,
             snap_on: cfg.snap_on,
             preview_playing: None,
@@ -5310,6 +5332,16 @@ impl App {
             self.select_track_plain(t);
             self.status = format!("track {} selected", t + 1);
         }
+        // v96 (sc-2): a MULTI-selection IS the preview route — the user
+        // story ("sidechain appears not to work in preview") is select
+        // source+target, hit preview, HEAR the duck. A single selection
+        // deliberately leaves the picker's set alone (decades-old
+        // single-track behavior, acceptance A2). Runtime-only: no
+        // save_config here — selection churn must not spam the file,
+        // and the picker stays the persisted authority.
+        if self.track_sel.len() >= 2 {
+            self.preview_tracks = self.track_sel.clone();
+        }
     }
 
     /// v94: keep the set invariant when `n_tracks` changes (Settings seam)
@@ -5321,6 +5353,9 @@ impl App {
     fn clamp_track_sel(&mut self) {
         let n = self.n_tracks.max(1);
         self.track_sel.retain(|&j| j < n);
+        // v96 (sc-2): the preview route shares the selection's table
+        // bounds — a track that vanishes must vanish from the set too.
+        self.preview_tracks.retain(|&j| j < n);
         self.track_sel_anchor = self.track_sel_anchor.min(n - 1);
         if self.track_sel.is_empty() {
             self.track_sel = vec![self.selected.min(n - 1)];
@@ -6060,7 +6095,8 @@ impl App {
             midi_live: self.midi_live,
             preview_on: self.preview_enabled,
             preview_secs: self.preview_secs_f(),
-            preview_track: self.preview_track.map(|t| t as u32),
+            preview_tracks: self.preview_tracks.iter().map(|&t| t as u32).collect(),
+            preview_track: None,
             snap_on: self.snap_on,
             auto_snap_on: self.auto_snap_on,
             auto_snap_sub: SUBDIVISIONS[self.auto_snap_sub].0,
@@ -10451,23 +10487,22 @@ impl App {
             self.backend.engine.stop_audition();
         }
         self.roll_hold = Some(note);
-        let ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, note, 100)];
-        match self.preview_track {
-            Some(t) => {
-                let inst = self.audition_copy(t);
-                if inst.is_none() {
-                    self.roll_hold = None;
-                    self.status = "audition: no synth available".into();
-                    return;
-                }
-                self.backend.engine.play_audition(t, ev.into(), inst);
-                self.status = format!(
-                    "\u{266a} {nm} \u{b7} {route}",
-                    nm = note_name(note),
-                    route = self.roll_track_label(t)
-                );
+        let ev: Vec<crate::audio::MidiEv> = vec![(0, 3, 0, note, 100)];
+        let route = self.preview_route();
+        if !route.is_empty() {
+            // v96 (sc-2): held note on EVERY routed track — each through
+            // its own headless copy, so source and target sustain together.
+            if self.audition_tracks(&route, ev) == 0 {
+                self.roll_hold = None;
+                self.status = "audition: no synth available".into();
+                return;
             }
-            None => {
+            self.status = format!(
+                "\u{266a} {nm} \u{b7} {route}",
+                nm = note_name(note),
+                route = self.preview_set_label(&route)
+            );
+        } else {
                 // v46: the default route holds a private piano copy
                 // through the engine's `AUD_PV` pseudo-slot (centre mix,
                 // like an asset preview) — headless, and it answers with
@@ -10487,7 +10522,6 @@ impl App {
                     .engine
                     .play_audition(crate::audio::AUD_PV, ev.into(), inst);
                 self.status = format!("\u{266a} {nm} \u{b7} default (piano)", nm = note_name(note));
-            }
         }
     }
 
@@ -10497,6 +10531,60 @@ impl App {
         if self.roll_hold.take().is_some() {
             self.backend.engine.stop_audition();
         }
+    }
+
+    /// v96 (sc-2): the live preview routing set — entries are clamped on
+    /// every track-count change, re-filtered here anyway so a stale
+    /// persisted index can only ever fall back to the default piano,
+    /// never route an audition onto a phantom track.
+    fn preview_route(&self) -> Vec<usize> {
+        self.preview_tracks
+            .iter()
+            .copied()
+            .filter(|&t| t < self.n_tracks)
+            .collect()
+    }
+
+    /// v96: status/combo label for a routing set. A single track keeps the
+    /// historical bare label; sets join with " + " (cap 3 + "N more" so a
+    /// 12-track selection can't spill the status line).
+    fn preview_set_label(&self, set: &[usize]) -> String {
+        match set.len() {
+            0 => String::new(),
+            1 => self.roll_track_label(set[0]),
+            n if n <= 3 => set
+                .iter()
+                .map(|&t| self.roll_track_label(t))
+                .collect::<Vec<_>>()
+                .join(" + "),
+            n => {
+                let head: Vec<String> = set[..2]
+                    .iter()
+                    .map(|&t| self.roll_track_label(t))
+                    .collect();
+                format!("{} + {} more", head.join(" + "), n - 2)
+            }
+        }
+    }
+
+    /// v96 (sc-2): stage ONE event stream as an audition voice on EVERY
+    /// track of the routing set — each renders through its own headless
+    /// copy (v46), so a sidechain source and its target sound together,
+    /// and the v95 send tap (reading acc[src], which the summed audition
+    /// rows fill) ducks the target exactly like clip playback would.
+    /// Returns the number of voices actually staged.
+    fn audition_tracks(&mut self, set: &[usize], ev: Vec<crate::audio::MidiEv>) -> usize {
+        let ev: Arc<[crate::audio::MidiEv]> = ev.into();
+        let mut staged = 0usize;
+        for &t in set {
+            let inst = self.audition_copy(t);
+            if inst.is_none() {
+                continue;
+            }
+            self.backend.engine.play_audition(t, ev.clone(), inst);
+            staged += 1;
+        }
+        staged
     }
 
     /// v46: the exact headless copy of track `t`'s configured synth.
@@ -10667,22 +10755,27 @@ impl App {
         // v38 R1: with a track picked the pattern plays through that
         // track's LIVE instrument + chain as an RT audition voice (the
         // per-click private-plugin bounce is gone for good).
-        if let Some(t) = self.preview_track {
+        // v96 (sc-2): the route is a SET — one voice per track, so an
+        // SC source+target pair previews together and the duck is heard.
+        let route = self.preview_route();
+        if !route.is_empty() {
             let mut ev = self.pattern_events(&pat);
             if ev.is_empty() {
                 self.status = format!("preview: \u{201c}{name}\u{201d} has no notes");
                 return;
             }
             ev.sort_unstable();
-            // v46: through a private COPY of the track's instrument — an
-            // asset preview can never leave MIDI in the live synth.
-            let inst = self.audition_copy(t);
-            self.backend.engine.play_audition(t, ev.into(), inst);
+            // v46: through private COPIES of the tracks' instruments — an
+            // asset preview can never leave MIDI in a live synth.
+            if self.audition_tracks(&route, ev) == 0 {
+                self.status = "preview: no synth available".into();
+                return;
+            }
             if self.metro_on {
                 self.preview_metro_only(&pat);
             }
             self.preview_playing = Some(key);
-            self.status = format!("preview playing \u{b7} {}", self.roll_track_label(t));
+            self.status = format!("preview playing \u{b7} {}", self.preview_set_label(&route));
             return;
         }
         match self.render_pattern_preview(&pat) {
@@ -11162,51 +11255,52 @@ impl App {
             if pat.notes.is_empty() && pat.ccs.is_empty() && pat.press.is_empty() {
                 self.status = "preview: nothing to play \u{b7} place a note first".into();
             } else {
-                match self.preview_track {
-                    // v38 R1: the pattern goes through the LIVE track
-                    // instrument as an RT audition voice — instant, no
-                    // plugin instantiation, and it is the SAME instance the
-                    // clips will play. Linked metro joins as a click-only
-                    // transient voice, phase-locked to tick 0.
-                    Some(t) => {
-                        let mut ev = self.pattern_events(&pat);
-                        if ev.is_empty() {
-                            self.status =
-                                "preview: pattern has no notes yet \u{b7} draw one first".into();
+                // v38 R1: the pattern goes through the LIVE track
+                // instrument as an RT audition voice — instant, no
+                // plugin instantiation, and it is the SAME instance the
+                // clips will play. Linked metro joins as a click-only
+                // transient voice, phase-locked to tick 0.
+                // v96 (sc-2): the route is a SET — one audition voice per
+                // routed track, so a selected SC pair previews together.
+                let route = self.preview_route();
+                if !route.is_empty() {
+                    let mut ev = self.pattern_events(&pat);
+                    if ev.is_empty() {
+                        self.status =
+                            "preview: pattern has no notes yet \u{b7} draw one first".into();
+                    } else {
+                        ev.sort_unstable();
+                        // v46: starting a pattern preview ends any
+                        // held key, and the pattern itself plays
+                        // through private COPIES of the instruments.
+                        self.roll_key_release();
+                        self.backend.engine.stop_audition();
+                        if self.audition_tracks(&route, ev) == 0 {
+                            self.status = "preview: no synth available".into();
                         } else {
-                            ev.sort_unstable();
-                            // v46: starting a pattern preview ends any
-                            // held key, and the pattern itself plays
-                            // through a private COPY of the instrument.
-                            self.roll_key_release();
-                            self.backend.engine.stop_audition();
-                            let inst = self.audition_copy(t);
-                            self.backend.engine.play_audition(t, ev.into(), inst);
                             if self.metro_on {
                                 self.preview_metro_only(&pat);
                             }
                             self.preview_playing = Some("piano roll".into());
                             self.status = format!(
                                 "preview playing \u{b7} {} \u{b7} space or STOP ends it",
-                                self.roll_track_label(t)
+                                self.preview_set_label(&route)
                             );
                         }
                     }
-                    None => match self.render_pattern_preview(&pat) {
-                        Some(buf) => {
-                            // Edit echo, not an audition: replace anything playing.
-                            self.backend.cmd(Cmd::PreviewStop { id: None });
-                            self.backend.cmd(Cmd::PreviewPlay {
-                                id: crate::audio::PREVIEW_TRANSIENT,
-                                samples: buf,
-                            });
-                            self.preview_playing = Some("piano roll".into());
-                            self.status =
-                            "preview playing \u{b7} default (piano) \u{b7} space or STOP ends it"
-                                .into();
-                        }
-                        None => self.status = "preview: no synth available".into(),
-                    },
+                } else if let Some(buf) = self.render_pattern_preview(&pat) {
+                    // Edit echo, not an audition: replace anything playing.
+                    self.backend.cmd(Cmd::PreviewStop { id: None });
+                    self.backend.cmd(Cmd::PreviewPlay {
+                        id: crate::audio::PREVIEW_TRANSIENT,
+                        samples: buf,
+                    });
+                    self.preview_playing = Some("piano roll".into());
+                    self.status =
+                        "preview playing \u{b7} default (piano) \u{b7} space or STOP ends it"
+                            .into();
+                } else {
+                    self.status = "preview: no synth available".into();
                 }
             }
         }
@@ -11271,21 +11365,32 @@ impl App {
                     // DAW-style routing: pick the TRACK whose instrument AND
                     // mixer chain previews this pattern.
                     ui.label("preview:");
-                    let cur_label = match self.preview_track {
-                        None => "\u{266a} default (piano)".to_string(),
-                        Some(t) => format!("\u{266a} {}", self.roll_track_label(t)),
+                    // v96 (sc-2): the route is a MULTI-SELECT set — track
+                    // rows TOGGLE, so one preview can play a whole
+                    // selection (this is what makes an SC pair audible).
+                    // The egui 0.36 ComboBox defaults to CloseOnClick,
+                    // which would kill the popup after the first toggle —
+                    // CloseOnClickOutside keeps it open for a run of
+                    // clicks; "default (piano)" = clear the set.
+                    let route = self.preview_route();
+                    let cur_label = if route.is_empty() {
+                        "\u{266a} default (piano)".to_string()
+                    } else {
+                        format!("\u{266a} {}", self.preview_set_label(&route))
                     };
-                    let mut pick: Option<Option<usize>> = None;
+                    let mut toggle: Option<usize> = None;
+                    let mut to_default = false;
                     egui::ComboBox::from_id_salt("roll_track_pick")
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .width(190.0)
                         .selected_text(RichText::new(cur_label).small())
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(self.preview_track.is_none(), "default (piano)")
+                                .selectable_label(route.is_empty(), "default (piano)")
                                 .on_hover_text("Bundled piano script, no track chain")
                                 .clicked()
                             {
-                                pick = Some(None);
+                                to_default = true;
                             }
                             ui.separator();
                             // v38 R3: every row reads the ENGINE TABLE —
@@ -11294,25 +11399,40 @@ impl App {
                             for t in 0..self.n_tracks {
                                 if ui
                                     .selectable_label(
-                                        self.preview_track == Some(t),
+                                        route.contains(&t),
                                         self.roll_track_label(t),
                                     )
-                                    .on_hover_text("Preview through this track's CURRENT instrument AND its effects chain")
+                                    .on_hover_text("Toggle this track in/out of the preview route — its CURRENT instrument AND its effects chain")
                                     .clicked()
                                 {
-                                    pick = Some(Some(t));
+                                    toggle = Some(t);
                                 }
                             }
                         });
-                    if let Some(v) = pick {
-                        self.preview_track = v;
+                    if to_default {
+                        self.preview_tracks.clear();
                         self.save_config();
                         // v38 R6: picking a route confirms itself in the
                         // status line (instant feedback).
-                        self.status = match v {
-                            Some(t) =>
-                                format!("preview \u{b7} {} \u{b7} live instrument + chain", self.roll_track_label(t)),
-                            None => "preview \u{b7} default (piano)".into(),
+                        self.status = "preview \u{b7} default (piano)".into();
+                    } else if let Some(t) = toggle {
+                        if self.preview_tracks.contains(&t) {
+                            self.preview_tracks.retain(|&j| j != t);
+                        } else {
+                            self.preview_tracks.push(t);
+                            self.preview_tracks.sort();
+                        }
+                        self.save_config();
+                        let route = self.preview_route();
+                        self.status = if route.is_empty() {
+                            "preview \u{b7} default (piano)".into()
+                        } else if route.len() == 1 {
+                            format!("preview \u{b7} {} \u{b7} live instrument + chain", self.roll_track_label(route[0]))
+                        } else {
+                            format!(
+                                "preview \u{b7} {} \u{b7} live instruments + chains",
+                                self.preview_set_label(&route)
+                            )
                         };
                     }
                     // v37 R3: the roll's LINKED metronome — the same
@@ -13008,7 +13128,10 @@ impl App {
             return;
         }
         self.smap_hold = Some(note);
-        self.preview_track = Some(t);
+        // v96: faithful port of the old single-route force — a sampler-map
+        // key auditions through THAT sampler's track; the set collapses to
+        // it (the map being clicked belongs to that one track).
+        self.preview_tracks = vec![t];
         self.roll_key_hold(note);
     }
 
@@ -32184,7 +32307,7 @@ mod tests {
             .center();
         frame(&mut app, &ctx, vec![moved(tr), btn_btn(tr, true)]);
         frame(&mut app, &ctx, vec![btn_btn(tr, false)]);
-        assert_eq!(app.preview_track, Some(0), "preview routes to track 1");
+        assert_eq!(app.preview_tracks, vec![0], "preview routes to track 1");
         // Track 1 has no explicit synth binding → the fallback keeps the
         // preview alive (default instrument through the live path).
         let pv2 = find_exact(&mut app, &ctx, "preview")
@@ -32542,7 +32665,7 @@ mod tests {
         let p = row.center();
         frame(&mut app, &ctx, vec![moved(p), btn_btn(p, true)]);
         frame(&mut app, &ctx, vec![btn_btn(p, false)]);
-        assert_eq!(app.preview_track, Some(0));
+        assert_eq!(app.preview_tracks, vec![0]);
         assert!(
             app.status.contains("live instrument"),
             "the pick confirms the live route: {}",
@@ -56743,8 +56866,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v95\""),
-            "INTERNAL_VERSION must be bumped to v95"
+            librs.contains("INTERNAL_VERSION: &str = \"v96\""),
+            "INTERNAL_VERSION must be bumped to v96"
         );
     }
 }
