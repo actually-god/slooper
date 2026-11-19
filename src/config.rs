@@ -211,6 +211,21 @@ pub struct TrackFxSave {
     pub params: Vec<f32>,
 }
 
+/// v97 (sc-4): one NON-UNITY sidechain receive level for the (target t,
+/// source s) route. Sparse by design — unity routes are never written, so
+/// old project/config files (missing key) load at unity unchanged.
+/// sc-5 extends this same shape (per-send pan) rather than adding a
+/// parallel table — bump with `#[serde(default = "...")]` fields.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScRecvGain {
+    /// Target track (the receiver — its chain's SC row).
+    pub t: u8,
+    /// Source track (the sender whose tap this level scales).
+    pub s: u8,
+    /// Receive level, linear amplitude (1.0 = unity = pre-v97 behavior).
+    pub gain: f32,
+}
+
 /// One slot of a track's mixer chain (see `Config::track_chain`). Tagged so
 /// a chain mixes effect scripts and hosted plugins in any order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -675,6 +690,11 @@ pub struct Config {
     /// rides the engine atomics (`Engine::set_sc_send`).
     #[serde(default)]
     pub sc_send: Vec<u128>,
+    /// v97 (sc-4): per-route sidechain receive levels (mixer "Sidechain in"
+    /// sliders). Sparse — only non-unity pairs; engine copy rides the
+    /// `sc_recv` atomics (`Engine::set_sc_recv_gain`).
+    #[serde(default)]
+    pub sc_recv_gain: Vec<ScRecvGain>,
     /// Extra VST search folders (user-set; the standard system folders are
     /// always scanned on top of these).
     #[serde(default)]
@@ -834,6 +854,7 @@ impl Default for Config {
             track_fx: Vec::new(),
             track_chain: Vec::new(),
             sc_send: Vec::new(),
+            sc_recv_gain: Vec::new(),
             vst_dirs: Vec::new(),
             editor_probe: Default::default(),
             track_vst: Vec::new(),
@@ -1396,6 +1417,7 @@ mod tests {
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             sc_send: Vec::new(),
+            sc_recv_gain: Vec::new(),
             track_fx: vec![vec![TrackFxSave {
                 stem: "template".into(),
                 params: vec![0.5, 4.0],

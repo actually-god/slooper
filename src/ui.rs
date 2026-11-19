@@ -43,7 +43,7 @@ use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
     TR_REC,
 };
-use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, TrackFxSave};
+use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, ScRecvGain, TrackFxSave};
 use crate::fx;
 use crate::midi::{hex, note_name, scale_axis, MidiAction, MidiBind, MidiMsg};
 use crate::midipat::{Pattern, PPQ};
@@ -1395,6 +1395,10 @@ pub struct App {
     /// v32 R5: sidechain send mask per track (bit k = source); mirrored
     /// into the engine atomics on every change.
     sc_send: [u128; MAX_LOOPS],
+    /// v97 (sc-4): sidechain RECEIVE level per route, target-major index
+    /// `t * MAX_LOOPS + s` (linear amplitude). Mirrors the engine `sc_recv`
+    /// atomics; only non-unity entries persist (sparse config save).
+    sc_recv_gain: [f32; MAX_LOOPS * MAX_LOOPS],
     /// Last track selection propagated to the audio engine (input
     /// monitoring follows the selected track's chain/gain/pan).
     sel_sent: usize,
@@ -2115,6 +2119,17 @@ impl App {
             backend.engine.set_loop_pan(t, pan01(trk_pan[t]));
             backend.engine.set_sc_send(t, sc_send[t]);
         }
+        // v97 (sc-4): per-route sidechain receive levels → App mirror +
+        // engine atomics. Absent routes stay at the unity table default.
+        let mut sc_recv_gain = [1.0f32; MAX_LOOPS * MAX_LOOPS];
+        for r in &cfg.sc_recv_gain {
+            let (t, s) = (r.t as usize, r.s as usize);
+            if t < MAX_LOOPS && s < MAX_LOOPS {
+                let g = r.gain.max(0.0);
+                sc_recv_gain[t * MAX_LOOPS + s] = g;
+                backend.engine.set_sc_recv_gain(t, s, g);
+            }
+        }
         let sel_in: HashSet<String> = cfg.ports_in.iter().cloned().collect();
         let sel_out: HashMap<String, u8> = cfg
             .ports_out
@@ -2233,6 +2248,7 @@ impl App {
             trk_pan,
             trk_color,
             sc_send,
+            sc_recv_gain,
             sel_sent: usize::MAX,
             levels_dirty: false,
             // v68: mix-page session state (see the `mix_tab` field).
@@ -6089,6 +6105,18 @@ impl App {
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             sc_send: self.sc_send.to_vec(),
+            // v97 (sc-4): sparse — only non-unity routes are written, so a
+            // file saved here loads unchanged pre-v97 (missing key = unity).
+            sc_recv_gain: (0..MAX_LOOPS * MAX_LOOPS)
+                .filter_map(|i| {
+                    let g = self.sc_recv_gain[i];
+                    (g != 1.0).then(|| ScRecvGain {
+                        t: (i / MAX_LOOPS) as u8,
+                        s: (i % MAX_LOOPS) as u8,
+                        gain: g,
+                    })
+                })
+                .collect(),
             editor_probe: self.editor_probe.clone(),
             track_vst: Vec::new(),
             track_chain: self
@@ -28229,6 +28257,47 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 app.sc_send[loop_i] = v;
                 app.backend.engine.set_sc_send(loop_i, v);
                 app.fx_save_pending = true;
+            }
+            // v97 (sc-4): a routed chip carries a per-send RECEIVE slider —
+            // this chain's mix of the incoming keys (multiple sources sum).
+            // Independent of the sender's own volume/gain (v95 tap law).
+            if on && !self_bit {
+                let gi = loop_i * MAX_LOOPS + s;
+                let mut g = app.sc_recv_gain[gi];
+                let sresp = ui
+                    .push_id(("screcv", loop_i, s), |ui| {
+                        ui.add_sized(
+                            [96.0, 20.0],
+                            egui::Slider::new(&mut g, 0.0..=2.0)
+                                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(format!(
+                        "level of track {}'s key in this chain's sidechain row — {:.0} %\ndrag or use arrow keys; independent of the sender's own fader",
+                        s + 1,
+                        g * 100.0
+                    ));
+                let mut echo_now = false;
+                if sresp.changed() {
+                    app.sc_recv_gain[gi] = g;
+                    app.backend.engine.set_sc_recv_gain(loop_i, s, g);
+                    app.fx_save_pending = true;
+                    // A keyboard step echoes live; a mouse drag waits for
+                    // release so the status line doesn't spam mid-drag.
+                    echo_now = !sresp.dragged();
+                }
+                if sresp.drag_stopped() {
+                    echo_now = true;
+                }
+                if echo_now {
+                    app.status = format!(
+                        "sidechain send T{} into T{}: {:.0} %",
+                        s + 1,
+                        loop_i + 1,
+                        g * 100.0
+                    );
+                }
             }
         }
         if m != 0
