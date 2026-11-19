@@ -7395,9 +7395,10 @@ impl App {
             .iter()
             .enumerate()
             .flat_map(|(ki, kit)| {
-                kit.iter().enumerate().filter_map(move |(pi, p)| {
-                    (!p.asset_path.is_empty()).then(|| (ki, pi, p.asset_path.clone()))
-                })
+                kit.iter()
+                    .enumerate()
+                    .filter(|(_, p)| !p.asset_path.is_empty())
+                    .map(move |(pi, p)| (ki, pi, p.asset_path.clone()))
             })
             .collect();
         for (ki, pi, stored) in named {
