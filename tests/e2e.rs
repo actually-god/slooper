@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, Control, MidiOut, Port, ProcessHandler, ProcessScope,
-    RawMidi,
+    AsyncClient, AudioIn, AudioOut, Client, ClientOptions, Control, MidiOut, Port, ProcessHandler,
+    ProcessScope, RawMidi,
 };
 
 use slooper::arrange::{Arrangement, Clip};
@@ -4860,5 +4860,245 @@ fn v80_rt_bypass_passthrough() {
     assert!(
         through > 0.45,
         "muted slot must pass the dry 0.55 square (got {through}; ducked was {ducked})"
+    );
+}
+
+// ---- v95 (sc-3): the send tap is INDEPENDENT of the sender's mix state --
+//
+// User report 2026-11-18: mute / fader on a sidechain SOURCE track must
+// not touch the key. The tap sits after the sender's gain and pan stages
+// and before (and never scaled by) the volume fader and mute. These pins
+// reuse the v32 rig: 110 Hz key hard LEFT, target tone hard RIGHT probed
+// on the right bus only — the probe hears ONLY the duck.
+
+/// Shared scaffolding: (backend, ring, widx, sr). Key on track 0 (hard
+/// left, tone on track 1 (hard right) through the stock sidechain
+/// compressor; the probe listens to the RIGHT bus only.
+type V95Rig = (
+    Backend,
+    Arc<Vec<AtomicU32>>,
+    Arc<AtomicU64>,
+    u32,
+    AsyncClient<(), CapProc>,
+);
+
+fn v95_sc_setup(tag: &str) -> Option<V95Rig> {
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return None; // no audio server: skip
+    };
+    let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    // threshold -30 dB, ratio 4, attack 2 ms, release 100 ms, knee 6, depth 1.
+    let vals = [-30.0f32, 4.0, 2.0, 100.0, 6.0, 1.0];
+    let desc = reg
+        .desc("sidechain_comp")
+        .expect("stock sidechain_comp present")
+        .clone();
+    let inst = reg
+        .create_instance("sidechain_comp", sr as f64, &vals)
+        .expect("sidechain_comp compiles and instantiates");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    // activate_async CONSUMES the client: the returned AsyncClient (kept
+    // alive by the caller for the test's whole life) is what keeps the
+    // probe ports and the ring pumping.
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 2)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+    let n = 24_000usize;
+    let key: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 110.0 * i as f32 / sr as f32).sin())
+            .collect::<Vec<f32>>(),
+    );
+    let tone: Arc<[f32]> = Arc::from(vec![0.02f32; n]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0)); // key on track 0
+    arr.insert(1, 0, Clip::new(0, 1)); // tone on track 1 (the target)
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![key, tone]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.engine.set_loop_pan(0, 0.0); // key hard left
+    b.engine.set_loop_pan(1, 1.0); // tone hard right
+    b.cmd(Cmd::SetTrackEffects {
+        i: 1,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    Some((b, ring, widx, sr, active))
+}
+
+/// Open the tone, arm the send, and verify the duck baseline (returns the
+/// unkeyed RMS of the right bus).
+fn v95_sc_duck_baseline(
+    b: &Backend,
+    ring: &Arc<Vec<AtomicU32>>,
+    widx: &AtomicU64,
+    sr: u32,
+) -> f32 {
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(
+            ring,
+            widx,
+            (sr as u64 * ms / 1000) as usize,
+            Duration::from_millis(500),
+        )
+        .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(ring, widx, 480)
+                .map(|m| m > 0.005)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "target tone audible on the probe bus",
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    let open = rms(200);
+    assert!(open > 0.005, "tone must ride the probe bus (got {open})");
+    b.engine.set_sc_send(1, 1 << 0);
+    std::thread::sleep(Duration::from_millis(400));
+    let ducked = rms(200);
+    assert!(
+        ducked < open * 0.7,
+        "SC routing must attenuate the target: open {open}, ducked {ducked}"
+    );
+    open
+}
+
+/// v95: muting the KEY TRACK in the main mix must not un-key the target.
+#[test]
+fn e2e_v95_sc_muted_sender_still_ducks() {
+    let _g = e2e_lock();
+    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scmute") else {
+        return;
+    };
+    let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
+    // Mute the sender in the main mix: its AUDIO dies (left bus), its KEY
+    // must keep ducking the target (right bus).
+    b.engine.set_track_on(0, false);
+    std::thread::sleep(Duration::from_millis(400));
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(&ring, &widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    let ducked = rms(200);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        ducked < open * 0.7,
+        "sender mute must NOT kill the key: open {open}, ducked-after-mute {ducked}"
+    );
+}
+
+/// v95: dragging the KEY TRACK's volume fader to zero must not un-key.
+#[test]
+fn e2e_v95_sc_zero_volume_sender_ducks() {
+    let _g = e2e_lock();
+    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvol0") else {
+        return;
+    };
+    let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
+    b.engine.set_loop_vol(0, 0.0); // sender fader to -inf
+    std::thread::sleep(Duration::from_millis(400));
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(&ring, &widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    let ducked = rms(200);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        ducked < open * 0.7,
+        "sender volume 0 must NOT kill the key: open {open}, ducked-after-zero {ducked}"
+    );
+}
+
+/// v95: moving the sender's fader must not move the DUCK DEPTH (the tap
+/// is pre-fader: the key level — hence the depth — is fader-invariant).
+#[test]
+fn e2e_v95_sc_sender_vol_move_keeps_duck_depth() {
+    let _g = e2e_lock();
+    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvolmv") else {
+        return;
+    };
+    let _open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(&ring, &widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    let before = rms(200);
+    b.engine.set_loop_vol(0, 0.05); // big fader move on the SENDER
+    std::thread::sleep(Duration::from_millis(400));
+    let after = rms(200);
+    b.cmd(Cmd::StopAll);
+    let ratio = after / before;
+    assert!(
+        (0.75..=1.35).contains(&ratio),
+        "duck depth must be fader-invariant: before {before}, after {after}, ratio {ratio}"
+    );
+}
+
+/// v95: the sender's GAIN knob rides the key — driving the sender's gain
+/// toward zero takes the key below the compressor threshold, so the duck
+/// must DIE (contrast with the fader pin above: same audible silence,
+/// opposite key effect — gain feeds the tap, volume never does).
+#[test]
+fn e2e_v95_sc_sender_gain_zero_kills_key() {
+    let _g = e2e_lock();
+    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scg0") else {
+        return;
+    };
+    let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
+    b.engine.set_loop_gain(0, 0.02); // key: 0.3 x 0.707 x 0.02 ≈ -46 dBFS
+    std::thread::sleep(Duration::from_millis(500));
+    let rms = |ms: u64| -> f32 {
+        let x = read_ring(&ring, &widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+            .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    let restored = rms(200);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        restored > open * 0.7,
+        "sender gain→0 must sink the key below threshold: open {open}, after {restored}"
     );
 }
