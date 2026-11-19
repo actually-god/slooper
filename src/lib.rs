@@ -12,6 +12,8 @@
 //! - [`config`]: persistent settings (rack folders, projects dir, mixer,
 //!   shortcuts, MIDI bindings).
 //! - [`fx`]: runtime-compiled per-track effects (the effect framework).
+//! - [`mcp`]: built-in MCP server (loopback Streamable-HTTP + UI command
+//!   bridge + stdio shim; docs/MCP-DESIGN.md).
 //! - [`ports`]: enabled-device port filtering for the input/output pickers.
 //! - [`ui`]: the egui front-end (used by the binary).
 
@@ -28,6 +30,7 @@ pub mod ffiguard;
 pub mod fx;
 pub mod fxgui;
 pub(crate) mod kit;
+pub mod mcp;
 pub mod meter;
 pub mod midi;
 pub mod midiin;
