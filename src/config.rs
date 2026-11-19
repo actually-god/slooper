@@ -774,6 +774,20 @@ pub struct Config {
     /// backend there.
     #[serde(default = "default_audio_backend")]
     pub win_audio_backend: String,
+    /// v94/MCP: built-in MCP server (docs/MCP-DESIGN.md). Default OFF —
+    /// `mcp_enabled=false` boots zero sockets; the user opts in via
+    /// Settings ▸ AUTOMATION. Loopback-only, always.
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// v94: loopback listen port. 0 = pick any free port (the chosen port
+    /// lands in `data_dir()/mcp-endpoint.json`, same as any other port).
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+    /// v94: read-only latch — refuse every tool whose declared `read`
+    /// flag is false. Hot: consulted at dispatch time, never needs a
+    /// restart (of the app OR the agent's connection).
+    #[serde(default)]
+    pub mcp_read_only: bool,
 }
 
 impl Default for Config {
@@ -854,8 +868,18 @@ impl Default for Config {
             win_editor_embed: false,
             win_midi_inputs: Vec::new(),
             win_audio_backend: default_audio_backend(),
+            mcp_enabled: false,
+            mcp_port: default_mcp_port(),
+            mcp_read_only: false,
         }
     }
+}
+
+/// v94: the MCP server's default loopback port. Free at assignment time
+/// (2026-11 registry check against the repo's other fixed numbers); 0 in
+/// the config means "ephemeral" and is what tests/pins always use.
+fn default_mcp_port() -> u16 {
+    47618
 }
 
 /// W12f: "auto" = native JACK if its DLL is discoverable, else WASAPI.

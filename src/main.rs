@@ -35,6 +35,19 @@ fn main() -> eframe::Result {
         eprintln!("[slooper] panic: {info}");
         std::process::abort();
     }));
+    // v94/MCP-01: `slooper --mcp-bridge` = stdio↔HTTP shim for stdio-only
+    // MCP clients (docs/MCP-DESIGN.md D1; REQUIRED with the core). This
+    // process only ever pipes lines to the LIVE instance's loopback
+    // endpoint — no JACK, no eframe, no config: never a second DAW.
+    if std::env::args().any(|a| a == "--mcp-bridge") {
+        std::process::exit(match slooper::mcp::bridge::run() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[mcp-bridge] {e}");
+                2
+            }
+        });
+    }
     // v45 GL policy (crash forensics attempt #4): run the WHOLE process on
     // software GL by default. Rationale in `gl_force_software`; the kill
     // chain we are removing: kernel rejects one Mesa command stream over a
