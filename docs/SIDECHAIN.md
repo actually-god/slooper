@@ -1,4 +1,4 @@
-# Sidechain routing (v32 R5)
+# Sidechain routing (v32 R5; tap semantics v95)
 
 ## What sidechaining is
 
@@ -17,7 +17,7 @@ Everything runs on the realtime thread with zero allocations and no locks:
 
 * **Send matrix.** Each track owns a 128-bit send mask (`u128`, stored as
   an atomic lo/hi `u64` pair — there is no `AtomicU128`): bit *k* of
-  track *t*'s word means "track *k*'s audio keys *t*'s effect chain".
+  track *t*'s word means "track *k* keys *t*'s effect chain".
   `Engine::set_sc_send` clears the self-bit on the way in — a track can
   never key itself (that would be ordinary audio feedback through the
   detector).
@@ -27,15 +27,42 @@ Everything runs on the realtime thread with zero allocations and no locks:
   signal is one block late (~2.6 ms at 48 kHz/128) — well below the
   attack time of any real detector, and it buys a strict one-cycle
   feed-forward graph with no loops and no extra latency bookkeeping.
-* **The tap.** Inside the sample loop a track sends `dry × amp-ramp`
-  (post-trim, **pre-pan**, pre-chain) to every target that lists it.
-  Zero cost when no routing exists: sources that nothing keys are
-  filtered by one `u128` AND per mixed track; the edge table
-  (`e_src`/`e_tgt`, 256 entries) is expanded once per block.
+* **The tap (v95 semantics).** Each routed source sends, every sample,
+
+  ```text
+  key = dry × track_gain × (pgl + pgr) / sqrt(2)
+  ```
+
+  where `dry` is the track's pre-chain sum (clip samples × clip gain ×
+  fades + its live/pattern MIDI synth output). The tap sits **after the
+  sender's gain and pan stages** — the gain knob and the pan law are
+  *preserved on the key* — and **before, and completely independent of,
+  the volume fader and every mute** (play switch, automation mute,
+  transport stop of the sender aside). Muting the sender in the main mix
+  or dragging its fader to zero silences its AUDIO but never its KEY;
+  the master gain also never scales the key.
+  The pan factor is the track's own mono-downmix law — centre pan =
+  unity (pre-v95 routes keep their level), hard L/R = 0.707 — because
+  the bus is mono and the downmix is exactly the contribution the
+  sender would make to the master bus (minus fader and mute).
+  The tap is block-constant in gain/pan (no per-sample ramp): it only
+  ever feeds a detector, so steps are inaudible by construction.
+  Zero cost when no routing exists: edges expand to (source, target)
+  pairs once per block (`e_src`/`e_tgt`, 256 entries) and are filtered
+  to sources that actually carry material this block — a muted or
+  stopped source with clips/MIDI still expands edges (its key flows!),
+  a source with nothing to play contributes nothing.
 * **Consumers.** `fx_mix` and `run_chain_block` pass the track's
   sidechain row down to scripted slots. Plugins see silence for `sc` —
   VST3 sidechain inputs need extra JACK port plumbing and are future
   work (see below).
+* **MIDI senders.** A muted source track's patterns still key the
+  target when its synth instance is DEDICATED to that track. Tracks
+  sharing one synth instance (e.g. several strips on the default piano)
+  cannot be rendered for the key while muted without leaking their
+  notes through the audible owner's row — a known limitation: route
+  from an audible track or give the sender its own instrument.
+  (Poly tracks, whose copies render independently, key regardless.)
 
 ## Script ABI v2
 
@@ -53,11 +80,20 @@ v1 vtable for them and passes no key. The bundled example is
 `effects/sidechain_comp.rs`: a feed-forward compressor whose detector
 takes `max(|input|, depth × |sc|)`, i.e. key-only ducking at `depth = 1`.
 
+## Offline mirror
+
+`render_tracks` exports with the same tap law: source rows are held
+**for every routed source regardless of the play flag**, scaled by
+`gain × (pgl + pgr) / sqrt(2)` only (never volume), sample-aligned (the
+live one-block detector lag cannot be reproduced without knowing the RT
+block size and is not part of what the user hears "as mixed"). Live and
+export therefore duck identically.
+
 ## Mixer integration
 
-* Each mixer strip has an **SC** picker: a popup listing all audible
-  tracks with checkmarks (self excluded). The mask is shown as a short
-  tag on the strip and on SC-capable chain slots (`"(SC)"`).
+* The chain window has a **Sidechain in** picker: all track numbers,
+  click to toggle (self excluded — the mask shows as a tag and keyed
+  tracks are listed under the picker).
 * Sends persist per project (`Config::sc_send`, mirrored into the engine
   on boot and on every change; `write_config_deferred`).
 * The chain window tags effects loaded through the v2 entry so it is
@@ -69,7 +105,8 @@ takes `max(|input|, depth × |sc|)`, i.e. key-only ducking at `depth = 1`.
   JACK input ports fed from the same bus) are not wired yet — the SC bus
   currently feeds scripted effects only. The mixer model is identical
   either way, so plugin support is plumbing, not redesign.
-* The bus is mono-sum pre-pan (standard for detectors).
+* The bus is mono (post-pan downmix factor per the tap law above).
+* Muted MIDI sources key only through dedicated synth instances (above).
 * 128 tracks max ⇒ exactly one `u128` per track; no per-target edge
   budget tuning needed at this scale.
 
@@ -83,3 +120,12 @@ takes `max(|input|, depth × |sc|)`, i.e. key-only ducking at `depth = 1`.
   audible unrouted, drops >30 % when the send is armed, and recovers
   after the send is cleared. Sabotage-tested: removing the routing makes
   the pin fail.
+* `e2e_v95_sc_muted_sender_still_ducks` / `e2e_v95_sc_zero_volume_sender_ducks`:
+  the same rig — then mute (play switch) / fader-to-zero the SENDER: the
+  duck must NOT move. `e2e_v95_sc_sender_vol_move_keeps_duck_depth`:
+  a 20 dB sender fader move leaves the duck depth unchanged.
+* `v95_sc_export_muted_sender_still_keys` / `v95_sc_export_tap_tracks_gain_pan`:
+  the offline mirror — exact duck values prove the export tap is
+  mute/fader-independent and gain/pan-preserving (depth ∝ gain, hard
+  pan × 1/√2, volume has zero effect). `v48_export_sidechain_ducks_target`
+  re-targeted to the new contract in the same commit.
