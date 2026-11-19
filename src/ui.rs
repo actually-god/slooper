@@ -13187,9 +13187,23 @@ impl App {
                 .strong()
                 .small(),
         );
-        egui::ScrollArea::horizontal()
+        // v89 (card t_3bee89a5): BOTH axes, with SOLID bars. One lane row
+        // per mapped sample (24px, cap 64) outgrows the clipped window body
+        // vertically too — with only horizontal enabled the lower samples
+        // were unreachable (no bar, no wheel), and the unbounded inner
+        // height also pushed the bottom scroll chrome off-screen. And the
+        // egui 0.36 DEFAULT floating style (2px, dormant opacity 0 until
+        // hovered) reads as "no scrollbar" — the acceptance bar is visible
+        // chrome; chrome still appears only when the content overflows
+        // (ScrollBarVisibility::VisibleWhenNeeded, the default). Vertical
+        // scroll follows the same live-scrolled-rect rule the horizontal
+        // drags already use.
+        let old_scroll_style = ui.spacing().scroll;
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| self.smap_body(ui, t));
+        ui.spacing_mut().scroll = old_scroll_style;
     }
 
     /// The key-map window's body: header (mode/add/presets) + one lane
@@ -54682,6 +54696,53 @@ mod tests {
         app.push_sampler_map(0);
     }
 
+    // ============ v89: sampler key map vertical scroll (card t_3bee89a5) =====
+    // Bug: the key map was wrapped in `ScrollArea::horizontal()` — once the
+    // lane rows (one per mapped sample, cap 64) exceeded the clipped window
+    // body, lower lanes had neither a scrollbar nor any wheel reach.
+    // Contract pinned here: overflow -> vertical bar chrome appears and BOTH
+    // wheel and bar-drag move the lane stack; fitting content -> zero
+    // vertical chrome; clicks still select the right lane through the
+    // scrolled viewport (assign behavior unchanged = the pre-existing
+    // v51/v52/v56/v57 assign pins).
+
+    /// v89 helper: sampler window opened (v56 helper) AND forced FLOATING
+    /// at a fixed on-screen rect. Two reasons: (a) the default docked/
+    /// remembered layout hangs the map's right edge past the 1440-px test
+    /// viewport, and egui's `is_rect_visible` then culls the scrollbar
+    /// shapes entirely — the pins could not see the chrome they assert;
+    /// (b) it makes the bar-corner geometry deterministic.
+    fn v89_open_map_app(tag: &str) -> (App, egui::Context) {
+        let (mut app, ctx) = v56_open_sampler_map(tag);
+        let n = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Synth(0))
+            .expect("synth window registered")
+            + 4;
+        app.dyn_wins[n - 4].dock = [0, 1, 0]; // float
+        app.dyn_remember(
+            n,
+            egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(1150.0, 520.0)),
+        );
+        frame(&mut app, &ctx, vec![]);
+        app.smap_probe.expect("map still painted after re-place");
+        (app, ctx)
+    }
+
+    /// v89 helper: force the track-0 key map to `n` synthetic slots.
+    fn v89_set_slots(app: &mut App, n: usize) {
+        let slots = (0..n)
+            .map(|i| crate::config::SamplerSlotSave {
+                vel: 127,
+                asset: format!("/nonexistent/v89_pad{i}.wav"),
+                root: (24 + i * 2).min(108) as u8,
+            })
+            .collect();
+        app.sampler_maps[0] = Some(crate::config::SamplerMapSave { slots, mode: 0 });
+        app.push_sampler_map(0);
+    }
+
     /// v90 helper: the map the LIVE synth instance publishes — what the
     /// audio thread plays, hence what any audition of that key sounds.
     fn v90_live_map(app: &App) -> Vec<(u32, u8, u8)> {
@@ -54932,5 +54993,271 @@ mod tests {
         assert_eq!((m.slots[0].root, m.slots[0].vel), (48, 127), "first layer lands at C3");
         assert_eq!(m.slots[0].asset, app.assets[z].path.to_string_lossy());
         assert!(app.status.contains("C3") && app.status.contains("zap"), "{}", app.status);
+    }
+
+    /// v89 helper: one zero-input frame; collect thin filled prims —
+    /// vertical scrollbar candidates (width 4..18, height >= 60) and
+    /// horizontal ones (height 4..18, width >= 60). Lane rows and keys
+    /// paint roll_w-wide (excluded); separators are ~1px thick (excluded).
+    /// animation_time is zeroed FIRST (egui 0.36 fades Areas; card rule).
+    fn v89_scroll_chrome(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut vbars: Vec<egui::Rect> = Vec::new();
+        let mut hbars: Vec<egui::Rect> = Vec::new();
+        for cs in &out.shapes {
+            if let egui::epaint::Shape::Rect(rs) = &cs.shape {
+                let (w, h) = (rs.rect.width(), rs.rect.height());
+                if rs.fill.a() == 0 || rs.rect.is_negative() {
+                    continue;
+                }
+                if (4.0..=18.0).contains(&w) && h >= 60.0 {
+                    vbars.push(rs.rect);
+                } else if (4.0..=18.0).contains(&h) && w >= 60.0 {
+                    hbars.push(rs.rect);
+                }
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        (vbars, hbars)
+    }
+
+    /// v89 pin: overflow shows the vertical bar AND wheel-scroll moves the
+    /// lanes; fitting content shows no bar and the wheel does nothing.
+    #[test]
+    fn v89_sampler_map_overflow_wheel_and_bar_scroll() {
+        let (mut app, ctx) = v89_open_map_app("v89-wheel");
+        // Scrollbar chrome fades in via animate_bool_responsive — which
+        // FOLLOWS animation_time — so kill it up front, not just at scan
+        // frames: every frame after this paints the bar at full width.
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        // -- FIT phase: 3 slots -> no vertical bar, wheel is inert.
+        v89_set_slots(&mut app, 3);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, lx0, ly0, _) = app.smap_probe.expect("map painted");
+        // lane pitch, measured on the FITTING map: the keyboard row is the
+        // direct sibling of the n lane rows in smap_body's vertical layout,
+        // so ky - ly0 = n * pitch exactly (reused for scrolled clicks).
+        let (_, ky, _, _, _) = app.smap_probe.expect("map painted");
+        let pitch = (ky - ly0) / 3.0;
+        assert!(
+            (20.0..=40.0).contains(&pitch),
+            "lane pitch sane, measured {pitch}"
+        );
+        let (vb, hb) = v89_scroll_chrome(&mut app, &ctx);
+        let fit_vbars: Vec<egui::Rect> =
+            vb.into_iter().filter(|v| hb.iter().any(|h| (h.max.x - v.max.x).abs() < 16.0 && h.width() >= 300.0)).collect();
+        assert!(
+            fit_vbars.is_empty(),
+            "fitting map must show NO vertical bar: {fit_vbars:?}"
+        );
+        // wheel over the map while it fits: content must not move.
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(egui::pos2(lx0 + 400.0, ly0 + 40.0))]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            }],
+        );
+        for _ in 0..20 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, _, ly_fit, _) = app.smap_probe.expect("map painted");
+        assert!(
+            (ly_fit - ly0).abs() < 1.0,
+            "fitting map must not scroll: ly {ly0} -> {ly_fit}"
+        );
+        // -- OVERFLOW phase: 30 slots -> the vertical bar appears.
+        v89_set_slots(&mut app, 30);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (kx, ky, lx, ly, _) = app.smap_probe.expect("map painted");
+        let (vb, hb) = v89_scroll_chrome(&mut app, &ctx);
+        let h = hb
+            .iter()
+            .filter(|h| h.width() >= 300.0)
+            .max_by_key(|h| (h.width() * 10.0) as i64)
+            .expect("horizontal bar exists (roll wider than viewport)");
+        let paired: Vec<egui::Rect> = vb
+            .into_iter()
+            // Solid bars reserve their 6px INSIDE the offered rect, so the
+            // vertical bar can sit up to one bar-width outside the
+            // horizontal bar's x-range (6px bar + 4px inner margin); 16px pairs
+            // the corner for either allocation order.
+            .filter(|v| (h.max.x - v.max.x).abs() < 16.0)
+            .collect();
+        assert!(
+            !paired.is_empty(),
+            "overflowing map must paint a vertical scrollbar meeting the \
+             horizontal bar's right corner (h={h:?})"
+        );
+        let _ = (kx, ky, lx, ly);
+        // -- wheel scrolls the lane stack through the viewport.
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(egui::pos2(lx0 + 400.0, ly + 40.0))]);
+        }
+        for _ in 0..2 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -400.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                }],
+            );
+        }
+        for _ in 0..25 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, _, ly_after, _) = app.smap_probe.expect("map painted");
+        assert!(
+            ly - ly_after >= 150.0,
+            "wheel over the map must scroll the lanes up: ly {ly} -> {ly_after}"
+        );
+    }
+
+    /// v89 pin: dragging the scrollbar thumb moves the lane stack.
+    #[test]
+    fn v89_sampler_map_bar_drag_scrolls() {
+        let (mut app, ctx) = v89_open_map_app("v89-bardrag");
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        v89_set_slots(&mut app, 30);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, lx, ly, _) = app.smap_probe.expect("map painted");
+        let (vb, hb) = v89_scroll_chrome(&mut app, &ctx);
+        let h = hb
+            .iter()
+            .filter(|h| h.width() >= 300.0)
+            .max_by_key(|h| (h.width() * 10.0) as i64)
+            .expect("horizontal bar");
+        let bar = *vb
+            .iter()
+            .filter(|v| (h.max.x - v.max.x).abs() < 16.0)
+            .max_by_key(|v| (v.height() * 10.0) as i64)
+            .expect("vertical bar present");
+        // Grab near the top of the bar (thumb sits at the top at offset 0)
+        // and drag DOWN -> content moves UP -> lane-origin y decreases.
+        let grab = egui::pos2(bar.center().x, bar.min.y + 12.0);
+        frame(&mut app, &ctx, vec![moved(grab)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(grab, egui::PointerButton::Primary, true)],
+        );
+        for step in 1..=6 {
+            let p = egui::pos2(grab.x, grab.y + (step as f32) * 55.0);
+            frame(&mut app, &ctx, vec![moved(p)]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(
+                egui::pos2(grab.x, grab.y + 330.0),
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        for _ in 0..25 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, _, ly_after, _) = app.smap_probe.expect("map painted");
+        let _ = lx;
+        assert!(
+            ly - ly_after >= 100.0,
+            "dragging the vertical bar down must scroll the lanes: {ly} -> {ly_after}"
+        );
+    }
+
+    /// v89 pin: with the map overflowing AND scrolled, a lane click still
+    // selects exactly the lane painted at that point (slot-click behavior
+    /// intact through the scrolled viewport).
+    #[test]
+    fn v89_sampler_map_scrolled_lane_click_selects() {
+        let (mut app, ctx) = v89_open_map_app("v89-clicksel");
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        // Measure the pitch on a fitting 3-slot map (see pin 1).
+        v89_set_slots(&mut app, 3);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, _, ly_fit, _) = app.smap_probe.expect("map painted");
+        let (_, ky, _, _, _) = app.smap_probe.expect("map painted");
+        let pitch = (ky - ly_fit) / 3.0;
+        // Overflow, small wheel scroll, then click the lane whose row is
+        // safely inside the visible band just below the viewport top.
+        v89_set_slots(&mut app, 30);
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, _, ly0, _) = app.smap_probe.expect("map painted");
+        frame(&mut app, &ctx, vec![moved(egui::pos2(0.0, 0.0))]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(egui::pos2(700.0, ly0 + 40.0))]);
+        }
+        frame(
+            &mut app, &ctx,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            }],
+        );
+        for _ in 0..20 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (_, _, lx, ly_now, _) = app.smap_probe.expect("map painted");
+        assert!(
+            ly0 - ly_now >= 50.0,
+            "wheel must actually scroll the overflowed map (the click below \
+             is only meaningful THROUGH the scrolled viewport): {ly0} -> {ly_now}"
+        );
+        let mut hit = None;
+        for k in 0..30usize {
+            let y = ly_now + (k as f32 + 0.5) * pitch;
+            if y > ly0 + 8.0 && y < ly0 + 160.0 {
+                hit = Some((k, y));
+                break;
+            }
+        }
+        let (k, y) = hit.expect("a lane row lands in the visible band");
+        let p = egui::pos2(lx + 400.0, y);
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(
+            app.smap_sel,
+            Some(k),
+            "clicking lane {k}'s painted row (y={y}, pitch={pitch}) must select it"
+        );
     }
 }
