@@ -4,6 +4,24 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- **Sampler presets and key maps survive restarts.** Saving a sampler
+  key map (session, project, or named preset) and loading it after
+  restarting the app listed every sample as `(missing)` and played
+  nothing — the refs were fine, the resolver was not: map slots point
+  at their **canonical rack file** (audio is never embedded, same rule
+  as clips), but resolution only saw the in-session sample table,
+  which a fresh start leaves empty. Every resolve step now re-links a
+  slot through the rack folders (exact path, then file-name fallback —
+  a moved rack folder no longer loses the samples, the slot is
+  rewritten to the new canonical location) and decodes it up front. A
+  `(missing)` marker now appears only for a file genuinely gone, and
+  the load message names each such slot instead of staying silent.
+  Drum-kit pads, which persisted the same pointers, got the same fix.
+
 ## [0.23.0] — 2026-11-18
 
 The **workflow release**: every sound gets a preset shelf, hosted

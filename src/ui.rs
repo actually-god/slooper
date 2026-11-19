@@ -1517,6 +1517,10 @@ pub struct App {
     /// Pristine (pre-edit) audio per edited asset path; the render always
     /// starts here so repeated edits never compound.
     se_source: std::collections::BTreeMap<String, std::sync::Arc<[f32]>>,
+    /// v93: rack paths whose DECODE failed (exists but unreadable). The
+    /// warm pass memoizes failures so a corrupt file cannot re-decode on
+    /// every frame/push; a successful path never enters this set.
+    smap_warm_bad: std::collections::HashSet<std::path::PathBuf>,
     /// Asset path whose sample editor is open.
     sample_edit_win: Option<String>,
     /// "save as new asset" name field.
@@ -2264,6 +2268,7 @@ impl App {
             rack_rename: None,
             sample_edits: Default::default(),
             se_source: Default::default(),
+            smap_warm_bad: std::collections::HashSet::new(),
             sample_edit_win: None,
             se_name: String::new(),
             se_geom: None,
@@ -7379,6 +7384,34 @@ impl App {
     /// v29 R5: re-resolve every pad's asset path against the loaded
     /// asset table (cheap; run before use, not per frame).
     fn drum_resolve(&mut self) {
+        // v93: pads persisted rack paths resolved against the same lazily
+        // decoded table as sampler slots — warm (re-resolve + decode) first,
+        // self-healing moved files, or every assigned pad goes silent on a
+        // restart.
+        let dirs = self.rack_res_dirs();
+        let mut healed = false;
+        let named: Vec<(usize, usize, String)> = self
+            .drum_kits
+            .iter()
+            .enumerate()
+            .flat_map(|(ki, kit)| {
+                kit.iter().enumerate().filter_map(move |(pi, p)| {
+                    (!p.asset_path.is_empty()).then(|| (ki, pi, p.asset_path.clone()))
+                })
+            })
+            .collect();
+        for (ki, pi, stored) in named {
+            if let Some(fp) = self.warm_sample_asset(&stored, &dirs) {
+                let canon = fp.to_string_lossy().into_owned();
+                if canon != self.drum_kits[ki][pi].asset_path {
+                    self.drum_kits[ki][pi].asset_path = canon;
+                    healed = true;
+                }
+            }
+        }
+        if healed {
+            self.save_config();
+        }
         // Only pads that actually name a file scan the asset table; the
         // (stock) rest short-circuits on the empty path.
         for kit in self.drum_kits.iter_mut() {
@@ -7395,11 +7428,99 @@ impl App {
         }
     }
 
+    /// v93: the rack folder list for sample-path re-resolution — the exact
+    /// rule `apply_load` uses for project assets (project::resolve_asset).
+    fn rack_res_dirs(&self) -> Vec<PathBuf> {
+        self.rack
+            .iter()
+            .map(|f| PathBuf::from(f.path.trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect()
+    }
+
+    /// v93 (card t_aaffeb92): make a persisted slot/pad sample path an entry
+    /// of `self.assets` — THE table every map/kit resolution scans. This was
+    /// the whole bug: the tables were populated only by in-session rack
+    /// clicks/drags, so a restart painted "(missing)" over refs whose files
+    /// sit exactly where stored. Contract = canonical rack POINTER, never
+    /// embedded audio (mirrors project.rs for clips): stored path if the
+    /// file exists, else re-resolve by file name against the rack folders
+    /// (`project::resolve_asset`), then DECODE it into the table. Returns
+    /// the canonical path; None only when the file is genuinely gone or
+    /// undecodable (callers say so — never silent). Before the audio rate
+    /// is known nothing decodes: the caller retries on a later event.
+    fn warm_sample_asset(&mut self, stored: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+        if self.sample_rate == 0 || stored.is_empty() {
+            return None;
+        }
+        let stored_p = PathBuf::from(stored);
+        let found = if stored_p.exists() {
+            Some(stored_p)
+        } else {
+            crate::project::resolve_asset(stored, dirs)
+        }?;
+        if self.assets.iter().any(|a| !a.dirty && a.path == found) {
+            return Some(found);
+        }
+        if self.smap_warm_bad.contains(&found) {
+            return None;
+        }
+        let sel = self.sel_asset;
+        let ok = self.ensure_asset(&found).is_some();
+        self.sel_asset = sel; // a warm pass must never steal the rack selection
+        if ok {
+            Some(found)
+        } else {
+            self.smap_warm_bad.insert(found);
+            None
+        }
+    }
+
+    /// v93: warm every slot of track `t`'s key map (re-resolve + decode +
+    /// SELF-HEAL stale path strings to the canonical rack location, saved
+    /// when anything moved). Returns (healed, missing stems) — the missing
+    /// list feeds the preset-load status echo (slot-level, never silent).
+    fn warm_sampler_map(&mut self, t: usize) -> (usize, Vec<String>) {
+        let dirs = self.rack_res_dirs();
+        let mut healed = 0usize;
+        let mut missing: Vec<String> = Vec::new();
+        let Some(mut m) = self.sampler_maps.get(t).cloned().flatten() else {
+            return (0, missing);
+        };
+        let mut changed = false;
+        for s in m.slots.iter_mut() {
+            if let Some(fp) = self.warm_sample_asset(&s.asset, &dirs) {
+                let canon = fp.to_string_lossy().into_owned();
+                if canon != s.asset {
+                    s.asset = canon;
+                    healed += 1;
+                    changed = true;
+                }
+            } else if !s.asset.is_empty() && self.sample_rate != 0 {
+                missing.push(
+                    std::path::Path::new(&s.asset)
+                        .file_stem()
+                        .map(|x| x.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "?".into()),
+                );
+            }
+        }
+        if changed {
+            self.sampler_maps[t] = Some(m.clone());
+            self.save_config();
+        }
+        (healed, missing)
+    }
+
     /// v51: publish track `t`'s sampler key map onto its live script
     /// instance. Slot asset PATHS resolve to rack ids like the drum kit
     /// (`drum_resolve`); an unresolved path drops the slot rather than
     /// aliasing the wrong sample. `None` clears the map (legacy params).
     fn push_sampler_map(&mut self, t: usize) {
+        // v93: the persisted slot paths must be IN the asset table before
+        // ANY resolution runs — boot restore, preset load and synth
+        // re-binds all happen with a cold (lazily-filled) table.
+        self.warm_sampler_map(t);
         let Some(handle) = self.track_synth_inst.get(t).cloned().flatten() else {
             return;
         };
@@ -12764,9 +12885,21 @@ impl App {
                 let n = m.slots.len();
                 self.sampler_maps[t] = Some(m);
                 self.smap_sel = None;
+                // v93: resolve + warm BEFORE the echo — a slot whose file is
+                // genuinely gone is NAMED here (and painted "(missing)" in
+                // the window), never silently dropped.
+                let (_healed, missing) = self.warm_sampler_map(t);
                 self.push_sampler_map(t);
                 self.save_config();
-                self.status = format!("sampler preset {name}: {n} slots loaded");
+                self.status = if missing.is_empty() {
+                    format!("sampler preset {name}: {n} slots loaded")
+                } else {
+                    format!(
+                        "sampler preset {name}: {} of {n} slots loaded, missing: {}",
+                        n - missing.len(),
+                        missing.join(", ")
+                    )
+                };
             }
             Err(e) => self.status = format!("sampler preset load failed: {e}"),
         }
@@ -13216,6 +13349,10 @@ impl App {
     /// smap_note_* geometry so they can never drift apart again. The roll
     /// is wider than any window, so it sits in a horizontal scroll (v52).
     fn smap_body(&mut self, ui: &mut egui::Ui, t: usize) {
+        // v93: the window must show TRUE resolution state on any frame,
+        // including the first one after a restart — warm the table (cheap
+        // no-op once warm; a gone file hits only the poison memo).
+        self.warm_sampler_map(t);
         const LANE_H: f32 = 24.0;
         const KEY_H: f32 = 22.0;
         const HDR_W: f32 = 190.0;
@@ -55744,7 +55881,7 @@ mod tests {
     /// was the user's report: the boot table is empty, every slot missing.
     #[test]
     fn v93_smap_boot_restore_resolves_all_slots() {
-        let (mut app, _kick, _snare) = v93_map_app("v93boot");
+        let (app, _kick, _snare) = v93_map_app("v93boot");
         app.save_config();
         drop(app);
         let mut app2 = v93_reboot("v93boot");
