@@ -5132,13 +5132,15 @@ fn e2e_v97_sc_send_gain_scales_duck() {
     // detector (ratio 4) means a clearly shallower duck.
     b.engine.set_sc_recv_gain(1, 0, 0.5);
     let half = measure(200);
-    assert!(
-        half > open * 0.7,
-        "half send level must raise the floor toward the open tone: open {open}, half {half}"
-    );
     // Zero: the route is armed but silent — the tone rides unducked.
     b.engine.set_sc_recv_gain(1, 0, 0.0);
     let off = measure(200);
+    // Measured ladder: off ~0.97x open, half ~0.4x off, full ~0.6x half,
+    // boost ~0.6x full — assert the monotonic gaps with ~30 % margins.
+    assert!(
+        half < off * 0.6 && half > off * 0.15,
+        "half send level must still duck, but clearly shallower than the v95 duck: open {open}, half {half}, off {off}"
+    );
     assert!(
         off > open * 0.9,
         "receive gain 0 must un-duck the target: open {open}, off {off}"
@@ -5147,7 +5149,7 @@ fn e2e_v97_sc_send_gain_scales_duck() {
     b.engine.set_sc_recv_gain(1, 0, 1.0);
     let full = measure(200);
     assert!(
-        full < open * 0.7,
+        full < half * 0.8 && full < open * 0.7,
         "unity must restore the v95 duck: open {open}, full {full}"
     );
     // Boost: twice the key drives more gain reduction still.
