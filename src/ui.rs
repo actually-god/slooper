@@ -56062,10 +56062,17 @@ mod tests {
 
     /// Pin 5: sibling class — a drum-kit pad assigned from the rack also
     /// persisted a path resolved against the lazy table (drum_resolve). The
-    /// same restart must resolve it.
+    /// same restart must resolve it. Deliberately NO sampler key map on the
+    /// session: the drum seam must resolve it on its OWN (the SAB3 sabotage
+    /// proved a co-resident map warm would mask a dead drum seam).
     #[test]
     fn v93_drum_kit_boot_resolves_pad() {
-        let (mut app, kick, _snare) = v93_map_app("v93drum");
+        let mut app = headless_app("v93drum");
+        let kick = std::env::temp_dir()
+            .join("sp-uity-v93drum")
+            .join("samples")
+            .join("kick.wav");
+        assert!(kick.exists());
         app.drum_kits[0][0].asset_path = kick.to_string_lossy().into_owned();
         app.save_config();
         drop(app);
