@@ -1936,8 +1936,11 @@ const fn smap_is_black(n: u8) -> bool {
     matches!(n % 12, 1 | 3 | 6 | 8 | 10)
 }
 const fn smap_whites_below(n: u8) -> usize {
-    // whites strictly below pitch-class r inside one octave
-    const PRE: [usize; 12] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6];
+    // whites strictly below pitch-class r inside one octave. NOTE (v92):
+    // the black pitch-classes 6/8/10 count FOUR/FIVE/SIX whites (F# has
+    // C,D,E,F below) — a 3/4/5 here slides F#/G#/A# one boundary left and
+    // paints five black keys in a row (v92_ pins watch this table).
+    const PRE: [usize; 12] = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6];
     (n as usize / 12) * 7 + PRE[n as usize % 12]
 }
 const fn smap_white_keys_build() -> [u8; 74 + 1] {
