@@ -1,4 +1,4 @@
-//! v94/MCP — built-in MCP server core (docs/MCP-DESIGN.md spine).
+//! v107/MCP — built-in MCP server core (docs/MCP-DESIGN.md spine).
 //!
 //! Shape (decisions D1–D7, all settled by MCP-00 — do not re-litigate):
 //! - Streamable HTTP on 127.0.0.1 ONLY, POST /mcp, JSON-request/JSON-response
