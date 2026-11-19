@@ -56870,4 +56870,271 @@ mod tests {
             "INTERNAL_VERSION must be bumped to v96"
         );
     }
+
+    // ---- v96 (sc-2): multi-track preview — SC finally audible -------------
+
+    /// A4: the config→App mapping. The legacy scalar loads as a
+    /// ONE-ELEMENT set; a set wins over the scalar; the set normalizes;
+    /// out-of-table entries are dropped; empty means default piano.
+    #[test]
+    fn v96_preview_set_mapping() {
+        let mut cfg = Config::default();
+        cfg.preview_track = Some(3);
+        assert_eq!(
+            preview_set_from_cfg(&cfg),
+            vec![3],
+            "an OLD config with a scalar preview_track loads as a one-element set"
+        );
+        cfg.preview_tracks = vec![1, 0, 1];
+        assert_eq!(
+            preview_set_from_cfg(&cfg),
+            vec![0, 1],
+            "the set wins over the legacy scalar; sorted & deduped"
+        );
+        cfg.preview_track = None;
+        cfg.preview_tracks = vec![7, 1];
+        assert_eq!(preview_set_from_cfg(&cfg), vec![1, 7]);
+        cfg.preview_tracks = vec![0, 9999];
+        assert_eq!(
+            preview_set_from_cfg(&cfg),
+            vec![0],
+            "out-of-table entries are dropped"
+        );
+        cfg.preview_tracks.clear();
+        cfg.preview_track = None;
+        assert!(preview_set_from_cfg(&cfg).is_empty(), "empty = default piano");
+    }
+
+    /// A1b + A2: a REAL multi-selection (Ctrl-click header, the v94 seam)
+    /// makes the preview route the WHOLE set — and the roll PREVIEW
+    /// stages one audition voice per member. A plain single-selection
+    /// click never touches the route (old behavior, preserved).
+    #[test]
+    fn v96_multiselect_selection_routes_preview() {
+        fn find_exact(app: &mut App, ctx: &egui::Context, want: &str) -> Option<egui::Rect> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == want {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.map(|p| egui::Rect::from_min_size(p, egui::vec2(4.0, 12.0)))
+        }
+        let mut app = headless_app("v96mroute");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Plain single click: old behavior — the route is untouched.
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![0]);
+        assert!(
+            app.preview_tracks.is_empty(),
+            "a plain selection never changes the persisted route: {:?}",
+            app.preview_tracks
+        );
+        // Ctrl+click track 3: the MULTI-selection IS the preview route —
+        // the user story is select the SC pair, hit preview, HEAR the duck.
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![0, 2]);
+        assert_eq!(
+            app.preview_tracks, vec![0, 2],
+            "multi-selection routes the preview to the whole set"
+        );
+        // And PREVIEW actually fans out — one voice per member track.
+        open_roll_headless(&mut app, &ctx);
+        app.piano_roll.as_mut().unwrap().pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+        });
+        frame(&mut app, &ctx, vec![]);
+        let pv = find_exact(&mut app, &ctx, "preview")
+            .expect("preview button")
+            .center();
+        frame(&mut app, &ctx, vec![moved(pv), btn_btn(pv, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(pv, false)]);
+        let mut tracks: Vec<usize> = app
+            .backend
+            .engine
+            .audition_snapshot()
+            .iter()
+            .map(|r| r.track)
+            .collect();
+        tracks.sort_unstable();
+        assert_eq!(
+            tracks,
+            vec![0, 2],
+            "one audition voice per selected track (engine side: e2e_v96_multi_preview_pair_ducks)"
+        );
+        assert!(
+            app.status.contains("track 1") && app.status.contains("track 3"),
+            "status names BOTH routed tracks: {}",
+            app.status
+        );
+    }
+
+    /// A3: the picker rows TOGGLE the route — the popup stays open for a
+    /// run of clicks (egui 0.36 ComboBox defaults to CloseOnClick, which
+    /// would silently cap the route at ONE track per open — the whole
+    /// reported bug in widget form). "default (piano)" clears the set.
+    #[test]
+    fn v96_picker_multi_route_toggle() {
+        fn combo_label_pos(app: &mut App, ctx: &egui::Context) -> egui::Pos2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == "preview:" {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.expect("preview: route label painted")
+        }
+        let mut app = headless_app("v96picktog");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        open_roll_headless(&mut app, &ctx);
+        let label = combo_label_pos(&mut app, &ctx);
+        let cb = egui::pos2(label.x + 120.0, label.y + 6.0);
+        frame(&mut app, &ctx, vec![moved(cb), btn_btn(cb, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(cb, false)]);
+        frame(&mut app, &ctx, vec![]); // popup opens
+        // Toggle track 1 in. LAST-match reads: the popup is a window (it
+        // paints after the combo button, whose label reuses the same text).
+        let r1 = galley_at_last(&mut app, &ctx, "track 1 \u{b7}")
+            .expect("row: track 1")
+            .center();
+        frame(&mut app, &ctx, vec![moved(r1), btn_btn(r1, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(r1, false)]);
+        assert_eq!(app.preview_tracks, vec![0], "row click toggles the route in");
+        // THE multi-route step — a CloseOnClick popup would have CLOSED
+        // here and this second click would hit dead space.
+        let r2 = galley_at_last(&mut app, &ctx, "track 2 \u{b7}")
+            .expect("row: track 2 (popup survived the first toggle!)")
+            .center();
+        frame(&mut app, &ctx, vec![moved(r2), btn_btn(r2, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(r2, false)]);
+        assert_eq!(app.preview_tracks, vec![0, 1], "a SECOND track joins in the same open");
+        assert!(
+            app.status.contains("live instruments + chains"),
+            "multi-route echo: {}",
+            app.status
+        );
+        // Toggle track 1 back OUT — sets, not scalars.
+        let r1 = galley_at_last(&mut app, &ctx, "track 1 \u{b7}")
+            .expect("row: track 1 again")
+            .center();
+        frame(&mut app, &ctx, vec![moved(r1), btn_btn(r1, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(r1, false)]);
+        assert_eq!(app.preview_tracks, vec![1], "row click toggles OUT too");
+        // Rejoin so the fan-out assertion below routes BOTH tracks.
+        let r1 = galley_at_last(&mut app, &ctx, "track 1 \u{b7}")
+            .expect("row: track 1 rejoin")
+            .center();
+        frame(&mut app, &ctx, vec![moved(r1), btn_btn(r1, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(r1, false)]);
+        assert_eq!(app.preview_tracks, vec![0, 1]);
+        // The combo BUTTON now labels itself with the whole route.
+        let btn_label = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().any(|cs| {
+                matches!(&cs.shape, egui::epaint::Shape::Text(t) if t.galley.text().contains("track 1") && t.galley.text().contains("track 2"))
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit
+        };
+        assert!(btn_label, "the combo button shows the whole SET route");
+        // Preview through the toggled set: one voice per toggled track.
+        app.piano_roll.as_mut().unwrap().pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+        });
+        frame(&mut app, &ctx, vec![]);
+        let pv = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out.shapes.iter().find_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    if t.galley.text() == "preview" {
+                        return Some(t.pos);
+                    }
+                }
+                None
+            });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit.map(|p| egui::Rect::from_min_size(p, egui::vec2(4.0, 12.0)))
+                .expect("preview button")
+                .center()
+        };
+        frame(&mut app, &ctx, vec![moved(pv), btn_btn(pv, true)]);
+        frame(&mut app, &ctx, vec![btn_btn(pv, false)]);
+        let mut tracks: Vec<usize> = app
+            .backend
+            .engine
+            .audition_snapshot()
+            .iter()
+            .map(|r| r.track)
+            .collect();
+        tracks.sort_unstable();
+        assert_eq!(tracks, vec![0, 1], "picker-toggled set fans out per track");
+    }
 }
