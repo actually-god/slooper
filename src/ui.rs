@@ -55773,7 +55773,9 @@ mod tests {
 
     /// Pin 2: the card's literal flow — save a preset, RESTART, load it
     /// through the real picker: every sample resolves, the map reaches the
-    /// engine (audition has audio), zero "(missing)".
+    /// engine (audition has audio), zero "(missing)". After the restart the
+    /// user must touch a rack sample to open the map window at all (that
+    /// is what seeds it — the v56 flow); the LOAD is the fix's test surface.
     #[test]
     fn v93_smap_preset_load_after_restart_resolves() {
         let (mut app, _kick, _snare) = v93_map_app("v93load");
@@ -55787,13 +55789,6 @@ mod tests {
         frame(&mut app2, &ctx, vec![]);
         assert!(app2.sampler_maps[0].is_none(), "clean slate after restart");
         v93_pump_bound(&mut app2, &ctx);
-        app2.synth_win = Some(0);
-        frame(&mut app2, &ctx, vec![]);
-        app2.smap_probe.expect("key map painted");
-        // v56 lesson: the name box ECHOES shadow popup rows — clear first.
-        app2.status.clear();
-        app2.smap_preset_name.clear();
-        frame(&mut app2, &ctx, vec![]);
         let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
             for ev in [
                 vec![moved(p)],
@@ -55803,6 +55798,20 @@ mod tests {
                 frame(app, ctx, ev);
             }
         };
+        // v56 flow: a rack click selects the sampler asset (and seeds the
+        // map on the first window open) — cold-boot users get here the same
+        // way, WITHOUT any earlier session's warm table.
+        let kick = galley_at(&mut app2, &ctx, "kick")
+            .expect("kick rack row")
+            .center();
+        click(&mut app2, &ctx, kick);
+        app2.synth_win = Some(0);
+        frame(&mut app2, &ctx, vec![]);
+        app2.smap_probe.expect("key map painted");
+        // v56 lesson: the name box ECHOES shadow popup rows — clear first.
+        app2.status.clear();
+        app2.smap_preset_name.clear();
+        frame(&mut app2, &ctx, vec![]);
         let lb = *galley_centers(&mut app2, &ctx, "load", true)
             .first()
             .expect("load combo");
@@ -55842,9 +55851,21 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut app2, &ctx, vec![]);
         v93_pump_bound(&mut app2, &ctx);
+        let kick = galley_at(&mut app2, &ctx, "kick")
+            .expect("kick rack row")
+            .center();
+        for ev in [
+            vec![moved(kick)],
+            vec![moved(kick), btn(kick, egui::PointerButton::Primary, true)],
+            vec![btn(kick, egui::PointerButton::Primary, false)],
+        ] {
+            frame(&mut app2, &ctx, ev);
+        }
         app2.synth_win = Some(0);
         frame(&mut app2, &ctx, vec![]);
         app2.smap_probe.expect("key map painted");
+        // The widget flow of Load is pinned by pin 2; the degraded-path
+        // ECHO is what matters here — drive the seam directly.
         app2.sampler_preset_load(0, "gone");
         assert!(
             app2.status.to_lowercase().contains("missing")
