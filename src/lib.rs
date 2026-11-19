@@ -47,6 +47,14 @@ pub mod vsthost;
 
 pub use midi::{MidiAction, MidiBind, MidiMsg};
 
+/// Single source of truth for the internal series stamp (vNN). The public
+/// release version is Cargo.toml's version — read through
+/// `env!("CARGO_PKG_VERSION")` (header, host reports, crash reports).
+/// This constant is the ONLY place the internal series number lives:
+/// bump one line here per pass; the settings-panel footer reads it.
+/// Never rendered in the header (pins v91_* hold that seam).
+pub const INTERNAL_VERSION: &str = "v91";
+
 /// Arm the vendor-teardown hush (v73/S8, shared body): SIGTRAP becomes
 /// `_exit(0)`. Built for the production Unix path (below) and, as before,
 /// for every test build on both OSes (`any(unix, test)` keeps Windows
