@@ -319,7 +319,7 @@ fn gen_token() -> String {
     let stack_probe = &nanos as *const u64 as u64;
     let mut s = nanos ^ ((std::process::id() as u64) << 33) ^ stack_probe ^ 0x9E37_79B9_7F4A_7C15;
     let mut out = String::with_capacity(32);
-    for _ in 0..4 {
+    for _ in 0..2 {
         s = splitmix64(s);
         out.push_str(&format!("{s:016x}"));
     }
