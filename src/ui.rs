@@ -56743,8 +56743,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v94\""),
-            "INTERNAL_VERSION must be bumped to v94"
+            librs.contains("INTERNAL_VERSION: &str = \"v95\""),
+            "INTERNAL_VERSION must be bumped to v95"
         );
     }
 }
