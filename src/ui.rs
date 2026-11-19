@@ -5270,6 +5270,13 @@ impl App {
             let a = self.track_sel_anchor.min(self.n_tracks - 1);
             let (lo, hi) = (a.min(t), a.max(t));
             self.track_sel = (lo..=hi).collect();
+            // The run ALWAYS contains the anchor; a prior Ctrl-removal may
+            // have re-seated `selected` outside it (e.g. active dropped to
+            // set[0], anchor stayed put) — re-seat onto the anchor so the
+            // set invariant (sc-2 relies on it) holds on EVERY path.
+            if !self.track_sel.contains(&self.selected) {
+                self.selected = a;
+            }
             self.status = format!("tracks {}–{} selected ({})", lo + 1, hi + 1, hi - lo + 1);
         } else if ctrl {
             if self.track_sel.contains(&t) {
@@ -5307,15 +5314,24 @@ impl App {
 
     /// v94: keep the set invariant when `n_tracks` changes (Settings seam)
     /// or a project loads: members beyond the new count are dropped, the
-    /// anchor clamps, and the active track re-seats so the set never goes
-    /// empty. Growing back cannot drift: members kept their indices.
+    /// anchor clamps, and the active track re-seats onto the SURVIVING
+    /// member nearest its old index (the clamped index itself may not
+    /// exist — writing it would resurrect a phantom member). Growing back
+    /// cannot drift: kept members kept their indices.
     fn clamp_track_sel(&mut self) {
         let n = self.n_tracks.max(1);
-        self.selected = self.selected.min(n - 1);
         self.track_sel.retain(|&j| j < n);
         self.track_sel_anchor = self.track_sel_anchor.min(n - 1);
+        if self.track_sel.is_empty() {
+            self.track_sel = vec![self.selected.min(n - 1)];
+        }
         if !self.track_sel.contains(&self.selected) {
-            self.track_sel = vec![self.selected];
+            let old = self.selected.min(n - 1);
+            self.selected = *self
+                .track_sel
+                .iter()
+                .min_by_key(|&&j| (j as i64 - old as i64).abs())
+                .unwrap();
         }
     }
 
@@ -56281,6 +56297,454 @@ mod tests {
         assert!(
             app2.kit(0)[0].asset.is_some(),
             "a pad pointing at an existing rack file must resolve after a restart"
+        );
+    }
+
+    // ---- v94 (sc-1): multi-track selection --------------------------------
+    // Card t_d4479e3d. Clips/notes click language on track rows: plain
+    // replaces, Ctrl/Cmd toggles, Shift extends a run; the set
+    // (App::track_sel) is what multi-track preview (sc-2) consumes.
+    // Requirements + sabotage matrix: scratch slooper-v94/REQUIREMENTS.md.
+
+    /// Mixer dock strip header for `n` (1-based label): the proven v59 band
+    /// (master closed, 3 settle frames, x > 1000 mixer side, y < 853 —
+    /// below the fold the automation dock paints its own labelled rows).
+    fn v94_strip_head(app: &mut App, ctx: &egui::Context, n: usize) -> egui::Pos2 {
+        let c: Vec<egui::Pos2> = galley_centers(app, ctx, &format!("Track {n}"), true)
+            .into_iter()
+            .filter(|p| p.x > 1000.0 && p.y < 853.0)
+            .collect();
+        assert_eq!(c.len(), 1, "exactly one strip header 'Track {n}': {c:?}");
+        c[0]
+    }
+
+    /// The AC3 invariant as a whole: sc-2 consumes `track_sel` raw, so it
+    /// must be sorted+deduped, NON-EMPTY, contain the active track, and
+    /// never reference a hidden track.
+    fn v94_assert_sel_inv(app: &App) {
+        assert!(!app.track_sel.is_empty(), "selection never empty");
+        assert!(
+            app.track_sel.windows(2).all(|w| w[0] < w[1]),
+            "sorted & deduped: {:?}",
+            app.track_sel
+        );
+        assert!(
+            app.track_sel.contains(&app.selected),
+            "active inside set: sel={:?} active={}",
+            app.track_sel,
+            app.selected
+        );
+        assert!(
+            app.track_sel.iter().all(|&t| t < app.n_tracks),
+            "members in range: {:?}",
+            app.track_sel
+        );
+    }
+
+    /// Modifier click that HOLDS the modifiers THROUGH the release frame:
+    /// production reads `ui.input(|i| i.modifiers)` when `clicked()` fires
+    /// (the release frame), so clearing them in that same frame — after the
+    /// release event — would blind it (the v34 R18 trap; the shared
+    /// `click_mod` clears in-frame, fine for KEY events only).
+    /// Modifiers EXACTLY as egui-winit emits them on Linux: the `command`
+    /// FIELD is derived from ctrl by the platform layer — the
+    /// `egui::Modifiers::CTRL` CONSTANT carries command:false, so a harness
+    /// that sends it blinds production code reading `m.command` (found the
+    /// hard way; every ctrl-click degraded to plain).
+    fn v94_mods(ctrl: bool, shift: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            command: ctrl,
+            ctrl,
+            shift,
+            ..egui::Modifiers::NONE
+        }
+    }
+
+    fn v94_click_mod(app: &mut App, ctx: &egui::Context, p: egui::Pos2, m: egui::Modifiers) {
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::ModifiersChanged(m),
+                moved(p),
+                btn(p, egui::PointerButton::Primary, true),
+            ],
+        );
+        frame(app, ctx, vec![btn(p, egui::PointerButton::Primary, false)]);
+        frame(app, ctx, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+    }
+
+    /// AC1/AC2: the full click-modifier semantics through REAL header clicks
+    /// on BOTH surfaces (dock strip + mix page), with the v72 status echo
+    /// asserted exactly at every step.
+    #[test]
+    fn v94_track_row_click_semantics() {
+        let mut app = headless_app("v94click");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Plain click = single-select.
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.track_sel, vec![0]);
+        assert_eq!(app.status, "track 1 selected");
+        // Ctrl+click ADDS; the clicked track becomes active AND the anchor.
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![0, 2]);
+        assert_eq!(app.selected, 2, "added member becomes active");
+        assert_eq!(app.status, "tracks 1, 3 selected (2)");
+        v94_assert_sel_inv(&app);
+        // Ctrl+click REMOVES; the active track only moves if removed.
+        let p = v94_strip_head(&mut app, &ctx, 5);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        assert_eq!(app.track_sel, vec![0, 2, 4]);
+        assert_eq!(app.status, "tracks 1, 3, 5 selected (3)");
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![0, 4]);
+        assert_eq!(app.selected, 4, "active untouched — it was not removed");
+        assert_eq!(
+            app.status,
+            "track 3 unselected \u{b7} tracks 1, 5 selected (2)"
+        );
+        // Removing the ACTIVE member falls back to the first remaining.
+        let p = v94_strip_head(&mut app, &ctx, 5);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![0]);
+        assert_eq!(app.selected, 0, "active re-seats onto a remaining member");
+        assert_eq!(app.status, "track 5 unselected \u{b7} tracks 1 selected (1)");
+        // The LAST member refuses to leave — with an echo saying why.
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![0], "set never empties");
+        assert!(
+            app.status.contains("one track must stay selected"),
+            "refusal echo: {:?}",
+            app.status
+        );
+        v94_assert_sel_inv(&app);
+        // Shift+click extends the anchor run; active stays in the set;
+        // the anchor stays put (a second shift re-runs the SAME anchor).
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        click_pt(&mut app, &ctx, p);
+        let p = v94_strip_head(&mut app, &ctx, 5);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(false, true));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![2, 3, 4]);
+        assert_eq!(app.selected, 2, "shift leaves the active track in place");
+        assert_eq!(app.status, "tracks 3\u{2013}5 selected (3)");
+        let p = v94_strip_head(&mut app, &ctx, 4);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(false, true));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![2, 3], "anchor survives a shift run");
+        assert_eq!(app.status, "tracks 3\u{2013}4 selected (2)");
+        v94_assert_sel_inv(&app);
+        // Same language on the mix page (shared seam — no drift): opening
+        // the page and plain-clicking REPLACES the strip-built set.
+        click_exact(&mut app, &ctx, "MIX");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.mix_tab, "page open");
+        let ch = |app: &mut App, ctx: &egui::Context, n: usize| -> egui::Pos2 {
+            let c: Vec<egui::Pos2> = galley_centers(app, ctx, &format!("Ch {n}"), true)
+                .into_iter()
+                .filter(|p| p.y < 853.0)
+                .collect();
+            assert_eq!(c.len(), 1, "one mix-page header 'Ch {n}': {c:?}");
+            c[0]
+        };
+        let p = ch(&mut app, &ctx, 2);
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![1], "page replaces the strip's set");
+        assert_eq!(app.status, "track 2 selected");
+        let p = ch(&mut app, &ctx, 4);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.track_sel, vec![1, 3]);
+        assert_eq!(app.status, "tracks 2, 4 selected (2)");
+        v94_assert_sel_inv(&app);
+    }
+
+    /// AC3: the set invariant holds on EVERY mutation path, including the
+    /// MIDI actions routed through the plain-select helper and the
+    /// Ctrl-removal-reseats / shift-run interaction that naively leaves the
+    /// active track OUTSIDE the run (sc-2 reads the list raw — the seam
+    /// re-seats onto the anchor).
+    #[test]
+    fn v94_track_sel_invariant() {
+        let mut app = headless_app("v94inv");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        v94_assert_sel_inv(&app); // a fresh app starts valid
+        // MIDI Select/Next/Prev route through the seam: the set follows.
+        app.fire_midi_action(crate::midi::MidiAction::Select(5));
+        assert_eq!(app.track_sel, vec![5], "MIDI Select follows the seam");
+        app.fire_midi_action(crate::midi::MidiAction::SelectNext);
+        assert_eq!(app.track_sel, vec![6]);
+        app.fire_midi_action(crate::midi::MidiAction::SelectPrev);
+        assert_eq!(app.selected, 5);
+        assert_eq!(app.track_sel, vec![5]);
+        v94_assert_sel_inv(&app);
+        // The re-seat edge: active ends at set[0] while the anchor sits at
+        // 3; a shift run 3..=4 then EXCLUDES the active track unless the
+        // seam re-seats it onto the anchor.
+        app.select_track_click(2, false, false); // [2] a2
+        app.select_track_click(5, true, false); // [2,5] a5
+        app.select_track_click(3, true, false); // [2,3,5] a3
+        app.select_track_click(3, true, false); // remove 3 -> [2,5], active->2
+        assert_eq!(app.track_sel, vec![2, 5]);
+        assert_eq!(app.selected, 2);
+        app.select_track_click(4, false, true); // shift from anchor 3 -> run [3,4]
+        assert_eq!(app.track_sel, vec![3, 4]);
+        assert!(
+            app.track_sel.contains(&app.selected),
+            "shift re-seats the active member onto the anchor: sel={:?} active={}",
+            app.track_sel,
+            app.selected
+        );
+        v94_assert_sel_inv(&app);
+    }
+
+    /// AC4: a n_tracks shrink prunes members past the new count, a
+    /// grow-back cannot drift what was kept, and a project load starts a
+    /// fresh single-select (its tracks are a different world).
+    #[test]
+    fn v94_track_count_shrink_prunes() {
+        let mut app = headless_app("v94shrink");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.select_track_click(9, false, false);
+        app.select_track_click(12, true, false);
+        assert_eq!(app.track_sel, vec![9, 12]);
+        // Settings shrink to 11 tracks (the seam the settings row calls).
+        app.n_tracks = 11;
+        app.clamp_track_sel();
+        assert_eq!(app.track_sel, vec![9]);
+        assert_eq!(app.selected, 9);
+        v94_assert_sel_inv(&app);
+        // Grow back: kept members kept their indices — no drift.
+        app.n_tracks = 16;
+        app.clamp_track_sel();
+        assert_eq!(app.track_sel, vec![9]);
+        // Project load resets to a fresh single-select.
+        app.select_track_click(11, false, false);
+        app.select_track_click(13, true, false);
+        assert_eq!(app.track_sel, vec![11, 13]);
+        app.do_save("v94rt");
+        app.select_track_click(0, false, false);
+        let path = crate::project::project_path(&app.projects_dir(), "v94rt");
+        app.do_load(&path);
+        v94_assert_sel_inv(&app);
+        assert_eq!(
+            app.track_sel,
+            vec![app.selected],
+            "a loaded project starts single-selected"
+        );
+    }
+
+    /// AC5: the shared head menu joins ALL selected tracks to the RECORD
+    /// GROUP through the ONE seam — ascending order, the v52 R4 loop ("l")
+    /// inherit contract, already-members skipped — and echoes the joiners.
+    #[test]
+    fn v94_rec_group_join_from_selection() {
+        let mut app = headless_app("v94recgrp");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Pre-joined front member carries loop "l"; joiners must inherit it.
+        app.rec_group.push(0);
+        app.rec_src[0].loop_rec = true;
+        // Select tracks 1, 3, 5 on the real strips.
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        click_pt(&mut app, &ctx, p);
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        let p = v94_strip_head(&mut app, &ctx, 5);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        assert_eq!(app.track_sel, vec![0, 2, 4]);
+        // The shared head menu carries the join-from-selection entry.
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "REC group (selection)")
+            .expect("join entry in the shared head menu");
+        click_pt(&mut app, &ctx, item.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.rec_group,
+            vec![0, 2, 4],
+            "selected tracks joined in ascending order (track 1 already a member — skipped)"
+        );
+        assert!(
+            app.rec_src[2].loop_rec && app.rec_src[4].loop_rec,
+            "joiners inherit the front member's loop selector (v52 R4)"
+        );
+        assert!(
+            app.status.contains("tracks 3, 5 join"),
+            "echo names the joiners: {:?}",
+            app.status
+        );
+        // Joining again with the same selection is a no-op with an echo.
+        let p = v94_strip_head(&mut app, &ctx, 5);
+        rmb(&mut app, &ctx, p);
+        let item2 = galley_at_last(&mut app, &ctx, "REC group (selection)")
+            .expect("join entry on the second header too (shared menu)");
+        click_pt(&mut app, &ctx, item2.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rec_group, vec![0, 2, 4], "no duplicates on re-join");
+        assert!(
+            app.status.contains("already joined"),
+            "re-join echo: {:?}",
+            app.status
+        );
+    }
+
+    /// AC2 (visual): every member paints its header selectable; the ACTIVE
+    /// member additionally rides the kit accent on its label — color-only,
+    /// so the strip-alignment pins cannot shift.
+    #[test]
+    fn v94_active_accent_painted() {
+        let mut app = headless_app("v94accent");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        click_pt(&mut app, &ctx, p);
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        assert_eq!(app.track_sel, vec![0, 2]);
+        let st = ctx.global_style();
+        let accent = crate::kit::Kit::of(&st.visuals).accent;
+        // Section colors of the painted (strip band) "Track N" galley.
+        fn label_colors(app: &mut App, ctx: &egui::Context, needle: &str) -> Vec<Color32> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hits = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Text(t) = &cs.shape {
+                        let r = egui::Rect::from_min_size(t.pos, t.galley.rect.size());
+                        if t.galley.text() == needle && r.center().x > 1000.0 && r.center().y < 853.0
+                        {
+                            return Some(
+                                t.galley
+                                    .job
+                                    .sections
+                                    .iter()
+                                    .map(|s| s.format.color)
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                    }
+                    None
+                })
+                .collect::<Vec<_>>();
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hits.into_iter().next().unwrap_or_default()
+        }
+        assert!(
+            label_colors(&mut app, &ctx, "Track 3").contains(&accent),
+            "ACTIVE member's label rides the kit accent"
+        );
+        assert!(
+            !label_colors(&mut app, &ctx, "Track 1").contains(&accent),
+            "member-but-not-active keeps the default text color"
+        );
+        assert!(
+            !label_colors(&mut app, &ctx, "Track 2").contains(&accent),
+            "non-member keeps the default text color"
+        );
+        // Members paint the selected background; non-members do not.
+        let (bg_r, bg_g, bg_b, _) = st.visuals.selection.bg_fill.to_tuple();
+        let bg_rgb = (bg_r, bg_g, bg_b);
+        let rects = painted_rects(&mut app, &ctx, bg_rgb);
+        for n in [1usize, 3] {
+            let c = v94_strip_head(&mut app, &ctx, n);
+            assert!(
+                rects.iter().any(|r| r.contains(c) && r.height() < 40.0),
+                "selected strip header {n} paints the selection background"
+            );
+        }
+        let c2 = v94_strip_head(&mut app, &ctx, 2);
+        assert!(
+            !rects.iter().any(|r| r.contains(c2) && r.height() < 40.0),
+            "non-member header paints NO selection background"
+        );
+    }
+
+    /// AC6: can't-drift source scan — the two surfaces share the ONE click
+    /// seam, menu + checkbox share the ONE join seam, production raw
+    /// `.selected =` writes are confined to the seams (exact count; a new
+    /// bypassing write trips the pin for audit), and the settings clamp is
+    /// wired. Comment-safe (active-call style, the w12e trap).
+    #[test]
+    fn v94_selection_seams_shared() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs"))
+            .expect("own source");
+        let prod = src.split("\nmod tests").next().expect("tests module boundary");
+        let active = |needle: &str| -> usize {
+            prod.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains(needle)
+                })
+                .count()
+        };
+        // Both headers call the ONE click seam (mixer_strip + mix_column).
+        assert_eq!(
+            active(".select_track_click("),
+            2,
+            "exactly two production click-seam call sites"
+        );
+        // Programmatic selects (drum commit, MIDI Select/Next/Prev, load)
+        // route through the plain helper: drum(1) + fire(3) + load(1) +
+        // the click seam's own plain branch(1).
+        assert_eq!(active(".select_track_plain("), 6);
+        // Settings shrink calls the clamp.
+        assert_eq!(active(".clamp_track_sel("), 1);
+        // Raw writes to `.selected =` ONLY inside the seams: plain(1) +
+        // click ctrl-add(1) + ctrl-remove fallback(1) + shift re-seat(1) +
+        // clamp(1) + settings clamp line(1).
+        assert_eq!(
+            active(".selected = "),
+            6,
+            "no new bypassing writes to App::selected"
+        );
+        // Menu + checkbox share the ONE join seam.
+        assert_eq!(active(".rec_group_join(&"), 2);
+        // The join entry + the menu itself are the SHARED head menu.
+        assert_eq!(active("track_head_menu(ui, app,"), 2);
+        // Internal version rides this series (v91 single-home law).
+        let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("lib.rs");
+        assert!(
+            librs.contains("INTERNAL_VERSION: &str = \"v94\""),
+            "INTERNAL_VERSION must be bumped to v94"
         );
     }
 }
