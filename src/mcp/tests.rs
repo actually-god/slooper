@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 use crate::mcp::http;
 use crate::mcp::rpc;
 use crate::mcp::tools::{ToolDef, ToolError};
-use crate::mcp::McpServer;
 use crate::ui::tests::headless_app;
 use crate::ui::App;
 
@@ -594,18 +593,6 @@ fn parse_http(raw: &[u8]) -> (u16, Option<String>) {
     }
 }
 
-/// Drive the real server: send, pump the queue until the worker's
-/// oneshot has been answered, then read the response.
-fn pump_until_pumpable(app: &mut App) {
-    // One frame's worth of drain is all the dispatcher needs; the worker
-    // holds the connection open on the oneshot meanwhile.
-    std::thread::sleep(std::time::Duration::from_millis(120));
-    let mut srv = app.mcp.take().unwrap();
-    srv.drain(app);
-    app.mcp = Some(srv);
-    std::thread::sleep(std::time::Duration::from_millis(60));
-}
-
 #[test]
 #[ignore = "slow-tier: real socket"]
 fn v94_mcp_socket_roundtrip_e2e() {
@@ -622,6 +609,10 @@ fn v94_mcp_socket_roundtrip_e2e() {
     let ctx = egui::Context::default();
     app.mcp_port = 0;
     app.mcp_enabled = true;
+    // Shrink the worker's oneshot wait (600 ms) so the frozen-frame-loop
+    // -32002 path is provable on the wire without a 5 s wall-clock burn.
+    // Every other call is drained well inside 600 ms by the pump below.
+    app.mcp.as_mut().unwrap().set_wait(std::time::Duration::from_millis(600));
     app.mcp_frame(&ctx);
     let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
 
@@ -631,7 +622,7 @@ fn v94_mcp_socket_roundtrip_e2e() {
         sock.set_read_timeout(Some(std::time::Duration::from_secs(8)))
             .unwrap();
         let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer *** application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         sock.write_all(req.as_bytes()).unwrap();
@@ -703,11 +694,41 @@ fn v94_mcp_socket_roundtrip_e2e() {
     );
     assert_eq!(st, 401, "missing bearer token -> 401 on the wire");
     let (st, _) = http_post_raw(
-        &format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://evil.com\r\nAuthorization: Bearer ***"),
+        &format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://evil.com\r\nAuthorization: Bearer {token}"),
         port,
         "{}",
     );
     assert_eq!(st, 403, "foreign Origin -> 403 on the wire");
+
+    // UI-thread timeout on the wire: push a command and deliberately do
+    // NOT drain it; the worker's (test-shrunk) wait expires -> the client
+    // gets the structured -32002 (the frozen-frame-loop path; AC 5 e2e).
+    {
+        use std::io::{Read, Write};
+        // Header built from separate args: an earlier write layer of
+        // this session mangled any "prefix: {placeholder}" adjacency
+        // into "***", so the line is composed at runtime instead.
+        let hdr_auth = format!("{}: {} {}", "Authorization", "Bearer", token);
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"ping\"}";
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock
+            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{hdr_auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        // Longer than the 600 ms worker wait, far shorter than the read timeout.
+        std::thread::sleep(std::time::Duration::from_millis(1400));
+        let mut raw = Vec::new();
+        sock.read_to_end(&mut raw).unwrap();
+        let (st, tbody) = parse_http(&raw);
+        assert_eq!(st, 200, "a UI timeout is a protocol response, never a hang");
+        let v: Value = serde_json::from_str(tbody.as_ref().unwrap()).unwrap();
+        assert_eq!(v["error"]["code"], -32002, "undrained command -> -32002");
+        assert_eq!(v["id"], 99);
+    }
 
     // server still healthy afterwards; hot stop cleans up
     app.mcp_enabled = false;
@@ -718,6 +739,25 @@ fn v94_mcp_socket_roundtrip_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v94: the app binary for the bridge-child test. Cargo injects
+/// CARGO_BIN_EXE_slooper for INTEGRATION tests only — unit tests must
+/// derive the sibling binary: target/<profile>/deps/slooper-<hash> ->
+/// target/<profile>/slooper(.exe). Never the harness (which lives IN
+/// deps/, W12e recursion trap), and the wait in the caller is bounded.
+fn app_binary() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_slooper") {
+        if !p.is_empty() {
+            return p.into();
+        }
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    let dir = exe.parent().and_then(|p| p.parent()).expect("deps parent");
+    let name = if cfg!(windows) { "slooper.exe" } else { "slooper" };
+    let p = dir.join(name);
+    assert!(p.exists(), "cargo test always builds the sibling bin: {}", p.display());
+    p
+}
+
 #[test]
 #[ignore = "slow-tier: real socket"]
 fn v94_mcp_bridge_stdio_child_forwards() {
@@ -726,20 +766,18 @@ fn v94_mcp_bridge_stdio_child_forwards() {
     // endpoint discovery via SLOOPER_DATA_DIR/mcp-endpoint.json. The test
     // thread plays the frame loop draining the queue.
     let dir = isolated_data_dir("v94br");
-    let mut srv = McpServer::new();
     let ctx = egui::Context::default();
-    // No App here: the shim-forwarding contract is App-independent, and
-    // dispatch would need one — use McpServer::drain via a stub executor
-    // instead: drain needs &mut App, so instead we accept with a queue we
-    // pump with a trivial ping responder. Simplest honest route: start
-    // the real server (it writes the endpoint file), and answer commands
-    // by draining against a real (cheap, shared-cache) headless app.
+    // Start the REAL server through the App — the one the pump loop below
+    // drains via `app.mcp`. (A standalone McpServer here would own a queue
+    // nobody drains: the shim would only ever collect the worker's -32002.)
     let mut app = headless_app("v94br");
-    let _ = srv.sync(true, 0, &ctx);
-    let port = srv.port().expect("server up");
+    app.mcp_port = 0;
+    app.mcp_enabled = true;
+    app.mcp_frame(&ctx);
+    assert!(app.mcp.as_ref().unwrap().is_running(), "server up");
     assert!(crate::mcp::bridge::endpoint_path().exists(), "child finds this");
 
-    let mut child = std::process::Command::new(std::env::var("CARGO_BIN_EXE_slooper").expect("cargo bin env"))
+    let mut child = std::process::Command::new(app_binary())
         .arg("--mcp-bridge")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -781,8 +819,6 @@ fn v94_mcp_bridge_stdio_child_forwards() {
     let v: Value = serde_json::from_str(&line).expect("one JSON-RPC response line on stdout");
     assert_eq!(v["result"], json!({}), "ping round-tripped through the shim");
     assert_eq!(v["id"], 1);
-    let _ = port;
-    drop(srv);
     clear_data_dir();
     let _ = std::fs::remove_dir_all(&dir);
 }
