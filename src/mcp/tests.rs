@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::mcp::http;
 use crate::mcp::rpc;
 use crate::mcp::tools::{ToolDef, ToolError};
-use crate::ui::tests::headless_app;
+use crate::ui::headless_app;
 use crate::ui::App;
 
 // ── probe tools (registered per-App: test isolation, never global) ──────
@@ -418,13 +418,22 @@ fn v94_mcp_lifecycle_disabled_no_listener() {
     let mut app = headless_app("v94off"); // Config default: mcp_enabled=false
     let ctx = egui::Context::default();
     assert!(!app.mcp_enabled, "MCP is OFF by default");
+    app.mcp_port = 0; // ephemeral so a start-attempt could NEVER fail by luck
+    // Assert after EVERY frame: a server that opens on frame N and
+    // self-stops on N+1 would pass final-state-only asserts (a sab run
+    // proved this pin vacuous against exactly that slip).
     app.mcp_frame(&ctx);
-    app.mcp_frame(&ctx);
-    assert!(!app.mcp.as_ref().unwrap().is_running(), "disabled boots no server");
+    assert!(!app.mcp.as_ref().unwrap().is_running(), "disabled boots no server (frame 1)");
     assert!(
         !crate::mcp::bridge::endpoint_path().exists(),
-        "disabled boots ZERO sockets — no endpoint file at {}",
+        "disabled boots ZERO sockets — no endpoint file at {} (frame 1)",
         crate::mcp::bridge::endpoint_path().display()
+    );
+    app.mcp_frame(&ctx);
+    assert!(!app.mcp.as_ref().unwrap().is_running(), "disabled boots no server (frame 2)");
+    assert!(
+        !crate::mcp::bridge::endpoint_path().exists(),
+        "disabled boots ZERO sockets — still no endpoint file (frame 2)"
     );
     assert!(app.mcp.as_ref().unwrap().status_line().contains("off"));
     clear_data_dir();
@@ -536,10 +545,12 @@ fn v94_mcp_config_defaults_roundtrip() {
     let old: Config = serde_json::from_str("{}").unwrap();
     assert!(!old.mcp_enabled && old.mcp_port == 47618 && !old.mcp_read_only);
     // Round-trip keeps a non-default combo.
-    let mut c = Config::default();
-    c.mcp_enabled = true;
-    c.mcp_port = 0;
-    c.mcp_read_only = true;
+    let c = crate::config::Config {
+        mcp_enabled: true,
+        mcp_port: 0,
+        mcp_read_only: true,
+        ..Default::default()
+    };
     let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
     assert!(back.mcp_enabled && back.mcp_port == 0 && back.mcp_read_only);
 }

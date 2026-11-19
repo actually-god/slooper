@@ -29958,8 +29958,12 @@ fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 }
+// v94: headless_app re-export — mcp pins need it, but the ui tests module
+// MUST stay column-0 `mod tests` (a dozen source-scan pins anchor on it).
 #[cfg(test)]
-pub(crate) mod tests {
+pub(crate) use self::tests::headless_app;
+#[cfg(test)]
+mod tests {
     use super::*;
 
     #[test]
@@ -31009,10 +31013,10 @@ pub(crate) mod tests {
         app.poll_vst_opens();
     }
 
-    /// v94: the MCP half of `App::logic` for headless pins is
-    /// `App::mcp_frame` itself (pub(crate), one code path with production,
-    /// doctrine v59) — pins call it directly; the drain executes tools
-    /// exactly like the frame loop.
+    // v94: the MCP half of `App::logic` for headless pins is
+    // `App::mcp_frame` itself (pub(crate), one code path with production,
+    // doctrine v59) — pins call it directly; the drain executes tools
+    // exactly like the frame loop.
 
     /// v94/MCP-01 AC (in-app visibility): Settings carries an AUTOMATION
     /// section with the enable switch, the read-only latch, a live status
