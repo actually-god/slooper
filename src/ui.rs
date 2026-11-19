@@ -48289,7 +48289,7 @@ mod tests {
 
     #[test]
     fn v92_smap_black_straddles_white_boundary() {
-        let (mut app, _ctx) = v56_open_sampler_map("v92str");
+        let (app, _ctx) = v56_open_sampler_map("v92str");
         let (kx, _ky, _lx, _ly, _rw) = app.smap_probe.expect("map painted");
         // A black key always covers half of its white neighbour BELOW and
         // half of the one ABOVE: its center is exactly the left edge of
