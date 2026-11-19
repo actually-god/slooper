@@ -146,6 +146,14 @@ src/            application source (Rust 2021 edition)
                   drivers). Linux never builds the WinMM side — the
                   ring itself is OS-neutral so every w9/w12b pin runs
                   everywhere.
+  mcp/            built-in MCP server (v94, docs/MCP-DESIGN.md): mod.rs
+                  lifecycle (hot start/stop from the frame loop, endpoint
+                  file, token), http.rs (loopback HTTP gate: Host/Origin/
+                  token), rpc.rs (JSON-RPC dispatcher + error taxonomy),
+                  tools.rs (global tool registry — MCP-02..05 register
+                  via install_all seams, read-only latch is flag-declared,
+                  never name-parsed), bridge.rs (`--mcp-bridge` stdio
+                  shim). UI pumps requests; execution is UI-thread only.
   audio/rt_recovery.rs
                   W12a pure recovery table: the WASAPI RT thread classifies
                   its own death (none/stream/device-invalidated), the idle
