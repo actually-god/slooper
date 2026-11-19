@@ -4872,11 +4872,17 @@ fn v80_rt_bypass_passthrough() {
 // on the right bus only — the probe hears ONLY the duck.
 
 /// Shared scaffolding: (backend, ring, widx, sr). Key on track 0 (hard
-/// left), tone on track 1 (hard right) through the stock sidechain
+/// left, tone on track 1 (hard right) through the stock sidechain
 /// compressor; the probe listens to the RIGHT bus only.
-fn v95_sc_setup(
-    tag: &str,
-) -> Option<(Backend, Arc<Vec<AtomicU32>>, Arc<AtomicU64>, u32, AsyncClient<(), CapProc>)> {
+type V95Rig = (
+    Backend,
+    Arc<Vec<AtomicU32>>,
+    Arc<AtomicU64>,
+    u32,
+    AsyncClient<(), CapProc>,
+);
+
+fn v95_sc_setup(tag: &str) -> Option<V95Rig> {
     let Some((b, _client_name, sr)) = start_backend() else {
         return None; // no audio server: skip
     };
