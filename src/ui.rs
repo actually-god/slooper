@@ -5341,7 +5341,7 @@ impl App {
     /// inherits the LINKED loop selector from the front member) cannot
     /// drift between entry points. Already-member tracks are skipped.
     fn rec_group_join(&mut self, ts: &[usize]) {
-        let mut ts: Vec<usize> = ts.iter().copied().collect();
+        let mut ts: Vec<usize> = ts.to_vec();
         ts.sort_unstable();
         ts.dedup();
         let mut joined = Vec::new();
