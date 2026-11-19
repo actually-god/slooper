@@ -17910,7 +17910,21 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     n if n.is_empty() => "slooper · untitled".to_string(),
                     n => format!("slooper · {n}"),
                 };
-                ui.heading(RichText::new(title).strong());
+                // v91 (card t_05002c1e): the PUBLIC version rides directly
+                // under the project name. env! is the single source — the
+                // same value vsthost/claphost report to hosts and crash.rs
+                // puts in reports — so this line can never drift from the
+                // tagged release. The internal series stamp is NOT here
+                // (settings footer only; pins v91_* hold the seam).
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.add(egui::Label::new(RichText::new(title).strong().heading()).wrap_mode(egui::TextWrapMode::Extend));
+                    ui.label(
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .weak()
+                            .small(),
+                    );
+                });
                 // v25: status display rules —
                 //  * fresh message: exactly as written;
                 //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
@@ -29125,6 +29139,26 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     .weak(),
                 );
             }
+            // v91 (card t_05002c1e): the internal series stamp — ALWAYS the
+            // last row of the panel, after every section (and even when a
+            // filter hides them all: it is a footer stamp, not a setting).
+            // The public release version shows under the project name in
+            // the top bar, never here; the value reads the single source,
+            // crate::INTERNAL_VERSION (pins v91_* hold both seams).
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "internal version: {}",
+                    crate::INTERNAL_VERSION
+                ))
+                .weak()
+                .small(),
+            )
+            .on_hover_text(
+                "Internal development series (docs / PR chain). The public \
+                 release version shows under the project name at the top \
+                 of the window.",
+            );
         });
     });
 }
@@ -54993,6 +55027,166 @@ mod tests {
         assert_eq!((m.slots[0].root, m.slots[0].vel), (48, 127), "first layer lands at C3");
         assert_eq!(m.slots[0].asset, app.assets[z].path.to_string_lossy());
         assert!(app.status.contains("C3") && app.status.contains("zap"), "{}", app.status);
+    }
+
+    // ---- v91 (card t_05002c1e): version indicators --------------------------
+    // Public version under the project name (CARGO_PKG_VERSION); internal
+    // series stamp as the final row of the settings panel. All painted
+    // text here is ASCII — no glyph-coverage-probe entry needed.
+
+    /// All painted `(text, absolute_rect)` pairs of one frame at viewport
+    /// height `h` (tall `h` defeats ScrollArea painting cull — v59 lesson).
+    fn v91_scan(app: &mut App, ctx: &egui::Context, h: f32) -> Vec<(String, egui::Rect)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, h),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hits: Vec<(String, egui::Rect)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let local = t.galley.rect;
+                    return Some((
+                        t.galley.text().to_string(),
+                        egui::Rect::from_min_size(t.pos + local.min.to_vec2(), local.size()),
+                    ));
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hits
+    }
+
+    #[test]
+    fn v91_header_public_version_under_project_name() {
+        // R1: the public version renders directly under the project-name
+        // heading, sharing its left edge, inside the topbar band — and it
+        // is the CARGO_PKG_VERSION value, no literal in sight (source pin
+        // holds the no-duplicate half).
+        let mut app = headless_app("v91hdr");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let title = painted_text_rect(&ctx, &mut app, "slooper · untitled")
+            .expect("project-name heading paints");
+        let pubv = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let v = painted_text_rect(&ctx, &mut app, &pubv)
+            .expect("public version under the project name");
+        assert!(v.min.y >= title.max.y - 2.0, "version below the name: title={title:?} v={v:?}");
+        assert!((v.min.x - title.min.x).abs() < 2.0, "same left edge: {title:?} {v:?}");
+        assert!(v.max.y <= TOPBAR_H, "stays inside the {TOPBAR_H}px topbar: {v:?}");
+    }
+
+    #[test]
+    fn v91_settings_internal_version_footer_row() {
+        // R3: the stamp renders from crate::INTERNAL_VERSION as the LAST
+        // painted row of the settings scroll (tall viewport lays out every
+        // section), and survives a filter that hides every section — then
+        // it sits below even the "nothing matches" dead-end label, proving
+        // it is outside and after the section flow.
+        let mut app = headless_app("v91sett");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let want = format!("internal version: {}", crate::INTERNAL_VERSION);
+        let hits = v91_scan(&mut app, &ctx, 2600.0);
+        // Settings panel band: leftmost 410 px, below the topbar, above
+        // the bottom bar (which rides ~y2560 in this tall frame).
+        let band: Vec<(String, egui::Rect)> = hits
+            .into_iter()
+            .filter(|(_, r)| r.center().x < 410.0 && r.center().y > TOPBAR_H && r.center().y < 2000.0)
+            .collect();
+        assert!(band.len() > 50, "panel actually painted its sections ({} rows)", band.len());
+        let f: Vec<(String, egui::Rect)> =
+            band.iter().filter(|(t, _)| t.contains(&want)).cloned().collect();
+        assert_eq!(f.len(), 1, "exactly one internal-version row: {f:?}");
+        let ymax = band.iter().map(|(_, r)| r.max.y).fold(0.0f32, f32::max);
+        assert!(
+            (f[0].1.max.y - ymax).abs() < 0.5,
+            "footer is the bottom-most panel row: footer={:?} ymax={ymax}",
+            f[0].1
+        );
+        // Filter hides every section: the stamp still renders, last.
+        app.sett_filter = "zzz".into();
+        let dead = painted_text_rect(&ctx, &mut app, "nothing matches")
+            .expect("dead-end label paints");
+        let foot = painted_text_rect(&ctx, &mut app, &want)
+            .expect("footer renders even with all sections hidden");
+        assert!(foot.min.y > dead.max.y, "footer below the dead-end label: {dead:?} {foot:?}");
+    }
+
+    #[test]
+    fn v91_version_surfaces_do_not_cross_contaminate() {
+        // R4: internal stamp absent from the header surfaces (settings
+        // closed = nothing paints it); with settings OPEN the public
+        // version still exists exactly once — the header galley.
+        let mut app = headless_app("v91cc");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "internal version").is_none(),
+            "internal stamp must not paint while settings is closed"
+        );
+        app.show_settings = true;
+        let g = v91_scan(&mut app, &ctx, 853.0);
+        let pubv = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let pub_hits: Vec<&(String, egui::Rect)> =
+            g.iter().filter(|(t, _)| t.contains(&pubv)).collect();
+        assert_eq!(pub_hits.len(), 1, "public version painted once, header only: {pub_hits:?}");
+        assert!(pub_hits[0].1.max.y < TOPBAR_H, "the lone galley is the header: {:?}", pub_hits[0].1);
+    }
+
+    #[test]
+    fn v91_version_sources_single_home() {
+        // R2 + "final row" (source order) + both negative polarities.
+        // Comment lines are stripped first (the v12e needle-survives-
+        // in-comment trap), and both needles are concat-split so this
+        // pin's own literals can never self-match.
+        let strip = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let lib_code = strip(include_str!("lib.rs"));
+        let def = concat!("pub const INTERNAL_", "VERSION");
+        assert_eq!(lib_code.matches(def).count(), 1, "one internal-version definition in lib.rs");
+        let at = lib_code.find(def).unwrap();
+        let after = &lib_code[at + def.len()..at + def.len() + 40];
+        let vs = after.split_once(": &str = \"v").expect("definition shaped `: &str = \"vNN\"`");
+        assert!(vs.1.as_bytes()[0].is_ascii_digit(), "value is vNN: {after:?}");
+
+        let ui_src = include_str!("ui.rs");
+        let prod_cut = ui_src.find("\nmod tests").expect("column-0 `mod tests` anchor");
+        let prod = strip(&ui_src[..prod_cut]);
+        let intern = concat!("crate::INTERNAL_", "VERSION");
+        assert_eq!(prod.matches(intern).count(), 1, "exactly one internal-version render site in ui.rs prod");
+        let pkg = concat!("CARGO_PKG_", "VERSION");
+        assert_eq!(prod.matches(pkg).count(), 1, "exactly one public-version read site in ui.rs prod");
+        assert!(!prod.contains(env!("CARGO_PKG_VERSION")), "public version never hardcoded as a literal in ui.rs prod");
+
+        // Header block: public version YES, internal stamp NO.
+        let tb0 = prod.find("fn top_bar(").expect("top_bar");
+        let tb = &prod[tb0..tb0 + prod[tb0..].find("\nfn ").expect("fn after top_bar")];
+        assert_eq!(tb.matches(pkg).count(), 1, "top_bar reads the public version");
+        assert!(!tb.contains(intern), "top_bar never mentions the internal series");
+
+        // Settings block: internal stamp YES — after EVERY section gate —
+        // and the public version never.
+        let sp0 = prod.find("fn settings_panel(").expect("settings_panel");
+        let sp = &prod[sp0..prod.find("fn settings_sect(").expect("settings_sect")];
+        let at = sp.find(intern).expect("footer reads the constant");
+        let last_sect = sp.rfind("settings_sect(").expect("at least one section gate");
+        assert!(at > last_sect, "internal row is the FINAL row in source order: footer@{at} last-section-gate@{last_sect}");
+        assert!(!sp.contains(pkg), "public version never rendered inside the settings panel");
     }
 
     /// v89 helper: one zero-input frame; collect thin filled prims —
