@@ -56830,22 +56830,34 @@ mod tests {
         app.backend.engine.set_sc_send(1, 1 << 0);
         app.fx_window = Some(1);
         frame(&mut app, &ctx, vec![]);
-        // Routed chip paints as [1]; its level slider paints at unity.
-        let chip = galley_at_last(&mut app, &ctx, "[1]").expect("routed chip paints");
-        let lv = galley_at_last(&mut app, &ctx, "100 %").expect("unity receive level paints");
+        // Routed chip paints as the EXACT galley "[1]" (the "keyed by [1]"
+        // echo label must not masquerade as it — exact-text scan); the
+        // level slider paints at unity right next to its chip.
+        let chips = galleys_all(&mut app, &ctx, "[1]");
+        assert_eq!(chips.len(), 1, "the routed chip is the only exact [1] galley: {chips:?}");
+        let chip = chips[0];
+        let lv = painted_text_rect(&ctx, &mut app, "100 %").expect("unity receive level paints");
         assert!(
-            (lv.center().y - chip.center().y).abs() < 14.0,
+            (lv.center().y - chip.y).abs() < 14.0,
             "the level sits on its chip's row: {chip:?} vs {lv:?}"
         );
         assert_eq!(app.sc_recv_gain[1 * MAX_LOOPS + 0], 1.0, "unity until touched");
-        // Drag the level right: deeper send. (The value label rides inside
-        // the track, so its galley center is a legal slider grab.)
-        drag_steps(
+        // Drag the level right inline (not via drag_steps): the edit flags
+        // the deferred config save, which the idle-flush consumes the first
+        // pointer-up frame — so the flag must be observed WHILE held down.
+        let from = lv.center();
+        let to = egui::pos2(from.x + 48.0, from.y);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
             &mut app,
             &ctx,
-            lv.center(),
-            egui::pos2(lv.center().x + 48.0, lv.center().y),
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
         );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(from.x + 24.0, from.y))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        assert!(app.fx_save_pending, "a live level edit schedules the save");
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]); // the idle flush persists it
         let gi = 1 * MAX_LOOPS + 0;
         assert!(
             app.sc_recv_gain[gi] > 1.4,
@@ -56861,7 +56873,6 @@ mod tests {
             1.0,
             "the reverse (T1->T0) pair is untouched"
         );
-        assert!(app.fx_save_pending, "a level edit schedules the save");
         assert!(
             app.status.contains("sidechain send T1 into T2:"),
             "status echo lands on release: {:?}",
