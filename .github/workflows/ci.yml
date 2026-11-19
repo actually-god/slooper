@@ -70,7 +70,15 @@ jobs:
         # The #[ignore = "slow-tier: …"] set in its OWN process — same
         # isolation the old manual 3-chunk filter protocol provided against
         # the dlopen deadlock class, now mechanism-based.
-        run: bash scripts/ci-suite-guard.sh linux-slow-tier target/test-logs/ci-linux-slow.log cargo test --profile citest --lib --locked -- --ignored
+        # v94: the MCP bridge-child pin execs the app binary; `--lib`
+        # never builds it, so stage it here and hand the pin the canonical
+        # env name (cargo injects CARGO_BIN_EXE_* for integration tests
+        # only — unit tests must be handed it).
+        env:
+          CARGO_BIN_EXE_slooper: ${{ github.workspace }}/target/citest/slooper
+        run: |
+          cargo build --profile citest --bins --locked
+          bash scripts/ci-suite-guard.sh linux-slow-tier target/test-logs/ci-linux-slow.log cargo test --profile citest --lib --locked -- --ignored
       - name: Doctests
         run: cargo test --profile citest --doc --locked
       - name: Script-editor pair in isolated processes
