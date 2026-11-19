@@ -1387,7 +1387,7 @@ pub struct App {
     /// v42/MPE: Settings switch — bend/poly-AT from the port reach
     /// instruments (mirrored into the engine every frame it changes).
     mpe_on: bool,
-    /// v94/MCP: mirrors of the `Config::mcp_*` trio (Settings ▸
+    /// v107/MCP: mirrors of the `Config::mcp_*` trio (Settings ▸
     /// AUTOMATION). The server itself starts/stops hot from the frame
     /// loop (`mcp_frame`) — a restart is never needed for any of them.
     pub(crate) mcp_enabled: bool,
@@ -6142,7 +6142,7 @@ impl App {
             .collect()
     }
 
-    /// v94/MCP: per-frame housekeeping — hot start/stop pair + draining
+    /// v107/MCP: per-frame housekeeping — hot start/stop pair + draining
     /// the command queue onto the UI thread (docs/MCP-DESIGN.md D3: the
     /// worker threads NEVER touch App; commands execute HERE and nowhere
     /// else). Called from `App::logic` and, for headless pins, from
@@ -17943,7 +17943,7 @@ impl eframe::App for App {
             100
         }));
 
-        // v94: MCP server — hot start/stop pair + drain of the command
+        // v107: MCP server — hot start/stop pair + drain of the command
         // queue onto the UI thread (docs/MCP-DESIGN.md D3). Worker threads
         // never touch App; every tool call executes right here. The idle
         // repaint heartbeat above already bounds worst-case wake latency.
@@ -30542,7 +30542,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
             }
-            // ---- v94: AUTOMATION (MCP) -------------------------------------
+            // ---- v107: AUTOMATION (MCP) -------------------------------------
             if settings_sect(
                 ui,
                 &app.sett_filter,
@@ -30969,7 +30969,7 @@ fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 }
-// v94: headless_app re-export — mcp pins need it, but the ui tests module
+// v107: headless_app re-export — mcp pins need it, but the ui tests module
 // MUST stay column-0 `mod tests` (a dozen source-scan pins anchor on it).
 #[cfg(test)]
 pub(crate) use self::tests::headless_app;
@@ -32024,18 +32024,18 @@ mod tests {
         app.poll_vst_opens();
     }
 
-    // v94: the MCP half of `App::logic` for headless pins is
+    // v107: the MCP half of `App::logic` for headless pins is
     // `App::mcp_frame` itself (pub(crate), one code path with production,
     // doctrine v59) — pins call it directly; the drain executes tools
     // exactly like the frame loop.
 
-    /// v94/MCP-01 AC (in-app visibility): Settings carries an AUTOMATION
+    /// v107/MCP-01 AC (in-app visibility): Settings carries an AUTOMATION
     /// section with the enable switch, the read-only latch, a live status
     /// line, the endpoint-file path and the stdio-bridge hint — all found
     /// by the section filter (user standing order: the user always sees
     /// what the MCP surface is doing).
     #[test]
-    fn v94_mcp_settings_automation_section_paints() {
+    fn v107_mcp_settings_automation_section_paints() {
         let mut app = headless_app("v94setpaint");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
@@ -32057,12 +32057,12 @@ mod tests {
         assert!(bridge_hint.is_some(), "the stdio bridge usage line is shown");
     }
 
-    /// v94/MCP-01 AC (hot toggle + persistence + echo): clicking the real
+    /// v107/MCP-01 AC (hot toggle + persistence + echo): clicking the real
     /// Settings checkbox starts the listener with NO restart, echoes the
     /// status, persists the config, and clicking it off hot-stops the
     /// server and deletes the endpoint file. Port 0 = ephemeral (D6).
     #[test]
-    fn v94_mcp_settings_toggle_persists() {
+    fn v107_mcp_settings_toggle_persists() {
         let mut app = headless_app("v94tog");
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
@@ -58415,12 +58415,13 @@ mod tests {
         assert_eq!(active(".rec_group_join(&"), 2);
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
-        // Internal version rides this series (v91 single-home law).
+        // Internal version rides the series (v91 single-home law; v107 MCP-01
+        // bumped it — retargeted here so the law holds, not the old number).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v106\""),
-            "INTERNAL_VERSION must be bumped to v106"
+            librs.contains("INTERNAL_VERSION: &str = \"v107\""),
+            "INTERNAL_VERSION must be bumped to v107"
         );
     }
 

@@ -147,7 +147,7 @@ src/            application source (Rust 2021 edition)
                   drivers). Linux never builds the WinMM side — the
                   ring itself is OS-neutral so every w9/w12b pin runs
                   everywhere.
-  mcp/            built-in MCP server (v94, docs/MCP-DESIGN.md): mod.rs
+  mcp/            built-in MCP server (v107, docs/MCP-DESIGN.md): mod.rs
                   lifecycle (hot start/stop from the frame loop, endpoint
                   file, token), http.rs (loopback HTTP gate: Host/Origin/
                   token), rpc.rs (JSON-RPC dispatcher + error taxonomy),

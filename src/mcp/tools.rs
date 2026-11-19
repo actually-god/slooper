@@ -9,7 +9,7 @@
 //! Extension contract for MCP-02..05: add a module with a
 //! `register(&mut Vec<ToolDef>)` fn and ONE line in [`install_all`].
 //! The dispatcher, bridge and lifecycle never change for a new tool.
-//! Names follow `^[a-z_]+\.[a-z_.]+$` (pinned by v94_mcp_tool_table_invariants);
+//! Names follow `^[a-z_]+\.[a-z_.]+$` (pinned by v107_mcp_tool_table_invariants);
 //! units are the native currency of each setter seam (§6).
 
 use serde_json::{json, Value};

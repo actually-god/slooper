@@ -1,4 +1,4 @@
-//! v94 MCP quick-tier pins (docs/MCP-DESIGN.md D6): the REAL dispatcher
+//! v107 MCP quick-tier pins (docs/MCP-DESIGN.md D6): the REAL dispatcher
 //! and the REAL pure gate, zero sockets. Slow tier (real socket / bridge
 //! child) lives at the bottom, `#[ignore = "slow-tier: …"]` — CI runs it
 //! via the windows-native full suite (`--include-ignored`).
@@ -30,7 +30,7 @@ fn probe_write(_app: &mut App, _args: &Value) -> Result<Value, ToolError> {
 }
 
 fn probe_panic(_app: &mut App, _args: &Value) -> Result<Value, ToolError> {
-    panic!("v94 probe firewall trip (expected by v94_mcp_rpc_panic_firewall)")
+    panic!("v107 probe firewall trip (expected by v107_mcp_rpc_panic_firewall)")
 }
 
 fn probe_domain_err(_app: &mut App, _args: &Value) -> Result<Value, ToolError> {
@@ -115,8 +115,8 @@ fn call(app: &mut App, name: &str, args: Value) -> Option<Value> {
 // ── protocol surface ─────────────────────────────────────────────────────
 
 #[test]
-fn v94_mcp_rpc_initialize() {
-    let mut app = headless_app("v94init");
+fn v107_mcp_rpc_initialize() {
+    let mut app = headless_app("v107init");
     let r = rpc::dispatch(
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
                 "params":{"protocolVersion":"2025-06-18","capabilities":{},
@@ -138,15 +138,15 @@ fn v94_mcp_rpc_initialize() {
 }
 
 #[test]
-fn v94_mcp_rpc_ping() {
-    let mut app = headless_app("v94ping");
+fn v107_mcp_rpc_ping() {
+    let mut app = headless_app("v107ping");
     let r = rpc::dispatch(&json!({"jsonrpc":"2.0","id":7,"method":"ping"}), &mut app).unwrap();
     assert_eq!(r["result"], json!({}), "ping answers an empty result");
 }
 
 #[test]
-fn v94_mcp_rpc_discover() {
-    let mut app = headless_app("v94disc");
+fn v107_mcp_rpc_discover() {
+    let mut app = headless_app("v107disc");
     let r = rpc::dispatch(&json!({"jsonrpc":"2.0","id":3,"method":"server/discover"}), &mut app)
         .unwrap();
     assert!(
@@ -160,8 +160,8 @@ fn v94_mcp_rpc_discover() {
 }
 
 #[test]
-fn v94_mcp_rpc_notification_no_response() {
-    let mut app = headless_app("v94notif");
+fn v107_mcp_rpc_notification_no_response() {
+    let mut app = headless_app("v107notif");
     assert!(
         rpc::dispatch(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), &mut app)
             .is_none(),
@@ -183,8 +183,8 @@ fn v94_mcp_rpc_notification_no_response() {
 }
 
 #[test]
-fn v94_mcp_tools_list_shape() {
-    let mut app = headless_app("v94list");
+fn v107_mcp_tools_list_shape() {
+    let mut app = headless_app("v107list");
     let r = rpc::dispatch(&json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}), &mut app).unwrap();
     let tools = r["result"]["tools"].as_array().unwrap().clone();
     let echo = tools
@@ -204,8 +204,8 @@ fn v94_mcp_tools_list_shape() {
 }
 
 #[test]
-fn v94_mcp_core_echo_observed_ack() {
-    let mut app = headless_app("v94echo");
+fn v107_mcp_core_echo_observed_ack() {
+    let mut app = headless_app("v107echo");
     let r = call(&mut app, "core.echo", json!({"text": "hi"})).unwrap();
     assert_eq!(r["result"]["structuredContent"]["echo"], "hi");
     assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("hi"), "text block mirrors");
@@ -218,11 +218,11 @@ fn v94_mcp_core_echo_observed_ack() {
 }
 
 #[test]
-fn v94_mcp_tool_registry_probe_tool() {
+fn v107_mcp_tool_registry_probe_tool() {
     // The MCP-02..05 contract: a registration (schema + description +
     // flags + fn) shows up in tools/list and executes via tools/call —
     // zero core edits.
-    let mut app = headless_app("v94reg");
+    let mut app = headless_app("v107reg");
     register_probes(&mut app);
     let r = rpc::dispatch(&json!({"jsonrpc":"2.0","id":5,"method":"tools/list"}), &mut app).unwrap();
     let names: Vec<&str> = r["result"]["tools"]
@@ -237,8 +237,8 @@ fn v94_mcp_tool_registry_probe_tool() {
 }
 
 #[test]
-fn v94_mcp_tool_call_executes_on_ui_thread() {
-    let mut app = headless_app("v94thr");
+fn v107_mcp_tool_call_executes_on_ui_thread() {
+    let mut app = headless_app("v107thr");
     register_probes(&mut app);
     let mine = thread_serial();
     let r = call(&mut app, "probe.thread", json!({})).unwrap();
@@ -250,8 +250,8 @@ fn v94_mcp_tool_call_executes_on_ui_thread() {
 }
 
 #[test]
-fn v94_mcp_read_only_latch() {
-    let mut app = headless_app("v94ro");
+fn v107_mcp_read_only_latch() {
+    let mut app = headless_app("v107ro");
     register_probes(&mut app);
     app.mcp_read_only = true;
     let w = call(&mut app, "probe.write", json!({})).unwrap();
@@ -265,8 +265,8 @@ fn v94_mcp_read_only_latch() {
 }
 
 #[test]
-fn v94_mcp_rpc_panic_firewall() {
-    let mut app = headless_app("v94fire");
+fn v107_mcp_rpc_panic_firewall() {
+    let mut app = headless_app("v107fire");
     register_probes(&mut app);
     let r = call(&mut app, "probe.panic", json!({})).unwrap();
     assert_eq!(r["error"]["code"], -32000, "caught panic -> -32000");
@@ -276,8 +276,8 @@ fn v94_mcp_rpc_panic_firewall() {
 }
 
 #[test]
-fn v94_mcp_rpc_domain_error() {
-    let mut app = headless_app("v94dom");
+fn v107_mcp_rpc_domain_error() {
+    let mut app = headless_app("v107dom");
     register_probes(&mut app);
     let r = call(&mut app, "probe.domainerr", json!({})).unwrap();
     assert!(r.get("error").is_none());
@@ -288,8 +288,8 @@ fn v94_mcp_rpc_domain_error() {
 }
 
 #[test]
-fn v94_mcp_rpc_unknown_tool_and_params() {
-    let mut app = headless_app("v94unk");
+fn v107_mcp_rpc_unknown_tool_and_params() {
+    let mut app = headless_app("v107unk");
     let r = call(&mut app, "no.such.tool", json!({})).unwrap();
     assert_eq!(r["error"]["code"], -32601, "unknown tool -> -32601");
     let r = rpc::dispatch(
@@ -310,7 +310,7 @@ fn v94_mcp_rpc_unknown_tool_and_params() {
 // ── gate + bridge queue taxonomy (pure halves, real bytes) ───────────────
 
 #[test]
-fn v94_mcp_http_gate_order() {
+fn v107_mcp_http_gate_order() {
     let tok = "t0k3n";
     let good = |m: &str, p: &str, h: Option<&str>, o: Option<&str>, a: Option<&str>| {
         http::gate(m, p, h, o, a, tok)
@@ -349,7 +349,7 @@ fn v94_mcp_http_gate_order() {
 }
 
 #[test]
-fn v94_mcp_bridge_busy_queue_busy_error() {
+fn v107_mcp_bridge_busy_queue_busy_error() {
     // The real bounded queue + the real submit mapping + the exact -32001
     // body bytes the worker writes on overflow (shared builders, D6).
     let (tx, rx) = std::sync::mpsc::sync_channel::<crate::mcp::Cmd>(16);
@@ -378,7 +378,7 @@ fn v94_mcp_bridge_busy_queue_busy_error() {
 }
 
 #[test]
-fn v94_mcp_bridge_timeout_short_wait() {
+fn v107_mcp_bridge_timeout_short_wait() {
     // The shared await helper: no drained command -> Timeout -> the real
     // -32002 body. (The socket-layer 5 s default is exercised by the CI
     // slow tier; injecting the short wait keeps this fast-tier.)
@@ -413,9 +413,9 @@ fn clear_data_dir() {
 }
 
 #[test]
-fn v94_mcp_lifecycle_disabled_no_listener() {
-    let dir = isolated_data_dir("v94off");
-    let mut app = headless_app("v94off"); // Config default: mcp_enabled=false
+fn v107_mcp_lifecycle_disabled_no_listener() {
+    let dir = isolated_data_dir("v107off");
+    let mut app = headless_app("v107off"); // Config default: mcp_enabled=false
     let ctx = egui::Context::default();
     assert!(!app.mcp_enabled, "MCP is OFF by default");
     app.mcp_port = 0; // ephemeral so a start-attempt could NEVER fail by luck
@@ -441,9 +441,9 @@ fn v94_mcp_lifecycle_disabled_no_listener() {
 }
 
 #[test]
-fn v94_mcp_lifecycle_hot_start_stop() {
-    let dir = isolated_data_dir("v94hot");
-    let mut app = headless_app("v94hot");
+fn v107_mcp_lifecycle_hot_start_stop() {
+    let dir = isolated_data_dir("v107hot");
+    let mut app = headless_app("v107hot");
     let ctx = egui::Context::default();
     app.mcp_port = 0; // ephemeral — never a fixed port in tests (D6)
     app.mcp_enabled = true;
@@ -472,11 +472,11 @@ fn v94_mcp_lifecycle_hot_start_stop() {
 }
 
 #[test]
-fn v94_mcp_lifecycle_port_busy_keeps_boot() {
-    let dir = isolated_data_dir("v94busy");
+fn v107_mcp_lifecycle_port_busy_keeps_boot() {
+    let dir = isolated_data_dir("v107busy");
     let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let busy_port = blocker.local_addr().unwrap().port();
-    let mut app = headless_app("v94busy");
+    let mut app = headless_app("v107busy");
     let ctx = egui::Context::default();
     app.mcp_port = busy_port;
     app.mcp_enabled = true;
@@ -504,7 +504,7 @@ fn v94_mcp_lifecycle_port_busy_keeps_boot() {
 // ── tool table invariants (source-scan family, design §6 pin) ────────────
 
 #[test]
-fn v94_mcp_tool_table_invariants() {
+fn v107_mcp_tool_table_invariants() {
     // Contract over the COMPILED global table (probe tools live per-App,
     // never here, so the invariants are un-jammable by tests):
     // dotted lowercase names, real descriptions, real schemas, and every
@@ -535,7 +535,7 @@ fn v94_mcp_tool_table_invariants() {
 }
 
 #[test]
-fn v94_mcp_config_defaults_roundtrip() {
+fn v107_mcp_config_defaults_roundtrip() {
     use crate::config::Config;
     let d = Config::default();
     assert!(!d.mcp_enabled, "OFF by default (D2)");
@@ -606,7 +606,7 @@ fn parse_http(raw: &[u8]) -> (u16, Option<String>) {
 
 #[test]
 #[ignore = "slow-tier: real socket"]
-fn v94_mcp_socket_roundtrip_e2e() {
+fn v107_mcp_socket_roundtrip_e2e() {
     // The card's headline AC: a REAL client over a REAL socket against a
     // live lazily-started server — port 0 + discovery file, full protocol
     // shape + gate refusals on the wire (design §7 slow tier).
@@ -615,8 +615,8 @@ fn v94_mcp_socket_roundtrip_e2e() {
     // oneshot — so after writing a request we sleep, execute one real
     // `McpServer::drain` on this thread (= the frame-loop role), and only
     // then read the response. Deterministic, single-threaded, bounded.
-    let dir = isolated_data_dir("v94sock");
-    let mut app = headless_app("v94sock");
+    let dir = isolated_data_dir("v107sock");
+    let mut app = headless_app("v107sock");
     let ctx = egui::Context::default();
     app.mcp_port = 0;
     app.mcp_enabled = true;
@@ -750,14 +750,22 @@ fn v94_mcp_socket_roundtrip_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// v94: the app binary for the bridge-child test. Cargo injects
-/// CARGO_BIN_EXE_slooper for INTEGRATION tests only — unit tests must
-/// derive the sibling binary: target/<profile>/deps/slooper-<hash> ->
-/// target/<profile>/slooper(.exe). Never the harness (which lives IN
-/// deps/, W12e recursion trap), and the wait in the caller is bounded.
+/// v107: the app binary for the bridge-child test. PRIORITY: the
+/// CI-staged `SLOOPER_PROBE_EXE` (Windows suite steps) then
+/// `CARGO_BIN_EXE_slooper` (Linux slow tier, exported in ci.yml — cargo
+/// injects it for INTEGRATION tests only, `--lib` never does); last
+/// resort is the sibling-bin derive (`target/<profile>/deps/slooper-
+/// <hash>` -> one up). Never the harness; the caller's wait is bounded.
 fn app_binary() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_slooper") {
-        if !p.is_empty() {
+    // W12e rule, learned the hard way on the Windows full-suite runner:
+    // the pins that spawn the APP must ride the CI-STAGED exe —
+    // SLOOPER_PROBE_EXE (both Windows suite steps export it; Linux slow
+    // tier exports CARGO_BIN_EXE_slooper, ci.yml). The derive-below
+    // fallback holds on Linux dev loops but NOT on the runner: there the
+    // libtest harness can sit somewhere the sibling exe never was, and
+    // execing a build-dir sibling that IS the harness would recurse.
+    for var in ["SLOOPER_PROBE_EXE", "CARGO_BIN_EXE_slooper"] {
+        if let Some(p) = std::env::var_os(var).filter(|p| !p.is_empty()) {
             return p.into();
         }
     }
@@ -765,23 +773,51 @@ fn app_binary() -> std::path::PathBuf {
     let dir = exe.parent().and_then(|p| p.parent()).expect("deps parent");
     let name = if cfg!(windows) { "slooper.exe" } else { "slooper" };
     let p = dir.join(name);
-    assert!(p.exists(), "cargo test always builds the sibling bin: {}", p.display());
+    assert!(
+        p.exists(),
+        "no staged app exe (SLOOPER_PROBE_EXE / CARGO_BIN_EXE_slooper) \
+         and no sibling bin at {} — export one before running this pin",
+        p.display()
+    );
     p
+}
+
+/// v107: resolver priority pin — the STAGED env exe always wins (both
+/// names checked, empty values rejected), so the bridge-child pin can
+/// never exec a libtest harness even when a sibling bin exists.
+#[test]
+fn v107_mcp_bridge_app_binary_prefers_staged_exe() {
+    let real_probe = std::env::var_os("SLOOPER_PROBE_EXE");
+    let real_bin = std::env::var_os("CARGO_BIN_EXE_slooper");
+    std::env::set_var("SLOOPER_PROBE_EXE", "/probe/staged.exe");
+    std::env::set_var("CARGO_BIN_EXE_slooper", "/linux/staged");
+    assert_eq!(app_binary(), std::path::PathBuf::from("/probe/staged.exe"));
+    std::env::set_var("SLOOPER_PROBE_EXE", "");
+    assert_eq!(app_binary(), std::path::PathBuf::from("/linux/staged"));
+    // Restore the real environment before the derive path is ever hit.
+    match real_probe {
+        Some(v) => std::env::set_var("SLOOPER_PROBE_EXE", v),
+        None => std::env::remove_var("SLOOPER_PROBE_EXE"),
+    }
+    match real_bin {
+        Some(v) => std::env::set_var("CARGO_BIN_EXE_slooper", v),
+        None => std::env::remove_var("CARGO_BIN_EXE_slooper"),
+    }
 }
 
 #[test]
 #[ignore = "slow-tier: real socket"]
-fn v94_mcp_bridge_stdio_child_forwards() {
+fn v107_mcp_bridge_stdio_child_forwards() {
     // Real `slooper --mcp-bridge` child (CARGO_BIN_EXE_slooper, NEVER the
     // build.rs-baked path — W12e rule): stdin line -> POST -> stdout line,
     // endpoint discovery via SLOOPER_DATA_DIR/mcp-endpoint.json. The test
     // thread plays the frame loop draining the queue.
-    let dir = isolated_data_dir("v94br");
+    let dir = isolated_data_dir("v107br");
     let ctx = egui::Context::default();
     // Start the REAL server through the App — the one the pump loop below
     // drains via `app.mcp`. (A standalone McpServer here would own a queue
     // nobody drains: the shim would only ever collect the worker's -32002.)
-    let mut app = headless_app("v94br");
+    let mut app = headless_app("v107br");
     app.mcp_port = 0;
     app.mcp_enabled = true;
     app.mcp_frame(&ctx);
