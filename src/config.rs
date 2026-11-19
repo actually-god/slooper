@@ -117,6 +117,20 @@ pub fn default_drum_kit() -> Vec<DrumPadSave> {
 /// v51: one sampler key-map slot: a rack asset (stored as a PATH like the
 /// drum kit, so projects can re-link after a reload) plus the root note
 /// whose pitch the sample already has.
+///
+/// v93 (card t_aaffeb92) — resolution contract, PRESET SCHEMA of record:
+/// `asset` is a POINTER to the canonical rack location, never embedded
+/// audio. Embedding was rejected on purpose: presets would duplicate
+/// gigabytes of sample data and fork rack edits (project.rs states the
+/// same rule for clips: "Audio is never embedded"). At every resolution
+/// seam (`App::warm_sample_asset`, ui.rs) the stored path is used if the
+/// file exists; otherwise the file NAME is re-resolved against the
+/// configured rack folders (`project::resolve_asset`, the clip contract)
+/// and the slot is rewritten to what was found (self-heal); the referenced
+/// file is then DECODED into the asset table, which the v51-v92 resolution
+/// silently assumed was already populated (it wasn't after a restart —
+/// that was the "(missing)" bug). Only a file genuinely gone from disk and
+/// rack yields the slot-level "(missing)" marker + a named status echo.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SamplerSlotSave {
     pub asset: String,
