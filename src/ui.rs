@@ -865,6 +865,26 @@ fn track_head_menu(ui: &mut egui::Ui, app: &mut App, t: usize) {
     if track_color_submenu(ui, app, t) {
         ui.close();
     }
+    // v94 (sc-1): the selection replaces one-by-one checkbox joins — every
+    // selected track joins the RECORD GROUP here (ascending order, v52
+    // loop-inherit contract via the shared `rec_group_join` seam). The "G"
+    // checkbox stays for single-track join/leave: membership outlives the
+    // volatile selection.
+    let n_sel = app.track_sel.len();
+    if ui
+        .button("REC group (selection)")
+        .on_hover_text(format!(
+            "join the {} selected track(s) to the record group so they arm \
+             and stop TOGETHER from the top-bar 'REC GROUP' button (loop \
+             'l' is shared); leave with the strip's G checkbox",
+            n_sel
+        ))
+        .clicked()
+    {
+        let sel = app.track_sel.clone();
+        app.rec_group_join(&sel);
+        ui.close();
+    }
     if ui
         .button("Track templates\u{2026}")
         .on_hover_text(
@@ -1381,8 +1401,19 @@ pub struct App {
     levels_dirty: bool,
 
     // --- DAW state ---
-    /// Track targeted by keyboard/MIDI "selected" actions.
+    /// Track targeted by keyboard/MIDI "selected" actions. v94: the ACTIVE
+    /// member of [`App::track_sel`] — always exactly one; every consumer of
+    /// "the current track" keeps reading this field unchanged.
     selected: usize,
+    /// v94 (sc-1): multi-track selection — the clip/note click language on
+    /// track rows (plain replaces, Ctrl/Cmd toggles, Shift extends a run;
+    /// [`App::select_track_click`] is the single seam). Invariant: sorted,
+    /// NON-EMPTY, always contains `selected`, all members < `n_tracks`.
+    /// Multi-track preview / sidechain work (sc-2) consumes this list
+    /// directly. Session state only (like `sel_clips`) — never persisted.
+    track_sel: Vec<usize>,
+    /// v94: the Shift-run anchor = last plain/Ctrl click.
+    track_sel_anchor: usize,
     /// Tracks the program EXPOSES (Settings → DAW, 1..=16). Levels and
     /// bindings of hidden tracks survive: raising the count back restores
     /// them, so lowering tracks can never destroy a binding.
@@ -2209,6 +2240,8 @@ impl App {
             mix_geom: MixGeom::default(),
             mix_hscroll: 0.0,
             selected: 0,
+            track_sel: vec![0],
+            track_sel_anchor: 0,
             n_tracks: cfg.n_tracks.clamp(1, MAX_LOOPS),
             loop_tl: cfg.loop_tl,
             loop_mode: cfg.loop_mode.min(2),
@@ -5197,6 +5230,139 @@ impl App {
         self.sel_clips = ids;
     }
 
+    /// v94 (sc-1): is track `t` in the multi-track selection?
+    fn is_track_sel(&self, t: usize) -> bool {
+        self.track_sel.contains(&t)
+    }
+
+    /// v94: member list for echoes, 1-based ("1, 3, 5").
+    fn track_sel_list(&self) -> String {
+        self.track_sel
+            .iter()
+            .map(|&t| (t + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// v94: programmatic single-select (MIDI actions, drum commit): replaces
+    /// the set, keeps the [`App`] invariants, moves the anchor, and stays
+    /// SILENT — the calling action already echoes its own result (v72).
+    fn select_track_plain(&mut self, t: usize) {
+        let t = t.min(self.n_tracks.saturating_sub(1));
+        self.selected = t;
+        self.track_sel = vec![t];
+        self.track_sel_anchor = t;
+        self.last_click_track = Some(t);
+    }
+
+    /// v94 (sc-1): the ONE handler for track-row clicks — the mixer dock
+    /// strip header and the mix-page channel header both call this, so the
+    /// two surfaces cannot drift (the v68 shared-menu rule). Plain replaces
+    /// the set; Ctrl/Cmd toggles membership — adding makes the track the
+    /// active anchor, removing never empties the set (the last member
+    /// refuses, with an echo saying why); Shift extends the anchor run and
+    /// leaves the active track where it is. Every click echoes the result
+    /// (v72 standard).
+    fn select_track_click(&mut self, t: usize, ctrl: bool, shift: bool) {
+        let t = t.min(self.n_tracks.saturating_sub(1));
+        self.last_click_track = Some(t);
+        if shift {
+            let a = self.track_sel_anchor.min(self.n_tracks - 1);
+            let (lo, hi) = (a.min(t), a.max(t));
+            self.track_sel = (lo..=hi).collect();
+            self.status = format!("tracks {}–{} selected ({})", lo + 1, hi + 1, hi - lo + 1);
+        } else if ctrl {
+            if self.track_sel.contains(&t) {
+                if self.track_sel.len() == 1 {
+                    self.status =
+                        format!("track {}: one track must stay selected", t + 1);
+                } else {
+                    self.track_sel.retain(|&j| j != t);
+                    if !self.track_sel.contains(&self.selected) {
+                        self.selected = self.track_sel[0];
+                    }
+                    self.status = format!(
+                        "track {} unselected \u{b7} tracks {} selected ({})",
+                        t + 1,
+                        self.track_sel_list(),
+                        self.track_sel.len()
+                    );
+                }
+            } else {
+                self.track_sel.push(t);
+                self.track_sel.sort();
+                self.selected = t;
+                self.track_sel_anchor = t;
+                self.status = format!(
+                    "tracks {} selected ({})",
+                    self.track_sel_list(),
+                    self.track_sel.len()
+                );
+            }
+        } else {
+            self.select_track_plain(t);
+            self.status = format!("track {} selected", t + 1);
+        }
+    }
+
+    /// v94: keep the set invariant when `n_tracks` changes (Settings seam)
+    /// or a project loads: members beyond the new count are dropped, the
+    /// anchor clamps, and the active track re-seats so the set never goes
+    /// empty. Growing back cannot drift: members kept their indices.
+    fn clamp_track_sel(&mut self) {
+        let n = self.n_tracks.max(1);
+        self.selected = self.selected.min(n - 1);
+        self.track_sel.retain(|&j| j < n);
+        self.track_sel_anchor = self.track_sel_anchor.min(n - 1);
+        if !self.track_sel.contains(&self.selected) {
+            self.track_sel = vec![self.selected];
+        }
+    }
+
+    /// v94 (sc-1): join `ts` to the RECORD GROUP from ONE seam — the strip
+    /// "G" checkbox and the head-menu join-from-selection share it, so the
+    /// v52 R4 contract (join order = ascending front-oldest; a joiner
+    /// inherits the LINKED loop selector from the front member) cannot
+    /// drift between entry points. Already-member tracks are skipped.
+    fn rec_group_join(&mut self, ts: &[usize]) {
+        let mut ts: Vec<usize> = ts.iter().copied().collect();
+        ts.sort_unstable();
+        ts.dedup();
+        let mut joined = Vec::new();
+        for &t in ts.iter() {
+            if t >= self.n_tracks || self.rec_group.contains(&t) {
+                continue;
+            }
+            if let Some(old) = self.rec_group.first().copied() {
+                self.rec_src[t].loop_rec = self.rec_src[old].loop_rec;
+            }
+            self.rec_group.push(t);
+            joined.push(t + 1);
+        }
+        if joined.is_empty() {
+            self.status = format!(
+                "record group: already joined \u{b7} {} track(s)",
+                self.rec_group.len()
+            );
+        } else if joined.len() == 1 {
+            self.status = format!(
+                "record group: track {} joins \u{2014} {} track(s) selected",
+                joined[0],
+                self.rec_group.len()
+            );
+        } else {
+            self.status = format!(
+                "record group: tracks {} join \u{2014} {} track(s) selected",
+                joined
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.rec_group.len()
+            );
+        }
+    }
+
     /// v34 R18: the shift+click RUN anchored at `sel_anchor` and landing
     /// on clip `hit` (whose start is `hit_pos`): every clip of the anchor's
     /// TRACK whose span overlaps the [anchor..hit] window — across child
@@ -7843,7 +8009,7 @@ impl App {
         // becomes the selected track and every freshly stamped clip is
         // outlined (the historic complaint was "commit does nothing", but
         // clips at an offscreen playhead with no feedback read as nothing).
-        self.selected = t;
+        self.select_track_plain(t); // v94: keeps the set invariant (was raw write)
         self.last_click_track = Some(t);
         self.sel_clips = new_ids;
         let mut msg = format!(
@@ -16182,6 +16348,9 @@ impl App {
         self.arr = arr;
         // The saved project carries its own configured track count.
         self.n_tracks = pr.n_tracks.unwrap_or(16).clamp(1, MAX_LOOPS);
+        // v94: a loaded project starts a fresh selection — the OLD set
+        // refers to the previous project's tracks (single-select reset).
+        self.select_track_plain(self.selected.min(self.n_tracks - 1));
         // Per-track synths (missing slots fall back to the default piano).
         for t in 0..MAX_LOOPS {
             if sel.instruments {
@@ -16584,7 +16753,7 @@ impl App {
 
     fn fire_midi_action(&mut self, a: MidiAction) {
         match a {
-            MidiAction::Select(i) => self.selected = i,
+            MidiAction::Select(i) => self.select_track_plain(i),
             MidiAction::RecSelected => self.toggle_record_all(self.selected),
             MidiAction::ClearSelected => self.clear_track(self.selected),
             MidiAction::PlaySelected => self.backend.cmd(Cmd::ToggleTrackOn { i: self.selected }),
@@ -16597,8 +16766,16 @@ impl App {
                 self.send_metro();
             }
             // Selection NEVER wraps: it stops at track 1 and track 16.
-            MidiAction::SelectNext => self.selected = (self.selected + 1).min(self.n_tracks - 1),
-            MidiAction::SelectPrev => self.selected = self.selected.saturating_sub(1),
+            MidiAction::SelectNext => {
+                // v94: routed through the select seam so the set
+                // invariant follows every active-track move.
+                let nxt = (self.selected + 1).min(self.n_tracks - 1);
+                self.select_track_plain(nxt);
+            }
+            MidiAction::SelectPrev => {
+                let prv = self.selected.saturating_sub(1);
+                self.select_track_plain(prv);
+            }
             // The global transport: PlayAll toggles play/stop (space-bar
             // style), StopAll always parks (the playhead holds its place).
             MidiAction::PlayAll => {
@@ -23390,20 +23567,27 @@ fn mix_page(ui: &mut egui::Ui, app: &mut App) {
 fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
     let rect = ui.max_rect();
     ui.shrink_clip_rect(rect);
-    let sel = app.selected == t;
+    let sel = app.is_track_sel(t);
     let rec = app.backend.engine.rec_state_of(t) == TR_REC;
     let on = app.backend.engine.track_on(t);
+    // v94 (sc-1): same selection language as the dock strips; the ACTIVE
+    // member's text rides the kit accent (shared seam = no drift).
+    let mut txt = RichText::new(format!("Ch {}", t + 1)).strong();
+    if app.selected == t {
+        txt = txt.color(crate::kit::Kit::of(ui.visuals()).accent);
+    }
     // Header first (the color chip paints INSIDE it, v56-style: an
     // allocated chip row would shift every lower row in colored
     // columns and break the page-wide alignment).
     let head = ui
         .add_sized(
             [MIX_COL_W - 4.0, 18.0],
-            egui::Button::selectable(sel, RichText::new(format!("Ch {}", t + 1)).strong()),
+            egui::Button::selectable(sel, txt),
         )
         .on_hover_text(
-            "Channel strip: click selects the track \u{b7} right-click for \
-             the track menu (color, templates)",
+            "Channel strip: click selects \u{b7} Ctrl+click adds/removes \u{b7} \
+             Shift+click a range \u{b7} right-click for the track menu \
+             (color, templates)",
         );
     let chip = app
         .trk_color
@@ -23416,7 +23600,8 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
         ui.painter().rect_filled(cr, 0.0, sw);
     }
     if head.clicked() {
-        app.selected = t;
+        let m = ui.input(|i| i.modifiers);
+        app.select_track_click(t, m.command, m.shift);
     }
     // v68: IDENTICAL menu to the dock strip (shared helper).
     head.context_menu(|ui| track_head_menu(ui, app, t));
@@ -23757,9 +23942,16 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
     // neighbour (the ghosted "Track 6" report).
     let strip_rect = ui.max_rect();
     ui.shrink_clip_rect(strip_rect);
-    let sel = app.selected == t;
+    let sel = app.is_track_sel(t);
     let rec = app.backend.engine.rec_state_of(t) == TR_REC;
     let on = app.backend.engine.track_on(t);
+    // v94 (sc-1): member of the multi-selection paints selectable; the
+    // ACTIVE member's text additionally rides the kit accent (theme-safe,
+    // color-only = zero layout shift for the strip-alignment pins).
+    let mut txt = RichText::new(format!("Track {}", t + 1)).strong();
+    if app.selected == t {
+        txt = txt.color(crate::kit::Kit::of(ui.visuals()).accent);
+    }
     let nl = app.arr.tracks[t].lanes.len();
     let clips: usize = app.arr.tracks[t].lanes.iter().map(|l| l.clips.len()).sum();
     ui.horizontal(|ui| {
@@ -23781,10 +23973,14 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             ui.allocate_space(egui::vec2(11.0, 16.0));
         }
         let head = ui
-            .selectable_label(sel, RichText::new(format!("Track {}", t + 1)).strong())
-            .on_hover_text("Click to select \u{b7} right-click for the track menu (color)");
+            .selectable_label(sel, txt)
+            .on_hover_text(
+                "Click selects \u{b7} Ctrl+click adds/removes \u{b7} Shift+click a \
+                 range \u{b7} right-click for the track menu (color)",
+            );
         if head.clicked() {
-            app.selected = t;
+            let m = ui.input(|i| i.modifiers);
+            app.select_track_click(t, m.command, m.shift);
         }
         // v59: right-click opens the SAME Track color submenu the grid
         // menu carries (shared helper — the two menus cannot drift).
@@ -23836,15 +24032,9 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             );
         if grp_resp.changed() {
             if grp {
-                if let Some(old) = app.rec_group.first().copied() {
-                    app.rec_src[t].loop_rec = app.rec_src[old].loop_rec;
-                }
-                app.rec_group.push(t);
-                app.status = format!(
-                    "record group: track {} joins — {} track(s) selected",
-                    t + 1,
-                    app.rec_group.len()
-                );
+                // v94 (sc-1): join goes through the shared seam (the head
+                // menu's join-from-selection uses the same code path).
+                app.rec_group_join(&[t]);
             } else {
                 app.rec_group.retain(|&j| j != t);
                 app.status = format!(
@@ -28672,6 +28862,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 if p_changed(&r, before, &mut n) {
                     app.n_tracks = n as usize;
                     app.selected = app.selected.min(app.n_tracks - 1);
+                    // v94: shrink prunes members past the new count (grow
+                    // back can never drift — kept members kept their index).
+                    app.clamp_track_sel();
                     app.bind_loop_sel = app.bind_loop_sel.min(app.n_tracks - 1);
                     app.save_config();
                     app.status = format!("{} tracks", app.n_tracks);
