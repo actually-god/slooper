@@ -1642,6 +1642,14 @@ impl Engine {
         self.sc_send_hi[i].store((m >> 64) as u64, Ordering::Relaxed);
     }
 
+    /// v95 (sc-3): union of every target's send mask = the set of tracks
+    /// that key SOME chain this block. Read once per RT block; gates the
+    /// mute/vol-independent tap (a muted SOURCE still collects clips and
+    /// keys its targets — docs/SIDECHAIN.md).
+    pub fn sc_src_mask(&self) -> u128 {
+        (0..MAX_LOOPS).fold(0u128, |m, t| m | self.sc_send(t))
+    }
+
     /// Per-track pan position ([0, 1]; 0.5 = centre).
     pub fn loop_pan(&self, i: usize) -> f32 {
         f32::from_bits(self.pan[i].load(Ordering::Relaxed))
@@ -2049,29 +2057,40 @@ impl Engine {
         let mut out = vec![0.0f32; len.max(1)];
         let mut any = false;
 
-        // v32 R5 sidechain mirror: the live bus taps every AUDIBLE source
-        // track's dry, post-trim sum and hands the routed targets' chains
-        // the summed taps. Offline the taps are sample-aligned (the live
-        // one-block detector lag cannot be reproduced without knowing the
-        // RT block size and is not part of what the user hears "as mixed").
-        // A track without a chain of its own can still be a source, so
-        // source buses are computed regardless of the export scope.
+        // v32 R5 / v95 sidechain mirror: the live bus taps every ROUTED
+        // source's dry sum scaled by GAIN x PAN-FOLD only — never the
+        // volume fader, never the mute (play flag or automation): muting
+        // the sender silences its audio but keeps the key, exactly like
+        // the live tap (docs/SIDECHAIN.md). Offline the taps are
+        // sample-aligned (the live one-block detector lag cannot be
+        // reproduced without knowing the RT block size and is not part of
+        // what the user hears "as mixed"). A track without a chain of its
+        // own can still be a source, so source buses are computed
+        // regardless of the export scope.
         let mut send = [0u128; MAX_LOOPS];
         let mut sc_any = false;
         for (tg, s) in send.iter_mut().enumerate() {
             *s = self.sc_send(tg);
             sc_any |= *s != 0;
         }
+        // Reuse cache for TARGET mix buses (unchanged post-trim law).
         let mut dry_hold: Vec<Option<Vec<f32>>> = if sc_any {
             vec![None; MAX_LOOPS]
         } else {
             Vec::new()
         };
+        // v95: held TAP buses (gain x pan-fold, mute/fader-independent).
+        let mut tap_hold: Vec<Option<Vec<f32>>> = if sc_any {
+            vec![None; MAX_LOOPS]
+        } else {
+            Vec::new()
+        };
 
-        // The track's DRY bus: all lanes' clips summed post-trim — exactly
-        // the signal the live chain is fed (`None` = nothing placed).
-        let track_dry = |t: usize| -> Option<Vec<f32>> {
-            let tamp = self.loop_vol(t) * self.loop_gain(t);
+        // The track's DRY bus: all lanes' clips summed — exactly the
+        // signal the live chain is fed before its trim (`None` = nothing
+        // placed). `scale` is folded in per call site: volume x gain for
+        // the mix bus, gain x pan-fold for the sidechain tap.
+        let track_dry_s = |t: usize, scale: f32| -> Option<Vec<f32>> {
             let has_audio = arr.tracks[t].lanes.iter().any(|l| {
                 l.clips
                     .iter()
@@ -2132,7 +2151,7 @@ impl Engine {
                     render_midi_any(&h, &mut ev, 0, len.max(1), &mut buf, sr);
                 }
                 for (k, x) in buf.into_iter().enumerate() {
-                    trk[k] += x * tamp;
+                    trk[k] += x * scale;
                 }
             }
             // Audio clips: the clip is pinned at `pos` and the source
@@ -2158,11 +2177,14 @@ impl Engine {
                     let dend = dend.max(dstart as u64) as usize;
                     for k in dstart..dend {
                         let s = data[(cl.cut + (k as u64 - cl.data_start())) as usize];
-                        trk[k] += s * tamp * cl.gain * cl.fade_at(k as u64, alen);
+                        trk[k] += s * scale * cl.gain * cl.fade_at(k as u64, alen);
                     }
                 }
             }
             Some(trk)
+        };
+        let track_dry = |t: usize| -> Option<Vec<f32>> {
+            track_dry_s(t, self.loop_vol(t) * self.loop_gain(t))
         };
 
         // Target tracks: the export scope (an explicit track export
@@ -2180,10 +2202,20 @@ impl Engine {
             targets.push(t);
         }
         if sc_any {
-            // Hold the dry bus of every AUDIBLE sidechain source — also of
-            // sources OUTSIDE the export scope (they only ever feed another
-            // track's chain, exactly like the live tap).
+            // v95: hold the TAP bus of EVERY routed source — play flag and
+            // fader irrelevant (the key survives both). Scale = the track's
+            // gain x its mono pan-fold, the exact mirror of the live
+            // sc_fold. Sources OUTSIDE the export scope are tapped too
+            // (they only ever feed another track's chain, like the live bus).
             let src_mask = send.iter().fold(0u128, |m, s| m | *s);
+            for (src, slot) in tap_hold.iter_mut().enumerate() {
+                if (src_mask >> src) & 1 != 0 {
+                    let (pgl, pgr) = pan_gains(self.loop_pan(src));
+                    let scale = self.loop_gain(src) * (pgl + pgr) * F1S2;
+                    *slot = track_dry_s(src, scale);
+                }
+            }
+            // Mix-bus reuse cache for target tracks (unchanged post-trim).
             for (src, slot) in dry_hold.iter_mut().enumerate() {
                 if (src_mask >> src) & 1 != 0 && (self.track_on(src) || Some(src) == only) {
                     *slot = track_dry(src);
@@ -2201,7 +2233,7 @@ impl Engine {
             for &t in &targets {
                 if send[t] != 0 {
                     let mut row = vec![0.0f32; len.max(1)];
-                    for (src, d) in dry_hold.iter().enumerate() {
+                    for (src, d) in tap_hold.iter().enumerate() {
                         if (send[t] >> src) & 1 != 0 {
                             if let Some(d) = d {
                                 for (r, x) in row.iter_mut().zip(d.iter()) {
@@ -3377,6 +3409,40 @@ impl Proc {
                     t as u8
                 }
             };
+        }
+        // v95 (sc-3) phase B: MUTED sidechain sources join rendering so a
+        // muted sender's patterns/keys still produce their KEY (the tap
+        // reads midi_scratch regardless of audibility). Only DEDICATED
+        // instances qualify: staging a muted track's events into a SHARED
+        // instance's merged stream would leak its notes through the
+        // audible owner's row into the mix (v33 ownership cannot separate
+        // them). Shared-synth muted senders: docs/SIDECHAIN.md.
+        let sc_src = engine.sc_src_mask();
+        if sc_src != 0 {
+            for (t, owner_slot) in owner.iter_mut().enumerate() {
+                if *owner_slot != 0xFF || (sc_src >> t) & 1 == 0 {
+                    continue; // already participating / not a sender
+                }
+                if engine.poly_on(t)
+                    && matches!(poly_cache.get(t), Some(row) if !row.is_empty())
+                {
+                    continue; // poly rows render their own copies
+                }
+                let Some(h) = synths_cache
+                    .get(t)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| dflt.clone())
+                else {
+                    continue;
+                };
+                let ptr = Arc::as_ptr(&h) as usize;
+                if own.iter().any(|(p, _)| *p == ptr) {
+                    continue; // instance already owned by an audible track
+                }
+                own.push((ptr, t));
+                *owner_slot = t as u8;
+            }
         }
         for t in 0..MAX_LOOPS {
             if owner[t] != t as u8 {
@@ -4601,14 +4667,27 @@ impl Proc {
         false
     }
 
-    fn collect_clips(&self, p0: u64, n: usize, hold_mask: u128, entries: &mut Vec<ClipEntry>) {
+    fn collect_clips(
+        &self,
+        p0: u64,
+        n: usize,
+        hold_mask: u128,
+        sc_src_mask: u128,
+        entries: &mut Vec<ClipEntry>,
+    ) {
         entries.clear();
         let span_end = p0.saturating_add(n as u64);
         for (t, track) in self.arr.tracks.iter().enumerate() {
             // v32 R7: a just-muted track keeps its window while its release
             // ramp is running (hold_mask) — else the fade has nothing to
             // fade and the mute lands as a hard step.
-            if !self.engine.track_on(t) && (hold_mask >> t) & 1 == 0 {
+            // v95 (sc-3): a sidechain SOURCE keeps its window even with the
+            // play flag OFF — the tap is mute/vol-independent, so a muted
+            // sender's clips still produce its key (docs/SIDECHAIN.md).
+            if !self.engine.track_on(t)
+                && (hold_mask >> t) & 1 == 0
+                && (sc_src_mask >> t) & 1 == 0
+            {
                 continue;
             }
             for lane in &track.lanes {
@@ -5017,9 +5096,14 @@ impl Proc {
         let pv_mask = if transport { pv_mask } else { 0 };
         let any_pv = pv_mask != 0;
 
+        // v95 (sc-3): union of all send masks — a track with clips that
+        // keys SOME chain keeps its clip windows even when muted/stopped,
+        // so this must gate clip_sound (and the idle return below) too.
+        let sc_src_any = self.engine.sc_src_mask();
         let clip_sound = transport
             && self.arr.tracks.iter().enumerate().any(|(t, tr)| {
-                self.engine.track_on(t) && tr.lanes.iter().any(|l| !l.clips.is_empty())
+                let has_clips = tr.lanes.iter().any(|l| !l.clips.is_empty());
+                has_clips && (self.engine.track_on(t) || (sc_src_any >> t) & 1 != 0)
             });
         // v32 R7: a release ramp from the previous block still running:
         // the mix must keep producing (fading) even though the gates
@@ -5123,7 +5207,7 @@ impl Proc {
         let mut entries = std::mem::take(&mut self.clip_buf);
         entries.clear();
         if clip_sound || env_held {
-            self.collect_clips(p0, block_n, env_mask, &mut entries);
+            self.collect_clips(p0, block_n, env_mask, sc_src_any, &mut entries);
         }
         // MIDI pattern clips of this block, rendered per track through the
         // track's synth into `midi_scratch` (mixed in the sample loop).
@@ -5340,8 +5424,16 @@ impl Proc {
             // A track whose synth is sounding is audible even when the
             // transport is stopped: the live feed rides the track's own
             // chain × gain × volume × pan, exactly like its clips.
+            // v95 (sc-3): a MUTED sidechain source may now be rendered
+            // purely for its key (dedicated instances) — rendering alone
+            // must not promote it into the mix. Only play-on tracks or
+            // audition targets (v38: audition answers on ANY track) keep
+            // the promotion.
             for (t, a) in audible.iter_mut().enumerate() {
-                *a |= self.midi_live[t];
+                *a |= self.midi_live[t]
+                    && (self.engine.track_on(t)
+                        || ((self.aud_mask >> t) & 1) != 0
+                        || self.aud_held[t] > 0);
             }
         }
 
@@ -5587,12 +5679,17 @@ impl Proc {
             n_acc: nacc,
         } = lists;
 
-        // ---- v32 R5: sidechain bus block setup --------------------------
+        // ---- v32 R5 / v95: sidechain bus block setup ---------------------
         // Sends are read every block from the engine atomics (UI writes
-        // land next block). Edges expand to (source, target) pairs; the
-        // per-sample loop taps ONLY sources that are actually used, and a
-        // project without routing costs one AND per mixed track.
-        let mut sc_src_any = 0u128;
+        // land next block). Edges expand to (source, target) pairs —
+        // v95: an edge exists whenever the source has MATERIAL this block
+        // (a clip window or live/pattern MIDI), whether or not it is
+        // AUDIBLE: mute and the fader never touch the key. The tap scale
+        // is the sender's post-pan, pre-fader mono downmix
+        //   fold = trk_gain x (pgl + pgr) / sqrt(2)
+        // (block-constant — the bus feeds a detector, steps are inaudible;
+        // volume/mute/master NEVER enter it — docs/SIDECHAIN.md). A
+        // project without routing costs one atomic AND per track.
         let mut n_edge = 0usize;
         let mut e_src = [0u8; 256];
         let mut e_tgt = [0u8; 256];
@@ -5604,13 +5701,25 @@ impl Proc {
                 continue;
             }
             sc_any = true;
-            sc_src_any |= m;
             for s in 0..MAX_LOOPS {
-                if (m >> s) & 1 != 0 && n_edge < e_src.len() {
+                // Sources with no material this block must NOT tap a
+                // stale acc[] row — they simply get no edge.
+                let sourced = (entry_mask >> s) & 1 != 0 || self.midi_live[s];
+                if (m >> s) & 1 != 0 && sourced && n_edge < e_src.len() {
                     e_src[n_edge] = s as u8;
                     e_tgt[n_edge] = tg as u8;
                     n_edge += 1;
                 }
+            }
+        }
+        // v95: per-block tap scale (see above). The trk_gain atomic
+        // already carries this block's automation gain (apply_auto_real
+        // writes it before the sample loop); pgl/pgr carry automation pan.
+        let mut sc_fold = [0.0f32; MAX_LOOPS];
+        if sc_any {
+            for t in 0..MAX_LOOPS {
+                let g = f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
+                sc_fold[t] = g * (pgl[t] + pgr[t]) * F1S2;
             }
         }
         let mut sc_apply = std::mem::take(&mut self.sc_apply);
@@ -5760,19 +5869,10 @@ impl Proc {
                     // v32 R7: ramped track trim (block-constant `amp` was
                     // the click at mute toggles / volume jumps).
                     let av = amp_a[t] + amp_s[t] * i as f32;
-                    // v32 R5: sidechain tap — the track's dry post-trim
-                    // sum feeds every target that lists it as a source
-                    // (consumed NEXT block: one block of detector lag).
-                    if sc_src_any & (1u128 << t) != 0 {
-                        let tap = a * av;
-                        if tap != 0.0 || n_edge != 0 {
-                            for k in 0..n_edge {
-                                if e_src[k] as usize == t {
-                                    sc_build[e_tgt[k] as usize][i] += tap;
-                                }
-                            }
-                        }
-                    }
+                    // v95 (sc-3): the sidechain tap used to live HERE, at
+                    // `a * av` — which made mute and the fader kill the key
+                    // (the reported bug). It moved below the mix loop:
+                    // audibility-independent, scaled by sc_fold instead.
                     if vst_mask[t] {
                         // Held back: this track's chain (scripts and
                         // plugins, in chain order) runs block-wise over
@@ -5806,6 +5906,20 @@ impl Proc {
                         }
                         play_l += pl;
                         play_r += pr;
+                    }
+                }
+                // v95 (sc-3): sidechain tap — EVERY routed source feeds
+                // its targets this block, audible or not (the old tap sat
+                // inside the audibility-gated mix loop above, so sender
+                // mute/volume killed the key — the reported bug). Edges
+                // are pre-filtered to sources with material this block;
+                // sc_fold is the sender's gain x pan-fold — the fader,
+                // every mute and the master never touch it. Consumed
+                // NEXT block (one block of detector lag).
+                if n_edge != 0 {
+                    for k in 0..n_edge {
+                        let tap = acc[e_src[k] as usize] * sc_fold[e_src[k] as usize];
+                        sc_build[e_tgt[k] as usize][i] += tap;
                     }
                 }
             }
@@ -7602,11 +7716,98 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
             "target click must duck to 0.1 under the tap, got {}",
             out[500]
         );
-        // Mute the source: no audible tap -> the duck disappears.
+        // v95 CONTRACT CHANGE (sc-3): muting the sender no longer kills
+        // its key. The audio disappears, the tap SURVIVES: the click is
+        // still ducked (sc = 1.0 x fold(centre) x gain(1) = 1.0 -> the
+        // click renders at 1 x (1 - 0.9 x 1.0) = 0.1).
         e.set_track_on(0, false);
         let out2 = e.render_project().expect("render");
-        assert!(out2[0].abs() < 1e-9, "muted source contributes nothing");
-        v48_tap(&out2, 500, 1.0);
+        assert!(out2[0].abs() < 1e-9, "muted source contributes no audio");
+        v48_tap(&out2, 500, 0.1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- v95 (sc-3): tap = post sender gain/pan, pre volume/mute --------
+    // User report 2026-11-18: the send must be COMPLETELY independent of
+    // the sender's mix level (mute / fader) and must PRESERVE the sender's
+    // gain and pan on the key signal. Tap law:
+    //   sc[i] = dry[i] x trk_gain x (pgl + pgr) x 1/sqrt(2)
+    // i.e. the track's dry post-trim sum fed through the track's own mono
+    // downmix law (centre = unity so pre-existing routes keep their level;
+    // hard L/R = 0.707). Volume, mute (play switch AND automation) and the
+    // master gain never scale the key.
+
+    /// Shared v95 rig: constant 0.25 source on track 0, unity click at
+    /// sample 500 on track 1 through the V48 duck script
+    /// (out x (1 - 0.9 x min(|sc|,1))), send armed 0 -> 1.
+    fn v95_sc_rig(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
+        let (reg, dir) = v48_reg(tag, "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![0.25f32; 1500]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0)); // track 0: constant source
+        arr.insert(1, 0, Clip::new(1, 500)); // track 1: click at 500
+        e.set_project(Arc::new(vec![src, v48_click(1000)]), Arc::new(arr), 1500);
+        let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+        let desc = reg.desc("v48sc").unwrap().clone();
+        e.set_track_fx(
+            1,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+        e.set_sc_send(1, 1 << 0);
+        (e, dir)
+    }
+
+    #[test]
+    fn v95_sc_export_muted_sender_still_keys() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (e, dir) = v95_sc_rig("v95scmute");
+        let out = e.render_project().expect("render");
+        // Baseline: 0.25 source audio + click 1.0 ducked to 0.775.
+        v48_tap(&out, 500, 1.025);
+        // MUTE the sender: audio leaves the mix, the KEY must not.
+        e.set_track_on(0, false);
+        let out2 = e.render_project().expect("render");
+        assert!(out2[0].abs() < 1e-9, "muted source contributes no audio");
+        v48_tap(&out2, 500, 0.775); // the duck SURVIVES the sender's mute
+        // Fader to zero: same story — silence in the mix, key alive.
+        e.set_track_on(0, true);
+        e.set_loop_vol(0, 0.0);
+        let out3 = e.render_project().expect("render");
+        assert!(out3[0].abs() < 1e-9, "zero-volume source contributes no audio");
+        v48_tap(&out3, 500, 0.775); // ... and the duck survives the fader
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v95_sc_export_tap_tracks_gain_pan() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        // KEY PRESERVATION (acceptance: pan/gain moves on the sender
+        // audibly change the key signal): with the sender MUTED (its audio
+        // gone) the duck depth is pure key level:
+        //   out[500] = 1 x (1 - 0.9 x sc),  sc = 0.25 x gain x fold,
+        //   fold = (pgl + pgr) x 1/sqrt(2)  (centre 1.000, hard L/R 0.707).
+        let (e, dir) = v95_sc_rig("v95scgp");
+        e.set_track_on(0, false);
+        e.set_loop_gain(0, 0.5);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.125); // sc = 0.25 x 0.5
+        e.set_loop_gain(0, 2.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.5); // sc = 0.25 x 2 — twice the key
+        // Hard-left pan at unity gain: the key rides the downmix fold.
+        e.set_loop_gain(0, 1.0);
+        e.set_loop_pan(0, 0.0);
+        let o = e.render_project().expect("render");
+        let sc = 0.25 * std::f32::consts::FRAC_1_SQRT_2;
+        v48_tap(&o, 500, 1.0 - 0.9 * sc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
