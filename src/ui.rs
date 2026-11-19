@@ -6110,7 +6110,7 @@ impl App {
             sc_recv_gain: (0..MAX_LOOPS * MAX_LOOPS)
                 .filter_map(|i| {
                     let g = self.sc_recv_gain[i];
-                    (g != 1.0).then(|| ScRecvGain {
+                    (g != 1.0).then_some(ScRecvGain {
                         t: (i / MAX_LOOPS) as u8,
                         s: (i % MAX_LOOPS) as u8,
                         gain: g,
@@ -56841,7 +56841,8 @@ mod tests {
             (lv.center().y - chip.y).abs() < 14.0,
             "the level sits on its chip's row: {chip:?} vs {lv:?}"
         );
-        assert_eq!(app.sc_recv_gain[1 * MAX_LOOPS + 0], 1.0, "unity until touched");
+        let idx = |t: usize, s: usize| t * MAX_LOOPS + s;
+        assert_eq!(app.sc_recv_gain[idx(1, 0)], 1.0, "unity until touched");
         // Drag the level right inline (not via drag_steps): the edit flags
         // the deferred config save, which the idle-flush consumes the first
         // pointer-up frame — so the flag must be observed WHILE held down.
@@ -56858,7 +56859,7 @@ mod tests {
         assert!(app.fx_save_pending, "a live level edit schedules the save");
         frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
         frame(&mut app, &ctx, vec![]); // the idle flush persists it
-        let gi = 1 * MAX_LOOPS + 0;
+        let gi = idx(1, 0);
         assert!(
             app.sc_recv_gain[gi] > 1.4,
             "drag raises the receive level: {}",
@@ -56868,11 +56869,7 @@ mod tests {
             (app.backend.engine.sc_recv_gain(1, 0) - app.sc_recv_gain[gi]).abs() < 1e-6,
             "the engine atomic follows the slider"
         );
-        assert_eq!(
-            app.sc_recv_gain[0 * MAX_LOOPS + 1],
-            1.0,
-            "the reverse (T1->T0) pair is untouched"
-        );
+        assert_eq!(app.sc_recv_gain[idx(0, 1)], 1.0, "the reverse (T1->T0) pair is untouched");
         assert!(
             app.status.contains("sidechain send T1 into T2:"),
             "status echo lands on release: {:?}",
@@ -56888,7 +56885,7 @@ mod tests {
         let src = include_str!("ui.rs").replace("\r\n", "\n");
         let cut = src.find("\nmod tests").expect("mod tests at column 0");
         let prod = &src[..cut];
-        let needle = concat!("level of track {}'s key in this chain's sidechain row");
+        let needle = "level of track {}'s key in this chain's sidechain row";
         assert_eq!(
             prod.matches(needle).count(),
             1,

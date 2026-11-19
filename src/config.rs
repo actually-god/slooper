@@ -1131,19 +1131,21 @@ mod tests {
             old.sc_recv_gain.is_empty(),
             "old files load with no route entries — unity everywhere"
         );
-        let mut c = Config::default();
-        c.sc_recv_gain = vec![
-            ScRecvGain {
-                t: 1,
-                s: 0,
-                gain: 0.5,
-            },
-            ScRecvGain {
-                t: 3,
-                s: 2,
-                gain: 1.75,
-            },
-        ];
+        let c = Config {
+            sc_recv_gain: vec![
+                ScRecvGain {
+                    t: 1,
+                    s: 0,
+                    gain: 0.5,
+                },
+                ScRecvGain {
+                    t: 3,
+                    s: 2,
+                    gain: 1.75,
+                },
+            ],
+            ..Config::default()
+        };
         let j = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&j).unwrap();
         assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "round-trip exact");
