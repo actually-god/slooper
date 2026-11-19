@@ -566,9 +566,16 @@ pub struct Config {
     /// longer ones are auditioned from the start for exactly this long.
     #[serde(default = "default_preview_secs")]
     pub preview_secs: f32,
-    /// Track whose instrument + mixer chain auditions MIDI (piano-roll
-    /// "preview through track"). `None` = the default synth script.
+    /// v96 (sc-2): the TRACKS whose instruments + mixer chains audition
+    /// MIDI (piano-roll "preview through track" generalized to a set —
+    /// previewing a selection of source+target finally HEARS the
+    /// sidechain). Empty = the default synth script.
     #[serde(default)]
+    pub preview_tracks: Vec<u32>,
+    /// v96: LEGACY scalar route (`None` = default synth). Old config
+    /// files still carry it; it loads as a one-element set (see
+    /// `preview_set_from_cfg`). Never written anymore.
+    #[serde(default, skip_serializing)]
     pub preview_track: Option<u32>,
     /// Grid snap on/off (main header checkbox). True = placement snaps to
     /// the subdivision grid; false = one sample (the minimum resolution).
@@ -812,6 +819,7 @@ impl Default for Config {
             midi_live: true,
             preview_on: true,
             preview_secs: default_preview_secs(),
+            preview_tracks: Vec::new(),
             preview_track: None,
             snap_on: true,
             vol_scale_v2: true,
@@ -1339,7 +1347,8 @@ mod tests {
             midi_live: false,
             preview_on: false,
             preview_secs: 2.5,
-            preview_track: Some(3),
+            preview_tracks: vec![3],
+            preview_track: None,
             snap_on: false,
             vol_scale_v2: true,
             project_dir: "/tmp/projects".into(),
@@ -1474,7 +1483,7 @@ mod tests {
         assert!(!back.preview_on, "preview toggle round-trips");
         assert!(back.win_editor_embed, "W8b embed flag round-trips");
         assert!((back.preview_secs - 2.5).abs() < f32::EPSILON);
-        assert_eq!(back.preview_track, Some(3), "preview track round-trips");
+        assert_eq!(back.preview_tracks, vec![3], "preview track set round-trips");
         assert!(!back.snap_on, "snap toggle round-trips");
         assert_eq!(back.fx_dir, "/tmp/effects");
         // v25: panel visibility + theme ride the config file.
@@ -1482,6 +1491,26 @@ mod tests {
         assert_eq!(back.theme, "light");
         assert_eq!(back.track_fx[0][0].stem, "template");
         assert_eq!(back.track_fx[0][0].params, vec![0.5, 4.0]);
+    }
+
+    /// v96 (sc-2): an OLD config file carrying the SCALAR `preview_track`
+    /// still deserializes (skip_serializing only affects WRITING), and a
+    /// new save carries the SET only — the legacy scalar is never
+    /// re-emitted. (The scalar→set mapping itself is `preview_set_from_cfg`,
+    /// pinned in ui::tests.)
+    #[test]
+    fn v96_config_scalar_preview_backcompat() {
+        let old: Config = serde_json::from_str(r#"{"preview_track": 3}"#).unwrap();
+        assert_eq!(old.preview_track, Some(3), "legacy scalar loads");
+        assert!(old.preview_tracks.is_empty(), "no set in an old file");
+        let new: Config = serde_json::from_str(r#"{"preview_tracks":[0,2]}"#).unwrap();
+        assert_eq!(new.preview_tracks, vec![0, 2], "set field loads");
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains("\"preview_tracks\":[0,2]"), "{json}");
+        assert!(
+            !json.contains("preview_track\""),
+            "legacy scalar is never re-written: {json}"
+        );
     }
 
     #[test]
