@@ -19757,6 +19757,8 @@ fn dock_last(app: &mut App, idx: usize) {
     } else {
         app.dyn_wins[idx - 4].dock[0] = 1;
     }
+    // v98: float→dock — along axis starts fresh, cross thickness stays.
+    reset_dock_along(app, idx, dock_edge(app, idx));
     dedupe_slot(app, idx);
     app.dock_rects[idx] = [0.0; 4];
     app.dock_collapsed[idx] = false;
@@ -19910,10 +19912,15 @@ fn set_group_active(app: &mut App, member: usize) {
 /// float-out). `idx` becomes the group's active tab.
 fn dock_tab_into(app: &mut App, idx: usize, host: usize) {
     let (e, o) = (dock_edge(app, host), dock_order(app, host));
+    // v98: float→tab-group entry also starts the along axis fresh.
+    let was_free = !is_docked(app, idx);
     if idx < 4 {
         app.side_wins.dock[idx] = [1, e, o];
     } else {
         app.dyn_wins[idx - 4].dock = [1, e, o];
+    }
+    if was_free {
+        reset_dock_along(app, idx, e);
     }
     set_group_active(app, idx);
     app.dock_collapsed[idx] = false;
@@ -20197,6 +20204,9 @@ fn strip_def(i: usize, edge: i16) -> f32 {
 /// re-pack the edge's orders to 0..n-1.
 fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
     let n = win_count(app);
+    // v98: entering the dock from a float? The along dimension is a
+    // different quantity there — start it fresh (see reset_dock_along).
+    let was_free = !is_docked(app, idx);
     // v47 R1: rank by GROUPS, not windows — docked windows sharing
     // (edge, order) are one tab group and re-rank as a unit (a new drop
     // lands between groups, it never splits one).
@@ -20251,6 +20261,9 @@ fn dock_at(app: &mut App, idx: usize, edge: i16, pt: egui::Pos2) {
     }
     app.dock_collapsed[idx] = false;
     app.dock_rects[idx] = [0.0; 4];
+    if was_free {
+        reset_dock_along(app, idx, edge);
+    }
     app.side_dirty = true;
 }
 
@@ -20265,11 +20278,16 @@ fn dock_all_windows(app: &mut App) {
     // groups (equal orders are group identity, "dock all" never shuffles
     // them). Only floating windows get pulled in: primaries to their
     // stock edge, dynamic windows below the right edge's tail.
+    let mut pulled: Vec<(usize, i16)> = Vec::new();
     for (i, (d, f)) in app.side_wins.dock.iter_mut().zip(def).enumerate() {
         if d[0] != 1 {
             *d = f;
-            let _ = i;
+            pulled.push((i, f[1]));
         }
+    }
+    // v98: every "dock all" pull is a float→dock transition.
+    for (i, e) in pulled {
+        reset_dock_along(app, i, e);
     }
     let dyn_floats: Vec<usize> = app
         .dyn_wins
@@ -20285,6 +20303,8 @@ fn dock_all_windows(app: &mut App) {
             .max()
             .unwrap_or(0);
         app.dyn_wins[n].dock = [1, 1, maxo + 1];
+        // v98: float→dock along reset (see dock_all primaries).
+        reset_dock_along(app, 4 + n, 1);
     }
     // Stock defaults may still collide with a kept group — push collisions
     // to the free tail (explicit groups stay untouched).
@@ -20760,84 +20780,102 @@ fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     }
 }
 
+/// v98 (dock-1-size-persist): the docked-size persistence contract.
+///
+/// The config rect's CROSS axis must hold the thickness the panel RESERVES
+/// — the exact quantity `default_size`/egui `PanelState` round-trips. The
+/// pre-v98 write-back inside `docked_head` measured the panel's INNER
+/// CONTENT rect instead: ~33 px narrower than the reserved thickness
+/// (wrapper + frame margins), and its 24 px tolerance passively re-latched
+/// that narrower number on EVERY boot — each restart shaved another margin
+/// off every docked window (420 → 387 → 354 → ...) until it stuck at the
+/// min_size floor. That ratchet is the user report "subwindow sizes always
+/// reset themselves to some minimum size when the user reloads".
+///
+/// Two rules stop the class:
+///  (a) measure the panel's OWN outer rect (a fixed point of the
+///      default_size round-trip), not anything content-derived;
+///  (b) latch only on real divider manipulation (pointer held down) or the
+///      never-moved first seed — a boot or fair-share LAYOUT COMPROMISE is
+///      never persisted back as user intent (the old 2 px along-axis latch
+///     also flattened every stacked 700/300 split to fair share on frame 1).
+fn remember_dock_size(ui: &egui::Ui, app: &mut App, idx: usize, outer: egui::Rect, latch_along: bool) {
+    if outer.width() < 8.0 || outer.height() < 8.0 {
+        return; // tabbed co-members paint zeroed rects: nothing was laid out
+    }
+    let dragging = ui.ctx().input(|i| i.pointer.any_down());
+    let edge = dock_edge(app, idx);
+    let cross_h = edge == 2 || edge == 3;
+    let mut dirty = false;
+    {
+        let wr = match idx {
+            0 => &mut app.side_wins.rack,
+            1 => &mut app.side_wins.binds,
+            2 => &mut app.side_wins.monitor,
+            3 => &mut app.side_wins.mixer,
+            _ => &mut app.dyn_wins[idx - 4].rect,
+        };
+        let (ci, ai) = if cross_h { (3usize, 2usize) } else { (2usize, 3usize) };
+        let (size_c, size_a) = if cross_h {
+            (outer.height(), outer.width())
+        } else {
+            (outer.width(), outer.height())
+        };
+        if dragging && (wr[ci] - size_c).abs() > 2.0 {
+            wr[ci] = size_c;
+            dirty = true;
+        } else if wr[ci] < 40.0 && size_c > 40.0 {
+            wr[ci] = size_c; // first record (never-moved window)
+        }
+        // v98 review: a LONE dock's along dimension is the WHOLE edge
+        // (809px for a side dock), not a share — persisting it and feeding
+        // it back when the edge later gains members starves them (a
+        // pre-v98 fair-share CAP used to mask exactly this). LONE call
+        // sites pass latch_along=false; multi-member sites latch shares.
+        if latch_along {
+            if dragging && (wr[ai] - size_a).abs() > 2.0 {
+                wr[ai] = size_a;
+                dirty = true;
+            } else if wr[ai] < 40.0 && size_a > 40.0 {
+                wr[ai] = size_a;
+            }
+        }
+    }
+    if dirty {
+        app.side_dirty = true;
+    }
+}
+
+/// v98: the ALONG dimension of a FLOAT (a side float's height, a bottom
+/// float's width) means something else than a docked member's along-SHARE
+/// of the edge strip. Carrying the float value into a fresh dock slot and
+/// feeding it as a share default is the v44 R1 "stale 520 snaps the bottom
+/// bar huge" class — clearing it on float→dock entry starts that axis at
+/// "no preference" (built-in footprint / proportional share decides),
+/// while the CROSS axis (the thickness the user chose) carries over.
+fn reset_dock_along(app: &mut App, idx: usize, edge: i16) {
+    let wr = match idx {
+        0 => &mut app.side_wins.rack,
+        1 => &mut app.side_wins.binds,
+        2 => &mut app.side_wins.monitor,
+        3 => &mut app.side_wins.mixer,
+        _ => &mut app.dyn_wins[idx - 4].rect,
+    };
+    if edge == 2 || edge == 3 {
+        wr[2] = 0.0;
+    } else {
+        wr[3] = 0.0;
+    }
+}
+
 /// Header row of a docked window; records the panel rect used for
 /// drag grabs, drop ranking and the OS-drop guard.
 fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     let r = ui.available_rect_before_wrap();
     app.dock_rects[idx] = [r.min.x, r.min.y, r.width(), r.height()];
-    let dragging_divider = ui.ctx().input(|i| i.pointer.any_down());
-    {
-        let edge = dock_edge(app, idx);
-        let prim = idx < 4;
-        let wr = if prim {
-            match idx {
-                0 => &mut app.side_wins.rack,
-                1 => &mut app.side_wins.binds,
-                2 => &mut app.side_wins.monitor,
-                _ => &mut app.side_wins.mixer,
-            }
-        } else {
-            &mut app.dyn_wins[idx - 4].rect
-        };
-        // Persist only the CROSS dimension (panel thickness): width for
-        // left/right docks, height for bottom docks — the along-edge size
-        // is whatever the viewport gives and would churn the config.
-        // IMPORTANT: this must NOT latch every frame — the inner rect is
-        // narrower than the reserved thickness by the panel margins, and
-        // feeding it back as next frame's default_size SHRINKS the panel
-        // every frame (a runaway that once starved the grid to a phantom
-        // 1537-px max-rect). Only a real divider drag moves it, and those
-        // clear this threshold immediately.
-        let cross = edge == 2 || edge == 3;
-        let (cur, size) = if cross {
-            (wr[3], r.height())
-        } else {
-            (wr[2], r.width())
-        };
-        if size > 16.0 && (cur - size).abs() > 24.0 {
-            if cross {
-                wr[3] = size;
-            } else {
-                wr[2] = size;
-            }
-            if dragging_divider {
-                app.side_dirty = true;
-            }
-        } else if cur < 40.0 && size > 40.0 {
-            // first record (never-moved window)
-            if cross {
-                wr[3] = size;
-            } else {
-                wr[2] = size;
-            }
-        }
-        // v44 R1: record the ALONG-edge size too. The cross rule above only
-        // latches real divider moves, but the along dimension is exactly the
-        // member's strip share — without persisting it, every reflow (a new
-        // neighbour arriving on the edge changes the panel-id salt) fed the
-        // stale FLOAT width (e.g. the monitor's 520) back as the fair-share
-        // default, snapping the window back huge and squeezing everyone else
-        // out of the strip ("can't fit other windows in the bottom bar").
-        // The along axis reserves nothing, so this cannot run away.
-        let (cur_a, size_a) = if cross {
-            (wr[2], r.width())
-        } else {
-            (wr[3], r.height())
-        };
-        if size_a > 16.0 && (cur_a - size_a).abs() > 2.0 {
-            if cross {
-                wr[2] = size_a;
-                if dragging_divider {
-                    app.side_dirty = true;
-                }
-            } else {
-                wr[3] = size_a;
-                if dragging_divider {
-                    app.side_dirty = true;
-                }
-            }
-        }
-    }
+    // v98: the docked rect write-back MOVED to `remember_dock_size` (the
+    // draw sites measure the panel's OUTER rect there). Everything below
+    // the header row is chrome/paint; geometry persistence lives there.
     ui.horizontal(|ui| {
         // v44 R1: fold the header itself — the title gives way first, then
         // the window buttons clip only at truly degenerate widths.
@@ -21296,36 +21334,36 @@ fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     let known = win_rect(app, idx);
     // v35 R6: minimums down to an interactable border + header only, so
     // stacks of docks can be squeezed to nearly nothing and pulled back.
-    match edge {
-        0 => {
-            egui::Panel::left(egui::Id::new(("dockw", idx)))
-                .resizable(true)
-                .default_size(known[2].max(def_w(idx)))
-                .min_size(20.0)
-                .show(ui, |ui| docked_window(ui, app, idx));
-        }
-        1 => {
-            egui::Panel::right(egui::Id::new(("dockw", idx)))
-                .resizable(true)
-                .default_size(known[2].max(def_w(idx)))
-                .min_size(20.0)
-                .show(ui, |ui| docked_window(ui, app, idx));
-        }
-        3 => {
-            egui::Panel::top(egui::Id::new(("dockw", idx)))
-                .resizable(true)
-                .default_size(known[3].max(def_h(idx)))
-                .min_size(20.0)
-                .show(ui, |ui| docked_window(ui, app, idx));
-        }
-        _ => {
-            egui::Panel::bottom(egui::Id::new(("dockw", idx)))
-                .resizable(true)
-                .default_size(known[3].max(def_h(idx)))
-                .min_size(20.0)
-                .show(ui, |ui| docked_window(ui, app, idx));
-        }
-    }
+    // v98: a recorded size wins outright; the built-in footprint is the
+    // fallback for NEVER-recorded rects only. The old `.max(def_*)` floor
+    // yanked a deliberately-thinned dock back to the default width on
+    // every boot — same "my size doesn't stick" class as the margin
+    // ratchet fixed by remember_dock_size.
+    let w = if known[2] > 8.0 { known[2] } else { def_w(idx) };
+    let h = if known[3] > 8.0 { known[3] } else { def_h(idx) };
+    let ir = match edge {
+        0 => egui::Panel::left(egui::Id::new(("dockw", idx)))
+            .resizable(true)
+            .default_size(w)
+            .min_size(20.0)
+            .show(ui, |ui| docked_window(ui, app, idx)),
+        1 => egui::Panel::right(egui::Id::new(("dockw", idx)))
+            .resizable(true)
+            .default_size(w)
+            .min_size(20.0)
+            .show(ui, |ui| docked_window(ui, app, idx)),
+        3 => egui::Panel::top(egui::Id::new(("dockw", idx)))
+            .resizable(true)
+            .default_size(h)
+            .min_size(20.0)
+            .show(ui, |ui| docked_window(ui, app, idx)),
+        _ => egui::Panel::bottom(egui::Id::new(("dockw", idx)))
+            .resizable(true)
+            .default_size(h)
+            .min_size(20.0)
+            .show(ui, |ui| docked_window(ui, app, idx)),
+    };
+    remember_dock_size(ui, app, idx, ir.response.rect, false);
 }
 
 /// One docked edge. Several windows on the SAME edge must tile ALONG the
@@ -21341,11 +21379,16 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
     }
     match edge {
         2 | 3 => {
-            let h = ids
+            // v98: strip thickness = the LARGEST user-RECORDED member cross
+            // (a rect entry >8 counts as recorded); the built-in footprint
+            // is only the fallback when nobody has a size yet. The old
+            // unconditional `.max(def_h)` floor raised thin user layouts
+            // back up every boot.
+            let saved = ids
                 .iter()
                 .map(|i| win_rect(app, *i)[3])
-                .fold(0.0f32, f32::max)
-                .max(def_h(ids[0]));
+                .fold(0.0f32, f32::max);
+            let h = if saved > 8.0 { saved } else { def_h(ids[0]) };
             let wrap = if edge == 3 {
                 egui::Panel::top(egui::Id::new(("dockedge", edge)))
             } else {
@@ -21360,60 +21403,79 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                 .default_size(h)
                 .min_size(20.0)
                 .show(ui, |ui| {
-                    // v35 R6: fair-share defaults — a freshly added dock
-                    // must not be squeezed to zero by its neighbours' old
-                    // solo sizes. Each window asks for what it recorded,
-                    // capped at its share of what is left.
-                    //
-                    // v49 R4: EVERY nested member gets a live max_size =
-                    // (space still free) − MIN_SHARE per member behind it,
-                    // so dragging one divider can NEVER starve a
-                    // neighbour out of existence: the divider stays a
-                    // visible boundary between two drawn windows in both
-                    // directions. (Starved neighbours used to park the
-                    // handle over foreign widgets, where it lost the hit
-                    // test — "resize works one way but not back".)
+                    // v35 R6 fair-share + v49 R4 live max_size (dragging one
+                    // divider can NEVER starve a neighbour out of existence)
+                    // stay; v98 RE-SCOPES the cap: the old rule capped each
+                    // member at an EQUAL share of the remaining space, so a
+                    // saved 700/300 stack collapsed to half-and-half on EVERY
+                    // boot (the along-axis half of "sizes reset on reload").
+                    // Recorded shares are now EXACT when the total fits the
+                    // strip; when it oversubscribes, every member scales by
+                    // ONE common ratio (floored at the old 48) so the user's
+                    // proportion survives the boot compromise.
                     const MIN_SHARE: f32 = 56.0;
                     let strip = ui.max_rect().width();
-                    let mut alloc = 0.0f32;
+                    // v98: a member with NO recorded share wants the
+                    // UNIFORM split (old fresh behavior) — the def_w float
+                    // footprint is a float/lone-dock quantity, not a share.
+                    let wants: Vec<f32> = ids
+                        .iter()
+                        .map(|i| {
+                            let rec = win_rect(app, *i)[2];
+                            if rec > 8.0 {
+                                rec
+                            } else {
+                                strip / ids.len() as f32
+                            }
+                        })
+                        .collect();
+                    let sum: f32 = wants.iter().sum();
+                    let budget = (strip - MIN_SHARE).max(wants.len() as f32 * 48.0);
+                    let scale = if sum > budget && sum > 0.0 {
+                        budget / sum
+                    } else {
+                        1.0
+                    };
                     for (n, i) in ids.iter().enumerate() {
                         let b = ui.max_rect();
                         if n + 1 == ids.len() {
                             // The last window fills the rest of the strip.
-                            egui::Panel::bottom(egui::Id::new(("dockfill", *i)))
+                            let ir = egui::Panel::bottom(egui::Id::new(("dockfill", *i)))
                                 .resizable(false)
                                 .exact_size(b.height())
                                 .show(ui, |ui| docked_window(ui, app, *i));
+                            remember_dock_size(ui, app, *i, ir.response.rect, true);
                         } else {
-                            let rec = win_rect(app, *i)[2].max(0.0);
-                            let want = if rec > 8.0 { rec } else { def_w(*i) };
-                            let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
-                            alloc += want.min(cap);
+                            let sized = (wants[n] * scale).max(48.0);
                             // Live remaining along the strip this frame.
                             let rem = (ui.max_rect().max.x
                                 - ui.cursor().min.x.max(ui.max_rect().min.x))
-                            .max(0.0);
-                            let max_w = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
+                                .max(0.0);
+                            let max_w =
+                                (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
                             // Id salted by stack depth: egui caches a
                             // resizable panel's size by Id, so when the
                             // stack changes the fair-share default must
                             // apply afresh (else old solo sizes persist).
-                            egui::Panel::left(egui::Id::new(("dockw", *i, ids.len())))
+                            let ir = egui::Panel::left(egui::Id::new(("dockw", *i, ids.len())))
                                 .resizable(true)
-                                .default_size(want.min(cap).max(48.0))
+                                .default_size(sized)
                                 .min_size(20.0)
                                 .max_size(max_w)
                                 .show(ui, |ui| docked_window(ui, app, *i));
+                            remember_dock_size(ui, app, *i, ir.response.rect, true);
                         }
                     }
                 });
         }
         _ => {
-            let w = ids
+            // Left/right edges: thickness = widest recorded member (see the
+            // v98 note on the bottom branch above).
+            let saved = ids
                 .iter()
                 .map(|i| win_rect(app, *i)[2])
-                .fold(0.0f32, f32::max)
-                .max(def_w(ids[0]));
+                .fold(0.0f32, f32::max);
+            let w = if saved > 8.0 { saved } else { def_w(ids[0]) };
             let mut wpanel = match edge {
                 0 => egui::Panel::left(egui::Id::new(("dockedge", edge))),
                 _ => egui::Panel::right(egui::Id::new(("dockedge", edge))),
@@ -21422,23 +21484,41 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
             // v35 R6: thinner floors — docked stacks squeeze to a border.
             wpanel = wpanel.resizable(true).default_size(w).min_size(56.0);
             wpanel.show(ui, |ui| {
-                // v35 R6: fair-share defaults (see bottom-edge note).
-                // v49 R4: live max_size per member (see bottom-edge note).
+                // v35 R6 fair-share + v49 R4 live max_size + the v98
+                // proportional along-scale — see the bottom-edge branch.
                 const MIN_SHARE: f32 = 56.0;
                 let strip = ui.max_rect().height();
-                let mut alloc = 0.0f32;
+                // v98: fill member's recorded share joins the scale math;
+                // NEVER-recorded members want the uniform split (see the
+                // bottom-edge branch above).
+                let wants: Vec<f32> = ids
+                    .iter()
+                    .map(|i| {
+                        let rec = win_rect(app, *i)[3];
+                        if rec > 8.0 {
+                            rec
+                        } else {
+                            strip / ids.len() as f32
+                        }
+                    })
+                    .collect();
+                let sum: f32 = wants.iter().sum();
+                let budget = (strip - MIN_SHARE).max(wants.len() as f32 * 48.0);
+                let scale = if sum > budget && sum > 0.0 {
+                    budget / sum
+                } else {
+                    1.0
+                };
                 for (n, i) in ids.iter().enumerate() {
                     let b = ui.max_rect();
                     if n + 1 == ids.len() {
-                        egui::Panel::left(egui::Id::new(("dockfill", *i)))
+                        let ir = egui::Panel::left(egui::Id::new(("dockfill", *i)))
                             .resizable(false)
                             .exact_size(b.width())
                             .show(ui, |ui| docked_window(ui, app, *i));
+                        remember_dock_size(ui, app, *i, ir.response.rect, true);
                     } else {
-                        let rec = win_rect(app, *i)[3].max(0.0);
-                        let want = if rec > 8.0 { rec } else { def_h(*i) };
-                        let cap = ((strip - alloc) / (ids.len() - n) as f32).max(48.0);
-                        alloc += want.min(cap);
+                        let sized = (wants[n] * scale).max(48.0);
                         // v49 R4: NO ScrollArea wrap any more. It was a
                         // pre-v44 hack to stop a top panel sizing to its
                         // content's DESIRED height; body_clipped now caps
@@ -21449,15 +21529,15 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                         // ALL (egui's panel docs call this out by name).
                         let rem = (ui.max_rect().max.y
                             - ui.cursor().min.y.max(ui.max_rect().min.y))
-                        .max(0.0);
+                            .max(0.0);
                         let max_h = (rem - MIN_SHARE * (ids.len() - 1 - n) as f32).max(48.0);
-                        let sz = want.min(cap).max(48.0);
-                        egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
+                        let ir = egui::Panel::top(egui::Id::new(("dockw", *i, ids.len())))
                             .resizable(true)
-                            .default_size(sz)
+                            .default_size(sized)
                             .min_size(20.0)
                             .max_size(max_h)
                             .show(ui, |ui| docked_window(ui, app, *i));
+                        remember_dock_size(ui, app, *i, ir.response.rect, true);
                     }
                 }
             });
@@ -56935,8 +57015,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v97\""),
-            "INTERNAL_VERSION must be bumped to v97"
+            librs.contains("INTERNAL_VERSION: &str = \"v98\""),
+            "INTERNAL_VERSION must be bumped to v98"
         );
     }
 
@@ -57284,5 +57364,347 @@ mod tests {
             .collect();
         tracks.sort_unstable();
         assert_eq!(tracks, vec![0, 1], "picker-toggled set fans out per track");
+    }
+
+    // -------------------------------------------------------------------
+    // v98 (dock-1-size-persist): docked windows must persist the EXACT user
+    // geometry across restarts. Pre-v98 the write-back measured the panel's
+    // inner CONTENT rect and fed it back as the RESERVED default_size, so
+    // every boot subtracted one frame margin (420→387→354→… to the min
+    // floor), and the ungated 2 px along-latch persisted the fair-share
+    // CAP as intent (any 700/300 stack flattened to ~50/50 on frame 1).
+    // Pins: thickness fixed point across two boots, along ratio + intent
+    // survival, a real divider drag surviving reload, float↔dock toggling,
+    // and the never-moved default-footprint seed.
+    // -------------------------------------------------------------------
+
+    /// Seed a sandbox config whose side/dynamic windows are DOCKED with
+    /// explicit user geometry (the "previous session" state).
+    fn write_dock_config(body: &str) {
+        let cfg_dir = std::env::var("SLOOPER_CONFIG_DIR").unwrap();
+        std::fs::write(format!("{cfg_dir}/config.json"), body).unwrap();
+    }
+
+    fn dyn_slot(app: &App, kind: DynKind) -> usize {
+        app.dyn_wins
+            .iter()
+            .position(|w| w.kind == kind)
+            .expect("dyn window registered")
+            + 4
+    }
+
+    #[test]
+    fn v98_docked_thickness_survives_two_boots() {
+        let mut app = headless_app("v98thick2boot");
+        app.drain_events();
+        drop(app);
+        // Right edge: MIXER (420w) + MASTER OUT (420w). Left edge: rack
+        // (never moved) + DRUMS at a DELIBERATELY THIN 180w (the old
+        // `.max(def_w)` floor yanked thin user docks back to 340/390).
+        write_dock_config(
+            r#"{
+  "show_master": true,
+  "show_drums": true,
+  "side_wins": {
+    "rack": [0.0, 0.0, 0.0, 0.0],
+    "binds": [0.0, 0.0, 0.0, 0.0],
+    "monitor": [0.0, 0.0, 0.0, 0.0],
+    "mixer": [980.0, 80.0, 420.0, 700.0],
+    "dock": [[1, 0, 0], [0, 2, 1], [0, 2, 0], [1, 1, 0]],
+    "prim_tab": [false, false, false, false]
+  },
+  "dyn_docks": [
+    {"kind": "master", "dock": [1, 1, 1], "rect": [1100.0, 80.0, 420.0, 300.0], "tab_act": false},
+    {"kind": "drums", "dock": [1, 0, 1], "rect": [200.0, 80.0, 180.0, 520.0], "tab_act": false}
+  ]
+}"#,
+        );
+        for boot in 0..2 {
+            let mut app = App::new(Backend::start());
+            app.drain_events();
+            let ctx = egui::Context::default();
+            for _ in 0..6 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let near = |a: f32, b: f32| (a - b).abs() < 3.0;
+            assert!(
+                near(app.side_wins.mixer[2], 420.0),
+                "boot{boot}: mixer thickness {}/420 (margin ratchet)",
+                app.side_wins.mixer[2]
+            );
+            let mi = dyn_slot(&app, DynKind::Master);
+            assert!(
+                near(app.dyn_wins[mi - 4].rect[2], 420.0),
+                "boot{boot}: MASTER OUT thickness {}/420 — the worst-case panel",
+                app.dyn_wins[mi - 4].rect[2]
+            );
+            let di = dyn_slot(&app, DynKind::Drums);
+            let dw = app.dyn_wins[di - 4].rect[2];
+            assert!(
+                dw > 8.0 && dw < 200.0,
+                "boot{boot}: drums stays USER-thin ({dw} < 200), never yanked \
+                 to the built-in footprint"
+            );
+            app.save_config();
+            let cfg = crate::config::Config::load();
+            assert!(
+                near(cfg.side_wins.mixer[2], app.side_wins.mixer[2]),
+                "boot{boot}: saved thickness == painted thickness (fixed point)"
+            );
+            drop(app);
+        }
+    }
+
+    #[test]
+    fn v98_docked_along_split_survives_boot() {
+        let mut app = headless_app("v98alongsplit");
+        app.drain_events();
+        drop(app);
+        // A 600/200 vertical split of the right edge: the old fair-share CAP
+        // painted ~390/390 and the ungated along-latch PERSISTED that
+        // compromise. Now: intent untouched in the rects, painted shares
+        // still visibly unequal (≈3:1 requested; the fill member absorbs
+        // slack, so assert a wide 1.5..3.5 band, never the collapsed ~1.0).
+        write_dock_config(
+            r#"{
+  "show_master": true,
+  "side_wins": {
+    "rack": [0.0, 0.0, 0.0, 0.0],
+    "binds": [0.0, 0.0, 0.0, 0.0],
+    "monitor": [0.0, 0.0, 0.0, 0.0],
+    "mixer": [980.0, 80.0, 400.0, 600.0],
+    "dock": [[1, 0, 0], [0, 2, 1], [0, 2, 0], [1, 1, 0]],
+    "prim_tab": [false, false, false, false]
+  },
+  "dyn_docks": [
+    {"kind": "master", "dock": [1, 1, 1], "rect": [1100.0, 80.0, 400.0, 200.0], "tab_act": false}
+  ]
+}"#,
+        );
+        let mut app = App::new(Backend::start());
+        app.drain_events();
+        let ctx = egui::Context::default();
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi = dyn_slot(&app, DynKind::Master);
+        let near = |a: f32, b: f32| (a - b).abs() < 3.0;
+        assert!(
+            near(app.side_wins.mixer[3], 600.0),
+            "mixer along-intent 600 survived boot, got {}",
+            app.side_wins.mixer[3]
+        );
+        assert!(
+            near(app.dyn_wins[mi - 4].rect[3], 200.0),
+            "MASTER OUT along-intent 200 survived boot (the clamp was \
+             persisted as intent pre-v98), got {}",
+            app.dyn_wins[mi - 4].rect[3]
+        );
+        let a = app.dock_rects[3];
+        let g = app.dock_rects[mi];
+        assert!(a[3] > 8.0 && g[3] > 8.0, "both members painted: {a:?} {g:?}");
+        let ratio = a[3] / g[3];
+        assert!(
+            (1.5..3.5).contains(&ratio),
+            "painted split stays unequal (ratio {ratio}, from 600:200) — \
+             never the old fair-share collapse"
+        );
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    #[test]
+    fn v98_docked_bottom_split_survives_boot() {
+        // Mirror of the right-edge pin on the BOTTOM edge (the sibling
+        // code branch): MONITOR 900 + BINDS 300 oversubscribe the strip —
+        // saved intent untouched, painted shares keep the 3:1 proportion.
+        let mut app = headless_app("v98btmsplit");
+        app.drain_events();
+        drop(app);
+        write_dock_config(
+            r#"{
+  "show_master": false,
+  "side_wins": {
+    "rack": [0.0, 0.0, 0.0, 0.0],
+    "binds": [900.0, 600.0, 300.0, 240.0],
+    "monitor": [200.0, 600.0, 900.0, 240.0],
+    "mixer": [0.0, 0.0, 0.0, 0.0],
+    "dock": [[1, 0, 0], [1, 2, 1], [1, 2, 0], [0, 1, 0]],
+    "prim_tab": [false, false, false, false]
+  }
+}"#,
+        );
+        let mut app = App::new(Backend::start());
+        app.drain_events();
+        let ctx = egui::Context::default();
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let near = |a: f32, b: f32| (a - b).abs() < 3.0;
+        assert!(
+            near(app.side_wins.monitor[2], 900.0),
+            "monitor along-intent 900 survived boot, got {}",
+            app.side_wins.monitor[2]
+        );
+        assert!(
+            near(app.side_wins.binds[2], 300.0),
+            "binds along-intent 300 survived boot, got {}",
+            app.side_wins.binds[2]
+        );
+        let m = app.dock_rects[2]; // monitor: first (left) member
+        let b = app.dock_rects[1]; // binds: fill member
+        assert!(m[2] > 8.0 && b[2] > 8.0, "both painted: {m:?} {b:?}");
+        let ratio = m[2] / b[2];
+        assert!(
+            (1.5..3.5).contains(&ratio),
+            "bottom split keeps the user's proportion (ratio {ratio}, from 900:300)"
+        );
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    #[test]
+    fn v98_dock_drag_survives_reload() {
+        // REAL seam drag on the right-edge wrapper of a LONE docked
+        // MASTER OUT (mixer hidden), then reload: the grown thickness must
+        // come back — pre-v98 the first boot ratcheted ~33 px off it
+        // (measured: grown−387-ish vs restored grown−33 > tolerance).
+        let mut app = headless_app("v98dragreload");
+        app.drain_events();
+        app.show_master = true;
+        app.show_mixer = false;
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi = dyn_slot(&app, DynKind::Master);
+        let w0 = app.dyn_wins[mi - 4].rect[2];
+        // LONE dock: default_size = recorded cross (the built-in 560 seed),
+        // so the wrapper's LEFT edge — the resize seam — is 1440−w0.
+        let seam = 1440.0 - w0;
+        let y = app.dock_rects[mi][1] + 40.0;
+        drag_steps(&mut app, &ctx, egui::pos2(seam + 2.0, y), egui::pos2(seam + 82.0, y));
+        let w1 = app.dyn_wins[mi - 4].rect[2];
+        assert!(
+            (w1 - (w0 - 80.0)).abs() < 16.0,
+            "dragging the seam INWARD by 80 shrank MASTER OUT: {w0} -> {w1}"
+        );
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]); // debounce autosave fires here
+        }
+        let cfg = crate::config::Config::load();
+        let saved = cfg
+            .dyn_docks
+            .iter()
+            .find(|d| d.kind == "master")
+            .unwrap()
+            .rect[2];
+        assert!(
+            (saved - w1).abs() < 3.0,
+            "drag landed in config: {saved} vs {w1}"
+        );
+        drop(app);
+        let mut app2 = App::new(Backend::start());
+        app2.drain_events();
+        for _ in 0..6 {
+            frame(&mut app2, &ctx, vec![]);
+        }
+        let mi2 = dyn_slot(&app2, DynKind::Master);
+        let w2 = app2.dyn_wins[mi2 - 4].rect[2];
+        assert!(
+            (w2 - w1).abs() < 8.0,
+            "reloaded thickness {w2} kept the dragged {w1} (not the old \
+             boot-ratchet decay)"
+        );
+        let pw = app2.dock_rects[mi2][2];
+        assert!(pw < w2 && pw > w2 - 40.0, "painted inside the reserved {w2}: {pw}");
+        drop(app2);
+        settle_plugin_drop();
+    }
+
+    #[test]
+    fn v98_float_dock_toggle_preserves_thickness() {
+        let mut app = headless_app("v98fltoggledock");
+        app.drain_events();
+        drop(app);
+        write_dock_config(
+            r#"{
+  "show_master": true,
+  "side_wins": {
+    "rack": [0.0, 0.0, 0.0, 0.0],
+    "binds": [0.0, 0.0, 0.0, 0.0],
+    "monitor": [0.0, 0.0, 0.0, 0.0],
+    "mixer": [980.0, 80.0, 420.0, 700.0],
+    "dock": [[1, 0, 0], [0, 2, 1], [0, 2, 0], [1, 1, 0]],
+    "prim_tab": [false, false, false, false]
+  },
+  "dyn_docks": [
+    {"kind": "master", "dock": [1, 1, 1], "rect": [1100.0, 80.0, 420.0, 300.0], "tab_act": false}
+  ]
+}"#,
+        );
+        let mut app = App::new(Backend::start());
+        app.drain_events();
+        let ctx = egui::Context::default();
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi = dyn_slot(&app, DynKind::Master);
+        float_out(&mut app, mi); // the header/slot-menu/double-click entry
+        frame(&mut app, &ctx, vec![]);
+        let w = app.dyn_wins[mi - 4].rect[2];
+        assert!(
+            (w - 420.0).abs() < 4.0,
+            "floating out keeps the docked thickness (float width = cross): {w}"
+        );
+        dock_at(&mut app, mi, 1, egui::pos2(1300.0, 500.0));
+        // The along axis restarts (float height ≠ dock share: the v44 R1
+        // stale-value class) while the cross carries over untouched.
+        assert_eq!(app.dyn_wins[mi - 4].rect[3], 0.0, "along axis reset on dock entry");
+        assert!(
+            (app.dyn_wins[mi - 4].rect[2] - 420.0).abs() < 4.0,
+            "cross thickness survived the round trip"
+        );
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let g = app.dock_rects[mi];
+        assert!(g[2] > 8.0, "re-docked member paints in the dock again: {g:?}");
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    #[test]
+    fn v98_never_moved_windows_seed_default_footprint() {
+        // Fresh sandbox (zero rects): the seed branch must still latch the
+        // built-in footprint so future drags have a base — and the value
+        // must be a fixed point (boot 2 paints the same width, no creep).
+        let mut app = headless_app("v98seedfoot");
+        app.drain_events();
+        app.show_master = true;
+        let ctx = egui::Context::default();
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let rack = app.side_wins.rack[2];
+        assert!(
+            (rack - 340.0).abs() < 12.0,
+            "never-moved rack seeds to its built-in 340 footprint, got {rack}"
+        );
+        app.save_config();
+        drop(app);
+        let mut app2 = App::new(Backend::start());
+        app2.drain_events();
+        app2.show_master = true;
+        for _ in 0..6 {
+            frame(&mut app2, &ctx, vec![]);
+        }
+        let rack2 = app2.side_wins.rack[2];
+        assert!(
+            (rack2 - rack).abs() < 3.0,
+            "seeded footprint is a fixed point across boots ({rack} -> {rack2})"
+        );
+        drop(app2);
+        settle_plugin_drop();
     }
 }
