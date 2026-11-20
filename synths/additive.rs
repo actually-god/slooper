@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 7
+// slooper-synth-version: 8
 // additive.rs — harmonic partial bank with two morphable spectra.
 //
 // The additive/harmonic synth family lives in one skeleton — a bank
@@ -35,6 +35,10 @@
 // NaN-guarded. All time-based math is per-voice state advanced once per
 // SAMPLE (never per block) — host block sizes run from ~1 ms to seconds.
 // ---------------------------------------------------------------------------
+
+// v105: MPE note pressure (poly_at) raises the pressured voice up to
+// +3.5 dB — the note still sounds normally at rest, like every older
+// slooper release (no pressure = the exact pre-v105 render).
 
 include!("synth_api.rs");
 
@@ -93,6 +97,7 @@ struct Voice {
     stage: Stage,
     env: f64,
     vel: f64,
+    press: f64,
     freq: f64,
     phase: [f32; PARTIALS],
     // Per-partial amplitude: profile level × per-partial decay state.
@@ -104,7 +109,7 @@ struct Voice {
 impl Voice {
     const DEAD: Voice = Voice {
         alive: false, note: 0, held: false, pedal_held: false,
-        seeded: false, stage: Stage::Off, env: 0.0, vel: 0.0, freq: 0.0,
+        seeded: false, stage: Stage::Off, env: 0.0, vel: 0.0, press: 0.0, freq: 0.0,
         phase: [0.0; PARTIALS],
         amp: [0.0; PARTIALS],
         vibph: 0.0, age: 0.0,
@@ -186,6 +191,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     v.stage = Stage::Attack;
     v.freq = 440.0 * (2.0f64).powf((note as f64 - 69.0) / 12.0);
     v.vel = (vel.max(1) as f64 / 127.0).powf(0.6);
+    v.press = 0.0;
     // Random start phases: stacked sines at phase 0 sum to a huge transient.
     let mut seed = (note as u32)
         .wrapping_mul(2654435761)
@@ -418,7 +424,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 v.amp[i] *= dpart[i];
                 acc += tab.sin(x) * v.amp[i];
             }
-            let raw = acc * (v.env * v.vel * gain * 0.35) as f32;
+            let raw = acc * (v.env * v.vel * (1.0 + 0.5 * v.press) * gain * 0.35) as f32;
             if raw.is_finite() {
                 unsafe { *out.add(k) += raw };
             } else {
@@ -484,9 +490,24 @@ pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     unsafe { &mut *(s as *mut Add) }.bend_st = st as f64;
 }
 
-static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+// v105 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
+// matching live voice's level by up to +3.5 dB (x1.5 at 127; 0 = normal).
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Add) };
+    for v in p.voices.iter_mut() {
+        if v.alive && v.note == note {
+            v.press = val as f64 / 127.0;
+        }
+    }
+}
+
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
 
 #[no_mangle]
-pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
-    &DESC_V2
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }

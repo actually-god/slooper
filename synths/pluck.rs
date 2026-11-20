@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 7
+// slooper-synth-version: 8
 // pluck.rs — Karplus-Strong plucked strings.
 //
 // Physical-modeled string instruments reduce to the classic extended
@@ -21,6 +21,10 @@
 // create), NaN-guarded.
 // ---------------------------------------------------------------------------
 
+// v105: MPE note pressure (poly_at) raises the pressured voice up to
+// +3.5 dB — the note still sounds normally at rest, like every older
+// slooper release (no pressure = the exact pre-v105 render).
+
 include!("synth_api.rs");
 
 const VOICES: usize = 10;
@@ -35,6 +39,7 @@ struct Voice {
     damp: f64,   // loop one-pole state
     bstate: f64, // body resonator state
     energy: f64,
+    press: f64,
 }
 
 struct Pluck {
@@ -68,6 +73,7 @@ extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_vo
             damp: 0.0,
             bstate: 0.0,
             energy: 0.0,
+            press: 0.0,
         })
         .collect::<Vec<_>>();
     let s = Box::new(Pluck {
@@ -125,6 +131,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     }
     v.wp = li & (SEG - 1);
     v.energy = amp;
+    v.press = 0.0;
 }
 
 extern "C" fn note_off(_s: *mut core::ffi::c_void, _ch: u8, _note: u8) {
@@ -213,7 +220,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             v.bstate += (o - v.bstate) * 0.08;
             o = o * (1.0 - body * 0.6) + v.bstate * body * 0.9;
 
-            acc += o;
+            acc += o * (1.0 + 0.5 * v.press);
             v.energy = v.energy * 0.9995 + o.abs() * 0.0005;
             if v.energy < 1.0e-5 {
                 v.alive = false;
@@ -270,9 +277,24 @@ pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     unsafe { &mut *(s as *mut Pluck) }.bend_st = st as f64;
 }
 
-static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+// v105 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
+// matching live voice's level by up to +3.5 dB (x1.5 at 127; 0 = normal).
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Pluck) };
+    for v in p.voices.iter_mut() {
+        if v.alive && v.note == note {
+            v.press = val as f64 / 127.0;
+        }
+    }
+}
+
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
 
 #[no_mangle]
-pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
-    &DESC_V2
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }

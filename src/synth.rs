@@ -2380,10 +2380,13 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
         set_host_assets(Arc::new(vec![sine]), 48_000);
         for stem in ["additive", "fm", "pad", "piano", "pluck", "sampler", "tri_osc"] {
             let params: &[f32] = if stem == "sampler" { &[0.0, 48.0, 1.0] } else { &[] };
-            let inst = reg
-                .create_instance(stem, 48_000.0, params)
-                .unwrap_or_else(|| panic!("{stem} instance"));
             let render = |at: bool| -> f64 {
+                // FRESH instance per round: pluck seeds its noise per
+                // voice slot, and the slot round-robin would make an
+                // A/B on one instance unequal-conditions (measured 2.85).
+                let inst = reg
+                    .create_instance(stem, 48_000.0, params)
+                    .unwrap_or_else(|| panic!("{stem} instance"));
                 let mut ev: Vec<(u64, u8, u8, u8, u8)> =
                     vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
                 if at {
