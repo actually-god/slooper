@@ -1376,13 +1376,18 @@ impl ClapStageEntry {
                 ),
                 // 0x90 with velocity 0 is note off by the classic convention.
                 0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, q.m[1], 0.0),
-                // CC / program / pressure / pitch bend travel as raw bytes:
-                // spec says plugins should take both forms, and every CLAP
-                // plugin on this host does. v103: pitch bend (0xE0) was
-                // MISSING here — bends were silently dropped for CLAP
-                // entirely. (Poly aftertouch 0xA0 still has no path
-                // anywhere in the engine — follow-up card.)
-                0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
+                // CC / program / pressure / pitch bend / poly AT travel as
+                // raw bytes: spec says plugins should take both forms, and
+                // every CLAP plugin on this host does. v103: pitch bend
+                // (0xE0) was MISSING here — bends were silently dropped for
+                // CLAP entirely. v104 (card t_0ab25d9a): poly aftertouch
+                // (0xA0) was the same hole one status nibble over — the MPE
+                // voice message vanished for CLAP while VST2/VST3 carried
+                // it (VST2 raw batch; VST3 0xA0 => PolyAftertouch since
+                // v42/MPE). Engine-side split (documented, decision (a)):
+                // SCRIPTED synths still have no poly-AT callback (kind-4
+                // dispatch arms drop) — follow-up feature card, not here.
+                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
                 _ => {}
             }
         }

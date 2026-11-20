@@ -23,6 +23,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Per-note aftertouch now reaches CLAP instruments.** A MPE controller's
+  note-by-note pressure (polyphonic aftertouch — the message that bends
+  one held note while its neighbours stay still) was forwarded to VST2 and
+  VST3 instruments but silently dropped on the way to CLAP ones, so the
+  same controller played differently depending on the plugin format. CLAP
+  instruments now receive it like every other instrument. Built-in
+  scripted instruments still ignore per-note pressure — their script
+  interface has no per-note aftertouch input yet (a follow-up will add
+  it); channel aftertouch and expression work there today.
+
 - **Pitch bends now bend the same amount on every plugin.** A glide or
   wheel bend drawn in the piano roll is written in semitones, but hosted
   instruments received it raw and interpreted it with whatever bend range
