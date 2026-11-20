@@ -6730,6 +6730,7 @@ mod tests {
                 press: 0,
                 start,
                 len: (PPQ / 2) as u32,
+                bend: None,
             });
         }
         let mut cl = Clip::new(0, 0);
@@ -7210,7 +7211,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 10,
-        });
+        bend: None,});
         let mut arr = Arrangement::new();
         arr.insert(0, 0, Clip::new(0, 0));
         let cache: Vec<Option<std::sync::Arc<Pattern>>> = vec![Some(std::sync::Arc::new(pat))];
@@ -7484,7 +7485,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         let mut pb = Pattern::new(120);
         pb.len_ticks = 480;
         pb.notes.push(Note {
@@ -7494,7 +7495,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         Arc::new(vec![Some(Arc::new(pa)), Some(Arc::new(pb))])
     }
 
