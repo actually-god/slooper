@@ -517,10 +517,17 @@ struct PianoRoll {
     /// MIDI clip or rack asset): **save** overwrites the asset in place
     /// instead of minting a new one.
     edit_asset: Option<u32>,
-    /// v52 R6: selected pitch-bend segment index (lane editor selection).
+    /// v52 R6: selected pitch-bend segment index (v102: the LEGACY orphan
+    /// lane's selection — the lane exists only while unmigrated segs survive).
     sel_bend: Option<usize>,
-    /// v52 R6: the segment being dragged into existence (BendNew).
-    bend_live: Option<crate::midipat::BendSeg>,
+    /// v102 (pb-3): freehand stroke in flight for the in-roll curve draw
+    /// (NbDraw): `(t, cents)` points in draw order, t normalized to the
+    /// note body (spec docs/SAMPLER-PITCH.md § 4).
+    nb_live: Vec<(f32, f32)>,
+    /// v102: curve snapshot at the grab of an Alt+Z magnitude warp
+    /// (NbWarp) — the warp scales from these bases every frame, never
+    /// compounds on itself.
+    nb_base: Vec<(f32, f32)>,
     /// v55 (S2): press-point frozen when plain RMB opened the note menu.
     /// The menu targets THIS point (grid v20 R4 anchor pattern), not the
     /// drifting pointer. Cleared when the menu closes.
@@ -556,13 +563,22 @@ enum RollGesture {
         from: egui::Pos2,
         add: bool,
     },
-    /// v52 R6: creating a pitch-bend glide live. The in-flight segment
-    /// rides `PianoRoll::bend_live`; `src` = source note PITCH when the
-    /// drag started from a note (Z-drag), enabling land-on-note snapping.
-    BendNew { t0: u32, v0: f32, src: Option<u8> },
-    /// v52 R6: drag one endpoint of a stored segment (`end` 0 = start).
+    /// v102 (pb-3): freehand pitch curve being drawn ON a note (Z+drag,
+    /// spec docs/SAMPLER-PITCH.md § 4). The in-flight stroke rides
+    /// `PianoRoll::nb_live`; release simplifies (RDP) and commits to
+    /// `note_bends` — land-on-target stays as release-over-note sugar.
+    NbDraw { idx: usize },
+    /// v102: dragging one control-point dot of a selected note's curve
+    /// (`pi` indexes the curve's control points at press time).
+    NbPt { idx: usize, pi: usize },
+    /// v102: Alt+Z whole-curve magnitude warp; `c0` = cents under the
+    /// pointer at grab (scale anchor); base points ride `nb_base`.
+    NbWarp { idx: usize, c0: f32 },
+    /// v52 R6 (v102: LEGACY orphan lane only): drag one endpoint of a
+    /// stored segment (`end` 0 = start).
     BendEP { idx: usize, end: u8 },
-    /// v52 R6: drag the mid-curve dot vertically to set curvature.
+    /// v52 R6 (v102: LEGACY orphan lane only): drag the mid-curve dot
+    /// vertically to set curvature.
     BendCurve { idx: usize },
     /// v52 R6: drag a bar in the velocity lane (absolute from pointer y).
     VelDrag { idx: usize },
@@ -10924,6 +10940,9 @@ impl App {
         // Preview fires when a NEW note lands (pointer released after a
         // fresh draw) — immediate audible feedback while composing.
         let mut placed: Option<u8> = None;
+        // v102 (pb-3): a curve edit's echo survives the audition echo
+        // (placed pattern, v38 R6: WHAT happened AND what you're hearing).
+        let mut curve_echo: Option<String> = None;
         let mut open = true;
 
         // ---- roll keyboard (only while the roll owns the keyboard;
@@ -11182,6 +11201,7 @@ impl App {
                 &mut stop_preview,
                 &mut audition,
                 &mut placed,
+                &mut curve_echo,
             );
         } else {
             let screen = ui.ctx().viewport_rect();
@@ -11222,6 +11242,7 @@ impl App {
                         &mut stop_preview,
                         &mut audition,
                         &mut placed,
+                        &mut curve_echo,
                     )
                 });
             });
@@ -11371,6 +11392,11 @@ impl App {
                 }
             }
         }
+        // v102 (pb-3): the curve-edit echo survives the audition echo —
+        // "what you did · what you're hearing" in one line (placed pattern).
+        if let Some(e) = curve_echo.take() {
+            self.status = format!("{e} \u{b7} {}", self.status);
+        }
         // v38 R4: STOP is a first-class state now — the button, SPACE and
         // the roll closing all land here, and the status line confirms.
         if stop_preview {
@@ -11426,6 +11452,7 @@ impl App {
         stop_preview: &mut bool,
         audition: &mut Option<u8>,
         placed: &mut Option<u8>,
+        curve_echo: &mut Option<String>,
     ) {
         // ---- toolbar ----
         ui.horizontal(|ui| {
@@ -11629,6 +11656,37 @@ impl App {
                     {
                         *clear = true;
                     }
+                    // v102 (pb-3): escape hatch + discoverability for the
+                    // new in-roll curves: one click clears the SELECTED
+                    // notes' curves (the notes stay).
+                    let n_curves = roll
+                        .sel_notes
+                        .iter()
+                        .filter(|&&ix| {
+                            roll.pat.notes.get(ix).and_then(|n| n.bend).is_some()
+                        })
+                        .count();
+                    if ui
+                        .small_button("clear curve")
+                        .enabled(n_curves > 0)
+                        .on_hover_text(if n_curves > 0 {
+                            "Remove the pitch curves from the selected notes (the notes stay)"
+                        } else {
+                            "Select a note that HAS a pitch curve \u{b7} Z+drag draws one"
+                        })
+                        .clicked()
+                    {
+                        for &ix in roll.sel_notes.clone() {
+                            if let Some(n) = roll.pat.notes.get_mut(ix) {
+                                n.bend = None;
+                            }
+                        }
+                        roll.pat.bake_bends();
+                        roll.pat.compact_note_bends();
+                        roll.changed = true;
+                        self.status =
+                            format!("cleared {n_curves} curve(s) \u{b7} notes kept");
+                    }
                     if ui
                         .small_button(RichText::new("save").strong())
                         .on_hover_text(
@@ -11641,7 +11699,7 @@ impl App {
                     }
                     ui.label(
                         RichText::new(format!(
-                            "{} notes \u{b7} {}s \u{b7} {} bpm (metronome)",
+                            "{} notes \u{b7} {}s \u{b7} {} bpm \u{b7} Z+drag a note = pitch curve",
                             roll.pat.notes.len(),
                             roll.pat.len_samples(sr) as f64 / sr.max(1) as f64,
                             roll.pat.bpm
@@ -11750,7 +11808,9 @@ impl App {
                 }
             } else {
                 ui.label(
-                    RichText::new("glide \u{b7} drag in the lane to draw one; Z-drag from a note")
+                    RichText::new(
+                        "glide \u{b7} legacy orphan \u{b7} drag its dots \u00b7 new curves: Z+drag a note",
+                    )
                         .weak()
                         .small(),
                 );
@@ -11928,6 +11988,31 @@ impl App {
         // notes (+ yellow end caps on the selected ones — the
         // resize handles, same language as the loop-area handles)
         const EDGE_PX: f32 = 6.0;
+        // v102 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
+        // pitch-curve trail geometry. The trail box rides the note's ROW:
+        // ±trail_half px around the row center; ±1200 ¢ fills it, and a
+        // bigger curve auto-scales (rounded up to 600 ¢ steps, cap ±2400)
+        // so everything drawn stays visible. Drawing sensitivity follows
+        // the same map — the stroke under the pointer IS the painted curve.
+        let trail_half = (2.0 * roll.row_h).max(24.0);
+        let nb_of = |n: &crate::midipat::Note| -> Option<&crate::midipat::NoteBend> {
+            n.bend
+                .and_then(|i| roll.pat.note_bends.get(i as usize))
+                .filter(|nb| nb.active())
+        };
+        let nb_disp = |pts: &[(f32, f32)]| -> f32 {
+            let mx = pts.iter().fold(0f32, |a, p| a.max(p.1.abs()));
+            if mx <= 1200.0 {
+                1200.0
+            } else {
+                (mx.ceil() / 600.0 * 600.0).min(2400.0)
+            }
+        };
+        let row_c = |n: i32| y_of(n) + roll.row_h * 0.5;
+        let y_of_c = |n: i32, disp: f32, c: f32| row_c(n) - c / disp * trail_half;
+        let c_at_y = |n: i32, disp: f32, y: f32| {
+            ((row_c(n) - y) / trail_half * disp).clamp(-2400.0, 2400.0)
+        };
         let hover = ui.input(|i| i.pointer.hover_pos());
         for (idx, note) in roll.pat.notes.iter().enumerate() {
             let n = note.note as i32;
@@ -11971,6 +12056,57 @@ impl App {
                     );
                 }
             }
+            // v102 (pb-3): the note's pitch curve — trail painted ON the
+            // note body (the glide lane retired here); a SELECTED note also
+            // reveals its control dots (endpoints bigger = the classic
+            // endpoint-drag targets).
+            if let Some(nb) = nb_of(note) {
+                let dur = dur.max(1e-6);
+                let disp = nb_disp(&nb.pts);
+                let tcol = if is_sel {
+                    Color32::from_rgb(250, 200, 50)
+                } else {
+                    Color32::from_rgb(90, 220, 170)
+                };
+                let mut prev: Option<egui::Pos2> = None;
+                let mut tx = x0.max(grid_x0);
+                while tx <= x1 {
+                    let t = ((sec_at(tx) - s0) / dur).clamp(0.0, 1.0);
+                    let q = egui::pos2(tx, y_of_c(n, disp, nb.cents_at(t)));
+                    if let Some(p) = prev {
+                        painter.line_segment([p, q], egui::Stroke::new(1.6f32, tcol));
+                    }
+                    prev = Some(q);
+                    tx += 3.0;
+                }
+                if is_sel {
+                    for (k, (pt_t, pt_c)) in nb.pts.iter().enumerate() {
+                        let endp = k == 0 || k + 1 == nb.pts.len();
+                        let q = egui::pos2(x_of(s0 + pt_t * dur), y_of_c(n, disp, *pt_c));
+                        painter.circle_filled(q, if endp { 4.0 } else { 3.0 }, tcol);
+                    }
+                }
+            }
+            // v102: the freehand stroke in flight previews live in accent.
+            if matches!(roll.gesture, RollGesture::NbDraw { idx: d } if d == idx)
+                && roll.nb_live.len() >= 2
+            {
+                let disp = nb_disp(&roll.nb_live);
+                let mut prev: Option<egui::Pos2> = None;
+                for (pt_t, pt_c) in roll.nb_live.iter() {
+                    let q = egui::pos2(x_of(s0 + pt_t * dur), y_of_c(n, disp, *pt_c));
+                    if let Some(p) = prev {
+                        painter.line_segment(
+                            [p, q],
+                            egui::Stroke::new(1.8f32, crate::kit::ACCENT),
+                        );
+                    }
+                    prev = Some(q);
+                }
+                if let Some(q) = prev {
+                    painter.circle_filled(q, 3.5, crate::kit::ACCENT);
+                }
+            }
         }
         // marquee rectangle while rubber-banding
         if let RollGesture::Marquee { from, .. } = roll.gesture {
@@ -11997,6 +12133,12 @@ impl App {
         // lane maps \u{b1}12 st across its height.
         const VEL_LANE_H: f32 = 30.0;
         const BEND_LANE_H: f32 = 46.0;
+        // v102 (pb-3): the GLIDE LANE RETIRED onto the notes (spec § 4
+        // "Retire"). The strip exists only while a loaded project still
+        // has legacy ORPHAN segments (glides drawn into gaps — never lose
+        // sound on load, spec § 6); drawing new bends happens on the note.
+        let lane_open = !roll.pat.bend_segs.is_empty();
+        let bend_h = if lane_open { BEND_LANE_H } else { 0.0 };
         // Lane bottoms ride the PREVIOUS frame's canvas bottom: the
         // toolbar readout row shifts `rect` by one row, and the wheel
         // router in `roll_pass` hit-tests against the same remembered
@@ -12005,22 +12147,24 @@ impl App {
             .canvas_rect
             .map_or(grid_bot, |cr| cr.max.y - SB);
         let bend_lane = egui::Rect::from_min_max(
-            egui::pos2(grid_x0, lane_bot - BEND_LANE_H),
+            egui::pos2(grid_x0, lane_bot - bend_h),
             egui::pos2(rect.max.x - SB, lane_bot),
         );
         let vel_lane = egui::Rect::from_min_max(
-            egui::pos2(grid_x0, lane_bot - BEND_LANE_H - VEL_LANE_H),
-            egui::pos2(rect.max.x - SB, lane_bot - BEND_LANE_H),
+            egui::pos2(grid_x0, lane_bot - bend_h - VEL_LANE_H),
+            egui::pos2(rect.max.x - SB, lane_bot - bend_h),
         );
         let bend_c = (bend_lane.min.y + bend_lane.max.y) * 0.5;
         let bend_amp = BEND_LANE_H * 0.42;
         let y_of_st = |v: f32| bend_c - v / 12.0 * bend_amp;
         let st_at = |y: f32| (((bend_c - y) / bend_amp) * 12.0).clamp(-12.0, 12.0);
-        let in_bend = |pt: egui::Pos2| bend_lane.contains(pt);
+        let in_bend = |pt: egui::Pos2| lane_open && bend_lane.contains(pt);
         let in_vel = |pt: egui::Pos2| vel_lane.contains(pt);
         {
             painter.rect_filled(vel_lane, 0.0, Color32::from_gray(18));
-            painter.rect_filled(bend_lane, 0.0, Color32::from_gray(16));
+            if lane_open {
+                painter.rect_filled(bend_lane, 0.0, Color32::from_gray(16));
+            }
             for (idx, note) in roll.pat.notes.iter().enumerate() {
                 let x0 = x_of(t_of(note.start));
                 let x1 = x_of(t_of(note.start + note.len.max(1)));
@@ -12042,30 +12186,31 @@ impl App {
                     },
                 );
             }
-            painter.line_segment(
-                [
-                    egui::pos2(bend_lane.min.x, bend_c),
-                    egui::pos2(bend_lane.max.x, bend_c),
-                ],
-                egui::Stroke::new(1.0, Color32::from_gray(70)),
-            );
-            painter.text(
-                egui::pos2(bend_lane.min.x + 3.0, bend_lane.min.y + 8.0),
-                egui::Align2::LEFT_TOP,
-                "glide lane \u{b7} drag = new glide \u{b7} Z-drag from a note glides to another",
-                egui::FontId::proportional(8.0),
-                Color32::from_gray(140),
-            );
-            let mut live_segs: Vec<(crate::midipat::BendSeg, bool)> = roll
+            if lane_open {
+                painter.line_segment(
+                    [
+                        egui::pos2(bend_lane.min.x, bend_c),
+                        egui::pos2(bend_lane.max.x, bend_c),
+                    ],
+                    egui::Stroke::new(1.0, Color32::from_gray(70)),
+                );
+                // v102: honest copy for the LEGACY strip — new glides are
+                // drawn on the note now; this lane only holds orphan segs.
+                painter.text(
+                    egui::pos2(bend_lane.min.x + 3.0, bend_lane.min.y + 8.0),
+                    egui::Align2::LEFT_TOP,
+                    "legacy glide lane \u{b7} drag its dots to fix \u{b7} Shift+RMB deletes",
+                    egui::FontId::proportional(8.0),
+                    Color32::from_gray(140),
+                );
+            }
+            let live_segs: Vec<(crate::midipat::BendSeg, bool)> = roll
                 .pat
                 .bend_segs
                 .iter()
                 .enumerate()
                 .map(|(i, g)| (*g, roll.sel_bend == Some(i)))
                 .collect();
-            if let Some(l) = roll.bend_live {
-                live_segs.push((l, true));
-            }
             let mut tmp: Vec<crate::midipat::Bend> = Vec::new();
             for (g, sel) in live_segs.iter() {
                 tmp.clear();
@@ -12169,6 +12314,40 @@ impl App {
                 (sec >= s0 - 1e-6 && sec <= s0 + t_of(n.len.max(1)) + 1e-6).then_some(i)
             })
         };
+        // v102 (pb-3): in-roll curve control-dot hit test — selected notes
+        // only, same no-borrow idiom as note_hit (returns note idx + point
+        // idx; the dots are painted for exactly these rows).
+        let nb_dot_hit = |notes: &[crate::midipat::Note],
+                          sel: &[usize],
+                          bends: &[crate::midipat::NoteBend],
+                          pt: egui::Pos2|
+         -> Option<(usize, usize)> {
+            for &ni in sel.iter().rev() {
+                let Some(n) = notes.get(ni) else { continue };
+                let Some(ci) = n.bend else { continue };
+                let Some(nb) = bends.get(ci as usize).filter(|nb| nb.active()) else {
+                    continue;
+                };
+                let s0 = t_of(n.start);
+                let dur = t_of(n.len.max(1)).max(1e-6);
+                let x0 = x_of(s0);
+                let x1 = (x_of(s0 + dur)).max(x0 + 2.0);
+                if pt.x < x0 - 8.0 || pt.x > x1 + 8.0 {
+                    continue;
+                }
+                let disp = nb_disp(&nb.pts);
+                for (pi, (pt_t, pt_c)) in nb.pts.iter().enumerate() {
+                    let q = egui::pos2(
+                        x_of(s0 + pt_t * dur),
+                        y_of_c(n.note as i32, disp, *pt_c),
+                    );
+                    if (pt - q).length() <= 8.0 {
+                        return Some((ni, pi));
+                    }
+                }
+            }
+            None
+        };
         // v38 R5: MODE CURSOR — say what a press WILL do before
         // it happens: pointing hand over a note body (select /
         // drag; wheel trims velocity), side-arrows on an end cap
@@ -12202,13 +12381,21 @@ impl App {
         if let Some(hp) = hover {
             if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
                 if let Some(n) = roll.pat.notes.get(i) {
+                    // v102: the readout says whether THIS note has a curve
+                    // and what the next gesture would be (discoverability).
+                    let curve = nb_of(n).is_some();
                     painter.text(
                         hp + egui::vec2(14.0, 14.0),
                         egui::Align2::LEFT_TOP,
                         format!(
-                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length",
+                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length{}",
                             note_name(n.note),
-                            n.vel
+                            n.vel,
+                            if curve {
+                                " \u{b7} curve: drag dots \u00b7 Shift+RMB removes it"
+                            } else {
+                                " \u{b7} Z+drag: draw pitch curve"
+                            }
                         ),
                         egui::FontId::proportional(9.0),
                         Color32::from_rgb(230, 230, 170),
@@ -12252,8 +12439,29 @@ impl App {
                             roll.changed = true;
                             self.status = "glide deleted".into();
                         }
-                    } else {
-                        if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
+                    } else if let Some((i, _, _)) = note_hit(&roll.pat.notes, pt) {
+                        let has_curve = roll
+                            .pat
+                            .notes
+                            .get(i)
+                            .and_then(|n| n.bend)
+                            .and_then(|c| roll.pat.note_bends.get(c as usize))
+                            .is_some_and(|nb| nb.active());
+                        if has_curve {
+                            // v102 (pb-3, spec § 4): Shift+RMB on a note that
+                            // HAS a curve deletes the CURVE (note stays) — the
+                            // delete verb aims at the newest object.
+                            if let Some(n) = roll.pat.notes.get_mut(i) {
+                                n.bend = None;
+                            }
+                            roll.pat.bake_bends();
+                            roll.pat.compact_note_bends();
+                            roll.changed = true;
+                            self.status = format!(
+                                "curve removed from {} · Shift+RMB again deletes the note",
+                                note_name(roll.pat.notes[i].note)
+                            );
+                        } else {
                             let nm = note_name(roll.pat.notes[i].note);
                             roll.pat.notes.remove(i);
                             roll.sel_notes.retain(|s| *s != i);
@@ -12270,7 +12478,7 @@ impl App {
                             roll.pat.compact_note_bends();
                             roll.changed = true;
                             // v38 R6: the delete announces itself.
-                            self.status = format!("deleted {nm} \u{b7} Shift+RMB");
+                            self.status = format!("deleted {nm} · Shift+RMB");
                         }
                     }
                     // A shift-delete must never leave a menu anchored on
@@ -12337,18 +12545,10 @@ impl App {
                                     .into();
                         }
                         None => {
-                            let t0 = tick_of(snap(sec));
-                            let v0 = st_at(pt.y);
-                            roll.bend_live = Some(crate::midipat::BendSeg {
-                                t0,
-                                v0,
-                                t1: t0 + 1,
-                                v1: v0,
-                                curve: 0.0,
-                            });
-                            roll.sel_bend = None;
-                            roll.gesture = RollGesture::BendNew { t0, v0, src: None };
-                            self.status = "drawing a glide \u{b7} release to keep".into();
+                            // v102: the retired lane creates NOTHING — a
+                            // miss in the orphan strip rubber-bands like
+                            // empty grid (new curves draw on the note).
+                            roll.gesture = RollGesture::Marquee { from: pt, add: false };
                         }
                     }
                 } else if in_vel(pt) {
@@ -12384,23 +12584,51 @@ impl App {
                 } else if ui.input(|i| i.key_down(egui::Key::Z))
                     && note_hit(&roll.pat.notes, pt).is_some()
                 {
-                    // Z-drag from a note: the glide LEAVES the note's end
-                    // at 0 st and (on release over another note) LANDS on
-                    // that note's pitch (Septabee-style note-to-note).
-                    let (idx, _, n1) = note_hit(&roll.pat.notes, pt).unwrap();
-                    let sp = roll.pat.notes[idx].note;
-                    let t0 = tick_of(n1);
-                    roll.bend_live = Some(crate::midipat::BendSeg {
-                        t0,
-                        v0: 0.0,
-                        t1: t0 + 1,
-                        v1: 0.0,
-                        curve: 0.0,
-                    });
-                    roll.sel_bend = None;
-                    roll.gesture = RollGesture::BendNew { t0, v0: 0.0, src: Some(sp) };
-                    self.status = "glide from the note end \u{b7} release over the target note"
-                        .into();
+                    // v102 (pb-3, spec § 4): Z+drag ON a note draws the pitch
+                    // curve ON the note body (septabee parity). Alt+Z on a
+                    // note that already has a curve = whole-curve magnitude
+                    // warp. The v52 lane-creating Z-drag is retired here.
+                    let (idx, _, _) = note_hit(&roll.pat.notes, pt).unwrap();
+                    if !roll.sel_notes.contains(&idx) {
+                        roll.sel_notes = vec![idx];
+                        roll.sel_anchor = Some(idx);
+                    }
+                    let nm = note_name(roll.pat.notes[idx].note);
+                    let row = roll.pat.notes[idx].note as i32;
+                    let cur = roll.pat.notes[idx].bend;
+                    let mut warping = false;
+                    if mods.alt {
+                        if let Some(ci) = cur.map(|c| c as usize) {
+                            if let Some(nb) = roll.pat.note_bends.get(ci).filter(|nb| nb.active())
+                            {
+                                let disp = nb_disp(&nb.pts);
+                                let c0 = c_at_y(row, disp, pt.y);
+                                roll.nb_base = nb.pts.clone();
+                                roll.gesture = RollGesture::NbWarp { idx, c0 };
+                                warping = true;
+                                self.status = format!(
+                                    "warping the curve on {nm} \u{b7} drag up = bigger \u{b7} release to keep"
+                                );
+                            }
+                        }
+                    }
+                    if !warping {
+                        roll.gesture = RollGesture::NbDraw { idx };
+                        roll.nb_live = vec![(0.0, 0.0)];
+                        self.status = format!(
+                            "drawing a pitch curve on {nm} \u{b7} release to keep \u{b7} Alt+Z warps it"
+                        );
+                    }
+                } else if let Some((idx, pi)) =
+                    nb_dot_hit(&roll.pat.notes, &roll.sel_notes, &roll.pat.note_bends, pt)
+                {
+                    // v102: grabbing a control dot edits that curve point
+                    // (dots exist on SELECTED notes — the press that grabs
+                    // one never reaches the note-move branch below).
+                    roll.gesture = RollGesture::NbPt { idx, pi };
+                    self.status =
+                        "moving a curve point \u{b7} Shift snaps time \u{b7} Ctrl snaps 100 cents"
+                            .into();
                 } else {
                 match note_hit(&roll.pat.notes, pt) {
                     Some((idx, n0, n1)) => {
@@ -12611,16 +12839,113 @@ impl App {
                             roll.changed = true;
                         }
                     }
-                    RollGesture::BendNew { t0, v0, src: _ } => {
+                    RollGesture::NbDraw { idx } => {
+                        // Freehand stroke: append the pointer to nb_live with
+                        // strictly increasing t (back-strokes just update the
+                        // last sample). Drawing scale = 1200 ¢ per trail half,
+                        // identical to the paint (WYSIWYG under the pointer).
                         if in_grid(pt) {
-                            let t1 = tick_of(snap(sec_at(pt.x))).max(t0 + 1);
-                            roll.bend_live = Some(crate::midipat::BendSeg {
-                                t0,
-                                v0,
-                                t1,
-                                v1: st_at(pt.y),
-                                curve: 0.0,
-                            });
+                            if let Some(n) = roll.pat.notes.get(idx) {
+                                let s0 = t_of(n.start);
+                                let dur = t_of(n.len.max(1)).max(1e-6);
+                                let row = n.note as i32;
+                                let t = ((sec_at(pt.x) - s0) / dur).clamp(0.0, 1.0);
+                                let c = c_at_y(row, 1200.0, pt.y);
+                                let live = &mut roll.nb_live;
+                                let extend = live.last().is_some_and(|lp| t - lp.0 >= 1e-4);
+                                if extend {
+                                    live.push((t, c));
+                                } else if let Some(lp) = live.last_mut() {
+                                    lp.1 = c;
+                                } else {
+                                    live.push((t, c));
+                                }
+                            }
+                        }
+                    }
+                    RollGesture::NbPt { idx, pi } => {
+                        // Control-point drag: endpoints keep their t (a
+                        // per-note curve always spans its body); interior
+                        // dots move freely, clamped between neighbours so
+                        // t stays strictly increasing.
+                        let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
+                        let geo = roll
+                            .pat
+                            .notes
+                            .get(idx)
+                            .map(|n| (n.note as i32, t_of(n.start), t_of(n.len.max(1)).max(1e-6)));
+                        let mut edited = false;
+                        if let (Some(ci), Some((row, s0, dur))) = (ci, geo) {
+                            if let Some(nb) = roll.pat.note_bends.get_mut(ci as usize) {
+                                if pi < nb.pts.len() {
+                                    let disp = nb_disp(&nb.pts);
+                                    let sec = sec_at(pt.x);
+                                    let t = if mods.shift {
+                                        (snap(sec) - s0) / dur
+                                    } else {
+                                        (sec - s0) / dur
+                                    };
+                                    let mut c = c_at_y(row, disp, pt.y);
+                                    if mods.ctrl {
+                                        c = (c / 100.0).round() * 100.0;
+                                    }
+                                    let last = nb.pts.len() - 1;
+                                    if pi == 0 || pi == last {
+                                        nb.pts[pi].1 = c;
+                                    } else {
+                                        let tmin = nb.pts[pi - 1].0 + 1e-3;
+                                        let tmax = nb.pts[pi + 1].0 - 1e-3;
+                                        nb.pts[pi].0 = t.clamp(tmin.min(1.0), tmax.max(0.0));
+                                        nb.pts[pi].1 = c;
+                                    }
+                                    edited = true;
+                                }
+                            }
+                        }
+                        if edited {
+                            roll.pat.bake_bends();
+                            roll.changed = true;
+                        }
+                    }
+                    RollGesture::NbWarp { idx, c0 } => {
+                        // Alt+Z magnitude warp: scale every point from the
+                        // grab anchor, always relative to the snapshot (a
+                        // compounding drag would runaway).
+                        let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
+                        let mut edited = false;
+                        if let Some(ci) = ci {
+                            if !roll.nb_base.is_empty() {
+                                let row = match roll.pat.notes.get(idx) {
+                                    Some(n) => n.note as i32,
+                                    None => 0,
+                                };
+                                if roll.pat.notes.get(idx).is_some() {
+                                    let disp = nb_disp(&roll.nb_base);
+                                    let c = c_at_y(row, disp, pt.y);
+                                    // Near-zero anchor cannot carry a ratio —
+                                    // warp additively over an octave instead.
+                                    let f = if c0.abs() > 24.0 {
+                                        c / c0
+                                    } else {
+                                        1.0 + (c - c0) / 1200.0
+                                    }
+                                    .clamp(0.05, 20.0);
+                                    if let Some(nb) = roll.pat.note_bends.get_mut(ci as usize) {
+                                        nb.pts = roll
+                                            .nb_base
+                                            .iter()
+                                            .map(|(t, v)| {
+                                                (*t, (v * f).clamp(-2400.0, 2400.0))
+                                            })
+                                            .collect();
+                                        edited = true;
+                                    }
+                                }
+                            }
+                        }
+                        if edited {
+                            roll.pat.bake_bends();
+                            roll.changed = true;
                         }
                     }
                     RollGesture::BendEP { idx, end } => {
@@ -12705,32 +13030,92 @@ impl App {
                     }
                     roll.sel_anchor = roll.sel_notes.first().copied();
                     self.status = format!("selected {} note(s) by box", roll.sel_notes.len());
-                } else if let RollGesture::BendNew { src, .. } = roll.gesture {
-                    // v52 R6: keep the drawn glide. Released over a NOTE
-                    // (a Z-start glide), it LANDS there: ends at the
-                    // target's start, value = target pitch − source
-                    // pitch — Septabee's note-to-note portamento.
-                    if let Some(mut g) = roll.bend_live.take() {
-                        if let Some(sp) = src {
-                            let sec = sec_at(pt.x);
-                            if let Some(tn) = roll.pat.notes.iter().find(|n| {
-                                let s0 = t_of(n.start);
-                                sec >= s0 - 1e-6
-                                    && sec <= s0 + t_of(n.len.max(1)) + 1e-6
-                            }) {
-                                g.t1 = tick_of(t_of(tn.start)).max(g.t0 + 1);
-                                g.v1 = (tn.note as i32 - sp as i32) as f32;
+                } else if let RollGesture::NbDraw { idx } = roll.gesture {
+                    // v102 (pb-3): commit the freehand stroke. RDP-simplify
+                    // (ε = 4 ¢, spec § 4), land-on-target sugar preserved
+                    // (release OVER another note = end at its pitch delta),
+                    // then bake + auto-audition — the "can't tell if it
+                    // works" killer the whole series exists for.
+                    let live = std::mem::take(&mut roll.nb_live);
+                    if live.len() >= 2 && idx < roll.pat.notes.len() {
+                        let srcrow = roll.pat.notes[idx].note as i32;
+                        // Land-on-target: the v52 muscle memory survives as
+                        // one-gesture 808 note-to-note slides.
+                        let sec = sec_at(pt.x);
+                        let land = roll.pat.notes.iter().find(|n| {
+                            let a = t_of(n.start);
+                            (n.note as i32) != srcrow
+                                && sec >= a - 1e-6
+                                && sec <= a + t_of(n.len.max(1)) + 1e-6
+                        });
+                        let end_c = land
+                            .map(|tn| (tn.note as i32 - srcrow) as f32 * 100.0)
+                            .unwrap_or_else(|| c_at_y(srcrow, 1200.0, pt.y));
+                        let mut pts: Vec<(f32, f32)> =
+                            live.into_iter().filter(|p| p.0 < 0.995).collect();
+                        pts.push((1.0, end_c));
+                        let pts = rdp_simplify(&pts, 4.0);
+                        let nb = crate::midipat::NoteBend::new(pts);
+                        let npts = nb.pts.len();
+                        let cur = roll.pat.notes[idx].bend;
+                        let reuse = cur
+                            .map(|c| c as usize)
+                            .filter(|c| *c < roll.pat.note_bends.len());
+                        match reuse {
+                            Some(ci) => roll.pat.note_bends[ci] = nb,
+                            None => {
+                                roll.pat.note_bends.push(nb);
+                                roll.pat.notes[idx].bend =
+                                    Some((roll.pat.note_bends.len() - 1) as u32);
                             }
                         }
-                        if g.t1 > g.t0 {
-                            roll.pat.bend_segs.push(g);
-                            roll.pat.bake_bends();
-                            roll.sel_bend = Some(roll.pat.bend_segs.len() - 1);
-                            roll.changed = true;
-                            self.status = format!(
-                                "glide {:+.1} st \u{b7} right-click it in the lane to delete",
-                                g.v1 - g.v0
-                            );
+                        roll.pat.bake_bends();
+                        roll.changed = true;
+                        *preview = true;
+                        *curve_echo = Some(format!(
+                            "pitch curve on {} \u{b7} {npts} pts \u{b7} ends {end_c:+.0} cents \u{b7} drag a dot to edit",
+                            note_name(roll.pat.notes[idx].note)
+                        ));
+                    } else if !live.is_empty() {
+                        self.status = "curve too short \u{b7} drag a longer stroke across the note".into();
+                    }
+                } else if let RollGesture::NbPt { idx, pi } = roll.gesture {
+                    // v102: a committed point edit answers with its values
+                    // and re-hears the curve (auto-audition).
+                    let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
+                    if let Some(ci) = ci {
+                        let echo = roll
+                            .pat
+                            .note_bends
+                            .get(ci as usize)
+                            .and_then(|nb| nb.pts.get(pi).copied());
+                        if let Some(nb) = roll.pat.note_bends.get_mut(ci as usize) {
+                            nb.sanitize();
+                        }
+                        roll.pat.bake_bends();
+                        roll.changed = true;
+                        *preview = true;
+                        if let Some((t, c)) = echo {
+                            *curve_echo =
+                                Some(format!("curve point \u{b7} t {t:.2} at {c:+.0} cents"));
+                        }
+                    }
+                } else if let RollGesture::NbWarp { idx, .. } = roll.gesture {
+                    // v102: warp done — drop the snapshot, echo the result.
+                    roll.nb_base.clear();
+                    let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
+                    if let Some(ci) = ci {
+                        let end_c = roll
+                            .pat
+                            .note_bends
+                            .get(ci as usize)
+                            .and_then(|nb| nb.pts.last())
+                            .map(|p| p.1);
+                        roll.pat.bake_bends();
+                        roll.changed = true;
+                        *preview = true;
+                        if let Some(c) = end_c {
+                            *curve_echo = Some(format!("curve warped \u{b7} ends {c:+.0} cents"));
                         }
                     }
                 } else if was_move && roll.changed {
@@ -13047,7 +13432,8 @@ impl App {
                     win_rect: None,
                     edit_asset: edit,
                     sel_bend: None,
-                    bend_live: None,
+                    nb_live: Vec::new(),
+            nb_base: Vec::new(),
                     menu_anchor: None,
                 }));
                 self.roll_keep_focus = true;
@@ -13132,7 +13518,6 @@ impl App {
         rb.drag_notes.clear();
         rb.gesture = RollGesture::None;
         rb.sel_bend = None;
-        rb.bend_live = None;
         rb.menu_anchor = None;
         rb.focused = true;
         self.status = format!(
@@ -26895,6 +27280,63 @@ fn lane_row(
 
 /// v55 (S2): what a plain right-click on the piano-roll canvas targets.
 #[derive(Clone, Copy)]
+/// v102 (pb-3, spec docs/SAMPLER-PITCH.md § 4): Ramer–Douglas–Peucker
+/// simplification of a drawn curve stroke. Distance is VERTICAL (cents) —
+/// strokes are strictly time-increasing, so vertical deviation is the
+/// shape-faithful metric and ε reads directly in cents (spec: 4 ¢ detail).
+fn rdp_simplify(pts: &[(f32, f32)], eps: f32) -> Vec<(f32, f32)> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    let mut stack = vec![(0usize, pts.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        // Line from a to b; vertical deviation of every interior point.
+        let (ta, ca) = pts[a];
+        let (tb, cb) = pts[b];
+        let span = (tb - ta).max(1e-6);
+        let mut worst = -1.0f32;
+        let mut wi = a;
+        for k in a + 1..b {
+            let (tk, ck) = pts[k];
+            let lin = ca + (cb - ca) * ((tk - ta) / span);
+            let d = (ck - lin).abs();
+            if d > worst {
+                worst = d;
+                wi = k;
+            }
+        }
+        if worst > eps {
+            keep[wi] = true;
+            stack.push((a, wi));
+            stack.push((wi, b));
+        }
+    }
+    let mut out = Vec::new();
+    for (i, p) in pts.iter().enumerate() {
+        if keep[i] {
+            out.push(*p);
+        }
+    }
+    out
+}
+
+/// v102 (pb-3): trail-geometry helpers live inline in `roll_inner` so they
+/// capture the live scale; this pins the shared auto-scale rule for pins.
+fn nb_display_scale(pts: &[(f32, f32)]) -> f32 {
+    let mx = pts.iter().fold(0f32, |a, p| a.max(p.1.abs()));
+    if mx <= 1200.0 {
+        1200.0
+    } else {
+        (mx.ceil() / 600.0 * 600.0).min(2400.0)
+    }
+}
+
 enum RollRmbHit {
     Note(usize),
     Glide(usize),
@@ -26992,6 +27434,14 @@ fn roll_rmb_menu(
     }
     match hit {
         Some(RollRmbHit::Note(i)) if i < roll.pat.notes.len() => {
+            // v102 (pb-3): does this note carry an active pitch curve?
+            let nb_of_note = roll
+                .pat
+                .notes
+                .get(i)
+                .and_then(|n| n.bend)
+                .and_then(|c| roll.pat.note_bends.get(c as usize))
+                .filter(|nb| nb.active());
             // The right-clicked note joins the selection alone UNLESS it
             // is already part of a multi-selection — then every length
             // edit applies to the whole group (grid clip-menu convention).
@@ -27094,6 +27544,30 @@ fn roll_rmb_menu(
                 return;
             }
             ui.separator();
+            // v102 (pb-3): the curve verbs ride the note menu too.
+            if nb_of_note.is_some() {
+                if ui
+                    .button("Clear curve")
+                    .on_hover_text("Remove this note's pitch curve (the note stays)")
+                    .clicked()
+                {
+                    if let Some(n) = roll.pat.notes.get_mut(i) {
+                        n.bend = None;
+                    }
+                    roll.pat.bake_bends();
+                    roll.pat.compact_note_bends();
+                    roll.changed = true;
+                    roll.menu_anchor = None;
+                    *status = format!("curve removed from {}", note_name(roll.pat.notes[i].note));
+                    ui.close();
+                }
+            } else {
+                ui.label(
+                    RichText::new("Z+drag on the note = draw a pitch curve")
+                        .weak()
+                        .small(),
+                );
+            }
             if ui
                 .button("Delete note (Shift+RMB)")
                 .on_hover_text("Remove this note now — or Shift+right-click it")
@@ -37300,7 +37774,8 @@ mod tests {
             win_rect: None,
             edit_asset: None,
             sel_bend: None,
-            bend_live: None,
+            nb_live: Vec::new(),
+            nb_base: Vec::new(),
             menu_anchor: None,
         }));
         frame(&mut app, &ctx, vec![]);
@@ -37560,7 +38035,8 @@ mod tests {
             win_rect: None,
             edit_asset: Some(a3),
             sel_bend: None,
-            bend_live: None,
+            nb_live: Vec::new(),
+            nb_base: Vec::new(),
             menu_anchor: None,
         }));
         frame(&mut app, &ctx, vec![]);
