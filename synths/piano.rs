@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 7
+// slooper-synth-version: 8
 // piano.rs — the default slooper synthesizer: a REAL piano.
 //
 // A compact sample-player for the 'Piano 1' (GM acoustic grand)
@@ -19,6 +19,10 @@
 // the exact extraction procedure. The player code (everything outside
 // the blob) is MIT like slooper.
 // ---------------------------------------------------------------------------
+
+// v106: MPE note pressure (poly_at) raises the pressured voice up to
+// +3.5 dB — the note still sounds normally at rest, like every older
+// slooper release (no pressure = the exact pre-v106 render).
 
 include!("synth_api.rs");
 
@@ -52,6 +56,7 @@ struct Voice {
     pos: f64,
     rate: f64,
     gain: f32,
+    press: f32,
     rel: bool,
     age: u32,
 }
@@ -65,6 +70,7 @@ impl Voice {
             pos: 0.0,
             rate: 0.0,
             gain: 0.0,
+            press: 0.0,
             rel: false,
             age: 0,
         }
@@ -251,6 +257,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
         pos: 0.0,
         rate,
         gain: amp,
+        press: 0.0,
         rel: false,
         age: 0,
     };
@@ -395,7 +402,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 }
                 v.gain = env;
             }
-            acc += raw * env;
+            acc += raw * env * (1.0 + 0.5 * v.press);
             v.pos += v.rate * bend_ratio;
             if z.looping && lend > lstart && v.pos >= lend as f64 {
                 v.pos -= (lend - lstart) as f64;
@@ -463,9 +470,24 @@ pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     unsafe { &mut *(s as *mut Piano) }.bend_st = st as f64;
 }
 
-static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+// v106 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
+// matching live voice's level by up to +3.5 dB (x1.5 at 127; 0 = normal).
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Piano) };
+    for v in p.voices.iter_mut() {
+        if v.on && v.key == note {
+            v.press = val as f32 / 127.0;
+        }
+    }
+}
+
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
 
 #[no_mangle]
-pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
-    &DESC_V2
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }

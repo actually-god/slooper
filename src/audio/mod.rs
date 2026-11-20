@@ -3080,15 +3080,13 @@ pub fn render_midi_events(
                 0 => inst.note_off(ch, d1),
                 1 => inst.cc(ch, d1, d2),
                 2 => inst.press(ch, d2),
-                // v42/MPE: per-note aftertouch has no scripted callback —
-                // drop cleanly. v100 (card t_52aa65b1): pitch bend (d1 =
-                // LSB, d2 = MSB of the raw 14-bit) decodes to semitones in
-                // ROLL space (BEND_FULL_ST at full deflection) and reaches
-                // ABI v2 scripts; v1 scripts no-op inside Instance::bend.
-                // v104 (card t_0ab25d9a): hosted plugins DO get 0xA0 now;
-                // the scripted half stays a documented drop (decision (a),
-                // follow-up ABI card).
-                4 => {}
+                // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
+                // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
+                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
+                // to scripted synths via Instance::poly_at: ABI v3 scripts
+                // get the raw byte, v1/v2 scripts no-op inside the call
+                // (the historic clean drop).
+                4 => inst.poly_at(ch, d1, d2),
                 5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                 _ => inst.note_on(ch, d1, d2),
             }
@@ -3663,16 +3661,13 @@ impl Proc {
                                 0 => inst.note_off(ch, d1),
                                 1 => inst.cc(ch, d1, d2),
                                 2 => inst.press(ch, d2),
-                                // v42/MPE: per-note aftertouch has no
-                                // scripted callback — drop cleanly.
-                                // v100 (card t_52aa65b1): pitch bend rides
-                                // Instance::bend (LSB/MSB -> 14-bit -> roll
-                                // semitones); this arm also serves the
-                                // roll/clip audition pool via aud_block.
-                                // v104 (card t_0ab25d9a): scripted per-note
-                                // AT stays a documented drop (hosting half
-                                // ships 0xA0; decision (a), ABI follow-up).
-                                4 => {}
+                                // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
+                                // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
+                                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
+                                // to scripted synths via Instance::poly_at: ABI v3 scripts
+                                // get the raw byte, v1/v2 scripts no-op inside the call
+                                // (the historic clean drop).
+                                4 => inst.poly_at(ch, d1, d2),
                                 5 => {
                                     inst.bend(
                                         ch,
@@ -3907,13 +3902,13 @@ impl Proc {
                                     0 => inst.note_off(ch, d1),
                                     1 => inst.cc(ch, d1, d2),
                                     2 => inst.press(ch, d2),
-                                    // v42/MPE: per-note aftertouch has no scripted
-                                    // callback — drop cleanly. v100 (card t_52aa65b1):
-                                    // pitch bend -> Instance::bend (roll semitones).
-                                    // v104 (card t_0ab25d9a): hosted plugins DO get
-                                    // 0xA0 now; the scripted half stays a documented
-                                    // drop (decision (a), follow-up ABI card).
-                                    4 => {}
+                                    // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
+                                    // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
+                                    // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
+                                    // to scripted synths via Instance::poly_at: ABI v3 scripts
+                                    // get the raw byte, v1/v2 scripts no-op inside the call
+                                    // (the historic clean drop).
+                                    4 => inst.poly_at(ch, d1, d2),
                                     5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                                     _ => inst.note_on(ch, d1, d2),
                                 }
@@ -4020,13 +4015,13 @@ impl Proc {
                                 0 => inst.note_off(ch, d1),
                                 1 => inst.cc(ch, d1, d2),
                                 2 => inst.press(ch, d2),
-                                // v42/MPE: per-note aftertouch has no scripted
-                                // callback — drop cleanly. v100 (card t_52aa65b1):
-                                // pitch bend -> Instance::bend (roll semitones).
-                                // v104 (card t_0ab25d9a): hosted plugins DO get
-                                // 0xA0 now; the scripted half stays a documented
-                                // drop (decision (a), follow-up ABI card).
-                                4 => {}
+                                // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
+                                // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
+                                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
+                                // to scripted synths via Instance::poly_at: ABI v3 scripts
+                                // get the raw byte, v1/v2 scripts no-op inside the call
+                                // (the historic clean drop).
+                                4 => inst.poly_at(ch, d1, d2),
                                 5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                                 _ => inst.note_on(ch, d1, d2),
                             }
@@ -4123,13 +4118,13 @@ impl Proc {
                                         0 => inst.note_off(ch, d1),
                                         1 => inst.cc(ch, d1, d2),
                                         2 => inst.press(ch, d2),
-                                        // v42/MPE: per-note aftertouch has no scripted
-                                        // callback — drop cleanly. v100 (card t_52aa65b1):
-                                        // pitch bend -> Instance::bend (roll semitones).
-                                        // v104 (card t_0ab25d9a): hosted plugins DO get
-                                        // 0xA0 now; the scripted half stays a documented
-                                        // drop (decision (a), follow-up ABI card).
-                                        4 => {}
+                                        // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
+                                        // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
+                                        // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
+                                        // to scripted synths via Instance::poly_at: ABI v3 scripts
+                                        // get the raw byte, v1/v2 scripts no-op inside the call
+                                        // (the historic clean drop).
+                                        4 => inst.poly_at(ch, d1, d2),
                                         5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                                         _ => inst.note_on(ch, d1, d2),
                                     }
