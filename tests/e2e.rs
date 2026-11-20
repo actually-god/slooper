@@ -5487,3 +5487,274 @@ fn e2e_v96_multi_preview_pair_ducks() {
     );
     b.engine.stop_audition();
 }
+
+// ---- v99 (sc-5): sender-side GENERAL send gain/pan ----------------------
+
+/// v99: two-channel capture (backend L bus + R bus, per the `Cmd::Apply`
+/// routing bits: 1 = L, 2 = R) so ONE rig reads two hard-panned targets'
+/// buses simultaneously — the sender knob must move both together.
+struct CapProcLR {
+    sink_l: jack::Port<jack::AudioIn>,
+    sink_r: jack::Port<jack::AudioIn>,
+    ring_l: Arc<Vec<AtomicU32>>,
+    ring_r: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+}
+
+impl jack::ProcessHandler for CapProcLR {
+    fn process(&mut self, _c: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
+        let n = ps.n_frames() as usize;
+        if n == 0 {
+            return jack::Control::Continue;
+        }
+        let l = self.sink_l.as_slice(ps);
+        let r = self.sink_r.as_slice(ps);
+        let nring = self.ring_l.len() as u64;
+        let mut w = self.widx.load(Ordering::Relaxed);
+        for i in 0..n {
+            self.ring_l[(w % nring) as usize].store(l[i].to_bits(), Ordering::Relaxed);
+            self.ring_r[(w % nring) as usize].store(r[i].to_bits(), Ordering::Relaxed);
+            w += 1;
+        }
+        self.widx.store(w, Ordering::Relaxed);
+        jack::Control::Continue
+    }
+}
+
+type V99Rig = (
+    Backend,
+    Arc<Vec<AtomicU32>>,
+    Arc<Vec<AtomicU32>>,
+    Arc<AtomicU64>,
+    u32,
+    jack::AsyncClient<(), CapProcLR>,
+);
+
+/// v99 rig: ONE MUTED sender (track 0, 110 Hz @ 0.3, centred — the v95 law
+/// keeps the KEY alive through the mute) keys TWO targets, each running a
+/// stock sidechain_comp over its own soft tone: A on track 1 HARD RIGHT,
+/// B on track 2 HARD LEFT. The dual-sink capture reads bus R == A's duck
+/// and bus L == B's duck in the same frames — one sender knob, two readers.
+fn v99_sc_setup(tag: &str) -> Option<V99Rig> {
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return None; // no audio server: skip
+    };
+    let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut reg = slooper::fx::Registry::open(dir.clone());
+    reg.rescan();
+    // threshold -30 dB, ratio 4, attack 2 ms, release 100 ms, knee 6, depth 1.
+    let vals = [-30.0f32, 4.0, 2.0, 100.0, 6.0, 1.0];
+    let desc = reg
+        .desc("sidechain_comp")
+        .expect("stock sidechain_comp present")
+        .clone();
+    let inst_a = reg
+        .create_instance("sidechain_comp", sr as f64, &vals)
+        .expect("sidechain_comp A compiles and instantiates");
+    let inst_b = reg
+        .create_instance("sidechain_comp", sr as f64, &vals)
+        .expect("sidechain_comp B compiles and instantiates");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ring_n = 1usize << 19;
+    let ring_l: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_r: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        jack::Client::new(tag, jack::ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sinkL", jack::AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sinkR", jack::AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProcLR {
+                sink_l,
+                sink_r,
+                ring_l: ring_l.clone(),
+                ring_r: ring_r.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    // Routing bits per Cmd::Apply: 1 = the slot carries the L bus only,
+    // 2 = the R bus only (hard-pan isolation — the v32 e2e rule).
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![
+            (format!("{src_name}:sinkL"), 1),
+            (format!("{src_name}:sinkR"), 2),
+        ],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "dual sink layout not applied"
+    );
+    let n = 24_000usize;
+    let key: Arc<[f32]> = Arc::from(
+        (0..n)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 110.0 * i as f32 / sr as f32).sin())
+            .collect::<Vec<f32>>(),
+    );
+    let tone: Arc<[f32]> = Arc::from(vec![0.02f32; n]);
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0)); // sender: 110 Hz key, muted below
+    arr.insert(1, 0, Clip::new(1, 0)); // target A: tone, hard R
+    arr.insert(2, 0, Clip::new(2, 0)); // target B: tone, hard L
+    b.cmd(Cmd::SetProject {
+        assets: Arc::new(vec![key, tone.clone(), tone]),
+        arr: Arc::new(arr),
+        len: n as u64,
+    });
+    b.cmd(Cmd::SetLoop(true));
+    b.cmd(Cmd::SetTrackOn { i: 0, on: false }); // mute keeps the key (v95)
+    b.engine.set_loop_pan(0, 0.5); // sender centred
+    b.engine.set_loop_pan(1, 1.0); // target A hard right
+    b.engine.set_loop_pan(2, 0.0); // target B hard left
+    b.cmd(Cmd::SetTrackEffects {
+        i: 1,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst_a, desc.clone())]),
+        },
+    });
+    b.cmd(Cmd::SetTrackEffects {
+        i: 2,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst_b, desc)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    Some((b, ring_l, ring_r, widx, sr, active))
+}
+
+fn v99_rms(ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, sr: u32, ms: u64) -> f32 {
+    let x = read_ring(ring, widx, (sr as u64 * ms / 1000) as usize, Duration::from_millis(500))
+        .expect("ring");
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+}
+
+/// Sleep past setter + compressor settling, then read (L bus, R bus).
+fn v99_both(rl: &Arc<Vec<AtomicU32>>, rr: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, sr: u32) -> (f32, f32) {
+    std::thread::sleep(Duration::from_millis(400));
+    (v99_rms(rl, widx, sr, 200), v99_rms(rr, widx, sr, 200))
+}
+
+/// v99 (sc-5): the sender's GENERAL send gain moves EVERY target's duck by
+/// the same factor — both hard-panned buses respond together (a per-edge
+/// misapplication would make the two ratios diverge: causal fingerprint),
+/// and zero send opens both buses. Ladder thresholds are the measured
+/// v97-family ratios with >=25 % margins.
+#[test]
+fn e2e_v99_sc_send_gain_moves_both_targets_equally() {
+    let _g = e2e_lock();
+    let Some((b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scgain") else {
+        return;
+    };
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring_r, &widx, 480)
+                .map(|m| m > 0.005)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "target tone on the probe bus",
+    );
+    // Open (send un-armed) reference on both buses.
+    let (open_l, open_r) = v99_both(&ring_l, &ring_r, &widx, sr);
+    assert!(open_l > 0.005 && open_r > 0.005, "both tones audible: L {open_l}, R {open_r}");
+    // A MUTED sender still keys BOTH targets (v95 tap law holds).
+    b.engine.set_sc_send(1, 1 << 0);
+    b.engine.set_sc_send(2, 1 << 0);
+    let (base_l, base_r) = v99_both(&ring_l, &ring_r, &widx, sr);
+    assert!(
+        base_l < open_l * 0.7 && base_r < open_r * 0.7,
+        "unity send ducks both targets: L open {open_l} -> {base_l}; R open {open_r} -> {base_r}"
+    );
+    // Half send: both shallower, the two ratios close (one knob).
+    b.engine.set_sc_send_gain(0, 0.5);
+    let (hl, hr) = v99_both(&ring_l, &ring_r, &widx, sr);
+    let rl = hl / base_l;
+    let rr = hr / base_r;
+    assert!(
+        hl > base_l * 1.2 && hr > base_r * 1.2,
+        "half send must lighten BOTH ducks together: L {base_l}->{hl}, R {base_r}->{hr}"
+    );
+    assert!(
+        (rl - rr).abs() < 0.25,
+        "the two buses must respond alike (identical scaling): L ratio {rl}, R ratio {rr}"
+    );
+    // Send zero: key silent — both buses ride open.
+    b.engine.set_sc_send_gain(0, 0.0);
+    let (zl, zr) = v99_both(&ring_l, &ring_r, &widx, sr);
+    assert!(
+        zl > open_l * 0.9 && zr > open_r * 0.9,
+        "zero send must un-duck EVERY target: L open {open_l} -> {zl}; R open {open_r} -> {zr}"
+    );
+    // Unity: back under the baseline duck.
+    b.engine.set_sc_send_gain(0, 1.0);
+    let (fl, fr) = v99_both(&ring_l, &ring_r, &widx, sr);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        fl < hl * 0.85 && fr < hr * 0.85,
+        "unity restores the deep duck on both: L {fl} vs half {hl}; R {fr} vs half {hr}"
+    );
+}
+
+/// v99 (sc-5) pan law: the SC bus feeds a MONO-SUMMED detector (one f32 per
+/// sample — documented in docs/SIDECHAIN.md), so a hard send pan folds the
+/// key by 1/sqrt(2) and both buses duck shallower together; a panned send
+/// at zero gain still opens both.
+#[test]
+fn e2e_v99_sc_send_pan_folds_key_level() {
+    let _g = e2e_lock();
+    let Some((b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scpan") else {
+        return;
+    };
+    b.cmd(Cmd::PlayAll);
+    wait_until(
+        || {
+            ring_peak(&ring_r, &widx, 480)
+                .map(|m| m > 0.005)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "target tone on the probe bus",
+    );
+    let (_open_l, _open_r) = v99_both(&ring_l, &ring_r, &widx, sr);
+    b.engine.set_sc_send(1, 1 << 0);
+    b.engine.set_sc_send(2, 1 << 0);
+    let (base_l, base_r) = v99_both(&ring_l, &ring_r, &widx, sr);
+    // Hard-left send pan: key folds to 1/sqrt(2) — the duck lightens on
+    // BOTH buses (a level effect at the mono detector, by design).
+    b.engine.set_sc_send_pan(0, 0.0);
+    let (pl, pr) = v99_both(&ring_l, &ring_r, &widx, sr);
+    assert!(
+        pl > base_l * 1.15 && pr > base_r * 1.15,
+        "hard send pan must lighten BOTH ducks via the 1/sqrt(2) fold: L {base_l}->{pl}, R {base_r}->{pr}"
+    );
+    // Centre: back to the deep duck.
+    b.engine.set_sc_send_pan(0, 0.5);
+    let (cl, cr) = v99_both(&ring_l, &ring_r, &widx, sr);
+    assert!(
+        cl < pl * 0.9 && cr < pr * 0.9,
+        "centre pan restores the duck: L {cl} vs panned {pl}; R {cr} vs panned {pr}"
+    );
+    // Panned AND zeroed: the documented composition still opens both.
+    b.engine.set_sc_send_pan(0, 1.0);
+    b.engine.set_sc_send_gain(0, 0.0);
+    let (zl, zr) = v99_both(&ring_l, &ring_r, &widx, sr);
+    b.cmd(Cmd::StopAll);
+    assert!(
+        zl > base_l * 1.5 && zr > base_r * 1.5,
+        "zero send (any pan) un-ducks both buses: L {base_l}->{zl}, R {base_r}->{zr}"
+    );
+}

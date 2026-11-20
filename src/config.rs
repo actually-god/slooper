@@ -214,16 +214,27 @@ pub struct TrackFxSave {
 /// v97 (sc-4): one NON-UNITY sidechain receive level for the (target t,
 /// source s) route. Sparse by design — unity routes are never written, so
 /// old project/config files (missing key) load at unity unchanged.
-/// sc-5 extends this same shape (per-send pan) rather than adding a
-/// parallel table — bump with `#[serde(default = "...")]` fields.
+/// v99 (sc-5): per-SENDER general send levels ride the SAME Vec as
+/// SELF-PAIR entries (`t == s`): a self-pair can never be a live route
+/// (`Engine::set_sc_send` clears the self-bit), so the slot is provably
+/// free. For a self entry `gain` = the sender's send gain and `pan` = its
+/// send pan (-1..=1, 0 = centre); pair entries ignore `pan` (always
+/// written 0.0). Absent/legacy entries load at unity + centre unchanged.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScRecvGain {
-    /// Target track (the receiver — its chain's SC row).
+    /// Target track (the receiver — its chain's SC row). For a SELF-PAIR
+    /// (`t == s`, v99) this carries the sender id of the send-level row.
     pub t: u8,
     /// Source track (the sender whose tap this level scales).
     pub s: u8,
-    /// Receive level, linear amplitude (1.0 = unity = pre-v97 behavior).
+    /// Receive level (v97) / sender send gain (v99 self-pair), linear
+    /// amplitude (1.0 = unity = pre-v97 behavior).
     pub gain: f32,
+    /// v99 (sc-5): send pan for a SELF-PAIR entry, -1.0 (hard left) ..=
+    /// 1.0 (hard right), 0.0 = centre (the serde default — v97-era files
+    /// load every send centred, exactly their pre-v99 behavior).
+    #[serde(default)]
+    pub pan: f32,
 }
 
 /// One slot of a track's mixer chain (see `Config::track_chain`). Tagged so
@@ -1145,11 +1156,13 @@ mod tests {
                     t: 1,
                     s: 0,
                     gain: 0.5,
+                    pan: 0.0,
                 },
                 ScRecvGain {
                     t: 3,
                     s: 2,
                     gain: 1.75,
+                    pan: 0.0,
                 },
             ],
             ..Config::default()
@@ -1157,6 +1170,36 @@ mod tests {
         let j = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&j).unwrap();
         assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "round-trip exact");
+    }
+
+    /// v99 (sc-5): the per-SENDER send level rides the SAME sparse Vec as
+    /// SELF-PAIR entries (`t == s`, provably inert as routes). Additivity
+    /// in BOTH directions: v97-era files (entries WITHOUT the `pan` key)
+    /// load pan = 0.0 = centre = their pre-v99 behavior, and self pairs
+    /// round-trip gain + pan exactly.
+    #[test]
+    fn v99_config_send_entry_roundtrip() {
+        // v97-era JSON: no `pan` key on either entry -> centre default,
+        // gains untouched (the exact byte-string a v97 build wrote).
+        let legacy: Config = serde_json::from_str(
+            r#"{"sc_recv_gain":[{"t":1,"s":0,"gain":0.5},{"t":2,"s":2,"gain":1.25,"pan":-0.4}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.sc_recv_gain[0].pan, 0.0, "v97-era entry loads centred");
+        assert_eq!(legacy.sc_recv_gain[0].gain, 0.5, "v97-era gain unchanged");
+        // The self-pair (t==s==2) reads back its pan exactly.
+        assert_eq!(legacy.sc_recv_gain[1].t, 2);
+        assert!((legacy.sc_recv_gain[1].pan + 0.4).abs() < 1e-6, "self-pair pan round");
+        // Full struct round trip (save path writes pan on every entry).
+        let c = Config {
+            sc_recv_gain: vec![
+                ScRecvGain { t: 0, s: 0, gain: 1.5, pan: -0.75 },
+                ScRecvGain { t: 1, s: 0, gain: 0.25, pan: 0.0 },
+            ],
+            ..Config::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "self-pair round-trip exact");
     }
 
     #[test]
