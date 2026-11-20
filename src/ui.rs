@@ -1296,7 +1296,7 @@ pub struct App {
     backend: Backend,
 
     // --- audio / device state ---
-    status: String,
+    pub(crate) status: String,
     client_name: Option<String>,
     sample_rate: u32,
     avail_in: Vec<PortInfo>,
@@ -1387,6 +1387,25 @@ pub struct App {
     /// v42/MPE: Settings switch — bend/poly-AT from the port reach
     /// instruments (mirrored into the engine every frame it changes).
     mpe_on: bool,
+    /// v107/MCP: mirrors of the `Config::mcp_*` trio (Settings ▸
+    /// AUTOMATION). The server itself starts/stops hot from the frame
+    /// loop (`mcp_frame`) — a restart is never needed for any of them.
+    pub(crate) mcp_enabled: bool,
+    pub(crate) mcp_port: u16,
+    /// The port TextEdit binds a String (repo pattern: metro_bpm) so a
+    /// half-typed value can never corrupt the u16 seam.
+    mcp_port_edit: String,
+    /// Read by the dispatcher (read-only latch) — hence pub(crate).
+    pub(crate) mcp_read_only: bool,
+    /// Reveal-token button state (transient; never persisted).
+    mcp_token_shown: bool,
+    /// Option so `mcp_frame` can move the server out and call
+    /// `drain(&mut srv, self)` without a double mutable borrow.
+    /// Always Some in a live app. pub(crate) for the mcp pins.
+    pub(crate) mcp: Option<crate::mcp::McpServer>,
+    /// Snapshot of the global tool table (MCP-02..05 register through
+    /// `mcp::tools::install_all`; dispatch only ever sees THIS copy).
+    pub(crate) mcp_tools: Vec<crate::mcp::ToolDef>,
     /// W8b (Windows): Settings switch — plugin editors open as embed
     /// children inside the main window. Always inert on Linux
     /// (`embed_hwnd` never becomes Some there).
@@ -2292,6 +2311,13 @@ impl App {
             show_midi: cfg.show_midi,
             light_theme: cfg.theme.trim().eq_ignore_ascii_case("light"),
             mpe_on: cfg.mpe,
+            mcp_enabled: cfg.mcp_enabled,
+            mcp_port: cfg.mcp_port,
+            mcp_port_edit: cfg.mcp_port.to_string(),
+            mcp_read_only: cfg.mcp_read_only,
+            mcp_token_shown: false,
+            mcp: Some(crate::mcp::McpServer::new()),
+            mcp_tools: crate::mcp::tools::table(),
             win_embed: cfg.win_editor_embed,
             // W9: restore the WinMM selection from the config; the picker
             // re-ticks itself from these on first paint.
@@ -6116,6 +6142,26 @@ impl App {
             .collect()
     }
 
+    /// v107/MCP: per-frame housekeeping — hot start/stop pair + draining
+    /// the command queue onto the UI thread (docs/MCP-DESIGN.md D3: the
+    /// worker threads NEVER touch App; commands execute HERE and nowhere
+    /// else). Called from `App::logic` and, for headless pins, from
+    /// `logic_tick_mcp` — one code path, no drift.
+    pub(crate) fn mcp_frame(&mut self, ctx: &egui::Context) {
+        if let Some(srv) = self.mcp.as_mut() {
+            if let Some(msg) = srv.sync(self.mcp_enabled, self.mcp_port, ctx) {
+                self.status = msg;
+            }
+        }
+        // Move-out dance: drain needs &mut the server AND &mut App.
+        let mut srv = match self.mcp.take() {
+            Some(s) => s,
+            None => return,
+        };
+        srv.drain(self);
+        self.mcp = Some(srv);
+    }
+
     /// Persist every user-facing setting (bindings, mixer, grid, rack,
     /// ports, effects chains) to disk.
     fn save_config(&self) {
@@ -6161,6 +6207,9 @@ impl App {
             win_editor_embed: self.win_embed,
             win_midi_inputs: self.win_midi.clone(),
             win_audio_backend: self.win_backend.clone(),
+            mcp_enabled: self.mcp_enabled,
+            mcp_port: self.mcp_port,
+            mcp_read_only: self.mcp_read_only,
             shortcuts: (0..N_ACTIONS)
                 .map(|i| self.short_keys[i].map(key_debug))
                 .collect(),
@@ -17893,6 +17942,12 @@ impl eframe::App for App {
         } else {
             100
         }));
+
+        // v107: MCP server — hot start/stop pair + drain of the command
+        // queue onto the UI thread (docs/MCP-DESIGN.md D3). Worker threads
+        // never touch App; every tool call executes right here. The idle
+        // repaint heartbeat above already bounds worst-case wake latency.
+        self.mcp_frame(ctx);
 
         // v37 R5: publish "a recorder is armed" to the RT thread every
         // tick (atomic write, zero cost when unchanged) — while ANY take /
@@ -30487,6 +30542,113 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     }
                 });
             }
+            // ---- v107: AUTOMATION (MCP) -------------------------------------
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "AUTOMATION (MCP)",
+                "mcp automation agent remote control server endpoint port token bridge http read-only llm claude stdio",
+            ) {
+                any = true;
+                if ui
+                    .checkbox(&mut app.mcp_enabled, "MCP server (control this instance)")
+                    .on_hover_text(
+                        "Model Context Protocol endpoint on 127.0.0.1 ONLY: MCP clients \
+                         (Claude Desktop, coding agents) list and call tools that drive \
+                         THIS running instance live. Access needs the token in the \
+                         endpoint file below — nothing is exposed to the network. The \
+                         switch applies immediately; no restart is ever needed.",
+                    )
+                    .changed()
+                {
+                    app.save_config();
+                    app.status = if app.mcp_enabled {
+                        "MCP server: on — applying (status below)".into()
+                    } else {
+                        "MCP server: off — endpoint closed".into()
+                    };
+                }
+                ui.horizontal(|ui| {
+                    ui.label("port");
+                    let before = app.mcp_port_edit.clone();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.mcp_port_edit)
+                            .desired_width(64.0),
+                    )
+                    .on_hover_text(
+                        "loopback port to listen on; 0 picks any free port. The \
+                         port actually used is always written to the endpoint \
+                         file. Applies live.",
+                    );
+                    if app.mcp_port_edit != before
+                        && app.mcp_port_edit.trim().parse::<u16>().is_ok()
+                    {
+                        let p: u16 = app.mcp_port_edit.trim().parse().unwrap();
+                        if p != app.mcp_port {
+                            app.mcp_port = p;
+                            app.save_config();
+                            app.status = format!("MCP port = {p} (applies live)");
+                        }
+                    }
+                });
+                if ui
+                    .checkbox(&mut app.mcp_read_only, "read-only (the agent may not write)")
+                    .on_hover_text(
+                        "Hard latch: every writing tool is refused (access-denied) \
+                         until unticked; reads keep working. Applies to the very \
+                         next tool call — the agent's connection survives.",
+                    )
+                    .changed()
+                {
+                    app.save_config();
+                    app.status = if app.mcp_read_only {
+                        "MCP read-only: ON — write tools refused".into()
+                    } else {
+                        "MCP read-only: OFF — write tools allowed".into()
+                    };
+                }
+                ui.label(format!(
+                    "status: {}",
+                    app.mcp
+                        .as_ref()
+                        .map_or_else(|| "off — no sockets are open".to_string(), |m| m.status_line())
+                ));
+                if app.mcp.as_ref().is_some_and(|m| m.token().is_some()) {
+                    let shown = app.mcp_token_shown;
+                    let tok = app
+                        .mcp
+                        .as_ref()
+                        .and_then(|m| m.token())
+                        .map(|t| if shown { t.to_string() } else { "********".to_string() })
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("token: {tok}"));
+                        if ui
+                            .button(if shown { "hide" } else { "reveal" })
+                            .on_hover_text("the same token lives in the endpoint file")
+                            .clicked()
+                        {
+                            app.mcp_token_shown = !shown;
+                        }
+                    });
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "endpoint: {}",
+                        crate::mcp::bridge::endpoint_path().display()
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.label(
+                    RichText::new(
+                        "stdio clients: run  slooper --mcp-bridge  (it finds the \
+                         port + token in that file)",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
             if !any {
                 // v43 R5: an explicit dead end — a query that hits nothing
                 // must say so, not paint an empty panel.
@@ -30542,7 +30704,7 @@ fn settings_sect(ui: &mut egui::Ui, filt: &str, title: &str, keys: &str) -> bool
 
 /// The settings category chips: (label, query). Each query must hit its
 /// section through `settings_sect` — heading or keywords.
-const SETTINGS_CHIPS: [(&str, &str); 7] = [
+const SETTINGS_CHIPS: [(&str, &str); 8] = [
     ("GUI", "gui"),
     ("monitoring", "monitoring"),
     ("preview", "preview"),
@@ -30550,6 +30712,7 @@ const SETTINGS_CHIPS: [(&str, &str); 7] = [
     ("MPE", "mpe"),
     ("MIDI keys", "midi"),
     ("ports", "ports"),
+    ("automation", "automation"),
 ];
 
 /// First-save (or Save As) name prompt.
@@ -30806,6 +30969,10 @@ fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 }
+// v107: headless_app re-export — mcp pins need it, but the ui tests module
+// MUST stay column-0 `mod tests` (a dozen source-scan pins anchor on it).
+#[cfg(test)]
+pub(crate) use self::tests::headless_app;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30876,7 +31043,7 @@ mod tests {
         app.track_synth_inst[t].is_some()
     }
 
-    fn headless_app(tag: &str) -> App {
+    pub(crate) fn headless_app(tag: &str) -> App {
         std::env::set_var("SLOOPER_NULL_AUDIO", "1");
         let dir = std::env::temp_dir().join(format!("sp-uity-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -31855,6 +32022,89 @@ mod tests {
         app.tick_plugin_persist();
         app.poll_editor_probes();
         app.poll_vst_opens();
+    }
+
+    // v107: the MCP half of `App::logic` for headless pins is
+    // `App::mcp_frame` itself (pub(crate), one code path with production,
+    // doctrine v59) — pins call it directly; the drain executes tools
+    // exactly like the frame loop.
+
+    /// v107/MCP-01 AC (in-app visibility): Settings carries an AUTOMATION
+    /// section with the enable switch, the read-only latch, a live status
+    /// line, the endpoint-file path and the stdio-bridge hint — all found
+    /// by the section filter (user standing order: the user always sees
+    /// what the MCP surface is doing).
+    #[test]
+    fn v107_mcp_settings_automation_section_paints() {
+        let mut app = headless_app("v94setpaint");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.sett_filter = "automation".into();
+        frame(&mut app, &ctx, vec![]);
+        let sec = galley_at(&mut app, &ctx, "AUTOMATION (MCP)");
+        let boxx = galley_at(&mut app, &ctx, "MCP server (control this instance)");
+        let latch = galley_at(&mut app, &ctx, "read-only (the agent may not write)");
+        let status = galley_at(&mut app, &ctx, "status: off — no sockets are open");
+        let endpoint =
+            galley_at(&mut app, &ctx, &format!("endpoint: {}", crate::mcp::bridge::endpoint_path().display()));
+        let bridge_hint = galley_at(&mut app, &ctx, "slooper --mcp-bridge");
+        assert!(sec.is_some(), "AUTOMATION (MCP) section paints under the filter");
+        assert!(boxx.is_some(), "enable checkbox paints");
+        assert!(latch.is_some(), "read-only latch checkbox paints");
+        assert!(status.is_some(), "status line shows the OFF default (zero sockets)");
+        assert!(endpoint.is_some(), "endpoint-file path is shown");
+        assert!(bridge_hint.is_some(), "the stdio bridge usage line is shown");
+    }
+
+    /// v107/MCP-01 AC (hot toggle + persistence + echo): clicking the real
+    /// Settings checkbox starts the listener with NO restart, echoes the
+    /// status, persists the config, and clicking it off hot-stops the
+    /// server and deletes the endpoint file. Port 0 = ephemeral (D6).
+    #[test]
+    fn v107_mcp_settings_toggle_persists() {
+        let mut app = headless_app("v94tog");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        app.sett_filter = "automation".into();
+        app.mcp_port = 0; // pins never fight over fixed ports
+        frame(&mut app, &ctx, vec![]);
+        // Enable through the real checkbox (label_center = the widget).
+        let p = label_center(&mut app, &ctx, "MCP server (control this instance)")
+            .expect("enable checkbox paints");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.mcp_enabled, "checkbox flips the flag");
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"mcp_enabled\": true"), "enable persists: {cfg_txt}");
+        // The frame loop hot-starts it (mcp_frame is the real logic() path).
+        app.mcp_frame(&ctx);
+        let running = app.mcp.as_ref().unwrap().is_running();
+        assert!(running, "enable starts the listener with no restart");
+        let port = app.mcp.as_ref().unwrap().port().unwrap();
+        assert!(port > 0, "port 0 resolved to an ephemeral port");
+        assert!(app.status.contains("MCP server on"), "start echoes: {}", app.status);
+        frame(&mut app, &ctx, vec![]);
+        let shown = galley_at(&mut app, &ctx, &format!("status: listening on 127.0.0.1:{port}"));
+        assert!(shown.is_some(), "status line paints the live port");
+        // The read-only latch: click persists + echoes.
+        let p = label_center(&mut app, &ctx, "read-only (the agent may not write)")
+            .expect("latch checkbox paints");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.mcp_read_only, "latch flips");
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"mcp_read_only\": true"), "latch persists: {cfg_txt}");
+        // Disable: hot stop, endpoint file gone, config false.
+        let p = label_center(&mut app, &ctx, "MCP server (control this instance)")
+            .expect("enable checkbox again");
+        click_pt(&mut app, &ctx, p);
+        app.mcp_frame(&ctx);
+        let stopped = !app.mcp.as_ref().unwrap().is_running();
+        assert!(stopped, "disable hot-stops the listener");
+        assert!(!crate::mcp::bridge::endpoint_path().exists(), "stop removes the endpoint file");
+        assert!(app.status.contains("stopped"), "stop echoes: {}", app.status);
+        let cfg_txt = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(cfg_txt.contains("\"mcp_enabled\": false"), "disable persists");
     }
 
     /// The regression test for "Ctrl+C copies, Ctrl+V pastes nothing":
@@ -58165,12 +58415,13 @@ mod tests {
         assert_eq!(active(".rec_group_join(&"), 2);
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
-        // Internal version rides this series (v91 single-home law).
+        // Internal version rides the series (v91 single-home law; v107 MCP-01
+        // bumped it — retargeted here so the law holds, not the old number).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v106\""),
-            "INTERNAL_VERSION must be bumped to v106"
+            librs.contains("INTERNAL_VERSION: &str = \"v107\""),
+            "INTERNAL_VERSION must be bumped to v107"
         );
     }
 
