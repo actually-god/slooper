@@ -7310,6 +7310,27 @@ mod tests {
         assert!(e.audition_snapshot().is_empty(), "stop purges the pool");
     }
 
+    /// v96 (sc-2): the pool must hold voices on DIFFERENT tracks
+    /// SIMULTANEOUSLY — the multi-track preview stages one voice per
+    /// routed track, so coexistence is the load-bearing property.
+    #[test]
+    fn v96_pool_holds_multi_track_voices() {
+        let e = Engine::new();
+        let a: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 36u8, 100u8)].into();
+        let b: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 69u8, 100u8)].into();
+        e.play_audition(0, a, None);
+        e.play_audition(1, b, None);
+        let mut tr: Vec<usize> = e.audition_snapshot().iter().map(|r| r.track).collect();
+        tr.sort_unstable();
+        assert_eq!(tr, vec![0, 1], "voices coexist per routed track");
+        assert!(e.audition_active());
+        e.stop_audition();
+        assert!(
+            e.audition_snapshot().is_empty(),
+            "ONE stop purges every routed voice"
+        );
+    }
+
     /// Helper for the v46 poly pins: a 2-lane / 2-note arrangement.
     fn v46_poly_arrangement(second_lane_only: Option<bool>) -> crate::arrange::Arrangement {
         use crate::arrange::{Clip, Lane};
