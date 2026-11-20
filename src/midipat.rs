@@ -1592,6 +1592,24 @@ mod tests {
             v1: 0.0,
             curve: 0.0,
         });
+        // A second note carries a WARPED owned seg (curve +100): the
+        // legacy warp must land as an extra midpoint (2->3 pts).
+        p.notes.push(Note {
+            ch: 0,
+            note: 65,
+            vel: 100,
+            press: 0,
+            start: 480,
+            len: 240,
+            bend: None,
+        });
+        p.bend_segs.push(BendSeg {
+            t0: 500,
+            v0: 0.0,
+            t1: 700,
+            v1: 10.0,
+            curve: 100.0,
+        });
         p.bake_bends();
         let lane_before = p.bends.clone();
         p.migrate_bend_segs();
@@ -1605,6 +1623,14 @@ mod tests {
         assert!((c.pts[0].1 - 0.0).abs() < 0.5);
         assert!((c.pts[1].0 - 220.0 / 240.0).abs() < 1e-4);
         assert!((c.pts[1].1 - 500.0).abs() < 0.5, "cents = st x100");
+        // Warped owned seg -> 3 pts carrying the warp's extra midpoint.
+        assert!(p.notes[1].bend.is_some(), "warped seg migrated too");
+        let cw = &p.note_bends[p.notes[1].bend.unwrap() as usize];
+        assert_eq!(cw.pts.len(), 3, "curve-100 warp adds a midpoint");
+        assert!((cw.pts[1].0 - 0.5).abs() < 1e-4, "midpoint at mid tick");
+        assert!((cw.pts[1].1 - 750.0).abs() < 1.0, "warped value at midpoint (s=.5 -> sp=.75)");
+        // The WARP really bulges: linear would sit at 500 cents there.
+        assert!((cw.cents_at(0.5) - 500.0).abs() > 50.0, "warp shape survives, not flattened");
         // Idempotent: second run is a no-op (no owner-less segs match).
         let (segs2, curves2) = (p.bend_segs.clone(), p.note_bends.clone());
         p.migrate_bend_segs();
