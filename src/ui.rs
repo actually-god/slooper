@@ -27313,8 +27313,8 @@ fn rdp_simplify(pts: &[(f32, f32)], eps: f32) -> Vec<(f32, f32)> {
         let span = (tb - ta).max(1e-6);
         let mut worst = -1.0f32;
         let mut wi = a;
-        for k in a + 1..b {
-            let (tk, ck) = pts[k];
+        for (k, &(tk, ck)) in pts[a + 1..b].iter().enumerate() {
+            let k = a + 1 + k;
             let lin = ca + (cb - ca) * ((tk - ta) / span);
             let d = (ck - lin).abs();
             if d > worst {
@@ -27335,17 +27335,6 @@ fn rdp_simplify(pts: &[(f32, f32)], eps: f32) -> Vec<(f32, f32)> {
         }
     }
     out
-}
-
-/// v102 (pb-3): trail-geometry helpers live inline in `roll_inner` so they
-/// capture the live scale; this pins the shared auto-scale rule for pins.
-fn nb_display_scale(pts: &[(f32, f32)]) -> f32 {
-    let mx = pts.iter().fold(0f32, |a, p| a.max(p.1.abs()));
-    if mx <= 1200.0 {
-        1200.0
-    } else {
-        (mx.ceil() / 600.0 * 600.0).min(2400.0)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -48845,7 +48834,7 @@ mod tests {
         // and is PAINTED as a trail on the note body (green unselected).
         let mut app = headless_app("v102migpaint");
         let ctx = egui::Context::default();
-        let c = v52_roll_rig(&mut app, &ctx);
+        v52_roll_rig(&mut app, &ctx);
         {
             let r = app.piano_roll.as_mut().unwrap();
             r.pat.notes.push(crate::midipat::Note {
