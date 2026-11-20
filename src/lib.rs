@@ -12,6 +12,8 @@
 //! - [`config`]: persistent settings (rack folders, projects dir, mixer,
 //!   shortcuts, MIDI bindings).
 //! - [`fx`]: runtime-compiled per-track effects (the effect framework).
+//! - [`mcp`]: built-in MCP server (loopback Streamable-HTTP + UI command
+//!   bridge + stdio shim; docs/MCP-DESIGN.md).
 //! - [`ports`]: enabled-device port filtering for the input/output pickers.
 //! - [`ui`]: the egui front-end (used by the binary).
 
@@ -28,6 +30,7 @@ pub mod ffiguard;
 pub mod fx;
 pub mod fxgui;
 pub(crate) mod kit;
+pub mod mcp;
 pub mod meter;
 pub mod midi;
 pub mod midiin;
@@ -53,7 +56,7 @@ pub use midi::{MidiAction, MidiBind, MidiMsg};
 /// This constant is the ONLY place the internal series number lives:
 /// bump one line here per pass; the settings-panel footer reads it.
 /// Never rendered in the header (pins v91_* hold that seam).
-pub const INTERNAL_VERSION: &str = "v106";
+pub const INTERNAL_VERSION: &str = "v107";
 
 /// Arm the vendor-teardown hush (v73/S8, shared body): SIGTRAP becomes
 /// `_exit(0)`. Built for the production Unix path (below) and, as before,
