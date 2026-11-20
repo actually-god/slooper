@@ -633,7 +633,9 @@ track instruments on their own MIDI channel/voice — what MPE controllers
 (LinnStrument, SEABOARD, KeyStep 37 in MPE mode, …) send per note group.
 MIDI takes record both lanes (14-bit bends, per-note pressure), pattern
 playback replays them, and every **hosted plugin** reacts per channel.
-Built-in scripted synths don't respond to bend/poly-AT (ABI v1). Recorded
+Built-in scripted synths respond to **pitch bend** since v100 (a full
+deflection is ±12 semitones; held notes shift while the line plays);
+per-note poly-AT still has no scripted callback (ABI v1/v2). Recorded
 bends are also centered on stop/seek (panic clears all 16 channels). Off
 by default — classic single-channel setups are byte-for-byte unchanged.
 

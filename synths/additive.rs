@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 6
+// slooper-synth-version: 7
 // additive.rs — harmonic partial bank with two morphable spectra.
 //
 // The additive/harmonic synth family lives in one skeleton — a bank
@@ -114,6 +114,7 @@ impl Voice {
 struct Add {
     sr: f64,
     tab: Tab,
+    bend_st: f64, // v100: pitch bend (roll GLIDE lane), semitones
     voices: [Voice; VOICES],
     next: usize,
     pedal: bool,
@@ -140,6 +141,7 @@ extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_vo
         tab: Tab::new(),
         voices: [Voice::DEAD; VOICES],
         next: 0,
+        bend_st: 0.0,
         pedal: false,
         prof: [0.0; PARTIALS],
         prof_key: [i32::MIN; 8],
@@ -259,6 +261,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
         pedal,
         prof,
         prof_key,
+        bend_st,
         ..
     } = p;
     let sr = *sr;
@@ -338,12 +341,13 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
     let k_rel = 1.0 - (-5.0 / (rel * sr)).exp();
     let vib_inc = vr / sr;
 
+    let bend_ratio = (*bend_st * (1.0 / 12.0)).exp2(); // v100: glide lane
     for k in 0..n {
         for v in voices.iter_mut() {
             if !v.alive {
                 continue;
             }
-            let f = v.freq;
+            let f = v.freq * bend_ratio;
             if f < 6.0 || f > sr * 0.4 {
                 v.alive = false;
                 continue;
@@ -466,4 +470,23 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
     &DESC
+}
+
+// --- v100 (card t_52aa65b1): channel pitch bend = the piano-roll GLIDE lane.
+// The host decodes 14-bit MIDI bend to SEMITONES (full deflection = ±12) and
+// calls this before the next process() block; every sounding voice's pitch is
+// multiplied by 2^(st/12) there, so baked glide bends HELD notes live.
+#[no_mangle]
+pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
+    if s.is_null() {
+        return;
+    }
+    unsafe { &mut *(s as *mut Add) }.bend_st = st as f64;
+}
+
+static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
+    &DESC_V2
 }

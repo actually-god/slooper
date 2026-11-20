@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 6
+// slooper-synth-version: 7
 // piano.rs — the default slooper synthesizer: a REAL piano.
 //
 // A compact sample-player for the 'Piano 1' (GM acoustic grand)
@@ -76,6 +76,7 @@ struct Piano {
     zones: Vec<Zone>,
     samples: Vec<Sample>,
     pcm: Vec<f32>,
+    bend_st: f64, // v100: pitch bend (roll GLIDE lane), semitones
     voices: [Voice; VOICES],
     sustain: bool,
     pressed: [bool; 128],
@@ -177,6 +178,7 @@ extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_vo
         samples,
         pcm,
         voices: [Voice::silent(); VOICES],
+        bend_st: 0.0,
         sustain: false,
         pressed: [false; 128],
         hold_rel: [false; 128],
@@ -345,6 +347,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
     let mk = level * 3.0; // make-up so vel-110 notes peak near 0.4
     let rel_step = 1.0 / (0.12 * p.sr); // ~120 ms damper
 
+    let bend_ratio = (p.bend_st * (1.0 / 12.0)).exp2(); // v100: glide lane
     let zones = &p.zones;
     let samples = &p.samples;
     let pcm = &p.pcm;
@@ -393,7 +396,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 v.gain = env;
             }
             acc += raw * env;
-            v.pos += v.rate;
+            v.pos += v.rate * bend_ratio;
             if z.looping && lend > lstart && v.pos >= lend as f64 {
                 v.pos -= (lend - lstart) as f64;
             }
@@ -446,4 +449,23 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
     &DESC
+}
+
+// --- v100 (card t_52aa65b1): channel pitch bend = the piano-roll GLIDE lane.
+// The host decodes 14-bit MIDI bend to SEMITONES (full deflection = ±12) and
+// calls this before the next process() block; every sounding voice's pitch is
+// multiplied by 2^(st/12) there, so baked glide bends HELD notes live.
+#[no_mangle]
+pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
+    if s.is_null() {
+        return;
+    }
+    unsafe { &mut *(s as *mut Piano) }.bend_st = st as f64;
+}
+
+static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
+    &DESC_V2
 }
