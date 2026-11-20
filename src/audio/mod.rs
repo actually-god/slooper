@@ -992,6 +992,12 @@ pub struct Engine {
     /// target `t`'s SC row. Default 1.0 — every pre-v97 project is
     /// bit-identical (docs/SIDECHAIN.md).
     sc_recv: [AtomicU32; MAX_LOOPS * MAX_LOOPS],
+    /// v99 (sc-5): per-SENDER general sidechain send level. Gain (f32 bits,
+    /// default 1.0) and pan position (f32 bits in [0,1], default 0.5 =
+    /// centre) applied to sender `t`'s tap BEFORE it routes to any target
+    /// (signal order tap -> send -> receive -> sum, docs/SIDECHAIN.md).
+    sc_out_gain: [AtomicU32; MAX_LOOPS],
+    sc_out_pan: [AtomicU32; MAX_LOOPS],
     /// Per-track stereo pan position as f32 in [0, 1] (0 = hard left,
     /// 0.5 = centre). Equal-power split between the L and R mix buses.
     pan: [AtomicU32; MAX_LOOPS],
@@ -1198,6 +1204,8 @@ impl Engine {
             sc_send_lo: core::array::from_fn(|_| AtomicU64::new(0)),
             sc_send_hi: core::array::from_fn(|_| AtomicU64::new(0)),
             sc_recv: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            sc_out_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            sc_out_pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             selected: AtomicU8::new(0),
             monitor_on: AtomicBool::new(true),
@@ -1660,6 +1668,57 @@ impl Engine {
     /// from the next audio block, like every SC setter).
     pub fn set_sc_recv_gain(&self, t: usize, s: usize, g: f32) {
         self.sc_recv[t * MAX_LOOPS + s].store(g.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// v99 (sc-5): the sender's GENERAL sidechain send gain — scales source
+    /// `s`'s tap toward EVERY target routing it, before any per-receive
+    /// level. Default 1.0; independent of the sender's volume/mute (the v95
+    /// tap law). Applies from the next block, like every SC setter.
+    pub fn sc_send_gain(&self, s: usize) -> f32 {
+        f32::from_bits(self.sc_out_gain[s].load(Ordering::Relaxed))
+    }
+
+    /// v99 (sc-5): set a sender's send gain (clamped to >= 0).
+    pub fn set_sc_send_gain(&self, s: usize, g: f32) {
+        self.sc_out_gain[s].store(g.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// v99 (sc-5): the sender's send pan position, [0,1] with 0.5 = centre
+    /// (the track-pan convention). The SC bus feeds a MONO-SUMMED detector
+    /// (script ABI v2 carries one f32 per sample), so the pan applies to the
+    /// key BEFORE the mono downmix: fold = (spl + spr)/sqrt(2) — centre is
+    /// unity, hard L/R x0.707, exactly the v95 track-pan law. The choice is
+    /// documented in docs/SIDECHAIN.md; balance semantics activate when a
+    /// stereo key consumer (plugin sidechain bus) is wired.
+    pub fn sc_send_pan(&self, s: usize) -> f32 {
+        f32::from_bits(self.sc_out_pan[s].load(Ordering::Relaxed))
+    }
+
+    /// v99 (sc-5): set a sender's send pan (clamped to [0,1]).
+    pub fn set_sc_send_pan(&self, s: usize, p: f32) {
+        self.sc_out_pan[s].store(p.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// v99 (sc-5): the sender's full send scale — send gain x send-pan mono
+    /// fold — shared by the live `sc_fold` and the export mirror so live
+    /// and export stay bit-identical. A bit-compare fast path returns
+    /// exactly 1.0 for untouched senders (defaults cost no trig, and
+    /// pre-v99 taps are bit-for-bit preserved).
+    fn sc_out_scale(&self, s: usize) -> f32 {
+        let gb = self.sc_out_gain[s].load(Ordering::Relaxed);
+        let g = if gb == 1.0f32.to_bits() {
+            1.0
+        } else {
+            f32::from_bits(gb)
+        };
+        let pb = self.sc_out_pan[s].load(Ordering::Relaxed);
+        let fold = if pb == 0.5f32.to_bits() {
+            1.0
+        } else {
+            let (spl, spr) = pan_gains(f32::from_bits(pb));
+            (spl + spr) * F1S2
+        };
+        g * fold
     }
 
     /// v95 (sc-3): union of every target's send mask = the set of tracks
@@ -2231,7 +2290,11 @@ impl Engine {
             for (src, slot) in tap_hold.iter_mut().enumerate() {
                 if (src_mask >> src) & 1 != 0 {
                     let (pgl, pgr) = pan_gains(self.loop_pan(src));
-                    let scale = self.loop_gain(src) * (pgl + pgr) * F1S2;
+                    // v99 (sc-5): the sender's general send gain/pan scales
+                    // its tap toward EVERY target — the exact mirror of the
+                    // live sc_fold (defaults = bit-exact pre-v99 scale).
+                    let scale =
+                        self.loop_gain(src) * (pgl + pgr) * F1S2 * self.sc_out_scale(src);
                     *slot = track_dry_s(src, scale);
                 }
             }
@@ -5776,9 +5839,13 @@ impl Proc {
         // writes it before the sample loop); pgl/pgr carry automation pan.
         let mut sc_fold = [0.0f32; MAX_LOOPS];
         if sc_any {
+            // v99 (sc-5): the sender's general send gain/pan rides the tap
+            // fold — BEFORE the per-edge receive level (multiplied at
+            // e_scale below), matching the tap -> send -> receive -> sum
+            // signal order (docs/SIDECHAIN.md).
             for t in 0..MAX_LOOPS {
                 let g = f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
-                sc_fold[t] = g * (pgl[t] + pgr[t]) * F1S2;
+                sc_fold[t] = g * (pgl[t] + pgr[t]) * F1S2 * self.engine.sc_out_scale(t);
             }
         }
         // v97 (sc-4): fold each edge's receive level into a per-edge tap
@@ -7977,6 +8044,110 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         e.set_sc_recv_gain(1, 2, 1.0);
         let o = e.render_project().expect("render");
         v48_tap(&o, 500, 1.0 - 0.9 * 0.75);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v99 (sc-5): the per-SENDER send-level tables default to unity gain
+    /// and centre pan (an untouched project's key is bit-identical to
+    /// pre-v99) and every setter clamps and stays per-sender.
+    #[test]
+    fn v99_engine_sc_out_defaults_and_clamps() {
+        let e = Engine::new();
+        assert_eq!(e.sc_send_gain(0), 1.0, "unity default = pre-v99 tap");
+        assert_eq!(e.sc_send_pan(9), 0.5, "centre default");
+        e.set_sc_send_gain(2, 0.5);
+        assert!((e.sc_send_gain(2) - 0.5).abs() < 1e-6);
+        assert_eq!(e.sc_send_gain(3), 1.0, "neighbour senders independent");
+        e.set_sc_send_gain(4, -2.0);
+        assert_eq!(e.sc_send_gain(4), 0.0, "negative clamps to silence");
+        e.set_sc_send_pan(2, 3.0);
+        assert_eq!(e.sc_send_pan(2), 1.0, "pan clamps to hard right");
+        e.set_sc_send_pan(2, -3.0);
+        assert_eq!(e.sc_send_pan(2), 0.0, "pan clamps to hard left");
+        assert_eq!(e.sc_send_pan(5), 0.5, "pan neighbours untouched");
+        // Send LEVELS never touch the routing MASK table (the shared config
+        // entry shape keeps them in separate engine state).
+        e.set_sc_send_gain(7, 0.25);
+        assert_eq!(e.sc_send(7), 0, "send level does not touch the send mask");
+    }
+
+    /// v99 rig: ONE sender (0.25 DC, MUTED — v95: mute keeps the key) into
+    /// TWO targets (tracks 1 and 2, each running the v48sc duck script over
+    /// a 1.0 click: out = 1 - 0.9 x |sc|). Target A's click lands at
+    /// sample 400, B's at 600, so the render output reads both ducks —
+    /// one sender knob must move them TOGETHER, per-receive levels apart.
+    fn v99_sc_rig(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
+        let (reg, dir) = v48_reg(tag, "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![0.25f32; 1500]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0)); // sender (muted below)
+        arr.insert(1, 0, Clip::new(1, 400)); // target A: click at 400
+        arr.insert(2, 0, Clip::new(2, 600)); // target B: click at 600
+        e.set_project(
+            Arc::new(vec![src, v48_click(1000), v48_click(1000)]),
+            Arc::new(arr),
+            1500,
+        );
+        for t in [1usize, 2] {
+            let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+            let desc = reg.desc("v48sc").unwrap().clone();
+            e.set_track_fx(
+                t,
+                TrackFx {
+                    slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+                },
+            );
+        }
+        e.set_sc_send(1, 1 << 0);
+        e.set_sc_send(2, 1 << 0);
+        e.set_track_on(0, false); // muted: audio gone, key intact (v95 law)
+        (e, dir)
+    }
+
+    /// v99 (sc-5): the sender's general send level scales EVERY target's
+    /// duck by the same exact factor (export mirror; the live path shares
+    /// `sc_out_scale`, e2e proves the RT side). Hard send pan = the
+    /// documented mono-sum fold x 1/sqrt(2) — a LEVEL choice, documented
+    /// in docs/SIDECHAIN.md (the detector sums the key to one f32).
+    #[test]
+    fn v99_sc_export_send_level_scales_both_targets_exactly() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (e, dir) = v99_sc_rig("v99send");
+        // Default: unity send, centred — the v95 duck on BOTH targets.
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 400, 1.0 - 0.9 * 0.25);
+        v48_tap(&o, 600, 1.0 - 0.9 * 0.25);
+        // Half send: both ducks move identically shallower — one knob,
+        // all receivers (the card's contract).
+        e.set_sc_send_gain(0, 0.5);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 400, 1.0 - 0.9 * 0.125);
+        v48_tap(&o, 600, 1.0 - 0.9 * 0.125);
+        // Send pan hard right: the mono-summed detector sees the key at
+        // 1/sqrt(2) (the fold), send gain still applies on top.
+        e.set_sc_send_pan(0, 1.0);
+        let o = e.render_project().expect("render");
+        let f1s2 = std::f32::consts::FRAC_1_SQRT_2;
+        v48_tap(&o, 400, 1.0 - 0.9 * (0.125 * f1s2));
+        v48_tap(&o, 600, 1.0 - 0.9 * (0.125 * f1s2));
+        // Send gain zero: routed but silent key — both clicks unducked.
+        e.set_sc_send_gain(0, 0.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 400, 1.0);
+        v48_tap(&o, 600, 1.0);
+        // Per-receive levels keep mixing UNDER the send (order check:
+        // send unity/centre again, A half-open, B closed — they diverge).
+        e.set_sc_send_gain(0, 1.0);
+        e.set_sc_send_pan(0, 0.5);
+        e.set_sc_recv_gain(1, 0, 0.5);
+        e.set_sc_recv_gain(2, 0, 0.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 400, 1.0 - 0.9 * 0.125);
+        v48_tap(&o, 600, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
