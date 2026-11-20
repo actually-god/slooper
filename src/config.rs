@@ -1156,11 +1156,13 @@ mod tests {
                     t: 1,
                     s: 0,
                     gain: 0.5,
+                    pan: 0.0,
                 },
                 ScRecvGain {
                     t: 3,
                     s: 2,
                     gain: 1.75,
+                    pan: 0.0,
                 },
             ],
             ..Config::default()
@@ -1168,6 +1170,36 @@ mod tests {
         let j = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&j).unwrap();
         assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "round-trip exact");
+    }
+
+    /// v99 (sc-5): the per-SENDER send level rides the SAME sparse Vec as
+    /// SELF-PAIR entries (`t == s`, provably inert as routes). Additivity
+    /// in BOTH directions: v97-era files (entries WITHOUT the `pan` key)
+    /// load pan = 0.0 = centre = their pre-v99 behavior, and self pairs
+    /// round-trip gain + pan exactly.
+    #[test]
+    fn v99_config_send_entry_roundtrip() {
+        // v97-era JSON: no `pan` key on either entry -> centre default,
+        // gains untouched (the exact byte-string a v97 build wrote).
+        let legacy: Config = serde_json::from_str(
+            r#"{"sc_recv_gain":[{"t":1,"s":0,"gain":0.5},{"t":2,"s":2,"gain":1.25,"pan":-0.4}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.sc_recv_gain[0].pan, 0.0, "v97-era entry loads centred");
+        assert_eq!(legacy.sc_recv_gain[0].gain, 0.5, "v97-era gain unchanged");
+        // The self-pair (t==s==2) reads back its pan exactly.
+        assert_eq!(legacy.sc_recv_gain[1].t, 2);
+        assert!((legacy.sc_recv_gain[1].pan + 0.4).abs() < 1e-6, "self-pair pan round");
+        // Full struct round trip (save path writes pan on every entry).
+        let c = Config {
+            sc_recv_gain: vec![
+                ScRecvGain { t: 0, s: 0, gain: 1.5, pan: -0.75 },
+                ScRecvGain { t: 1, s: 0, gain: 0.25, pan: 0.0 },
+            ],
+            ..Config::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "self-pair round-trip exact");
     }
 
     #[test]
