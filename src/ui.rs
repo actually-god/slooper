@@ -11666,17 +11666,15 @@ impl App {
                             roll.pat.notes.get(ix).and_then(|n| n.bend).is_some()
                         })
                         .count();
-                    if ui
-                        .small_button("clear curve")
-                        .enabled(n_curves > 0)
+                    let cc = ui
+                        .small_button(RichText::new("clear curve").weak())
                         .on_hover_text(if n_curves > 0 {
                             "Remove the pitch curves from the selected notes (the notes stay)"
                         } else {
                             "Select a note that HAS a pitch curve \u{b7} Z+drag draws one"
-                        })
-                        .clicked()
-                    {
-                        for &ix in roll.sel_notes.clone() {
+                        });
+                    if n_curves > 0 && cc.clicked() {
+                        for ix in roll.sel_notes.clone() {
                             if let Some(n) = roll.pat.notes.get_mut(ix) {
                                 n.bend = None;
                             }
@@ -11809,7 +11807,7 @@ impl App {
             } else {
                 ui.label(
                     RichText::new(
-                        "glide \u{b7} legacy orphan \u{b7} drag its dots \u00b7 new curves: Z+drag a note",
+                        "glide \u{b7} legacy orphan \u{b7} drag its dots \u{b7} new curves: Z+drag a note",
                     )
                         .weak()
                         .small(),
@@ -12072,7 +12070,7 @@ impl App {
                 let mut tx = x0.max(grid_x0);
                 while tx <= x1 {
                     let t = ((sec_at(tx) - s0) / dur).clamp(0.0, 1.0);
-                    let q = egui::pos2(tx, y_of_c(n, disp, nb.cents_at(t)));
+                    let q = egui::pos2(tx, y_of_c(n, disp, nb.cents_at(t as f32)));
                     if let Some(p) = prev {
                         painter.line_segment([p, q], egui::Stroke::new(1.6f32, tcol));
                     }
@@ -12082,7 +12080,10 @@ impl App {
                 if is_sel {
                     for (k, (pt_t, pt_c)) in nb.pts.iter().enumerate() {
                         let endp = k == 0 || k + 1 == nb.pts.len();
-                        let q = egui::pos2(x_of(s0 + pt_t * dur), y_of_c(n, disp, *pt_c));
+                        let q = egui::pos2(
+                            x_of(s0 + *pt_t as f64 * dur),
+                            y_of_c(n, disp, *pt_c),
+                        );
                         painter.circle_filled(q, if endp { 4.0 } else { 3.0 }, tcol);
                     }
                 }
@@ -12094,7 +12095,10 @@ impl App {
                 let disp = nb_disp(&roll.nb_live);
                 let mut prev: Option<egui::Pos2> = None;
                 for (pt_t, pt_c) in roll.nb_live.iter() {
-                    let q = egui::pos2(x_of(s0 + pt_t * dur), y_of_c(n, disp, *pt_c));
+                    let q = egui::pos2(
+                        x_of(s0 + *pt_t as f64 * dur),
+                        y_of_c(n, disp, *pt_c),
+                    );
                     if let Some(p) = prev {
                         painter.line_segment(
                             [p, q],
@@ -12338,7 +12342,7 @@ impl App {
                 let disp = nb_disp(&nb.pts);
                 for (pi, (pt_t, pt_c)) in nb.pts.iter().enumerate() {
                     let q = egui::pos2(
-                        x_of(s0 + pt_t * dur),
+                        x_of(s0 + *pt_t as f64 * dur),
                         y_of_c(n.note as i32, disp, *pt_c),
                     );
                     if (pt - q).length() <= 8.0 {
@@ -12392,7 +12396,7 @@ impl App {
                             note_name(n.note),
                             n.vel,
                             if curve {
-                                " \u{b7} curve: drag dots \u00b7 Shift+RMB removes it"
+                                " \u{b7} curve: drag dots \u{b7} Shift+RMB removes it"
                             } else {
                                 " \u{b7} Z+drag: draw pitch curve"
                             }
@@ -12849,7 +12853,8 @@ impl App {
                                 let s0 = t_of(n.start);
                                 let dur = t_of(n.len.max(1)).max(1e-6);
                                 let row = n.note as i32;
-                                let t = ((sec_at(pt.x) - s0) / dur).clamp(0.0, 1.0);
+                                let t =
+                                    ((sec_at(pt.x) - s0) / dur).clamp(0.0, 1.0) as f32;
                                 let c = c_at_y(row, 1200.0, pt.y);
                                 let live = &mut roll.nb_live;
                                 let extend = live.last().is_some_and(|lp| t - lp.0 >= 1e-4);
@@ -12895,7 +12900,8 @@ impl App {
                                     } else {
                                         let tmin = nb.pts[pi - 1].0 + 1e-3;
                                         let tmax = nb.pts[pi + 1].0 - 1e-3;
-                                        nb.pts[pi].0 = t.clamp(tmin.min(1.0), tmax.max(0.0));
+                                        nb.pts[pi].0 =
+                                            (t as f32).clamp(tmin.min(1.0), tmax.max(0.0));
                                         nb.pts[pi].1 = c;
                                     }
                                     edited = true;
@@ -27279,7 +27285,6 @@ fn lane_row(
 }
 
 /// v55 (S2): what a plain right-click on the piano-roll canvas targets.
-#[derive(Clone, Copy)]
 /// v102 (pb-3, spec docs/SAMPLER-PITCH.md § 4): Ramer–Douglas–Peucker
 /// simplification of a drawn curve stroke. Distance is VERTICAL (cents) —
 /// strokes are strictly time-increasing, so vertical deviation is the
@@ -27337,6 +27342,7 @@ fn nb_display_scale(pts: &[(f32, f32)]) -> f32 {
     }
 }
 
+#[derive(Clone, Copy)]
 enum RollRmbHit {
     Note(usize),
     Glide(usize),
