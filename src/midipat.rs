@@ -445,6 +445,10 @@ impl Pattern {
     pub fn bake_bends(&mut self) {
         if !self.has_note_bends() {
             if self.bend_segs.is_empty() {
+                // v102 (pb-3): no source left = the audible lane must go
+                // silent too — a bare `return` kept the LAST baked curve
+                // sounding after its owner note/curve was deleted.
+                self.bends.clear();
                 return;
             }
             let mut out = Vec::new();

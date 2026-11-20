@@ -11012,9 +11012,9 @@ impl App {
                 // v101 (pb-2): a deleted note's pitch curve must leave the
                 // audible lane too — re-bake it (curves merge with orphan
                 // segs) and compact the unowned table entries away.
-                if roll.pat.has_note_bends() {
-                    roll.pat.bake_bends();
-                }
+                // v102: unconditional bake — the last curve's owner dying
+                // must silence the lane (bake clears the empty case).
+                roll.pat.bake_bends();
                 roll.pat.compact_note_bends();
                 // v38 R6: the delete key answers (was silent — "did my
                 // keypress even do anything?").
@@ -11784,6 +11784,9 @@ impl App {
                 }
                 if rdel {
                     roll.pat.bend_segs.remove(si);
+                    // v102: re-bake so a deleted orphan can't leave ghost
+                    // pitch-bend events (bake clears the empty case).
+                    roll.pat.bake_bends();
                     roll.sel_bend = None;
                     roll.changed = true;
                     self.status = "glide deleted".into();
@@ -12476,9 +12479,9 @@ impl App {
                             }
                             // v101 (pb-2): deleted note → its curve must
                             // leave the audible lane too (see delete-key).
-                            if roll.pat.has_note_bends() {
-                                roll.pat.bake_bends();
-                            }
+                            // v102: unconditional bake — clearing the last
+                            // curve must silence the lane (bake handles empty).
+                            roll.pat.bake_bends();
                             roll.pat.compact_note_bends();
                             roll.changed = true;
                             // v38 R6: the delete announces itself.
@@ -12934,8 +12937,11 @@ impl App {
                                         c / c0
                                     } else {
                                         1.0 + (c - c0) / 1200.0
-                                    }
-                                    .clamp(0.05, 20.0);
+                                    };
+                                    // Magnitude clamped, SIGN preserved —
+                                    // dragging across the center line flips
+                                    // the curve (up-bend becomes down-bend).
+                                    let f = f.signum() * f.abs().clamp(0.05, 20.0);
                                     if let Some(nb) = roll.pat.note_bends.get_mut(ci as usize) {
                                         nb.pts = roll
                                             .nb_base
@@ -27589,9 +27595,7 @@ fn roll_rmb_menu(
                 }
                 // v101 (pb-2): deleted notes → curves leave the audible
                 // lane too (see delete-key site).
-                if roll.pat.has_note_bends() {
-                    roll.pat.bake_bends();
-                }
+                roll.pat.bake_bends();
                 roll.pat.compact_note_bends();
                 roll.sel_notes.clear();
                 roll.changed = true;
@@ -48354,13 +48358,17 @@ mod tests {
     }
 
     #[test]
-    fn v52_roll_glide_lane_drag_creates_baked_glide() {
-        let mut app = headless_app("v52glidelane");
+    fn v102_retired_lane_drag_creates_nothing() {
+        // v102 CONTRACT CHANGE (retargets v52_roll_glide_lane_drag...):
+        // the old bottom glide STRIP no longer creates segments by drag —
+        // drawing moved ONTO the notes. A drag there on a clean pattern
+        // must leave zero bend_segs (it rubber-bands like empty grid).
+        let mut app = headless_app("v102laneretire");
         let ctx = egui::Context::default();
         let c = v52_roll_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let bot = c.max.y - 10.0;
-        let lane_mid = bot - 23.0; // bend lane = bottom 46 px
+        let lane_mid = bot - 23.0;
         let a = egui::pos2(grid_x0 + 80.0, lane_mid);
         let b = egui::pos2(grid_x0 + 320.0, lane_mid - 10.0);
         frame(&mut app, &ctx, vec![moved(a), btn(a, egui::PointerButton::Primary, true)]);
@@ -48368,27 +48376,18 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(b), btn(b, egui::PointerButton::Primary, false)]);
         frame(&mut app, &ctx, vec![]);
         let r = app.piano_roll.as_ref().unwrap();
-        assert_eq!(r.pat.bend_segs.len(), 1, "one glide drawn");
-        assert!(r.pat.bend_segs[0].t1 > r.pat.bend_segs[0].t0, "has length");
-        assert!(
-            r.pat.bend_segs[0].v1 > r.pat.bend_segs[0].v0,
-            "dragged UP = rising pitch ({} -> {})",
-            r.pat.bend_segs[0].v0,
-            r.pat.bend_segs[0].v1
-        );
-        assert!(!r.pat.bends.is_empty(), "baked to pitch-bend events");
-        assert!(app.status.contains("glide"), "status echoes: {}", app.status);
+        assert!(r.pat.bend_segs.is_empty(), "lane drag must NOT create glides now");
+        assert!(r.pat.bends.is_empty(), "no baked pitch-bend either");
+        assert!(r.pat.note_bends.is_empty(), "and no curve was drawn from there");
     }
 
-    #[test]
-    fn v52_roll_z_drag_from_note_lands_on_target_pitch() {
-        let mut app = headless_app("v52zglide");
-        let ctx = egui::Context::default();
-        let c = v52_roll_rig(&mut app, &ctx);
-        let grid_x0 = c.min.x + 58.0;
-        // y_of inverse with the rig's vscroll = 500:
-        // row R spans y in [B + V - (R+2)r, B + V - (R+1)r) → center −1.5r.
-        let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
+    /// Rig for the v102 pins: two notes (60 @ tick 0, 63 @ tick 2400) on
+    /// the pinned canvas; returns canvas + the row-center y mapping.
+    fn v102_two_note_rig(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> egui::Rect {
+        let c = v52_roll_rig(app, ctx);
         {
             let r = app.piano_roll.as_mut().unwrap();
             r.pat.notes.push(crate::midipat::Note {
@@ -48398,7 +48397,8 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480,
-            bend: None,});
+                bend: None,
+            });
             r.pat.notes.push(crate::midipat::Note {
                 ch: 0,
                 note: 63,
@@ -48406,11 +48406,25 @@ mod tests {
                 press: 0,
                 start: 2400,
                 len: 480,
-            bend: None,});
+                bend: None,
+            });
         }
-        frame(&mut app, &ctx, vec![]);
-        // x(tick) = grid_x0 + tick/3 at 160 px/beat, 120 bpm.
-        let a = egui::pos2(grid_x0 + 80.0, row_y(60)); // src note body
+        frame(app, ctx, vec![]);
+        c
+    }
+
+    #[test]
+    fn v102_z_drag_note_to_note_lands_pitch() {
+        // v102 CONTRACT CHANGE (retargets v52_roll_z_drag...): Z+drag from
+        // a note now DRAWS THE CURVE ON THE NOTE; released OVER another
+        // note the curve ENDS at that note's pitch delta (+300 cents) —
+        // the note-to-note slide survives as one gesture, no lane, no seg.
+        let mut app = headless_app("v102zland");
+        let ctx = egui::Context::default();
+        let c = v102_two_note_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
+        let a = egui::pos2(grid_x0 + 80.0, row_y(60)); // source note body
         let b = egui::pos2(grid_x0 + 800.0, row_y(63)); // target note body
         let z = |down: bool| {
             egui::Event::Key {
@@ -48431,16 +48445,26 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         {
             let r = app.piano_roll.as_ref().unwrap();
-            assert_eq!(r.pat.bend_segs.len(), 1, "Z-drag made one glide");
-            let g = &r.pat.bend_segs[0];
-            assert_eq!(g.t0, 480, "leaves at the SOURCE note end");
-            assert_eq!(g.v0, 0.0, "starts in tune");
-            assert_eq!(g.t1, 2400, "lands at the TARGET note start");
-            assert_eq!(g.v1, 3.0, "target(63) - source(60) = +3 st");
+            assert!(r.pat.bend_segs.is_empty(), "no lane segments anymore");
+            let n0 = &r.pat.notes[0];
+            let ci = n0.bend.expect("source note carries the curve handle");
+            let nb = &r.pat.note_bends[ci as usize];
+            assert!(nb.active(), "curve is audible");
+            assert_eq!(nb.pts.len(), 2, "2-pt straight slide: {:?}", nb.pts);
+            assert_eq!((nb.pts[0].0, nb.pts[0].1), (0.0, 0.0), "starts in tune");
+            assert!(
+                (nb.pts[1].1 - 300.0).abs() < 1.0,
+                "ends at target pitch +300 cents, got {}",
+                nb.pts[1].1
+            );
+            assert!(r.nb_live.is_empty(), "stroke buffer cleared on commit");
+            assert!(!r.pat.bends.is_empty(), "baked to the audible lane");
         }
-        // The Z-drag must NOT have moved the source note.
+        // The gesture must NOT move the source note, and must echo.
         let n0 = app.piano_roll.as_ref().unwrap().pat.notes[0];
         assert_eq!((n0.start, n0.note), (0, 60), "source note untouched");
+        assert!(app.status.contains("pitch curve"), "status: {}", app.status);
+        assert!(app.status.contains("300"), "echo carries the pitch: {}", app.status);
     }
 
     #[test]
@@ -48500,6 +48524,337 @@ mod tests {
             assert!(r.pat.bends.is_empty(), "no ghost pitch-bend left");
             assert!(app.status.contains("deleted"), "status: {}", app.status);
         }
+    }
+
+    // ============ v102 (pb-3): in-roll pitch curves ON the notes ============
+    //
+    // The per-note curve replaces the v52 glide lane (spec
+    // docs/SAMPLER-PITCH.md § 4): Z+drag draws on the note body, dots
+    // edit, Alt+Z warps, Shift+RMB deletes the curve. Pins drive real
+    // gestures through frame().
+
+    /// Rig: one note (60 @ tick 0, len 480) WITH an already-committed
+    /// 2-point curve (0 -> +300 cents), note SELECTED (dots live).
+    /// Returns the canvas rect.
+    fn v102_curve_rig(app: &mut App, ctx: &egui::Context) -> egui::Rect {
+        let c = v52_roll_rig(app, ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+            r.pat.note_bends.push(crate::midipat::NoteBend::new(vec![
+                (0.0, 0.0),
+                (1.0, 300.0),
+            ]));
+            r.pat.notes[0].bend = Some(0);
+            r.pat.bake_bends();
+            r.sel_notes = vec![0];
+        }
+        frame(app, ctx, vec![]);
+        c
+    }
+
+    #[test]
+    fn v102_z_drag_freehand_simplifies_and_bakes() {
+        // A multi-sample straight stroke across the note commits as the
+        // 2-point line the user drew (RDP eps = 4 cents), attached to the
+        // note, baked, and echoed in the status line.
+        let mut app = headless_app("v102freehand");
+        let ctx = egui::Context::default();
+        let c = v102_two_note_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row60 = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let z = |down: bool| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: down,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut app,
+            &ctx,
+            vec![z(true), moved(egui::pos2(grid_x0 + 50.0, row60)), btn(egui::pos2(grid_x0 + 50.0, row60), egui::PointerButton::Primary, true)],
+        );
+        // 3 drag steps ON the line c = 300*t (dy = -c/27.27 px): exact
+        // collinearity in t — RDP must collapse the whole stroke to 2 pts.
+        for (dx, dy) in [(80.0, -3.0), (112.0, -4.2), (144.0, -5.4)] {
+            let q = egui::pos2(grid_x0 + dx, row60 + dy);
+            frame(&mut app, &ctx, vec![moved(q)]);
+        }
+        let rel = egui::pos2(grid_x0 + 160.0, row60 - 6.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(rel), btn(rel, egui::PointerButton::Primary, false), z(false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let ci = r.pat.notes[0].bend.expect("drawn curve attached to the note");
+            let nb = &r.pat.note_bends[ci as usize];
+            assert_eq!(nb.pts.len(), 2, "collinear stroke -> line: {:?}", nb.pts);
+            assert!(!r.pat.bends.is_empty(), "curve audible via baked lane");
+        }
+        assert!(app.status.contains("pitch curve"), "status: {}", app.status);
+        // Negative control: a SECOND Z-press WITHOUT drag (too-short
+        // stroke) must not silently commit anything new.
+        let a = egui::pos2(grid_x0 + 80.0, row60);
+        frame(&mut app, &ctx, vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(a), btn(a, egui::PointerButton::Primary, false), z(false)]);
+        frame(&mut app, &ctx, vec![]);
+        // A press-release with NO stroke never commits: the curve from the
+        // first stroke is untouched and the table grew nothing.
+        let r = app.piano_roll.as_ref().unwrap();
+        assert_eq!(r.pat.note_bends.len(), 1, "nothing committed");
+        assert_eq!(
+            r.pat.note_bends[0].pts,
+            vec![(0.0, 0.0), (1.0, 300.0)],
+            "old curve untouched by the click (no commit, no reuse-overwrite)"
+        );
+    }
+
+    #[test]
+    fn v102_curve_dot_drag_edits_endpoint() {
+        // Grab the END dot of the selected note's curve and pull it up:
+        // cents change, endpoint time stays pinned at 1.0, the edit re-bakes
+        // and echoes its values.
+        let mut app = headless_app("v102dote");
+        let ctx = egui::Context::default();
+        let c = v102_curve_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row60 = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let th = 24.0f32; // (2 * row_h 11).max(24) at default zoom
+        // t=1 endpoint: x at the note END, y = row center MINUS 300/1200*th
+        // (6 px up).
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row60 - 300.0 / 1200.0 * th);
+        let up = egui::pos2(dot.x + 30.0, dot.y - 60.0);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(up)]);
+        frame(&mut app, &ctx, vec![moved(up), btn(up, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let nb = &r.pat.note_bends[0];
+            assert_eq!(nb.pts.len(), 2, "still 2 points");
+            assert_eq!(nb.pts[1].0, 1.0, "endpoint time is pinned");
+            assert!(nb.pts[1].1 > 800.0, "endpoint pulled way up: {}", nb.pts[1].1);
+            assert!(r.pat.bends.len() >= 2, "re-baked after edit");
+        }
+        assert!(app.status.contains("curve point"), "echo: {}", app.status);
+    }
+
+    #[test]
+    fn v102_alt_z_warps_whole_curve() {
+        // Alt+Z on a note that HAS a curve scales the WHOLE curve from the
+        // grab point. Grab at +~218 cents, drag to the mirrored −~218 line:
+        // ratio −1 flips the curve (last point 300 -> −300).
+        let mut app = headless_app("v102warp");
+        let ctx = egui::Context::default();
+        let c = v102_curve_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row60 = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let z = |down: bool| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: down,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let alt = |on: bool| {
+            egui::Event::ModifiersChanged(if on {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            })
+        };
+        let a = egui::pos2(grid_x0 + 80.0, row60 - 4.0); // grab ABOVE center
+        let b = egui::pos2(grid_x0 + 90.0, row60 + 4.0); // release BELOW center
+        frame(&mut app, &ctx, vec![alt(true)]);
+        frame(&mut app, &ctx, vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        assert!(app.status.contains("warping"), "warp echo arms: {}", app.status);
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(&mut app, &ctx, vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)]);
+        frame(&mut app, &ctx, vec![alt(false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let nb = &r.pat.note_bends[0];
+            assert!(
+                (nb.pts[1].1 - (-300.0)).abs() < 12.0,
+                "ratio -1 warps +300 to -300, got {}",
+                nb.pts[1].1
+            );
+            assert!(r.nb_base.is_empty(), "warp snapshot dropped");
+        }
+        assert!(app.status.contains("curve warped"), "echo: {}", app.status);
+    }
+
+    #[test]
+    fn v102_shift_rmb_clears_curve_then_deletes_note() {
+        // Shift+RMB on a note WITH a curve removes ONLY the curve (note
+        // stays, audible lane cleaned). A second Shift+RMB hits the old
+        // note-delete verb.
+        let mut app = headless_app("v102srmb");
+        let ctx = egui::Context::default();
+        let c = v102_curve_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let p = egui::pos2(grid_x0 + 80.0, c.max.y - 10.0 + 500.0 - 11.0 * 60.5);
+        let shift = |on: bool| {
+            egui::Event::ModifiersChanged(if on {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            })
+        };
+        frame(&mut app, &ctx, vec![shift(true), moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![shift(false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes.len(), 1, "note KEPT");
+            assert!(r.pat.notes[0].bend.is_none(), "curve handle gone");
+            assert!(r.pat.bends.is_empty(), "audible lane cleaned");
+            assert!(r.pat.note_bends.is_empty(), "table compacted");
+        }
+        assert!(app.status.contains("curve removed"), "echo: {}", app.status);
+        // Second Shift+RMB: the note itself goes (old verb survives).
+        frame(&mut app, &ctx, vec![shift(true), moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![shift(false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.piano_roll.as_ref().unwrap().pat.notes.is_empty(), "note deleted");
+        assert!(app.status.contains("deleted"), "echo: {}", app.status);
+    }
+
+    #[test]
+    fn v102_delete_key_note_takes_curve_along() {
+        // The keyboard delete is a note-delete site: the dead note's curve
+        // must leave the audible lane AND the table (no orphan sound).
+        let mut app = headless_app("v102delkey");
+        let ctx = egui::Context::default();
+        v102_curve_rig(&mut app, &ctx);
+        let del = egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, &ctx, vec![del]);
+        frame(&mut app, &ctx, vec![]);
+        let r = app.piano_roll.as_ref().unwrap();
+        assert!(r.pat.notes.is_empty(), "note gone");
+        assert!(r.pat.bends.is_empty(), "curve left the audible lane");
+        assert!(r.pat.note_bends.is_empty(), "table compacted");
+    }
+
+    #[test]
+    fn v102_clear_curve_button_and_hint() {
+        // Toolbar discoverability: the readout teaches the gesture and the
+        // "clear curve" button clears the SELECTED notes' curves in a click.
+        let mut app = headless_app("v102clearbtn");
+        let ctx = egui::Context::default();
+        v102_curve_rig(&mut app, &ctx);
+        assert!(
+            galley_at(&mut app, &ctx, "Z+drag a note = pitch curve").is_some(),
+            "toolbar teaches the gesture"
+        );
+        click_last(&mut app, &ctx, "clear curve");
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes.len(), 1, "notes stay");
+            assert!(r.pat.notes[0].bend.is_none(), "curve cleared");
+            assert!(r.pat.bends.is_empty(), "lane cleaned");
+        }
+        assert!(app.status.contains("cleared"), "echo: {}", app.status);
+    }
+
+    #[test]
+    fn v102_migrated_curve_paints_on_note() {
+        // "Old projects show their previous bends on the notes": a legacy
+        // in-note glide segment migrates to the note's curve (pb-2 engine)
+        // and is PAINTED as a trail on the note body (green unselected).
+        let mut app = headless_app("v102migpaint");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+            r.pat.bend_segs.push(crate::midipat::BendSeg {
+                t0: 60,
+                v0: 0.0,
+                t1: 420,
+                v1: 5.0,
+                curve: 0.0,
+            });
+            r.pat.migrate_bend_segs();
+            r.pat.bake_bends();
+        }
+        assert_eq!(app.piano_roll.as_ref().unwrap().pat.bend_segs.len(), 0);
+        let ci = app.piano_roll.as_ref().unwrap().pat.notes[0]
+            .bend
+            .expect("legacy bend migrated onto the note");
+        assert_eq!(ci, 0);
+        // Paint probe: an unselected curve trail is a (90,220,170) stroke.
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let trails = out
+            .shapes
+            .iter()
+            .filter(|cs| {
+                matches!(&cs.shape, egui::epaint::Shape::LineSegment { stroke, .. }
+                    if {
+                        let (r0, g0, b0, a0) = stroke.color.to_tuple();
+                        a0 == 255 && r0 == 90 && g0 == 220 && b0 == 170
+                    })
+            })
+            .count();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        assert!(trails >= 3, "curve trail painted on the note body ({trails})");
+    }
+
+    #[test]
+    fn v102_rdp_simplify_contract() {
+        // Unit floor for the commit-time simplifier: collinear wobble
+        // within eps collapses to the line; a real peak survives.
+        let wob = vec![(0.0f32, 0.0f32), (0.25, 3.0), (0.5, -2.0), (0.75, 1.0), (1.0, 0.0)];
+        let flat = rdp_simplify(&wob, 4.0);
+        assert_eq!(flat.len(), 2, "wobble within 4 cents collapses");
+        let spiky = vec![(0.0f32, 0.0f32), (0.25, 3.0), (0.5, 90.0), (0.75, 1.0), (1.0, 0.0)];
+        let kept = rdp_simplify(&spiky, 4.0);
+        // Vertical-distance RDP: the 90-cent peak keeps BOTH its shoulders
+        // (each deviates 42 cents from the sub-chords) — shape-faithful.
+        assert_eq!(kept.len(), 5, "peak + shoulders survive: {kept:?}");
+        assert_eq!(kept[2], (0.5, 90.0));
     }
 
     // ================= v55: piano-roll RMB length menu (S2) =================
@@ -57661,8 +58016,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v101\""),
-            "INTERNAL_VERSION must be bumped to v101"
+            librs.contains("INTERNAL_VERSION: &str = \"v102\""),
+            "INTERNAL_VERSION must be bumped to v102"
         );
     }
 
