@@ -55381,11 +55381,12 @@ mod tests {
                 .collect()
         }
         let ui_src = prod_window(include_str!("ui.rs"));
-        // Positive: the TWO shared picker rows are live call sites.
+        // Positive: the THREE shared picker rows are live call sites
+        // (v82 pair + the v103 bend-range row — same shared picker law).
         assert_eq!(
             ui_src.matches("presetbar::picker_row(ui,").count(),
-            2,
-            "program + factory-preset rows must ride the shared picker"
+            3,
+            "program + factory-preset + bend-range rows must ride the shared picker"
         );
         assert!(
             ui_src.contains(&concat!(
