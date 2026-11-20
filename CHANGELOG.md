@@ -8,6 +8,15 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **The piano roll's glide lane now glides on the built-in instruments.**
+  Pitch bends baked into a clip — drawn with the glide tool or recorded
+  from a hardware wheel — were silently discarded for every scripted
+  instrument, including the default sampler: playback, audition and
+  export all sounded exactly like no bend at all. (VST/CLAP instruments
+  always received them, so the lane looked alive in the editor.) Scripted
+  instruments now receive bends like MIDI: a full deflection is ±12
+  semitones, and held notes shift with the line while it plays.
+
 - **Docked subwindow sizes survive restarts — for real this time.**
   Resizing a docked panel (MASTER OUT was the worst case) and relaunching
   reset it toward a minimum: every restart quietly shaved a frame's worth
