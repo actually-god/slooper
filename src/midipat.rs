@@ -328,7 +328,7 @@ impl Pattern {
     /// v101: any note carries a usable in-roll pitch curve?
     pub fn has_note_bends(&self) -> bool {
         self.notes.iter().any(|n| {
-            matches!(n.bend, Some(i) if self.note_bends.get(i as usize).map_or(false, |nb| nb.active()))
+            matches!(n.bend, Some(i) if self.note_bends.get(i as usize).is_some_and(|nb| nb.active()))
         })
     }
 
@@ -485,7 +485,7 @@ impl Pattern {
         let mut items: Vec<(u32, usize, u32, u32)> = Vec::new(); // (onset, curve idx, note start, note len)
         for n in self.notes.iter() {
             if let Some(i) = n.bend {
-                if self.note_bends.get(i as usize).map_or(false, |nb| nb.active()) {
+                if self.note_bends.get(i as usize).is_some_and(|nb| nb.active()) {
                     items.push((n.start, i as usize, n.start, n.len));
                 }
             }
