@@ -517,14 +517,14 @@ struct PianoRoll {
     /// MIDI clip or rack asset): **save** overwrites the asset in place
     /// instead of minting a new one.
     edit_asset: Option<u32>,
-    /// v52 R6: selected pitch-bend segment index (v102: the LEGACY orphan
+    /// v52 R6: selected pitch-bend segment index (v105: the LEGACY orphan
     /// lane's selection — the lane exists only while unmigrated segs survive).
     sel_bend: Option<usize>,
-    /// v102 (pb-3): freehand stroke in flight for the in-roll curve draw
+    /// v105 (pb-3): freehand stroke in flight for the in-roll curve draw
     /// (NbDraw): `(t, cents)` points in draw order, t normalized to the
     /// note body (spec docs/SAMPLER-PITCH.md § 4).
     nb_live: Vec<(f32, f32)>,
-    /// v102: curve snapshot at the grab of an Alt+Z magnitude warp
+    /// v105: curve snapshot at the grab of an Alt+Z magnitude warp
     /// (NbWarp) — the warp scales from these bases every frame, never
     /// compounds on itself.
     nb_base: Vec<(f32, f32)>,
@@ -563,21 +563,21 @@ enum RollGesture {
         from: egui::Pos2,
         add: bool,
     },
-    /// v102 (pb-3): freehand pitch curve being drawn ON a note (Z+drag,
+    /// v105 (pb-3): freehand pitch curve being drawn ON a note (Z+drag,
     /// spec docs/SAMPLER-PITCH.md § 4). The in-flight stroke rides
     /// `PianoRoll::nb_live`; release simplifies (RDP) and commits to
     /// `note_bends` — land-on-target stays as release-over-note sugar.
     NbDraw { idx: usize },
-    /// v102: dragging one control-point dot of a selected note's curve
+    /// v105: dragging one control-point dot of a selected note's curve
     /// (`pi` indexes the curve's control points at press time).
     NbPt { idx: usize, pi: usize },
-    /// v102: Alt+Z whole-curve magnitude warp; `c0` = cents under the
+    /// v105: Alt+Z whole-curve magnitude warp; `c0` = cents under the
     /// pointer at grab (scale anchor); base points ride `nb_base`.
     NbWarp { idx: usize, c0: f32 },
-    /// v52 R6 (v102: LEGACY orphan lane only): drag one endpoint of a
+    /// v52 R6 (v105: LEGACY orphan lane only): drag one endpoint of a
     /// stored segment (`end` 0 = start).
     BendEP { idx: usize, end: u8 },
-    /// v52 R6 (v102: LEGACY orphan lane only): drag the mid-curve dot
+    /// v52 R6 (v105: LEGACY orphan lane only): drag the mid-curve dot
     /// vertically to set curvature.
     BendCurve { idx: usize },
     /// v52 R6: drag a bar in the velocity lane (absolute from pointer y).
@@ -1927,6 +1927,11 @@ pub struct App {
     /// v62: per-track selected VST2 factory program (-1 = none). Seeded
     /// from config, pushed by the PARAMETERS combo, captured on save.
     track_synth_program: Vec<i32>,
+    /// v103 (card t_62c5a14e): per-track pitch-bend RANGE in semitones
+    /// (0 = off). The UI table is the single truth — a hosted plugin
+    /// never reports its RPN0 — mirrored to Config/Project and pushed to
+    /// every bound entry (bind, rebuild, picker row).
+    track_bend_range: Vec<u8>,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -2556,6 +2561,13 @@ impl App {
             params_preset_locs_for: String::new(),
             track_synth_program: (0..MAX_LOOPS)
                 .map(|t| cfg.track_synth_programs.get(t).copied().unwrap_or(-1))
+                .collect(),
+            track_bend_range: (0..MAX_LOOPS)
+                .map(|t| {
+                    cfg.track_bend_ranges.get(t).copied().unwrap_or(
+                        crate::vsthost::DEFAULT_BEND_RANGE,
+                    )
+                })
                 .collect(),
             auto_press_pt: None,
             auto_click_pt: None,
@@ -3806,6 +3818,8 @@ impl App {
         // v60: program picked in the factory-program combo (applied
         // after the row closes — same deferred-action shape as preset).
         let mut pick_prog: Option<usize> = None;
+        // v103: bend range picked in the per-track row (deferred shape).
+        let mut pick_bend: Option<(usize, u8)> = None;
         let total = entry.descs().iter().filter(|d| d.writable && !d.program_change).count();
         let ql = new_filter.trim().to_lowercase();
         // v82: the count label echoes the filter LIVE (goal 1: every
@@ -3992,6 +4006,54 @@ impl App {
                         pick_prog = Some(i);
                     }
                 });
+            }
+            // v103 (card t_62c5a14e): per-track PITCH-BEND RANGE for a
+            // hosted instrument. The roll writes absolute semitones
+            // (glide law, full scale ±12); the plugin bends EXACTLY that
+            // far, clamping past the cap, because slooper announces R
+            // as RPN0 and rescales the raw wheel on delivery — depth
+            // now matches across plugins. Synth targets only: FX never
+            // consume pitch, and a chain slot cannot name a track.
+            if let GuiTarget::Synth(t) = target {
+                if t < MAX_LOOPS {
+                    let cur = self.bend_range_for(t);
+                    let caption = if cur == 0 {
+                        "off".to_string()
+                    } else {
+                        format!("{cur} st")
+                    };
+                    let items: Vec<crate::presetbar::PickerItem> = (0..=24u8)
+                        .map(|n| crate::presetbar::PickerItem {
+                            display: if n == 0 {
+                                "off (no bend)".to_string()
+                            } else {
+                                format!("{n} st")
+                            },
+                            hover: format!("wheel goes {n} semitones up AND down"),
+                            clip_dir: None,
+                        })
+                        .collect();
+                    ui.horizontal(|ui| {
+                        if let Some(i) = crate::presetbar::picker_row(
+                            ui,
+                            egui::Id::new("slooper_v103_bend_range"),
+                            &crate::presetbar::PickerRowSpec {
+                                label: Some("bend range"),
+                                label_width: crate::presetbar::LABEL_COL,
+                                caption: &caption,
+                                width: 150.0,
+                                hover: "pitch-bend wheel width sent to the plugin (RPN0) \u{b7} \
+                                        bends drawn in the roll keep their semitone depth, \
+                                        clamped here \u{b7} 0 disables bend",
+                                empty_text: None,
+                            },
+                            &items,
+                            Some(cur as usize),
+                        ) {
+                            pick_bend = Some((t, i as u8));
+                        }
+                    });
+                }
             }
             // v67: surface plugin-side preset-load reports (CLAP
             // `clap.preset-load`) while this window shows the entry - same
@@ -4236,6 +4298,25 @@ impl App {
             } else {
                 self.status = format!("program \u{201c}{nm}\u{201d} refused by the plugin");
             }
+        }
+        // v103: apply a bend-range pick — table + live entry + persist.
+        if let Some((t, r)) = pick_bend {
+            entry.set_bend_range(r);
+            if self.track_bend_range.len() < MAX_LOOPS {
+                self.track_bend_range
+                    .resize(MAX_LOOPS, crate::vsthost::DEFAULT_BEND_RANGE);
+            }
+            self.track_bend_range[t] = r;
+            self.status = format!(
+                "bend range track {}: {} (RPN0 sent to plugin)",
+                t + 1,
+                if r == 0 {
+                    "off".to_string()
+                } else {
+                    format!("{r} st")
+                }
+            );
+            self.save_config();
         }
         // v34 R2: run the preset-bar actions collected this frame.
         if do_save {
@@ -6217,6 +6298,7 @@ impl App {
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
+            track_bend_ranges: self.track_bend_range.clone(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
@@ -7214,6 +7296,14 @@ impl App {
         self.rebuild_track_synth_sync(t)
     }
 
+    /// v103: one accessor for the per-track bend-range table.
+    fn bend_range_for(&self, t: usize) -> u8 {
+        self.track_bend_range
+            .get(t)
+            .copied()
+            .unwrap_or(crate::vsthost::DEFAULT_BEND_RANGE)
+    }
+
     /// Land a loaded synth binding: retire this track's editor (the
     /// engine may drop the old plugin the moment the command lands, and
     /// the editor thread must not outlive the AEffect it drives), then
@@ -7226,6 +7316,9 @@ impl App {
         if let Some(mut w) = self.vst_editors.remove(&t) {
             w.close();
         }
+        // v103: a fresh bind comes up on the track's bend range — the
+        // entry is fresh, so it announces RPN0 on its first block.
+        entry.set_bend_range(self.bend_range_for(t));
         let inst = Some(std::sync::Arc::new(SynthHandle::Vst(entry)));
         self.backend.cmd(Cmd::SetTrackSynth {
             i: t,
@@ -7255,7 +7348,11 @@ impl App {
                     saved.as_deref(),
                     patch.as_ref(),
                 ) {
-                    Ok(load) => Some(std::sync::Arc::new(SynthHandle::Vst(load.entry))),
+                    Ok(load) => {
+                        // v103: fresh bind → push the track's bend range.
+                        load.entry.set_bend_range(self.bend_range_for(t));
+                        Some(std::sync::Arc::new(SynthHandle::Vst(load.entry)))
+                    }
                     Err(err) => {
                         self.status = format!("synth: {err}");
                         return false;
@@ -10940,7 +11037,7 @@ impl App {
         // Preview fires when a NEW note lands (pointer released after a
         // fresh draw) — immediate audible feedback while composing.
         let mut placed: Option<u8> = None;
-        // v102 (pb-3): a curve edit's echo survives the audition echo
+        // v105 (pb-3): a curve edit's echo survives the audition echo
         // (placed pattern, v38 R6: WHAT happened AND what you're hearing).
         let mut curve_echo: Option<String> = None;
         let mut open = true;
@@ -11012,7 +11109,7 @@ impl App {
                 // v101 (pb-2): a deleted note's pitch curve must leave the
                 // audible lane too — re-bake it (curves merge with orphan
                 // segs) and compact the unowned table entries away.
-                // v102: unconditional bake — the last curve's owner dying
+                // v105: unconditional bake — the last curve's owner dying
                 // must silence the lane (bake clears the empty case).
                 roll.pat.bake_bends();
                 roll.pat.compact_note_bends();
@@ -11392,7 +11489,7 @@ impl App {
                 }
             }
         }
-        // v102 (pb-3): the curve-edit echo survives the audition echo —
+        // v105 (pb-3): the curve-edit echo survives the audition echo —
         // "what you did · what you're hearing" in one line (placed pattern).
         if let Some(e) = curve_echo.take() {
             self.status = format!("{e} \u{b7} {}", self.status);
@@ -11656,7 +11753,7 @@ impl App {
                     {
                         *clear = true;
                     }
-                    // v102 (pb-3): escape hatch + discoverability for the
+                    // v105 (pb-3): escape hatch + discoverability for the
                     // new in-roll curves: one click clears the SELECTED
                     // notes' curves (the notes stay).
                     let n_curves = roll
@@ -11784,7 +11881,7 @@ impl App {
                 }
                 if rdel {
                     roll.pat.bend_segs.remove(si);
-                    // v102: re-bake so a deleted orphan can't leave ghost
+                    // v105: re-bake so a deleted orphan can't leave ghost
                     // pitch-bend events (bake clears the empty case).
                     roll.pat.bake_bends();
                     roll.sel_bend = None;
@@ -11989,7 +12086,7 @@ impl App {
         // notes (+ yellow end caps on the selected ones — the
         // resize handles, same language as the loop-area handles)
         const EDGE_PX: f32 = 6.0;
-        // v102 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
+        // v105 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
         // pitch-curve trail geometry. The trail box rides the note's ROW:
         // ±trail_half px around the row center; ±1200 ¢ fills it, and a
         // bigger curve auto-scales (rounded up to 600 ¢ steps, cap ±2400)
@@ -12057,7 +12154,7 @@ impl App {
                     );
                 }
             }
-            // v102 (pb-3): the note's pitch curve — trail painted ON the
+            // v105 (pb-3): the note's pitch curve — trail painted ON the
             // note body (the glide lane retired here); a SELECTED note also
             // reveals its control dots (endpoints bigger = the classic
             // endpoint-drag targets).
@@ -12091,7 +12188,7 @@ impl App {
                     }
                 }
             }
-            // v102: the freehand stroke in flight previews live in accent.
+            // v105: the freehand stroke in flight previews live in accent.
             if matches!(roll.gesture, RollGesture::NbDraw { idx: d } if d == idx)
                 && roll.nb_live.len() >= 2
             {
@@ -12140,7 +12237,7 @@ impl App {
         // lane maps \u{b1}12 st across its height.
         const VEL_LANE_H: f32 = 30.0;
         const BEND_LANE_H: f32 = 46.0;
-        // v102 (pb-3): the GLIDE LANE RETIRED onto the notes (spec § 4
+        // v105 (pb-3): the GLIDE LANE RETIRED onto the notes (spec § 4
         // "Retire"). The strip exists only while a loaded project still
         // has legacy ORPHAN segments (glides drawn into gaps — never lose
         // sound on load, spec § 6); drawing new bends happens on the note.
@@ -12201,7 +12298,7 @@ impl App {
                     ],
                     egui::Stroke::new(1.0, Color32::from_gray(70)),
                 );
-                // v102: honest copy for the LEGACY strip — new glides are
+                // v105: honest copy for the LEGACY strip — new glides are
                 // drawn on the note now; this lane only holds orphan segs.
                 painter.text(
                     egui::pos2(bend_lane.min.x + 3.0, bend_lane.min.y + 8.0),
@@ -12321,7 +12418,7 @@ impl App {
                 (sec >= s0 - 1e-6 && sec <= s0 + t_of(n.len.max(1)) + 1e-6).then_some(i)
             })
         };
-        // v102 (pb-3): in-roll curve control-dot hit test — selected notes
+        // v105 (pb-3): in-roll curve control-dot hit test — selected notes
         // only, same no-borrow idiom as note_hit (returns note idx + point
         // idx; the dots are painted for exactly these rows).
         let nb_dot_hit = |notes: &[crate::midipat::Note],
@@ -12388,7 +12485,7 @@ impl App {
         if let Some(hp) = hover {
             if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
                 if let Some(n) = roll.pat.notes.get(i) {
-                    // v102: the readout says whether THIS note has a curve
+                    // v105: the readout says whether THIS note has a curve
                     // and what the next gesture would be (discoverability).
                     let curve = nb_of(n).is_some();
                     painter.text(
@@ -12455,7 +12552,7 @@ impl App {
                             .and_then(|c| roll.pat.note_bends.get(c as usize))
                             .is_some_and(|nb| nb.active());
                         if has_curve {
-                            // v102 (pb-3, spec § 4): Shift+RMB on a note that
+                            // v105 (pb-3, spec § 4): Shift+RMB on a note that
                             // HAS a curve deletes the CURVE (note stays) — the
                             // delete verb aims at the newest object.
                             if let Some(n) = roll.pat.notes.get_mut(i) {
@@ -12479,7 +12576,7 @@ impl App {
                             }
                             // v101 (pb-2): deleted note → its curve must
                             // leave the audible lane too (see delete-key).
-                            // v102: unconditional bake — clearing the last
+                            // v105: unconditional bake — clearing the last
                             // curve must silence the lane (bake handles empty).
                             roll.pat.bake_bends();
                             roll.pat.compact_note_bends();
@@ -12552,7 +12649,7 @@ impl App {
                                     .into();
                         }
                         None => {
-                            // v102: the retired lane creates NOTHING — a
+                            // v105: the retired lane creates NOTHING — a
                             // miss in the orphan strip rubber-bands like
                             // empty grid (new curves draw on the note).
                             roll.gesture = RollGesture::Marquee { from: pt, add: false };
@@ -12591,7 +12688,7 @@ impl App {
                 } else if ui.input(|i| i.key_down(egui::Key::Z))
                     && note_hit(&roll.pat.notes, pt).is_some()
                 {
-                    // v102 (pb-3, spec § 4): Z+drag ON a note draws the pitch
+                    // v105 (pb-3, spec § 4): Z+drag ON a note draws the pitch
                     // curve ON the note body (septabee parity). Alt+Z on a
                     // note that already has a curve = whole-curve magnitude
                     // warp. The v52 lane-creating Z-drag is retired here.
@@ -12629,7 +12726,7 @@ impl App {
                 } else if let Some((idx, pi)) =
                     nb_dot_hit(&roll.pat.notes, &roll.sel_notes, &roll.pat.note_bends, pt)
                 {
-                    // v102: grabbing a control dot edits that curve point
+                    // v105: grabbing a control dot edits that curve point
                     // (dots exist on SELECTED notes — the press that grabs
                     // one never reaches the note-move branch below).
                     roll.gesture = RollGesture::NbPt { idx, pi };
@@ -13043,7 +13140,7 @@ impl App {
                     roll.sel_anchor = roll.sel_notes.first().copied();
                     self.status = format!("selected {} note(s) by box", roll.sel_notes.len());
                 } else if let RollGesture::NbDraw { idx } = roll.gesture {
-                    // v102 (pb-3): commit the freehand stroke. RDP-simplify
+                    // v105 (pb-3): commit the freehand stroke. RDP-simplify
                     // (ε = 4 ¢, spec § 4), land-on-target sugar preserved
                     // (release OVER another note = end at its pitch delta),
                     // then bake + auto-audition — the "can't tell if it
@@ -13092,7 +13189,7 @@ impl App {
                         self.status = "curve too short \u{b7} drag a longer stroke across the note".into();
                     }
                 } else if let RollGesture::NbPt { idx, pi } = roll.gesture {
-                    // v102: a committed point edit answers with its values
+                    // v105: a committed point edit answers with its values
                     // and re-hears the curve (auto-audition).
                     let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
                     if let Some(ci) = ci {
@@ -13113,7 +13210,7 @@ impl App {
                         }
                     }
                 } else if let RollGesture::NbWarp { idx, .. } = roll.gesture {
-                    // v102: warp done — drop the snapshot, echo the result.
+                    // v105: warp done — drop the snapshot, echo the result.
                     roll.nb_base.clear();
                     let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
                     if let Some(ci) = ci {
@@ -16642,6 +16739,7 @@ impl App {
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
+            track_bend_ranges: self.track_bend_range.clone(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
@@ -16983,6 +17081,12 @@ impl App {
             // rebuild below reopens every bound instrument.
             self.track_synth_program[t] =
                 pr.track_synth_programs.get(t).copied().unwrap_or(-1);
+            // v103: bend ranges are synth setup too.
+            self.track_bend_range[t] = pr
+                .track_bend_ranges
+                .get(t)
+                .copied()
+                .unwrap_or(crate::vsthost::DEFAULT_BEND_RANGE);
         }
         if sel.instruments || sel.synth_setup {
             self.rebuild_all_synths();
@@ -27291,7 +27395,7 @@ fn lane_row(
 }
 
 /// v55 (S2): what a plain right-click on the piano-roll canvas targets.
-/// v102 (pb-3, spec docs/SAMPLER-PITCH.md § 4): Ramer–Douglas–Peucker
+/// v105 (pb-3, spec docs/SAMPLER-PITCH.md § 4): Ramer–Douglas–Peucker
 /// simplification of a drawn curve stroke. Distance is VERTICAL (cents) —
 /// strokes are strictly time-increasing, so vertical deviation is the
 /// shape-faithful metric and ε reads directly in cents (spec: 4 ¢ detail).
@@ -27435,7 +27539,7 @@ fn roll_rmb_menu(
     }
     match hit {
         Some(RollRmbHit::Note(i)) if i < roll.pat.notes.len() => {
-            // v102 (pb-3): does this note carry an active pitch curve?
+            // v105 (pb-3): does this note carry an active pitch curve?
             let nb_of_note = roll
                 .pat
                 .notes
@@ -27545,7 +27649,7 @@ fn roll_rmb_menu(
                 return;
             }
             ui.separator();
-            // v102 (pb-3): the curve verbs ride the note menu too.
+            // v105 (pb-3): the curve verbs ride the note menu too.
             if nb_of_note.is_some() {
                 if ui
                     .button("Clear curve")
@@ -33502,7 +33606,7 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(q), btn_btn(q, true)]);
         frame(&mut app, &ctx, vec![btn_btn(q, false)]);
         assert!(app.status.contains("quantized"), "{}", app.status);
-        // v102 RETARGET: the toolbar gained a "clear curve" button, so a
+        // v105 RETARGET: the toolbar gained a "clear curve" button, so a
         // substring "clear" read could (and did) land on it — click the
         // EXACT label.
         click_last_exact(&mut app, &ctx, "clear");
@@ -48346,12 +48450,12 @@ mod tests {
     }
 
     #[test]
-    fn v102_retired_lane_drag_creates_nothing() {
-        // v102 CONTRACT CHANGE (retargets v52_roll_glide_lane_drag...):
+    fn v105_retired_lane_drag_creates_nothing() {
+        // v105 CONTRACT CHANGE (retargets v52_roll_glide_lane_drag...):
         // the old bottom glide STRIP no longer creates segments by drag —
         // drawing moved ONTO the notes. A drag there on a clean pattern
         // must leave zero bend_segs (it rubber-bands like empty grid).
-        let mut app = headless_app("v102laneretire");
+        let mut app = headless_app("v105laneretire");
         let ctx = egui::Context::default();
         let c = v52_roll_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
@@ -48369,9 +48473,9 @@ mod tests {
         assert!(r.pat.note_bends.is_empty(), "and no curve was drawn from there");
     }
 
-    /// Rig for the v102 pins: two notes (60 @ tick 0, 63 @ tick 2400) on
+    /// Rig for the v105 pins: two notes (60 @ tick 0, 63 @ tick 2400) on
     /// the pinned canvas; returns canvas + the row-center y mapping.
-    fn v102_two_note_rig(
+    fn v105_two_note_rig(
         app: &mut App,
         ctx: &egui::Context,
     ) -> egui::Rect {
@@ -48402,14 +48506,14 @@ mod tests {
     }
 
     #[test]
-    fn v102_z_drag_note_to_note_lands_pitch() {
-        // v102 CONTRACT CHANGE (retargets v52_roll_z_drag...): Z+drag from
+    fn v105_z_drag_note_to_note_lands_pitch() {
+        // v105 CONTRACT CHANGE (retargets v52_roll_z_drag...): Z+drag from
         // a note now DRAWS THE CURVE ON THE NOTE; released OVER another
         // note the curve ENDS at that note's pitch delta (+300 cents) —
         // the note-to-note slide survives as one gesture, no lane, no seg.
-        let mut app = headless_app("v102zland");
+        let mut app = headless_app("v105zland");
         let ctx = egui::Context::default();
-        let c = v102_two_note_rig(&mut app, &ctx);
+        let c = v105_two_note_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let row_y = |row: i32| c.max.y - 10.0 + 500.0 - 11.0 * (row as f32 + 0.5);
         let a = egui::pos2(grid_x0 + 80.0, row_y(60)); // source note body
@@ -48514,7 +48618,7 @@ mod tests {
         }
     }
 
-    // ============ v102 (pb-3): in-roll pitch curves ON the notes ============
+    // ============ v105 (pb-3): in-roll pitch curves ON the notes ============
     //
     // The per-note curve replaces the v52 glide lane (spec
     // docs/SAMPLER-PITCH.md § 4): Z+drag draws on the note body, dots
@@ -48524,7 +48628,7 @@ mod tests {
     /// Rig: one note (60 @ tick 0, len 480) WITH an already-committed
     /// 2-point curve (0 -> +300 cents), note SELECTED (dots live).
     /// Returns the canvas rect.
-    fn v102_curve_rig(app: &mut App, ctx: &egui::Context) -> egui::Rect {
+    fn v105_curve_rig(app: &mut App, ctx: &egui::Context) -> egui::Rect {
         let c = v52_roll_rig(app, ctx);
         {
             let r = app.piano_roll.as_mut().unwrap();
@@ -48550,13 +48654,13 @@ mod tests {
     }
 
     #[test]
-    fn v102_z_drag_freehand_simplifies_and_bakes() {
+    fn v105_z_drag_freehand_simplifies_and_bakes() {
         // A multi-sample straight stroke across the note commits as the
         // 2-point line the user drew (RDP eps = 4 cents), attached to the
         // note, baked, and echoed in the status line.
-        let mut app = headless_app("v102freehand");
+        let mut app = headless_app("v105freehand");
         let ctx = egui::Context::default();
-        let c = v102_two_note_rig(&mut app, &ctx);
+        let c = v105_two_note_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let row60 = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
         let z = |down: bool| egui::Event::Key {
@@ -48610,13 +48714,13 @@ mod tests {
     }
 
     #[test]
-    fn v102_curve_dot_drag_edits_endpoint() {
+    fn v105_curve_dot_drag_edits_endpoint() {
         // Grab the END dot of the selected note's curve and pull it up:
         // cents change, endpoint time stays pinned at 1.0, the edit re-bakes
         // and echoes its values.
-        let mut app = headless_app("v102dote");
+        let mut app = headless_app("v105dote");
         let ctx = egui::Context::default();
-        let c = v102_curve_rig(&mut app, &ctx);
+        let c = v105_curve_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let row60 = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
         let th = 24.0f32; // (2 * row_h 11).max(24) at default zoom
@@ -48640,13 +48744,13 @@ mod tests {
     }
 
     #[test]
-    fn v102_alt_z_warps_whole_curve() {
+    fn v105_alt_z_warps_whole_curve() {
         // Alt+Z on a note that HAS a curve scales the WHOLE curve from the
         // grab point. Grab at +~218 cents, drag to the mirrored −~218 line:
         // ratio −1 flips the curve (last point 300 -> −300).
-        let mut app = headless_app("v102warp");
+        let mut app = headless_app("v105warp");
         let ctx = egui::Context::default();
-        let c = v102_curve_rig(&mut app, &ctx);
+        let c = v105_curve_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let row60 = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
         let z = |down: bool| egui::Event::Key {
@@ -48686,13 +48790,13 @@ mod tests {
     }
 
     #[test]
-    fn v102_shift_rmb_clears_curve_then_deletes_note() {
+    fn v105_shift_rmb_clears_curve_then_deletes_note() {
         // Shift+RMB on a note WITH a curve removes ONLY the curve (note
         // stays, audible lane cleaned). A second Shift+RMB hits the old
         // note-delete verb.
-        let mut app = headless_app("v102srmb");
+        let mut app = headless_app("v105srmb");
         let ctx = egui::Context::default();
-        let c = v102_curve_rig(&mut app, &ctx);
+        let c = v105_curve_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let p = egui::pos2(grid_x0 + 80.0, c.max.y - 10.0 + 500.0 - 11.0 * 60.5);
         let shift = |on: bool| {
@@ -48726,12 +48830,12 @@ mod tests {
     }
 
     #[test]
-    fn v102_delete_key_note_takes_curve_along() {
+    fn v105_delete_key_note_takes_curve_along() {
         // The keyboard delete is a note-delete site: the dead note's curve
         // must leave the audible lane AND the table (no orphan sound).
-        let mut app = headless_app("v102delkey");
+        let mut app = headless_app("v105delkey");
         let ctx = egui::Context::default();
-        v102_curve_rig(&mut app, &ctx);
+        v105_curve_rig(&mut app, &ctx);
         let del = egui::Event::Key {
             key: egui::Key::Delete,
             physical_key: None,
@@ -48748,13 +48852,13 @@ mod tests {
     }
 
     #[test]
-    fn v102_clear_curve_button_and_menu() {
+    fn v105_clear_curve_button_and_menu() {
         // Toolbar discoverability (readout teaches the gesture), the RMB
         // menu carries "Clear curve" on a note that HAS one, and the
         // toolbar button clears the SELECTED notes' curves in a click.
-        let mut app = headless_app("v102clearbtn");
+        let mut app = headless_app("v105clearbtn");
         let ctx = egui::Context::default();
-        let c = v102_curve_rig(&mut app, &ctx);
+        let c = v105_curve_rig(&mut app, &ctx);
         let grid_x0 = c.min.x + 58.0;
         let p = egui::pos2(grid_x0 + 80.0, c.max.y - 10.0 + 500.0 - 11.0 * 60.5);
         assert!(
@@ -48803,7 +48907,7 @@ mod tests {
     }
 
     #[test]
-    fn v102_dead_lane_state_gone() {
+    fn v105_dead_lane_state_gone() {
         // The lane-CREATING state is retired, not gated: the `bend_live`
         // field and the `BendNew` gesture must be ABSENT from production
         // code (no dead chrome / orphan state). Negative needles are
@@ -48828,11 +48932,11 @@ mod tests {
     }
 
     #[test]
-    fn v102_migrated_curve_paints_on_note() {
+    fn v105_migrated_curve_paints_on_note() {
         // "Old projects show their previous bends on the notes": a legacy
         // in-note glide segment migrates to the note's curve (pb-2 engine)
         // and is PAINTED as a trail on the note body (green unselected).
-        let mut app = headless_app("v102migpaint");
+        let mut app = headless_app("v105migpaint");
         let ctx = egui::Context::default();
         v52_roll_rig(&mut app, &ctx);
         {
@@ -48889,7 +48993,7 @@ mod tests {
     }
 
     #[test]
-    fn v102_rdp_simplify_contract() {
+    fn v105_rdp_simplify_contract() {
         // Unit floor for the commit-time simplifier: collinear wobble
         // within eps collapses to the line; a real peak survives.
         let wob = vec![(0.0f32, 0.0f32), (0.25, 3.0), (0.5, -2.0), (0.75, 1.0), (1.0, 0.0)];
@@ -49160,7 +49264,7 @@ mod tests {
             bend: None,});
         }
         frame(&mut app, &ctx, vec![]);
-        // v102 RETARGET: the glide lane closed onto the notes, so the
+        // v105 RETARGET: the glide lane closed onto the notes, so the
         // velocity strip now sits directly above the canvas bottom (the
         // 46 px bend-lane band is gone). Drag the pointer to HALF height
         // over the note's x span.
@@ -56183,11 +56287,12 @@ mod tests {
                 .collect()
         }
         let ui_src = prod_window(include_str!("ui.rs"));
-        // Positive: the TWO shared picker rows are live call sites.
+        // Positive: the THREE shared picker rows are live call sites
+        // (v82 pair + the v103 bend-range row — same shared picker law).
         assert_eq!(
             ui_src.matches("presetbar::picker_row(ui,").count(),
-            2,
-            "program + factory-preset rows must ride the shared picker"
+            3,
+            "program + factory-preset + bend-range rows must ride the shared picker"
         );
         assert!(
             ui_src.contains(&concat!(
@@ -58064,8 +58169,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v102\""),
-            "INTERNAL_VERSION must be bumped to v102"
+            librs.contains("INTERNAL_VERSION: &str = \"v105\""),
+            "INTERNAL_VERSION must be bumped to v105"
         );
     }
 
@@ -58942,5 +59047,80 @@ mod tests {
         );
         drop(app2);
         settle_plugin_drop();
+    }
+
+    /// v103 (card t_62c5a14e): the PARAMETERS window (Synth target)
+    /// carries a per-track bend-range picker; picking a row writes the
+    /// App table, pushes the LIVE entry (so the RT re-announces RPN0 —
+    /// plugin-side proof lives in the vsthost pins), and echoes status.
+    /// A fresh bind comes up on the track's table value (default ±2).
+    #[test]
+    fn v103_ui_bend_range_row_sets_entry_and_table() {
+        let mut app = headless_app("v103ui");
+        app.show_master = false;
+        for t in 0..MAX_LOOPS {
+            assert_eq!(app.bend_range_for(t), 2, "fresh app seeds ±2 default");
+        }
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v103ui-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join(file);
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/w6")
+                .join(file),
+            &fixture,
+        )
+        .unwrap();
+        let load = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("w6 fixture opens");
+        let entry = load.entry.clone();
+        app.land_track_synth_vst(0, entry.clone());
+        assert_eq!(entry.bend_range(), 2, "a fresh bind adopts the track default");
+        app.params_win = Some(GuiTarget::Synth(0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "bend range").is_some(),
+            "the row paints for a Synth target"
+        );
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        let combo = galley_at(&mut app, &ctx, "2 st")
+            .expect("combo shows the current range")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "5 st")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert_eq!(app.track_bend_range[0], 5, "the table holds the pick");
+        assert_eq!(entry.bend_range(), 5, "the LIVE entry got the new range");
+        assert!(
+            app.status.contains("track 1") && app.status.contains("5 st"),
+            "status echoes the change: {}",
+            app.status
+        );
+        // The combo caption now reads the new value (table is truth).
+        assert!(
+            galley_at(&mut app, &ctx, "5 st").is_some(),
+            "caption repaints at 5 st"
+        );
+        drop(app);
+        drop(entry);
+        settle_plugin_drop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::vsthost::{
@@ -1172,6 +1172,12 @@ struct RtState {
     err_streak: u32,
     dead: bool,
     note_id: i32,
+    /// v103 (card t_62c5a14e): bend-range trio — see vsthost::RtState;
+    /// same currency rule (queue() rescales roll-space 0xE0, RPN0 rides
+    /// the raw-MIDI arm of fill_events as plain CC events).
+    bend_range: std::sync::Arc<AtomicU8>,
+    bend_seen: u8,
+    bend_announced: u16,
 }
 
 const RING_CAP: usize = 64 * 1024;
@@ -1212,10 +1218,37 @@ pub struct ClapStageEntry {
     midi_drops: std::sync::Arc<AtomicU64>,
     /// v67: plugin-side preset-load reports (CLAP `clap.preset-load`).
     preset_slot: std::sync::Arc<PresetSlot>,
+    /// v103: per-track pitch-bend range (see vsthost::StageEntry).
+    bend_range: std::sync::Arc<AtomicU8>,
+    /// Test-only read-back path (fixture probe params): the params
+    /// extension captured at open. NEVER called while processing.
+    #[cfg(test)]
+    params_ext: *const ffi::ClapPluginParams,
 }
 
 unsafe impl Send for ClapStageEntry {}
 unsafe impl Sync for ClapStageEntry {}
+
+impl ClapStageEntry {
+    /// Test-only (v103, card t_62c5a14e): read a PLAIN parameter value
+    /// straight from the plugin (the fixture's probe params 4/5 record
+    /// received pitch bend / RPN-0 data). Same caller-owns-the-plugin
+    /// contract as a `process` driver — fixture pins are solo.
+    #[cfg(test)]
+    pub(crate) fn plug_value(&self, id: u32) -> Option<f64> {
+        if self.params_ext.is_null() {
+            return None;
+        }
+        let mut out = 0.0f64;
+        let ok =
+            unsafe { ((*self.params_ext).get_value)(self.plugin, id, &mut out) };
+        if ok {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
 
 impl std::fmt::Debug for ClapStageEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1243,6 +1276,25 @@ impl ClapStageEntry {
     }
 
     fn queue_msg(&self, s: &mut RtState, m: [u8; 3], pos: i64) {
+        // v103: same currency seam as vsthost::RtStageEntry::queue —
+        // roll-space bends rescale to the track range, RPN0 announces
+        // per channel before the first bend since the last change.
+        if m[0] & 0xF0 == 0xE0 {
+            let r = s.bend_range.load(Ordering::Relaxed);
+            let bit = 1u16 << (m[0] & 0x0F);
+            if s.bend_seen == u8::MAX || s.bend_announced & bit == 0 {
+                for b in crate::vsthost::rpn0_burst(m[0] & 0x0F, r) {
+                    self.push_q(s, b, pos);
+                }
+                s.bend_announced |= bit;
+            }
+            let v = crate::vsthost::bend_rescale(((m[2] as u16) << 7) | (m[1] as u16), r);
+            return self.push_q(s, [m[0], (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8], pos);
+        }
+        self.push_q(s, m, pos)
+    }
+
+    fn push_q(&self, s: &mut RtState, m: [u8; 3], pos: i64) {
         if s.pending.len() < MIDI_QUEUE_CAP {
             s.pending.push(QueuedMsg { m, pos });
         } else {
@@ -1324,10 +1376,18 @@ impl ClapStageEntry {
                 ),
                 // 0x90 with velocity 0 is note off by the classic convention.
                 0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, q.m[1], 0.0),
-                // CC / program / pressure travel as raw bytes: spec says
-                // plugins should take both forms, and every CLAP plugin on
-                // this host does.
-                0xB0 | 0xC0 | 0xD0 => self.push_midi(s, t, q.m),
+                // CC / program / pressure / pitch bend / poly AT travel as
+                // raw bytes: spec says plugins should take both forms, and
+                // every CLAP plugin on this host does. v103: pitch bend
+                // (0xE0) was MISSING here — bends were silently dropped for
+                // CLAP entirely. v104 (card t_0ab25d9a): poly aftertouch
+                // (0xA0) was the same hole one status nibble over — the MPE
+                // voice message vanished for CLAP while VST2/VST3 carried
+                // it (VST2 raw batch; VST3 0xA0 => PolyAftertouch since
+                // v42/MPE). Engine-side split (documented, decision (a)):
+                // SCRIPTED synths still have no poly-AT callback (kind-4
+                // dispatch arms drop) — follow-up feature card, not here.
+                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
                 _ => {}
             }
         }
@@ -1623,6 +1683,12 @@ impl StageEntry for ClapStageEntry {
     fn midi_drops(&self) -> u64 {
         self.midi_drops.load(Ordering::Relaxed)
     }
+    fn set_bend_range(&self, st: u8) {
+        self.bend_range.store(st.min(24), Ordering::Relaxed);
+    }
+    fn bend_range(&self) -> u8 {
+        self.bend_range.load(Ordering::Relaxed)
+    }
 
     fn take_preset_report(&self) -> Option<crate::vsthost::PresetLoadEvent> {
         self.preset_slot
@@ -1771,6 +1837,19 @@ impl StageEntry for ClapStageEntry {
             s.stage_r.copy_from_slice(&s.stage_l);
             s.stage_ol.fill(0.0);
             s.stage_or.fill(0.0);
+            // v103: adopt range change, announce eagerly on ch0 (see the
+            // vsthost process_inner twin for the full contract).
+            let br = s.bend_range.load(Ordering::Relaxed);
+            if br != s.bend_seen {
+                if s.bend_seen != u8::MAX {
+                    s.bend_announced = 0;
+                }
+                for m in crate::vsthost::rpn0_burst(0, br) {
+                    self.push_q(s, m, s.abs_processed);
+                }
+                s.bend_announced |= 1;
+                s.bend_seen = br;
+            }
             // SAFETY: audio thread only; `s` is the single live RtState.
             unsafe { self.process_block(s) };
             s.abs_processed += VST_BLOCK as i64;
@@ -2095,6 +2174,7 @@ pub(crate) fn open_unlocked(
     };
     outbuf_data.slots.resize_with(OUT_RING, EvSlot::default);
 
+    let bend_range = std::sync::Arc::new(AtomicU8::new(crate::vsthost::DEFAULT_BEND_RANGE));
     let st = RtState {
         in_ring: FxRing::with_capacity(RING_CAP),
         out_ring: FxRing::with_capacity(RING_CAP),
@@ -2142,6 +2222,9 @@ pub(crate) fn open_unlocked(
         err_streak: 0,
         dead: false,
         note_id: 0,
+        bend_range: bend_range.clone(),
+        bend_seen: u8::MAX,
+        bend_announced: 0,
     };
     // Wire the self-referential pointers now (RtState lives in an
     // UnsafeCell and is NEVER moved afterwards).
@@ -2162,6 +2245,9 @@ pub(crate) fn open_unlocked(
         in_ports,
         midi_drops: std::sync::Arc::new(AtomicU64::new(0)),
         preset_slot,
+        bend_range,
+        #[cfg(test)]
+        params_ext,
     });
     unsafe {
         let s = &mut *std::sync::Arc::get_mut(&mut e).unwrap().state.get();
@@ -2343,7 +2429,11 @@ pub(crate) mod tests {
     fn v34_clap_open_reads_normalized_params() {
         let e = fixture_entry("gain");
         // v67: fixture-gain gained `fixload` (the preset-load trigger) - 3.
-        assert_eq!(e.descs().len(), 3);
+        // v103: +2 HIDDEN probe params (bend currency) - 5.
+        // v104: +3 HIDDEN probe params (poly-AT observer, card t_0ab25d9a) - 8.
+        // Hidden params stay in descs (v66 doctrine: the mirror must keep
+        // them); they are NOT writable, so no new knobs appear in any window.
+        assert_eq!(e.descs().len(), 8);
         assert_eq!(e.descs()[0].name, "fixgain");
         // plain default 1.0 on [0,1] normalizes to 1.0
         assert!((e.descs()[0].default - 1.0).abs() < 1e-6);
@@ -2679,5 +2769,61 @@ pub(crate) mod tests {
         //  NOT reentrant; taking it here too would self-deadlock.)
         let err = open(&p, Some("com.slooper.nope"), 48_000, None, None).unwrap_err();
         assert!(err.contains("com.slooper.nope"), "{err}");
+    }
+
+    /// v103 (card t_62c5a14e): pitch bend must REACH a CLAP plugin at the
+    /// track's announced range. Pre-v103 the 0xE0 status had NO arm in
+    /// fill_events — bends were silently dropped for CLAP entirely, so
+    /// BOTH asserts are red pre-fix (bend param stays 0, RPN param 0).
+    /// The fixture records raw-MIDI pitch bend into hidden param 4 and
+    /// the RPN-0 data MSB (while slot 0/0) into hidden param 5.
+    #[test]
+    fn v103_clap_pitch_bend_reaches_plugin() {
+        let e = fixture_entry("gain");
+        e.set_bend_range(4);
+        assert_eq!(e.bend_range(), 4, "the entry adopts the track range");
+        let mut out = vec![0.0f32; 1536]; // 3 CLAP blocks
+        // +3 st on ch0 (midipat law: raw 10240).
+        let raw = 10240u16;
+        let ev = vec![(0usize, [0xE0u8, (raw & 0x7F) as u8, (raw >> 7) as u8])];
+        e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
+        let got = e.plug_value(4).expect("probe-bend param reads back");
+        let want = crate::vsthost::bend_rescale(raw, 4) as f64;
+        assert!(
+            (got - want).abs() < 0.5,
+            "rescaled bend reaches the plugin: got {got}, want {want}"
+        );
+        let rpn = e.plug_value(5).expect("probe-rpn param reads back");
+        assert_eq!(rpn, 4.0, "RPN0 data-MSB = the range the plugin was told");
+        assert_eq!(e.midi_drops(), 0, "the burst never overflows the queue");
+    }
+
+    /// v104 (card t_0ab25d9a): poly aftertouch must REACH a CLAP plugin.
+    /// Pre-fix the fill_events match armed 0x90/0x80/0xB0/0xC0/0xD0/0xE0
+    /// and 0xA0 fell through `_ => {}` — the exact v103 0xE0 failure class
+    /// one status nibble over: poly-AT (the core MPE voice message) was
+    /// silently dropped for CLAP entirely. ALL asserts are red pre-fix
+    /// (count stays 0). The fixture records the raw 0xA0 into hidden
+    /// probe params 6 (count), 7 ((ch<<8)|note), 8 (pressure).
+    #[test]
+    fn v104_clap_poly_at_reaches_plugin() {
+        let e = fixture_entry("gain");
+        assert_eq!(e.plug_value(6), Some(0.0), "fresh instance saw no poly-AT");
+        let mut out = vec![0.0f32; 1536]; // 3 CLAP blocks
+        // ch2, note 64, pressure 100.
+        let ev = vec![(0usize, [0xA2u8, 64, 100])];
+        e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
+        assert_eq!(
+            e.plug_value(6),
+            Some(1.0),
+            "the 0xA0 reached the plugin's event list (pre-v104: dropped)"
+        );
+        assert_eq!(
+            e.plug_value(7),
+            Some(((2 << 8) | 64) as f64),
+            "channel + note preserved"
+        );
+        assert_eq!(e.plug_value(8), Some(100.0), "pressure preserved");
+        assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
     }
 }
