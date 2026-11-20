@@ -1923,6 +1923,117 @@ mod tests {
         );
     }
 
+    // v101 (pb-2): THE render A/B pin the pb-1 spike promised — a
+    // per-note PITCH CURVE (control points, not a hand-fed sweep) must
+    // drive the scripted render through the real bake → kind-5 lane →
+    // ABI v2 path. Both polarities: curve ON vs no curve (flat control
+    // with identical timing), plus shape proof: the curve bows UP to
+    // +12 st mid-note and back DOWN by the end — a linear-sweep
+    // regression would raise the LATE window, this must raise the MID
+    // one and drop below flat at the end.
+
+    fn v101_curve_render(reg: &crate::synth::Registry, synth: &str, note: u8, curved: bool) -> Vec<f32> {
+        let mut pat = crate::midipat::Pattern::new(120);
+        if curved {
+            pat.note_bends.push(crate::midipat::NoteBend::new(vec![
+                (0.0, -1200.0),
+                (0.5, 1200.0),
+                (1.0, -1200.0),
+            ]));
+        }
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note,
+            vel: 110,
+            press: 0,
+            start: 0,
+            len: 960,
+            bend: if curved { Some(0) } else { None },
+        });
+        pat.bake_bends();
+        assert_eq!(pat.bends.is_empty(), !curved, "bake must fill the lane from the curve");
+        let inst = reg
+            .create_instance(synth, 48_000.0, if synth == "sampler" { &[0.0, 48.0, 1.0] } else { &[] })
+            .expect("scripted instance");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, note, 110u8)];
+        for b in pat.bends.iter() {
+            ev.push((
+                pat.ticks_to_samples(b.at, 48_000),
+                5u8,
+                0u8,
+                (b.val & 0x7F) as u8,
+                ((b.val >> 7) & 0x7F) as u8,
+            ));
+        }
+        ev.push((47_000, 0, 0, note, 0));
+        let mut out = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    #[test]
+    fn v101_pitch_curve_drives_scripted_sampler_render() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let flat = v101_curve_render(&reg, "sampler", 48, false);
+        let curve = v101_curve_render(&reg, "sampler", 48, true);
+        assert_ne!(flat, curve, "per-note pitch curve never reached the scripted sampler render");
+        let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
+        // MID window (t .40-.60): curve peaks at +12 st there -> ~2x flat.
+        let (mf, mc) = (win(&flat, 19_200, 28_800), win(&curve, 19_200, 28_800));
+        // END window (t .80-1.0): curve is back at -12 st -> ~0.5x flat.
+        let (ef, ec) = (win(&flat, 38_400, 48_000), win(&curve, 38_400, 48_000));
+        eprintln!("v101 A/B sampler: mid {mf} -> {mc} ({:.3}x), end {ef} -> {ec} ({:.3}x)", mc / mf, ec / ef);
+        assert!(mf >= 30.0, "flat control must carry cycles: {mf}");
+        assert!(mc / mf > 1.5, "MID must climb ~2x: got {:.3}", mc / mf);
+        // MEASURED ladder: end window averages 0.725x (window mean of a
+        // down-ramp, not the endpoint math) — flat regression = 1.0.
+        assert!(ec / ef < 0.80, "END must fall below flat (~0.72x measured): got {:.3}", ec / ef);
+    }
+
+    #[test]
+    fn v101_pitch_curve_shape_not_a_linear_sweep() {
+        // Same harness, the SHAPE polarity: a plain 0->+12 linear sweep
+        // raises the late window; our up-and-down curve must raise MID
+        // AND pull the end BELOW flat. A bake that ignored the middle
+        // control point (e.g. first/last-only linear) fails this.
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let curve = v101_curve_render(&reg, "sampler", 48, true);
+        let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
+        let (mc, ec) = (win(&curve, 19_200, 28_800), win(&curve, 38_400, 48_000));
+        eprintln!("v101 shape sampler: mid {mc} end {ec} ratio {:.3}", ec / mc);
+        assert!(ec / mc < 0.45, "END must fall well below MID (dome shape): got {:.3}", ec / mc);
+    }
+
+    #[test]
+    fn v101_pitch_curve_drives_bundled_piano_render() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let flat = v101_curve_render(&reg, "piano", 57, false);
+        let curve = v101_curve_render(&reg, "piano", 57, true);
+        assert_ne!(flat, curve, "pitch curve never reached the bundled piano render");
+        let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
+        let (mf, mc) = (win(&flat, 19_200, 28_800), win(&curve, 19_200, 28_800));
+        eprintln!("v101 A/B piano: mid {mf} -> {mc} ({:.3}x)", mc / mf);
+        assert!(mf >= 20.0, "piano must sound in the measure window: {mf}");
+        assert!(mc / mf > 1.3, "curve must raise the piano's mid-window pitch: got {:.3}", mc / mf);
+    }
+
     #[test]
     fn v100_poly_aftertouch_still_dropped_cleanly() {
         // Guard for the OTHER half of the old `4 | 5 => {}` arm: per-note
