@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub use crate::synth_api::{
-    SynthAssetV1, SynthHostV1, SynthInfoV1, SynthParamV1, SLOOPER_MAX_SYNTH_PARAMS,
-    SLOOPER_SYNTH_ABI,
+    SynthAssetV1, SynthHostV1, SynthInfoV1, SynthInfoV2, SynthParamV1, SLOOPER_MAX_SYNTH_PARAMS,
+    SLOOPER_SYNTH_ABI, SLOOPER_SYNTH_ABI_V2,
 };
 
 pub const MAX_PARAMS: usize = SLOOPER_MAX_SYNTH_PARAMS;
@@ -244,6 +244,10 @@ struct SynthFns {
     cc: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, num: u8, val: u8),
     press: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, val: u8),
     process: extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
+    /// v100 (card t_52aa65b1): pitch-bend callback if the script declares
+    /// a SynthInfoV2 table (`slooper_synth_info_v2`). None = ABI v1 script:
+    /// `Instance::bend` is a no-op, exactly the pre-v100 drop.
+    bend: Option<extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32)>,
 }
 
 /// Library handle that is NEVER dlclosed — see the identical comment in
@@ -447,6 +451,16 @@ impl Instance {
     pub fn press(&self, ch: u8, val: u8) {
         let _g = InstGuard::enter(self);
         (self.fns.press)(self.state, ch, val)
+    }
+    /// v100 (card t_52aa65b1): channel pitch bend in SEMITONES (roll space:
+    /// a full 14-bit deflection = ±12 st, `midipat::BEND_FULL_ST`). Routed
+    /// live/RT, offline-bounce and both audition paths. ABI v1 scripts have
+    /// no callback — the call is a no-op for them (the historic drop).
+    pub fn bend(&self, ch: u8, st: f32) {
+        if let Some(f) = self.fns.bend {
+            let _g = InstGuard::enter(self);
+            f(self.state, ch, st)
+        }
     }
 
     /// Render `out.len()` samples (OUT IS ACCUMULATED INTO — the plugin
@@ -784,6 +798,20 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
     if nulls > 0 {
         return reject(format!("{nulls} callback pointer(s) are null"));
     }
+    // v100 (card t_52aa65b1): OPTIONAL ABI v2 entry point — the fx ABI
+    // ladder is the precedent (v2 scripts export BOTH symbols; the host
+    // probes the newer one). A missing, null or mis-stamped v2 export
+    // degrades silently to "no bend", i.e. the v1 behavior.
+    let mut bend: Option<extern "C" fn(*mut core::ffi::c_void, u8, f32)> = None;
+    if let Ok(sym2) = lib.get::<extern "C" fn() -> *const SynthInfoV2>(b"slooper_synth_info_v2\0") {
+        let i2 = sym2();
+        if !i2.is_null() {
+            let d2 = unsafe { &*i2 };
+            if d2.abi == SLOOPER_SYNTH_ABI_V2 && d2.bend as usize != 0 {
+                bend = Some(d2.bend);
+            }
+        }
+    }
     let params = (0..d.n_params as usize)
         .filter(|_| !d.params.is_null())
         .map(|k| unsafe { &*d.params.add(k) })
@@ -809,6 +837,7 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
         cc: d.cc,
         press: d.press,
         process: d.process,
+        bend,
     };
     SynthEntry {
         stem: stem.to_string(),
