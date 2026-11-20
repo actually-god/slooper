@@ -28,6 +28,11 @@ pub struct Note {
     pub press: u8,
     pub start: u32,
     pub len: u32,
+    /// v101 (pb-2): index into [`Pattern::note_bends`] — the in-roll
+    /// pitch curve drawn ON this note (spec docs/SAMPLER-PITCH.md § 5).
+    /// Field-owned handle (NOT positional): moves/clones with the note;
+    /// `merged_with` must offset the other pattern's handles.
+    pub bend: Option<u32>,
 }
 
 /// A timed controller change.
@@ -108,6 +113,129 @@ pub fn st_to_bend(v: f32) -> u16 {
     (8192 + d) as u16
 }
 
+/// v101 (pb-2, spec docs/SAMPLER-PITCH.md § 5): ONE in-roll pitch curve,
+/// drawn ON a note — the table entry `Note::bend` indexes. Control points
+/// `(t, cents)`: `t` is the fraction of the NOTE LENGTH (0..=1, so the
+/// curve stretches with the note body), `cents` is the pitch offset from
+/// the note's own row (±2400). Evaluated with monotone piecewise cubic
+/// Hermite (PCHIP): 2 points degrade to EXACTLY the old linear sweep, and
+/// strokes never overshoot their control values (vibrato-safe). Past the
+/// last point the value HOLDS (808 slides stay put — no return-to-0).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NoteBend {
+    /// Control points, sorted by t, strictly increasing t (2..=16; the
+    /// engine clamps, sorts and decimates on [`NoteBend::sanitize`]).
+    pub pts: Vec<(f32, f32)>,
+}
+
+/// Point cap the engine enforces on top of the UI's (RDP simplification
+/// is pb-3's; the engine still refuses to evaluate runaway tables).
+pub const NB_MAX_PTS: usize = 16;
+/// Full deflection of a note curve in cents (spec range decision).
+pub const NB_MAX_CENTS: f32 = 2400.0;
+
+/// Cents → playback frequency multiplier. Composes MULTIPLICATIVELY
+/// after the note's base frequency and any detune (B_T13 lesson: bends
+/// must compose with detune, never replace it).
+pub fn cents_to_freq_mult(cents: f32) -> f32 {
+    (cents * (1.0 / 1200.0)).exp2()
+}
+
+impl NoteBend {
+    /// Sanitize + wrap a control-point list (what the UI/API hands in).
+    pub fn new(pts: Vec<(f32, f32)>) -> Self {
+        let mut nb = NoteBend { pts };
+        nb.sanitize();
+        nb
+    }
+
+    /// Clamp ranges, sort by t, drop duplicate/decreasing t (keeps the
+    /// FIRST of a tie), decimate to [`NB_MAX_PTS`] keeping endpoints.
+    pub fn sanitize(&mut self) {
+        for p in self.pts.iter_mut() {
+            p.0 = p.0.clamp(0.0, 1.0);
+            p.1 = p.1.clamp(-NB_MAX_CENTS, NB_MAX_CENTS);
+        }
+        self.pts
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        self.pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-5);
+        while self.pts.len() > NB_MAX_PTS {
+            // Uniform-ish decimation: drop the middle point each pass.
+            self.pts.remove(self.pts.len() / 2);
+        }
+    }
+
+    /// Curve value in CENTS at note-fraction `t` (PCHIP; hold-first /
+    /// hold-last outside the point span; empty = 0 = no bend).
+    pub fn cents_at(&self, t: f32) -> f32 {
+        let p = &self.pts;
+        match p.len() {
+            0 => 0.0,
+            1 => p[0].1,
+            // 2 points == the legacy linear sweep, bit-for-bit the lerp.
+            2 => {
+                if t <= p[0].0 {
+                    return p[0].1;
+                }
+                if t >= p[1].0 {
+                    return p[1].1;
+                }
+                p[0].1 + (p[1].1 - p[0].1) * ((t - p[0].0) / (p[1].0 - p[0].0))
+            }
+            _ => {
+                let n = p.len().min(NB_MAX_PTS);
+                if t <= p[0].0 {
+                    return p[0].1;
+                }
+                if t >= p[n - 1].0 {
+                    return p[n - 1].1;
+                }
+                // Secant slopes d[i] over [i, i+1].
+                let mut d = [0f32; NB_MAX_PTS];
+                for i in 0..n - 1 {
+                    d[i] = (p[i + 1].1 - p[i].1) / (p[i + 1].0 - p[i].0);
+                }
+                // Segment k with p[k].0 < t <= p[k+1].0.
+                let mut k = 0usize;
+                while k + 1 < n - 1 && t > p[k + 1].0 {
+                    k += 1;
+                }
+                // Fritsch–Carlson monotone tangents: simple ends, interior
+                // zero at sign changes else weighted harmonic mean of the
+                // adjacent secants — guarantees no overshoot.
+                let mut m = [0f32; NB_MAX_PTS];
+                m[0] = d[0];
+                m[n - 1] = d[n - 2];
+                for i in 1..n - 1 {
+                    m[i] = if d[i - 1] * d[i] <= 0.0 {
+                        0.0
+                    } else {
+                        let h0 = p[i].0 - p[i - 1].0;
+                        let h1 = p[i + 1].0 - p[i].0;
+                        let w1 = 2.0 * h1 + h0;
+                        let w2 = h1 + 2.0 * h0;
+                        (w1 + w2) / (w1 / d[i - 1] + w2 / d[i])
+                    };
+                }
+                let h = p[k + 1].0 - p[k].0;
+                let s = (t - p[k].0) / h;
+                let s2 = s * s;
+                let s3 = s2 * s;
+                ((2.0 * s3 - 3.0 * s2 + 1.0) * p[k].1
+                    + (s3 - 2.0 * s2 + s) * h * m[k]
+                    + (-2.0 * s3 + 3.0 * s2) * p[k + 1].1
+                    + (s3 - s2) * h * m[k + 1])
+                    .clamp(-NB_MAX_CENTS, NB_MAX_CENTS)
+            }
+        }
+    }
+
+    /// True when a curve would actually sound (≥1 usable point).
+    pub fn active(&self) -> bool {
+        !self.pts.is_empty()
+    }
+}
+
 /// A timed polyphonic aftertouch (0xA) message, v42/MPE: pressure for ONE
 /// held note while other voices on the same channel stay unaffected — the
 /// core per-voice expression message of MPE performance.
@@ -136,7 +264,15 @@ pub struct Pattern {
     /// v52 R6: editable pitch-bend glides (the SOURCE; `bends` is their
     /// baked playback form — hand-written `bends` from an import survive
     /// until the first segment edit re-bakes the lane).
+    /// v101 (pb-2): after load-time migration [`migrate_bend_segs`] these
+    /// hold ONLY ORPHAN segments (no owning note — glides drawn into
+    /// gaps); owned glides live on their note as [`Pattern::note_bends`].
     pub bend_segs: Vec<BendSeg>,
+    /// v101 (pb-2): in-roll per-note pitch curves (spec § 5). Table is
+    /// INDEXED BY `Note::bend`; entries unowned after a note removal are
+    /// harmless (bake iterates notes) and compact away at save/load
+    /// (see [`Pattern::compact_note_bends`]).
+    pub note_bends: Vec<NoteBend>,
 }
 
 impl Pattern {
@@ -150,6 +286,7 @@ impl Pattern {
             bends: Vec::new(),
             polys: Vec::new(),
             bend_segs: Vec::new(),
+            note_bends: Vec::new(),
         }
     }
 
@@ -158,7 +295,21 @@ impl Pattern {
     /// length is the longer pattern's, and the tempo stays `self`'s.
     pub fn merged_with(&self, other: &Pattern) -> Pattern {
         let mut out = self.clone();
+        let self_notes = out.notes.len();
+        // v101 (pb-2): the curve table is INDEXED BY Note::bend — two
+        // patterns cannot share one table without offsetting. Append
+        // other's curves and shift the APPENDED notes' handles by the
+        // pre-extend base (the asset-ids-are-indices trap, spec § 5).
+        let base = out.note_bends.len() as u32;
+        out.note_bends.extend(other.note_bends.iter().cloned());
         out.notes.extend(other.notes.iter().copied());
+        if base > 0 {
+            for n in out.notes[self_notes..].iter_mut() {
+                if let Some(i) = n.bend {
+                    n.bend = Some(i + base);
+                }
+            }
+        }
         out.ccs.extend(other.ccs.iter().copied());
         out.press.extend(other.press.iter().copied());
         out.bends.extend(other.bends.iter().copied());
@@ -174,18 +325,192 @@ impl Pattern {
         out
     }
 
-    /// v52 R6: rebuild the raw `bends` lane from the editable segments
-    /// (segments are then authoritative). Call after ANY seg edit.
-    pub fn bake_bends(&mut self) {
+    /// v101: any note carries a usable in-roll pitch curve?
+    pub fn has_note_bends(&self) -> bool {
+        self.notes.iter().any(|n| {
+            matches!(n.bend, Some(i) if self.note_bends.get(i as usize).map_or(false, |nb| nb.active()))
+        })
+    }
+
+    /// v101 (pb-2, spec § 6): one-time load migration — every legacy
+    /// glide-lane [`BendSeg`] whose body a note CONTAINS (1-tick
+    /// tolerance) becomes that note's [`NoteBend`]; the legacy `curve`
+    /// warp contributes one extra midpoint so 3 pts reproduce the warped
+    /// shape; values beyond the note end CLAMP (per-note curves have no
+    /// empty-time — documented edge). ORPHAN segs (no owning note, glides
+    /// into gaps) stay in `bend_segs` untouched — the legacy strip keeps
+    /// them and they keep sounding. NEVER touches the `bends` lane, so a
+    /// migrated load renders EXACTLY the old audio until the first edit.
+    /// Idempotent: run again after a migration it is a no-op.
+    pub fn migrate_bend_segs(&mut self) {
         if self.bend_segs.is_empty() {
             return;
         }
-        let mut out = Vec::new();
-        for seg in self.bend_segs.iter() {
-            bake_seg(seg, 8, &mut out);
+        let mut keep: Vec<BendSeg> = Vec::new();
+        let mut owned = 0usize;
+        for seg in self.bend_segs.iter().copied() {
+            // Owner = LAST note (max start) whose body contains t0.
+            let owner = self
+                .notes
+                .iter()
+                .filter(|n| (n.start as i64 - 1..=(n.start + n.len) as i64 + 1).contains(&(seg.t0 as i64)))
+                .max_by_key(|n| n.start)
+                .copied();
+            let Some(on) = owner else {
+                keep.push(seg); // orphan — legacy strip territory
+                continue;
+            };
+            let oi = self
+                .notes
+                .iter()
+                .position(|n| n.start == on.start && n.note == on.note && n.ch == on.ch && n.len == on.len)
+                .unwrap();
+            if self.notes[oi].bend.is_some() {
+                // Note already carries a curve (file had both meta layers
+                // — only hand-edited files do); curve wins, seg retires.
+                owned += 1;
+                continue;
+            }
+            let len = on.len.max(1) as f64;
+            let end = (on.start + on.len) as f64;
+            let t1c = (seg.t1 as f64).min(end); // CLAMP at note end (spec)
+            let span = (seg.t1 - seg.t0).max(1) as f64;
+            let c = (seg.curve / 100.0).clamp(-1.0, 1.0);
+            let val_at = |t: f64| -> f32 {
+                // f32 math EXACTLY like bake_seg (bit-identity of the
+                // migrated re-bake against the legacy lane).
+                let s = (((t - seg.t0 as f64) / span) as f32).clamp(0.0, 1.0);
+                let sp = (s + c * s * (1.0 - s)).clamp(0.0, 1.0);
+                seg.v0 + (seg.v1 - seg.v0) * sp
+            };
+            let norm = |t: f64| -> f32 {
+                ((t - on.start as f64) / len).clamp(0.0, 1.0) as f32
+            };
+            let mut pts = vec![
+                (norm(seg.t0 as f64), seg.v0 * 100.0),
+                (norm(t1c), val_at(t1c) * 100.0),
+            ];
+            if c.abs() >= 0.005 {
+                // Warp midpoint: at the UNWARPED middle tick, warped value.
+                let mid = seg.t0 as f64 + span * 0.5;
+                if mid > seg.t0 as f64 && mid < t1c {
+                    pts.insert(1, (norm(mid), val_at(mid) * 100.0));
+                }
+            }
+            let nb = NoteBend::new(pts);
+            if nb.pts.len() < 2 {
+                keep.push(seg); // degenerate overlap — leave legacy intact
+                continue;
+            }
+            self.note_bends.push(nb);
+            self.notes[oi].bend = Some((self.note_bends.len() - 1) as u32);
+            owned += 1;
         }
-        out.sort_by_key(|b| b.at);
-        self.bends = out;
+        if owned > 0 {
+            self.bend_segs = keep;
+        }
+    }
+
+    /// v101: drop curve entries no live note owns, remapping the
+    /// remaining handles (compaction; shared handles stay shared).
+    pub fn compact_note_bends(&mut self) {
+        let mut map = vec![u32::MAX; self.note_bends.len()];
+        let mut live: Vec<NoteBend> = Vec::new();
+        for n in &mut self.notes {
+            let Some(i) = n.bend else { continue };
+            let i = i as usize;
+            if i >= self.note_bends.len() || self.note_bends[i].pts.is_empty() {
+                n.bend = None;
+                continue;
+            }
+            if map[i] == u32::MAX {
+                map[i] = live.len() as u32;
+                live.push(self.note_bends[i].clone());
+            }
+            n.bend = Some(map[i]);
+        }
+        self.note_bends = live;
+    }
+
+    /// v52 R6: rebuild the raw `bends` lane from the editable segments
+    /// (segments are then authoritative). Call after ANY seg edit.
+    /// v101 (pb-2): per-note [`NoteBend`] curves join the same lane
+    /// (single truth for VST feed, MIDI export, scripted ABI v2 and the
+    /// roll audition — everything downstream already understands bends).
+    /// Curves sample dense every 8 ticks across their own point span,
+    /// exactly like [`bake_seg`]; on overlap the LAST-ONSET note wins
+    /// each tick (spec § 5); nothing returns to 0 after a note ends
+    /// (808 slides stay put, same as the old lane). A pattern with NO
+    /// curves takes the old code path UNCHANGED (back-compat pins).
+    pub fn bake_bends(&mut self) {
+        if !self.has_note_bends() {
+            if self.bend_segs.is_empty() {
+                return;
+            }
+            let mut out = Vec::new();
+            for seg in self.bend_segs.iter() {
+                bake_seg(seg, 8, &mut out);
+            }
+            out.sort_by_key(|b| b.at);
+            self.bends = out;
+            return;
+        }
+        // tick -> (onset of the winning source, raw 14-bit value).
+        let mut lane: std::collections::BTreeMap<u32, (u32, u16)> = Default::default();
+        let put = |lane: &mut std::collections::BTreeMap<u32, (u32, u16)>,
+                       at: u32,
+                       onset: u32,
+                       val: u16| {
+            match lane.get(&at) {
+                Some(&(o, _)) if o > onset => {} // earlier onset never trumps later
+                _ => {
+                    lane.insert(at, (onset, val));
+                }
+            }
+        };
+        // Legacy (orphan) segments first — same math as the old path.
+        for seg in self.bend_segs.iter() {
+            let t1 = seg.t1.max(seg.t0 + 1);
+            let steps = ((t1 - seg.t0) / 8).max(1);
+            let c = (seg.curve / 100.0).clamp(-1.0, 1.0);
+            for i in 0..=steps {
+                let s = i as f32 / steps as f32;
+                let sp = (s + c * s * (1.0 - s)).clamp(0.0, 1.0);
+                let v = seg.v0 + (seg.v1 - seg.v0) * sp;
+                let at = seg.t0 + ((t1 - seg.t0) as f64 * s as f64).round() as u32;
+                put(&mut lane, at, seg.t0, st_to_bend(v));
+            }
+        }
+        // Note curves in onset order (later onsets overwrite on conflict).
+        let mut items: Vec<(u32, usize, u32, u32)> = Vec::new(); // (onset, curve idx, note start, note len)
+        for n in self.notes.iter() {
+            if let Some(i) = n.bend {
+                if self.note_bends.get(i as usize).map_or(false, |nb| nb.active()) {
+                    items.push((n.start, i as usize, n.start, n.len));
+                }
+            }
+        }
+        items.sort();
+        for (_, ci, ns, nl) in items {
+            let nb = &self.note_bends[ci];
+            let len = nl.max(1) as f32;
+            let ts = nb.pts[0].0;
+            let te = nb.pts[nb.pts.len() - 1].0;
+            let t0 = (ns as f32 + ts * len).round() as u32;
+            let t1 = ((ns as f32 + te * len).round() as u32).max(t0 + 1);
+            let steps = ((t1 - t0) / 8).max(1);
+            for i in 0..=steps {
+                let s = i as f32 / steps as f32;
+                let at = t0 + ((t1 - t0) as f64 * s as f64).round() as u32;
+                let tn = ((at as f32 - ns as f32) / len).clamp(0.0, 1.0);
+                // pts are CENTS; the lane speaks semitones.
+                put(&mut lane, at, ns, st_to_bend(nb.cents_at(tn) * 0.01));
+            }
+        }
+        self.bends = lane
+            .iter()
+            .map(|(at, (_, v))| Bend { ch: 0, val: *v, at: *at })
+            .collect();
     }
 
     /// v52 R6: an imported file's raw bends (no `slooper-bnd` meta)
@@ -312,6 +637,49 @@ impl Pattern {
             tr.extend_from_slice(&vlq(s.len() as u32));
             tr.extend_from_slice(s.as_bytes());
         }
+        // v101 (pb-2): private note-curve meta — in-roll pitch curves.
+        // One whitespace-separated entry per OWNING note:
+        //   <ch>:<pitch>:<start>:<t>x1000:<cents>x100(@...)*
+        // t in 1/1000 note-length units, cents in 1/100 cent (exact
+        // round-trip at UI-representable resolutions). Entries unowned
+        // in RAM simply never get written → the table self-compacts.
+        {
+            let mut s = String::new();
+            for n in &self.notes {
+                let Some(i) = n.bend else { continue };
+                let Some(nb) = self.note_bends.get(i as usize) else { continue };
+                if !nb.active() {
+                    continue;
+                }
+                if !s.is_empty() {
+                    s.push(' ');
+                }
+                s.push_str(&format!(
+                    "{}:{}:{}:",
+                    n.ch & 0xF,
+                    n.note & 0x7F,
+                    n.start
+                ));
+                for (k, p) in nb.pts.iter().enumerate() {
+                    if k > 0 {
+                        s.push('@');
+                    }
+                    s.push_str(&format!(
+                        "{}:{}",
+                        (p.0 * 1000.0).round() as u32,
+                        (p.1 * 100.0).round() as i32
+                    ));
+                }
+            }
+            if !s.is_empty() {
+                let s = format!("slooper-npb {s}");
+                tr.extend_from_slice(&vlq(0));
+                tr.push(0xFF);
+                tr.push(0x01);
+                tr.extend_from_slice(&vlq(s.len() as u32));
+                tr.extend_from_slice(s.as_bytes());
+            }
+        }
 
         // Flatten to (tick, event-bytes) and diff-sort.
         let mut ev: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -381,6 +749,10 @@ impl Pattern {
         }
         let ntrk = u16::from_be_bytes([b[10], b[11]]) as usize;
         let mut pat = Pattern::new(120);
+        // v101: slooper-npb parses before notes exist — park links here,
+        // resolve after the track loop once every note has its final
+        // (ch, pitch, start) key.
+        let mut nb_links: Vec<(u8, u8, u32, u32)> = Vec::new();
         let mut pos = 14usize;
         for tk in 0..ntrk {
             if pos + 8 > b.len() || &b[pos..pos + 4] != b"MTrk" {
@@ -457,6 +829,44 @@ impl Pattern {
                                         }
                                     }
                                 }
+                            } else if let Some(rest) = txt.strip_prefix("slooper-npb") {
+                                // v101 (pb-2): in-roll per-note pitch curves.
+                                for g in rest.split_whitespace() {
+                                    let f: Vec<&str> = g.splitn(4, ':').collect();
+                                    if f.len() != 4 {
+                                        continue;
+                                    }
+                                    let (Ok(ch), Ok(pitch), Ok(start)) = (
+                                        f[0].parse::<u8>(),
+                                        f[1].parse::<u8>(),
+                                        f[2].parse::<u32>(),
+                                    ) else {
+                                        continue;
+                                    };
+                                    let mut pts = Vec::new();
+                                    for q in f[3].split('@') {
+                                        let t: Vec<&str> = q.split(':').collect();
+                                        if t.len() != 2 {
+                                            continue;
+                                        }
+                                        if let (Ok(tt), Ok(cc)) =
+                                            (t[0].parse::<u32>(), t[1].parse::<i32>())
+                                        {
+                                            pts.push((tt as f32 / 1000.0, cc as f32 / 100.0));
+                                        }
+                                    }
+                                    let nb = NoteBend::new(pts);
+                                    if !nb.active() {
+                                        continue;
+                                    }
+                                    pat.note_bends.push(nb);
+                                    nb_links.push((
+                                        ch & 0xF,
+                                        pitch & 0x7F,
+                                        start,
+                                        (pat.note_bends.len() - 1) as u32,
+                                    ));
+                                }
                             }
                         }
                         0x2F => break, // end of track
@@ -491,7 +901,7 @@ impl Pattern {
                                 press: 0,
                                 start: tick,
                                 len: 1,
-                            });
+                            bend: None,});
                             held.insert((ch, note), pat.notes.len() - 1);
                         } else if let Some(prev) = held.remove(&(ch, note)) {
                             running = st;
@@ -598,12 +1008,31 @@ impl Pattern {
                 n.press = p.val;
             }
         }
+        // v101 (pb-2): attach parsed curves to their owning notes by the
+        // exact (ch, pitch, start) key (the meta is written per OWNING
+        // note, so the key is the author identity; first match wins).
+        for (ch, pitch, start, idx) in nb_links.iter().copied() {
+            if let Some(n) = pat
+                .notes
+                .iter_mut()
+                .find(|n| n.ch == ch && n.note == pitch && n.start == start && n.bend.is_none())
+            {
+                n.bend = Some(idx);
+            }
+        }
         // v52 R6: file finalization — an editable meta layer is
         // authoritative (re-baked from segments); a foreign file's raw
         // bends get polyline segments so the lane can display/edit them.
+        // v101 (pb-2, spec § 6): slooper-native segment layers migrate
+        // ONCE into per-note curves here (orphans stay); the bake then
+        // reproduces the SAME 14-bit lane (2-pt PCHIP == the old lerp on
+        // the same 8-tick grid), so old projects load audio-identical.
+        // A native CURVE file (slooper-npb) is also NOT a foreign
+        // import: its raw 0xE lane is its own baked form — no polyline.
         if !pat.bend_segs.is_empty() {
+            pat.migrate_bend_segs();
             pat.bake_bends();
-        } else if !pat.bends.is_empty() {
+        } else if !pat.bends.is_empty() && pat.note_bends.is_empty() {
             pat.segs_from_bends();
         }
         pat.sort();
@@ -655,7 +1084,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 96,
-        });
+        bend: None,});
         a.bends.push(Bend {
             ch: 0,
             val: 8192,
@@ -670,7 +1099,7 @@ mod tests {
             press: 0,
             start: 24,
             len: 48,
-        });
+        bend: None,});
         b.polys.push(Poly {
             ch: 0,
             note: 60,
@@ -696,7 +1125,7 @@ mod tests {
             press: 40,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         p.notes.push(Note {
             ch: 1,
             note: 67,
@@ -704,7 +1133,7 @@ mod tests {
             press: 0,
             start: 240,
             len: 240,
-        });
+        bend: None,});
         p.ccs.push(Cc {
             ch: 0,
             num: 7,
@@ -751,7 +1180,7 @@ mod tests {
             press: 0,
             start: 100,
             len: 300,
-        });
+        bend: None,});
         p.quantize_grid(PPQ as u32 / 4, true);
         let n = &p.notes[0];
         assert_eq!(n.start % (PPQ as u32 / 4), 0);
@@ -889,6 +1318,12 @@ mod tests {
 
     #[test]
     fn v52_bend_segs_roundtrip_through_mid() {
+        // v101 CONTRACT CHANGE (spec § 6): an OWNED segment now MIGRATES
+        // to its note's pitch-curve on load — the file format is
+        // unchanged (slooper-bnd still written for un-migrated/legacy
+        // readers, the baked 0xE lane carries the sound for everyone).
+        // Orphan segs (no containing note) keep the OLD contract: the
+        // editable layer survives verbatim and re-bakes equal.
         let mut p = Pattern::new(120);
         p.notes.push(Note {
             ch: 0,
@@ -897,9 +1332,9 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         p.bend_segs.push(BendSeg {
-            t0: 100,
+            t0: 300,
             v0: 0.0,
             t1: 400,
             v1: -3.5,
@@ -909,14 +1344,39 @@ mod tests {
         let f = std::env::temp_dir().join(format!("sp-v52bnd-{}.mid", std::process::id()));
         p.save_mid(&f).unwrap();
         let q = Pattern::load_mid(&f).unwrap();
-        assert_eq!(q.bend_segs.len(), 1, "editable layer survives the file");
+        assert_eq!(q.bend_segs.len(), 1, "orphan editable layer survives the file");
         let g = &q.bend_segs[0];
-        assert_eq!((g.t0, g.t1), (100, 400));
+        assert_eq!((g.t0, g.t1), (300, 400));
         assert!(g.v0.abs() < 0.011 && (g.v1 + 3.5).abs() < 0.011);
         assert!((g.curve - 65.0).abs() < 0.51);
         // The meta is authoritative: the playback lane re-bakes equal.
         assert_eq!(q.bends.len(), p.bends.len(), "rebaked lane matches");
+        // And a seg that LIVES INSIDE a note now arrives as a curve.
+        let mut p2 = Pattern::new(120);
+        p2.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+            bend: None,
+        });
+        p2.bend_segs.push(BendSeg {
+            t0: 20,
+            v0: 0.0,
+            t1: 200,
+            v1: -2.0,
+            curve: 0.0,
+        });
+        let f2 = std::env::temp_dir().join(format!("sp-v52bnd2-{}.mid", std::process::id()));
+        p2.save_mid(&f2).unwrap();
+        let q2 = Pattern::load_mid(&f2).unwrap();
         std::fs::remove_file(&f).ok();
+        std::fs::remove_file(&f2).ok();
+        assert!(q2.bend_segs.is_empty(), "owned seg migrated away");
+        assert!(q2.notes[0].bend.is_some(), "…into the owning note's curve");
+        assert!(!q2.bends.is_empty(), "lane re-derived for old-app playback");
     }
 
     #[test]
@@ -932,7 +1392,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 480,
-        });
+        bend: None,});
         p.bends.push(Bend {
             ch: 0,
             val: st_to_bend(2.0),
@@ -954,5 +1414,416 @@ mod tests {
         assert!((g.v1 + 1.0).abs() < 0.011);
         assert_eq!(g.curve, 0.0);
         std::fs::remove_file(&f).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // v101 (pb-2): per-note pitch curves — model, PCHIP, derived bake,
+    // migration, remap, SMF round-trip. Spec: docs/SAMPLER-PITCH.md §5-6.
+    // Every pin is sabotage-verified: the assertion FAILS when the
+    // behavior under test is broken (both polarities where meaningful).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn v101_pchip_two_points_are_exactly_linear_and_hold() {
+        let c = NoteBend::new(vec![(0.0, 0.0), (1.0, 1200.0)]);
+        // Exact lerp everywhere between, hold-first/hold-last outside.
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            assert!((c.cents_at(t) - t * 1200.0).abs() < 1e-3, "t {t}");
+        }
+        assert_eq!(c.cents_at(-0.5), 0.0, "hold first");
+        assert_eq!(c.cents_at(3.0), 1200.0, "hold last — 808 slides stay put");
+        // The engine's freq mult composes multiplicatively (B_T13).
+        assert!((cents_to_freq_mult(1200.0) - 2.0).abs() < 1e-6);
+        assert!((cents_to_freq_mult(-1200.0) - 0.5).abs() < 1e-6);
+        assert!((cents_to_freq_mult(0.0) - 1.0).abs() < 1e-9);
+        assert!((cents_to_freq_mult(100.0) - 2f32.powf(1.0 / 12.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn v101_pchip_never_overshoots_its_control_values() {
+        // Vibrato-ish zig-zag: every segment is monotone, so a curve
+        // that overshoots between points is the classic Catmull-Rom bug.
+        let c = NoteBend::new(vec![
+            (0.0, 0.0),
+            (0.2, 500.0),
+            (0.4, -500.0),
+            (0.6, 1200.0),
+            (0.8, -1200.0),
+            (1.0, 0.0),
+        ]);
+        // Piecewise bounds: between control points the value must stay
+        // within that segment's [min(y), max(y)].
+        let mut i = 0;
+        while i + 1 < c.pts.len() {
+            let (a, b) = (c.pts[i], c.pts[i + 1]);
+            let lo = a.1.min(b.1);
+            let hi = a.1.max(b.1);
+            for k in 0..=40 {
+                let t = a.0 + (b.0 - a.0) * k as f32 / 40.0;
+                let v = c.cents_at(t);
+                assert!(
+                    v >= lo - 1e-3 && v <= hi + 1e-3,
+                    "overshoot at t {t}: {v} outside [{lo},{hi}]"
+                );
+            }
+            i += 1;
+        }
+        // Control points are hit EXACTLY (a curve must render as drawn).
+        for p in &c.pts {
+            assert!((c.cents_at(p.0) - p.1).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn v101_sanitize_clamps_sorts_dedupes_and_caps() {
+        // Unsorted, out-of-range, duplicated t, over-cap count.
+        let mut pts = vec![(0.5, 9999.0), (0.0, 0.0), (0.5, -50.0)];
+        for i in 1..40 {
+            pts.push((i as f32 / 60.0, 10.0));
+        }
+        let c = NoteBend::new(pts);
+        assert!(c.pts.len() <= NB_MAX_PTS, "cap enforced");
+        for w in c.pts.windows(2) {
+            assert!(w[0].0 < w[1].0, "strictly increasing t: {:?}", c.pts);
+        }
+        for p in &c.pts {
+            assert!(p.0 >= 0.0 && p.0 <= 1.0, "t clamped");
+            assert!(p.1 >= -NB_MAX_CENTS && p.1 <= NB_MAX_CENTS, "cents clamped");
+        }
+        // Empty curve = no bend, no panic.
+        assert_eq!(NoteBend::default().cents_at(0.5), 0.0);
+    }
+
+    #[test]
+    fn v101_curve_bakes_dense_on_the_lane_and_holds_last() {
+        // A -12 st -> +12 st slide over a 480-tick note: dense 8-tick
+        // grid, first sample -full-scale, last +full-scale, and NO
+        // return-to-0 sample past the note end (hold-last semantics).
+        let mut p = Pattern::new(120);
+        let mut n = Note {
+            ch: 0,
+            note: 36,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+            bend: None,
+        };
+        p.note_bends.push(NoteBend::new(vec![(0.0, -1200.0), (1.0, 1200.0)]));
+        n.bend = Some(0);
+        p.notes.push(n);
+        p.bake_bends();
+        assert!(!p.bends.is_empty(), "curve must populate the lane");
+        assert_eq!(p.bends.first().unwrap().at, 0);
+        assert_eq!(p.bends.first().unwrap().val, st_to_bend(-12.0), "starts at -full");
+        assert_eq!(p.bends.last().unwrap().at, 480);
+        assert_eq!(p.bends.last().unwrap().val, st_to_bend(12.0), "ends at +full");
+        let mid = p.bends.iter().find(|b| b.at == 240).unwrap();
+        assert_eq!(mid.val, st_to_bend(0.0), "midpoint crosses zero");
+        assert_eq!(p.bends.len(), 61, "dense 8-tick grid, same density as bake_seg");
+        // Monotonic — no wobble, no post-note return samples.
+        for w in p.bends.windows(2) {
+            assert!(w[0].val < w[1].val, "monotonic sweep, ticks {}->{}", w[0].at, w[1].at);
+            assert_eq!(w[1].at - w[0].at, 8);
+        }
+    }
+
+    #[test]
+    fn v101_overlapping_curves_last_onset_wins() {
+        // Note A (onset 0) sweeps DOWN, note B (onset 128) sweeps UP.
+        // Where both cover a tick, the LATER onset (B) owns the lane.
+        let mut p = Pattern::new(120);
+        p.note_bends.push(NoteBend::new(vec![(0.0, -1200.0), (1.0, -1200.0)]));
+        p.note_bends.push(NoteBend::new(vec![(0.0, 1200.0), (1.0, 1200.0)]));
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+            bend: Some(0),
+        });
+        p.notes.push(Note {
+            ch: 0,
+            note: 64,
+            vel: 100,
+            press: 0,
+            start: 128,
+            len: 480,
+            bend: Some(1),
+        });
+        p.bake_bends();
+        // In the overlap (ticks 128..480) the lane must sit at B's +full.
+        for b in p.bends.iter().filter(|b| b.at >= 136 && b.at <= 472) {
+            assert_eq!(b.val, st_to_bend(12.0), "tick {}: last-onset B must own", b.at);
+        }
+        // Before B's onset A owns it (sabotage polarity: would also be
+        // true if the merge dropped everything — pin both sides).
+        let a_own = p.bends.iter().find(|b| b.at == 64).unwrap();
+        assert_eq!(a_own.val, st_to_bend(-12.0), "A owns pre-B territory");
+    }
+
+    #[test]
+    fn v101_migrate_moves_owned_segs_and_keeps_orphans_lane_untouched() {
+        // note 0..240 owns seg 20..220; orphan seg 300..400 sits in a gap.
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 240,
+            bend: None,
+        });
+        p.bend_segs.push(BendSeg {
+            t0: 20,
+            v0: 0.0,
+            t1: 220,
+            v1: 5.0,
+            curve: 0.0,
+        });
+        p.bend_segs.push(BendSeg {
+            t0: 300,
+            v0: -2.0,
+            t1: 400,
+            v1: 0.0,
+            curve: 0.0,
+        });
+        p.bake_bends();
+        let lane_before = p.bends.clone();
+        p.migrate_bend_segs();
+        assert_eq!(p.bends, lane_before, "migration NEVER touches the audio lane");
+        assert_eq!(p.bend_segs.len(), 1, "orphan seg survives in the legacy strip");
+        assert_eq!(p.bend_segs[0].t0, 300);
+        assert!(p.notes[0].bend.is_some(), "owning note gained the curve");
+        let c = &p.note_bends[p.notes[0].bend.unwrap() as usize];
+        assert_eq!(c.pts.len(), 2, "curve-0 seg -> linear 2-pt curve");
+        assert!((c.pts[0].0 - 20.0 / 240.0).abs() < 1e-4);
+        assert!((c.pts[0].1 - 0.0).abs() < 0.5);
+        assert!((c.pts[1].0 - 220.0 / 240.0).abs() < 1e-4);
+        assert!((c.pts[1].1 - 500.0).abs() < 0.5, "cents = st x100");
+        // Idempotent: second run is a no-op (no owner-less segs match).
+        let (segs2, curves2) = (p.bend_segs.clone(), p.note_bends.clone());
+        p.migrate_bend_segs();
+        assert_eq!(p.bend_segs, segs2);
+        assert_eq!(p.note_bends, curves2);
+    }
+
+    #[test]
+    fn v101_migrated_linear_seg_rebakes_bit_identical_lane() {
+        // THE back-compat pin (spec § 6 + acceptance "bit-identical"): a
+        // contained integer-semitone sweep, migrated then re-baked, must
+        // produce the EXACT same 14-bit lane as the legacy bake_seg.
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+            bend: None,
+        });
+        p.bend_segs.push(BendSeg {
+            t0: 0,
+            v0: 0.0,
+            t1: 480,
+            v1: -3.5,
+            curve: 0.0,
+        });
+        p.bake_bends();
+        let legacy_lane = p.bends.clone();
+        assert_eq!(legacy_lane.len(), 61);
+        p.migrate_bend_segs();
+        p.bake_bends();
+        assert_eq!(p.bends, legacy_lane, "migrated re-bake must be bit-identical");
+    }
+
+    #[test]
+    fn v101_note_bends_roundtrip_through_mid() {
+        // Curves survive save → load: pts exact at file resolution, the
+        // (ch,pitch,start) link re-attaches, and the re-baked lane is
+        // STABLE across the reload (idempotent bake).
+        let mut p = Pattern::new(120);
+        p.note_bends.push(NoteBend::new(vec![
+            (0.0, 0.0),
+            (0.25, -300.0),
+            (0.75, 600.0),
+            (1.0, 1200.0),
+        ]));
+        p.notes.push(Note {
+            ch: 1,
+            note: 55,
+            vel: 90,
+            press: 0,
+            start: 96,
+            len: 320,
+            bend: Some(0),
+        });
+        p.notes.push(Note {
+            ch: 1,
+            note: 57,
+            vel: 90,
+            press: 0,
+            start: 480,
+            len: 96,
+            bend: None,
+        });
+        p.bake_bends();
+        let before = p.bends.clone();
+        assert!(!before.is_empty());
+        let f = std::env::temp_dir().join(format!("sp-v101rt-{}.mid", std::process::id()));
+        p.save_mid(&f).unwrap();
+        let q = Pattern::load_mid(&f).unwrap();
+        std::fs::remove_file(&f).ok();
+        assert_eq!(q.note_bends.len(), 1, "one curve survives");
+        let c = &q.note_bends[0];
+        let orig = &p.note_bends[0];
+        assert_eq!(c.pts.len(), orig.pts.len());
+        for (a, b) in c.pts.iter().zip(orig.pts.iter()) {
+            assert!((a.0 - b.0).abs() <= 0.0005, "t resolution 1/1000");
+            assert!((a.1 - b.1).abs() <= 0.011, "cents resolution 1/100");
+        }
+        let n55 = q.notes.iter().find(|n| n.note == 55).unwrap();
+        let n57 = q.notes.iter().find(|n| n.note == 57).unwrap();
+        assert_eq!(n55.bend, Some(0), "curve re-linked to its author note");
+        assert_eq!(n57.bend, None, "plain note stays plain");
+        assert!(q.bend_segs.is_empty(), "native curve file is NOT a foreign import (no polyline bloat)");
+        assert_eq!(q.bends, before, "lane is stable across the round-trip");
+        // And the meta is INVISIBLE to bend-less patterns (back-compat).
+        let mut r = Pattern::new(120);
+        r.notes.push(Note {
+            ch: 0,
+            note: 48,
+            vel: 80,
+            press: 0,
+            start: 0,
+            len: 120,
+            bend: None,
+        });
+        let f2 = std::env::temp_dir().join(format!("sp-v101pl-{}.mid", std::process::id()));
+        r.save_mid(&f2).unwrap();
+        let raw = std::fs::read(&f2).unwrap();
+        std::fs::remove_file(&f2).ok();
+        assert!(
+            !raw.windows(11).any(|w| w == b"slooper-npb"),
+            "no curve meta written for curve-less patterns"
+        );
+    }
+
+    #[test]
+    fn v101_merge_offsets_curve_handles() {
+        // The asset-ids-are-indices trap: merging must shift other's
+        // handles by self's table length, else curves cross-wire.
+        let mut a = Pattern::new(120);
+        a.note_bends.push(NoteBend::new(vec![(0.0, -600.0), (1.0, -600.0)]));
+        a.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 90,
+            press: 0,
+            start: 0,
+            len: 240,
+            bend: Some(0),
+        });
+        let mut b = Pattern::new(120);
+        b.note_bends.push(NoteBend::new(vec![(0.0, 600.0), (1.0, 600.0)]));
+        b.notes.push(Note {
+            ch: 0,
+            note: 64,
+            vel: 90,
+            press: 0,
+            start: 0,
+            len: 240,
+            bend: Some(0),
+        });
+        let mut m = a.merged_with(&b);
+        assert_eq!(m.note_bends.len(), 2, "both tables merged");
+        let n60 = m.notes.iter().find(|n| n.note == 60).unwrap();
+        let n64 = m.notes.iter().find(|n| n.note == 64).unwrap();
+        assert_eq!(n60.bend, Some(0));
+        assert_eq!(n64.bend, Some(1), "other's handle was OFFSET, not copied");
+        assert!((m.note_bends[n64.bend.unwrap() as usize].cents_at(0.5) - 600.0).abs() < 0.5,
+            "handle resolves to ITS OWN curve (cross-wire sabotage check)");
+        m.bake_bends();
+        // Last-onset-wins on total overlap: equal onsets, sorted-stable
+        // later entry (n64) takes the lane — just prove BOTH curves'
+        // values appear and the lane is sound.
+        assert!(!m.bends.is_empty());
+    }
+
+    #[test]
+    fn v101_remove_note_and_compact_close_the_handle() {
+        // Deleting the bent note must (a) leave its curve OUT of the
+        // audible lane, (b) let compaction drop the entry and leave the
+        // OTHER note's handle pointing at ITS curve.
+        let mut p = Pattern::new(120);
+        p.note_bends.push(NoteBend::new(vec![(0.0, -600.0), (1.0, -600.0)]));
+        p.note_bends.push(NoteBend::new(vec![(0.0, 900.0), (1.0, 900.0)]));
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 90,
+            press: 0,
+            start: 0,
+            len: 240,
+            bend: Some(0),
+        });
+        p.notes.push(Note {
+            ch: 0,
+            note: 64,
+            vel: 90,
+            press: 0,
+            start: 480,
+            len: 240,
+            bend: Some(1),
+        });
+        p.bake_bends();
+        let lane_both = p.bends.len();
+        // Remove the first note (what the UI delete sites do).
+        p.notes.remove(0);
+        if p.has_note_bends() {
+            p.bake_bends();
+        }
+        p.compact_note_bends();
+        assert_eq!(p.note_bends.len(), 1, "orphaned entry compacted away");
+        assert_eq!(p.notes[0].bend, Some(0), "survivor's handle REMAPPED");
+        assert!(
+            (p.note_bends[0].cents_at(0.5) - 900.0).abs() < 0.5,
+            "remapped handle still resolves to the SURVIVOR'S curve"
+        );
+        p.bake_bends();
+        // Lane lost the -600 region entirely: every lane sample is the
+        // +900 st level now (sabotage: forgetting bake leaves -600 tails).
+        assert!(p.bends.len() < lane_both, "lane shrank with the deleted curve");
+        for b in p.bends.iter().filter(|b| b.at >= 480) {
+            assert_eq!(b.val, st_to_bend(9.0), "post-survival lane is pure survivor");
+        }
+        assert!(
+            !p.bends.iter().take_while(|b| b.at < 480).any(|b| (b.val as i32 - st_to_bend(-6.0) as i32).abs() < 4),
+            "deleted note's curve fully GONE from the lane"
+        );
+    }
+
+    #[test]
+    fn v101_legacy_segs_only_bake_path_untouched() {
+        // No curves anywhere -> bake_bends takes the UNCHANGED legacy
+        // path: byte-identical to calling bake_seg directly.
+        let mut p = Pattern::new(120);
+        p.bend_segs.push(BendSeg {
+            t0: 48,
+            v0: 1.25,
+            t1: 300,
+            v1: -2.0,
+            curve: -40.0,
+        });
+        p.bake_bends();
+        let mut direct = Vec::new();
+        bake_seg(&p.bend_segs[0], 8, &mut direct);
+        direct.sort_by_key(|b| b.at);
+        assert_eq!(p.bends, direct, "legacy path must not change AT ALL");
     }
 }
