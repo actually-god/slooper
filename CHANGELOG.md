@@ -6,6 +6,21 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ## [Unreleased]
 
+### Added
+
+- **Per-note pitch curves (engine).** Sampler pitch bends now live ON
+  their note as a control-point curve (up to 16 points, ±2 octaves,
+  smooth monotone interpolation — 2-point curves are the old straight
+  sweep to the bit). Every consumer derives from one source: the baked
+  bend lane feeds VST instruments, MIDI export, and the roll preview
+  exactly as before, and scripted instruments pick it up over the same
+  channel-bend path. Projects are forward-compatible: glides drawn in
+  the old lane migrate automatically to their notes on load (glides in
+  gaps keep working as before), files save and reload with their curves
+  intact, and every bend-less pattern and old project loads byte-
+  identical. The piano-roll curve drawing lands in the next step of
+  this series.
+
 ### Fixed
 
 - **Pitch bends now bend the same amount on every plugin.** A glide or

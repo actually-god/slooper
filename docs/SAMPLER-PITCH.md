@@ -185,6 +185,15 @@ pub bend: Option<u32>,                // index into note_bends
   per-sample table view handed to the script's process callback.
   VST path needs NOTHING new (raw 0xE0 already flows) — but VST and
   script content must both derive from `note_bends` (single truth).
+  **IMPLEMENTED (v101, chose (c) — none of the above):** the derived
+  14-bit lane IS the delivery. Curves sample into `bends` (PCHIP,
+  dense 8-tick, last-onset wins); gl-1's ABI v2 `bend(ch, st)` already
+  rides that lane to scripted synths (all RT arms + offline + the
+  audition pool), VSTs take the raw 0xE0, export renders from the same
+  events. One truth, zero per-voice ABI surface, VST parity automatic.
+  Per-voice expression stays a genuine post-pb-3 candidate only if
+  poly curves need independence (channel-semantics caveat already
+  documented below).
 - **Derived bakes stay**: `bake_bends` becomes a DERIVED lane (per-note
   curves → unified 14-bit channel lane) for MIDI export and the VST
   instrument feed. Overlapping bent notes: last-onset note wins each
