@@ -10429,7 +10429,7 @@ impl App {
                             press,
                             start: st,
                             len,
-                        });
+                        bend: None,});
                     }
                 }
                 1 => pat.ccs.push(crate::midipat::Cc {
@@ -10474,7 +10474,7 @@ impl App {
                 press,
                 start: st,
                 len: end_tick.saturating_sub(st).max(1),
-            });
+            bend: None,});
         }
         pat.sort();
         // v37 R5: the asset length is the RECORDED WINDOW (stop − start),
@@ -11087,6 +11087,13 @@ impl App {
                 }
                 roll.sel_notes.clear();
                 roll.changed = true;
+                // v101 (pb-2): a deleted note's pitch curve must leave the
+                // audible lane too — re-bake it (curves merge with orphan
+                // segs) and compact the unowned table entries away.
+                if roll.pat.has_note_bends() {
+                    roll.pat.bake_bends();
+                }
+                roll.pat.compact_note_bends();
                 // v38 R6: the delete key answers (was silent — "did my
                 // keypress even do anything?").
                 self.status = format!("deleted {k} note(s)");
@@ -12352,6 +12359,12 @@ impl App {
                                     *s -= 1;
                                 }
                             }
+                            // v101 (pb-2): deleted note → its curve must
+                            // leave the audible lane too (see delete-key).
+                            if roll.pat.has_note_bends() {
+                                roll.pat.bake_bends();
+                            }
+                            roll.pat.compact_note_bends();
                             roll.changed = true;
                             // v38 R6: the delete announces itself.
                             self.status = format!("deleted {nm} \u{b7} Shift+RMB");
@@ -12599,7 +12612,7 @@ impl App {
                                 press: 0,
                                 start: st,
                                 len: min_len_ticks,
-                            });
+                            bend: None,});
                             let idx = roll.pat.notes.len() - 1;
                             roll.sel_notes = vec![idx];
                             roll.sel_anchor = Some(idx);
@@ -27198,6 +27211,12 @@ fn roll_rmb_menu(
                         roll.pat.notes.remove(ix);
                     }
                 }
+                // v101 (pb-2): deleted notes → curves leave the audible
+                // lane too (see delete-key site).
+                if roll.pat.has_note_bends() {
+                    roll.pat.bake_bends();
+                }
+                roll.pat.compact_note_bends();
                 roll.sel_notes.clear();
                 roll.changed = true;
                 roll.menu_anchor = None;
@@ -30565,7 +30584,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 120,
-        });
+        bend: None,});
         pat.notes.push(crate::midipat::Note {
             ch: 0,
             note: 72,
@@ -30573,7 +30592,7 @@ mod tests {
             press: 0,
             start: (pat.len_ticks as f32 * 0.9) as u32,
             len: 120,
-        });
+        bend: None,});
         let a = app.assets.len() as u32;
         app.assets.push(crate::assets::Asset::midi(
             a,
@@ -32825,7 +32844,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480, // one beat at PPQ=480 → 160 px wide
-            });
+            bend: None,});
             (r.row_h, row)
         };
         frame(&mut app, &ctx, vec![]);
@@ -32952,7 +32971,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480,
-            });
+            bend: None,});
             (r.row_h, row)
         };
         frame(&mut app, &ctx, vec![]);
@@ -33145,7 +33164,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         pat.quantize_grid(480, false);
         let before = app.assets.len();
         app.save_piano_roll(&mut pat, 2);
@@ -33664,7 +33683,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         let before = app.assets.len();
         app.save_piano_roll(&mut pat, 1);
         let id = app.assets.len() as u32 - 1;
@@ -33745,7 +33764,7 @@ mod tests {
                 press: 0,
                 start: 480,
                 len: 240,
-            });
+            bend: None,});
         let sv = galley_of(&mut app, &ctx, "save", true).expect("roll save button");
         let sv = sv.center();
         frame(&mut app, &ctx, vec![moved(sv), btn_btn(sv, true)]);
@@ -33807,7 +33826,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         let buf = app.render_pattern_preview(&pat).expect("preview renders");
         let peak = buf.iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!(peak > 1e-3, "preview peak must be audible, got {peak}");
@@ -34902,7 +34921,7 @@ mod tests {
                     press: 0,
                     start: 480,
                     len: 480,
-                },
+                bend: None,},
                 crate::midipat::Note {
                     ch: 0,
                     note: 50,
@@ -34910,7 +34929,7 @@ mod tests {
                     press: 0,
                     start: 960,
                     len: 480,
-                },
+                bend: None,},
             ];
         }
         frame(&mut app, &ctx, vec![]);
@@ -36114,7 +36133,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         pat.save_mid(&samples.join("roll.mid")).unwrap();
         let a0 = app.ensure_asset(&kick).unwrap();
         let a1 = app.ensure_asset(&samples.join("snare.wav")).unwrap();
@@ -36994,7 +37013,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         pat.save_mid(&mid).unwrap();
         frame_files(
             &mut app,
@@ -45802,7 +45821,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: PPQ as u32,
-            });
+            bend: None,});
             let id = app.assets.len() as u32;
             app.assets.push(Asset::midi(
                 id,
@@ -47004,7 +47023,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 480,
-        });
+        bend: None,});
         pat.notes.push(Note {
             ch: 0,
             note: 72,
@@ -47012,7 +47031,7 @@ mod tests {
             press: 0,
             start: 960,
             len: 480,
-        });
+        bend: None,});
         let id = app.assets.len() as u32;
         app.assets.push(Asset::midi(
             id,
@@ -47410,7 +47429,7 @@ mod tests {
             press: 0,
             start: 0,
             len: PPQ as u32,
-        });
+        bend: None,});
         let m = app.assets.len() as u32;
         app.assets.push(Asset::midi(
             m,
@@ -48001,7 +48020,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480,
-            });
+            bend: None,});
             r.pat.notes.push(crate::midipat::Note {
                 ch: 0,
                 note: 63,
@@ -48009,7 +48028,7 @@ mod tests {
                 press: 0,
                 start: 2400,
                 len: 480,
-            });
+            bend: None,});
         }
         frame(&mut app, &ctx, vec![]);
         // x(tick) = grid_x0 + tick/3 at 160 px/beat, 120 bpm.
@@ -48127,6 +48146,7 @@ mod tests {
                 press: 0,
                 start,
                 len,
+                bend: None,
             });
         }
         frame(app, ctx, vec![]);
@@ -48240,7 +48260,7 @@ mod tests {
                 press: 0,
                 start: 1920,
                 len: 480,
-            });
+            bend: None,});
             // Both selected; RMB on the FIRST must apply to BOTH.
             r.sel_notes = vec![0, 1];
         }
@@ -48358,7 +48378,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480,
-            });
+            bend: None,});
         }
         frame(&mut app, &ctx, vec![]);
         // Velocity lane = band above the glide lane; drag the pointer to
@@ -48392,7 +48412,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480,
-            });
+            bend: None,});
         }
         app.roll_vel_step = 17;
         frame(&mut app, &ctx, vec![]);
@@ -48426,7 +48446,7 @@ mod tests {
                 press: 0,
                 start: 0,
                 len: 480,
-            });
+            bend: None,});
             r.sel_notes = vec![0];
             r.focused = true;
         }
@@ -50836,6 +50856,7 @@ mod tests {
             press: 0,
             start,
             len: 240,
+            bend: None,
         };
         let a1 = mk(
             app,
@@ -54135,7 +54156,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        }];
+        bend: None,}];
         let dir = std::env::temp_dir().join("slooper-v83-pins");
         let _ = std::fs::create_dir_all(&dir);
         app.assets.push(crate::assets::Asset::midi(
@@ -55963,7 +55984,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 240,
-        });
+        bend: None,});
         pat.save_mid(&samples.join("roll.mid")).unwrap();
         app.rack[0].rescan();
         let m = app.ensure_asset(&samples.join("roll.mid")).expect("midi imports");
@@ -57633,7 +57654,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 480,
-        });
+        bend: None,});
         frame(&mut app, &ctx, vec![]);
         let pv = find_exact(&mut app, &ctx, "preview")
             .expect("preview button")
@@ -57761,7 +57782,7 @@ mod tests {
             press: 0,
             start: 0,
             len: 480,
-        });
+        bend: None,});
         frame(&mut app, &ctx, vec![]);
         let pv = {
             let raw = egui::RawInput {
