@@ -1912,4 +1912,27 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    /// v103 (card t_62c5a14e): the per-track bend-range table is
+    /// additive-serializable — old files (key absent) load clean and the
+    /// app fills its default; an EXPLICIT 0 (= bend off) never collapses.
+    #[test]
+    fn v103_bend_ranges_persist_config() {
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            legacy.track_bend_ranges.is_empty(),
+            "old config files load with the table absent"
+        );
+        let c = Config {
+            track_bend_ranges: vec![0, 5, 12],
+            ..Config::default()
+        };
+        let back: Config =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(
+            back.track_bend_ranges,
+            vec![0, 5, 12],
+            "explicit 0 (off) survives byte-exact"
+        );
+    }
 }

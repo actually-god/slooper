@@ -654,4 +654,32 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// v103 (card t_62c5a14e): named acceptance pin for PROJECT-file
+    /// persistence through the real save/load path (the v62 test twin
+    /// above covers the same round trip on its literal; this one names
+    /// the requirement and adds the >12-value table shape).
+    #[test]
+    fn v103_bend_ranges_persist_project_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "v103proj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bend.slooper");
+        let mut pr = sample();
+        pr.track_bend_ranges = vec![0, 5, 12, 2, 2, 24];
+        save(&p, &pr).expect("save");
+        let back = load(&p).expect("load");
+        assert_eq!(
+            back.track_bend_ranges,
+            vec![0, 5, 12, 2, 2, 24],
+            "bend ranges survive the project file (explicit 0 kept)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

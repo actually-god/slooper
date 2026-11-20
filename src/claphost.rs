@@ -2764,4 +2764,31 @@ pub(crate) mod tests {
         let err = open(&p, Some("com.slooper.nope"), 48_000, None, None).unwrap_err();
         assert!(err.contains("com.slooper.nope"), "{err}");
     }
+
+    /// v103 (card t_62c5a14e): pitch bend must REACH a CLAP plugin at the
+    /// track's announced range. Pre-v103 the 0xE0 status had NO arm in
+    /// fill_events — bends were silently dropped for CLAP entirely, so
+    /// BOTH asserts are red pre-fix (bend param stays 0, RPN param 0).
+    /// The fixture records raw-MIDI pitch bend into hidden param 4 and
+    /// the RPN-0 data MSB (while slot 0/0) into hidden param 5.
+    #[test]
+    fn v103_clap_pitch_bend_reaches_plugin() {
+        let e = fixture_entry("gain");
+        e.set_bend_range(4);
+        assert_eq!(e.bend_range(), 4, "the entry adopts the track range");
+        let mut out = vec![0.0f32; 1536]; // 3 CLAP blocks
+        // +3 st on ch0 (midipat law: raw 10240).
+        let raw = 10240u16;
+        let ev = vec![(0usize, [0xE0u8, (raw & 0x7F) as u8, (raw >> 7) as u8])];
+        e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
+        let got = e.plug_value(4).expect("probe-bend param reads back");
+        let want = crate::vsthost::bend_rescale(raw, 4) as f64;
+        assert!(
+            (got - want).abs() < 0.5,
+            "rescaled bend reaches the plugin: got {got}, want {want}"
+        );
+        let rpn = e.plug_value(5).expect("probe-rpn param reads back");
+        assert_eq!(rpn, 4.0, "RPN0 data-MSB = the range the plugin was told");
+        assert_eq!(e.midi_drops(), 0, "the burst never overflows the queue");
+    }
 }
