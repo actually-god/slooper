@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub use crate::synth_api::{
-    SynthAssetV1, SynthHostV1, SynthInfoV1, SynthInfoV2, SynthParamV1, SLOOPER_MAX_SYNTH_PARAMS,
-    SLOOPER_SYNTH_ABI, SLOOPER_SYNTH_ABI_V2,
+    SynthAssetV1, SynthHostV1, SynthInfoV1, SynthInfoV2, SynthInfoV3, SynthParamV1,
+    SLOOPER_MAX_SYNTH_PARAMS, SLOOPER_SYNTH_ABI, SLOOPER_SYNTH_ABI_V2, SLOOPER_SYNTH_ABI_V3,
 };
 
 pub const MAX_PARAMS: usize = SLOOPER_MAX_SYNTH_PARAMS;
@@ -248,6 +248,11 @@ struct SynthFns {
     /// a SynthInfoV2 table (`slooper_synth_info_v2`). None = ABI v1 script:
     /// `Instance::bend` is a no-op, exactly the pre-v100 drop.
     bend: Option<extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32)>,
+    /// v105 (card t_a4df161f): per-note aftertouch callback if the script
+    /// declares a SynthInfoV3 table (`slooper_synth_info_v3`). None = ABI
+    /// v1/v2 script: `Instance::poly_at` is a no-op, exactly the pre-v105
+    /// documented drop.
+    poly_at: Option<extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8, val: u8)>,
 }
 
 /// Library handle that is NEVER dlclosed — see the identical comment in
@@ -460,6 +465,17 @@ impl Instance {
         if let Some(f) = self.fns.bend {
             let _g = InstGuard::enter(self);
             f(self.state, ch, st)
+        }
+    }
+    /// v105 (card t_a4df161f): PER-NOTE aftertouch (MPE note pressure),
+    /// RAW MIDI byte 0..=127 (d2 of the 0xA0 message; d1 = note). Routed
+    /// live/RT, offline-bounce and both audition paths, like every other
+    /// callback. ABI v1/v2 scripts have no callback — the call is a no-op
+    /// for them (the documented pre-v105 drop, decision (a) of v104).
+    pub fn poly_at(&self, ch: u8, note: u8, val: u8) {
+        if let Some(f) = self.fns.poly_at {
+            let _g = InstGuard::enter(self);
+            f(self.state, ch, note, val)
         }
     }
 
@@ -812,6 +828,23 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
             }
         }
     }
+    // v105 (card t_a4df161f): OPTIONAL ABI v3 entry point, probed LAST and
+    // WINNING when valid (SynthInfoV3 is cumulative, so its bend restates
+    // the v2 one). A missing, null or mis-stamped v3 export degrades
+    // silently to the v2 result — exactly the v100 ladder discipline.
+    let mut poly_at: Option<extern "C" fn(*mut core::ffi::c_void, u8, u8, u8)> = None;
+    if let Ok(sym3) = lib.get::<extern "C" fn() -> *const SynthInfoV3>(b"slooper_synth_info_v3\0") {
+        let i3 = sym3();
+        if !i3.is_null() {
+            let d3 = unsafe { &*i3 };
+            if d3.abi == SLOOPER_SYNTH_ABI_V3 && d3.poly_at as usize != 0 {
+                poly_at = Some(d3.poly_at);
+                if d3.bend as usize != 0 {
+                    bend = Some(d3.bend);
+                }
+            }
+        }
+    }
     let params = (0..d.n_params as usize)
         .filter(|_| !d.params.is_null())
         .map(|k| unsafe { &*d.params.add(k) })
@@ -838,6 +871,7 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
         press: d.press,
         process: d.process,
         bend,
+        poly_at,
     };
     SynthEntry {
         stem: stem.to_string(),
