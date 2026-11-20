@@ -936,7 +936,7 @@ fn e2e_midi_clip_plays_live() {
             press: 0,
             start: (i as u32) * slooper::midipat::PPQ as u32,
             len: slooper::midipat::PPQ as u32 / 2,
-        });
+        bend: None,});
     }
     pat.sort();
     b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
@@ -1578,7 +1578,7 @@ fn one_note_pattern(sr: u32, note: u8, len_secs: f64) -> slooper::midipat::Patte
         press: 0,
         start: 0,
         len: ticks,
-    });
+    bend: None,});
     pat.len_ticks = ticks;
     pat.sort();
     let _ = sr;
@@ -2361,7 +2361,7 @@ fn e2e_v13_sampler_patch_swap_live() {
             press: 0,
             start: i * step,
             len: step / 2,
-        });
+        bend: None,});
     }
     pat.len_ticks = 12 * step;
     pat.sort();
@@ -3456,7 +3456,7 @@ fn v46_e2e_poly_track_renders_per_lane_copies() {
                 // Sustain to the end of the bar: the flip-back-to-mono
                 // window below always falls inside sounding notes.
                 len: slooper::midipat::PPQ as u32 * (2 - i as u32),
-            });
+            bend: None,});
         }
         p.sort();
         p
@@ -3674,7 +3674,7 @@ fn e2e_tier2_new_bundled_plugins_live() {
             press: 0,
             start: i * step,
             len: step,
-        });
+        bend: None,});
     }
     pat.len_ticks = 12 * step;
     pat.sort();
@@ -4598,7 +4598,7 @@ fn e2e_scrub_while_stopped_is_silent() {
             press: 0,
             start: (i as u32) * slooper::midipat::PPQ as u32,
             len: slooper::midipat::PPQ as u32 * 3 / 4,
-        });
+        bend: None,});
     }
     pat.sort();
     b.cmd(Cmd::SetMidiAssets(Arc::new(vec![Some(Arc::new(pat))])));
