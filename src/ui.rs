@@ -6177,7 +6177,7 @@ impl App {
                 // entries (t == s) — sparse, same Vec, see ScRecvGain.
                 .chain((0..MAX_LOOPS).filter_map(|s| {
                     let (g, p) = (self.sc_out_gain[s], self.sc_out_pan[s]);
-                    (g != 1.0 || p != 0.5).then(|| ScRecvGain {
+                    (g != 1.0 || p != 0.5).then_some(ScRecvGain {
                         t: s as u8,
                         s: s as u8,
                         gain: g,
