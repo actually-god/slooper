@@ -57362,6 +57362,56 @@ mod tests {
     }
 
     #[test]
+    fn v98_docked_bottom_split_survives_boot() {
+        // Mirror of the right-edge pin on the BOTTOM edge (the sibling
+        // code branch): MONITOR 900 + BINDS 300 oversubscribe the strip —
+        // saved intent untouched, painted shares keep the 3:1 proportion.
+        let mut app = headless_app("v98btmsplit");
+        app.drain_events();
+        drop(app);
+        write_dock_config(
+            r#"{
+  "show_master": false,
+  "side_wins": {
+    "rack": [0.0, 0.0, 0.0, 0.0],
+    "binds": [900.0, 600.0, 300.0, 240.0],
+    "monitor": [200.0, 600.0, 900.0, 240.0],
+    "mixer": [0.0, 0.0, 0.0, 0.0],
+    "dock": [[1, 0, 0], [1, 2, 1], [1, 2, 0], [0, 1, 0]],
+    "prim_tab": [false, false, false, false]
+  }
+}"#,
+        );
+        let mut app = App::new(Backend::start());
+        app.drain_events();
+        let ctx = egui::Context::default();
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let near = |a: f32, b: f32| (a - b).abs() < 3.0;
+        assert!(
+            near(app.side_wins.monitor[2], 900.0),
+            "monitor along-intent 900 survived boot, got {}",
+            app.side_wins.monitor[2]
+        );
+        assert!(
+            near(app.side_wins.binds[2], 300.0),
+            "binds along-intent 300 survived boot, got {}",
+            app.side_wins.binds[2]
+        );
+        let m = app.dock_rects[2]; // monitor: first (left) member
+        let b = app.dock_rects[1]; // binds: fill member
+        assert!(m[2] > 8.0 && b[2] > 8.0, "both painted: {m:?} {b:?}");
+        let ratio = m[2] / b[2];
+        assert!(
+            (1.5..3.5).contains(&ratio),
+            "bottom split keeps the user's proportion (ratio {ratio}, from 900:300)"
+        );
+        drop(app);
+        settle_plugin_drop();
+    }
+
+    #[test]
     fn v98_dock_drag_survives_reload() {
         // REAL seam drag on the right-edge wrapper of a LONE docked
         // MASTER OUT (mixer hidden), then reload: the grown thickness must
