@@ -1399,6 +1399,12 @@ pub struct App {
     /// `t * MAX_LOOPS + s` (linear amplitude). Mirrors the engine `sc_recv`
     /// atomics; only non-unity entries persist (sparse config save).
     sc_recv_gain: [f32; MAX_LOOPS * MAX_LOOPS],
+    /// v99 (sc-5): per-SENDER general sidechain send level, engine units
+    /// (gain 1.0 = unity, pan 0.5 = centre). Mirrors the engine
+    /// `sc_out_*` atomics; persisted as SELF-PAIR entries in
+    /// `Config.sc_recv_gain` (sparse — only non-default senders written).
+    sc_out_gain: [f32; MAX_LOOPS],
+    sc_out_pan: [f32; MAX_LOOPS],
     /// Last track selection propagated to the audio engine (input
     /// monitoring follows the selected track's chain/gain/pan).
     sel_sent: usize,
@@ -2143,10 +2149,21 @@ impl App {
         }
         // v97 (sc-4): per-route sidechain receive levels → App mirror +
         // engine atomics. Absent routes stay at the unity table default.
+        // v99 (sc-5): SELF-PAIR entries (t == s) carry the sender's general
+        // SEND gain/pan instead (config pan -1..=1 -> engine [0,1]).
         let mut sc_recv_gain = [1.0f32; MAX_LOOPS * MAX_LOOPS];
+        let mut sc_out_gain = [1.0f32; MAX_LOOPS];
+        let mut sc_out_pan = [0.5f32; MAX_LOOPS];
         for r in &cfg.sc_recv_gain {
             let (t, s) = (r.t as usize, r.s as usize);
-            if t < MAX_LOOPS && s < MAX_LOOPS {
+            if t == s && t < MAX_LOOPS {
+                let g = r.gain.max(0.0);
+                let p = (r.pan.clamp(-1.0, 1.0) * 0.5 + 0.5).clamp(0.0, 1.0);
+                sc_out_gain[s] = g;
+                sc_out_pan[s] = p;
+                backend.engine.set_sc_send_gain(s, g);
+                backend.engine.set_sc_send_pan(s, p);
+            } else if t < MAX_LOOPS && s < MAX_LOOPS {
                 let g = r.gain.max(0.0);
                 sc_recv_gain[t * MAX_LOOPS + s] = g;
                 backend.engine.set_sc_recv_gain(t, s, g);
@@ -2271,6 +2288,8 @@ impl App {
             trk_color,
             sc_send,
             sc_recv_gain,
+            sc_out_gain,
+            sc_out_pan,
             sel_sent: usize::MAX,
             levels_dirty: false,
             // v68: mix-page session state (see the `mix_tab` field).
@@ -6150,8 +6169,21 @@ impl App {
                         t: (i / MAX_LOOPS) as u8,
                         s: (i % MAX_LOOPS) as u8,
                         gain: g,
+                        // Pair entries have no pan (v99): always centre.
+                        pan: 0.0,
                     })
                 })
+                // v99 (sc-5): per-sender general send levels as SELF-PAIR
+                // entries (t == s) — sparse, same Vec, see ScRecvGain.
+                .chain((0..MAX_LOOPS).filter_map(|s| {
+                    let (g, p) = (self.sc_out_gain[s], self.sc_out_pan[s]);
+                    (g != 1.0 || p != 0.5).then(|| ScRecvGain {
+                        t: s as u8,
+                        s: s as u8,
+                        gain: g,
+                        pan: (p - 0.5) * 2.0,
+                    })
+                }))
                 .collect(),
             editor_probe: self.editor_probe.clone(),
             track_vst: Vec::new(),
@@ -23652,6 +23684,20 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
 const MIX_COL_W: f32 = 130.0;
 const MIX_COL_GAP: f32 = 8.0;
 
+/// v99 (sc-5): "L40" / "C" / "R40" readout for a send-pan value in engine
+/// units ([0,1], 0.5 = centre). Shared by the slider formatter and the
+/// status echo so the two strings cannot drift.
+fn sc_pan_text(p01: f32) -> String {
+    let d = ((p01 - 0.5) * 128.0).round() as i32;
+    if d < 0 {
+        format!("L{}", -d)
+    } else if d > 0 {
+        format!("R{d}")
+    } else {
+        "C".to_string()
+    }
+}
+
 /// v68: screen rects the mix page painted THIS frame (the v63 SeGeom
 /// pattern): pins hit-test exact column rects instead of guessing.
 /// Length ALWAYS equals `n_tracks` — columns scrolled off carry
@@ -23662,6 +23708,9 @@ struct MixGeom {
     fader: Vec<egui::Rect>,
     gain: Vec<egui::Rect>,
     pan: Vec<egui::Rect>,
+    /// v99 (sc-5): the sender's general send-gain / send-pan sliders.
+    send_gain: Vec<egui::Rect>,
+    send_pan: Vec<egui::Rect>,
 }
 
 /// v68 (S4): the full-page mixer. One channel column per track: header
@@ -23713,6 +23762,8 @@ fn mix_page(ui: &mut egui::Ui, app: &mut App) {
             app.mix_geom.fader.push(egui::Rect::NOTHING);
             app.mix_geom.gain.push(egui::Rect::NOTHING);
             app.mix_geom.pan.push(egui::Rect::NOTHING);
+            app.mix_geom.send_gain.push(egui::Rect::NOTHING);
+            app.mix_geom.send_pan.push(egui::Rect::NOTHING);
             continue;
         }
         ui.scope_builder(
@@ -23861,8 +23912,9 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
         );
     });
     // Reserve the rows that come AFTER the faders: dB readouts (14) +
-    // pan slider (18) + pan readout (14) + chips (20) + spacing slack.
-    let fh = (ui.available_height() - 96.0).clamp(56.0, 360.0);
+    // pan slider (18) + pan readout (14) + send gain row (18) + send pan
+    // row (18) [v99] + chips (20) + spacing slack.
+    let fh = (ui.available_height() - 140.0).clamp(56.0, 360.0);
     let vv0 = vshow;
     let gg0 = gshow;
     let (vv_now, gg_now, rv, rg) = ui
@@ -23962,6 +24014,91 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
             .selectable(false),
         );
     });
+    // ---- v99 (sc-5): the sender's GENERAL sidechain send level ----
+    // This track keys every chain that routes it (Sidechain in, in the
+    // TARGET's chain window). These rows scale the tapped key bus before
+    // it routes to ANY receiver; each receiver then mixes the send per
+    // route (v97 sliders). Fixed rows in EVERY column (geometry constant,
+    // content varies) — the v68 page alignment holds.
+    let mut sg = app.sc_out_gain[t];
+    let rsg = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_sized(
+                [32.0, 18.0],
+                egui::Label::new(RichText::new("send").monospace().small()).selectable(false),
+            );
+            ui.add_sized(
+                [84.0, 18.0],
+                Slider::new(&mut sg, 0.0..=2.0)
+                    .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+            )
+        })
+        .inner
+        .on_hover_text(format!(
+            "general sidechain send level · scales this track's key for EVERY \
+             track that routes it (Sidechain in, in the target's chain window) · \
+             the fader and mute never touch the key · {:.0} %",
+            sg * 100.0
+        ));
+    let mut echo_sg = false;
+    if rsg.changed() {
+        let g = sg.max(0.0);
+        app.sc_out_gain[t] = g;
+        app.backend.engine.set_sc_send_gain(t, g);
+        app.fx_save_pending = true;
+        echo_sg = !rsg.dragged();
+    }
+    if rsg.drag_stopped() {
+        echo_sg = true;
+    }
+    if echo_sg {
+        app.status = format!(
+            "sidechain send-out T{}: {:.0} %",
+            t + 1,
+            app.sc_out_gain[t] * 100.0
+        );
+    }
+    // Send pan rides the key BEFORE its mono-summing detector (the SC bus
+    // carries ONE summed f32 per sample): centre = unity, hard L/R ×0.707
+    // — exactly the v95 track-pan law (docs/SIDECHAIN.md).
+    let mut sp = (app.sc_out_pan[t] - 0.5) * 2.0; // engine [0,1] -> slider -1..=1
+    let rsp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add_sized(
+                [32.0, 18.0],
+                egui::Label::new(RichText::new("s-pan").monospace().small()).selectable(false),
+            );
+            ui.add_sized(
+                [84.0, 18.0],
+                Slider::new(&mut sp, -1.0..=1.0).custom_formatter(|v, _| sc_pan_text(v * 0.5 + 0.5)),
+            )
+        })
+        .inner
+        .on_hover_text(
+            "sidechain send pan · pans the KEY before its mono-summed detector \
+             (centre = full key level, hard L/R = ×0.707 — the same law as track \
+             panning); balance becomes audible when a stereo key consumer lands",
+        );
+    let mut echo_sp = false;
+    if rsp.changed() {
+        let p = (sp * 0.5 + 0.5).clamp(0.0, 1.0);
+        app.sc_out_pan[t] = p;
+        app.backend.engine.set_sc_send_pan(t, p);
+        app.fx_save_pending = true;
+        echo_sp = !rsp.dragged();
+    }
+    if rsp.drag_stopped() {
+        echo_sp = true;
+    }
+    if echo_sp {
+        app.status = format!(
+            "sidechain send-out T{} pan: {}",
+            t + 1,
+            sc_pan_text(app.sc_out_pan[t])
+        );
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         if ui
@@ -23987,6 +24124,8 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
     app.mix_geom.fader.push(rv.rect);
     app.mix_geom.gain.push(rg.rect);
     app.mix_geom.pan.push(rp.rect);
+    app.mix_geom.send_gain.push(rsg.rect);
+    app.mix_geom.send_pan.push(rsp.rect);
 }
 
 fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
@@ -56935,8 +57074,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v97\""),
-            "INTERNAL_VERSION must be bumped to v97"
+            librs.contains("INTERNAL_VERSION: &str = \"v99\""),
+            "INTERNAL_VERSION must be bumped to v99"
         );
     }
 

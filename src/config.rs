@@ -214,16 +214,27 @@ pub struct TrackFxSave {
 /// v97 (sc-4): one NON-UNITY sidechain receive level for the (target t,
 /// source s) route. Sparse by design — unity routes are never written, so
 /// old project/config files (missing key) load at unity unchanged.
-/// sc-5 extends this same shape (per-send pan) rather than adding a
-/// parallel table — bump with `#[serde(default = "...")]` fields.
+/// v99 (sc-5): per-SENDER general send levels ride the SAME Vec as
+/// SELF-PAIR entries (`t == s`): a self-pair can never be a live route
+/// (`Engine::set_sc_send` clears the self-bit), so the slot is provably
+/// free. For a self entry `gain` = the sender's send gain and `pan` = its
+/// send pan (-1..=1, 0 = centre); pair entries ignore `pan` (always
+/// written 0.0). Absent/legacy entries load at unity + centre unchanged.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ScRecvGain {
-    /// Target track (the receiver — its chain's SC row).
+    /// Target track (the receiver — its chain's SC row). For a SELF-PAIR
+    /// (`t == s`, v99) this carries the sender id of the send-level row.
     pub t: u8,
     /// Source track (the sender whose tap this level scales).
     pub s: u8,
-    /// Receive level, linear amplitude (1.0 = unity = pre-v97 behavior).
+    /// Receive level (v97) / sender send gain (v99 self-pair), linear
+    /// amplitude (1.0 = unity = pre-v97 behavior).
     pub gain: f32,
+    /// v99 (sc-5): send pan for a SELF-PAIR entry, -1.0 (hard left) ..=
+    /// 1.0 (hard right), 0.0 = centre (the serde default — v97-era files
+    /// load every send centred, exactly their pre-v99 behavior).
+    #[serde(default)]
+    pub pan: f32,
 }
 
 /// One slot of a track's mixer chain (see `Config::track_chain`). Tagged so
