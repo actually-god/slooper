@@ -48760,25 +48760,83 @@ mod tests {
     }
 
     #[test]
-    fn v102_clear_curve_button_and_hint() {
-        // Toolbar discoverability: the readout teaches the gesture and the
-        // "clear curve" button clears the SELECTED notes' curves in a click.
+    fn v102_clear_curve_button_and_menu() {
+        // Toolbar discoverability (readout teaches the gesture), the RMB
+        // menu carries "Clear curve" on a note that HAS one, and the
+        // toolbar button clears the SELECTED notes' curves in a click.
         let mut app = headless_app("v102clearbtn");
         let ctx = egui::Context::default();
-        v102_curve_rig(&mut app, &ctx);
+        let c = v102_curve_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let p = egui::pos2(grid_x0 + 80.0, c.max.y - 10.0 + 500.0 - 11.0 * 60.5);
         assert!(
             galley_at(&mut app, &ctx, "Z+drag a note = pitch curve").is_some(),
             "toolbar teaches the gesture"
         );
+        // ---- RMB menu verb on a curve-carrying note ----
+        frame(&mut app, &ctx, vec![moved(p)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Secondary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "Clear curve").is_some(),
+            "note menu carries the curve verb"
+        );
+        click_last(&mut app, &ctx, "Clear curve");
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            assert_eq!(r.pat.notes.len(), 1, "note kept");
+            assert!(r.pat.notes[0].bend.is_none(), "menu cleared the curve");
+            assert!(r.pat.bends.is_empty(), "lane cleaned");
+        }
+        assert!(app.status.contains("curve removed"), "echo: {}", app.status);
+        // ---- toolbar button path (re-arm a curve, select, one click) ----
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.note_bends.push(crate::midipat::NoteBend::new(vec![
+                (0.0, 0.0),
+                (1.0, -200.0),
+            ]));
+            r.pat.notes[0].bend = Some(r.pat.note_bends.len() as u32 - 1);
+            r.pat.bake_bends();
+            r.sel_notes = vec![0];
+        }
+        frame(&mut app, &ctx, vec![]);
         click_last(&mut app, &ctx, "clear curve");
         frame(&mut app, &ctx, vec![]);
         {
             let r = app.piano_roll.as_ref().unwrap();
             assert_eq!(r.pat.notes.len(), 1, "notes stay");
-            assert!(r.pat.notes[0].bend.is_none(), "curve cleared");
-            assert!(r.pat.bends.is_empty(), "lane cleaned");
+            assert!(r.pat.notes[0].bend.is_none(), "button cleared the curve");
+            assert!(r.pat.bends.is_empty(), "lane cleaned again");
         }
         assert!(app.status.contains("cleared"), "echo: {}", app.status);
+    }
+
+    #[test]
+    fn v102_dead_lane_state_gone() {
+        // The lane-CREATING state is retired, not gated: the `bend_live`
+        // field and the `BendNew` gesture must be ABSENT from production
+        // code (no dead chrome / orphan state). Negative needles are
+        // concat!-built so the assertion can never pass off its own
+        // literal (source-pin polarity trap); the positive needle pins
+        // the orphan-only gate for the legacy strip.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs"))
+            .expect("own source");
+        let prod = src.split("\nmod tests").next().expect("tests module boundary");
+        let dead_a = concat!("bend", "_live");
+        let dead_b = concat!("Bend", "New");
+        assert!(!prod.contains(dead_a), "retired lane state `{dead_a}` must be gone");
+        assert!(!prod.contains(dead_b), "retired gesture `{dead_b}` must be gone");
+        let active = prod
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("lane_open = !roll.pat.bend_segs.is_empty()")
+            })
+            .count();
+        assert_eq!(active, 1, "the legacy strip opens ONLY from orphan segs");
     }
 
     #[test]
@@ -49114,9 +49172,11 @@ mod tests {
             bend: None,});
         }
         frame(&mut app, &ctx, vec![]);
-        // Velocity lane = band above the glide lane; drag the pointer to
-        // HALF height over the note's x span.
-        let p = egui::pos2(grid_x0 + 80.0, bot - 46.0 - 15.0);
+        // v102 RETARGET: the glide lane closed onto the notes, so the
+        // velocity strip now sits directly above the canvas bottom (the
+        // 46 px bend-lane band is gone). Drag the pointer to HALF height
+        // over the note's x span.
+        let p = egui::pos2(grid_x0 + 80.0, bot - 15.0);
         frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
         frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
         frame(&mut app, &ctx, vec![]);
