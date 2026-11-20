@@ -634,8 +634,10 @@ track instruments on their own MIDI channel/voice — what MPE controllers
 MIDI takes record both lanes (14-bit bends, per-note pressure), pattern
 playback replays them, and every **hosted plugin** reacts per channel.
 Built-in scripted synths respond to **pitch bend** since v100 (a full
-deflection is ±12 semitones; held notes shift while the line plays);
-per-note poly-AT still has no scripted callback (ABI v1/v2). Recorded
+deflection is ±12 semitones; held notes shift while the line plays) and
+to **per-note pressure** since v105 (script ABI v3 `poly_at(ch, note,
+val)`; the bundled synths lift the pressured voice up to +3.5 dB, and a
+resting note sounds exactly as before). Recorded
 bends are also centered on stop/seek (panic clears all 16 channels). Off
 by default — classic single-channel setups are byte-for-byte unchanged.
 
