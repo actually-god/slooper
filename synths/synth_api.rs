@@ -32,6 +32,12 @@
 //     (already zeroed), on the audio thread. Allocation-free, no locks,
 //     no I/O, must never panic. `params` points to n_params f32 sliders.
 //
+// v2 additions (SLOW-rolling: your script keeps working on v1 unchanged —
+// see SynthInfoV2 below for the ladder recipe):
+//   * `bend(s, ch, st)`       — channel pitch bend in SEMITONES; this is
+//     where the piano roll's GLIDE lane lands (a full deflection = ±12).
+//     Multiply voice pitch by 2^(st/12) for every live voice on `ch`.
+//
 // Notes arrive with sample-accurate batching: slooper calls note_on /
 // note_off / cc / press immediately BEFORE the process call that covers
 // that audio block segment, so you may start a voice directly in note_on.
@@ -89,11 +95,13 @@ pub struct SynthHostV1 {
     /// `note_on()` — exactly like `load_asset`). Fill `slots[0..n]` with
     /// the mapped samples, each packed as `(asset_id << 8) | root_note`
     /// (asset id is a rack id, root note a MIDI number 0..=127), write
-    /// the map mode to `*mode` (0 = hard cutoff: switch at the midpoint,
-    /// a note exactly halfway uses the lower sample; 1 = crossfade: bend
-    /// the two nearest samples to the note and mix them by inverse
-    /// distance), and return n (at most `max`). n == 0 means no map —
-    /// the legacy single-asset params rule.
+    /// the map mode to `*mode` (low bits: 0 = hard cutoff, switch at the
+    /// midpoint, a note exactly halfway uses the lower sample; 1 =
+    /// crossfade, bend the two nearest samples to the note and mix them
+    /// by inverse distance. Bit 31: this track HAS a key map — with
+    /// n == 0 that means "mapped to nothing", i.e. silence, NOT the
+    /// legacy params), and return n (at most `max`). n == 0 with bit 31
+    /// clear means no map at all — the legacy single-asset params rule.
     pub load_map: extern "C" fn(slots: *mut u64, max: u32, mode: *mut u32) -> u32,
 }
 
@@ -116,7 +124,66 @@ pub struct SynthInfoV1 {
         extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
 }
 
+/// ABI v2 marker (v100, card t_52aa65b1). [`SLOOPER_SYNTH_ABI`] stays 1
+/// forever for legacy scripts — follow the fx ABI ladder: a script ADDs
+/// v2 support, it never rewrites its v1 entry point.
+pub const SLOOPER_SYNTH_ABI_V2: u32 = 2;
+
+/// v100: pitch-bend-capable synth description. The frozen [`SynthInfoV1`]
+/// fields come first, in the same order, followed by ONE appended callback
+/// (the static asserts below enforce that shape — same discipline as the
+/// fx ABI ladder in `effect_api.rs`).
+///
+/// To support v2 a script keeps declaring its `SynthInfoV1` DESC and
+/// `slooper_synth_info` exactly as before, and ADDS:
+///
+/// ```ignore
+/// pub static DESC2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, .., bend };
+/// #[no_mangle]
+/// pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC2 }
+/// ```
+///
+/// Older slooper binaries keep loading such a script through the v1 entry
+/// (bend silently ignored, exactly the pre-v100 behavior); v1-only scripts
+/// keep loading in newer hosts (the v2 probe just misses).
+#[repr(C)]
+pub struct SynthInfoV2 {
+    /// Must be [`SLOOPER_SYNTH_ABI_V2`].
+    pub abi: u32,
+    pub name: *const core::ffi::c_char,
+    pub author: *const core::ffi::c_char,
+    pub description: *const core::ffi::c_char,
+    pub n_params: u32,
+    pub params: *const SynthParamV1,
+    pub create: extern "C" fn(sample_rate: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void,
+    pub destroy: extern "C" fn(s: *mut core::ffi::c_void),
+    pub note_on: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8, vel: u8),
+    pub note_off: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8),
+    pub all_off: extern "C" fn(s: *mut core::ffi::c_void),
+    pub cc: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, num: u8, val: u8),
+    pub press: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, val: u8),
+    pub process:
+        extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
+    /// v100: channel pitch bend — this is where the piano roll's GLIDE
+    /// lane lands. `st` is SEMITONES in the roll's own space: a full
+    /// deflection (a 12 st glide note, or the raw MIDI bend wheel at
+    /// ±full) is ±12.0. Channel-wide like MIDI: apply it to every live
+    /// voice on `ch`, and derive the rate/frequency of a voice started
+    /// NOW from the value in effect NOW. Arrives on the audio thread
+    /// immediately BEFORE the `process` segment that covers it, exactly
+    /// like note_on/note_off — allocation-free, no locks, never panics.
+    /// Voices are usually pitched by `2^(st / 12)`.
+    pub bend: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32),
+}
+
 unsafe impl Sync for SynthParamV1 {}
 unsafe impl Sync for SynthInfoV1 {}
+unsafe impl Sync for SynthInfoV2 {}
 unsafe impl Sync for SynthHostV1 {}
 unsafe impl Sync for SynthAssetV1 {}
+
+const _: () = assert!(
+    core::mem::offset_of!(SynthInfoV2, process) == core::mem::offset_of!(SynthInfoV1, process)
+);
+const _: () =
+    assert!(core::mem::offset_of!(SynthInfoV2, bend) > core::mem::offset_of!(SynthInfoV2, process));

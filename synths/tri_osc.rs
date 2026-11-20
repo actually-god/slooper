@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 6
+// slooper-synth-version: 7
 // tri_osc.rs — the subtractive synth workhorse.
 //
 // The classic three-oscillator subtractive analog is all one machine —
@@ -62,6 +62,7 @@ struct TriOsc {
     voices: [Voice; VOICES],
     next: usize,
     last_freq: f64, // glide source
+    bend_st: f64, // v100: pitch bend (roll GLIDE lane), semitones
     pedal: bool,
 }
 
@@ -121,6 +122,7 @@ extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_vo
         sr: if sr > 1.0 { sr } else { 48000.0 },
         voices: [Voice::DEAD; VOICES],
         next: 0,
+        bend_st: 0.0,
         last_freq: 440.0,
         pedal: false,
     });
@@ -250,6 +252,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
         1.0
     };
 
+    let bend_ratio = (p.bend_st * (1.0 / 12.0)).exp2(); // v100: glide lane
     for k in 0..n {
         for v in &mut p.voices {
             if !v.alive {
@@ -282,7 +285,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
 
             // --- pitch (glide toward target) and oscillators ---
             v.freq += (v.target - v.freq) * glide_k;
-            let f = v.freq * oct_f;
+            let f = v.freq * oct_f * bend_ratio;
             if f < 6.0 || f > sr * 0.4 {
                 v.alive = false;
                 continue;
@@ -357,4 +360,23 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
     &DESC
+}
+
+// --- v100 (card t_52aa65b1): channel pitch bend = the piano-roll GLIDE lane.
+// The host decodes 14-bit MIDI bend to SEMITONES (full deflection = ±12) and
+// calls this before the next process() block; every sounding voice's pitch is
+// multiplied by 2^(st/12) there, so baked glide bends HELD notes live.
+#[no_mangle]
+pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
+    if s.is_null() {
+        return;
+    }
+    unsafe { &mut *(s as *mut TriOsc) }.bend_st = st as f64;
+}
+
+static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
+    &DESC_V2
 }
