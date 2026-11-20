@@ -36,9 +36,9 @@
 // SAMPLE (never per block) — host block sizes run from ~1 ms to seconds.
 // ---------------------------------------------------------------------------
 
-// v105: MPE note pressure (poly_at) raises the pressured voice up to
+// v106: MPE note pressure (poly_at) raises the pressured voice up to
 // +3.5 dB — the note still sounds normally at rest, like every older
-// slooper release (no pressure = the exact pre-v105 render).
+// slooper release (no pressure = the exact pre-v106 render).
 
 include!("synth_api.rs");
 
@@ -490,7 +490,7 @@ pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     unsafe { &mut *(s as *mut Add) }.bend_st = st as f64;
 }
 
-// v105 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
+// v106 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
 // matching live voice's level by up to +3.5 dB (x1.5 at 127; 0 = normal).
 #[no_mangle]
 pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {

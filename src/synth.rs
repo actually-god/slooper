@@ -248,9 +248,9 @@ struct SynthFns {
     /// a SynthInfoV2 table (`slooper_synth_info_v2`). None = ABI v1 script:
     /// `Instance::bend` is a no-op, exactly the pre-v100 drop.
     bend: Option<extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32)>,
-    /// v105 (card t_a4df161f): per-note aftertouch callback if the script
+    /// v106 (card t_a4df161f): per-note aftertouch callback if the script
     /// declares a SynthInfoV3 table (`slooper_synth_info_v3`). None = ABI
-    /// v1/v2 script: `Instance::poly_at` is a no-op, exactly the pre-v105
+    /// v1/v2 script: `Instance::poly_at` is a no-op, exactly the pre-v106
     /// documented drop.
     poly_at: Option<extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8, val: u8)>,
 }
@@ -467,11 +467,11 @@ impl Instance {
             f(self.state, ch, st)
         }
     }
-    /// v105 (card t_a4df161f): PER-NOTE aftertouch (MPE note pressure),
+    /// v106 (card t_a4df161f): PER-NOTE aftertouch (MPE note pressure),
     /// RAW MIDI byte 0..=127 (d2 of the 0xA0 message; d1 = note). Routed
     /// live/RT, offline-bounce and both audition paths, like every other
     /// callback. ABI v1/v2 scripts have no callback — the call is a no-op
-    /// for them (the documented pre-v105 drop, decision (a) of v104).
+    /// for them (the documented pre-v106 drop, decision (a) of v104).
     pub fn poly_at(&self, ch: u8, note: u8, val: u8) {
         if let Some(f) = self.fns.poly_at {
             let _g = InstGuard::enter(self);
@@ -828,7 +828,7 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
             }
         }
     }
-    // v105 (card t_a4df161f): OPTIONAL ABI v3 entry point, probed LAST and
+    // v106 (card t_a4df161f): OPTIONAL ABI v3 entry point, probed LAST and
     // WINNING when valid (SynthInfoV3 is cumulative, so its bend restates
     // the v2 one). A missing, null or mis-stamped v3 export degrades
     // silently to the v2 result — exactly the v100 ladder discipline.
@@ -2156,7 +2156,7 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
         assert!(reg.create_instance("v100_bogus_abi", 48_000.0, &[]).is_none());
     }
 
-    // ---- v105 (card t_a4df161f): poly aftertouch must REACH scripted
+    // ---- v106 (card t_a4df161f): poly aftertouch must REACH scripted
     // synths. The five kind-4 arms used to be a documented drop (decision
     // (a) of v104 shipped only the hosting half). ABI v3 (SynthInfoV3 +
     // slooper_synth_info_v3) adds poly_at(s, ch, note, val-raw-0..=127);
@@ -2164,7 +2164,7 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
 
     /// One staged render of the probe scripts: optional poly-AT event at
     /// offset 960, window measured 4800..19200 (probe tone = 200 Hz).
-    fn v105_probe_render(
+    fn v106_probe_render(
         inst: &std::sync::Arc<Instance>,
         kind4: Option<(u8, u8, u8)>,
         kind5: Option<u16>,
@@ -2184,7 +2184,7 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
 
     /// Shared boilerplate of the two probe scripts (v1 table + one-voice
     /// 200 Hz tone gated by `amp`; each script supplies `callbacks`).
-    const V105_PROBE_HEAD: &str = r#"
+    const V106_PROBE_HEAD: &str = r#"
 include!("synth_api.rs");
 use core::ffi::c_void;
 struct P { sr: f64, ph: f64, on: bool, amp: f64 }
@@ -2208,7 +2208,7 @@ extern "C" fn pr(_s: *mut c_void, _c: u8, _v: u8) {}
     /// Targeting proof script: valid cumulative v3. poly_at answers ONLY
     /// the exact (ch=1, note=61) live voice with amp = val/127 — so the
     /// render proves channel, note AND pressure byte independently.
-    const V105_PROBE_V3: &str = r#"
+    const V106_PROBE_V3: &str = r#"
 extern "C" fn bd(_s: *mut c_void, _c: u8, _st: f32) {}
 extern "C" fn pa(s: *mut c_void, ch: u8, note: u8, val: u8) {
     let p = unsafe { &mut *(s as *mut P) };
@@ -2226,7 +2226,7 @@ extern "C" fn po(s: *mut c_void, out: *mut f32, n: usize, _p: *const f32) {
 }
 pub static DESC: SynthInfoV1 = SynthInfoV1 {
     abi: SLOOPER_SYNTH_ABI,
-    name: b"v105-probe-v3\0".as_ptr() as *const core::ffi::c_char,
+    name: b"v106-probe-v3\0".as_ptr() as *const core::ffi::c_char,
     author: core::ptr::null(),
     description: core::ptr::null(),
     n_params: 0, params: core::ptr::null(),
@@ -2243,7 +2243,7 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
     /// Ladder-proof script: a VALID v2 table (bend lifts amp to 0.5) plus
     /// a MIS-STAMPED v3 table (abi: 77 — poly_at would lift amp to 1.0).
     /// The host must trust the stamp: poly_at stays unwired, bend works.
-    const V105_PROBE_BOGUS3: &str = r#"
+    const V106_PROBE_BOGUS3: &str = r#"
 extern "C" fn bd(s: *mut c_void, _c: u8, st: f32) {
     let p = unsafe { &mut *(s as *mut P) };
     if st > 0.1 { p.amp = 0.5; }
@@ -2263,7 +2263,7 @@ extern "C" fn po(s: *mut c_void, out: *mut f32, n: usize, _p: *const f32) {
 }
 pub static DESC: SynthInfoV1 = SynthInfoV1 {
     abi: SLOOPER_SYNTH_ABI,
-    name: b"v105-bogus3\0".as_ptr() as *const core::ffi::c_char,
+    name: b"v106-bogus3\0".as_ptr() as *const core::ffi::c_char,
     author: core::ptr::null(),
     description: core::ptr::null(),
     n_params: 0, params: core::ptr::null(),
@@ -2285,34 +2285,34 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
     /// poly_at off) — the v100 ladder discipline one rung higher.
     #[test]
     #[ignore = "slow-tier: compiles two probe scripts with rustc (~20 s)"]
-    fn v105_abi_v3_ladder_guards() {
+    fn v106_abi_v3_ladder_guards() {
         if !crate::fx::rustc_available() {
             return;
         }
         let reg = v51_registry();
         std::fs::write(
-            reg.dir().join("v105_probe_v3.rs"),
-            format!("{V105_PROBE_HEAD}{V105_PROBE_V3}"),
+            reg.dir().join("v106_probe_v3.rs"),
+            format!("{V106_PROBE_HEAD}{V106_PROBE_V3}"),
         )
         .unwrap();
         std::fs::write(
-            reg.dir().join("v105_bogus3.rs"),
-            format!("{V105_PROBE_HEAD}{V105_PROBE_BOGUS3}"),
+            reg.dir().join("v106_bogus3.rs"),
+            format!("{V106_PROBE_HEAD}{V106_PROBE_BOGUS3}"),
         )
         .unwrap();
         let reg = Registry::open(reg.dir().to_path_buf());
 
         // -- valid v3: the callback must observe ch/note/val.
         let a = reg
-            .create_instance("v105_probe_v3", 48_000.0, &[])
+            .create_instance("v106_probe_v3", 48_000.0, &[])
             .expect("probe v3 instance");
-        let full = v105_probe_render(&a, Some((1, 61, 127)), None);
-        let half = v105_probe_render(&a, Some((1, 61, 64)), None);
-        let wrong_note = v105_probe_render(&a, Some((1, 62, 127)), None);
-        let wrong_ch = v105_probe_render(&a, Some((2, 61, 127)), None);
-        let none = v105_probe_render(&a, None, None);
+        let full = v106_probe_render(&a, Some((1, 61, 127)), None);
+        let half = v106_probe_render(&a, Some((1, 61, 64)), None);
+        let wrong_note = v106_probe_render(&a, Some((1, 62, 127)), None);
+        let wrong_ch = v106_probe_render(&a, Some((2, 61, 127)), None);
+        let none = v106_probe_render(&a, None, None);
         eprintln!(
-            "v105 targeting: full {full:.1} half {half:.1} wrong-note {wrong_note:.1} \
+            "v106 targeting: full {full:.1} half {half:.1} wrong-note {wrong_note:.1} \
              wrong-ch {wrong_ch:.1} none {none:.1}"
         );
         assert!(full > 1e3, "correctly-targeted poly-AT must open the tone: {full}");
@@ -2327,21 +2327,21 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
 
         // -- mis-stamped v3: poly_at unwired, v2 bend still wired.
         let b = reg
-            .create_instance("v105_bogus3", 48_000.0, &[])
+            .create_instance("v106_bogus3", 48_000.0, &[])
             .expect("bogus-v3 instance");
-        let at = v105_probe_render(&b, Some((1, 61, 127)), None);
-        let bend = v105_probe_render(&b, None, Some(crate::midipat::st_to_bend(6.0)));
-        eprintln!("v105 ladder bogus3: at {at:.1} bend {bend:.1}");
+        let at = v106_probe_render(&b, Some((1, 61, 127)), None);
+        let bend = v106_probe_render(&b, None, Some(crate::midipat::st_to_bend(6.0)));
+        eprintln!("v106 ladder bogus3: at {at:.1} bend {bend:.1}");
         assert!(at < 10.0, "a mis-stamped v3 table must NOT wire poly_at: {at}");
         assert!(bend > 1e2, "the v2 bend must survive a bogus v3 export: {bend}");
     }
 
     /// Contract change (same-commit retarget, the v103 bend-4 precedent):
     /// this v100 guard pinned the scripted poly-AT DROP on the bundled
-    /// sampler. v105 inverts that contract for v3-capable scripts, so the
+    /// sampler. v106 inverts that contract for v3-capable scripts, so the
     /// subject moves to bundled `drums` — still a v1 script, so the
     /// "clean, audio-invisible, panic-free drop" survives there; the
-    /// audible half lives in v105_pressure_audible_on_bundled_scripts.
+    /// audible half lives in v106_pressure_audible_on_bundled_scripts.
     #[test]
     fn v100_poly_aftertouch_still_dropped_cleanly() {
         if !crate::fx::rustc_available() {
@@ -2369,7 +2369,7 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
     /// the designed ~2.25x (amp x1.5). Sabotage: drop poly_at from a
     /// script (or the probe from the host) and that stem goes red.
     #[test]
-    fn v105_pressure_audible_on_bundled_scripts() {
+    fn v106_pressure_audible_on_bundled_scripts() {
         if !crate::fx::rustc_available() {
             return;
         }
@@ -2402,7 +2402,7 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
                     / (48_000 - 14_400) as f64
             };
             let (plain, at) = (render(false), render(true));
-            eprintln!("v105 {stem}: plain {plain:.6} at {at:.6} ratio {:.2}", at / plain.max(1e-12));
+            eprintln!("v106 {stem}: plain {plain:.6} at {at:.6} ratio {:.2}", at / plain.max(1e-12));
             assert!(plain > 1e-6, "{stem}: control render must actually sound: {plain}");
             let r = at / plain;
             assert!(

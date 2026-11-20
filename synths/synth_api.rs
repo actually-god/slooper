@@ -166,11 +166,11 @@ pub struct SynthInfoV2 {
     pub bend: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32),
 }
 
-/// ABI v3 marker (v105, card t_a4df161f). Same add-only discipline: a
+/// ABI v3 marker (v106, card t_a4df161f). Same add-only discipline: a
 /// v2 script ADDs v3, it never rewrites its v1 or v2 entry point.
 pub const SLOOPER_SYNTH_ABI_V3: u32 = 3;
 
-/// v105: per-note-aftertouch-capable synth description. The companion
+/// v106: per-note-aftertouch-capable synth description. The companion
 /// table is CUMULATIVE: it restates the full post-v1 vocabulary, so a
 /// v3 script exports ONLY `slooper_synth_info_v3` and may delete its v2
 /// table. The host probes v3 first; a missing, null or mis-stamped v3

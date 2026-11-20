@@ -3082,7 +3082,7 @@ pub fn render_midi_events(
                 2 => inst.press(ch, d2),
                 // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
                 // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                // HOSTED plugins with 0xA0; v105 (card t_a4df161f) routes it
+                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
                 // to scripted synths via Instance::poly_at: ABI v3 scripts
                 // get the raw byte, v1/v2 scripts no-op inside the call
                 // (the historic clean drop).
@@ -3663,7 +3663,7 @@ impl Proc {
                                 2 => inst.press(ch, d2),
                                 // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
                                 // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                // HOSTED plugins with 0xA0; v105 (card t_a4df161f) routes it
+                                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
                                 // to scripted synths via Instance::poly_at: ABI v3 scripts
                                 // get the raw byte, v1/v2 scripts no-op inside the call
                                 // (the historic clean drop).
@@ -3904,7 +3904,7 @@ impl Proc {
                                     2 => inst.press(ch, d2),
                                     // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
                                     // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                    // HOSTED plugins with 0xA0; v105 (card t_a4df161f) routes it
+                                    // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
                                     // to scripted synths via Instance::poly_at: ABI v3 scripts
                                     // get the raw byte, v1/v2 scripts no-op inside the call
                                     // (the historic clean drop).
@@ -4017,7 +4017,7 @@ impl Proc {
                                 2 => inst.press(ch, d2),
                                 // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
                                 // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                // HOSTED plugins with 0xA0; v105 (card t_a4df161f) routes it
+                                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
                                 // to scripted synths via Instance::poly_at: ABI v3 scripts
                                 // get the raw byte, v1/v2 scripts no-op inside the call
                                 // (the historic clean drop).
@@ -4120,7 +4120,7 @@ impl Proc {
                                         2 => inst.press(ch, d2),
                                         // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
                                         // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                        // HOSTED plugins with 0xA0; v105 (card t_a4df161f) routes it
+                                        // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
                                         // to scripted synths via Instance::poly_at: ABI v3 scripts
                                         // get the raw byte, v1/v2 scripts no-op inside the call
                                         // (the historic clean drop).
