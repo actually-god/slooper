@@ -23,6 +23,30 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Per-note aftertouch now reaches CLAP instruments.** A MPE controller's
+  note-by-note pressure (polyphonic aftertouch — the message that bends
+  one held note while its neighbours stay still) was forwarded to VST2 and
+  VST3 instruments but silently dropped on the way to CLAP ones, so the
+  same controller played differently depending on the plugin format. CLAP
+  instruments now receive it like every other instrument. Built-in
+  scripted instruments still ignore per-note pressure — their script
+  interface has no per-note aftertouch input yet (a follow-up will add
+  it); channel aftertouch and expression work there today.
+
+- **Pitch bends now bend the same amount on every plugin.** A glide or
+  wheel bend drawn in the piano roll is written in semitones, but hosted
+  instruments received it raw and interpreted it with whatever bend range
+  they happened to default to — often ±2 semitones, so a 7-semitone glide
+  sounded small and every plugin disagreed. Each track now has a
+  **bend range** setting (PARAMETERS window, instrument tracks; default
+  ±2 st, 0 disables bend, saved with the session and project): slooper
+  programs the plugin with the standard MIDI pitch-bend-sensitivity
+  message (RPN 0) on load, on every change, and just before the first
+  bend on each MIDI channel, and rescales the wheel to match — so bends
+  inside the range hear exactly their written depth, and deeper bends
+  need a wider range. CLAP instruments are covered too — they previously
+  received no pitch bend at all.
+
 - **The piano roll's glide lane now glides on the built-in instruments.**
   Pitch bends baked into a clip — drawn with the glide tool or recorded
   from a hardware wheel — were silently discarded for every scripted

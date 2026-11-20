@@ -61,6 +61,21 @@ typedef struct fixture_plugin {
    bool                      load_armed;    // v67: fixload latch
    bool                      load_reported; // v67: sink answered loaded()
 
+   // v103 (card t_62c5a14e): raw-MIDI observer — the host rescales
+   // roll-space pitch bends to the track range and announces RPN0; pins
+   // read the results back through the hidden probe params (ids 4/5).
+   double                    bend_val;  // last pitch bend, 14-bit unsigned
+   int                       rpn_sel;   // last CC101 (RPN MSB select)
+   int                       rpn_act;   // slot 0/0 currently selected
+   double                    rpn_msb;   // last CC6 while slot 0/0 active
+   int                       midi_msgs; // raw MIDI events seen
+   // v104 (card t_0ab25d9a): poly-aftertouch (0xA0) observer — hidden
+   // probe params 6/7/8 read these back (count, (ch<<8)|note, pressure).
+   int                       poly_msgs;
+   int                       poly_ch;
+   int                       poly_note;
+   int                       poly_press;
+
    double                    sample_rate;
    bool                      active;
    bool                      processing;
@@ -158,6 +173,31 @@ static clap_process_status fx_process(const clap_plugin_t *p, const clap_process
       case CLAP_EVENT_PARAM_VALUE:
          fx_apply_param(p, (const clap_event_param_value_t *)h);
          break;
+      case CLAP_EVENT_MIDI: {
+         const clap_event_midi_t *mm = (const clap_event_midi_t *)h;
+         const uint8_t *d = mm->data;
+         fixture_plugin_t *f2 = selfp(p);
+         f2->midi_msgs++;
+         int status = d[0] & 0xF0;
+         if (status == 0xE0)
+            f2->bend_val = (double)(((d[2] << 7) | d[1]));
+         else if (status == 0xB0) {
+            int cc = d[1], v = d[2];
+            if (cc == 101)
+               f2->rpn_sel = v;
+            else if (cc == 100)
+               f2->rpn_act = (f2->rpn_sel == 0 && v == 0);
+            else if (cc == 6 && f2->rpn_act)
+               f2->rpn_msb = v;
+         } else if (status == 0xA0) {
+            // v104: poly aftertouch — record channel/note/pressure.
+            f2->poly_msgs++;
+            f2->poly_ch = d[0] & 0x0F;
+            f2->poly_note = d[1];
+            f2->poly_press = d[2];
+         }
+         break;
+      }
       default:
          break;
       }
@@ -212,7 +252,7 @@ static clap_process_status fx_process(const clap_plugin_t *p, const clap_process
 
 //////////////////////////  params  ///////////////////////////////////////
 
-#define PARAM_COUNT 3
+#define PARAM_COUNT 8 /* +5 hidden probe params (v103 x2, v104 x3) */
 
 static uint32_t pm_count(const clap_plugin_t *p) { (void)p; return PARAM_COUNT; }
 
@@ -228,7 +268,7 @@ static bool pm_get_info(const clap_plugin_t *p, uint32_t idx, clap_param_info_t 
       info->id = 2;
       snprintf(info->name, CLAP_NAME_SIZE, "%s", "fixamp");
       info->min_value = 0.0; info->max_value = 1.0; info->default_value = 1.0;
-   } else {
+   } else if (idx == 2) {
       // v67: preset-load trigger. Reaching >= 0.5 makes the plugin call
       // the host's clap.preset-load sink ONCE and then mutate its own
       // gain - a deterministic stand-in for a preset loaded through the
@@ -236,6 +276,34 @@ static bool pm_get_info(const clap_plugin_t *p, uint32_t idx, clap_param_info_t 
       info->id = 3;
       snprintf(info->name, CLAP_NAME_SIZE, "%s", "fixload");
       info->min_value = 0.0; info->max_value = 1.0; info->default_value = 0.0;
+   } else if (idx == 3) {
+      // v103: HIDDEN read-back probes for the bend currency pins (never
+      // knobs; the host must not write them — IS_READONLY + IS_HIDDEN).
+      info->id = 4;
+      snprintf(info->name, CLAP_NAME_SIZE, "%s", "probe-bend");
+      info->min_value = 0.0; info->max_value = 16383.0; info->default_value = 0.0;
+      info->flags = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY;
+   } else if (idx == 4) {
+     info->id = 5;
+     snprintf(info->name, CLAP_NAME_SIZE, "%s", "probe-rpn");
+     info->min_value = 0.0; info->max_value = 127.0; info->default_value = 0.0;
+     info->flags = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY;
+   } else if (idx == 5) {
+     // v104 (card t_0ab25d9a): hidden read-backs for the poly-AT pins.
+     info->id = 6;
+     snprintf(info->name, CLAP_NAME_SIZE, "%s", "probe-poly-c");
+     info->min_value = 0.0; info->max_value = 1e6; info->default_value = 0.0;
+     info->flags = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY;
+   } else if (idx == 6) {
+     info->id = 7;
+     snprintf(info->name, CLAP_NAME_SIZE, "%s", "probe-poly-n");
+     info->min_value = 0.0; info->max_value = 4095.0; info->default_value = 0.0;
+     info->flags = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY;
+   } else {
+     info->id = 8;
+     snprintf(info->name, CLAP_NAME_SIZE, "%s", "probe-poly-p");
+     info->min_value = 0.0; info->max_value = 127.0; info->default_value = 0.0;
+     info->flags = CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY;
    }
    return true;
 }
@@ -245,6 +313,11 @@ static bool pm_get_value(const clap_plugin_t *p, clap_id id, double *out) {
    if (id == 1) { *out = f->gain; return true; }
    if (id == 2) { *out = f->amp; return true; }
    if (id == 3) { *out = f->load_reported ? 1.0 : 0.0; return true; }
+   if (id == 4) { *out = f->bend_val; return true; }
+   if (id == 5) { *out = f->rpn_msb; return true; }
+   if (id == 6) { *out = (double)f->poly_msgs; return true; }
+   if (id == 7) { *out = (double)((f->poly_ch << 8) | f->poly_note); return true; }
+   if (id == 8) { *out = (double)f->poly_press; return true; }
    return false;
 }
 
