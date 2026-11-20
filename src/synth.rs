@@ -53,7 +53,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
 /// `v12_seed_stale_stamp_updates_despite_version_skew`), so it lives only
 /// for the tests that assert the shipped scripts stay stamped.
 #[cfg(test)]
-const BUNDLED_VERSION: &str = "7";
+const BUNDLED_VERSION: &str = "8";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
