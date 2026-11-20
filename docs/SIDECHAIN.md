@@ -1,4 +1,4 @@
-# Sidechain routing (v32 R5; tap semantics v95)
+# Sidechain routing (v32 R5; tap semantics v95; per-send levels v97)
 
 ## What sidechaining is
 
@@ -52,10 +52,20 @@ Everything runs on the realtime thread with zero allocations and no locks:
   to sources that actually carry material this block — a muted or
   stopped source with clips/MIDI still expands edges (its key flows!),
   a source with nothing to play contributes nothing.
-* **Consumers.** `fx_mix` and `run_chain_block` pass the track's
+* **The consumers.** `fx_mix` and `run_chain_block` pass the track's
   sidechain row down to scripted slots. Plugins see silence for `sc` —
   VST3 sidechain inputs need extra JACK port plumbing and are future
   work (see below).
+* **Per-send receive levels (v97).** Each (target, source) pair carries a
+  receive level (linear, default 1.0) that scales that source's tap
+  *before* the sum — so a target fed by several sources can MIX its keys
+  (50 % kick + 100 % bass etc.). The level lives on the receiver's side
+  only: the sender's own gain/pan still ride the key per the tap law, and
+  its fader/mute still never touch it. RT reads the table once per block
+  into the edge list (`e_gain` -> folded into `e_scale`); the live bus and
+  the offline mirror apply the identical factor. The slider in the mixer
+  (see below) is the only editor; old project/config files carry no
+  entries and therefore load at unity — pre-v97 behavior bit-for-bit.
 * **MIDI senders.** A muted source track's patterns still key the
   target when its synth instance is DEDICATED to that track. Tracks
   sharing one synth instance (e.g. several strips on the default piano)
@@ -93,9 +103,13 @@ export therefore duck identically.
 
 * The chain window has a **Sidechain in** picker: all track numbers,
   click to toggle (self excluded — the mask shows as a tag and keyed
-  tracks are listed under the picker).
+  tracks are listed under the picker). A routed chip carries a per-send
+  **level slider** (v97): 0–200 %, `nnn %` readout, hover explains it and
+  the status line echoes the pair + percent on release.
 * Sends persist per project (`Config::sc_send`, mirrored into the engine
-  on boot and on every change; `write_config_deferred`).
+  on boot and on every change; `write_config_deferred`). Receive levels
+  persist sparsely as `Config::sc_recv_gain: Vec<ScRecvGain { t, s, gain }>`
+  — only non-unity pairs are written (v97).
 * The chain window tags effects loaded through the v2 entry so it is
   visible whether an insert can actually *use* a key.
 
@@ -129,3 +143,12 @@ export therefore duck identically.
   mute/fader-independent and gain/pan-preserving (depth ∝ gain, hard
   pan × 1/√2, volume has zero effect). `v48_export_sidechain_ducks_target`
   re-targeted to the new contract in the same commit.
+* v97 receive levels: `v97_engine_sc_recv_defaults_and_clamp` (unity
+  table, clamping, per-pair independence); `v97_sc_export_recv_gain_scales_pair`
+  (two senders, exact duck math per pair level, unity = pre-v97 blend);
+  `v97_config_sc_recv_gain_old_files_unity_roundtrip` (sparse persistence);
+  `v97_ui_send_level_slider_paints_drag_and_echoes` +
+  `v97_ui_send_level_hover_copy_present` (paints, drags, echoes, persists);
+  `e2e_v97_sc_send_gain_scales_duck` (live bus: 0 un-keys, 0.5 shallows,
+  1.0 restores, 2.0 deepens) and `e2e_v97_sc_two_source_mix_swaps_duck`
+  (two unequal keys, 50/100 vs 100/50 measurably differ).

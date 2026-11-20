@@ -986,6 +986,11 @@ pub struct Engine {
     /// The self-bit is always cleared: a track never keys itself.
     sc_send_lo: [AtomicU64; MAX_LOOPS],
     sc_send_hi: [AtomicU64; MAX_LOOPS],
+    /// v97 (sc-4): receive-side level per sidechain route, target-major
+    /// index `t * MAX_LOOPS + s` (f32 bits): scales source `s`'s tap into
+    /// target `t`'s SC row. Default 1.0 — every pre-v97 project is
+    /// bit-identical (docs/SIDECHAIN.md).
+    sc_recv: [AtomicU32; MAX_LOOPS * MAX_LOOPS],
     /// Per-track stereo pan position as f32 in [0, 1] (0 = hard left,
     /// 0.5 = centre). Equal-power split between the L and R mix buses.
     pan: [AtomicU32; MAX_LOOPS],
@@ -1191,6 +1196,7 @@ impl Engine {
             trk_gain: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             sc_send_lo: core::array::from_fn(|_| AtomicU64::new(0)),
             sc_send_hi: core::array::from_fn(|_| AtomicU64::new(0)),
+            sc_recv: core::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             pan: core::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
             selected: AtomicU8::new(0),
             monitor_on: AtomicBool::new(true),
@@ -1640,6 +1646,19 @@ impl Engine {
         let m = mask & !(1u128 << i);
         self.sc_send_lo[i].store(m as u64, Ordering::Relaxed);
         self.sc_send_hi[i].store((m >> 64) as u64, Ordering::Relaxed);
+    }
+
+    /// v97 (sc-4): receive-side level of one (target, source) sidechain
+    /// route — this send's contribution to the target's summed SC row.
+    /// Unity (1.0) is the default and mirrors the pre-v97 always-unity sum.
+    pub fn sc_recv_gain(&self, t: usize, s: usize) -> f32 {
+        f32::from_bits(self.sc_recv[t * MAX_LOOPS + s].load(Ordering::Relaxed))
+    }
+
+    /// v97 (sc-4): set a route's receive level (clamped to >= 0; applies
+    /// from the next audio block, like every SC setter).
+    pub fn set_sc_recv_gain(&self, t: usize, s: usize, g: f32) {
+        self.sc_recv[t * MAX_LOOPS + s].store(g.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
     /// v95 (sc-3): union of every target's send mask = the set of tracks
@@ -2236,8 +2255,12 @@ impl Engine {
                     for (src, d) in tap_hold.iter().enumerate() {
                         if (send[t] >> src) & 1 != 0 {
                             if let Some(d) = d {
+                                // v97 (sc-4): per-(target, source) receive
+                                // level scales this send's contribution to
+                                // the row (unity = pre-v97 sum bit-exact).
+                                let g = self.sc_recv_gain(t, src);
                                 for (r, x) in row.iter_mut().zip(d.iter()) {
-                                    *r += *x;
+                                    *r += *x * g;
                                 }
                             }
                         }
@@ -5693,6 +5716,10 @@ impl Proc {
         let mut n_edge = 0usize;
         let mut e_src = [0u8; 256];
         let mut e_tgt = [0u8; 256];
+        // v97 (sc-4): per-edge receive level read once per block alongside
+        // the masks (UI writes land next block — every SC setter is
+        // block-constant by construction).
+        let mut e_gain = [1.0f32; 256];
         let mut sc_any = false;
         for tg in 0..MAX_LOOPS {
             let m: u128 = self.engine.sc_send(tg);
@@ -5708,6 +5735,7 @@ impl Proc {
                 if (m >> s) & 1 != 0 && sourced && n_edge < e_src.len() {
                     e_src[n_edge] = s as u8;
                     e_tgt[n_edge] = tg as u8;
+                    e_gain[n_edge] = self.engine.sc_recv_gain(tg, s);
                     n_edge += 1;
                 }
             }
@@ -5721,6 +5749,12 @@ impl Proc {
                 let g = f32::from_bits(self.engine.trk_gain[t].load(Ordering::Relaxed));
                 sc_fold[t] = g * (pgl[t] + pgr[t]) * F1S2;
             }
+        }
+        // v97 (sc-4): fold each edge's receive level into a per-edge tap
+        // scale (block-constant, same inaudibility argument as sc_fold).
+        let mut e_scale = [0.0f32; 256];
+        for k in 0..n_edge {
+            e_scale[k] = sc_fold[e_src[k] as usize] * e_gain[k];
         }
         let mut sc_apply = std::mem::take(&mut self.sc_apply);
         let mut sc_build = std::mem::take(&mut self.sc_build);
@@ -5913,12 +5947,13 @@ impl Proc {
                 // inside the audibility-gated mix loop above, so sender
                 // mute/volume killed the key — the reported bug). Edges
                 // are pre-filtered to sources with material this block;
-                // sc_fold is the sender's gain x pan-fold — the fader,
-                // every mute and the master never touch it. Consumed
-                // NEXT block (one block of detector lag).
+                // e_scale is the sender's gain x pan-fold x the target's
+                // v97 receive level for this edge — the fader, every mute
+                // and the master never touch it. Consumed NEXT block (one
+                // block of detector lag).
                 if n_edge != 0 {
                     for k in 0..n_edge {
-                        let tap = acc[e_src[k] as usize] * sc_fold[e_src[k] as usize];
+                        let tap = acc[e_src[k] as usize] * e_scale[k];
                         sc_build[e_tgt[k] as usize][i] += tap;
                     }
                 }
@@ -7829,6 +7864,88 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         let o = e.render_project().expect("render");
         let sc = 0.25 * std::f32::consts::FRAC_1_SQRT_2;
         v48_tap(&o, 500, 1.0 - 0.9 * sc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v97 (sc-4): the receive-level table is unity everywhere on a fresh
+    /// engine — an untouched project sums its sends exactly like pre-v97.
+    #[test]
+    fn v97_engine_sc_recv_defaults_and_clamp() {
+        let e = Engine::new();
+        assert_eq!(e.sc_recv_gain(1, 0), 1.0, "unity default = pre-v97 sum");
+        assert_eq!(e.sc_recv_gain(7, 7), 1.0, "every slot exists");
+        e.set_sc_recv_gain(1, 0, 0.5);
+        assert!((e.sc_recv_gain(1, 0) - 0.5).abs() < 1e-6);
+        assert_eq!(e.sc_recv_gain(0, 1), 1.0, "the reverse pair is independent");
+        assert_eq!(e.sc_recv_gain(1, 2), 1.0, "neighbours untouched");
+        e.set_sc_recv_gain(3, 4, -2.0);
+        assert_eq!(e.sc_recv_gain(3, 4), 0.0, "negative clamps to silence");
+    }
+
+    /// v97 rig: TWO senders into target 1 (A = 0.25 DC on track 0, B = 0.5
+    /// DC on track 2), click 1.0 on the target at sample 500.
+    fn v97_sc_rig2(tag: &str) -> (Arc<Engine>, std::path::PathBuf) {
+        let (reg, dir) = v48_reg(tag, "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src_a: Arc<[f32]> = Arc::from(vec![0.25f32; 1500]);
+        let src_b: Arc<[f32]> = Arc::from(vec![0.5f32; 1500]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(0, 0)); // sender A
+        arr.insert(1, 0, Clip::new(1, 500)); // target: click at 500
+        arr.insert(2, 0, Clip::new(2, 0)); // sender B
+        e.set_project(Arc::new(vec![src_a, v48_click(1000), src_b]), Arc::new(arr), 1500);
+        let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+        let desc = reg.desc("v48sc").unwrap().clone();
+        e.set_track_fx(
+            1,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+        e.set_sc_send(1, (1 << 0) | (1 << 2));
+        (e, dir)
+    }
+
+    /// v97 (sc-4): per-(target, source) receive levels in the export mirror
+    /// — same mask, different pair levels, different ducks. Senders are
+    /// MUTED so their AUDIO cannot bias the tap (v95: mute keeps the key),
+    /// making out[500] a pure readout of the summed, levelled key:
+    ///   out[500] = 1 x (1 - 0.9 x sc),  sc = 0.25 x gA + 0.5 x gB.
+    #[test]
+    fn v97_sc_export_recv_gain_scales_pair() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (e, dir) = v97_sc_rig2("v97pair");
+        e.set_track_on(0, false);
+        e.set_track_on(2, false);
+        // A full, B silent: sc = 0.25 — exactly the v95 single-send duck.
+        e.set_sc_recv_gain(1, 0, 1.0);
+        e.set_sc_recv_gain(1, 2, 0.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.25);
+        // Swap the pair levels: now B (twice the material) drives the key.
+        e.set_sc_recv_gain(1, 0, 0.0);
+        e.set_sc_recv_gain(1, 2, 1.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.5);
+        // Half A + half B: linear blend of the two contributions.
+        e.set_sc_recv_gain(1, 0, 0.5);
+        e.set_sc_recv_gain(1, 2, 0.5);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * (0.125 + 0.25));
+        // Both zero: routed but silent key — the click rides unducked.
+        e.set_sc_recv_gain(1, 0, 0.0);
+        e.set_sc_recv_gain(1, 2, 0.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0);
+        // Unity again (the DEFAULT — deleting the pair state must restore
+        // the pre-v97 blend of 0.25 + 0.5).
+        e.set_sc_recv_gain(1, 0, 1.0);
+        e.set_sc_recv_gain(1, 2, 1.0);
+        let o = e.render_project().expect("render");
+        v48_tap(&o, 500, 1.0 - 0.9 * 0.75);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
