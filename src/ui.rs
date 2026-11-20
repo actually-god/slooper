@@ -33513,11 +33513,10 @@ mod tests {
         frame(&mut app, &ctx, vec![moved(q), btn_btn(q, true)]);
         frame(&mut app, &ctx, vec![btn_btn(q, false)]);
         assert!(app.status.contains("quantized"), "{}", app.status);
-        let c = galley_at_last(&mut app, &ctx, "clear")
-            .expect("clear button")
-            .center();
-        frame(&mut app, &ctx, vec![moved(c), btn_btn(c, true)]);
-        frame(&mut app, &ctx, vec![btn_btn(c, false)]);
+        // v102 RETARGET: the toolbar gained a "clear curve" button, so a
+        // substring "clear" read could (and did) land on it — click the
+        // EXACT label.
+        click_last_exact(&mut app, &ctx, "clear");
         assert!(
             app.status.contains("pattern cleared"),
             "destructive clear confirms: {}",
