@@ -28,7 +28,7 @@
 
 use std::cell::UnsafeCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Fixed processing granularity handed to plugins (samples).
@@ -309,6 +309,16 @@ pub trait StageEntry: Send + Sync {
     /// Drop all buffered audio (transport seek). Audio thread only.
     fn flush(&self);
     fn midi_drops(&self) -> u64;
+    /// v103 (card t_62c5a14e): per-track pitch-bend RANGE in semitones
+    /// (0 = bend disabled) sent to the plugin as RPN0 and used to rescale
+    /// the roll-space bend currency (midipat::BEND_FULL_ST, ±12 st full
+    /// scale) into the plugin's wheel. The UI table is the single truth:
+    /// a plugin never reports its own RPN. Default no-op backends simply
+    /// keep the ±2 default (which matches the industry default anyway).
+    fn set_bend_range(&self, _st: u8) {}
+    fn bend_range(&self) -> u8 {
+        DEFAULT_BEND_RANGE
+    }
     /// Serial state chunk (VST3 shadow-editor harvest, CLAP `clap.state`);
     /// control thread only.
     fn chunk(&self) -> Option<Vec<u8>> {
@@ -329,6 +339,48 @@ pub trait StageEntry: Send + Sync {
     ) -> Result<crate::vstedit::EditorWindow, String> {
         Err("this plugin format hosts no editor window".into())
     }
+}
+
+/// v103: per-track pitch-bend range default (semitones, ±). Most hardware
+/// and GM synths default to ±2, but hosted plugins vary wildly; slooper
+/// now ALWAYS announces the track's range via RPN0 so the depth written
+/// in the piano roll means the same thing on every plugin.
+pub const DEFAULT_BEND_RANGE: u8 = 2;
+
+/// v103: map a roll-space 14-bit bend (full scale ±12 st, the midipat
+/// law shared by the roll editor, the scripted synths and every engine
+/// feed) into a plugin-channel 14-bit bend whose full scale is ±`range`
+/// st. Depth-preserving with a clamp: written semitones are heard
+/// exactly for |st| <= range; deeper bends wall at the range — raising
+/// the track range is the fix for those (documented in CHANGELOG).
+/// `range == 0` parks the wheel at center (bend disabled).
+pub fn bend_rescale(raw14: u16, range: u8) -> u16 {
+    if range == 0 {
+        return 8192;
+    }
+    let st = crate::midipat::bend_to_st(raw14);
+    let d = (st / range as f32 * 8191.0)
+        .round()
+        .clamp(-8191.0, 8191.0) as i32;
+    (d + 8192) as u16
+}
+
+/// v103: the six CCs that program RPN-0 (pitch bend sensitivity):
+/// select slot 0/0, write MSB semitones + LSB cents, close the slot.
+/// Same bytes reach VST2 (processEvents), VST3 (ControlChange events —
+/// the v33 wire already forwards CCs; VST3 defines no universal native
+/// bend-range parameter, raw MIDI RPN is the portable path) and CLAP
+/// (raw MIDI events).
+pub(crate) fn rpn0_burst(ch: u8, range: u8) -> [[u8; 3]; 6] {
+    let b = 0xB0 | (ch & 0x0F);
+    [
+        [b, 101, 0],
+        [b, 100, 0],
+        [b, 6, range.min(127)],
+        [b, 38, 0],
+        [b, 101, 127],
+        [b, 100, 127],
+    ]
 }
 
 impl StageEntry for RtStageEntry {
@@ -392,6 +444,14 @@ impl StageEntry for RtStageEntry {
     }
     fn midi_drops(&self) -> u64 {
         RtStageEntry::midi_drops(self)
+    }
+    fn set_bend_range(&self, st: u8) {
+        // Control thread (UI bind / params window). The RT thread adopts
+        // the new value at the top of its next block (bend_seen diff).
+        self.bend_range.store(st.min(24), Ordering::Relaxed);
+    }
+    fn bend_range(&self) -> u8 {
+        self.bend_range.load(Ordering::Relaxed)
     }
     fn chunk(&self) -> Option<Vec<u8>> {
         self.editor_state.lock().unwrap().clone()
@@ -2361,6 +2421,14 @@ struct RtState {
     // The Box is load-bearing (address stability), hence no Vec::into_boxed-slice style fix.
     #[allow(clippy::vec_box)]
     ev_pool: Vec<Box<vst2::api::Event>>,
+    /// v103: entry-shared pitch-bend range (UI writes via set_bend_range).
+    bend_range: Arc<AtomicU8>,
+    /// Range the RT thread has adopted; u8::MAX until the first block
+    /// (forces the eager init announcement).
+    bend_seen: u8,
+    /// Channels whose RPN0 was announced since the last range change —
+    /// a bend on a clear channel carries its own burst first (queue hook).
+    bend_announced: u16,
     errors: u32,
 }
 
@@ -2419,6 +2487,10 @@ pub struct RtStageEntry {
     /// and nothing calls into that library again. Never cleared — the user
     /// removes/reloads the plugin to get sound back.
     dead: AtomicBool,
+    /// v103 (card t_62c5a14e): per-track pitch-bend range shared with the
+    /// RT state (control thread writes via set_bend_range; the RT adopts
+    /// it per block — see RtState::bend_seen).
+    bend_range: Arc<AtomicU8>,
 }
 
 /// Raw editor-dispatch handle for a loaded VST2 plugin: just the
@@ -3147,6 +3219,7 @@ fn assemble(
     let last: Vec<f32> = (0..descs.len()).map(|k| params.get(k)).collect();
     let seen_gen = params.generation();
     let midi_drops = Arc::new(AtomicU64::new(0));
+    let bend_range = Arc::new(AtomicU8::new(DEFAULT_BEND_RANGE));
     let state = RtState {
         backend: parts.backend,
         hostbuf: parts.hostbuf,
@@ -3168,6 +3241,9 @@ fn assemble(
         abs_processed: 0,
         midi_drops: midi_drops.clone(),
         ev_pool: Vec::new(),
+        bend_range: bend_range.clone(),
+        bend_seen: u8::MAX,
+        bend_announced: 0,
         errors: 0,
     };
     RtStageEntry {
@@ -3184,6 +3260,7 @@ fn assemble(
         vst2,
         editor_state: Mutex::new(editor_state),
         midi_drops,
+        bend_range,
         dead: AtomicBool::new(false),
     }
 }
@@ -3879,8 +3956,36 @@ impl RtStageEntry {
 
     /// Queue one message, counting (never silently swallowing) overflow.
     fn queue(s: &mut RtState, msg: [u8; 3], pos: i64) {
+        // v103: ONE choke point for every feed (feed_midi, process_with_midi
+        // — pattern render, live port, audition copies, offline export), so
+        // the bend-currency translation cannot drift per call site. Engine
+        // bends are roll-space (±12 st full scale, midipat law); the plugin
+        // channel receives them rescaled to the track's bend range, and
+        // RPN0 announces that range BEFORE the first bend of every channel
+        // (and eagerly for ch0 at init / range change, see process_inner).
+        if msg[0] & 0xF0 == 0xE0 {
+            let r = s.bend_range.load(Ordering::Relaxed);
+            let bit = 1u16 << (msg[0] & 0x0F);
+            if s.bend_seen == u8::MAX || s.bend_announced & bit == 0 {
+                for b in rpn0_burst(msg[0] & 0x0F, r) {
+                    if s.pending_midi.len() >= MIDI_QUEUE_CAP {
+                        s.midi_drops.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    s.pending_midi.push(QueuedMidi { m: b, pos });
+                }
+                s.bend_announced |= bit;
+            }
+            let v = bend_rescale(((msg[2] as u16) << 7) | (msg[1] as u16), r);
+            let m = [msg[0], (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8];
+            return Self::push_q(s, m, pos);
+        }
+        Self::push_q(s, msg, pos)
+    }
+
+    fn push_q(s: &mut RtState, m: [u8; 3], pos: i64) {
         if s.pending_midi.len() < MIDI_QUEUE_CAP {
-            s.pending_midi.push(QueuedMidi { m: msg, pos });
+            s.pending_midi.push(QueuedMidi { m, pos });
         } else {
             s.midi_drops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3968,6 +4073,16 @@ impl RtStageEntry {
     /// has no RT thread). This is what lets a pin prove a program change
     /// reached the LIBRARY rather than only the host mirror: the fixture
     /// encodes its program in getState.
+    /// Test-only (v103): raw dispatcher call on a VST2 entry — the w6
+    /// fixture's private probe opcodes (9000..) read its MIDI observer.
+    #[cfg(test)]
+    pub(crate) fn v2_probe(&self, opcode: i32) -> isize {
+        match self.vst2 {
+            Some(h) => h.dispatch(opcode, 0, 0, std::ptr::null_mut(), 0.0),
+            None => -1,
+        }
+    }
+
     #[cfg(test)]
     pub fn save_state(&self) -> Result<Vec<u8>, String> {
         // SAFETY: `#[cfg(test)]` + caller-owns-entry contract (above);
@@ -4002,6 +4117,25 @@ impl RtStageEntry {
             s.stage_r.copy_from_slice(&s.stage_l);
             s.stage_ol.fill(0.0);
             s.stage_or.fill(0.0);
+            // v103: adopt a control-thread range change and announce it
+            // eagerly on ch0 at the block head (first block after load =
+            // the "on init" burst; later diffs = the "on change" burst).
+            // Other channels re-announce reactively on their next bend
+            // (queue hook — the mask reset here is what arms that).
+            let br = s.bend_range.load(Ordering::Relaxed);
+            if br != s.bend_seen {
+                if s.bend_seen != u8::MAX {
+                    s.bend_announced = 0;
+                }
+                for m in rpn0_burst(0, br) {
+                    if s.pending_midi.len() >= MIDI_QUEUE_CAP {
+                        break;
+                    }
+                    s.pending_midi.push(QueuedMidi { m, pos: s.abs_processed });
+                }
+                s.bend_announced |= 1; // ch0 just got it
+                s.bend_seen = br;
+            }
             // v33: deliver this block's due events FIRST — with their true
             // offset inside this block (see `deliver_midi`) — then render.
             self.deliver_midi(s);
@@ -7061,6 +7195,118 @@ mod tests {
             Some(0),
             "sfizz editor probe must be Safe despite the teardown trap (v73); \
              status = {st:?}"
+        );
+    }
+
+    // ---- v103 (card t_62c5a14e): per-track pitch-bend range ----
+
+    /// The rescale LAW, independent of any plugin: roll-space bends
+    /// (full scale ±12 st, midipat law) keep their written semitone depth
+    /// inside the track range and WALL at the range beyond it. R=0 parks
+    /// the wheel (bend off). These numbers are hand-derived from the
+    /// midipat law, NOT from `bend_rescale` itself.
+    #[test]
+    fn v103_bend_rescale_law() {
+        assert_eq!(DEFAULT_BEND_RANGE, 2, "industry-default ±2 st");
+        assert_eq!(bend_rescale(8192, 5), 8192, "center stays center");
+        assert_eq!(bend_rescale(16383, 0), 8192, "range 0 disables (up)");
+        assert_eq!(bend_rescale(0, 0), 8192, "range 0 disables (down)");
+        // +3 st roll bend (midipat: 8192 + round(3/12*8191) = 10240).
+        let up3 = 10240u16;
+        // R=12: identity-ish (full scale already ±12).
+        assert_eq!(bend_rescale(up3, 12), 10240, "±12 preserves the roll law");
+        // R=6: 3 st of a 6 st wheel = half deflection = 8192 + round(3/6*8191) = 12288.
+        assert_eq!(bend_rescale(up3, 6), 12288, "depth preserved within range");
+        // R=1: 3 st demands 24576 counts — clamps to the wheel top.
+        assert_eq!(bend_rescale(up3, 1), 16383, "deeper bends clamp up");
+        // -4 st roll bend (8192 - round(4/12*8191) = 5462), R=2: walls low.
+        assert_eq!(bend_rescale(5462, 2), 1, "deeper bends clamp down");
+        // -4 st with R=8: quarter deflection = 8192 - round(4/8*8191) = 4097.
+        assert_eq!(bend_rescale(5462, 8), 4097, "negative depth preserved");
+    }
+
+    /// RPN0 must REACH THE LIBRARY, not just the host: the w6 fixture
+    /// parses every effProcessEvents block and counts CC6 writes that
+    /// land while RPN slot 0/0 is selected (opcode 9000), the last MSB
+    /// (9001) / LSB (9002), and the last 14-bit bend (9003, +1-coded).
+    /// Expected per first block with a ch2 bend: EXACTLY two CC6 writes
+    /// — the eager init burst on ch0 (block head) + the reactive burst
+    /// immediately before the ch2 bend (its channel had not announced).
+    /// A second bend on the SAME channel must add no burst.
+    #[test]
+    fn v103_vst2_rpn0_observed_at_plugin() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v103rpn");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        e.set_bend_range(7);
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        assert_eq!(rt.v2_probe(9000), 0, "fresh instance has seen no CC6 yet");
+        let inp = vec![0.0f32; 1024]; // two VST_BLOCKs
+        let mut outp = vec![0.0f32; 1024];
+        // +3 st on channel 2 (midipat law: raw 10240).
+        let raw = 10240u16;
+        let lo = (raw & 0x7F) as u8;
+        let hi = ((raw >> 7) & 0x7F) as u8;
+        e.process_with_midi(&inp, &mut outp, &[(16, [0xE2, lo, hi])]);
+        assert_eq!(rt.v2_probe(9000), 2, "eager ch0 burst + reactive ch2 burst");
+        assert_eq!(rt.v2_probe(9001), 7, "RPN0 data-MSB = the track range (st)");
+        assert_eq!(rt.v2_probe(9002), 0, "RPN0 data-LSB = 0 cents");
+        let got = rt.v2_probe(9003);
+        assert_ne!(got, 0, "a pitch bend reached the plugin");
+        assert_eq!(
+            got - 1,
+            bend_rescale(raw, 7) as isize,
+            "bend rescaled to the ±7 st wheel the plugin was told about"
+        );
+        // Same channel again: range already announced — no re-burst.
+        e.process_with_midi(&inp, &mut outp, &[(8, [0xE2, lo, hi])]);
+        assert_eq!(rt.v2_probe(9000), 2, "no RPN0 re-burst per bend");
+        // A NEW channel gets its own burst (RPN state is per-channel).
+        e.process_with_midi(&inp, &mut outp, &[(8, [0xE3, lo, hi])]);
+        assert_eq!(rt.v2_probe(9000), 3, "per-channel announce on ch3");
+        assert_eq!(e.midi_drops(), 0, "the burst never overflows the queue");
+    }
+
+    /// Range changes must RE-ANNOUNCE: eager ch0 burst at the next block
+    /// head, and the per-channel mask reset means every channel's NEXT
+    /// bend carries the new value first (race-free for channels 1..15).
+    #[test]
+    fn v103_vst2_rpn_resent_after_range_change() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v103chg");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; 1024];
+        let mut outp = vec![0.0f32; 1024];
+        // Block 1, untouched range: the default ±2 is announced on init.
+        e.process(&inp, &mut outp);
+        assert_eq!(rt.v2_probe(9000), 1, "init burst");
+        assert_eq!(rt.v2_probe(9001), 2, "default range announced");
+        // UI moves the track to 5 st: next block head re-bursts eagerly.
+        e.set_bend_range(5);
+        e.process(&inp, &mut outp);
+        assert_eq!(rt.v2_probe(9000), 2, "change burst at block head");
+        assert_eq!(rt.v2_probe(9001), 5, "new range announced");
+        // ch1's mask bit was cleared with the change → its next bend is
+        // preceded by its own burst, and the bend rides the NEW scale.
+        let raw = 10240u16;
+        let lo = (raw & 0x7F) as u8;
+        let hi = ((raw >> 7) & 0x7F) as u8;
+        e.process_with_midi(&inp, &mut outp, &[(4, [0xE1, lo, hi])]);
+        assert_eq!(rt.v2_probe(9000), 3, "ch1 re-announces after the change");
+        assert_eq!(rt.v2_probe(9001), 5, "the re-burst carries 5, not 2");
+        assert_eq!(
+            rt.v2_probe(9003) - 1,
+            bend_rescale(raw, 5) as isize,
+            "rescale adopts the changed range"
         );
     }
 }

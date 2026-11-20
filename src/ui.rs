@@ -1911,6 +1911,11 @@ pub struct App {
     /// v62: per-track selected VST2 factory program (-1 = none). Seeded
     /// from config, pushed by the PARAMETERS combo, captured on save.
     track_synth_program: Vec<i32>,
+    /// v103 (card t_62c5a14e): per-track pitch-bend RANGE in semitones
+    /// (0 = off). The UI table is the single truth — a hosted plugin
+    /// never reports its RPN0 — mirrored to Config/Project and pushed to
+    /// every bound entry (bind, rebuild, picker row).
+    track_bend_range: Vec<u8>,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -2540,6 +2545,13 @@ impl App {
             params_preset_locs_for: String::new(),
             track_synth_program: (0..MAX_LOOPS)
                 .map(|t| cfg.track_synth_programs.get(t).copied().unwrap_or(-1))
+                .collect(),
+            track_bend_range: (0..MAX_LOOPS)
+                .map(|t| {
+                    cfg.track_bend_ranges.get(t).copied().unwrap_or(
+                        crate::vsthost::DEFAULT_BEND_RANGE,
+                    )
+                })
                 .collect(),
             auto_press_pt: None,
             auto_click_pt: None,
@@ -3790,6 +3802,8 @@ impl App {
         // v60: program picked in the factory-program combo (applied
         // after the row closes — same deferred-action shape as preset).
         let mut pick_prog: Option<usize> = None;
+        // v103: bend range picked in the per-track row (deferred shape).
+        let mut pick_bend: Option<(usize, u8)> = None;
         let total = entry.descs().iter().filter(|d| d.writable && !d.program_change).count();
         let ql = new_filter.trim().to_lowercase();
         // v82: the count label echoes the filter LIVE (goal 1: every
@@ -3976,6 +3990,54 @@ impl App {
                         pick_prog = Some(i);
                     }
                 });
+            }
+            // v103 (card t_62c5a14e): per-track PITCH-BEND RANGE for a
+            // hosted instrument. The roll writes absolute semitones
+            // (glide law, full scale ±12); the plugin bends EXACTLY that
+            // far, clamping past the cap, because slooper announces R
+            // as RPN0 and rescales the raw wheel on delivery — depth
+            // now matches across plugins. Synth targets only: FX never
+            // consume pitch, and a chain slot cannot name a track.
+            if let GuiTarget::Synth(t) = target {
+                if t < MAX_LOOPS {
+                    let cur = self.bend_range_for(t);
+                    let caption = if cur == 0 {
+                        "off".to_string()
+                    } else {
+                        format!("{cur} st")
+                    };
+                    let items: Vec<crate::presetbar::PickerItem> = (0..=24u8)
+                        .map(|n| crate::presetbar::PickerItem {
+                            display: if n == 0 {
+                                "off (no bend)".to_string()
+                            } else {
+                                format!("{n} st")
+                            },
+                            hover: format!("wheel goes {n} semitones up AND down"),
+                            clip_dir: None,
+                        })
+                        .collect();
+                    ui.horizontal(|ui| {
+                        if let Some(i) = crate::presetbar::picker_row(
+                            ui,
+                            egui::Id::new("slooper_v103_bend_range"),
+                            &crate::presetbar::PickerRowSpec {
+                                label: Some("bend range"),
+                                label_width: crate::presetbar::LABEL_COL,
+                                caption: &caption,
+                                width: 150.0,
+                                hover: "pitch-bend wheel width sent to the plugin (RPN0) \u{b7} \
+                                        bends drawn in the roll keep their semitone depth, \
+                                        clamped here \u{b7} 0 disables bend",
+                                empty_text: None,
+                            },
+                            &items,
+                            Some(cur as usize),
+                        ) {
+                            pick_bend = Some((t, i as u8));
+                        }
+                    });
+                }
             }
             // v67: surface plugin-side preset-load reports (CLAP
             // `clap.preset-load`) while this window shows the entry - same
@@ -4220,6 +4282,25 @@ impl App {
             } else {
                 self.status = format!("program \u{201c}{nm}\u{201d} refused by the plugin");
             }
+        }
+        // v103: apply a bend-range pick — table + live entry + persist.
+        if let Some((t, r)) = pick_bend {
+            entry.set_bend_range(r);
+            if self.track_bend_range.len() < MAX_LOOPS {
+                self.track_bend_range
+                    .resize(MAX_LOOPS, crate::vsthost::DEFAULT_BEND_RANGE);
+            }
+            self.track_bend_range[t] = r;
+            self.status = format!(
+                "bend range track {}: {} (RPN0 sent to plugin)",
+                t + 1,
+                if r == 0 {
+                    "off".to_string()
+                } else {
+                    format!("{r} st")
+                }
+            );
+            self.save_config();
         }
         // v34 R2: run the preset-bar actions collected this frame.
         if do_save {
@@ -6201,6 +6282,7 @@ impl App {
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
+            track_bend_ranges: self.track_bend_range.clone(),
         };
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
@@ -7198,6 +7280,14 @@ impl App {
         self.rebuild_track_synth_sync(t)
     }
 
+    /// v103: one accessor for the per-track bend-range table.
+    fn bend_range_for(&self, t: usize) -> u8 {
+        self.track_bend_range
+            .get(t)
+            .copied()
+            .unwrap_or(crate::vsthost::DEFAULT_BEND_RANGE)
+    }
+
     /// Land a loaded synth binding: retire this track's editor (the
     /// engine may drop the old plugin the moment the command lands, and
     /// the editor thread must not outlive the AEffect it drives), then
@@ -7210,6 +7300,9 @@ impl App {
         if let Some(mut w) = self.vst_editors.remove(&t) {
             w.close();
         }
+        // v103: a fresh bind comes up on the track's bend range — the
+        // entry is fresh, so it announces RPN0 on its first block.
+        entry.set_bend_range(self.bend_range_for(t));
         let inst = Some(std::sync::Arc::new(SynthHandle::Vst(entry)));
         self.backend.cmd(Cmd::SetTrackSynth {
             i: t,
@@ -7239,7 +7332,11 @@ impl App {
                     saved.as_deref(),
                     patch.as_ref(),
                 ) {
-                    Ok(load) => Some(std::sync::Arc::new(SynthHandle::Vst(load.entry))),
+                    Ok(load) => {
+                        // v103: fresh bind → push the track's bend range.
+                        load.entry.set_bend_range(self.bend_range_for(t));
+                        Some(std::sync::Arc::new(SynthHandle::Vst(load.entry)))
+                    }
                     Err(err) => {
                         self.status = format!("synth: {err}");
                         return false;
@@ -16245,6 +16342,7 @@ impl App {
                 .map(|s| s.as_deref().map(crate::config::b64_encode))
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
+            track_bend_ranges: self.track_bend_range.clone(),
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
@@ -16586,6 +16684,12 @@ impl App {
             // rebuild below reopens every bound instrument.
             self.track_synth_program[t] =
                 pr.track_synth_programs.get(t).copied().unwrap_or(-1);
+            // v103: bend ranges are synth setup too.
+            self.track_bend_range[t] = pr
+                .track_bend_ranges
+                .get(t)
+                .copied()
+                .unwrap_or(crate::vsthost::DEFAULT_BEND_RANGE);
         }
         if sel.instruments || sel.synth_setup {
             self.rebuild_all_synths();
@@ -55298,11 +55402,12 @@ mod tests {
                 .collect()
         }
         let ui_src = prod_window(include_str!("ui.rs"));
-        // Positive: the TWO shared picker rows are live call sites.
+        // Positive: the THREE shared picker rows are live call sites
+        // (v82 pair + the v103 bend-range row — same shared picker law).
         assert_eq!(
             ui_src.matches("presetbar::picker_row(ui,").count(),
-            2,
-            "program + factory-preset rows must ride the shared picker"
+            3,
+            "program + factory-preset + bend-range rows must ride the shared picker"
         );
         assert!(
             ui_src.contains(&concat!(
@@ -57179,8 +57284,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v101\""),
-            "INTERNAL_VERSION must be bumped to v101"
+            librs.contains("INTERNAL_VERSION: &str = \"v103\""),
+            "INTERNAL_VERSION must be bumped to v103"
         );
     }
 
@@ -58057,5 +58162,80 @@ mod tests {
         );
         drop(app2);
         settle_plugin_drop();
+    }
+
+    /// v103 (card t_62c5a14e): the PARAMETERS window (Synth target)
+    /// carries a per-track bend-range picker; picking a row writes the
+    /// App table, pushes the LIVE entry (so the RT re-announces RPN0 —
+    /// plugin-side proof lives in the vsthost pins), and echoes status.
+    /// A fresh bind comes up on the track's table value (default ±2).
+    #[test]
+    fn v103_ui_bend_range_row_sets_entry_and_table() {
+        let mut app = headless_app("v103ui");
+        app.show_master = false;
+        for t in 0..MAX_LOOPS {
+            assert_eq!(app.bend_range_for(t), 2, "fresh app seeds ±2 default");
+        }
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v103ui-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join(file);
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/w6")
+                .join(file),
+            &fixture,
+        )
+        .unwrap();
+        let load = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("w6 fixture opens");
+        let entry = load.entry.clone();
+        app.land_track_synth_vst(0, entry.clone());
+        assert_eq!(entry.bend_range(), 2, "a fresh bind adopts the track default");
+        app.params_win = Some(GuiTarget::Synth(0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "bend range").is_some(),
+            "the row paints for a Synth target"
+        );
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        let combo = galley_at(&mut app, &ctx, "2 st")
+            .expect("combo shows the current range")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "5 st")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert_eq!(app.track_bend_range[0], 5, "the table holds the pick");
+        assert_eq!(entry.bend_range(), 5, "the LIVE entry got the new range");
+        assert!(
+            app.status.contains("track 1") && app.status.contains("5 st"),
+            "status echoes the change: {}",
+            app.status
+        );
+        // The combo caption now reads the new value (table is truth).
+        assert!(
+            galley_at(&mut app, &ctx, "5 st").is_some(),
+            "caption repaints at 5 st"
+        );
+        drop(app);
+        drop(entry);
+        settle_plugin_drop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
