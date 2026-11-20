@@ -256,7 +256,7 @@ static bool pm_get_info(const clap_plugin_t *p, uint32_t idx, clap_param_info_t 
       info->id = 2;
       snprintf(info->name, CLAP_NAME_SIZE, "%s", "fixamp");
       info->min_value = 0.0; info->max_value = 1.0; info->default_value = 1.0;
-   } else {
+   } else if (idx == 2) {
       // v67: preset-load trigger. Reaching >= 0.5 makes the plugin call
       // the host's clap.preset-load sink ONCE and then mutate its own
       // gain - a deterministic stand-in for a preset loaded through the

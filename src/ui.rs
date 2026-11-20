@@ -58141,4 +58141,79 @@ mod tests {
         drop(app2);
         settle_plugin_drop();
     }
+
+    /// v103 (card t_62c5a14e): the PARAMETERS window (Synth target)
+    /// carries a per-track bend-range picker; picking a row writes the
+    /// App table, pushes the LIVE entry (so the RT re-announces RPN0 —
+    /// plugin-side proof lives in the vsthost pins), and echoes status.
+    /// A fresh bind comes up on the track's table value (default ±2).
+    #[test]
+    fn v103_ui_bend_range_row_sets_entry_and_table() {
+        let mut app = headless_app("v103ui");
+        app.show_master = false;
+        for t in 0..MAX_LOOPS {
+            assert_eq!(app.bend_range_for(t), 2, "fresh app seeds ±2 default");
+        }
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("v103ui-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixture = dir.join(file);
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/w6")
+                .join(file),
+            &fixture,
+        )
+        .unwrap();
+        let load = crate::vsthost::open(&fixture, crate::vsthost::VstKind::V2, 48_000, None)
+            .expect("w6 fixture opens");
+        let entry = load.entry.clone();
+        app.land_track_synth_vst(0, entry.clone());
+        assert_eq!(entry.bend_range(), 2, "a fresh bind adopts the track default");
+        app.params_win = Some(GuiTarget::Synth(0));
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "bend range").is_some(),
+            "the row paints for a Synth target"
+        );
+        let click = |app: &mut App, ctx: &egui::Context, p: egui::Pos2| {
+            for ev in [
+                vec![moved(p)],
+                vec![moved(p), btn(p, egui::PointerButton::Primary, true)],
+                vec![btn(p, egui::PointerButton::Primary, false)],
+            ] {
+                frame(app, ctx, ev);
+            }
+        };
+        let combo = galley_at(&mut app, &ctx, "2 st")
+            .expect("combo shows the current range")
+            .center();
+        click(&mut app, &ctx, combo);
+        frame(&mut app, &ctx, vec![]); // popup paints
+        let row = galley_at(&mut app, &ctx, "5 st")
+            .expect("popup row")
+            .center();
+        click(&mut app, &ctx, row);
+        assert_eq!(app.track_bend_range[0], 5, "the table holds the pick");
+        assert_eq!(entry.bend_range(), 5, "the LIVE entry got the new range");
+        assert!(
+            app.status.contains("track 1") && app.status.contains("5 st"),
+            "status echoes the change: {}",
+            app.status
+        );
+        // The combo caption now reads the new value (table is truth).
+        assert!(
+            galley_at(&mut app, &ctx, "5 st").is_some(),
+            "caption repaints at 5 st"
+        );
+        drop(app);
+        drop(entry);
+        settle_plugin_drop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
