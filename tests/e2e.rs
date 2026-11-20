@@ -5865,13 +5865,13 @@ fn v100_audition_baked_glide_heard_on_scripted_synth_live_rt() {
     b.cmd(Cmd::StopAll);
 }
 
-// ---- v105 (card t_a4df161f): poly aftertouch must REACH the scripted
+// ---- v106 (card t_a4df161f): poly aftertouch must REACH the scripted
 // synth over the live RT path too (v100 did this for bends). Same
 // audition-pool rig as v100_audition_baked_glide_heard_on_scripted_synth_live_rt,
 // amplitude domain: held note under AT=127 vs no AT, capture window RMS.
 
 #[test]
-fn v105_poly_at_heard_live_rt() {
+fn v106_poly_at_heard_live_rt() {
     let _g = e2e_lock();
     let Some((b, _client_name, sr)) = start_backend() else {
         return; // no audio server: skip
@@ -5945,7 +5945,7 @@ fn v105_poly_at_heard_live_rt() {
     let at = round(127);
     assert_ne!(plain, at, "live RT dropped every poly-AT event for the scripted sampler");
     let (p0, p1) = (rms(&plain), rms(&at));
-    eprintln!("v105 live RT: plain {p0:.6} at {p1:.6} ratio {:.2}", p1 / p0.max(1e-12));
+    eprintln!("v106 live RT: plain {p0:.6} at {p1:.6} ratio {:.2}", p1 / p0.max(1e-12));
     assert!(p0 > 1e-5, "control capture must carry the tone: {p0}");
     let r = p1 / p0;
     assert!(
