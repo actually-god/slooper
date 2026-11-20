@@ -43,7 +43,7 @@ use crate::audio::{
     Backend, Cmd, Evt, FxSlot, OutSel, PortInfo, SynthHandle, TrackFx, GAIN_UNITY_MIDI, MAX_LOOPS,
     TR_REC,
 };
-use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, TrackFxSave};
+use crate::config::{ChainSave, Config, MidiAxisCal, MidiBinding, ScRecvGain, TrackFxSave};
 use crate::fx;
 use crate::midi::{hex, note_name, scale_axis, MidiAction, MidiBind, MidiMsg};
 use crate::midipat::{Pattern, PPQ};
@@ -1395,6 +1395,10 @@ pub struct App {
     /// v32 R5: sidechain send mask per track (bit k = source); mirrored
     /// into the engine atomics on every change.
     sc_send: [u128; MAX_LOOPS],
+    /// v97 (sc-4): sidechain RECEIVE level per route, target-major index
+    /// `t * MAX_LOOPS + s` (linear amplitude). Mirrors the engine `sc_recv`
+    /// atomics; only non-unity entries persist (sparse config save).
+    sc_recv_gain: [f32; MAX_LOOPS * MAX_LOOPS],
     /// Last track selection propagated to the audio engine (input
     /// monitoring follows the selected track's chain/gain/pan).
     sel_sent: usize,
@@ -2137,6 +2141,17 @@ impl App {
             backend.engine.set_loop_pan(t, pan01(trk_pan[t]));
             backend.engine.set_sc_send(t, sc_send[t]);
         }
+        // v97 (sc-4): per-route sidechain receive levels → App mirror +
+        // engine atomics. Absent routes stay at the unity table default.
+        let mut sc_recv_gain = [1.0f32; MAX_LOOPS * MAX_LOOPS];
+        for r in &cfg.sc_recv_gain {
+            let (t, s) = (r.t as usize, r.s as usize);
+            if t < MAX_LOOPS && s < MAX_LOOPS {
+                let g = r.gain.max(0.0);
+                sc_recv_gain[t * MAX_LOOPS + s] = g;
+                backend.engine.set_sc_recv_gain(t, s, g);
+            }
+        }
         let sel_in: HashSet<String> = cfg.ports_in.iter().cloned().collect();
         let sel_out: HashMap<String, u8> = cfg
             .ports_out
@@ -2255,6 +2270,7 @@ impl App {
             trk_pan,
             trk_color,
             sc_send,
+            sc_recv_gain,
             sel_sent: usize::MAX,
             levels_dirty: false,
             // v68: mix-page session state (see the `mix_tab` field).
@@ -6125,6 +6141,18 @@ impl App {
             fx_dir: self.fx_dir_edit.trim().to_string(),
             vst_dirs: self.vst_dirs.clone(),
             sc_send: self.sc_send.to_vec(),
+            // v97 (sc-4): sparse — only non-unity routes are written, so a
+            // file saved here loads unchanged pre-v97 (missing key = unity).
+            sc_recv_gain: (0..MAX_LOOPS * MAX_LOOPS)
+                .filter_map(|i| {
+                    let g = self.sc_recv_gain[i];
+                    (g != 1.0).then_some(ScRecvGain {
+                        t: (i / MAX_LOOPS) as u8,
+                        s: (i % MAX_LOOPS) as u8,
+                        gain: g,
+                    })
+                })
+                .collect(),
             editor_probe: self.editor_probe.clone(),
             track_vst: Vec::new(),
             track_chain: self
@@ -28432,6 +28460,47 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
                 app.sc_send[loop_i] = v;
                 app.backend.engine.set_sc_send(loop_i, v);
                 app.fx_save_pending = true;
+            }
+            // v97 (sc-4): a routed chip carries a per-send RECEIVE slider —
+            // this chain's mix of the incoming keys (multiple sources sum).
+            // Independent of the sender's own volume/gain (v95 tap law).
+            if on && !self_bit {
+                let gi = loop_i * MAX_LOOPS + s;
+                let mut g = app.sc_recv_gain[gi];
+                let sresp = ui
+                    .push_id(("screcv", loop_i, s), |ui| {
+                        ui.add_sized(
+                            [96.0, 20.0],
+                            egui::Slider::new(&mut g, 0.0..=2.0)
+                                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                        )
+                    })
+                    .inner
+                    .on_hover_text(format!(
+                        "level of track {}'s key in this chain's sidechain row — {:.0} %\ndrag or use arrow keys; independent of the sender's own fader",
+                        s + 1,
+                        g * 100.0
+                    ));
+                let mut echo_now = false;
+                if sresp.changed() {
+                    app.sc_recv_gain[gi] = g;
+                    app.backend.engine.set_sc_recv_gain(loop_i, s, g);
+                    app.fx_save_pending = true;
+                    // A keyboard step echoes live; a mouse drag waits for
+                    // release so the status line doesn't spam mid-drag.
+                    echo_now = !sresp.dragged();
+                }
+                if sresp.drag_stopped() {
+                    echo_now = true;
+                }
+                if echo_now {
+                    app.status = format!(
+                        "sidechain send T{} into T{}: {:.0} %",
+                        s + 1,
+                        loop_i + 1,
+                        g * 100.0
+                    );
+                }
             }
         }
         if m != 0
@@ -56948,6 +57017,82 @@ mod tests {
         assert!(
             librs.contains("INTERNAL_VERSION: &str = \"v98\""),
             "INTERNAL_VERSION must be bumped to v98"
+        );
+    }
+
+    /// v97 (sc-4): a routed "Sidechain in" chip carries a per-send RECEIVE
+    /// slider; dragging it moves the App mirror, the engine atomic and the
+    /// status echo — for THAT pair only (R1/R2/R3).
+    #[test]
+    fn v97_ui_send_level_slider_paints_drag_and_echoes() {
+        let mut app = headless_app("v97screcv");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // Route track 0 into track 1's chain, then open that chain window.
+        app.sc_send[1] = 1 << 0;
+        app.backend.engine.set_sc_send(1, 1 << 0);
+        app.fx_window = Some(1);
+        frame(&mut app, &ctx, vec![]);
+        // Routed chip paints as the EXACT galley "[1]" (the "keyed by [1]"
+        // echo label must not masquerade as it — exact-text scan); the
+        // level slider paints at unity right next to its chip.
+        let chips = galleys_all(&mut app, &ctx, "[1]");
+        assert_eq!(chips.len(), 1, "the routed chip is the only exact [1] galley: {chips:?}");
+        let chip = chips[0];
+        let lv = painted_text_rect(&ctx, &mut app, "100 %").expect("unity receive level paints");
+        assert!(
+            (lv.center().y - chip.y).abs() < 14.0,
+            "the level sits on its chip's row: {chip:?} vs {lv:?}"
+        );
+        let idx = |t: usize, s: usize| t * MAX_LOOPS + s;
+        assert_eq!(app.sc_recv_gain[idx(1, 0)], 1.0, "unity until touched");
+        // Drag the level right inline (not via drag_steps): the edit flags
+        // the deferred config save, which the idle-flush consumes the first
+        // pointer-up frame — so the flag must be observed WHILE held down.
+        let from = lv.center();
+        let to = egui::pos2(from.x + 48.0, from.y);
+        frame(&mut app, &ctx, vec![moved(from)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(from), btn(from, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(egui::pos2(from.x + 24.0, from.y))]);
+        frame(&mut app, &ctx, vec![moved(to)]);
+        assert!(app.fx_save_pending, "a live level edit schedules the save");
+        frame(&mut app, &ctx, vec![btn(to, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]); // the idle flush persists it
+        let gi = idx(1, 0);
+        assert!(
+            app.sc_recv_gain[gi] > 1.4,
+            "drag raises the receive level: {}",
+            app.sc_recv_gain[gi]
+        );
+        assert!(
+            (app.backend.engine.sc_recv_gain(1, 0) - app.sc_recv_gain[gi]).abs() < 1e-6,
+            "the engine atomic follows the slider"
+        );
+        assert_eq!(app.sc_recv_gain[idx(0, 1)], 1.0, "the reverse (T1->T0) pair is untouched");
+        assert!(
+            app.status.contains("sidechain send T1 into T2:"),
+            "status echo lands on release: {:?}",
+            app.status
+        );
+    }
+
+    /// v97 (sc-4) source-scan (v72 doctrine): the hover copy the runtime
+    /// pin cannot observe must exist EXACTLY once in prod ui.rs (cut at the
+    /// column-0 `mod tests`, per the v72 trap record).
+    #[test]
+    fn v97_ui_send_level_hover_copy_present() {
+        let src = include_str!("ui.rs").replace("\r\n", "\n");
+        let cut = src.find("\nmod tests").expect("mod tests at column 0");
+        let prod = &src[..cut];
+        let needle = "level of track {}'s key in this chain's sidechain row";
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "the receive-slider hover text must exist exactly once in prod"
         );
     }
 

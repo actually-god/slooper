@@ -211,6 +211,21 @@ pub struct TrackFxSave {
     pub params: Vec<f32>,
 }
 
+/// v97 (sc-4): one NON-UNITY sidechain receive level for the (target t,
+/// source s) route. Sparse by design — unity routes are never written, so
+/// old project/config files (missing key) load at unity unchanged.
+/// sc-5 extends this same shape (per-send pan) rather than adding a
+/// parallel table — bump with `#[serde(default = "...")]` fields.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScRecvGain {
+    /// Target track (the receiver — its chain's SC row).
+    pub t: u8,
+    /// Source track (the sender whose tap this level scales).
+    pub s: u8,
+    /// Receive level, linear amplitude (1.0 = unity = pre-v97 behavior).
+    pub gain: f32,
+}
+
 /// One slot of a track's mixer chain (see `Config::track_chain`). Tagged so
 /// a chain mixes effect scripts and hosted plugins in any order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -682,6 +697,11 @@ pub struct Config {
     /// rides the engine atomics (`Engine::set_sc_send`).
     #[serde(default)]
     pub sc_send: Vec<u128>,
+    /// v97 (sc-4): per-route sidechain receive levels (mixer "Sidechain in"
+    /// sliders). Sparse — only non-unity pairs; engine copy rides the
+    /// `sc_recv` atomics (`Engine::set_sc_recv_gain`).
+    #[serde(default)]
+    pub sc_recv_gain: Vec<ScRecvGain>,
     /// Extra VST search folders (user-set; the standard system folders are
     /// always scanned on top of these).
     #[serde(default)]
@@ -842,6 +862,7 @@ impl Default for Config {
             track_fx: Vec::new(),
             track_chain: Vec::new(),
             sc_send: Vec::new(),
+            sc_recv_gain: Vec::new(),
             vst_dirs: Vec::new(),
             editor_probe: Default::default(),
             track_vst: Vec::new(),
@@ -1106,6 +1127,36 @@ mod tests {
             assert!(m >= prev, "not monotone at {v}");
             prev = m;
         }
+    }
+
+    /// v97 (sc-4): the sparse sidechain-receive table must be additive —
+    /// old files (missing key) load with NO entries (every route unity),
+    /// and non-unity pairs round-trip exactly.
+    #[test]
+    fn v97_config_sc_recv_gain_old_files_unity_roundtrip() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            old.sc_recv_gain.is_empty(),
+            "old files load with no route entries — unity everywhere"
+        );
+        let c = Config {
+            sc_recv_gain: vec![
+                ScRecvGain {
+                    t: 1,
+                    s: 0,
+                    gain: 0.5,
+                },
+                ScRecvGain {
+                    t: 3,
+                    s: 2,
+                    gain: 1.75,
+                },
+            ],
+            ..Config::default()
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.sc_recv_gain, c.sc_recv_gain, "round-trip exact");
     }
 
     #[test]
@@ -1405,6 +1456,7 @@ mod tests {
             fx_dir: "/tmp/effects".into(),
             track_chain: Vec::new(), // exercise the legacy track_fx/track_vst migration
             sc_send: Vec::new(),
+            sc_recv_gain: Vec::new(),
             track_fx: vec![vec![TrackFxSave {
                 stem: "template".into(),
                 params: vec![0.5, 4.0],
