@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 7
+// slooper-synth-version: 8
 // pad.rs — a slow, warm analog-style pad.
 //
 // Per voice: three sine partials (fundamental, a detuned twin for the
@@ -19,6 +19,10 @@
 //
 // 10 voices, oldest-steal, allocation-free DSP, NaN-guarded.
 // ---------------------------------------------------------------------------
+
+// v105: MPE note pressure (poly_at) raises the pressured voice up to
+// +3.5 dB — the note still sounds normally at rest, like every older
+// slooper release (no pressure = the exact pre-v105 render).
 
 include!("synth_api.rs");
 
@@ -41,6 +45,7 @@ struct Voice {
     pedal_held: bool, // note gone, waiting for pedal-up
     env: f64,
     vel: f64,
+    press: f64,
     freq: f64,
     p1: f64,
     p2: f64,
@@ -64,7 +69,7 @@ struct Pad {
 impl Voice {
     const DEAD: Voice = Voice {
         alive: false, note: 0, stage: Stage::Dead, pedal_held: false,
-        env: 0.0, vel: 0.0, freq: 0.0, p1: 0.0, p2: 0.0, p3: 0.0,
+        env: 0.0, vel: 0.0, press: 0.0, freq: 0.0, p1: 0.0, p2: 0.0, p3: 0.0,
         lp1: 0.0, bp1: 0.0, lp2: 0.0, bp2: 0.0, age: 0.0,
     };
 }
@@ -115,6 +120,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     v.note = note;
     v.freq = 440.0 * (2.0f64).powf((note as f64 - 69.0) / 12.0);
     v.vel = (vel.max(1) as f64 / 127.0).powf(0.8);
+    v.press = 0.0;
     v.stage = Stage::Attack;
     p.voices[idx] = v;
 }
@@ -239,7 +245,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             v.bp2 += fnk * (v.lp1 - v.lp2 - dcoef * v.bp2);
             v.lp2 += fnk * v.bp2;
 
-            let smp = v.lp2 * v.env * v.vel * gain * 0.35;
+            let smp = v.lp2 * v.env * v.vel * (1.0 + 0.5 * v.press) * gain * 0.35;
             if smp.is_finite() {
                 unsafe { *out.add(k) += smp as f32 };
             }
@@ -292,9 +298,24 @@ pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     unsafe { &mut *(s as *mut Pad) }.bend_st = st as f64;
 }
 
-static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+// v105 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
+// matching live voice's level by up to +3.5 dB (x1.5 at 127; 0 = normal).
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Pad) };
+    for v in p.voices.iter_mut() {
+        if v.alive && v.note == note {
+            v.press = val as f64 / 127.0;
+        }
+    }
+}
+
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
 
 #[no_mangle]
-pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
-    &DESC_V2
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }
