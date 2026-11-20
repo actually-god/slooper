@@ -2792,4 +2792,33 @@ pub(crate) mod tests {
         assert_eq!(rpn, 4.0, "RPN0 data-MSB = the range the plugin was told");
         assert_eq!(e.midi_drops(), 0, "the burst never overflows the queue");
     }
+
+    /// v104 (card t_0ab25d9a): poly aftertouch must REACH a CLAP plugin.
+    /// Pre-fix the fill_events match armed 0x90/0x80/0xB0/0xC0/0xD0/0xE0
+    /// and 0xA0 fell through `_ => {}` — the exact v103 0xE0 failure class
+    /// one status nibble over: poly-AT (the core MPE voice message) was
+    /// silently dropped for CLAP entirely. ALL asserts are red pre-fix
+    /// (count stays 0). The fixture records the raw 0xA0 into hidden
+    /// probe params 6 (count), 7 ((ch<<8)|note), 8 (pressure).
+    #[test]
+    fn v104_clap_poly_at_reaches_plugin() {
+        let e = fixture_entry("gain");
+        assert_eq!(e.plug_value(6), Some(0.0), "fresh instance saw no poly-AT");
+        let mut out = vec![0.0f32; 1536]; // 3 CLAP blocks
+        // ch2, note 64, pressure 100.
+        let ev = vec![(0usize, [0xA2u8, 64, 100])];
+        e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
+        assert_eq!(
+            e.plug_value(6),
+            Some(1.0),
+            "the 0xA0 reached the plugin's event list (pre-v104: dropped)"
+        );
+        assert_eq!(
+            e.plug_value(7),
+            Some(((2 << 8) | 64) as f64),
+            "channel + note preserved"
+        );
+        assert_eq!(e.plug_value(8), Some(100.0), "pressure preserved");
+        assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
+    }
 }
