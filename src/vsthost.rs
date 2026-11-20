@@ -7309,4 +7309,39 @@ mod tests {
             "rescale adopts the changed range"
         );
     }
+
+    /// v104 (card t_0ab25d9a): poly aftertouch (0xA0) must REACH VST2
+    /// plugins — the w6 fixture counts 0xA0 messages (opcode 9004) and
+    /// records the last `(channel << 8) | note` (9005) and pressure
+    /// (9006). VST2 forwarded every raw status byte since v37, so this
+    /// pin is the REGRESSION GUARD for the status class whose sibling
+    /// (CLAP) silently dropped it; sabotage = filtering 0xA0 out of the
+    /// one-call-per-block event batch (process_inner's VST2 arm).
+    #[test]
+    fn v104_vst2_poly_at_observed_at_plugin() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v104poly");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        assert_eq!(rt.v2_probe(9004), 0, "fresh instance has seen no 0xA0");
+        assert_eq!(rt.v2_probe(9005), -1, "no poly-AT note recorded yet");
+        assert_eq!(rt.v2_probe(9006), -1, "no poly-AT pressure yet");
+        let inp = vec![0.0f32; 1024]; // two VST_BLOCKs
+        let mut outp = vec![0.0f32; 1024];
+        // ch2, note 64, pressure 100 — one message mid-span.
+        e.process_with_midi(&inp, &mut outp, &[(32, [0xA2, 64, 100])]);
+        assert_eq!(rt.v2_probe(9004), 1, "the 0xA0 reached processEvents");
+        assert_eq!(rt.v2_probe(9005), (2 << 8) | 64, "channel + note verbatim");
+        assert_eq!(rt.v2_probe(9006), 100, "pressure verbatim");
+        // A second message replaces the "last" record, count accumulates.
+        e.process_with_midi(&inp, &mut outp, &[(8, [0xA5, 36, 7])]);
+        assert_eq!(rt.v2_probe(9004), 2, "count accumulates across blocks");
+        assert_eq!(rt.v2_probe(9005), (5 << 8) | 36, "last message wins");
+        assert_eq!(rt.v2_probe(9006), 7, "and its pressure");
+        assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
+    }
 }

@@ -1376,13 +1376,18 @@ impl ClapStageEntry {
                 ),
                 // 0x90 with velocity 0 is note off by the classic convention.
                 0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, q.m[1], 0.0),
-                // CC / program / pressure / pitch bend travel as raw bytes:
-                // spec says plugins should take both forms, and every CLAP
-                // plugin on this host does. v103: pitch bend (0xE0) was
-                // MISSING here — bends were silently dropped for CLAP
-                // entirely. (Poly aftertouch 0xA0 still has no path
-                // anywhere in the engine — follow-up card.)
-                0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
+                // CC / program / pressure / pitch bend / poly AT travel as
+                // raw bytes: spec says plugins should take both forms, and
+                // every CLAP plugin on this host does. v103: pitch bend
+                // (0xE0) was MISSING here — bends were silently dropped for
+                // CLAP entirely. v104 (card t_0ab25d9a): poly aftertouch
+                // (0xA0) was the same hole one status nibble over — the MPE
+                // voice message vanished for CLAP while VST2/VST3 carried
+                // it (VST2 raw batch; VST3 0xA0 => PolyAftertouch since
+                // v42/MPE). Engine-side split (documented, decision (a)):
+                // SCRIPTED synths still have no poly-AT callback (kind-4
+                // dispatch arms drop) — follow-up feature card, not here.
+                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
                 _ => {}
             }
         }
@@ -2424,10 +2429,11 @@ pub(crate) mod tests {
     fn v34_clap_open_reads_normalized_params() {
         let e = fixture_entry("gain");
         // v67: fixture-gain gained `fixload` (the preset-load trigger) - 3.
-        // v103: +2 HIDDEN probe params (bend currency) - 5. Hidden params
-        // stay in descs (v66 doctrine: the mirror must keep them); they
-        // are NOT writable, so no new knobs appear in any window.
-        assert_eq!(e.descs().len(), 5);
+        // v103: +2 HIDDEN probe params (bend currency) - 5.
+        // v104: +3 HIDDEN probe params (poly-AT observer, card t_0ab25d9a) - 8.
+        // Hidden params stay in descs (v66 doctrine: the mirror must keep
+        // them); they are NOT writable, so no new knobs appear in any window.
+        assert_eq!(e.descs().len(), 8);
         assert_eq!(e.descs()[0].name, "fixgain");
         // plain default 1.0 on [0,1] normalizes to 1.0
         assert!((e.descs()[0].default - 1.0).abs() < 1e-6);
@@ -2790,5 +2796,34 @@ pub(crate) mod tests {
         let rpn = e.plug_value(5).expect("probe-rpn param reads back");
         assert_eq!(rpn, 4.0, "RPN0 data-MSB = the range the plugin was told");
         assert_eq!(e.midi_drops(), 0, "the burst never overflows the queue");
+    }
+
+    /// v104 (card t_0ab25d9a): poly aftertouch must REACH a CLAP plugin.
+    /// Pre-fix the fill_events match armed 0x90/0x80/0xB0/0xC0/0xD0/0xE0
+    /// and 0xA0 fell through `_ => {}` — the exact v103 0xE0 failure class
+    /// one status nibble over: poly-AT (the core MPE voice message) was
+    /// silently dropped for CLAP entirely. ALL asserts are red pre-fix
+    /// (count stays 0). The fixture records the raw 0xA0 into hidden
+    /// probe params 6 (count), 7 ((ch<<8)|note), 8 (pressure).
+    #[test]
+    fn v104_clap_poly_at_reaches_plugin() {
+        let e = fixture_entry("gain");
+        assert_eq!(e.plug_value(6), Some(0.0), "fresh instance saw no poly-AT");
+        let mut out = vec![0.0f32; 1536]; // 3 CLAP blocks
+        // ch2, note 64, pressure 100.
+        let ev = vec![(0usize, [0xA2u8, 64, 100])];
+        e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
+        assert_eq!(
+            e.plug_value(6),
+            Some(1.0),
+            "the 0xA0 reached the plugin's event list (pre-v104: dropped)"
+        );
+        assert_eq!(
+            e.plug_value(7),
+            Some(((2 << 8) | 64) as f64),
+            "channel + note preserved"
+        );
+        assert_eq!(e.plug_value(8), Some(100.0), "pressure preserved");
+        assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
     }
 }
