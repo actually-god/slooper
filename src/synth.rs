@@ -1908,7 +1908,11 @@ mod tests {
         let flat = v100_glide_render(&inst, 57, &|_| 0.0);
         let up = v100_glide_render(&inst, 57, &|f| 12.0 * f);
         assert_ne!(flat, up, "baked bends never reached the bundled piano (kind 5 dropped)");
-        let win = |x: &[f32]| v100_cycles(&x[12_000..24_000]) as f64;
+        // Measure DURING the sample's audible life (zones do not loop: the
+        // note is silent after ~1-2 s) and late enough into the ramp that a
+        // flat render cannot pass: empirically ~1.6x here, vs ~1.25x in an
+        // early window (mid-ramp physics, not a bug) and 1.0x in silence.
+        let win = |x: &[f32]| v100_cycles(&x[19_200..28_800]) as f64;
         let (cf, cu) = (win(&flat), win(&up));
         assert!(cf >= 20.0, "piano must still sound in the measure window: {cf}");
         let r = cu / cf;
