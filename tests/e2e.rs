@@ -1935,7 +1935,7 @@ fn e2e_preview_renders_and_plays() {
     );
 
     // The user's real setting: audition THROUGH A TRACK whose instrument is
-    // a VSTi (`preview_track` points at it from the piano roll). The
+    // a VSTi (`preview_tracks` routes to it from the piano roll). The
     // offline plugin render must also produce a sustained tone, not a blip.
     let vst_path = match std::env::var("HOME") {
         Ok(h) => std::path::PathBuf::from(h).join(".vst3/vitalium.vst3"),
@@ -5102,7 +5102,6 @@ fn e2e_v95_sc_sender_gain_zero_kills_key() {
         "sender gain→0 must sink the key below threshold: open {open}, after {restored}"
     );
 }
-
 // ---- v97 (sc-4): per-receive sidechain send levels ---------------------
 // The "Sidechain in" sliders scale ONE route's tap into the target's summed
 // key. These pins reuse the v32/v95 rig (110 Hz key hard LEFT, target tone
@@ -5293,4 +5292,198 @@ fn e2e_v97_sc_two_source_mix_swaps_duck() {
         weak_lead > strong_lead * 1.15,
         "the same mask at swapped send levels must sound different: weak {weak_lead} vs strong {strong_lead}"
     );
+}
+
+// ---- v96 (sc-2): the multi-track preview the user was missing ------------
+//
+// User report 2026-11-18: "sidechain appears not to work in preview…
+// can only preview one track at a time." These pins drive EXACTLY what
+// the v96 UI fan-out does with a selected source+target pair: NO clips,
+// NO transport — one held audition voice per routed track
+// (`play_audition` through headless synth COPIES, like `audition_copy`).
+// A two-port probe splits the master: LEFT hears only the hard-left
+// source, RIGHT only the hard-right target, so "both audible" and "the
+// duck is heard" are MEASURED, not implied.
+
+/// Two-bus probe: `ring_l` carries the master LEFT bus only, `ring_r`
+/// the RIGHT bus only (the `Cmd::Apply` outs binding uses the route
+/// bits: 1 = L, 2 = R — the same trick v95 used for its one-bus probe).
+struct V96CapProc {
+    sink_l: Port<AudioIn>,
+    sink_r: Port<AudioIn>,
+    ring_l: Arc<Vec<AtomicU32>>,
+    ring_r: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+}
+
+impl ProcessHandler for V96CapProc {
+    fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
+        let n = ps.n_frames() as usize;
+        if n == 0 {
+            return Control::Continue;
+        }
+        let l = self.sink_l.as_slice(ps);
+        let r = self.sink_r.as_slice(ps);
+        let nring = self.ring_l.len() as u64;
+        let mut w = self.widx.load(Ordering::Relaxed);
+        for i in 0..n {
+            self.ring_l[(w % nring) as usize].store(l[i].to_bits(), Ordering::Relaxed);
+            self.ring_r[(w % nring) as usize].store(r[i].to_bits(), Ordering::Relaxed);
+            w += 1;
+        }
+        self.widx.store(w, Ordering::Relaxed);
+        Control::Continue
+    }
+}
+
+type V96Rig = (
+    Backend,
+    Arc<Vec<AtomicU32>>,
+    Arc<Vec<AtomicU32>>,
+    Arc<AtomicU64>,
+    u32,
+    AsyncClient<(), V96CapProc>,
+);
+
+/// Scaffolding: track 0 = SC source hard LEFT, track 1 = target hard
+/// RIGHT with the stock sidechain compressor in its chain. The SEND
+/// MASK is armed inside the test — the before/after IS the duck proof.
+fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return None; // no audio server: skip
+    };
+    let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut freg = slooper::fx::Registry::open(dir.clone());
+    freg.rescan();
+    // Detector settings identical to the v95 rig: thr -30 dB, ratio 4,
+    // attack 2 ms, release 100 ms, knee 6, depth 1.
+    let vals = [-30.0f32, 4.0, 2.0, 100.0, 6.0, 1.0];
+    let desc = freg
+        .desc("sidechain_comp")
+        .expect("stock sidechain_comp present")
+        .clone();
+    let inst = freg
+        .create_instance("sidechain_comp", sr as f64, &vals)
+        .expect("sidechain_comp compiles and instantiates");
+    let _ = std::fs::remove_dir_all(&dir);
+    let ring_n = 1usize << 19;
+    let ring_l: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let ring_r: Arc<Vec<AtomicU32>> =
+        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            V96CapProc {
+                sink_l,
+                sink_r,
+                ring_l: ring_l.clone(),
+                ring_r: ring_r.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "two-bus layout not applied"
+    );
+    b.engine.set_loop_pan(0, 0.0); // source hard left
+    b.engine.set_loop_pan(1, 1.0); // target hard right
+    b.cmd(Cmd::SetTrackEffects {
+        i: 1,
+        chain: TrackFx {
+            slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+        },
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    Some((b, ring_l, ring_r, widx, sr, active))
+}
+
+/// v96 (sc-2) AC-audio half: preview a selected SC pair — BOTH tracks
+/// sound at once (transport stopped, no clips) AND the target audibly
+/// ducks under the source's send. (UI fan-out half:
+/// v96_picker_multi_route_toggle + v96_multiselect_selection_routes_preview.)
+#[test]
+fn e2e_v96_multi_preview_pair_ducks() {
+    let _g = e2e_lock();
+    let Some((b, ring_l, ring_r, widx, sr, _scope)) = v96_multi_preview_setup("v96mprev") else {
+        return;
+    };
+    // Sustained tri_osc voices on purpose: a DECAYING piano envelope
+    // would fake a duck in the after-window.
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+    let copy = || -> Arc<slooper::audio::SynthHandle> {
+        Arc::new(slooper::audio::SynthHandle::Script(
+            reg.create_instance("tri_osc", sr as f64, &[])
+                .expect("bundled tri_osc must compile and load"),
+        ))
+    };
+    // Held note-ons (NO note-offs — sustain until stop_audition), the
+    // exact streams App::audition_tracks stages per routed track.
+    let ev_src: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 36u8, 110u8)].into();
+    let ev_tgt: Arc<[MidiEv]> = vec![(0u64, 3u8, 0u8, 69u8, 110u8)].into();
+    b.engine.play_audition(0, ev_src, Some(copy()));
+    b.engine.play_audition(1, ev_tgt, Some(copy()));
+    let rms = |ring: &Arc<Vec<AtomicU32>>, ms: u64| -> f32 {
+        let x = read_ring(
+            ring,
+            &widx,
+            (sr as u64 * ms / 1000) as usize,
+            Duration::from_millis(500),
+        )
+        .expect("ring");
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    // (1) BOTH tracks audible at once — the reported defect in one line.
+    wait_until(
+        || ring_peak(&ring_l, &widx, 480).map(|m| m > 0.005).unwrap_or(false),
+        Duration::from_secs(3),
+        "source track (LEFT bus) audible from its audition voice alone",
+    );
+    wait_until(
+        || ring_peak(&ring_r, &widx, 480).map(|m| m > 0.005).unwrap_or(false),
+        Duration::from_secs(3),
+        "target track (RIGHT bus) audible from its audition voice alone",
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    let open_l = rms(&ring_l, 200);
+    let open_r = rms(&ring_r, 200);
+    assert!(open_l > 0.005, "source audible on the LEFT bus: {open_l}");
+    assert!(open_r > 0.005, "target open on the RIGHT bus: {open_r}");
+    // (2) Arm the send — the sustained source keys the target's
+    // compressor and must pull the sustained target down.
+    b.engine.set_sc_send(1, 1 << 0);
+    std::thread::sleep(Duration::from_millis(400));
+    let ducked_r = rms(&ring_r, 200);
+    assert!(
+        ducked_r < open_r * 0.7,
+        "preview must HEAR the duck: target open {open_r}, keyed {ducked_r}"
+    );
+    // The source must not self-duck from its own send.
+    let still_l = rms(&ring_l, 200);
+    assert!(
+        still_l > open_l * 0.5,
+        "source must not self-duck: {open_l} -> {still_l}"
+    );
+    b.engine.stop_audition();
 }
