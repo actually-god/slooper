@@ -51,6 +51,10 @@
 // Slots pack `(asset << 16) | (velocity << 8) | root`.
 // ---------------------------------------------------------------------------
 
+// v106: MPE note pressure (poly_at) raises the pressured voice up to
+// +3.5 dB — the note still sounds normally at rest, like every older
+// slooper release (no pressure = the exact pre-v106 render).
+
 include!("synth_api.rs");
 
 const VOICES: usize = 24;
@@ -79,6 +83,8 @@ struct Voice {
     pos: f64,
     rate: f64,
     vel: f64,
+    note: u8,
+    press: f64,
     buf: std::rc::Rc<std::vec::Vec<f32>>,
 }
 
@@ -121,6 +127,8 @@ extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_voi
             pos: 0.0,
             rate: 1.0,
             vel: 0.0,
+            note: 0,
+            press: 0.0,
             buf: std::rc::Rc::new(std::vec::Vec::new()),
         }),
         next: 0,
@@ -285,6 +293,8 @@ fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
     v.pos = 0.0;
     v.rate = ((2.0f64).powf(semis / 12.0) * native).clamp(0.0625, 16.0);
     v.vel = vel_gain(vel, slot.vel) * w;
+    v.note = note;
+    v.press = 0.0;
     v.buf = buf;
 }
 
@@ -478,7 +488,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             let frac = v.pos - i as f64;
             let a = buf[i] as f64;
             let b = buf[i + 1] as f64;
-            acc += (a + (b - a) * frac) * v.vel;
+            acc += (a + (b - a) * frac) * v.vel * (1.0 + 0.5 * v.press);
             v.pos += v.rate * bend_ratio;
             if v.pos > buf.len() as f64 - 1.0 {
                 v.on = false;
@@ -531,9 +541,24 @@ pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     unsafe { &mut *(s as *mut Sampler) }.bend_st = st as f64;
 }
 
-static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
+// v106 (card t_a4df161f): MPE note pressure (raw MIDI byte) lifts the
+// matching live voice's level by up to +3.5 dB (x1.5 at 127; 0 = normal).
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Sampler) };
+    for v in p.voices.iter_mut() {
+        if v.on && v.note == note {
+            v.press = val as f64 / 127.0;
+        }
+    }
+}
+
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
 
 #[no_mangle]
-pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 {
-    &DESC_V2
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }

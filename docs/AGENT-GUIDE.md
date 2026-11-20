@@ -81,8 +81,8 @@ src/            application source (Rust 2021 edition)
                   the release pins in ffiguard::tests verify the round
                   trip — switching back to panic = "abort" makes them
                   abort, loudly.
-  synth.rs        scripted synth plugins (rust-script): ABI v1 + optional v2
-                companion table (bend) + host
+  synth.rs        scripted synth plugins (rust-script): ABI v1 + optional v2/v3
+                companion tables (bend; poly_at) + host
                   vtable, global-Mutex compile cache, bundled piano (recorded
                   physical model) + sampler seeded/updated-in-place in the
                   synths folder (SLOOPER_SYNTHS_DIR override)

@@ -8,6 +8,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **Note pressure reaches scripted synths (script ABI v3).** The MPE
+  per-note aftertouch lane (and every recorded poly-AT event) now rides a
+  new `poly_at(ch, note, val)` callback into scripted synths — the v104
+  fix armed hosted plugins; this ships the scripted half. Version-gated
+  like v100's bend: a script opts in by exporting `slooper_synth_info_v3`
+  (one cumulative table: `{abi, bend, poly_at}`); v1/v2 scripts load and
+  behave exactly as before. `val` is the raw MIDI byte 0..=127 — the
+  script owns its curve. The seven bundled synths (piano, sampler, pad,
+  fm, additive, pluck, tri_osc) raise the pressured voice's level by up
+  to +3.5 dB; unpressed renders are byte-for-byte the old sound.
+
 - **Pitch curves, drawn on the notes.** The piano roll now draws and
   edits each note's pitch curve right ON the note body: Z+drag paints a
   freehand curve (release over another note and the slide lands on its

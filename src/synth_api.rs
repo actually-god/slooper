@@ -38,6 +38,12 @@
 //     where the piano roll's GLIDE lane lands (a full deflection = ±12).
 //     Multiply voice pitch by 2^(st/12) for every live voice on `ch`.
 //
+// v3 additions (see SynthInfoV3 below — same ladder, add-only):
+//   * `poly_at(s, ch, note, val)` — PER-NOTE aftertouch (MPE note
+//     pressure), raw 0..=127 exactly like press/cc: your curve, your
+//     meaning. Apply to the live voice (ch, note) only — leave the
+//     others alone. val = 0 means released pressure, not silence.
+//
 // Notes arrive with sample-accurate batching: slooper calls note_on /
 // note_off / cc / press immediately BEFORE the process call that covers
 // that audio block segment, so you may start a voice directly in note_on.
@@ -160,8 +166,45 @@ pub struct SynthInfoV2 {
     pub bend: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32),
 }
 
+/// ABI v3 marker (v106, card t_a4df161f). Same add-only discipline: a
+/// v2 script ADDs v3, it never rewrites its v1 or v2 entry point.
+pub const SLOOPER_SYNTH_ABI_V3: u32 = 3;
+
+/// v106: per-note-aftertouch-capable synth description. The companion
+/// table is CUMULATIVE: it restates the full post-v1 vocabulary, so a
+/// v3 script exports ONLY `slooper_synth_info_v3` and may delete its v2
+/// table. The host probes v3 first; a missing, null or mis-stamped v3
+/// export falls back to v2 (bend, no poly_at), then to plain v1 — every
+/// older script loads and behaves exactly as before.
+///
+/// ```ignore
+/// static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
+/// #[no_mangle]
+/// pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
+/// ```
+#[repr(C)]
+pub struct SynthInfoV3 {
+    /// Must be [`SLOOPER_SYNTH_ABI_V3`].
+    pub abi: u32,
+    /// Same contract as [`SynthInfoV2::bend`].
+    pub bend: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32),
+    /// Per-note aftertouch (MPE note pressure) — one `0xA0` MIDI message
+    /// or the engine's poly-AT lane. `val` is the RAW MIDI byte 0..=127,
+    /// exactly the vocabulary of `cc`/`press`: the host applies no curve
+    /// and no pitch meaning — the script decides (gain, brightness,
+    /// vibrato, ...). Target the LIVE voice on (`ch`, `note`) only;
+    /// voices that match nothing are simply ignored (the message may
+    /// arrive before its note or after its release). A val of 0 is
+    /// "pressure released", NOT silence: return the voice to its
+    /// pressure-less sound. Arrives on the audio thread immediately
+    /// BEFORE the `process` segment that covers it, like every other
+    /// callback: allocation-free, no locks, never panics.
+    pub poly_at: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8, val: u8),
+}
+
 unsafe impl Sync for SynthParamV1 {}
 unsafe impl Sync for SynthInfoV1 {}
 unsafe impl Sync for SynthInfoV2 {}
+unsafe impl Sync for SynthInfoV3 {}
 unsafe impl Sync for SynthHostV1 {}
 unsafe impl Sync for SynthAssetV1 {}

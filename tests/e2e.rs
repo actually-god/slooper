@@ -5864,3 +5864,95 @@ fn v100_audition_baked_glide_heard_on_scripted_synth_live_rt() {
     drop(active);
     b.cmd(Cmd::StopAll);
 }
+
+// ---- v106 (card t_a4df161f): poly aftertouch must REACH the scripted
+// synth over the live RT path too (v100 did this for bends). Same
+// audition-pool rig as v100_audition_baked_glide_heard_on_scripted_synth_live_rt,
+// amplitude domain: held note under AT=127 vs no AT, capture window RMS.
+
+#[test]
+fn v106_poly_at_heard_live_rt() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("polyat105", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    let sine: Arc<[f32]> = (0..(2 * sr as usize))
+        .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / sr as f64).sin() as f32 * 0.5)
+        .collect();
+    slooper::synth::set_host_assets(Arc::new(vec![sine]), sr);
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+
+    let round = |val: u8| -> Vec<f32> {
+        // FRESH instance per round: voice pressure must not leak.
+        let inst = reg
+            .create_instance("sampler", sr as f64, &[0.0, 48.0, 1.0])
+            .expect("bundled sampler instance");
+        b.engine
+            .set_track_synth(0, Some(Arc::new(slooper::audio::SynthHandle::Script(inst))));
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
+        for i in 0..=40 {
+            ev.push(((i as u64 * sr as u64) / 100 + (sr as u64 / 100), 4u8, 0u8, 48u8, val));
+        }
+        ev.push(((3 * sr as u64) / 2, 0, 0, 48, 0));
+        b.engine.play_audition(0, ev.into(), None);
+        wait_until(
+            || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+            Duration::from_secs(5),
+            "audition note audible",
+        );
+        let _ = read_ring(&ring, &widx, (sr as usize * 4) / 5, Duration::from_millis(900))
+            .expect("discard window");
+        let win = read_ring(&ring, &widx, (sr as usize * 3) / 20, Duration::from_millis(500))
+            .expect("capture window");
+        wait_until(
+            || !b.engine.audition_active(),
+            Duration::from_secs(6),
+            "audition retires after the note-off",
+        );
+        b.engine.stop_audition();
+        std::thread::sleep(Duration::from_millis(300));
+        win
+    };
+
+    let rms = |x: &[f32]| -> f64 {
+        x.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / x.len() as f64
+    };
+    let plain = round(0);
+    let at = round(127);
+    assert_ne!(plain, at, "live RT dropped every poly-AT event for the scripted sampler");
+    let (p0, p1) = (rms(&plain), rms(&at));
+    eprintln!("v106 live RT: plain {p0:.6} at {p1:.6} ratio {:.2}", p1 / p0.max(1e-12));
+    assert!(p0 > 1e-5, "control capture must carry the tone: {p0}");
+    let r = p1 / p0;
+    assert!(
+        r > 1.7 && r < 3.0,
+        "AT 127 must lift the live render ~2.25x (amp x1.5): got {r:.2} \
+         (plain {p0:.6} at {p1:.6})"
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
+}
