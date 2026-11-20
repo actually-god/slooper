@@ -287,7 +287,8 @@ impl BoundSet {
 /// event encoding (0 note-off, 1 CC, 2 chan-press, 3 note-on) as
 /// `(kind, ch, d1, d2)`. Program change, pitch bend, poly aftertouch and
 /// system messages return `None` — the synth event vocabulary has no kind
-/// for them (pitch bend needs an ABI addition; tracked for later).
+/// for them (v100/card t_52aa65b1: pitch bend reaches ABI v2 scripts via
+/// `Instance::bend`; per-note aftertouch still has no callback).
 /// Allocation-free: safe on the realtime thread.
 pub fn live_event_kind(bytes: &[u8]) -> Option<(u8, u8, u8, u8)> {
     let b0 = *bytes.first()?;
@@ -3073,7 +3074,13 @@ pub fn render_midi_events(
                 0 => inst.note_off(ch, d1),
                 1 => inst.cc(ch, d1, d2),
                 2 => inst.press(ch, d2),
-                4 | 5 => {} // v42/MPE: scripted ABI v1 has no bend/poly-AT
+                // v42/MPE: per-note aftertouch has no scripted callback —
+                // drop cleanly. v100 (card t_52aa65b1): pitch bend (d1 =
+                // LSB, d2 = MSB of the raw 14-bit) decodes to semitones in
+                // ROLL space (BEND_FULL_ST at full deflection) and reaches
+                // ABI v2 scripts; v1 scripts no-op inside Instance::bend.
+                4 => {}
+                5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                 _ => inst.note_on(ch, d1, d2),
             }
             i += 1;
@@ -3647,9 +3654,21 @@ impl Proc {
                                 0 => inst.note_off(ch, d1),
                                 1 => inst.cc(ch, d1, d2),
                                 2 => inst.press(ch, d2),
-                                // v42/MPE: scripted synth ABI v1 has no
-                                // bend/poly-AT callbacks — drop cleanly.
-                                4 | 5 => {}
+                                // v42/MPE: per-note aftertouch has no
+                                // scripted callback — drop cleanly.
+                                // v100 (card t_52aa65b1): pitch bend rides
+                                // Instance::bend (LSB/MSB -> 14-bit -> roll
+                                // semitones); this arm also serves the
+                                // roll/clip audition pool via aud_block.
+                                4 => {}
+                                5 => {
+                                    inst.bend(
+                                        ch,
+                                        crate::midipat::bend_to_st(
+                                            ((d2 as u16) << 7) | (d1 as u16),
+                                        ),
+                                    )
+                                }
                                 _ => inst.note_on(ch, d1, d2),
                             }
                             i += 1;
@@ -3876,7 +3895,11 @@ impl Proc {
                                     0 => inst.note_off(ch, d1),
                                     1 => inst.cc(ch, d1, d2),
                                     2 => inst.press(ch, d2),
-                                    4 | 5 => {}
+                                    // v42/MPE: per-note aftertouch has no scripted
+                                    // callback — drop cleanly. v100 (card t_52aa65b1):
+                                    // pitch bend -> Instance::bend (roll semitones).
+                                    4 => {}
+                                    5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                                     _ => inst.note_on(ch, d1, d2),
                                 }
                                 i += 1;
@@ -3982,7 +4005,11 @@ impl Proc {
                                 0 => inst.note_off(ch, d1),
                                 1 => inst.cc(ch, d1, d2),
                                 2 => inst.press(ch, d2),
-                                4 | 5 => {}
+                                // v42/MPE: per-note aftertouch has no scripted
+                                // callback — drop cleanly. v100 (card t_52aa65b1):
+                                // pitch bend -> Instance::bend (roll semitones).
+                                4 => {}
+                                5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                                 _ => inst.note_on(ch, d1, d2),
                             }
                             i += 1;
@@ -4078,7 +4105,11 @@ impl Proc {
                                         0 => inst.note_off(ch, d1),
                                         1 => inst.cc(ch, d1, d2),
                                         2 => inst.press(ch, d2),
-                                        4 | 5 => {}
+                                        // v42/MPE: per-note aftertouch has no scripted
+                                        // callback — drop cleanly. v100 (card t_52aa65b1):
+                                        // pitch bend -> Instance::bend (roll semitones).
+                                        4 => {}
+                                        5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
                                         _ => inst.note_on(ch, d1, d2),
                                     }
                                     i += 1;

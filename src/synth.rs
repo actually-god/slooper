@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub use crate::synth_api::{
-    SynthAssetV1, SynthHostV1, SynthInfoV1, SynthParamV1, SLOOPER_MAX_SYNTH_PARAMS,
-    SLOOPER_SYNTH_ABI,
+    SynthAssetV1, SynthHostV1, SynthInfoV1, SynthInfoV2, SynthParamV1, SLOOPER_MAX_SYNTH_PARAMS,
+    SLOOPER_SYNTH_ABI, SLOOPER_SYNTH_ABI_V2,
 };
 
 pub const MAX_PARAMS: usize = SLOOPER_MAX_SYNTH_PARAMS;
@@ -53,7 +53,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
 /// `v12_seed_stale_stamp_updates_despite_version_skew`), so it lives only
 /// for the tests that assert the shipped scripts stay stamped.
 #[cfg(test)]
-const BUNDLED_VERSION: &str = "6";
+const BUNDLED_VERSION: &str = "7";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
@@ -244,6 +244,10 @@ struct SynthFns {
     cc: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, num: u8, val: u8),
     press: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, val: u8),
     process: extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
+    /// v100 (card t_52aa65b1): pitch-bend callback if the script declares
+    /// a SynthInfoV2 table (`slooper_synth_info_v2`). None = ABI v1 script:
+    /// `Instance::bend` is a no-op, exactly the pre-v100 drop.
+    bend: Option<extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32)>,
 }
 
 /// Library handle that is NEVER dlclosed — see the identical comment in
@@ -447,6 +451,16 @@ impl Instance {
     pub fn press(&self, ch: u8, val: u8) {
         let _g = InstGuard::enter(self);
         (self.fns.press)(self.state, ch, val)
+    }
+    /// v100 (card t_52aa65b1): channel pitch bend in SEMITONES (roll space:
+    /// a full 14-bit deflection = ±12 st, `midipat::BEND_FULL_ST`). Routed
+    /// live/RT, offline-bounce and both audition paths. ABI v1 scripts have
+    /// no callback — the call is a no-op for them (the historic drop).
+    pub fn bend(&self, ch: u8, st: f32) {
+        if let Some(f) = self.fns.bend {
+            let _g = InstGuard::enter(self);
+            f(self.state, ch, st)
+        }
     }
 
     /// Render `out.len()` samples (OUT IS ACCUMULATED INTO — the plugin
@@ -784,6 +798,20 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
     if nulls > 0 {
         return reject(format!("{nulls} callback pointer(s) are null"));
     }
+    // v100 (card t_52aa65b1): OPTIONAL ABI v2 entry point — the fx ABI
+    // ladder is the precedent (v2 scripts export BOTH symbols; the host
+    // probes the newer one). A missing, null or mis-stamped v2 export
+    // degrades silently to "no bend", i.e. the v1 behavior.
+    let mut bend: Option<extern "C" fn(*mut core::ffi::c_void, u8, f32)> = None;
+    if let Ok(sym2) = lib.get::<extern "C" fn() -> *const SynthInfoV2>(b"slooper_synth_info_v2\0") {
+        let i2 = sym2();
+        if !i2.is_null() {
+            let d2 = unsafe { &*i2 };
+            if d2.abi == SLOOPER_SYNTH_ABI_V2 && d2.bend as usize != 0 {
+                bend = Some(d2.bend);
+            }
+        }
+    }
     let params = (0..d.n_params as usize)
         .filter(|_| !d.params.is_null())
         .map(|k| unsafe { &*d.params.add(k) })
@@ -809,6 +837,7 @@ unsafe fn load_one(stem: &str, lib_path: &Path) -> SynthEntry {
         cc: d.cc,
         press: d.press,
         process: d.process,
+        bend,
     };
     SynthEntry {
         stem: stem.to_string(),
@@ -1804,5 +1833,209 @@ mod tests {
         let p0 = tone_power(&x, 200.0, 48000.0, 512, 7680);
         let p1 = tone_power(&x, 800.0, 48000.0, 512, 7680);
         assert!(p0 > 25.0 * p1, "under all layers -> lowest only: {p0} {p1}");
+    }
+
+    // ---- v100 (card t_52aa65b1): scripted synths must HEAR glide bends ----
+    // The glide lane bakes 14-bit pitch bends (kind 5, lsb/msb) that the
+    // engine used to drop at both scripted dispatch arms. These pins drive
+    // the REAL scripts through the event protocol only — a flat render vs a
+    // 0 -> +12 st baked ramp — and measure a zero-crossing (pitch) proxy.
+
+    /// Positive-going zero crossings = whole cycles (pitch proxy).
+    fn v100_cycles(x: &[f32]) -> usize {
+        x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count()
+    }
+
+    /// Render a held note under a bend ramp: `st_at(frac)` semitones at the
+    /// ramp fraction, baked dense (every 10 ms) exactly like `bake_seg`
+    /// (step 8 ticks at 120 BPM) and encoded via the editor's st_to_bend.
+    fn v100_glide_render(inst: &std::sync::Arc<Instance>, note: u8, st_at: &dyn Fn(f32) -> f32) -> Vec<f32> {
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, note, 110u8)];
+        for i in 0..=100 {
+            let frac = i as f32 / 100.0;
+            let raw = crate::midipat::st_to_bend(st_at(frac));
+            ev.push((
+                (960 + i * 480) as u64,
+                5u8,
+                0u8,
+                (raw & 0x7F) as u8,
+                ((raw >> 7) & 0x7F) as u8,
+            ));
+        }
+        ev.push((47_000, 0, 0, note, 0));
+        let mut out = vec![0f32; 48_000];
+        crate::audio::render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    #[test]
+    fn v100_baked_glide_audible_on_scripted_sampler() {
+        if !crate::fx::rustc_available() {
+            return; // no compiler on this machine: nothing to exercise (W3 rule)
+        }
+        let reg = v51_registry();
+        // Asset 0: 2 s of 200 Hz sine at half amplitude — long enough that
+        // the glide window lands inside a SUSTAINED sample playback.
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[0.0, 48.0, 1.0])
+            .expect("sampler instance (legacy params: asset 0, root 48, gain 1)");
+        let flat = v100_glide_render(&inst, 48, &|_| 0.0);
+        let up = v100_glide_render(&inst, 48, &|f| 12.0 * f);
+        assert_ne!(flat, up, "baked bends never reached the scripted sampler (kind 5 dropped)");
+        let late = |x: &[f32]| v100_cycles(&x[38_400..48_000]) as f64;
+        let (cf, cu) = (late(&flat), late(&up));
+        assert!(cf >= 30.0, "flat window must carry audible cycles: {cf}");
+        let r = cu / cf;
+        // Ramp ends at +12 st; the late window averages ~+10.8 st -> x1.87.
+        assert!(
+            r > 1.55 && r < 2.4,
+            "baked 0->12 st glide must near-double the late-window pitch \
+             (expect ~1.87): got {r:.3} (flat {cf} -> up {cu})"
+        );
+    }
+
+    #[test]
+    fn v100_baked_glide_audible_on_bundled_piano() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let inst = reg.create_instance("piano", 48_000.0, &[]).expect("bundled piano instance");
+        let flat = v100_glide_render(&inst, 57, &|_| 0.0);
+        let up = v100_glide_render(&inst, 57, &|f| 12.0 * f);
+        assert_ne!(flat, up, "baked bends never reached the bundled piano (kind 5 dropped)");
+        // Measure DURING the sample's audible life (zones do not loop: the
+        // note is silent after ~1-2 s) and late enough into the ramp that a
+        // flat render cannot pass: empirically ~1.6x here, vs ~1.25x in an
+        // early window (mid-ramp physics, not a bug) and 1.0x in silence.
+        let win = |x: &[f32]| v100_cycles(&x[19_200..28_800]) as f64;
+        let (cf, cu) = (win(&flat), win(&up));
+        assert!(cf >= 20.0, "piano must still sound in the measure window: {cf}");
+        let r = cu / cf;
+        assert!(
+            r > 1.3 && r < 2.8,
+            "glide must audibly raise the bundled piano's pitch: got {r:.3} \
+             (flat {cf} -> up {cu})"
+        );
+    }
+
+    #[test]
+    fn v100_poly_aftertouch_still_dropped_cleanly() {
+        // Guard for the OTHER half of the old `4 | 5 => {}` arm: per-note
+        // aftertouch (kind 4) has no scripted callback and must stay
+        // audio-invisible and panic-free.
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[0.0, 48.0, 1.0])
+            .expect("sampler instance");
+        let plain = v100_glide_render(&inst, 48, &|_| 0.0);
+        // Same render with poly-AT noise injected at every offset.
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
+        for i in 0..=100 {
+            ev.push((960 + (i * 480) as u64, 4u8, 0u8, 48u8, (i % 128) as u8));
+        }
+        ev.push((47_000, 0, 0, 48, 0));
+        let mut with_at = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, with_at.len(), &mut with_at);
+        assert_eq!(plain, with_at, "poly-AT must not reach scripted synths (no ABI callback yet)");
+    }
+
+    #[test]
+    fn v100_all_bundled_synths_load() {
+        // The ABI v2 bump must not reject ANY bundled script.
+        let reg = v51_registry();
+        for stem in ["additive", "drums", "fm", "granular", "pad", "piano", "pluck", "sampler", "tri_osc"] {
+            assert!(reg.desc(stem).is_some(), "bundled synth {stem} failed to load: {:?}", reg.desc(stem));
+        }
+    }
+
+    /// Third-party scripts compiled against synth_api.rs ABI 1 must keep
+    /// loading (append-only doctrine, same rule as the fx ABI ladder), and
+    /// an unknown ABI must still be REJECTED.
+    #[test]
+    #[ignore = "slow-tier: compiles two scripts with rustc (~20 s)"]
+    fn v100_legacy_abi1_script_still_loads_and_bogus_rejected() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry(); // seeds bundled + writes synth_api.rs
+        std::fs::write(
+            reg.dir().join("v100_legacy_v1.rs"),
+            r#"
+include!("synth_api.rs");
+extern "C" fn cr(_sr: f64, _h: *const SynthHostV1) -> *mut core::ffi::c_void {
+    core::ptr::NonNull::dangling().as_ptr()
+}
+extern "C" fn de(_s: *mut core::ffi::c_void) {}
+extern "C" fn no(_s: *mut core::ffi::c_void, _c: u8, _n: u8, _v: u8) {}
+extern "C" fn nf(_s: *mut core::ffi::c_void, _c: u8, _n: u8) {}
+extern "C" fn ao(_s: *mut core::ffi::c_void) {}
+extern "C" fn cc(_s: *mut core::ffi::c_void, _c: u8, _n: u8, _v: u8) {}
+extern "C" fn pr(_s: *mut core::ffi::c_void, _c: u8, _v: u8) {}
+extern "C" fn po(_s: *mut core::ffi::c_void, _o: *mut f32, _n: usize, _p: *const f32) {}
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: SLOOPER_SYNTH_ABI,
+    name: b"legacy-one\0".as_ptr() as *const core::ffi::c_char,
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 0,
+    params: core::ptr::null(),
+    create: cr, destroy: de, note_on: no, note_off: nf, all_off: ao,
+    cc: cc, press: pr, process: po,
+};
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
+    &DESC
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            reg.dir().join("v100_bogus_abi.rs"),
+            r#"
+include!("synth_api.rs");
+extern "C" fn cr(_sr: f64, _h: *const SynthHostV1) -> *mut core::ffi::c_void {
+    core::ptr::NonNull::dangling().as_ptr()
+}
+extern "C" fn de(_s: *mut core::ffi::c_void) {}
+extern "C" fn no(_s: *mut core::ffi::c_void, _c: u8, _n: u8, _v: u8) {}
+extern "C" fn nf(_s: *mut core::ffi::c_void, _c: u8, _n: u8) {}
+extern "C" fn ao(_s: *mut core::ffi::c_void) {}
+extern "C" fn cc(_s: *mut core::ffi::c_void, _c: u8, _n: u8, _v: u8) {}
+extern "C" fn pr(_s: *mut core::ffi::c_void, _c: u8, _v: u8) {}
+extern "C" fn po(_s: *mut core::ffi::c_void, _o: *mut f32, _n: usize, _p: *const f32) {}
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: 99,
+    name: b"bogus-abi\0".as_ptr() as *const core::ffi::c_char,
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 0,
+    params: core::ptr::null(),
+    create: cr, destroy: de, note_on: no, note_off: nf, all_off: ao,
+    cc: cc, press: pr, process: po,
+};
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
+    &DESC
+}
+"#,
+        )
+        .unwrap();
+        let reg = Registry::open(reg.dir().to_path_buf());
+        assert!(reg.desc("v100_legacy_v1").is_some(), "ABI 1 script must still load after the v2 bump");
+        assert!(reg.create_instance("v100_legacy_v1", 48_000.0, &[]).is_some());
+        assert!(reg.desc("v100_bogus_abi").is_none(), "ABI 99 must be rejected");
+        assert!(reg.create_instance("v100_bogus_abi", 48_000.0, &[]).is_none());
     }
 }
