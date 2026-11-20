@@ -20771,7 +20771,7 @@ fn dyn_body(ui: &mut egui::Ui, app: &mut App, idx: usize) {
 ///      never-moved first seed — a boot or fair-share LAYOUT COMPROMISE is
 ///      never persisted back as user intent (the old 2 px along-axis latch
 ///     also flattened every stacked 700/300 split to fair share on frame 1).
-fn remember_dock_size(ui: &egui::Ui, app: &mut App, idx: usize, outer: egui::Rect) {
+fn remember_dock_size(ui: &egui::Ui, app: &mut App, idx: usize, outer: egui::Rect, latch_along: bool) {
     if outer.width() < 8.0 || outer.height() < 8.0 {
         return; // tabbed co-members paint zeroed rects: nothing was laid out
     }
@@ -20799,11 +20799,18 @@ fn remember_dock_size(ui: &egui::Ui, app: &mut App, idx: usize, outer: egui::Rec
         } else if wr[ci] < 40.0 && size_c > 40.0 {
             wr[ci] = size_c; // first record (never-moved window)
         }
-        if dragging && (wr[ai] - size_a).abs() > 2.0 {
-            wr[ai] = size_a;
-            dirty = true;
-        } else if wr[ai] < 40.0 && size_a > 40.0 {
-            wr[ai] = size_a;
+        // v98 review: a LONE dock's along dimension is the WHOLE edge
+        // (809px for a side dock), not a share — persisting it and feeding
+        // it back when the edge later gains members starves them (a
+        // pre-v98 fair-share CAP used to mask exactly this). LONE call
+        // sites pass latch_along=false; multi-member sites latch shares.
+        if latch_along {
+            if dragging && (wr[ai] - size_a).abs() > 2.0 {
+                wr[ai] = size_a;
+                dirty = true;
+            } else if wr[ai] < 40.0 && size_a > 40.0 {
+                wr[ai] = size_a;
+            }
         }
     }
     if dirty {
@@ -21328,7 +21335,7 @@ fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
             .min_size(20.0)
             .show(ui, |ui| docked_window(ui, app, idx)),
     };
-    remember_dock_size(ui, app, idx, ir.response.rect);
+    remember_dock_size(ui, app, idx, ir.response.rect, false);
 }
 
 /// One docked edge. Several windows on the SAME edge must tile ALONG the
@@ -21380,10 +21387,9 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                     // proportion survives the boot compromise.
                     const MIN_SHARE: f32 = 56.0;
                     let strip = ui.max_rect().width();
-                    // v98: the FILL member's recorded share joins the scale
-                    // math too — otherwise a never-moved neighbour's default
-                    // eats the strip and the last member's saved size is
-                    // ignored entirely (fill = whatever sliver is left).
+                    // v98: a member with NO recorded share wants the
+                    // UNIFORM split (old fresh behavior) — the def_w float
+                    // footprint is a float/lone-dock quantity, not a share.
                     let wants: Vec<f32> = ids
                         .iter()
                         .map(|i| {
@@ -21391,7 +21397,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             if rec > 8.0 {
                                 rec
                             } else {
-                                def_w(*i)
+                                strip / ids.len() as f32
                             }
                         })
                         .collect();
@@ -21410,7 +21416,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                                 .resizable(false)
                                 .exact_size(b.height())
                                 .show(ui, |ui| docked_window(ui, app, *i));
-                            remember_dock_size(ui, app, *i, ir.response.rect);
+                            remember_dock_size(ui, app, *i, ir.response.rect, true);
                         } else {
                             let sized = (wants[n] * scale).max(48.0);
                             // Live remaining along the strip this frame.
@@ -21429,7 +21435,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                                 .min_size(20.0)
                                 .max_size(max_w)
                                 .show(ui, |ui| docked_window(ui, app, *i));
-                            remember_dock_size(ui, app, *i, ir.response.rect);
+                            remember_dock_size(ui, app, *i, ir.response.rect, true);
                         }
                     }
                 });
@@ -21454,8 +21460,9 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                 // proportional along-scale — see the bottom-edge branch.
                 const MIN_SHARE: f32 = 56.0;
                 let strip = ui.max_rect().height();
-                // v98: fill member's recorded share joins the scale math
-                // (see the bottom-edge branch above).
+                // v98: fill member's recorded share joins the scale math;
+                // NEVER-recorded members want the uniform split (see the
+                // bottom-edge branch above).
                 let wants: Vec<f32> = ids
                     .iter()
                     .map(|i| {
@@ -21463,7 +21470,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                         if rec > 8.0 {
                             rec
                         } else {
-                            def_h(*i)
+                            strip / ids.len() as f32
                         }
                     })
                     .collect();
@@ -21481,7 +21488,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             .resizable(false)
                             .exact_size(b.width())
                             .show(ui, |ui| docked_window(ui, app, *i));
-                        remember_dock_size(ui, app, *i, ir.response.rect);
+                        remember_dock_size(ui, app, *i, ir.response.rect, true);
                     } else {
                         let sized = (wants[n] * scale).max(48.0);
                         // v49 R4: NO ScrollArea wrap any more. It was a
@@ -21502,7 +21509,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                             .min_size(20.0)
                             .max_size(max_h)
                             .show(ui, |ui| docked_window(ui, app, *i));
-                        remember_dock_size(ui, app, *i, ir.response.rect);
+                        remember_dock_size(ui, app, *i, ir.response.rect, true);
                     }
                 }
             });
