@@ -87,13 +87,18 @@ static void w6_copy64(char *dst, const char *src) {
  * the crate-enum ordinal (25 — NOT the SDK's 9; same dialect note as the
  * program block above; verified against vendor/vst2 plugin.rs). We record
  * per-message: RPN slot selects (CC101/100), RPN-0 data writes (CC6/CC38
- * while slot 0/0), and pitch bend. Read back from host pins via private
- * opcodes 9000..9003 (never sent by real hosts — default 0 otherwise). */
+ * while slot 0/0), pitch bend, and poly aftertouch (v104). Read back from
+ * host pins via private opcodes 9000..9006 (never sent by real hosts —
+ * default 0 otherwise). */
 #define W6OP_ProcessEvents 25
 #define W6OP_ProbeRpnWrites 9000 /* CC6 lands while RPN slot 0/0 active */
 #define W6OP_ProbeRpnMsb 9001    /* last CC6 value (-1 = never)           */
 #define W6OP_ProbeRpnLsb 9002    /* last CC38 value (-1 = never)          */
 #define W6OP_ProbeBend 9003      /* last pitch bend 14-bit + 1 (0 = none) */
+/* v104 (card t_0ab25d9a): poly aftertouch (0xA0) observer. */
+#define W6OP_ProbePoly 9004      /* count of 0xA0 messages seen           */
+#define W6OP_ProbePolyNote 9005  /* (channel << 8) | note (-1 = never)    */
+#define W6OP_ProbePolyPress 9006 /* last poly-AT pressure (-1 = never)    */
 
 static int g_rpn_sel_msb = -1; /* last CC101 value            */
 static int g_rpn_active = 0;   /* slot 0/0 currently selected */
@@ -101,6 +106,10 @@ static int g_rpn_writes = 0;
 static int g_rpn_msb = -1;
 static int g_rpn_lsb = -1;
 static int g_bend = 0;
+static int g_poly_msgs = 0; /* v104: 0xA0 count                */
+static int g_poly_ch = -1;  /* v104: last poly-AT channel      */
+static int g_poly_note = -1; /* v104: last poly-AT note        */
+static int g_poly_press = -1; /* v104: last poly-AT pressure   */
 
 /* Mirror of vst2::api::MidiEvent's leading fields (repr C): six i32s of
  * header + note fields, then the 3 midi bytes. */
@@ -119,6 +128,13 @@ static void w6_note_midi(const uint8_t *m) {
     int status = m[0] & 0xF0;
     if (status == 0xE0) {
         g_bend = ((m[2] << 7) | m[1]) + 1; /* +1: 0 means "never" */
+        return;
+    }
+    if (status == 0xA0) { /* v104: poly aftertouch passthrough observer */
+        g_poly_msgs++;
+        g_poly_ch = m[0] & 0x0F;
+        g_poly_note = m[1];
+        g_poly_press = m[2];
         return;
     }
     if (status != 0xB0)
@@ -192,6 +208,12 @@ static long w6_dispatch(W6AEffect *e, int opcode, int index, long value,
         return g_rpn_lsb;
     case W6OP_ProbeBend:
         return g_bend;
+    case W6OP_ProbePoly:
+        return g_poly_msgs;
+    case W6OP_ProbePolyNote:
+        return g_poly_note < 0 ? -1 : ((g_poly_ch << 8) | g_poly_note);
+    case W6OP_ProbePolyPress:
+        return g_poly_press;
     default:
         return 0;
     }
@@ -238,7 +260,13 @@ W6EXPORT void *VSTPluginMain(void *host_callback) {
     g_rpn_writes = 0;
     g_rpn_msb = -1;
     g_rpn_lsb = -1;
-    g_bend = 0;    g_fx.magic = 0x56737450; /* 'VstP' */
+    g_bend = 0;
+    /* v104: poly-AT observer statics ride the same fresh-instance rule. */
+    g_poly_msgs = 0;
+    g_poly_ch = -1;
+    g_poly_note = -1;
+    g_poly_press = -1;
+    g_fx.magic = 0x56737450; /* 'VstP' */
     g_fx.dispatcher = w6_dispatch;
     g_fx.process = w6_process;
     g_fx.setParameter = w6_setparam;
