@@ -24072,7 +24072,8 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
             );
             ui.add_sized(
                 [84.0, 18.0],
-                Slider::new(&mut sp, -1.0..=1.0).custom_formatter(|v, _| sc_pan_text(v * 0.5 + 0.5)),
+                Slider::new(&mut sp, -1.0..=1.0)
+                    .custom_formatter(|v, _| sc_pan_text((v * 0.5 + 0.5) as f32)),
             )
         })
         .inner
