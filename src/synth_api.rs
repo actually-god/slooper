@@ -129,50 +129,34 @@ pub struct SynthInfoV1 {
 /// v2 support, it never rewrites its v1 entry point.
 pub const SLOOPER_SYNTH_ABI_V2: u32 = 2;
 
-/// v100: pitch-bend-capable synth description. The frozen [`SynthInfoV1`]
-/// fields come first, in the same order, followed by ONE appended callback
-/// (the static asserts below enforce that shape — same discipline as the
-/// fx ABI ladder in `effect_api.rs`).
-///
-/// To support v2 a script keeps declaring its `SynthInfoV1` DESC and
-/// `slooper_synth_info` exactly as before, and ADDS:
+/// v100: pitch-bend-capable synth description — a LEAN companion table.
+/// Only the additions live here; the script's identity remains its frozen
+/// [`SynthInfoV1`] DESC + `slooper_synth_info`. A v2-capable script ADDS
+/// exactly:
 ///
 /// ```ignore
-/// pub static DESC2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, .., bend };
+/// static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend };
 /// #[no_mangle]
-/// pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC2 }
+/// pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
 /// ```
 ///
-/// Older slooper binaries keep loading such a script through the v1 entry
-/// (bend silently ignored, exactly the pre-v100 behavior); v1-only scripts
-/// keep loading in newer hosts (the v2 probe just misses).
+/// The host probes `slooper_synth_info_v2` ALONGSIDE the v1 table; a
+/// missing probe hit means the script loads fine but bend is ignored
+/// (pre-v100 behavior). Older slooper binaries load such a script through
+/// the v1 entry point and never look at DESC_V2 (fx ABI ladder discipline).
 #[repr(C)]
 pub struct SynthInfoV2 {
     /// Must be [`SLOOPER_SYNTH_ABI_V2`].
     pub abi: u32,
-    pub name: *const core::ffi::c_char,
-    pub author: *const core::ffi::c_char,
-    pub description: *const core::ffi::c_char,
-    pub n_params: u32,
-    pub params: *const SynthParamV1,
-    pub create: extern "C" fn(sample_rate: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void,
-    pub destroy: extern "C" fn(s: *mut core::ffi::c_void),
-    pub note_on: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8, vel: u8),
-    pub note_off: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, note: u8),
-    pub all_off: extern "C" fn(s: *mut core::ffi::c_void),
-    pub cc: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, num: u8, val: u8),
-    pub press: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, val: u8),
-    pub process:
-        extern "C" fn(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params: *const f32),
-    /// v100: channel pitch bend — this is where the piano roll's GLIDE
-    /// lane lands. `st` is SEMITONES in the roll's own space: a full
-    /// deflection (a 12 st glide note, or the raw MIDI bend wheel at
-    /// ±full) is ±12.0. Channel-wide like MIDI: apply it to every live
-    /// voice on `ch`, and derive the rate/frequency of a voice started
-    /// NOW from the value in effect NOW. Arrives on the audio thread
-    /// immediately BEFORE the `process` segment that covers it, exactly
-    /// like note_on/note_off — allocation-free, no locks, never panics.
-    /// Voices are usually pitched by `2^(st / 12)`.
+    /// Channel pitch bend — this is where the piano roll's GLIDE lane
+    /// lands. `st` is SEMITONES in the roll's own space: a full deflection
+    /// (a 12 st glide note, or raw MIDI bend at full) is ±12.0.
+    /// Channel-wide like MIDI: apply to every live voice on `ch`, and
+    /// derive the rate/frequency of a voice starting NOW from the value in
+    /// effect NOW. Arrives on the audio thread immediately BEFORE the
+    /// `process` segment that covers it, exactly like note_on/note_off —
+    /// allocation-free, no locks, never panics. Voices are usually pitched
+    /// by `2^(st / 12)`.
     pub bend: extern "C" fn(s: *mut core::ffi::c_void, ch: u8, st: f32),
 }
 
@@ -181,9 +165,3 @@ unsafe impl Sync for SynthInfoV1 {}
 unsafe impl Sync for SynthInfoV2 {}
 unsafe impl Sync for SynthHostV1 {}
 unsafe impl Sync for SynthAssetV1 {}
-
-const _: () = assert!(
-    core::mem::offset_of!(SynthInfoV2, process) == core::mem::offset_of!(SynthInfoV1, process)
-);
-const _: () =
-    assert!(core::mem::offset_of!(SynthInfoV2, bend) > core::mem::offset_of!(SynthInfoV2, process));
