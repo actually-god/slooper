@@ -2424,10 +2424,11 @@ pub(crate) mod tests {
     fn v34_clap_open_reads_normalized_params() {
         let e = fixture_entry("gain");
         // v67: fixture-gain gained `fixload` (the preset-load trigger) - 3.
-        // v103: +2 HIDDEN probe params (bend currency) - 5. Hidden params
-        // stay in descs (v66 doctrine: the mirror must keep them); they
-        // are NOT writable, so no new knobs appear in any window.
-        assert_eq!(e.descs().len(), 5);
+        // v103: +2 HIDDEN probe params (bend currency) - 5.
+        // v104: +3 HIDDEN probe params (poly-AT observer, card t_0ab25d9a) - 8.
+        // Hidden params stay in descs (v66 doctrine: the mirror must keep
+        // them); they are NOT writable, so no new knobs appear in any window.
+        assert_eq!(e.descs().len(), 8);
         assert_eq!(e.descs()[0].name, "fixgain");
         // plain default 1.0 on [0,1] normalizes to 1.0
         assert!((e.descs()[0].default - 1.0).abs() < 1e-6);
