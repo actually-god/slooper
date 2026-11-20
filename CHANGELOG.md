@@ -8,6 +8,19 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Docked subwindow sizes survive restarts — for real this time.**
+  Resizing a docked panel (MASTER OUT was the worst case) and relaunching
+  reset it toward a minimum: every restart quietly shaved a frame's worth
+  of pixels off the saved size until it stuck at the dock floor, and any
+  unequal split between windows sharing an edge flattened to a fair
+  half-and-half on the very first frame after boot. The persisted geometry
+  now measures what the dock actually reserves (instead of the inner
+  content area, which is narrower by the panel margins — the ratchet), is
+  only updated by actual divider drags (never by the layout's own
+  compromises), and reboots honoring the user's proportions instead of
+  equal shares. Float↔dock toggling keeps the chosen thickness, and a
+  deliberately-thin dock is no longer yanked back to the built-in width.
+
 - **Sampler presets and key maps survive restarts.** Saving a sampler
   key map (session, project, or named preset) and loading it after
   restarting the app listed every sample as `(missing)` and played
