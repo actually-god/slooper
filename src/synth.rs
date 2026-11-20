@@ -2069,34 +2069,6 @@ mod tests {
     }
 
     #[test]
-    fn v100_poly_aftertouch_still_dropped_cleanly() {
-        // Guard for the OTHER half of the old `4 | 5 => {}` arm: per-note
-        // aftertouch (kind 4) has no scripted callback and must stay
-        // audio-invisible and panic-free.
-        if !crate::fx::rustc_available() {
-            return;
-        }
-        let reg = v51_registry();
-        let sine: Arc<[f32]> = (0..96_000)
-            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
-            .collect();
-        set_host_assets(Arc::new(vec![sine]), 48_000);
-        let inst = reg
-            .create_instance("sampler", 48_000.0, &[0.0, 48.0, 1.0])
-            .expect("sampler instance");
-        let plain = v100_glide_render(&inst, 48, &|_| 0.0);
-        // Same render with poly-AT noise injected at every offset.
-        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
-        for i in 0..=100 {
-            ev.push((960 + (i * 480) as u64, 4u8, 0u8, 48u8, (i % 128) as u8));
-        }
-        ev.push((47_000, 0, 0, 48, 0));
-        let mut with_at = vec![0f32; 48_000];
-        crate::audio::render_midi_events(&inst, &mut ev, 0, with_at.len(), &mut with_at);
-        assert_eq!(plain, with_at, "poly-AT must not reach scripted synths (no ABI callback yet)");
-    }
-
-    #[test]
     fn v100_all_bundled_synths_load() {
         // The ABI v2 bump must not reject ANY bundled script.
         let reg = v51_registry();
@@ -2182,5 +2154,259 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
         assert!(reg.create_instance("v100_legacy_v1", 48_000.0, &[]).is_some());
         assert!(reg.desc("v100_bogus_abi").is_none(), "ABI 99 must be rejected");
         assert!(reg.create_instance("v100_bogus_abi", 48_000.0, &[]).is_none());
+    }
+
+    // ---- v105 (card t_a4df161f): poly aftertouch must REACH scripted
+    // synths. The five kind-4 arms used to be a documented drop (decision
+    // (a) of v104 shipped only the hosting half). ABI v3 (SynthInfoV3 +
+    // slooper_synth_info_v3) adds poly_at(s, ch, note, val-raw-0..=127);
+    // the ladder must degrade for v1/v2 and for a mis-stamped v3.
+
+    /// One staged render of the probe scripts: optional poly-AT event at
+    /// offset 960, window measured 4800..19200 (probe tone = 200 Hz).
+    fn v105_probe_render(
+        inst: &std::sync::Arc<Instance>,
+        kind4: Option<(u8, u8, u8)>,
+        kind5: Option<u16>,
+    ) -> f64 {
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3, 0, 48, 110)];
+        if let Some((ch, note, val)) = kind4 {
+            ev.push((960, 4, ch, note, val));
+        }
+        if let Some(raw) = kind5 {
+            ev.push((960, 5, 0, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8));
+        }
+        ev.push((47_000, 0, 0, 48, 0));
+        let mut out = vec![0f32; 19_200];
+        crate::audio::render_midi_events(inst, &mut ev, 0, out.len(), &mut out);
+        tone_power(&out, 200.0, 48_000.0, 4_800, 19_200)
+    }
+
+    /// Shared boilerplate of the two probe scripts (v1 table + one-voice
+    /// 200 Hz tone gated by `amp`; each script supplies `callbacks`).
+    const V105_PROBE_HEAD: &str = r#"
+include!("synth_api.rs");
+use core::ffi::c_void;
+struct P { sr: f64, ph: f64, on: bool, amp: f64 }
+extern "C" fn cr(sr: f64, _h: *const SynthHostV1) -> *mut c_void {
+    Box::into_raw(Box::new(P { sr, ph: 0.0, on: false, amp: 0.0 })) as *mut c_void
+}
+extern "C" fn de(s: *mut c_void) {
+    if !s.is_null() { drop(unsafe { Box::from_raw(s as *mut P) }); }
+}
+extern "C" fn no(s: *mut c_void, _c: u8, _n: u8, v: u8) {
+    let p = unsafe { &mut *(s as *mut P) };
+    p.on = v > 0;
+    p.amp = 0.0;
+}
+extern "C" fn nf(s: *mut c_void, _c: u8, _n: u8) { unsafe { &mut *(s as *mut P) }.on = false; }
+extern "C" fn ao(s: *mut c_void) { unsafe { &mut *(s as *mut P) }.on = false; }
+extern "C" fn cc(_s: *mut c_void, _c: u8, _n: u8, _v: u8) {}
+extern "C" fn pr(_s: *mut c_void, _c: u8, _v: u8) {}
+"#;
+
+    /// Targeting proof script: valid cumulative v3. poly_at answers ONLY
+    /// the exact (ch=1, note=61) live voice with amp = val/127 — so the
+    /// render proves channel, note AND pressure byte independently.
+    const V105_PROBE_V3: &str = r#"
+extern "C" fn bd(_s: *mut c_void, _c: u8, _st: f32) {}
+extern "C" fn pa(s: *mut c_void, ch: u8, note: u8, val: u8) {
+    let p = unsafe { &mut *(s as *mut P) };
+    p.amp = if p.on && ch == 1 && note == 61 { val as f64 / 127.0 } else { 0.0 };
+}
+extern "C" fn po(s: *mut c_void, out: *mut f32, n: usize, _p: *const f32) {
+    let p = unsafe { &mut *(s as *mut P) };
+    let out = unsafe { core::slice::from_raw_parts_mut(out, n) };
+    let step = (std::f64::consts::TAU * 200.0 / p.sr) as f64;
+    for o in out.iter_mut() {
+        *o += (p.ph.sin() * 0.5 * p.amp) as f32;
+        p.ph += step;
+        if p.ph > std::f64::consts::TAU { p.ph -= std::f64::consts::TAU; }
+    }
+}
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: SLOOPER_SYNTH_ABI,
+    name: b"v105-probe-v3\0".as_ptr() as *const core::ffi::c_char,
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 0, params: core::ptr::null(),
+    create: cr, destroy: de, note_on: no, note_off: nf, all_off: ao,
+    cc: cc, press: pr, process: po,
+};
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend: bd, poly_at: pa };
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
+"#;
+
+    /// Ladder-proof script: a VALID v2 table (bend lifts amp to 0.5) plus
+    /// a MIS-STAMPED v3 table (abi: 77 — poly_at would lift amp to 1.0).
+    /// The host must trust the stamp: poly_at stays unwired, bend works.
+    const V105_PROBE_BOGUS3: &str = r#"
+extern "C" fn bd(s: *mut c_void, _c: u8, st: f32) {
+    let p = unsafe { &mut *(s as *mut P) };
+    if st > 0.1 { p.amp = 0.5; }
+}
+extern "C" fn pa(s: *mut c_void, _c: u8, _n: u8, _v: u8) {
+    unsafe { &mut *(s as *mut P) }.amp = 1.0;
+}
+extern "C" fn po(s: *mut c_void, out: *mut f32, n: usize, _p: *const f32) {
+    let p = unsafe { &mut *(s as *mut P) };
+    let out = unsafe { core::slice::from_raw_parts_mut(out, n) };
+    let step = (std::f64::consts::TAU * 200.0 / p.sr) as f64;
+    for o in out.iter_mut() {
+        *o += (p.ph.sin() * 0.5 * p.amp) as f32;
+        p.ph += step;
+        if p.ph > std::f64::consts::TAU { p.ph -= std::f64::consts::TAU; }
+    }
+}
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: SLOOPER_SYNTH_ABI,
+    name: b"v105-bogus3\0".as_ptr() as *const core::ffi::c_char,
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 0, params: core::ptr::null(),
+    create: cr, destroy: de, note_on: no, note_off: nf, all_off: ao,
+    cc: cc, press: pr, process: po,
+};
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
+static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend: bd };
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: 77, bend: bd, poly_at: pa };
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
+"#;
+
+    /// Channel, note and the raw pressure byte must all arrive intact at
+    /// a valid v3 script; a mis-stamped v3 must degrade to v2 (bend on,
+    /// poly_at off) — the v100 ladder discipline one rung higher.
+    #[test]
+    #[ignore = "slow-tier: compiles two probe scripts with rustc (~20 s)"]
+    fn v105_abi_v3_ladder_guards() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        std::fs::write(
+            reg.dir().join("v105_probe_v3.rs"),
+            format!("{V105_PROBE_HEAD}{V105_PROBE_V3}"),
+        )
+        .unwrap();
+        std::fs::write(
+            reg.dir().join("v105_bogus3.rs"),
+            format!("{V105_PROBE_HEAD}{V105_PROBE_BOGUS3}"),
+        )
+        .unwrap();
+        let reg = Registry::open(reg.dir().to_path_buf());
+
+        // -- valid v3: the callback must observe ch/note/val.
+        let a = reg
+            .create_instance("v105_probe_v3", 48_000.0, &[])
+            .expect("probe v3 instance");
+        let full = v105_probe_render(&a, Some((1, 61, 127)), None);
+        let half = v105_probe_render(&a, Some((1, 61, 64)), None);
+        let wrong_note = v105_probe_render(&a, Some((1, 62, 127)), None);
+        let wrong_ch = v105_probe_render(&a, Some((2, 61, 127)), None);
+        let none = v105_probe_render(&a, None, None);
+        eprintln!(
+            "v105 targeting: full {full:.1} half {half:.1} wrong-note {wrong_note:.1} \
+             wrong-ch {wrong_ch:.1} none {none:.1}"
+        );
+        assert!(full > 1e3, "correctly-targeted poly-AT must open the tone: {full}");
+        assert!(none < 10.0, "no AT must stay silent: {none}");
+        assert!(wrong_note < full / 100.0, "wrong note must NOT open the tone: {wrong_note}");
+        assert!(wrong_ch < full / 100.0, "wrong channel must NOT open the tone: {wrong_ch}");
+        let r = full / half.max(1e-9);
+        assert!(
+            r > 3.0 && r < 5.0,
+            "pressure must arrive as the raw byte (127 vs 64 = ~4x power): got {r:.2}"
+        );
+
+        // -- mis-stamped v3: poly_at unwired, v2 bend still wired.
+        let b = reg
+            .create_instance("v105_bogus3", 48_000.0, &[])
+            .expect("bogus-v3 instance");
+        let at = v105_probe_render(&b, Some((1, 61, 127)), None);
+        let bend = v105_probe_render(&b, None, Some(crate::midipat::st_to_bend(6.0)));
+        eprintln!("v105 ladder bogus3: at {at:.1} bend {bend:.1}");
+        assert!(at < 10.0, "a mis-stamped v3 table must NOT wire poly_at: {at}");
+        assert!(bend > 1e2, "the v2 bend must survive a bogus v3 export: {bend}");
+    }
+
+    /// Contract change (same-commit retarget, the v103 bend-4 precedent):
+    /// this v100 guard pinned the scripted poly-AT DROP on the bundled
+    /// sampler. v105 inverts that contract for v3-capable scripts, so the
+    /// subject moves to bundled `drums` — still a v1 script, so the
+    /// "clean, audio-invisible, panic-free drop" survives there; the
+    /// audible half lives in v105_pressure_audible_on_bundled_scripts.
+    #[test]
+    fn v100_poly_aftertouch_still_dropped_cleanly() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let inst = reg.create_instance("drums", 48_000.0, &[]).expect("bundled drums instance");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
+        for i in 0..=100 {
+            ev.push((960 + (i * 480) as u64, 4u8, 0u8, 48u8, (i % 128) as u8));
+        }
+        ev.push((47_000, 0, 0, 48, 0));
+        let mut with_at = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, with_at.len(), &mut with_at);
+        let mut ev2 = ev.clone();
+        ev2.retain(|e| e.1 != 4);
+        let mut plain = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev2, 0, plain.len(), &mut plain);
+        assert!(plain.iter().any(|x| x.abs() > 0.01), "drums must actually sound for this guard");
+        assert_eq!(plain, with_at, "poly-AT must stay invisible to v1 scripts (no callback)");
+    }
+
+    /// The user-visible half: every bundled script that speaks v3 must
+    /// HEAR pressure — held note, AT 127 vs no AT: window power rises by
+    /// the designed ~2.25x (amp x1.5). Sabotage: drop poly_at from a
+    /// script (or the probe from the host) and that stem goes red.
+    #[test]
+    fn v105_pressure_audible_on_bundled_scripts() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        for stem in ["additive", "fm", "pad", "piano", "pluck", "sampler", "tri_osc"] {
+            let params: &[f32] = if stem == "sampler" { &[0.0, 48.0, 1.0] } else { &[] };
+            let inst = reg
+                .create_instance(stem, 48_000.0, params)
+                .unwrap_or_else(|| panic!("{stem} instance"));
+            let render = |at: bool| -> f64 {
+                let mut ev: Vec<(u64, u8, u8, u8, u8)> =
+                    vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
+                if at {
+                    for i in 0..=40 {
+                        ev.push((960 + (i * 480) as u64, 4u8, 0u8, 48u8, 127));
+                    }
+                }
+                ev.push((47_000, 0, 0, 48, 0));
+                let mut out = vec![0f32; 48_000];
+                crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+                let w = 14_400..48_000;
+                out[w.clone()].iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>()
+                    / (48_000 - 14_400) as f64
+            };
+            let (plain, at) = (render(false), render(true));
+            eprintln!("v105 {stem}: plain {plain:.6} at {at:.6} ratio {:.2}", at / plain.max(1e-12));
+            assert!(plain > 1e-6, "{stem}: control render must actually sound: {plain}");
+            let r = at / plain;
+            assert!(
+                r > 1.7 && r < 3.0,
+                "{stem}: poly-AT at 127 must lift sustained power ~2.25x, got {r:.2} \
+                 (plain {plain:.6} at {at:.6})"
+            );
+        }
     }
 }
