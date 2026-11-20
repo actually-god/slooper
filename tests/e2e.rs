@@ -5487,3 +5487,109 @@ fn e2e_v96_multi_preview_pair_ducks() {
     );
     b.engine.stop_audition();
 }
+
+/// v100 (card t_52aa65b1): a baked glide-bend stream on an audition voice —
+/// the RT `render_midi_block` scripted arm — must actually bend the
+/// scripted sampler. A 0 -> +12 st ramp vs flat, measured by zero-crossing
+/// density in the late window (pre-fix these renders are byte-identical).
+#[test]
+fn v100_audition_baked_glide_heard_on_scripted_synth_live_rt() {
+    let _g = e2e_lock();
+    let Some((b, _client_name, sr)) = start_backend() else {
+        return; // no audio server: skip
+    };
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new("glide100", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
+        )
+        .unwrap();
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![(format!("{src_name}:sink"), 3)],
+    });
+    assert!(
+        wait_for(
+            &b,
+            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "sink layout not applied"
+    );
+
+    // Host asset: 2 s of 200 Hz sine at the live rate — sustained so the
+    // capture window sits inside the sample. Sampler bound to track 0 with
+    // legacy params (asset 0, root 48, gain 1); each round gets a FRESH
+    // instance so bend state cannot leak between rounds.
+    let sine: Arc<[f32]> = (0..(2 * sr as usize))
+        .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / sr as f64).sin() as f32 * 0.5)
+        .collect();
+    slooper::synth::set_host_assets(Arc::new(vec![sine]), sr);
+    let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
+
+    let round = |end_st: f32| -> Vec<f32> {
+        let inst = reg
+            .create_instance("sampler", sr as f64, &[0.0, 48.0, 1.0])
+            .expect("bundled sampler instance");
+        b.engine
+            .set_track_synth(0, Some(Arc::new(slooper::audio::SynthHandle::Script(inst))));
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
+        for i in 0..=100 {
+            let st = end_st * i as f32 / 100.0;
+            let raw = slooper::midipat::st_to_bend(st);
+            ev.push((
+                ((i as u64 * sr as u64) / 100) + (sr as u64 / 100),
+                5u8,
+                0u8,
+                (raw & 0x7F) as u8,
+                ((raw >> 7) & 0x7F) as u8,
+            ));
+        }
+        ev.push(((3 * sr as u64) / 2, 0, 0, 48, 0));
+        b.engine.play_audition(0, ev.into(), None);
+        wait_until(
+            || ring_peak(&ring, &widx, 4800).map(|p| p > 0.01).unwrap_or(false),
+            Duration::from_secs(5),
+            "glide audition note audible",
+        );
+        // Discard to t ≈ 0.8 s (jittered by at most a block), capture
+        // 0.15 s: the ramp is at +9.6..+11.4 st there vs +0 st flat.
+        let _ = read_ring(&ring, &widx, (sr as usize * 4) / 5, Duration::from_millis(900))
+            .expect("discard window");
+        let win = read_ring(&ring, &widx, (sr as usize * 3) / 20, Duration::from_millis(500))
+            .expect("capture window");
+        wait_until(
+            || !b.engine.audition_active(),
+            Duration::from_secs(6),
+            "audition retires after the note-off",
+        );
+        b.engine.stop_audition();
+        std::thread::sleep(Duration::from_millis(300));
+        win
+    };
+
+    let zc = |x: &[f32]| -> f64 {
+        x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count() as f64
+    };
+    let flat = round(0.0);
+    let up = round(12.0);
+    assert_ne!(flat, up, "live RT dropped every baked bend for the scripted sampler");
+    let (cf, cu) = (zc(&flat), zc(&up));
+    assert!(cf >= 12.0, "flat capture window must carry cycles: {cf}");
+    let r = cu / cf;
+    assert!(
+        r > 1.3 && r < 2.6,
+        "live baked glide must raise the late-window pitch ~1.8x: got {r:.3} \
+         (flat {cf} -> up {cu})"
+    );
+    drop(active);
+    b.cmd(Cmd::StopAll);
+}
