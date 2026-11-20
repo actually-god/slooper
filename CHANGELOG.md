@@ -19,6 +19,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   fm, additive, pluck, tri_osc) raise the pressured voice's level by up
   to +3.5 dB; unpressed renders are byte-for-byte the old sound.
 
+- **Pitch curves, drawn on the notes.** The piano roll now draws and
+  edits each note's pitch curve right ON the note body: Z+drag paints a
+  freehand curve (release over another note and the slide lands on its
+  pitch, 808-style), selected notes reveal draggable control points
+  (Shift snaps time, Ctrl snaps 100-cent steps), Alt+Z warps the whole
+  curve, and Shift+right-click clears just the curve. Every edit bakes
+  and re-auditions immediately — you hear what you drew. The old
+  separate glide strip is retired: it stays visible only for legacy
+  projects whose bends lived in gaps, while everything migrated onto
+  notes paints and edits on the note.
 - **Per-note pitch curves (engine).** Sampler pitch bends now live ON
   their note as a control-point curve (up to 16 points, ±2 octaves,
   smooth monotone interpolation — 2-point curves are the old straight
@@ -29,8 +39,7 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   the old lane migrate automatically to their notes on load (glides in
   gaps keep working as before), files save and reload with their curves
   intact, and every bend-less pattern and old project loads byte-
-  identical. The piano-roll curve drawing lands in the next step of
-  this series.
+  identical. The in-roll curve editor for it shipped directly above.
 
 ### Fixed
 
