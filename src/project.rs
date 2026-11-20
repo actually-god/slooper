@@ -157,6 +157,10 @@ pub struct Project {
     /// v62: per-track selected VST2 factory program (-1 = none).
     #[serde(default)]
     pub track_synth_programs: Vec<i32>,
+    /// v103: per-track pitch-bend range in semitones (0 = off);
+    /// absent entries take the app default (±2). See config.rs twin.
+    #[serde(default)]
+    pub track_bend_ranges: Vec<u8>,
     /// v29 R7: MIDI bindings to values (mixer / plugin controls) —
     /// per-project, managed from the automation manager's bindings rack.
     #[serde(default)]
@@ -342,6 +346,7 @@ mod tests {
             track_synth_params: vec![vec![0.5]],
             track_synth_states: vec![],
             track_synth_programs: vec![],
+            track_bend_ranges: vec![],
 
             value_binds: Vec::new(),
             drum: None,
@@ -551,6 +556,7 @@ mod tests {
             track_synth_params: Vec::new(),
             track_synth_states: Vec::new(),
             track_synth_programs: Vec::new(),
+            track_bend_ranges: Vec::new(),
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
@@ -613,6 +619,7 @@ mod tests {
             track_synth_params: Vec::new(),
             track_synth_states: Vec::new(),
             track_synth_programs: vec![-1, 4],
+            track_bend_ranges: vec![0, 5],
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
@@ -625,14 +632,26 @@ mod tests {
         save(&p, &pr).expect("save");
         let back = load(&p).expect("load");
         assert_eq!(back.track_synth_programs, vec![-1, 4], "programs survive save/load");
+        // v103 (card t_62c5a14e): same round-trip law for bend ranges —
+        // an EXPLICIT 0 (bend off) must never collapse to "absent".
+        assert_eq!(
+            back.track_bend_ranges,
+            vec![0, 5],
+            "v103: bend ranges survive save/load (explicit 0 kept)"
+        );
         // Pre-v62 file: strip the key -> the project still loads, empty table.
         let s = serde_json::to_string(&pr).unwrap();
         let mut j: serde_json::Value = serde_json::from_str(&s).unwrap();
         j.as_object_mut().unwrap().remove("track_synth_programs");
+        j.as_object_mut().unwrap().remove("track_bend_ranges");
         let older = dir.join("older.slooper");
         std::fs::write(&older, j.to_string()).unwrap();
         let legacy = load(&older).expect("pre-v62 file loads");
         assert!(legacy.track_synth_programs.is_empty(), "legacy loads empty");
+        assert!(
+            legacy.track_bend_ranges.is_empty(),
+            "v103: legacy bend ranges load empty (app default fills)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

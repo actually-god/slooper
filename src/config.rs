@@ -744,6 +744,12 @@ pub struct Config {
     /// track; re-applied when the synth (re)opens.
     #[serde(default)]
     pub track_synth_programs: Vec<i32>,
+    /// v103 (card t_62c5a14e): per-track PITCH-BEND RANGE in semitones
+    /// (index = track; absent/default = `vsthost::DEFAULT_BEND_RANGE` =
+    /// ±2 st, 0 = bend off). Hosted plugins get it as RPN0; the raw roll
+    /// bends are rescaled to it on delivery.
+    #[serde(default)]
+    pub track_bend_ranges: Vec<u8>,
     /// Number of tracks the program exposes (clamped 1..=16). Per-track
     /// levels and bindings are kept for ALL 16 slots regardless, so raising
     /// the count again restores everything that was configured while a
@@ -881,6 +887,7 @@ impl Default for Config {
             track_synth_params: Vec::new(),
             track_synth_states: Vec::new(),
             track_synth_programs: Vec::new(),
+            track_bend_ranges: Vec::new(),
             show_rack: true,
             show_mixer: true,
             mixer_follow_tracks: true,
@@ -1512,6 +1519,7 @@ mod tests {
             track_synth_params: vec![vec![], vec![0.2]],
             track_synth_states: vec![],
             track_synth_programs: vec![],
+            track_bend_ranges: vec![],
             vst_dirs: vec!["/tmp/vst".into()],
             track_vst: vec![
                 None,
