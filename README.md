@@ -21,7 +21,8 @@ tarball.
 - **Record audio and MIDI** — each take is written as a WAV / `.mid` asset
   into your rack's primary folder and auto-placed as a clip at the playhead.
 - **Instruments** — bundled grand piano, sampler (piano-style key map with
-  velocity layers, for drums and multisampling), drums kit and pad synth,
+  velocity layers, for drums and multisampling), drums kit, pad, and
+  fm / additive / pluck / tri-osc / granular script synths,
   or any hosted VSTi/CLAP instrument — native plugin editor windows
   included.
 - **Piano roll** — draw and edit notes on the snap grid, one-click quantize,
