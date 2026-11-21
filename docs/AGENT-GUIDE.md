@@ -155,6 +155,11 @@ src/            application source (Rust 2021 edition)
                   via install_all seams, read-only latch is flag-declared,
                   never name-parsed), bridge.rs (`--mcp-bridge` stdio
                   shim). UI pumps requests; execution is UI-thread only.
+                  ui/mcp_windows.rs (v108): the `windows.*` family —
+                  stable window ids (prim kinds + DynKind keys), open/
+                  close/move/resize/dock/undock, named layout save/restore
+                  via the WinLayout config table; every ack echoes
+                  post-change geometry.
   audio/rt_recovery.rs
                   W12a pure recovery table: the WASAPI RT thread classifies
                   its own death (none/stream/device-invalidated), the idle

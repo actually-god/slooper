@@ -657,14 +657,16 @@ fn wmove(app: &mut App, args: &Value) -> ToolResult {
         ));
     }
     let idx = resolve(app, id)?;
+    // Argument parsing BEFORE state checks: a missing coordinate is a
+    // parameter bug regardless of where the window sits.
+    let x = need_num(args, "x")?;
+    let y = need_num(args, "y")?;
     if is_docked(app, idx) {
         return Err(ToolError::wrong_kind(format!(
             "window \"{id}\" is docked — docked geometry is owned by the dock; \
              windows.undock first"
         )));
     }
-    let x = need_num(args, "x")?;
-    let y = need_num(args, "y")?;
     let r = win_rect(app, idx);
     let f = float_footprint(app, idx);
     let (w, h) = if r[2] > 8.0 { (r[2], r[3]) } else { (f[2], f[3]) };
@@ -692,14 +694,15 @@ fn wresize(app: &mut App, args: &Value) -> ToolResult {
         ));
     }
     let idx = resolve(app, id)?;
+    // Argument parsing BEFORE state checks (see windows.move).
+    let w = need_num(args, "w")?.clamp(MIN_W, app.vp_rect[2]);
+    let h = need_num(args, "h")?.clamp(MIN_H, app.vp_rect[3]);
     if is_docked(app, idx) {
         return Err(ToolError::wrong_kind(format!(
             "window \"{id}\" is docked — docked thickness is set by dock drags; \
              windows.undock first"
         )));
     }
-    let w = need_num(args, "w")?.clamp(MIN_W, app.vp_rect[2]);
-    let h = need_num(args, "h")?.clamp(MIN_H, app.vp_rect[3]);
     let r = win_rect(app, idx);
     let f = float_footprint(app, idx);
     let (x, y) = if r[2] > 8.0 { (r[0], r[1]) } else { (f[0], f[1]) };
@@ -753,10 +756,27 @@ fn wdock(app: &mut App, args: &Value) -> ToolResult {
             r.min(i16::MAX as i64) as i16
         }
     };
-    // Deterministic rank insertion through the REAL dock path:
-    // `dock_at` ranks by the live centers of the edge's tab groups, so the
-    // synthetic drop point is placed just past the (rank-1)-th group's
-    // center — the same math a drag does, one mouse-truth authority.
+    // Rank-addressed dock: the EXACT writes `dock_at` lands on drop
+    // (groups preserved, edge re-packed to contiguous ranks, collapse +
+    // stale dock-rect reset, along-axis fresh on float→dock) — but
+    // addressed by RANK instead of a drop point, because pre-first-draw
+    // frames have no live centers and the mouse's center math would
+    // collapse every rank to 0 there. Same terminal state, deterministic.
+    dock_pack(app, idx, edge, rank as usize);
+    commit(
+        app,
+        format!(
+            "window \"{id}\" docked {} rank {}",
+            EDGE_NAMES[edge as usize],
+            dock_order(app, idx)
+        ),
+    );
+    Ok(json!({"window": entry(app, idx), "status": app.status}))
+}
+
+/// The `dock_at` terminal writes with a direct insertion rank.
+fn dock_pack(app: &mut App, idx: usize, edge: i16, want: usize) {
+    let was_free = !is_docked(app, idx);
     let n = win_count(app);
     let mut mem: Vec<usize> = (0..n)
         .filter(|i| *i != idx && is_docked(app, *i) && dock_edge(app, *i) == edge)
@@ -770,46 +790,23 @@ fn wdock(app: &mut App, args: &Value) -> ToolResult {
             _ => groups.push(vec![i]),
         }
     }
-    let horiz = edge == 2 || edge == 3;
-    let mut centers: Vec<f32> = groups
-        .iter()
-        .filter_map(|g| {
-            g.iter()
-                .find(|i| app.dock_rects.get(**i).is_some_and(|r| r[2] > 8.0))
-                .map(|i| {
-                    let r = app.dock_rects[*i];
-                    if horiz {
-                        r[0] + r[2] * 0.5
-                    } else {
-                        r[1] + r[3] * 0.5
-                    }
-                })
-        })
-        .collect();
-    centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let want = (rank as usize).min(centers.len());
-    let along = if want == 0 {
-        f32::MIN / 4.0
-    } else if want >= centers.len() {
-        f32::MAX / 4.0
-    } else {
-        centers[want - 1] + 1.0
-    };
-    let pt = if horiz {
-        egui::pos2(along, 0.0)
-    } else {
-        egui::pos2(0.0, along)
-    };
-    dock_at(app, idx, edge, pt);
-    commit(
-        app,
-        format!(
-            "window \"{id}\" docked {} rank {}",
-            EDGE_NAMES[edge as usize],
-            dock_order(app, idx)
-        ),
-    );
-    Ok(json!({"window": entry(app, idx), "status": app.status}))
+    let rank = want.min(groups.len());
+    groups.insert(rank, vec![idx]);
+    for (r, g) in groups.iter().enumerate() {
+        for &i in g {
+            if i < 4 {
+                app.side_wins.dock[i] = [1, edge, r as i16];
+            } else {
+                app.dyn_wins[i - 4].dock = [1, edge, r as i16];
+            }
+        }
+    }
+    app.dock_collapsed[idx] = false;
+    app.dock_rects[idx] = [0.0; 4];
+    if was_free {
+        reset_dock_along(app, idx, edge);
+    }
+    app.side_dirty = true;
 }
 
 const UNDOCK_DESC: &str = "Float a docked window (optional {x,y} top-left, \
@@ -895,4 +892,532 @@ fn layout_restore(app: &mut App, args: &Value) -> ToolResult {
         "editors": [],
         "status": app.status,
     }))
+}
+
+// ── v108 quick-tier pins ─────────────────────────────────────────────────
+//
+// Contract (docs/MCP-DESIGN.md D6): every pin drives `rpc::dispatch` — the
+// real dispatcher the frame loop drains — never the tool fns, so gate order,
+// taxonomy, the read-only latch and observed-then-ack are exercised exactly
+// as production reaches them. `tick` = one drawn frame (registers windows,
+// measures dock rects) so geometry asserts read the same values the mouse
+// user sees.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        static TICK_T: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+    }
+
+    /// One headless frame at the standard 1440×853 viewport (mirrors the
+    /// ui::tests `frame` harness; no input events — registry and geometry
+    /// only).
+    pub(crate) fn tick(app: &mut App, ctx: &egui::Context) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(TICK_T.with(|c| {
+                let t = c.get();
+                c.set(t + 1.0 / 30.0);
+                t
+            })),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+    }
+
+    fn resp(app: &mut App, name: &str, args: Value) -> Value {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                         "params":{"name":name,"arguments":args}});
+        crate::mcp::rpc::dispatch(&req, app).expect("response to a request")
+    }
+
+    fn sc(app: &mut App, name: &str, args: Value) -> Value {
+        let r = resp(app, name, args);
+        assert_ne!(
+            r["result"]["isError"].as_bool(),
+            Some(true),
+            "pin expects an OK result from {name}: {r}"
+        );
+        r["result"]["structuredContent"].clone()
+    }
+
+    fn wins(app: &mut App) -> Vec<Value> {
+        sc(app, "windows.list", json!({}))["windows"]
+            .as_array()
+            .cloned()
+            .unwrap()
+    }
+
+    fn find<'a>(list: &'a [Value], id: &str) -> &'a Value {
+        list.iter()
+            .find(|w| w["id"] == id)
+            .unwrap_or_else(|| panic!("no window {id} in {list:?}"))
+    }
+
+    fn err(app: &mut App, name: &str, args: Value) -> (String, String) {
+        let r = resp(app, name, args);
+        let e = &r["result"];
+        (
+            e["structuredContent"]["error"].as_str().unwrap_or("").to_string(),
+            e["content"][0]["text"].as_str().unwrap_or("").to_string(),
+        )
+    }
+
+    // ── R1/R2: registry + ids ─────────────────────────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_list_registry() {
+        let mut app = headless_app("v108reg");
+        let ctx = egui::Context::default();
+        // Stock roster: the four primaries, stable keys, stock dock slots
+        // (default_dock = rack left/0, binds bottom/1, monitor bottom/0,
+        // mixer right/0) — no dynamic window has registered yet.
+        let l = wins(&mut app);
+        let ids: Vec<&str> = l.iter().map(|w| w["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["rack", "binds", "monitor", "mixer"], "primary ids are PrimKind keys");
+        for w in &l {
+            for k in ["id", "kind", "title", "open", "docked", "edge", "edge_name", "rank", "rect", "float_rect"] {
+                assert!(
+                    !w[k].is_null() || k == "rect" || k == "float_rect",
+                    "{}: field {k} missing",
+                    w["id"]
+                );
+            }
+            assert_eq!(w["kind"], "primary");
+        }
+        assert_eq!(find(&l, "rack")["title"], "ASSET RACK");
+        assert_eq!(find(&l, "rack")["edge"], 0);
+        assert_eq!(find(&l, "rack")["rank"], 0);
+        assert_eq!(find(&l, "binds")["edge"], 2);
+        assert_eq!(find(&l, "binds")["rank"], 1);
+        assert_eq!(find(&l, "mixer")["edge"], 1);
+        // open flags mirror the app's own visibility getters (one truth).
+        for w in &l {
+            let id = w["id"].as_str().unwrap();
+            assert_eq!(w["open"].as_bool(), Some(win_visible(&app, win_slot(&app, id).unwrap())));
+        }
+        // A dynamic kind joins the roster once open + drawn.
+        let ack = sc(&mut app, "windows.open", json!({"id": "drums"}));
+        assert_eq!(ack["window"]["id"], "drums");
+        assert_eq!(ack["window"]["open"], true);
+        tick(&mut app, &ctx);
+        let l = wins(&mut app);
+        let d = find(&l, "drums");
+        assert_eq!(d["kind"], "dynamic");
+        assert_eq!(d["open"], true);
+        assert!(d["rect"].is_array(), "drawn float carries measured geometry: {d}");
+        assert_eq!(d["docked"], false, "fresh dyn windows float (dyn default [0,1,0])");
+    }
+
+    // ── R3: params key extension, BOTH directions ─────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_params_key_both_ways() {
+        let mut app = headless_app("v108pk");
+        // Config back-compat: the unit kind still parses from its bare key.
+        assert_eq!(DynKind::from_key("params"), Some(DynKind::Params));
+        assert_eq!(DynKind::from_key("params:chain:2:1"), Some(DynKind::Params));
+        assert_eq!(DynKind::from_key("params:synth:9"), Some(DynKind::Params));
+        // Registry direction: a live params window REPORTS its extended id…
+        app.params_win = Some(GuiTarget::Chain(2, 1));
+        let idx = app.dyn_reg(DynKind::Params, "Test — parameters".into());
+        assert_eq!(win_id(&app, idx), "params:chain:2:1");
+        // …and that id RESOLVES back to the same slot; so does the bare key.
+        assert_eq!(win_slot(&app, "params:chain:2:1"), Some(idx));
+        assert_eq!(win_slot(&app, "params"), Some(idx));
+        app.params_win = Some(GuiTarget::Synth(1));
+        assert_eq!(win_id(&app, idx), "params:synth:1");
+        // Tool level: the close resolves through the bare key…
+        let ack = sc(&mut app, "windows.close", json!({"id": "params"}));
+        assert_eq!(ack["window"]["id"], "params");
+        assert_eq!(app.params_win, None, "closed through bare id");
+        // …and through the extended id.
+        app.params_win = Some(GuiTarget::Synth(0));
+        let ack = sc(&mut app, "windows.close", json!({"id": "params:synth:0"}));
+        assert_eq!(ack["window"]["open"], false);
+        assert_eq!(app.params_win, None, "closed through extended id");
+        // An open with a target that has no live plugin is honest failure.
+        let (kind, msg) = err(&mut app, "windows.open", json!({"id": "params:chain:0:0"}));
+        assert_eq!(kind, "not_found", "{msg}");
+    }
+
+    // ── R2 + errors: bad ids, bad edges ───────────────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_bad_id_and_edge() {
+        let mut app = headless_app("v108bad");
+        let (kind, msg) = err(&mut app, "windows.move", json!({"id": "nope", "x": 10.0, "y": 10.0}));
+        assert_eq!(kind, "not_found");
+        assert!(msg.contains("rack") && msg.contains("mixer"), "refusal lists live ids: {msg}");
+        let (kind, _) = err(&mut app, "windows.dock", json!({"id": "rack", "edge": "sideways"}));
+        assert_eq!(kind, "out_of_range");
+        let (kind, _) = err(&mut app, "windows.dock", json!({"id": "rack", "edge": 7}));
+        assert_eq!(kind, "out_of_range");
+        let (kind, _) = err(&mut app, "windows.move", json!({"id": "rack", "x": 10.0}));
+        assert_eq!(kind, "invalid_params");
+    }
+
+    // ── R4: open/close round-trip ─────────────────────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_open_close_roundtrip() {
+        let mut app = headless_app("v108oc");
+        let ctx = egui::Context::default();
+        for (id, check) in [("drums", "show_drums"), ("master", "show_master")] {
+            let ack = sc(&mut app, "windows.open", json!({"id": id}));
+            assert_eq!(ack["window"]["open"], true, "{id} open-ack");
+            tick(&mut app, &ctx);
+            let l = wins(&mut app);
+            assert_eq!(find(&l, id)["open"], true, "{id} observed open");
+            let _ = check;
+        }
+        assert!(app.show_drums && app.show_master);
+        // close round-trip + idempotence refusal
+        let ack = sc(&mut app, "windows.close", json!({"id": "drums"}));
+        assert_eq!(ack["window"]["open"], false, "ack echoes the CLOSED state");
+        assert!(!app.show_drums);
+        let (kind, msg) = err(&mut app, "windows.close", json!({"id": "drums"}));
+        assert_eq!(kind, "not_found", "second close is a clean refusal: {msg}");
+        // track-indexed kinds validate bounds BEFORE touching state
+        let ack = sc(&mut app, "windows.open", json!({"id": "chain:0"}));
+        assert_eq!(ack["window"]["open"], true);
+        assert_eq!(app.fx_window, Some(0));
+        let (kind, msg) = err(&mut app, "windows.open", json!({"id": "chain:99"}));
+        assert_eq!(kind, "out_of_range", "{msg}");
+        // echo carries the status echo (v72: every MCP write is visible)
+        assert!(app.status.contains("chain"), "status echo: {}", app.status);
+    }
+
+    // ── R5: move + viewport clamping ──────────────────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_move_clamps() {
+        let mut app = headless_app("v108mv");
+        let _ctx = egui::Context::default();
+        sc(&mut app, "windows.undock", json!({"id": "rack"}));
+        // Far corner: clamped so >=60 px of the title band stay in-view —
+        // the top-left may reach viewport edge minus the margin (the
+        // window body may hang off; the header stays grabbable).
+        let ack = sc(&mut app, "windows.move", json!({"id": "rack", "x": 99999.0, "y": 99999.0}));
+        let r = ack["window"]["rect"].as_array().unwrap().clone();
+        assert_eq!((r[0].as_f64().unwrap(), r[1].as_f64().unwrap()), (1440.0 - 60.0, 853.0 - 60.0));
+        // Far top-left: title band cannot leave the top-left either.
+        let ack = sc(&mut app, "windows.move", json!({"id": "rack", "x": -99999.0, "y": -99999.0}));
+        let r = ack["window"]["rect"].as_array().unwrap().clone();
+        assert_eq!((r[0].as_f64().unwrap(), r[1].as_f64().unwrap()), (60.0 - 340.0, 60.0));
+        // A normal move lands exactly.
+        let ack = sc(&mut app, "windows.move", json!({"id": "rack", "x": 300.0, "y": 200.0}));
+        let r = ack["window"]["rect"].as_array().unwrap().clone();
+        assert_eq!((r[0].as_f64(), r[1].as_f64()), (Some(300.0), Some(200.0)));
+        assert!(app.status.contains("moved"));
+    }
+
+    #[test]
+    fn v108_mcp_windows_docked_move_resize_refused() {
+        let mut app = headless_app("v108dm");
+        // rack/mixer are docked per the stock layout.
+        let (kind, msg) = err(&mut app, "windows.move", json!({"id": "rack", "x": 10.0, "y": 10.0}));
+        assert_eq!(kind, "wrong_kind");
+        assert!(msg.contains("undock"), "refusal names the way out: {msg}");
+        let (kind, _) = err(&mut app, "windows.resize", json!({"id": "mixer", "w": 300.0, "h": 300.0}));
+        assert_eq!(kind, "wrong_kind");
+        // undock -> resize -> re-dock: the full mouse-free path works.
+        let ack = sc(&mut app, "windows.undock", json!({"id": "mixer"}));
+        assert_eq!(ack["window"]["docked"], false);
+        let ack = sc(&mut app, "windows.resize", json!({"id": "mixer", "w": 10.0, "h": 10.0}));
+        let r = ack["window"]["rect"].as_array().unwrap().clone();
+        assert_eq!((r[2].as_f64().unwrap(), r[3].as_f64().unwrap()), (120.0, 80.0), "min clamp");
+        let ack = sc(&mut app, "windows.resize", json!({"id": "mixer", "w": 99999.0, "h": 99999.0}));
+        let r = ack["window"]["rect"].as_array().unwrap().clone();
+        assert_eq!((r[2].as_f64().unwrap(), r[3].as_f64().unwrap()), (1440.0, 853.0), "viewport clamp");
+        let ack = sc(&mut app, "windows.dock", json!({"id": "mixer", "edge": "left", "rank": 0}));
+        assert_eq!(ack["window"]["docked"], true);
+        assert_eq!(ack["window"]["edge"], 0);
+        assert_eq!(ack["window"]["rank"], 0);
+    }
+
+    // ── R7/R8: dock ranks + undock round-trip ─────────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_dock_rank() {
+        let mut app = headless_app("v108rk");
+        // Stock: rack left/0. Pull monitor onto left rank 0 — rack shifts.
+        let ack = sc(&mut app, "windows.dock", json!({"id": "monitor", "edge": "left", "rank": 0}));
+        assert_eq!(ack["window"]["rank"], 0);
+        let l = wins(&mut app);
+        assert_eq!(find(&l, "rack")["rank"], 1, "existing occupant re-packed after the insert");
+        assert_eq!(find(&l, "rack")["edge"], 0);
+        // Tail insert (no rank) goes after every group; ranks stay contiguous.
+        let ack = sc(&mut app, "windows.dock", json!({"id": "mixer", "edge": "left"}));
+        assert_eq!(ack["window"]["rank"], 2);
+        // Over-large rank clamps to the tail deterministically.
+        let ack = sc(&mut app, "windows.dock", json!({"id": "binds", "edge": 0, "rank": 999}));
+        assert_eq!(ack["window"]["rank"], 3);
+        let ranks: Vec<i64> = wins(&mut app)
+            .iter()
+            .filter(|w| w["edge"] == 0)
+            .map(|w| w["rank"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ranks.len(), 4);
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3], "edge ranks are contiguous 0..n");
+    }
+
+    #[test]
+    fn v108_mcp_windows_undock_roundtrip() {
+        let mut app = headless_app("v108ud");
+        let ack = sc(&mut app, "windows.undock", json!({"id": "rack"}));
+        assert_eq!(ack["window"]["docked"], false);
+        let rect0 = ack["window"]["rect"].clone();
+        assert!(rect0.is_array(), "float carries geometry: {ack}");
+        // Idempotence: already-floating echoes unchanged, no error.
+        let ack2 = sc(&mut app, "windows.undock", json!({"id": "rack"}));
+        assert_eq!(ack2["window"]["docked"], false);
+        assert_eq!(ack2["window"]["rect"], rect0);
+        // Optional position lands (and clamps).
+        let ack = sc(&mut app, "windows.dock", json!({"id": "rack", "edge": "right"}));
+        assert_eq!(ack["window"]["docked"], true);
+        let ack = sc(&mut app, "windows.undock", json!({"id": "rack", "x": 500.0, "y": 120.0}));
+        let r = ack["window"]["rect"].as_array().unwrap().clone();
+        assert_eq!((r[0].as_f64(), r[1].as_f64()), (Some(500.0), Some(120.0)));
+        assert!(app.status.contains("floated"));
+    }
+
+    // ── R9: layout save/restore + restart reproduction ────────────────────
+
+    #[test]
+    fn v108_mcp_windows_layout_save_restore() {
+        let mut app = headless_app("v108lay");
+        let ctx = egui::Context::default();
+        // A non-trivial arrangement: drums floated at an exact spot/size,
+        // rack docked bottom/0, mixer floated.
+        sc(&mut app, "windows.open", json!({"id": "drums"}));
+        tick(&mut app, &ctx);
+        sc(&mut app, "windows.move", json!({"id": "drums", "x": 100.0, "y": 90.0}));
+        sc(&mut app, "windows.resize", json!({"id": "drums", "w": 200.0, "h": 150.0}));
+        sc(&mut app, "windows.dock", json!({"id": "rack", "edge": "bottom", "rank": 0}));
+        sc(&mut app, "windows.undock", json!({"id": "mixer"}));
+        let saved = sc(&mut app, "windows.layout.save", json!({"name": "odd"}));
+        assert_eq!(saved["layout"], "odd");
+        assert_eq!(saved["layouts"].as_array().unwrap().len(), 1);
+        // Wreck it: rack back left, mixer docked, drums moved.
+        sc(&mut app, "windows.dock", json!({"id": "rack", "edge": "left"}));
+        sc(&mut app, "windows.dock", json!({"id": "mixer", "edge": "right"}));
+        sc(&mut app, "windows.move", json!({"id": "drums", "x": 600.0, "y": 400.0}));
+        // Restore: the arrangement comes back EXACTLY as observed.
+        let rest = sc(&mut app, "windows.layout.restore", json!({"name": "odd"}));
+        let l = rest["windows"].as_array().unwrap().clone();
+        assert_eq!(find(&l, "rack")["edge"], 2);
+        assert_eq!(find(&l, "rack")["rank"], 0);
+        assert_eq!(find(&l, "rack")["docked"], true);
+        assert_eq!(find(&l, "mixer")["docked"], false);
+        assert_eq!(find(&l, "drums")["float_rect"], json!([100.0, 90.0, 200.0, 150.0]));
+        // Unknown name self-documents the saved set.
+        let (kind, msg) = err(&mut app, "windows.layout.restore", json!({"name": "ghost"}));
+        assert_eq!(kind, "not_found");
+        assert!(msg.contains("odd"), "{msg}");
+    }
+
+    #[test]
+    fn v108_mcp_windows_layout_restart() {
+        let mut app = headless_app("v108rs");
+        let ctx = egui::Context::default();
+        sc(&mut app, "windows.open", json!({"id": "drums"}));
+        tick(&mut app, &ctx);
+        sc(&mut app, "windows.move", json!({"id": "drums", "x": 140.0, "y": 80.0}));
+        sc(&mut app, "windows.resize", json!({"id": "drums", "w": 260.0, "h": 180.0}));
+        sc(&mut app, "windows.dock", json!({"id": "monitor", "edge": "left", "rank": 0}));
+        sc(&mut app, "windows.layout.save", json!({"name": "rest"}));
+        drop(app);
+        // Simulated restart: same config dir, a brand-new App.
+        let mut app2 = App::new(crate::audio::Backend::start());
+        assert!(
+            app2.win_layouts.iter().any(|l| l.name == "rest"),
+            "named template survives restart: {:?}",
+            app2.win_layouts.iter().map(|l| &l.name).collect::<Vec<_>>()
+        );
+        let rest = sc(&mut app2, "windows.layout.restore", json!({"name": "rest"}));
+        let l = rest["windows"].as_array().unwrap().clone();
+        assert_eq!(find(&l, "monitor")["edge"], 0, "dock edge reproduced");
+        assert_eq!(find(&l, "monitor")["rank"], 0, "dock rank reproduced");
+        assert_eq!(app2.show_drums, true, "open flags reproduced");
+        let ctx2 = egui::Context::default();
+        tick(&mut app2, &ctx2);
+        let l = wins(&mut app2);
+        assert_eq!(
+            find(&l, "drums")["float_rect"],
+            json!([140.0, 80.0, 260.0, 180.0]),
+            "float geometry reproduced after drawing"
+        );
+    }
+
+    // ── R10: native editor boundary ───────────────────────────────────────
+
+    #[test]
+    fn v108_mcp_windows_editor_boundary() {
+        let mut app = headless_app("v108ed");
+        // No live editors: list carries the (empty) editors array.
+        let s = sc(&mut app, "windows.list", json!({}));
+        assert_eq!(s["editors"].as_array().unwrap().len(), 0);
+        // Geometry tools refuse editor ids with the documented boundary…
+        for tool in ["windows.move", "windows.resize", "windows.dock", "windows.undock"] {
+            let args = if tool == "windows.move" {
+                json!({"id": "vst:0", "x": 1.0, "y": 1.0})
+            } else if tool == "windows.resize" {
+                json!({"id": "vst:0", "w": 1.0, "h": 1.0})
+            } else if tool == "windows.dock" {
+                json!({"id": "vst:0", "edge": "left"})
+            } else {
+                json!({"id": "vstfx:1:2"})
+            };
+            let (kind, msg) = err(&mut app, tool, args);
+            assert_eq!(kind, "wrong_kind", "{tool}: {msg}");
+            assert!(msg.contains("WM-managed") || msg.contains("editor"), "{tool}: {msg}");
+        }
+        // …open refuses to SPAWN one…
+        let (kind, msg) = err(&mut app, "windows.open", json!({"id": "vst:0"}));
+        assert_eq!(kind, "wrong_kind", "{msg}");
+        // …and close is the supported lifecycle half: a clean not_found
+        // while nothing is live (the seam goes through the shared GUI
+        // toggle-close protocol — the same code path as the X button).
+        let (kind, msg) = err(&mut app, "windows.close", json!({"id": "vst:0"}));
+        assert_eq!(kind, "not_found", "{msg}");
+        let (kind, _) = err(&mut app, "windows.close", json!({"id": "vstfx:1:2"}));
+        assert_eq!(kind, "not_found");
+    }
+
+    // ── R12: the read-only latch covers this family ───────────────────────
+
+    #[test]
+    fn v108_mcp_windows_read_latch() {
+        let mut app = headless_app("v108latch");
+        app.mcp_read_only = true;
+        let r = resp(&mut app, "windows.open", json!({"id": "drums"}));
+        assert_eq!(r["error"]["code"], -32003, "writes refused: {r}");
+        assert!(!app.show_drums, "refusal is total — nothing changed");
+        let l = wins(&mut app);
+        assert_eq!(l.len(), 4, "the read tool still works");
+    }
+
+    // ── R11: a REAL client over a REAL socket (slow tier) ─────────────────
+
+    #[test]
+    #[ignore = "slow-tier: real socket"]
+    fn v108_mcp_windows_socket_e2e() {
+        // v107 pump model: the worker parks on the oneshot after queueing,
+        // so we sleep, run the frame-loop role (drain + one drawn frame),
+        // then read the response. Deterministic, bounded, port 0.
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join("slooper-mcp-v108sock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var(crate::paths::DATA_DIR_ENV, &dir);
+        let mut app = headless_app("v108sock");
+        let ctx = egui::Context::default();
+        app.mcp_port = 0;
+        app.mcp_enabled = true;
+        app.mcp.as_mut().unwrap().set_wait(std::time::Duration::from_millis(800));
+        app.mcp_frame(&ctx);
+        let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
+
+        let mut call = |body: &str| -> (u16, Option<String>) {
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\
+                 \r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(req.as_bytes()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            {
+                let mut srv = app.mcp.take().unwrap();
+                srv.drain(&mut app);
+                app.mcp = Some(srv);
+            }
+            tick(&mut app, &ctx); // the frame loop also DRAWS between calls
+            let mut raw = Vec::new();
+            sock.read_to_end(&mut raw).unwrap();
+            let split = raw.iter().position(|b| *b == b'\n').unwrap_or(0);
+            let status: u16 = String::from_utf8_lossy(&raw[..split])
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let body = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| String::from_utf8_lossy(&raw[p + 4..]).into_owned());
+            (status, body)
+        };
+
+        // The family is discoverable over the wire.
+        let (st, body) = call(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+        );
+        assert_eq!(st, 200);
+        let names: Vec<String> = serde_json::from_str::<Value>(body.as_ref().unwrap())
+            .unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for w in [
+            "windows.list",
+            "windows.open",
+            "windows.close",
+            "windows.move",
+            "windows.resize",
+            "windows.dock",
+            "windows.undock",
+            "windows.layout.save",
+            "windows.layout.restore",
+        ] {
+            assert!(names.iter().any(|n| n == w), "{w} missing over the wire");
+        }
+
+        // Full round-trip, every ack carrying POST-change geometry.
+        let mut tcall = |name: &str, args: Value| -> Value {
+            let (st, body) = call(
+                &json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+                        "params":{"name":name,"arguments":args}})
+                    .to_string(),
+            );
+            assert_eq!(st, 200, "{name} over the wire");
+            serde_json::from_str::<Value>(body.as_ref().unwrap()).unwrap()["result"]
+                ["structuredContent"]
+                .clone()
+        };
+        let ack = tcall("windows.open", json!({"id": "drums"}));
+        assert_eq!(ack["window"]["open"], true);
+        let ack = tcall("windows.list", json!({}));
+        let l = ack["windows"].as_array().unwrap().clone();
+        assert_eq!(find(&l, "drums")["open"], true, "observed by a later read");
+        let ack = tcall("windows.undock", json!({"id": "rack"}));
+        assert_eq!(ack["window"]["docked"], false);
+        let ack = tcall("windows.move", json!({"id": "rack", "x": 300.0, "y": 200.0}));
+        assert_eq!(
+            ack["window"]["rect"].as_array().unwrap()[0].as_f64().unwrap().round(),
+            300.0
+        );
+        let ack = tcall("windows.dock", json!({"id": "rack", "edge": "left", "rank": 0}));
+        assert_eq!((ack["window"]["docked"].as_bool(), ack["window"]["edge"].as_i64()), (Some(true), Some(0)));
+        let ack = tcall("windows.layout.save", json!({"name": "sock"}));
+        assert_eq!(ack["layout"], "sock");
+        let ack = tcall("windows.close", json!({"id": "drums"}));
+        assert_eq!(ack["window"]["open"], false);
+
+        drop(app); // McpServer::Drop closes the listener + endpoint file
+        std::env::remove_var(crate::paths::DATA_DIR_ENV);
+    }
 }
