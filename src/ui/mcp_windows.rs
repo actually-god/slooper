@@ -1295,6 +1295,91 @@ mod tests {
         assert_eq!(kind, "not_found");
     }
 
+    // ── R2/R4: every kind's key round-trips; opens land their app field ───
+
+    #[test]
+    fn v108_mcp_windows_registry_keys_roundtrip() {
+        // The complete key vocabulary of the registry (v107 D4 ids):
+        for key in [
+            "params",
+            "params:synth:1",
+            "params:chain:2:0",
+            "drums",
+            "master",
+            "roll",
+            "auto",
+            "chain:3",
+            "synth:2",
+            "synths:1",
+            "fx:1:0",
+            "vst:0",
+            "vstfx:1:2",
+        ] {
+            assert!(DynKind::from_key(key).is_some(), "registry key {key:?} unparseable");
+        }
+        // Track-indexed kinds REQUIRE their index (no silent track 0).
+        assert_eq!(DynKind::from_key("chain"), None);
+        assert_eq!(DynKind::from_key("chain:x"), None);
+        // Simultaneous windows get DISTINCT ids resolving to their own
+        // slots. The sandbox's DEFAULT open windows (show_master=true per
+        // Config::default) are part of the honest baseline.
+        let mut app = headless_app("v108keys");
+        sc(&mut app, "windows.open", json!({"id": "chain:0"}));
+        sc(&mut app, "windows.open", json!({"id": "synth:1"}));
+        sc(&mut app, "windows.open", json!({"id": "drums"}));
+        let ctx = egui::Context::default();
+        tick(&mut app, &ctx);
+        let l = wins(&mut app);
+        let mut dyn_ids: Vec<&str> = l
+            .iter()
+            .filter(|w| w["kind"] == "dynamic")
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        dyn_ids.sort_unstable();
+        assert_eq!(dyn_ids, ["chain:0", "drums", "master"]);
+        // An open that cannot DRAW (empty-track synth editor self-parks —
+        // the v35 guard) never registers: the roster shows windows that
+        // actually exist, never phantom entries.
+        assert!(!dyn_ids.contains(&"synth:1"), "non-drawable window registered anyway");
+        for id in dyn_ids {
+            let idx = win_slot(&app, id).unwrap_or_else(|| panic!("{id} must resolve"));
+            assert_eq!(win_id(&app, idx), id, "id round-trips through win_slot");
+        }
+    }
+
+    #[test]
+    fn v108_mcp_windows_open_dyn_fields() {
+        let mut app = headless_app("v108dyn");
+        // Every dynamic kind maps 1:1 onto the field the mouse writes.
+        sc(&mut app, "windows.open", json!({"id": "chain:2"}));
+        assert_eq!(app.fx_window, Some(2));
+        sc(&mut app, "windows.open", json!({"id": "synth:1"}));
+        assert_eq!(app.synth_win, Some(1));
+        sc(&mut app, "windows.open", json!({"id": "synths:0"}));
+        assert_eq!(app.synth_pick, Some(0));
+        sc(&mut app, "windows.open", json!({"id": "drums"}));
+        assert!(app.show_drums);
+        // master is default-open (Config::default show_master=true): the
+        // MCP open is an idempotent no-op that still acks.
+        let ack = sc(&mut app, "windows.open", json!({"id": "master"}));
+        assert_eq!(ack["window"]["open"], true, "reopen default-open window");
+        assert!(app.show_master);
+        // Roll and automation open through the GUI seam fns (fresh pattern
+        // / fresh curve — the toolbar-button contract, not a parallel path).
+        sc(&mut app, "windows.open", json!({"id": "roll"}));
+        assert!(app.piano_roll.is_some(), "roll seam opened a fresh pattern");
+        let ack = sc(&mut app, "windows.open", json!({"id": "auto"}));
+        assert!(app.auto_edit.is_some(), "auto seam opened a fresh curve");
+        assert_eq!((ack["window"]["id"].as_str(), ack["window"]["open"].as_bool()), (Some("auto"), Some(true)));
+        // Bad asset references are typed, never panics.
+        let (kind, msg) = err(&mut app, "windows.open", json!({"id": "auto", "asset": 99999}));
+        assert_eq!(kind, "not_found", "{msg}");
+        if !app.assets.is_empty() {
+            let (kind, msg) = err(&mut app, "windows.open", json!({"id": "roll", "asset": 99998}));
+            assert_eq!(kind, "not_found", "{msg}");
+        }
+    }
+
     // ── R12: the read-only latch covers this family ───────────────────────
 
     #[test]
