@@ -52,6 +52,12 @@ use crate::quantize::{self, snap_start};
 use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::synth;
 
+/// v111/MCP-03: the `windows.*` tool family. A child module so the tools
+/// share the roster's private state (App fields, win_* fns) with the mouse
+/// paths — one state, one authority (docs/MCP-DESIGN.md D3). Registration
+/// lands on the mcp tool table through the ONE line in tools::install_all.
+pub(crate) mod mcp_windows;
+
 /// Keys a user may plausibly bind to a shortcut.
 /// v108: Home/End joined this list — SHORTCUT_DEFAULTS has bound them since
 /// v35 (the go-to pair, documented as rebindable), but their absence here
@@ -1428,6 +1434,11 @@ pub struct App {
     /// RefCell so `save_config(&self)` keeps its signature (163 call sites).
     pub(crate) mcp_cfg_pending:
         std::cell::RefCell<Vec<crate::config::McpPending>>,
+    /// v111/MCP-03: viewport mirror (x, y, w, h) refreshed every frame in
+    /// `mcp_frame` — MCP tool handlers receive only `&mut App`, so the
+    /// geometry clamps (move/resize) read the last known viewport here.
+    /// The default matches the headless frame harness (1440×853).
+    vp_rect: [f32; 4],
     /// W8b (Windows): Settings switch — plugin editors open as embed
     /// children inside the main window. Always inert on Linux
     /// (`embed_hwnd` never becomes Some there).
@@ -2341,6 +2352,7 @@ impl App {
             mcp_token_shown: false,
             mcp: Some(crate::mcp::McpServer::new()),
             mcp_tools: crate::mcp::tools::table(),
+            vp_rect: [0.0, 0.0, 1440.0, 853.0],
             win_embed: cfg.win_editor_embed,
             // W9: restore the WinMM selection from the config; the picker
             // re-ticks itself from these on first paint.
@@ -6195,6 +6207,10 @@ impl App {
     /// else). Called from `App::logic` and, for headless pins, from
     /// `logic_tick_mcp` — one code path, no drift.
     pub(crate) fn mcp_frame(&mut self, ctx: &egui::Context) {
+        // v111/MCP-03: refresh the viewport mirror FIRST — tools run below in the
+        // drain and clamp move/resize against it (they never see `ctx`).
+        let vp = ctx.input(|i| i.viewport_rect());
+        self.vp_rect = [vp.min.x, vp.min.y, vp.width(), vp.height()];
         if let Some(srv) = self.mcp.as_mut() {
             if let Some(msg) = srv.sync(self.mcp_enabled, self.mcp_port, ctx) {
                 self.status = msg;
@@ -15839,18 +15855,40 @@ impl App {
     /// second effEditOpen against the same live instance structurally
     /// impossible); clicking with no live window opens it.
     fn toggle_synth_gui(&mut self, t: usize) {
-        if self.vst_editors.get(&t).is_some_and(|w| !w.is_closed()) {
-            // v20: close in place; the reaper harvests the patch (if the
-            // user changed any) once the editor thread retires the window.
-            if let Some(w) = self.vst_editors.get_mut(&t) {
-                w.close();
-            }
-            self.status = format!("track {}: plugin window closed", t + 1);
+        if self.close_live_synth_editor(t).is_some() {
             return;
         }
         // Drop any dead handle before opening the replacement.
         self.vst_editors.remove(&t);
         self.auto_open_synth_gui(t);
+    }
+
+    /// v111/MCP-03 (v59 doctrine: the toggle's close half and
+    /// `windows.close` share ONE seam): retire a LIVE host-side editor
+    /// window IN PLACE — the reaper harvests its state chunk. None = no
+    /// live window at that slot (dead handle or absent).
+    fn close_live_synth_editor(&mut self, t: usize) -> Option<String> {
+        let w = self.vst_editors.get_mut(&t)?;
+        if w.is_closed() {
+            return None;
+        }
+        let ident = w.identity().to_string();
+        w.close();
+        self.status = format!("track {}: plugin window closed", t + 1);
+        Some(ident)
+    }
+
+    /// v111/MCP-03: chain-row counterpart of [`App::close_live_synth_editor`].
+    fn close_live_fx_vst_editor(&mut self, t: usize, row: usize) -> Option<String> {
+        let w = self.fx_vst_editors.get_mut(&(t, row))?;
+        if w.is_closed() {
+            return None;
+        }
+        // v85: a close echoes with the window's identity, not a bare row.
+        let ident = w.identity().to_string();
+        w.close();
+        self.status = format!("{ident}: plugin window closed");
+        Some(ident)
     }
 
     /// Chain-slot counterpart: click a plugin row and the plugin's own GUI
@@ -15859,15 +15897,8 @@ impl App {
         // v20: toggle-close stays IN the map (vst_editors' rule) so the
         // reaper can harvest the shadow's state chunk after teardown.
         if self.fx_vst_editors.contains_key(&(t, row)) {
-            if let Some(w) = self.fx_vst_editors.get_mut(&(t, row)) {
-                if !w.is_closed() {
-                    // v85: synth-family parity — a close must echo, and it
-                    // echoes with the window's identity, not a bare row.
-                    let ident = w.identity().to_string();
-                    w.close();
-                    self.status = format!("{ident}: plugin window closed");
-                    return;
-                }
+            if self.close_live_fx_vst_editor(t, row).is_some() {
+                return;
             }
             self.fx_vst_editors.remove(&(t, row)); // dead handle
         }
@@ -20721,6 +20752,109 @@ fn win_title(app: &App, idx: usize) -> String {
         3 => "MIXER".into(),
         _ => app.dyn_wins[idx - 4].title.clone(),
     }
+}
+
+/// v111/MCP-03 (docs/MCP-DESIGN.md D4): stable machine ids for the four
+/// PRIMARY windows — decoupled from the display titles `win_title` renders,
+/// so a rename can never break an agent's address. Roster slot == idx.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PrimKind {
+    Rack,
+    Binds,
+    Monitor,
+    Mixer,
+}
+impl PrimKind {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            PrimKind::Rack => "rack",
+            PrimKind::Binds => "binds",
+            PrimKind::Monitor => "monitor",
+            PrimKind::Mixer => "mixer",
+        }
+    }
+    pub(crate) fn from_key(s: &str) -> Option<PrimKind> {
+        match s {
+            "rack" => Some(PrimKind::Rack),
+            "binds" => Some(PrimKind::Binds),
+            "monitor" => Some(PrimKind::Monitor),
+            "mixer" => Some(PrimKind::Mixer),
+            _ => None,
+        }
+    }
+    pub(crate) fn from_idx(i: usize) -> PrimKind {
+        match i {
+            0 => PrimKind::Rack,
+            1 => PrimKind::Binds,
+            2 => PrimKind::Monitor,
+            _ => PrimKind::Mixer,
+        }
+    }
+    pub(crate) fn idx(self) -> usize {
+        match self {
+            PrimKind::Rack => 0,
+            PrimKind::Binds => 1,
+            PrimKind::Monitor => 2,
+            PrimKind::Mixer => 3,
+        }
+    }
+}
+
+/// v111/MCP-03: the stable id of a roster slot. Primaries key by
+/// [`PrimKind`]; dynamic windows key by `DynKind::key()` — with ONE
+/// extension (design D4 ⚠ note): the PARAMETERS window's kind stays the
+/// unit `Params` (config schema untouched, `from_key("params")` keeps
+/// parsing for back-compat), but its *id* carries the live [`GuiTarget`]
+/// (`params:synth:<t>` / `params:chain:<t>:<r>`) so plugin windows never
+/// collide on a key that their title had to disambiguate before.
+pub(crate) fn win_id(app: &App, idx: usize) -> String {
+    if idx < 4 {
+        return PrimKind::from_idx(idx).key().to_string();
+    }
+    let w = match app.dyn_wins.get(idx - 4) {
+        Some(w) => w,
+        None => return String::new(),
+    };
+    match w.kind {
+        DynKind::Params => match app.params_win {
+            Some(GuiTarget::Synth(t)) => format!("params:synth:{t}"),
+            Some(GuiTarget::Chain(t, r)) => format!("params:chain:{t}:{r}"),
+            None => "params".into(),
+        },
+        k => k.key(),
+    }
+}
+
+/// v111/MCP-03: resolve a stable id to a REGISTERED roster slot. Accepts
+/// PrimKind keys, every DynKind key, and the extended params ids —
+/// `DynKind::from_key` head-matches `params`, so `params` and
+/// `params:synth:<t>`/`params:chain:<t>:<r>` all land on the Params slot.
+/// The target part of an extended id is validated by the tools against the
+/// live window, not here. Kinds that never opened this session have no
+/// slot (their id resolves only through `windows.open`).
+pub(crate) fn win_slot(app: &App, id: &str) -> Option<usize> {
+    if let Some(p) = PrimKind::from_key(id) {
+        return Some(p.idx());
+    }
+    let kind = DynKind::from_key(id)?;
+    app.dyn_wins.iter().position(|w| w.kind == kind).map(|n| 4 + n)
+}
+
+/// v111/MCP-03: the live valid ids for an unknown-id refusal
+/// (self-documenting errors, design D4).
+pub(crate) fn win_id_hints(app: &App) -> String {
+    let mut v: Vec<String> = (0..win_count(app)).map(|i| win_id(app, i)).collect();
+    for (t, w) in app.vst_editors.iter() {
+        if !w.is_closed() {
+            v.push(format!("vst:{t}"));
+        }
+    }
+    for ((t, r), w) in app.fx_vst_editors.iter() {
+        if !w.is_closed() {
+            v.push(format!("vstfx:{t}:{r}"));
+        }
+    }
+    v.join(" ")
 }
 fn is_docked(app: &App, idx: usize) -> bool {
     if idx < 4 {
@@ -56240,7 +56374,13 @@ mod tests {
             ("fn vst_rescan(", &["self.status = ", "scanning"]),
             ("fn poll_vst_opens(", &["self.status = ", "loader gone"]),
             ("fn poll_editor_probes(", &["self.status = ", "crash guard"]),
-            ("fn vst_row_gui(", &["self.status = ", "plugin window closed"]),
+            // v111/MCP-03: the close-echo seam moved from vst_row_gui into the
+            // shared close_live_synth_editor (GUI row button AND the MCP
+            // windows.close tool both run through it — one echo home).
+            (
+                "fn close_live_synth_editor(",
+                &["self.status = ", "plugin window closed"],
+            ),
         ];
         for (anchor, needles) in SEAMS {
             assert_eq!(
@@ -58728,8 +58868,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v110\""),
-            "INTERNAL_VERSION must be bumped to v110"
+            librs.contains("INTERNAL_VERSION: &str = \"v111\""),
+            "INTERNAL_VERSION must be bumped to v111"
         );
     }
 
