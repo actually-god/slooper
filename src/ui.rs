@@ -53,7 +53,12 @@ use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::synth;
 
 /// Keys a user may plausibly bind to a shortcut.
-const KEY_CANDIDATES: [egui::Key; 51] = [
+/// v108: Home/End joined this list — SHORTCUT_DEFAULTS has bound them since
+/// v35 (the go-to pair, documented as rebindable), but their absence here
+/// meant `key_from_name` dropped them on EVERY load: a config carried
+/// Home/End bindings silently lost them at the next restart (exposed by the
+/// v108 settings round-trip pin). Delete stays out deliberately (see below).
+const KEY_CANDIDATES: [egui::Key; 53] = [
     egui::Key::Num0,
     egui::Key::Num1,
     egui::Key::Num2,
@@ -109,6 +114,8 @@ const KEY_CANDIDATES: [egui::Key; 51] = [
     egui::Key::F10,
     egui::Key::F11,
     egui::Key::F12,
+    egui::Key::Home,
+    egui::Key::End,
 ];
 
 /// One row in the MIDI monitor log.
@@ -643,7 +650,7 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = {
 
 /// Grid subdivisions, shared by the metronome click, the quantize grid and
 /// the clip snap grid: (steps per beat, display name).
-const SUBDIVISIONS: [(u32, &str); 6] = [
+pub(crate) const SUBDIVISIONS: [(u32, &str); 6] = [
     (1, "quarter note"),
     (2, "eighth note"),
     (3, "triplet"),
@@ -651,6 +658,14 @@ const SUBDIVISIONS: [(u32, &str); 6] = [
     (6, "triplet eighths"),
     (8, "thirty-second note"),
 ];
+
+/// v108/MCP-02: steps-per-beat → SUBDIVISIONS index (inverse of the
+/// `SUBDIVISIONS[i].0` translation save_config does). domain_check has
+/// already refused steps values outside the table; the unwrap_or keeps the
+/// seam total even if called directly.
+pub(crate) fn sub_idx(steps: u32) -> usize {
+    SUBDIVISIONS.iter().position(|s| s.0 == steps).unwrap_or(0)
+}
 
 /// Min/max columns for one asset's waveform thumbnail (cached per asset
 /// index + column count; `peak` normalizes quiet takes to full height).
@@ -1406,6 +1421,13 @@ pub struct App {
     /// Snapshot of the global tool table (MCP-02..05 register through
     /// `mcp::tools::install_all`; dispatch only ever sees THIS copy).
     pub(crate) mcp_tools: Vec<crate::mcp::ToolDef>,
+    /// v108/MCP-02: pending settings.set writes for RESTART-tier fields
+    /// (persisted now, applied by `Config::load` on next start). `save_config`
+    /// re-applies them (dropping any the user has since edited in the GUI),
+    /// and NOTHING in the running app reads them — see `crate::mcp_settings`.
+    /// RefCell so `save_config(&self)` keeps its signature (163 call sites).
+    pub(crate) mcp_cfg_pending:
+        std::cell::RefCell<Vec<crate::config::McpPending>>,
     /// W8b (Windows): Settings switch — plugin editors open as embed
     /// children inside the main window. Always inert on Linux
     /// (`embed_hwnd` never becomes Some there).
@@ -2315,6 +2337,7 @@ impl App {
             mcp_port: cfg.mcp_port,
             mcp_port_edit: cfg.mcp_port.to_string(),
             mcp_read_only: cfg.mcp_read_only,
+            mcp_cfg_pending: std::cell::RefCell::new(Vec::new()),
             mcp_token_shown: false,
             mcp: Some(crate::mcp::McpServer::new()),
             mcp_tools: crate::mcp::tools::table(),
@@ -6162,10 +6185,12 @@ impl App {
         self.mcp = Some(srv);
     }
 
-    /// Persist every user-facing setting (bindings, mixer, grid, rack,
-    /// ports, effects chains) to disk.
-    fn save_config(&self) {
-        let cfg = Config {
+    /// The LIVE state of every persisted setting as a [`Config`] — the
+    /// single capture point shared by `save_config` (persist) and the
+    /// MCP settings surface (read + validate), so the exposed surface can
+    /// never drift from what the GUI writes (v61 shared-entry doctrine).
+    pub(crate) fn config_snapshot(&self) -> Config {
+        Config {
             n_tracks: self.n_tracks,
             show_rack: self.show_rack,
             show_mixer: self.show_mixer,
@@ -6348,7 +6373,42 @@ impl App {
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
             track_bend_ranges: self.track_bend_range.clone(),
-        };
+        }
+    }
+
+    /// Persist every user-facing setting (bindings, mixer, grid, rack,
+    /// ports, effects chains) to disk. pub(crate): the MCP settings tools
+    /// persist through this exact path (one save point, one overlay).
+    pub(crate) fn save_config(&self) {
+        let mut cfg = self.config_snapshot();
+        // v108/MCP-02: re-apply pending RESTART-tier writes (settings.set
+        // on a field that only takes effect on restart — see
+        // `crate::mcp_settings`). An entry survives only while the fresh
+        // LIVE snapshot still shows the value it had at MCP-set time: a
+        // GUI edit of that field since then drops the entry (the user
+        // owns it) — so the overlay can never clobber a newer edit.
+        {
+            let mut pending = self.mcp_cfg_pending.borrow_mut();
+            if !pending.is_empty() {
+                let mut tree = serde_json::to_value(&cfg).expect("Config serializes");
+                pending.retain(|p| {
+                    let live_is_old = tree
+                        .get(&p.name)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                        == p.prev;
+                    if live_is_old {
+                        tree[&p.name] = p.new.clone();
+                    }
+                    live_is_old
+                });
+                if !pending.is_empty() {
+                    if let Ok(merged) = serde_json::from_value(tree) {
+                        cfg = merged;
+                    }
+                }
+            }
+        }
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
         }
@@ -6357,6 +6417,230 @@ impl App {
         // can never drift from the persisted bindings — no matter which
         // UI path (learn, project load, reset, unbind) made the change.
         self.push_bound_snapshot();
+    }
+
+    /// v108/MCP-02: apply ONE live-tier setting from a freshly validated
+    /// `Config` through exactly the seams a GUI edit runs — the setters,
+    /// engine atomics, clamps and table-pads of `App::new`/Settings, never
+    /// a parallel write path (design D3/D5: same setter seams the GUI
+    /// uses). `settings.set` has already rejected unknown values
+    /// (serde + domain); a name outside `mcp_settings::LIVE` is a bug,
+    /// reported as an error, never applied. RESTART-tier fields never
+    /// reach this function (they persist via `mcp_cfg_pending`).
+    pub(crate) fn mcp_apply_setting(&mut self, name: &str, cfg: &Config) -> Result<(), String> {
+        match name {
+            "shortcuts" => {
+                // Same fill as App::new (migrate, trust exact-length
+                // tables, defaults-fill the rest).
+                let migrated = crate::midi::migrate_shortcuts(
+                    &cfg.shortcuts
+                        .iter()
+                        .map(|s| s.as_deref().and_then(key_from_name))
+                        .collect::<Vec<_>>(),
+                );
+                let trusted = cfg.shortcuts.len() == N_ACTIONS;
+                self.short_keys = core::array::from_fn(|i| {
+                    match migrated.get(i).copied().flatten() {
+                        Some(k) => Some(k),
+                        None if trusted => None,
+                        None => SHORTCUT_DEFAULTS[i],
+                    }
+                });
+            }
+            "midi" => {
+                let mut binds = [None; N_ACTIONS];
+                for b in &cfg.midi {
+                    let i = MidiAction::idx(b.action);
+                    if i < N_ACTIONS {
+                        if let Some(bd) = b.bind {
+                            binds[i] = Some(bd);
+                        }
+                    }
+                }
+                self.midi_binds = binds;
+            }
+            "midi_axis" => {
+                let mut cal: Vec<Option<MidiAxisCal>> = vec![None; N_ACTIONS];
+                for c in &cfg.midi_axis {
+                    if let Some(s) = cal.get_mut(usize::from(c.slot)) {
+                        *s = Some(*c);
+                    }
+                }
+                self.knob_cal = cal;
+            }
+            "gui_scale" => self.gui_scale = cfg.gui_scale.clamp(0.7, 1.6),
+            "latency_ms" => self.latency_ms = cfg.latency_ms.to_string(),
+            "trk_vol" => {
+                for i in 0..MAX_LOOPS {
+                    let v = cfg.trk_vol.get(i).copied().unwrap_or(VOL_UNITY_MIDI);
+                    self.set_trk_vol(i, v);
+                }
+            }
+            "trk_gain" => {
+                for i in 0..MAX_LOOPS {
+                    let v = cfg.trk_gain.get(i).copied().unwrap_or(GAIN_UNITY_MIDI);
+                    self.set_trk_gain(i, v);
+                }
+            }
+            "trk_pan" => {
+                for i in 0..MAX_LOOPS {
+                    let v = cfg.trk_pan.get(i).copied().unwrap_or(64);
+                    self.set_trk_pan(i, v);
+                }
+            }
+            "trk_color" => {
+                for t in 0..MAX_LOOPS {
+                    let c = cfg.trk_color.get(t).copied().flatten();
+                    self.set_trk_color(t, c);
+                }
+            }
+            "trk_h" => {
+                self.trk_height =
+                    (0..MAX_LOOPS).map(|i| cfg.trk_h.get(i).copied().unwrap_or(0.0)).collect();
+            }
+            "metro_bpm" => self.metro_bpm = cfg.metro_bpm.to_string(),
+            "metro_num" => self.metro_num = cfg.metro_num.clamp(1, 16).to_string(),
+            "metro_sub" => self.metro_sub = sub_idx(cfg.metro_sub),
+            "q_sub" => self.q_sub = sub_idx(cfg.q_sub),
+            "snap_sub" => self.snap_sub = sub_idx(cfg.snap_sub),
+            "auto_snap_sub" => self.auto_snap_sub = sub_idx(cfg.auto_snap_sub),
+            "auto_quantize" => self.auto_quantize = cfg.auto_quantize,
+            "loop_tl" => self.loop_tl = cfg.loop_tl,
+            "loop_mode" => self.loop_mode = cfg.loop_mode,
+            "loop_area_start" => self.loop_area.0 = cfg.loop_area_start,
+            "loop_area_end" => self.loop_area.1 = cfg.loop_area_end,
+            "master_vol" => {
+                // The real MIDI-knob path (VolMaster binding): mirrors the
+                // GUI handler's bookkeeping so the levels mirror and AREC
+                // automation see it exactly like a user move.
+                self.master_midi = cfg.master_vol;
+                self.master_dirty = true;
+                self.levels_dirty = true;
+                self.note_auto(0, crate::automation::TARGET_MASTER_VOL, vol_amp(cfg.master_vol));
+            }
+            "monitor_on" => self.monitor_enabled = cfg.monitor_on,
+            "midi_live" => {
+                self.midi_live = cfg.midi_live;
+                self.backend.engine.set_midi_live(cfg.midi_live);
+            }
+            "preview_on" => self.preview_enabled = cfg.preview_on,
+            "preview_secs" => self.preview_secs = cfg.preview_secs.max(0.0).to_string(),
+            "preview_tracks" => {
+                self.preview_tracks = preview_set_from_cfg(cfg);
+                self.preview_tracks.retain(|&t| t < self.n_tracks);
+            }
+            "snap_on" => self.snap_on = cfg.snap_on,
+            "auto_snap_on" => self.auto_snap_on = cfg.auto_snap_on,
+            "roll_vel_step" => self.roll_vel_step = cfg.roll_vel_step,
+            "project_dir" => self.project_dir = cfg.project_dir.clone(),
+            "dir_memo" => self.dir_memo = cfg.dir_memo.clone(),
+            "rack_collapsed" => {
+                self.rack_collapsed = cfg.rack_collapsed.iter().cloned().collect();
+            }
+            "rack_dir_order" => self.rack_dir_order = cfg.rack_dir_order.clone(),
+            "record_target" => self.record_target = cfg.record_target.clone(),
+            "rack_group_by_dir" => self.rack_group_by_dir = cfg.rack_group_by_dir,
+            // One table, three persisted columns — any of them rebuilds all
+            // three exactly like App::new.
+            "rec_src" | "rec_prev" | "rec_loop" => {
+                self.rec_src = (0..MAX_LOOPS)
+                    .map(|t| {
+                        let a = cfg.rec_src.get(t).copied().unwrap_or([true, false, false]);
+                        RecSrc {
+                            audio: a[0],
+                            preview: cfg.rec_prev.get(t).copied().unwrap_or(false),
+                            loop_rec: cfg.rec_loop.get(t).copied().unwrap_or(false),
+                            midi: a[1],
+                            auto: a[2],
+                        }
+                    })
+                    .collect();
+            }
+            "value_binds" => self.value_binds = cfg.value_binds.clone(),
+            "drum" => {
+                if let Some(d) = &cfg.drum {
+                    self.drum = DrumMachine::from_save(d);
+                }
+            }
+            "show_drums" => self.show_drums = cfg.show_drums,
+            "show_master" => self.show_master = cfg.show_master,
+            "sc_send" => {
+                for t in 0..MAX_LOOPS {
+                    let m = cfg.sc_send.get(t).copied().unwrap_or(0);
+                    self.sc_send[t] = m;
+                    self.backend.engine.set_sc_send(t, m);
+                }
+            }
+            "sc_recv_gain" => {
+                // Rebuild the v97/v99 tables + engine atomics exactly as
+                // App::new seeds them (self-pair entries = sender gain/pan).
+                for i in 0..MAX_LOOPS * MAX_LOOPS {
+                    self.sc_recv_gain[i] = 1.0;
+                }
+                for s in 0..MAX_LOOPS {
+                    self.sc_out_gain[s] = 1.0;
+                    self.sc_out_pan[s] = 0.5;
+                    self.backend.engine.set_sc_send_gain(s, 1.0);
+                    self.backend.engine.set_sc_send_pan(s, 0.5);
+                }
+                for r in &cfg.sc_recv_gain {
+                    let (t, s) = (r.t as usize, r.s as usize);
+                    if t == s && t < MAX_LOOPS {
+                        let g = r.gain.max(0.0);
+                        let p = (r.pan.clamp(-1.0, 1.0) * 0.5 + 0.5).clamp(0.0, 1.0);
+                        self.sc_out_gain[s] = g;
+                        self.sc_out_pan[s] = p;
+                        self.backend.engine.set_sc_send_gain(s, g);
+                        self.backend.engine.set_sc_send_pan(s, p);
+                    } else if t < MAX_LOOPS && s < MAX_LOOPS {
+                        let g = r.gain.max(0.0);
+                        self.sc_recv_gain[t * MAX_LOOPS + s] = g;
+                        self.backend.engine.set_sc_recv_gain(t, s, g);
+                    }
+                }
+            }
+            "editor_probe" => self.editor_probe = cfg.editor_probe.clone(),
+            "track_bend_ranges" => {
+                self.track_bend_range = (0..MAX_LOOPS)
+                    .map(|t| {
+                        cfg.track_bend_ranges.get(t).copied().unwrap_or(
+                            crate::vsthost::DEFAULT_BEND_RANGE,
+                        )
+                    })
+                    .collect();
+            }
+            "n_tracks" => {
+                self.n_tracks = cfg.n_tracks.clamp(1, 16);
+                // The documented Settings seam (v94): selection/preview
+                // sets re-seat to the new count.
+                self.clamp_track_sel();
+            }
+            "show_rack" => self.show_rack = cfg.show_rack,
+            "show_mixer" => self.show_mixer = cfg.show_mixer,
+            "mixer_follow_tracks" => self.mixer_follow_tracks = cfg.mixer_follow_tracks,
+            "show_midi" => self.show_midi = cfg.show_midi,
+            "show_binds" => self.show_binds = cfg.show_binds,
+            "theme" => self.light_theme = cfg.theme == "light",
+            "mpe" => self.mpe_on = cfg.mpe,
+            "win_editor_embed" => self.win_embed = cfg.win_editor_embed,
+            "mcp_enabled" => self.mcp_enabled = cfg.mcp_enabled,
+            "mcp_port" => {
+                self.mcp_port = cfg.mcp_port;
+                self.mcp_port_edit = cfg.mcp_port.to_string();
+            }
+            "mcp_read_only" => self.mcp_read_only = cfg.mcp_read_only,
+            other => return Err(format!("no live apply for {other} (classification bug)")),
+        }
+        Ok(())
+    }
+
+    /// v108 test seam: change the RESTART-tier backend mirror the way the
+    /// Settings backend picker does, proving save_config's pending overlay
+    /// yields to user edits. Test-only; zero production surface.
+    #[cfg(test)]
+    pub(crate) fn test_edit_win_backend(&mut self, v: &str) {
+        self.win_backend = v.to_string();
+        self.save_config();
     }
 
     // ---- DAW actions -----------------------------------------------------
@@ -58401,8 +58685,11 @@ mod tests {
         // route through the plain helper: drum(1) + fire(3) + load(1) +
         // the click seam's own plain branch(1).
         assert_eq!(active(".select_track_plain("), 6);
-        // Settings shrink calls the clamp.
-        assert_eq!(active(".clamp_track_sel("), 1);
+        // Settings shrink AND the MCP settings.set n_tracks live arm call
+        // the clamp (v108: settings.set routes through the same seams —
+        // needle re-targeted 1->2; a THIRD site outside these two is still
+        // a bypassing write and goes red).
+        assert_eq!(active(".clamp_track_sel("), 2);
         // Raw writes to `.selected =` ONLY inside the seams: plain(1) +
         // click ctrl-add(1) + ctrl-remove fallback(1) + shift re-seat(1) +
         // clamp(1) + settings clamp line(1).
@@ -58415,13 +58702,13 @@ mod tests {
         assert_eq!(active(".rec_group_join(&"), 2);
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
-        // Internal version rides the series (v91 single-home law; v107 MCP-01
+        // Internal version rides the series (v91 single-home law; v108 MCP-02
         // bumped it — retargeted here so the law holds, not the old number).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v107\""),
-            "INTERNAL_VERSION must be bumped to v107"
+            librs.contains("INTERNAL_VERSION: &str = \"v108\""),
+            "INTERNAL_VERSION must be bumped to v108"
         );
     }
 

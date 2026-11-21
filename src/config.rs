@@ -834,6 +834,21 @@ pub struct Config {
     pub mcp_read_only: bool,
 }
 
+/// v108/MCP-02: one pending RESTART-tier settings write made through the
+/// MCP `settings.set` tool — `new` is persisted to config.json now, but the
+/// RUNNING app keeps `prev` until a restart (a half-applied port/backend/
+/// domain-table change is exactly the "do not half-apply" failure). The
+/// entry lives in `App::mcp_cfg_pending` only for this session: once the
+/// file is saved with `new` in it, the next `Config::load` delivers it as
+/// live state. `prev` is the clobber guard: `save_config` re-applies `new`
+/// only while the live snapshot still equals `prev`.
+#[derive(Clone, Debug)]
+pub struct McpPending {
+    pub name: String,
+    pub new: serde_json::Value,
+    pub prev: serde_json::Value,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
