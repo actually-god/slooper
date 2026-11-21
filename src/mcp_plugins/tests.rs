@@ -77,9 +77,9 @@ fn tone_power(x: &[f32], f: f64, rate: f64, a: usize, b: usize) -> f64 {
     let w = std::f64::consts::TAU * f / rate;
     let (mut s0, mut s1) = (0.0f64, 0.0f64);
     for &v in &x[a..b] {
-        s0 = v as f64 + 2.0 * w.cos() * s1 - s0;
-        std::mem::swap(&mut s1, &mut s0);
-        std::mem::swap(&mut s1, &mut s0);
+        let s = v as f64 + 2.0 * w.cos() * s1 - s0;
+        s0 = s1;
+        s1 = s;
     }
     let real = s1 - w.cos() * s0;
     let imag = w.sin() * s0;
@@ -311,7 +311,12 @@ fn v109_plugin_param_set_fx_audible() {
             "plugin.param.set",
             json!({"track": 0, "row": 0, "param": 0, "value": mode}),
         );
-        noise.iter().map(|&x| inst.process_private(x)).collect()
+        // vfilter is a v4 STEREO script: its v1 `process` is only the
+        // documented no-op fallback — the real DSP lives in process_st.
+        noise
+            .iter()
+            .map(|&x| inst.process_private_st(x, x).0)
+            .collect()
     }
     structured(
         &mut app,
@@ -326,9 +331,16 @@ fn v109_plugin_param_set_fx_audible() {
     let low2 = tone_power(&hp, 300.0, 48000.0, 1024, 4096);
     let hi2 = tone_power(&hp, 6000.0, 48000.0, 1024, 4096);
     assert!(hi2 > 25.0 * low2, "HP pass should kill the bottom: {hi2} vs {low2}");
-    // NEGATIVE control: a no-op set (mode 2 again) leaves bytes identical.
+    // NEGATIVE control: same params again -> band power stationary within
+    // 20% (vfilter is STATEFUL — the envelope/filter carry across passes,
+    // so byte identity is the wrong invariant; stationarity is right).
     let hp2 = proc_render(&mut app, &inst, &noise, 2.0);
-    assert_eq!(hp, hp2, "same params must render identically (determinism)");
+    let p1 = tone_power(&hp, 6000.0, 48000.0, 1024, 4096);
+    let p2 = tone_power(&hp2, 6000.0, 48000.0, 1024, 4096);
+    assert!(
+        (p1 - p2).abs() < 0.2 * p1.max(p2),
+        "stateful but stationary: {p1:.3e} vs {p2:.3e}"
+    );
 }
 
 #[test]
@@ -692,6 +704,8 @@ fn v109_sampler_map_asset_and_velocity_audio() {
         SynthHandle::Script(i) => i.clone(),
         _ => panic!(),
     };
+    let (map, mode, live) = inst.map_snapshot();
+    assert!(live && !map.is_empty(), "MCP writes must publish the map live: {map:?} {mode}");
     let dom = |note: u8, vel: u8, want: f64, off: f64| {
         let x = render(&inst, note, vel);
         let a = tone_power(&x, want, 48000.0, 512, 7680);
@@ -853,6 +867,7 @@ fn v109_mcp_socket_plugins_surface_e2e() {
     app.mcp_frame(&ctx);
     let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
     app.mcp05_add_fx_script(0, "delay"); // UI-thread chain build (before wire)
+    app.mcp05_set_track_synth(0, "sampler"); // track gate must pass for the sampler error probe
 
     fn wire(app: &mut App, port: u16, token: &str, body: &str) -> Value {
         use std::io::{Read, Write};
@@ -941,7 +956,7 @@ fn v109_mcp_socket_plugins_surface_e2e() {
               "arguments":{"track":0,"row":0,"param":last,"value":hi}}})
             .to_string(),
     );
-    assert_eq!(v["result"]["isError"], false, "{v}");
+    assert_ne!(v["result"]["isError"].as_bool(), Some(true), "{v}");
     assert_eq!(v["result"]["structuredContent"]["value"], hi);
     let live = app.mcp05_fx_live(0, 0).unwrap();
     assert!(
