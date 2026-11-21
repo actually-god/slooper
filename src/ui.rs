@@ -14657,6 +14657,267 @@ impl App {
             self.kit(t).len()
         );
     }
+
+    // ── v109/MCP-05: pub(crate) seams for crate::mcp_plugins ─────────────
+    // Thin delegations ONLY: the MCP tool layer reaches plugin state
+    // exclusively through these, so every table invariant (drum_resolve,
+    // push_sampler_map, fx_save_pending, update_piano_roll_asset →
+    // push_project, save_config) stays owned by the code above. No new
+    // semantics live in this block.
+
+    pub(crate) fn mcp05_n_tracks(&self) -> usize {
+        self.n_tracks
+    }
+    /// (path, is-MIDI-pattern, is-automation) of an asset-table id.
+    pub(crate) fn mcp05_asset_entry(&self, id: usize) -> Option<(PathBuf, bool, bool)> {
+        let a = self.assets.get(id)?;
+        Some((a.path.clone(), a.pattern.is_some(), a.automation.is_some()))
+    }
+    pub(crate) fn mcp05_asset_index(&self, path: &str) -> Option<usize> {
+        self.assets.iter().position(|a| a.path.to_string_lossy() == path)
+    }
+    pub(crate) fn mcp05_asset_stems(&self) -> Vec<String> {
+        self.assets.iter().map(|a| a.name.clone()).collect()
+    }
+    pub(crate) fn mcp05_track_synth_stem(&self, t: usize) -> Option<String> {
+        self.track_synth.get(t).cloned().flatten()
+    }
+    pub(crate) fn mcp05_synth_handle(&self, t: usize) -> Option<std::sync::Arc<SynthHandle>> {
+        self.track_synth_inst.get(t).cloned().flatten()
+    }
+    pub(crate) fn mcp05_synth_desc(&self, stem: &str) -> Option<synth::SynthDesc> {
+        self.synth_registry.desc(stem).cloned()
+    }
+    pub(crate) fn mcp05_fx_desc(&self, stem: &str) -> Option<fx::EffectDesc> {
+        self.fx_registry.desc(stem).cloned()
+    }
+    pub(crate) fn mcp05_fx_registry_stems(&self) -> Vec<String> {
+        self.fx_registry.stems()
+    }
+    pub(crate) fn mcp05_synth_registry_stems(&self) -> Vec<String> {
+        self.synth_registry.stems()
+    }
+    /// (stem-or-plugin-name, params, bypass, is_hosted) of one chain row.
+    pub(crate) fn mcp05_fx_row(&self, t: usize, r: usize) -> Option<(String, Vec<f32>, bool, bool)> {
+        match self.fx_rows.get(t)?.get(r)? {
+            ChainRow::Script { stem, params, bypass } => {
+                Some((stem.clone(), params.clone(), *bypass, false))
+            }
+            ChainRow::Vst { name, params, bypass, .. } => {
+                Some((name.clone(), params.clone(), *bypass, true))
+            }
+        }
+    }
+    pub(crate) fn mcp05_fx_chain_len(&self, t: usize) -> usize {
+        self.fx_rows.get(t).map(|v| v.len()).unwrap_or(0)
+    }
+    pub(crate) fn mcp05_fx_live(&self, t: usize, r: usize) -> Option<std::sync::Arc<fx::Instance>> {
+        self.fx_live.get(t)?.get(r).cloned().flatten()
+    }
+    /// The GUI's own value-apply seam (rows + live instance + persist),
+    /// addressed exactly like a value-bind target.
+    pub(crate) fn mcp05_fx_set_param(&mut self, t: usize, r: usize, k: usize, v: f32) -> bool {
+        self.apply_target_value(t, &format!("fx:{r}:{k}"), v)
+    }
+    pub(crate) fn mcp05_synth_set_param(&mut self, t: usize, k: usize, v: f32) -> bool {
+        self.apply_target_value(t, &format!("synth:{k}"), v)
+    }
+    /// Apply preset pairs to a live chain slot through the fxgui loader's
+    /// semantics (shared `fx::apply_preset_pairs` — one loader, v59).
+    pub(crate) fn mcp05_fx_apply_preset(
+        &mut self,
+        t: usize,
+        r: usize,
+        pairs: &[(String, f64)],
+    ) -> Result<usize, String> {
+        let inst = self
+            .fx_live
+            .get(t)
+            .and_then(|v| v.get(r))
+            .cloned()
+            .flatten()
+            .ok_or_else(|| "chain slot has no live instance".to_string())?;
+        let desc = match self.fx_rows.get(t).and_then(|v| v.get(r)) {
+            Some(ChainRow::Script { stem, .. }) => self.fx_registry.desc(stem).cloned(),
+            Some(_) => return Err("chain slot is a hosted plugin".into()),
+            None => return Err("chain slot does not exist".into()),
+        }
+        .ok_or_else(|| "effect script is not installed".to_string())?;
+        let applied = fx::apply_preset_pairs(&inst, &desc, pairs).len();
+        if let Some(ChainRow::Script { params, .. }) = self.fx_rows.get_mut(t).and_then(|v| v.get_mut(r)) {
+            *params = (0..desc.params.len()).map(|k| inst.param(k)).collect();
+        }
+        self.fx_save_pending = true;
+        self.save_config();
+        Ok(applied)
+    }
+    pub(crate) fn mcp05_fx_dir(&self) -> PathBuf {
+        self.fx_registry.dir().to_path_buf()
+    }
+    pub(crate) fn mcp05_is_sampler_track(&self, t: usize) -> bool {
+        self.track_synth
+            .get(t)
+            .cloned()
+            .flatten()
+            .and_then(|stem| {
+                self.synth_registry
+                    .desc(&stem)
+                    .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            })
+            .unwrap_or(false)
+    }
+    pub(crate) fn mcp05_sampler_map(&self, t: usize) -> Option<crate::config::SamplerMapSave> {
+        self.sampler_maps.get(t).cloned().flatten()
+    }
+    /// The v51 publish seam: table + live map + persistence, one call.
+    pub(crate) fn mcp05_sampler_map_commit(&mut self, t: usize, map: crate::config::SamplerMapSave) {
+        self.sampler_maps[t] = Some(map);
+        self.push_sampler_map(t);
+        self.save_config();
+    }
+    /// (pad save record, resolved rack id) per pad.
+    pub(crate) fn mcp05_kit(&self, t: usize) -> Vec<(crate::config::DrumPadSave, Option<usize>)> {
+        self.kit(t).iter().map(|p| (pad_to_save(p), p.asset)).collect()
+    }
+    pub(crate) fn mcp05_pad_set(
+        &mut self,
+        t: usize,
+        pad: usize,
+        name: Option<&str>,
+        asset_path: Option<&str>,
+        vel: Option<u8>,
+        muted: Option<bool>,
+    ) -> bool {
+        let k = self.kit_mut(t);
+        let Some(p) = k.get_mut(pad) else {
+            return false;
+        };
+        if let Some(n) = name {
+            p.name = n.to_string();
+        }
+        if let Some(ap) = asset_path {
+            p.asset_path = ap.to_string();
+        }
+        if let Some(v) = vel {
+            p.vel = v;
+        }
+        if let Some(m) = muted {
+            p.muted = m;
+        }
+        self.drum_resolve();
+        self.save_config();
+        true
+    }
+    pub(crate) fn mcp05_pattern(&self, id: usize) -> Option<crate::midipat::Pattern> {
+        self.assets.get(id)?.pattern.as_ref().map(|p| (**p).clone())
+    }
+    /// The roll's own in-place commit (sort, save .mid, table swap,
+    /// push_project → SetMidiAssets).
+    pub(crate) fn mcp05_pattern_commit(&mut self, id: usize, mut pat: crate::midipat::Pattern) {
+        self.update_piano_roll_asset(&mut pat, id as u32);
+    }
+    pub(crate) fn mcp05_synth_preset_list(&self, stem: &str) -> Vec<String> {
+        Self::list_synth_presets(stem)
+    }
+    pub(crate) fn mcp05_synth_preset_save(&mut self, t: usize, raw: &str) {
+        self.synth_preset_name = raw.to_string();
+        self.synth_preset_save(t);
+    }
+    pub(crate) fn mcp05_synth_preset_load(&mut self, t: usize, name: &str) {
+        self.synth_preset_apply(t, name);
+    }
+    pub(crate) fn mcp05_synth_preset_dir(&self, stem: &str) -> PathBuf {
+        Self::synth_preset_dir(stem)
+    }
+    pub(crate) fn mcp05_sampler_preset_list() -> Vec<String> {
+        Self::sampler_preset_list()
+    }
+    pub(crate) fn mcp05_sampler_preset_save(&mut self, t: usize, raw: &str) {
+        self.smap_preset_name = raw.to_string();
+        self.sampler_preset_save(t);
+    }
+    pub(crate) fn mcp05_sampler_preset_load(&mut self, t: usize, name: &str) {
+        self.sampler_preset_load(t, name);
+    }
+    pub(crate) fn mcp05_sampler_preset_dir() -> PathBuf {
+        Self::sampler_preset_dir()
+    }
+    pub(crate) fn mcp05_kit_preset_list() -> Vec<String> {
+        Self::list_kit_presets()
+    }
+    pub(crate) fn mcp05_kit_preset_save(&mut self, t: usize, raw: &str) {
+        self.kit_preset_name = raw.to_string();
+        self.kit_preset_save(t);
+    }
+    pub(crate) fn mcp05_kit_preset_load(&mut self, t: usize, name: &str) {
+        self.kit_preset_apply(t, name);
+    }
+    pub(crate) fn mcp05_kit_preset_dir() -> PathBuf {
+        Self::kit_preset_dir()
+    }
+    /// Test seam: the GUI's own script-FX chain-add (pins drive the real
+    /// row+live-instance construction, never a hand-built table).
+    #[cfg(test)]
+    pub(crate) fn mcp05_add_fx_script(&mut self, t: usize, stem: &str) {
+        self.add_fx_script(t, stem);
+    }
+    /// Test seam: bind a synth stem through the GUI's bind path.
+    #[cfg(test)]
+    pub(crate) fn mcp05_set_track_synth(&mut self, t: usize, stem: &str) {
+        self.set_track_synth_stem(t, stem);
+    }
+    /// Test rig: set the app's audio rate (pins drive sampler/instance
+    /// paths that gate on a live rate).
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_set_sr(&mut self, sr: u32) {
+        self.sample_rate = sr;
+    }
+    /// Test rig: push a (silent) audio asset into the rack; returns its id.
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_add_audio_asset(&mut self, name: &str, path: PathBuf) -> usize {
+        self.assets.push(crate::assets::Asset::audio(
+            self.assets.len() as u32,
+            name.into(),
+            path,
+            std::sync::Arc::from(vec![0.0f32; 8]),
+            false,
+        ));
+        self.assets.len() - 1
+    }
+    /// Test rig: push a MIDI pattern asset (the roll's in-place seam saves
+    /// the `.mid` back to `path`); returns its id.
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_add_pattern_asset(&mut self, name: &str, path: PathBuf) -> usize {
+        self.assets.push(crate::assets::Asset {
+            id: self.assets.len() as u32,
+            name: name.into(),
+            path,
+            data: std::sync::Arc::from(vec![0.0f32; 0]),
+            dirty: false,
+            pattern: Some(std::sync::Arc::new(crate::midipat::Pattern::new(120))),
+            automation: None,
+        });
+        self.assets.len() - 1
+    }
+    /// Test rig: push a HOSTED chain row (entry None — live side stays
+    /// empty) so pins prove the native-tools wrong_kind gate against the
+    /// real Vst row shape.
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_add_fx_vst_row(&mut self, t: usize, name: &str) {
+        self.fx_rows[t].push(ChainRow::Vst {
+            path: "ghost.vst3".into(),
+            kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
+            name: name.into(),
+            params: vec![0.5, 0.5],
+            entry: None,
+            open_rx: None,
+            state: None,
+            program: None,
+            bypass: false,
+        });
+        self.rebuild_fx(t);
+    }
     /// v69 (S1): the ONE pad-sound assignment path: an audio file enters
     /// the rack (`ensure_asset` dedups) and becomes pad `p`'s sound.
     /// Shared by the per-pad "wav" import button and the central OS-drop
