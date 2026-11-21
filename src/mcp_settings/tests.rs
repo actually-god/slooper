@@ -140,9 +140,13 @@ fn v108_settings_set_live_roundtrip() {
     // string enum -> theme mirror (visuals follow next frame)
     structured(&mut app, "settings.set", json!({"name": "theme", "value": "light"}));
     assert_eq!(get_value(&mut app, "theme"), json!("light"));
-    // array seam: per-track table through the shared padded fill
+    // Array seam: the SHORT live list pads to the full padded table — the
+    // readback is the LIVE state (132-entry table), not the submitted echo.
     structured(&mut app, "settings.set", json!({"name": "trk_vol", "value": [64, 32]}));
-    assert_eq!(get_value(&mut app, "trk_vol"), json!([64, 32]));
+    let vol = get_value(&mut app, "trk_vol");
+    let vol = vol.as_array().unwrap();
+    assert_eq!((&vol[0], &vol[1]), (&json!(64), &json!(32)));
+    assert!(vol[2..].iter().all(|v| *v == json!(crate::ui::VOL_UNITY_MIDI)), "rest padded");
     // clamped numeric + selection-invariant seam (n_tracks runs clamp_track_sel)
     structured(&mut app, "settings.set", json!({"name": "n_tracks", "value": 8}));
     assert_eq!(get_value(&mut app, "n_tracks"), json!(8));
@@ -152,19 +156,33 @@ fn v108_settings_set_live_roundtrip() {
 #[test]
 fn v108_settings_shortcuts_live_fill() {
     let mut app = headless_app("v108sc");
-    // Short (non-trusted) list: index 0 lands, the rest defaults-fill —
-    // exactly the startup fill. An unparseable name must NOT reach the
-    // table (it is dropped -> default returns, proving key_from_name ran).
-    structured(
-        &mut app,
-        "settings.set",
-        json!({"name": "shortcuts", "value": ["Space", "ZogZogNotAKey"]}),
-    );
-    let sc = get_value(&mut app, "shortcuts");
-    let sc = sc.as_array().unwrap();
-    assert_eq!(sc[0], json!("Space"), "parsed shortcut applied live");
-    assert_ne!(sc[1], json!("ZogZogNotAKey"), "garbage name dropped to the default");
-    assert_eq!(sc.len(), crate::ui::N_ACTIONS, "table padded to N_ACTIONS");
+    // migrate_shortcuts only TRUSTS full-width tables (partial widths are
+    // legacy remaps or defaults) — so the MCP contract is read-modify-write
+    // of the full table. Read the current one, modify three slots:
+    let cur = get_value(&mut app, "shortcuts");
+    let mut table: Vec<Value> = cur.as_array().unwrap().clone();
+    assert_eq!(table.len(), crate::ui::N_ACTIONS, "snapshot is full width");
+    // The v35 go-to pair — the v108 product-bug fix: Home/End were bound in
+    // the defaults but key_from_name dropped them on every load. They must
+    // survive an MCP round trip now.
+    let home_i = table.iter().position(|v| *v == json!("Home")).expect("default Home bind");
+    let end_i = table.iter().position(|v| *v == json!("End")).expect("default End bind");
+    table[0] = json!("Q"); // real rename
+    table[1] = json!(null); // explicit unbind
+    table[3] = json!("ZogZogNotAKey"); // unparseable -> unbound (trusted table)
+    structured(&mut app, "settings.set", json!({"name": "shortcuts", "value": table}));
+    let got = get_value(&mut app, "shortcuts");
+    let got = got.as_array().unwrap();
+    assert_eq!(got[0], json!("Q"), "parsed shortcut applied live");
+    assert_eq!(got[1], json!(null), "explicit unbind honored");
+    assert_eq!(got[3], json!(null), "unparseable name unbinds (trusted table)");
+    assert_eq!(got[home_i], json!("Home"), "Home survives the round trip (bug fix)");
+    assert_eq!(got[end_i], json!("End"), "End survives the round trip (bug fix)");
+    // And a persisted file carrying Home/End reaches a fresh Config load.
+    assert!(cfg_text().contains("\"Home\"") && cfg_text().contains("\"End\""), "persisted");
+    let cfg = Config::load();
+    let names: Vec<Option<&str>> = cfg.shortcuts.iter().map(|s| s.as_deref()).collect();
+    assert!(names.iter().any(|n| *n == Some("Home")), "restart read keeps Home");
 }
 
 // ── R3 gold: the live apply path is OBSERVABLY real — the MCP server
