@@ -410,7 +410,7 @@ fn mixer_set(app: &mut App, args: &Value) -> ToolResult {
             let t = want_track(app, args)?;
             let m = sc_mask(app, t, value)?;
             app.set_sc_send_mask(t, m);
-            app.status = format!("MCP: track {} sidechain send \u{2192} {:#?}", t + 1, sc_dests(m));
+            app.status = format!("MCP: track {} sidechain send -> {:?}", t + 1, sc_dests(m));
             json!({"control": control, "track": t, "row": mixer_row(app, t)})
         }
         other => {
