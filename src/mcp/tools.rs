@@ -96,7 +96,7 @@ fn build() -> Vec<ToolDef> {
     let mut v: Vec<ToolDef> = Vec::new();
     register_core(&mut v);
     // ── extension seam (one line per card, keep the order) ──────────────
-    // crate::mcp_settings::register(&mut v);   // MCP-02 (settings.*)
+    crate::mcp_settings::register(&mut v); // MCP-02 (settings.*)
     // crate::mcp_windows::register(&mut v);    // MCP-03 (windows.*)
     // crate::mcp_mixer::register(&mut v);      // MCP-04 (mixer.* chain.* assets.*)
     // crate::mcp_plugins::register(&mut v);    // MCP-05 (plugins.* sampler.* drum.*)
