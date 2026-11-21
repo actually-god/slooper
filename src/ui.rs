@@ -52,7 +52,7 @@ use crate::quantize::{self, snap_start};
 use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::synth;
 
-/// v108/MCP-03: the `windows.*` tool family. A child module so the tools
+/// v111/MCP-03: the `windows.*` tool family. A child module so the tools
 /// share the roster's private state (App fields, win_* fns) with the mouse
 /// paths — one state, one authority (docs/MCP-DESIGN.md D3). Registration
 /// lands on the mcp tool table through the ONE line in tools::install_all.
@@ -6207,7 +6207,7 @@ impl App {
     /// else). Called from `App::logic` and, for headless pins, from
     /// `logic_tick_mcp` — one code path, no drift.
     pub(crate) fn mcp_frame(&mut self, ctx: &egui::Context) {
-        // v108: refresh the viewport mirror FIRST — tools run below in the
+        // v111/MCP-03: refresh the viewport mirror FIRST — tools run below in the
         // drain and clamp move/resize against it (they never see `ctx`).
         let vp = ctx.input(|i| i.viewport_rect());
         self.vp_rect = [vp.min.x, vp.min.y, vp.width(), vp.height()];
@@ -15863,7 +15863,7 @@ impl App {
         self.auto_open_synth_gui(t);
     }
 
-    /// v108/MCP-03 (v59 doctrine: the toggle's close half and
+    /// v111/MCP-03 (v59 doctrine: the toggle's close half and
     /// `windows.close` share ONE seam): retire a LIVE host-side editor
     /// window IN PLACE — the reaper harvests its state chunk. None = no
     /// live window at that slot (dead handle or absent).
@@ -15878,7 +15878,7 @@ impl App {
         Some(ident)
     }
 
-    /// v108: chain-row counterpart of [`App::close_live_synth_editor`].
+    /// v111/MCP-03: chain-row counterpart of [`App::close_live_synth_editor`].
     fn close_live_fx_vst_editor(&mut self, t: usize, row: usize) -> Option<String> {
         let w = self.fx_vst_editors.get_mut(&(t, row))?;
         if w.is_closed() {
@@ -20754,7 +20754,7 @@ fn win_title(app: &App, idx: usize) -> String {
     }
 }
 
-/// v108/MCP-03 (docs/MCP-DESIGN.md D4): stable machine ids for the four
+/// v111/MCP-03 (docs/MCP-DESIGN.md D4): stable machine ids for the four
 /// PRIMARY windows — decoupled from the display titles `win_title` renders,
 /// so a rename can never break an agent's address. Roster slot == idx.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20800,7 +20800,7 @@ impl PrimKind {
     }
 }
 
-/// v108/MCP-03: the stable id of a roster slot. Primaries key by
+/// v111/MCP-03: the stable id of a roster slot. Primaries key by
 /// [`PrimKind`]; dynamic windows key by `DynKind::key()` — with ONE
 /// extension (design D4 ⚠ note): the PARAMETERS window's kind stays the
 /// unit `Params` (config schema untouched, `from_key("params")` keeps
@@ -20825,7 +20825,7 @@ pub(crate) fn win_id(app: &App, idx: usize) -> String {
     }
 }
 
-/// v108/MCP-03: resolve a stable id to a REGISTERED roster slot. Accepts
+/// v111/MCP-03: resolve a stable id to a REGISTERED roster slot. Accepts
 /// PrimKind keys, every DynKind key, and the extended params ids —
 /// `DynKind::from_key` head-matches `params`, so `params` and
 /// `params:synth:<t>`/`params:chain:<t>:<r>` all land on the Params slot.
@@ -20840,7 +20840,7 @@ pub(crate) fn win_slot(app: &App, id: &str) -> Option<usize> {
     app.dyn_wins.iter().position(|w| w.kind == kind).map(|n| 4 + n)
 }
 
-/// v108/MCP-03: the live valid ids for an unknown-id refusal
+/// v111/MCP-03: the live valid ids for an unknown-id refusal
 /// (self-documenting errors, design D4).
 pub(crate) fn win_id_hints(app: &App) -> String {
     let mut v: Vec<String> = (0..win_count(app)).map(|i| win_id(app, i)).collect();
@@ -56374,7 +56374,7 @@ mod tests {
             ("fn vst_rescan(", &["self.status = ", "scanning"]),
             ("fn poll_vst_opens(", &["self.status = ", "loader gone"]),
             ("fn poll_editor_probes(", &["self.status = ", "crash guard"]),
-            // v108: the close-echo seam moved from vst_row_gui into the
+            // v111/MCP-03: the close-echo seam moved from vst_row_gui into the
             // shared close_live_synth_editor (GUI row button AND the MCP
             // windows.close tool both run through it — one echo home).
             (
