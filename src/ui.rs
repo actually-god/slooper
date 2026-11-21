@@ -1406,6 +1406,13 @@ pub struct App {
     /// Snapshot of the global tool table (MCP-02..05 register through
     /// `mcp::tools::install_all`; dispatch only ever sees THIS copy).
     pub(crate) mcp_tools: Vec<crate::mcp::ToolDef>,
+    /// v108/MCP-02: pending settings.set writes for RESTART-tier fields
+    /// (persisted now, applied by `Config::load` on next start). `save_config`
+    /// re-applies them (dropping any the user has since edited in the GUI),
+    /// and NOTHING in the running app reads them — see `crate::mcp_settings`.
+    /// RefCell so `save_config(&self)` keeps its signature (163 call sites).
+    pub(crate) mcp_cfg_pending:
+        std::cell::RefCell<Vec<crate::config::McpPending>>,
     /// W8b (Windows): Settings switch — plugin editors open as embed
     /// children inside the main window. Always inert on Linux
     /// (`embed_hwnd` never becomes Some there).
@@ -2315,6 +2322,7 @@ impl App {
             mcp_port: cfg.mcp_port,
             mcp_port_edit: cfg.mcp_port.to_string(),
             mcp_read_only: cfg.mcp_read_only,
+            mcp_cfg_pending: std::cell::RefCell::new(Vec::new()),
             mcp_token_shown: false,
             mcp: Some(crate::mcp::McpServer::new()),
             mcp_tools: crate::mcp::tools::table(),
@@ -6162,10 +6170,12 @@ impl App {
         self.mcp = Some(srv);
     }
 
-    /// Persist every user-facing setting (bindings, mixer, grid, rack,
-    /// ports, effects chains) to disk.
-    fn save_config(&self) {
-        let cfg = Config {
+    /// The LIVE state of every persisted setting as a [`Config`] — the
+    /// single capture point shared by `save_config` (persist) and the
+    /// MCP settings surface (read + validate), so the exposed surface can
+    /// never drift from what the GUI writes (v61 shared-entry doctrine).
+    pub(crate) fn config_snapshot(&self) -> Config {
+        Config {
             n_tracks: self.n_tracks,
             show_rack: self.show_rack,
             show_mixer: self.show_mixer,
@@ -6348,7 +6358,41 @@ impl App {
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
             track_bend_ranges: self.track_bend_range.clone(),
-        };
+        }
+    }
+
+    /// Persist every user-facing setting (bindings, mixer, grid, rack,
+    /// ports, effects chains) to disk.
+    fn save_config(&self) {
+        let mut cfg = self.config_snapshot();
+        // v108/MCP-02: re-apply pending RESTART-tier writes (settings.set
+        // on a field that only takes effect on restart — see
+        // `crate::mcp_settings`). An entry survives only while the fresh
+        // LIVE snapshot still shows the value it had at MCP-set time: a
+        // GUI edit of that field since then drops the entry (the user
+        // owns it) — so the overlay can never clobber a newer edit.
+        {
+            let mut pending = self.mcp_cfg_pending.borrow_mut();
+            if !pending.is_empty() {
+                let mut tree = serde_json::to_value(&cfg).expect("Config serializes");
+                pending.retain(|p| {
+                    let live_is_old = tree
+                        .get(&p.name)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                        == p.prev;
+                    if live_is_old {
+                        tree[&p.name] = p.new.clone();
+                    }
+                    live_is_old
+                });
+                if !pending.is_empty() {
+                    if let Ok(merged) = serde_json::from_value(tree) {
+                        cfg = merged;
+                    }
+                }
+            }
+        }
         if let Err(e) = cfg.save() {
             eprintln!("[slooper] could not save config: {e}");
         }
