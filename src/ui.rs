@@ -56374,7 +56374,13 @@ mod tests {
             ("fn vst_rescan(", &["self.status = ", "scanning"]),
             ("fn poll_vst_opens(", &["self.status = ", "loader gone"]),
             ("fn poll_editor_probes(", &["self.status = ", "crash guard"]),
-            ("fn vst_row_gui(", &["self.status = ", "plugin window closed"]),
+            // v108: the close-echo seam moved from vst_row_gui into the
+            // shared close_live_synth_editor (GUI row button AND the MCP
+            // windows.close tool both run through it — one echo home).
+            (
+                "fn close_live_synth_editor(",
+                &["self.status = ", "plugin window closed"],
+            ),
         ];
         for (anchor, needles) in SEAMS {
             assert_eq!(
