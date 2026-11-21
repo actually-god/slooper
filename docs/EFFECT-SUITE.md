@@ -1,9 +1,12 @@
 # The native effect suite
 
 slooper ships **23 scripted effects** — plain Rust files in `effects/`,
-seeded into `~/.local/share/slooper/effects` on first launch and re-seeded
-(never overwritten) on every app update. Every one of them is **live**: the
-same code path runs during playback, monitoring, preview bounce and export.
+seeded into `~/.local/share/slooper/effects` on first launch. The app
+re-seeds its own copies in place when they drift from the version it
+ships (the previous copy is kept as `<name>.rs.bak`) — so edits to a
+BUNDLED effect's file do not survive an update: save your variant under a
+different name. Every one of them is **live**: the same code path runs
+during playback, monitoring, preview bounce and export.
 
 This document covers the shared protocol every effect follows, the roster,
 and what "stereo aware" means concretely in slooper.
