@@ -489,6 +489,36 @@ mod tests {
         assert_eq!(a.place_auto(0, Clip::new(2, 999), 1000), 1);
     }
 
+    // ---- v112 (t_e25e805f): occupied must consult EXISTING clips' spans ----
+    // Asset table for these pins: asset 0 is 8000 samples, everything else 1000.
+    fn alen_v112(asset: u32) -> u64 {
+        if asset == 0 {
+            8_000
+        } else {
+            1_000
+        }
+    }
+
+    #[test]
+    fn v112_place_auto_dodge_longer_existing_clip() {
+        // AC1: lane 0 holds asset 0, a clip spanning [0, 8000).
+        let mut a = Arrangement::new();
+        a.insert(5, 0, Clip::new(0, 0));
+        // A 1000-sample take landing deep inside that tail overlaps and
+        // must dodge to a child lane — the module doc's promise.
+        assert_eq!(a.place_auto(5, Clip::new(1, 4_000), 1_000), 1);
+    }
+
+    #[test]
+    fn v112_place_auto_short_existing_allows_longer_incoming() {
+        // AC2/AC4: a short 1000-sample clip occupies [500, 1500).
+        let mut a = Arrangement::new();
+        a.insert(6, 0, Clip::new(1, 500));
+        // A longer incoming take that merely touches its end overlaps nothing
+        // and must keep lane 0 — the old code over-reported.
+        assert_eq!(a.place_auto(6, Clip::new(0, 1_500), 8_000), 0);
+    }
+
     #[test]
     fn lane_removal_keeps_base() {
         let mut a = Arrangement::new();
