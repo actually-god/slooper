@@ -53,7 +53,12 @@ use crate::sample_edit::{Curve as SeCurve, SampleEdit};
 use crate::synth;
 
 /// Keys a user may plausibly bind to a shortcut.
-const KEY_CANDIDATES: [egui::Key; 51] = [
+/// v108: Home/End joined this list — SHORTCUT_DEFAULTS has bound them since
+/// v35 (the go-to pair, documented as rebindable), but their absence here
+/// meant `key_from_name` dropped them on EVERY load: a config carried
+/// Home/End bindings silently lost them at the next restart (exposed by the
+/// v108 settings round-trip pin). Delete stays out deliberately (see below).
+const KEY_CANDIDATES: [egui::Key; 53] = [
     egui::Key::Num0,
     egui::Key::Num1,
     egui::Key::Num2,
@@ -109,6 +114,8 @@ const KEY_CANDIDATES: [egui::Key; 51] = [
     egui::Key::F10,
     egui::Key::F11,
     egui::Key::F12,
+    egui::Key::Home,
+    egui::Key::End,
 ];
 
 /// One row in the MIDI monitor log.
