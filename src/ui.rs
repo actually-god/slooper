@@ -3267,6 +3267,30 @@ impl App {
         self.note_auto(i, crate::automation::TARGET_TRACK_PAN, pan01(v));
     }
 
+    /// v110/MCP-04: master volume from a MIDI-range value — the REAL
+    /// knob-path bookkeeping (mirror + dirty flags + AREC note) that the
+    /// VolMaster binding, the config-apply arm and `mixer.set(master_vol)`
+    /// share, so the MCP surface cannot drift from a user move. (The
+    /// automation-adopt path in `logic` deliberately keeps its own mirror
+    /// write: echoing AREC there would feed automation into itself.)
+    fn set_master_midi(&mut self, v: u8) {
+        self.master_midi = v;
+        self.master_dirty = true;
+        self.levels_dirty = true;
+        self.note_auto(0, crate::automation::TARGET_MASTER_VOL, vol_amp(v));
+    }
+
+    /// v110/MCP-04: the ONE home for a sidechain-send mask write (mirror
+    /// table + engine atomic) — shared by the chain-window toggle chips,
+    /// the settings-apply arm and `mixer.set(sc_send)`. Callers own
+    /// persistence (`fx_save_pending` / `save_config`) like before.
+    fn set_sc_send_mask(&mut self, t: usize, m: u128) {
+        if let Some(s) = self.sc_send.get_mut(t) {
+            *s = m;
+        }
+        self.backend.engine.set_sc_send(t, m);
+    }
+
     /// Rebuild loop `i`'s live effect chain from its window rows and hand it
     /// to the audio engine. Also seeds each row's slider values from the
     /// descriptors (stored values win, clamped to range).
@@ -6509,15 +6533,7 @@ impl App {
             "loop_mode" => self.loop_mode = cfg.loop_mode,
             "loop_area_start" => self.loop_area.0 = cfg.loop_area_start,
             "loop_area_end" => self.loop_area.1 = cfg.loop_area_end,
-            "master_vol" => {
-                // The real MIDI-knob path (VolMaster binding): mirrors the
-                // GUI handler's bookkeeping so the levels mirror and AREC
-                // automation see it exactly like a user move.
-                self.master_midi = cfg.master_vol;
-                self.master_dirty = true;
-                self.levels_dirty = true;
-                self.note_auto(0, crate::automation::TARGET_MASTER_VOL, vol_amp(cfg.master_vol));
-            }
+            "master_vol" => self.set_master_midi(cfg.master_vol),
             "monitor_on" => self.monitor_enabled = cfg.monitor_on,
             "midi_live" => {
                 self.midi_live = cfg.midi_live;
@@ -6567,8 +6583,7 @@ impl App {
             "sc_send" => {
                 for t in 0..MAX_LOOPS {
                     let m = cfg.sc_send.get(t).copied().unwrap_or(0);
-                    self.sc_send[t] = m;
-                    self.backend.engine.set_sc_send(t, m);
+                    self.set_sc_send_mask(t, m);
                 }
             }
             "sc_recv_gain" => {
@@ -29535,8 +29550,7 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             };
             if resp.clicked() && !self_bit {
                 let v = (app.sc_send[loop_i] ^ bit) & !(1u128 << loop_i);
-                app.sc_send[loop_i] = v;
-                app.backend.engine.set_sc_send(loop_i, v);
+                app.set_sc_send_mask(loop_i, v);
                 app.fx_save_pending = true;
             }
             // v97 (sc-4): a routed chip carries a per-send RECEIVE slider —
@@ -31253,6 +31267,12 @@ fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
         }
     }
 }
+// v110/MCP-04: `mixer.*`/`chain.*`/`assets.*` — a ui CHILD module (MCP-03
+// precedent): handlers ride the App's private setter seams directly, so the
+// tool surface cannot drift from the mouse path and ui.rs stays untouched
+// beyond the two shared homes (set_master_midi / set_sc_send_mask).
+pub(crate) mod mcp_mixer;
+
 // v107: headless_app re-export — mcp pins need it, but the ui tests module
 // MUST stay column-0 `mod tests` (a dozen source-scan pins anchor on it).
 #[cfg(test)]
@@ -58703,12 +58723,13 @@ mod tests {
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
         // Internal version rides the series (v91 single-home law; v108 MCP-02
-        // bumped it — retargeted here so the law holds, not the old number).
+        // bumped it — retargeted here so the law holds, not the old number;
+        // v110 MCP-04 bump).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v108\""),
-            "INTERNAL_VERSION must be bumped to v108"
+            librs.contains("INTERNAL_VERSION: &str = \"v110\""),
+            "INTERNAL_VERSION must be bumped to v110"
         );
     }
 

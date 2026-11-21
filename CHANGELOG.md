@@ -8,6 +8,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **MCP mixer, chain and rack control (v110/MCP-04).** Eleven agent
+  tools ride the GUI's own setter seams: `mixer.list/get/set` (track
+  vol/gain/pan/clip-color, sidechain sends and master volume in the same
+  MIDI-range numbers the live mixer uses — no unit fork), `chain.list/
+  pick/remove` (plugin selection with the GUI's async load semantics: the
+  call returns `loading` and readiness shows up in `chain.list`; loading
+  a sample-based plugin onto a track still auto-arms its sampler synth),
+  and `assets.list/import/remove/assign` (rack scan, WAV import, deletes
+  that stay inside the rack, and the drag-and-drop equivalents: pad,
+  sampler, channel and single key-map slot). Every write echoes the
+  post-change state back; the read-only latch blocks all of them.
 - **Note pressure reaches scripted synths (script ABI v3).** The MPE
   per-note aftertouch lane (and every recorded poly-AT event) now rides a
   new `poly_at(ch, note, val)` callback into scripted synths — the v104
