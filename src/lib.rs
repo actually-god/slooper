@@ -31,6 +31,7 @@ pub mod fx;
 pub mod fxgui;
 pub(crate) mod kit;
 pub mod mcp;
+pub mod mcp_plugins;
 pub mod mcp_settings;
 pub mod meter;
 pub mod midi;
