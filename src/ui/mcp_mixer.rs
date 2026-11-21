@@ -702,6 +702,11 @@ fn chain_remove(app: &mut App, args: &Value) -> ToolResult {
 // ── assets.* ──────────────────────────────────────────────────────────────
 
 fn assets_list(app: &mut App, _args: &Value) -> ToolResult {
+    // Fresh scan first (asset.rs: scanning only LISTs candidate files and
+    // is cheap) — an agent must never see a stale folder snapshot.
+    for f in app.rack.iter_mut() {
+        f.rescan();
+    }
     let racks: Vec<Value> = app
         .rack
         .iter()
@@ -931,13 +936,26 @@ fn assets_assign(app: &mut App, args: &Value) -> ToolResult {
                 )));
             }
             app.sampler_set_asset(t, a);
-            app.status = format!("MCP: track {} sampler \u{2190} \u{201c}{asset_name}\u{201d}", t + 1);
+            app.status = format!("MCP: track {} sampler -> \u{201c}{asset_name}\u{201d}", t + 1);
             out["slot0_asset"] = json!(app
                 .sampler_maps
                 .get(t)
                 .and_then(|m| m.as_ref())
                 .and_then(|m| m.slots.first())
                 .map(|s| s.asset.clone()));
+            // The LIVE synth param the seam wrote (source of truth when no
+            // key-map was opened yet — the legacy-single-asset route).
+            out["synth_param0"] = app
+                .track_synth_inst
+                .get(t)
+                .and_then(|h| h.as_ref())
+                .map(|h| match &**h {
+                    crate::audio::SynthHandle::Script(i) => {
+                        json!(i.values().first().copied())
+                    }
+                    crate::audio::SynthHandle::Vst(_) => Value::Null,
+                })
+                .unwrap_or(Value::Null);
         }
         "keymap" => {
             if !is_audio {
@@ -988,7 +1006,7 @@ fn assets_assign(app: &mut App, args: &Value) -> ToolResult {
             }
             app.drum.ensure_rows(app.kit(t).len());
             app.save_config();
-            app.status = format!("MCP: drum kit track {} pad {} \u{2190} \u{201c}{asset_name}\u{201d}", t + 1, p + 1);
+            app.status = format!("MCP: drum kit track {} pad {} -> \u{201c}{asset_name}\u{201d}", t + 1, p + 1);
             out["pad"] = json!(p);
             out["pad_asset_path"] = json!(app.kit(t)[p].asset_path.clone());
         }
