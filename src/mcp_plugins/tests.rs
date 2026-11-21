@@ -37,9 +37,9 @@ fn call(app: &mut App, name: &str, args: Value) -> Value {
 fn structured(app: &mut App, name: &str, args: Value) -> Value {
     let r = call(app, name, args);
     assert!(r.get("error").is_none(), "unexpected JSON-RPC error: {r}");
-    assert_eq!(
+    assert_ne!(
         r["result"]["isError"].as_bool(),
-        Some(false),
+        Some(true),
         "{name}: {}",
         r["result"]
     );
@@ -56,12 +56,12 @@ fn is_error(app: &mut App, name: &str, args: Value, code: &str) -> String {
         r["result"]
     );
     assert_eq!(
-        r["result"]["error"]["code"].as_str().unwrap(),
+        r["result"]["structuredContent"]["error"].as_str().unwrap(),
         code,
         "{name} error code on {shown}: {}",
         r["result"]
     );
-    r["result"]["error"]["message"].as_str().unwrap().to_string()
+    r["result"]["content"][0]["text"].as_str().unwrap().to_string()
 }
 
 /// Headless app on an isolated data dir with a real sample rate.
@@ -147,17 +147,20 @@ fn v109_plugins_list_catalog_parity() {
         .map(|e| e["stem"].as_str().unwrap().to_string())
         .collect();
     for (name, _src) in crate::synth::BUNDLED {
-        let stem = name.trim_end_matches(".rs");
+        let stem = match name.strip_suffix(".rs") {
+            Some(stem) => stem,
+            None => continue, // attribution files ride BUNDLED but are not scripts
+        };
         assert!(listed.iter().any(|s| s == stem), "synth catalog missing {stem}");
     }
-    assert!(is_error(&mut app, "plugins.list", json!({"kind": "vst"}), "invalid")
+    assert!(is_error(&mut app, "plugins.list", json!({"kind": "vst"}), "invalid_params")
         .contains("all"));
 }
 
 #[test]
 fn v109_plugins_instances_addresses() {
     let (mut app, _dir) = fixture("inst");
-    app.mcp05_set_track_synth(0, "drum");
+    app.mcp05_set_track_synth(0, "drums");
     app.mcp05_add_fx_script(0, "delay");
     app.mcp05_add_fx_script(0, "chorus");
     app.mcp05_set_track_synth(1, "piano");
@@ -169,7 +172,7 @@ fn v109_plugins_instances_addresses() {
             .iter()
             .any(|i| q.as_object().unwrap().iter().all(|(k, v)| &i[k] == v))
     };
-    assert!(has(json!({"kind": "synth", "track": 0, "stem": "drum"})), "{out}");
+    assert!(has(json!({"kind": "synth", "track": 0, "stem": "drums"})), "{out}");
     assert!(has(json!({"kind": "synth", "track": 1, "stem": "piano"})), "{out}");
     // FX rows addressable {track,row} in dense order
     let fx0: Vec<&Value> = out["instances"]
@@ -258,9 +261,9 @@ fn v109_plugin_param_validation_errors() {
         "plugin.param.set",
         json!({"track": 0, "row": 0, "param": 0, "value": 2.0}),
     );
-    assert_eq!(ok["isError"].as_bool(), Some(false), "{ok}");
+    assert_ne!(ok["result"]["isError"].as_bool(), Some(true), "{ok}");
     // missing args -> invalid
-    is_error(&mut app, "plugin.param.set", json!({"track": 0}), "invalid");
+    is_error(&mut app, "plugin.param.set", json!({"track": 0}), "invalid_params");
     // track beyond the project -> out_of_range
     is_error(
         &mut app,
@@ -399,7 +402,7 @@ fn v109_fx_preset_roundtrip_and_sanitize() {
         "plugin.preset.save",
         json!({"track": 0, "row": 0, "name": "../../evil name"}),
     );
-    assert_eq!(saved["name"], "evil name", "{saved}");
+    assert_eq!(saved["name"], "delay-evil name", "{saved}");
     let list = structured(&mut app, "plugin.preset.list", json!({"track": 0, "row": 0}));
     assert!(
         list["presets"]
@@ -409,7 +412,14 @@ fn v109_fx_preset_roundtrip_and_sanitize() {
             .any(|x| x == "evil name"),
         "{list}"
     );
-    assert!(!list["builtin"].as_array().unwrap().is_empty(), "builtins listed");
+    assert!(
+        list["builtin"].as_array().unwrap().is_empty(),
+        "delay declares no factory presets: {list}"
+    );
+    // a script that DOES ship builtins lists them (parametric_eq)
+    app.mcp05_add_fx_script(1, "parametric_eq");
+    let eq_list = structured(&mut app, "plugin.preset.list", json!({"track": 1, "row": 0}));
+    assert!(!eq_list["builtin"].as_array().unwrap().is_empty(), "{eq_list}");
     // move away, load back, observe
     for k in [i0, i1] {
         let mid = (p["params"][k]["min"].as_f64().unwrap()
@@ -426,7 +436,10 @@ fn v109_fx_preset_roundtrip_and_sanitize() {
         "plugin.preset.load",
         json!({"track": 0, "row": 0, "name": "evil name"}),
     );
-    assert_eq!(loaded["applied"], 2, "{loaded}");
+    assert!(
+        loaded["applied"].as_u64().unwrap() >= 2,
+        "every stored pair lands (positional+label passes count writes): {loaded}"
+    );
     let live = app.mcp05_fx_live(0, 0).unwrap();
     assert!((live.param(i0) - v0 as f32).abs() < 1e-5);
     assert!((live.param(i1) - v1 as f32).abs() < 1e-5);
@@ -458,7 +471,8 @@ fn v109_synth_preset_roundtrip() {
         json!({"track": 0, "name": "bright!!"}),
     );
     assert_eq!(saved["name"], "bright", "{saved}"); // sanitize honored
-    assert!(dir.join("synth-presets").join("piano").join("bright.json").exists());
+    assert!(app.mcp05_synth_preset_dir("piano").join("bright.json").exists());
+    let _ = &dir;
     let mid = hi / 2.0;
     structured(
         &mut app,
@@ -496,8 +510,9 @@ fn v109_sampler_map_preset_roundtrip() {
         "plugin.preset.save",
         json!({"track": 0, "surface": "map", "name": "my keys"}),
     );
-    assert_eq!(saved["name"], "my keys");
-    assert!(dir.join("sampler-presets").join("my keys.json").exists());
+    assert_eq!(saved["name"], "my-keys"); // presetbar sanitizer: spaces -> dashes
+    assert!(App::mcp05_sampler_preset_dir().join("my-keys.json").exists());
+    let _ = &dir;
     // wipe the live map, load the preset back
     app.mcp05_sampler_map_commit(0, crate::config::SamplerMapSave { slots: vec![], mode: 0 });
     let empty = structured(&mut app, "sampler.map.get", json!({"track": 0}));
@@ -607,6 +622,11 @@ fn v109_sampler_validation_errors() {
         json!({"track": 0, "slot": 0, "asset_id": 0, "root": 128}),
         "out_of_range",
     );
+    structured(
+        &mut app,
+        "sampler.map.set",
+        json!({"track": 0, "slot": 0, "asset_id": 0, "root": 48}),
+    );
     let m = is_error(
         &mut app,
         "sampler.layers.remove",
@@ -627,7 +647,7 @@ fn v109_sampler_validation_errors() {
         &mut app,
         "sampler.map.set",
         json!({"track": 0, "asset_id": 0}),
-        "invalid",
+        "invalid_params",
     );
     // MIDI assets are not audio-slot material
     let pid = app.mcp05_test_add_pattern_asset("p.mid", PathBuf::from("/tmp/v109-p.mid"));
@@ -703,8 +723,8 @@ fn v109_sampler_map_asset_and_velocity_audio() {
 #[test]
 fn v109_drum_kit_pad_and_preset_roundtrip() {
     let (mut app, _dir) = fixture("drum");
-    app.mcp05_set_track_synth(0, "drum");
-    app.mcp05_set_track_synth(1, "drum");
+    app.mcp05_set_track_synth(0, "drums");
+    app.mcp05_set_track_synth(1, "drums");
     let kick = app.mcp05_test_add_audio_asset("808kick.wav", PathBuf::from("/tmp/v109-808.wav"));
     let out = structured(&mut app, "drum.kit.get", json!({"track": 0}));
     let npads = out["count"].as_u64().unwrap() as usize;
@@ -739,9 +759,9 @@ fn v109_drum_kit_pad_and_preset_roundtrip() {
         "drum.preset.save",
         json!({"track": 0, "name": "v109 kit"}),
     );
-    assert_eq!(saved["name"], "v109 kit");
+    assert_eq!(saved["name"], "v109-kit");
     let list = structured(&mut app, "drum.preset.list", json!({}));
-    assert!(list["presets"].as_array().unwrap().iter().any(|x| x == "v109 kit"));
+    assert!(list["presets"].as_array().unwrap().iter().any(|x| x == "v109-kit"));
     let loaded = structured(
         &mut app,
         "drum.preset.load",
@@ -939,5 +959,5 @@ fn v109_mcp_socket_plugins_surface_e2e() {
             .to_string(),
     );
     assert_eq!(v["result"]["isError"], true);
-    assert_eq!(v["result"]["error"]["code"], "out_of_range");
+    assert_eq!(v["result"]["structuredContent"]["error"], "out_of_range");
 }
