@@ -321,7 +321,7 @@ fn v108_settings_restart_persists_and_yields_to_user() {
 #[test]
 fn v108_settings_list_schema_meta() {
     let mut app = headless_app("v108meta");
-    let find = |n: &str| {
+    let mut find = |n: &str| {
         settings_list(&mut app)
             .into_iter()
             .find(|e| e["name"] == n)
@@ -382,10 +382,50 @@ fn v108_settings_tier_coverage_all_fields() {
         } else {
             live += 1;
             assert_eq!(ack["applied"], "live", "{name}");
-            assert_eq!(ack["value"], cur, "{name}: live field echoes its value");
+            // rack_collapsed serializes from a HashSet — set-compare arrays
+            // of strings so element order cannot flake.
+            let same = match (&ack["value"], &cur) {
+                (Value::Array(a), Value::Array(b))
+                    if a.iter().all(|v| v.is_string()) && a.len() == b.len() =>
+                {
+                    let mut a: Vec<&Value> = a.iter().collect();
+                    let mut b: Vec<&Value> = b.iter().collect();
+                    a.sort_by_key(|v| v.to_string());
+                    b.sort_by_key(|v| v.to_string());
+                    a == b
+                }
+                (a, b) => a == b,
+            };
+            assert!(same, "{name}: live field echoes its value ({} vs {cur})", ack["value"]);
         }
     }
     assert!(live >= 55 && restart >= 20, "sanity: {live} live + {restart} restart");
+}
+
+/// The module docs promise this name: classification tables and the serde
+/// schema agree in BOTH directions (typo in a table goes red even before
+/// settings.list would surface it via entry()'s runtime refusal).
+#[test]
+fn v108_settings_classify_total() {
+    let keys: Vec<String> = serde_json::to_value(Config::default())
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let classified: Vec<&str> =
+        mcp_settings::LIVE.iter().chain(mcp_settings::RESTART).copied().collect();
+    for k in &keys {
+        assert!(classified.contains(&k.as_str()), "unclassified Config field {k}");
+    }
+    for c in &classified {
+        assert!(keys.iter().any(|k| k == c), "classification names no field: {c}");
+    }
+    assert_eq!(classified.len(), keys.len(), "no duplicates in the tables");
+    assert_eq!(mcp_settings::classify("snap_on"), Some(mcp_settings::Apply::Live));
+    assert_eq!(mcp_settings::classify("ports_in"), Some(mcp_settings::Apply::Restart));
+    assert_eq!(mcp_settings::classify("nope"), None);
 }
 
 // ── R8 slow tier: REAL client over a REAL socket, restart persistence ─────
@@ -448,7 +488,7 @@ fn v108_mcp_settings_socket_roundtrip_e2e() {
             },
         )
     };
-    let rpc_over = |id: i64, method: &str, params: Value| -> Value {
+    let mut rpc_over = |id: i64, method: &str, params: Value| -> Value {
         let (st, body) = call(
             &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string(),
         );

@@ -643,7 +643,7 @@ const SHORTCUT_DEFAULTS: [Option<egui::Key>; N_ACTIONS] = {
 
 /// Grid subdivisions, shared by the metronome click, the quantize grid and
 /// the clip snap grid: (steps per beat, display name).
-const SUBDIVISIONS: [(u32, &str); 6] = [
+pub(crate) const SUBDIVISIONS: [(u32, &str); 6] = [
     (1, "quarter note"),
     (2, "eighth note"),
     (3, "triplet"),

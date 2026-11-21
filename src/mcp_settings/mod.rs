@@ -180,20 +180,20 @@ fn meta(name: &str) -> Value {
             Some(json!(["area", "current longest", "whole song"])),
         ),
         "win_audio_backend" => meta(None, None, None, Some(json!(["auto", "wasapi", "jack"]))),
-        "metro_bpm" => meta("BPM", Some(20), Some(300), None), // App::bpm() clamp
-        "metro_num" => meta("beats/measure", Some(1), Some(16), None), // App::beats()
-        "gui_scale" => meta("x UI zoom", None, None, None), // float clamp 0.7..1.6 in domain_check
-        "latency_ms" => meta("ms", Some(0), Some(1000), None), // save_config clamp
-        "roll_vel_step" => meta("velocity pts/tick", Some(1), Some(32), None), // save clamp
-        "n_tracks" => meta("tracks", Some(1), Some(16), None), // Config doc
+        "metro_bpm" => meta(Some("BPM"), Some(20), Some(300), None), // App::bpm() clamp
+        "metro_num" => meta(Some("beats/measure"), Some(1), Some(16), None), // App::beats()
+        "gui_scale" => meta(Some("x UI zoom"), None, None, None), // float clamp 0.7..1.6 in domain_check
+        "latency_ms" => meta(Some("ms"), Some(0), Some(1000), None), // save_config clamp
+        "roll_vel_step" => meta(Some("velocity pts/tick"), Some(1), Some(32), None), // save clamp
+        "n_tracks" => meta(Some("tracks"), Some(1), Some(16), None), // Config doc
         "q_sub" | "snap_sub" | "auto_snap_sub" | "metro_sub" => {
-            meta("steps/beat", None, None, Some(json!(subs)))
+            meta(Some("steps/beat"), None, None, Some(json!(subs)))
         }
-        "master_vol" | "trk_vol" => meta("MIDI (0=-inf, 115=0 dB)", None, None, None),
-        "trk_gain" => meta("MIDI (80=0 dB)", None, None, None),
-        "trk_pan" => meta("MIDI (64=centre)", None, None, None),
-        "loop_area_start" | "loop_area_end" => meta("samples", None, None, None),
-        "preview_secs" => meta("seconds", Some(0), None, None),
+        "master_vol" | "trk_vol" => meta(Some("MIDI (0=-inf, 115=0 dB)"), None, None, None),
+        "trk_gain" => meta(Some("MIDI (80=0 dB)"), None, None, None),
+        "trk_pan" => meta(Some("MIDI (64=centre)"), None, None, None),
+        "loop_area_start" | "loop_area_end" => meta(Some("samples"), None, None, None),
+        "preview_secs" => meta(Some("seconds"), Some(0), None, None),
         _ => Value::Null,
     }
 }
