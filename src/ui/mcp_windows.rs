@@ -253,7 +253,7 @@ fn list_entries(app: &App) -> Vec<Value> {
 
 // ── argument plumbing ────────────────────────────────────────────────────
 
-fn need_id<'a>(args: &'a Value) -> Result<&'a str, ToolError> {
+fn need_id(args: &Value) -> Result<&str, ToolError> {
     args.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::invalid("this tool needs a string \"id\" (see windows.list)"))
@@ -1249,7 +1249,7 @@ mod tests {
         let l = rest["windows"].as_array().unwrap().clone();
         assert_eq!(find(&l, "monitor")["edge"], 0, "dock edge reproduced");
         assert_eq!(find(&l, "monitor")["rank"], 0, "dock rank reproduced");
-        assert_eq!(app2.show_drums, true, "open flags reproduced");
+        assert!(app2.show_drums, "open flags reproduced");
         let ctx2 = egui::Context::default();
         tick(&mut app2, &ctx2);
         let l = wins(&mut app2);
