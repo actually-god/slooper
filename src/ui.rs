@@ -58963,13 +58963,13 @@ mod tests {
         assert_eq!(active(".rec_group_join(&"), 2);
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
-        // Internal version rides the series (v91 single-home law; v108 MCP-02
+        // Internal version rides the series (v91 single-home law; v109 MCP-05
         // bumped it — retargeted here so the law holds, not the old number).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v108\""),
-            "INTERNAL_VERSION must be bumped to v108"
+            librs.contains("INTERNAL_VERSION: &str = \"v109\""),
+            "INTERNAL_VERSION must be bumped to v109"
         );
     }
 
