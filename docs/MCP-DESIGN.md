@@ -422,6 +422,15 @@ header — titles/assignees are the board's):
   `chain.list`, never block the MCP call for a probe** — `assets.list/
   import/remove` + assign-equivalents via `crate::paths` validation. All
   writes through the §5 setter-seam table, acks observed (§4).
+  *shipped v110:* seam currency = MIDI-range u8 0..=127 exactly as the live
+  mixer tables hold them (vol 0=-inf/115=0 dB; gain 80=0 dB; pan 64=centre)
+  — the native currency of the seam; `mixer.set` also takes `color`
+  (palette index or null) and `sc_send` (destination array, self-send
+  refused); slot insert shifts `vst_pending_gui` so async loads keep their
+  rows; `assets.assign` (target = pad|sampler|channel) plus optional
+  `note=` single-slot key-map bind; `assets.remove` deletes backing files
+  ONLY for scanned rack files (hard rule), never the engine asset table
+  entry of a foreign/edited asset.
 - **MCP-05** (t_3f374341, **plugin-designer**) — `plugins.list`,
   `plugin.params/describe`, `plugin.param.get/set`, `plugin.preset.*` on the
   shared preset-bar storage (sanitize honored), `sampler.map.get/set` +

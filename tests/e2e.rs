@@ -5956,3 +5956,51 @@ fn v106_poly_at_heard_live_rt() {
     drop(active);
     b.cmd(Cmd::StopAll);
 }
+
+// ────────────────────────── v110 (MCP-04) ──────────────────────────
+// The mixer setter seam the MCP tools ride is AUDIBLE on the live RT bus:
+// App::set_trk_vol's engine call (set_loop_vol) must mute and restore a
+// playing track within blocks. The App-side wiring (tool -> seam) lives
+// in the lib tier (v110_mcp_mixer_*); this pins the RT semantics the
+// NULL-audio tier structurally cannot observe (Cmd queue never drains).
+#[test]
+fn v110_e2e_mixer_seam_vol_heard_live_rt() {
+    let _g = e2e_lock();
+    // v99 rig: track 2 = steady tone HARD RIGHT through a static comp.
+    let Some((b, _rl, rr, widx, sr, active)) = v99_sc_setup("v110vol") else {
+        return; // no audio server: skip
+    };
+    b.cmd(Cmd::PlayAll);
+    std::thread::sleep(Duration::from_millis(400));
+    let base = v99_rms(&rr, &widx, sr, 200);
+    assert!(base > 1e-3, "tone baseline audible: {base:.6}");
+    // The EXACT call App::set_trk_vol makes through the v110 seam:
+    b.engine.set_loop_vol(1, 0.0); // track idx 1 = rig target A (hard R)
+    let mut hushed = None;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        let q = v99_rms(&rr, &widx, sr, 150);
+        if q < base * 0.02 {
+            hushed = Some(q);
+            break;
+        }
+    }
+    let q = hushed.expect("vol=0 through the seam must silence the live RT bus");
+    // Unity again (vol_amp(115) = 1.0 — the mixer's 0 dB):
+    b.engine.set_loop_vol(1, 1.0);
+    let mut back = None;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        let q = v99_rms(&rr, &widx, sr, 200);
+        if q > base * 0.5 {
+            back = Some(q);
+            break;
+        }
+    }
+    assert!(
+        back.is_some(),
+        "unity restore must come back on the live bus (hushed {q:.6}, base {base:.6})"
+    );
+    b.cmd(Cmd::StopAll);
+    drop(active);
+}

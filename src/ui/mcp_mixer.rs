@@ -64,13 +64,11 @@ pub fn register(v: &mut Vec<ToolDef>) {
     });
     v.push(ToolDef {
         name: "mixer.set",
-        description: concat!(
-            "Write one mixer control through the GUI's own setter seams. Controls: \
+        description: "Write one mixer control through the GUI's own setter seams. Controls: \
              vol | gain | pan | color | sc_send (needs track) and master_vol (no track). \
              Mixer values are MIDI-range ints 0..=127 (vol: 0=-inf, 115=0 dB; gain: \
              80=0 dB; pan: 64=centre); color = palette index 0..9 or null; sc_send = \
-             array of destination track indices. Echoes the observed post-change state."
-        ),
+             array of destination track indices. Echoes the observed post-change state.",
         schema: json!({
             "type": "object",
             "properties": {
@@ -205,8 +203,7 @@ pub fn register(v: &mut Vec<ToolDef>) {
     });
     v.push(ToolDef {
         name: "assets.assign",
-        description: concat!(
-            "The rack-drag drop seams as a direct call. target=\u{201c}sampler\u{201d}: \
+        description: "The rack-drag drop seams as a direct call. target=\u{201c}sampler\u{201d}: \
              becomes the bound script synth's asset (needs a script synth on the track). \
              target=\u{201c}keymap\u{201d}: adds a sampler key-map slot (C3, the \u{201c}no \
              samples mapped\u{201d} drop zone). target=\u{201c}pad\u{201d} (+ pad: N): the drum \
@@ -214,8 +211,7 @@ pub fn register(v: &mut Vec<ToolDef>) {
              target=\u{201c}channel\u{201d} (+ optional lane, pos in samples): places the \
              asset as a clip on the arrange grid (the lane-strip drop contract). \
              Source = `asset` (table id) or `path` (imported first via the same seam). \
-             Mixer values are MIDI-range ints 0..=127; asset ids are table indices."
-        ),
+             Mixer values are MIDI-range ints 0..=127; asset ids are table indices.",
         schema: json!({
             "type": "object",
             "properties": {
