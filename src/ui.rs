@@ -58685,8 +58685,11 @@ mod tests {
         // route through the plain helper: drum(1) + fire(3) + load(1) +
         // the click seam's own plain branch(1).
         assert_eq!(active(".select_track_plain("), 6);
-        // Settings shrink calls the clamp.
-        assert_eq!(active(".clamp_track_sel("), 1);
+        // Settings shrink AND the MCP settings.set n_tracks live arm call
+        // the clamp (v108: settings.set routes through the same seams —
+        // needle re-targeted 1->2; a THIRD site outside these two is still
+        // a bypassing write and goes red).
+        assert_eq!(active(".clamp_track_sel("), 2);
         // Raw writes to `.selected =` ONLY inside the seams: plain(1) +
         // click ctrl-add(1) + ctrl-remove fallback(1) + shift re-seat(1) +
         // clamp(1) + settings clamp line(1).
@@ -58699,13 +58702,13 @@ mod tests {
         assert_eq!(active(".rec_group_join(&"), 2);
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
-        // Internal version rides the series (v91 single-home law; v107 MCP-01
+        // Internal version rides the series (v91 single-home law; v108 MCP-02
         // bumped it — retargeted here so the law holds, not the old number).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v107\""),
-            "INTERNAL_VERSION must be bumped to v107"
+            librs.contains("INTERNAL_VERSION: &str = \"v108\""),
+            "INTERNAL_VERSION must be bumped to v108"
         );
     }
 
