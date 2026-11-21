@@ -1,4 +1,4 @@
-//! v108/MCP-03: the `windows.*` tool family (docs/MCP-DESIGN.md D4/D5,
+//! v111/MCP-03: the `windows.*` tool family (docs/MCP-DESIGN.md D4/D5,
 //! board card t_5cd0d1e5).
 //!
 //! Registry model (design D4): every roster window answers to a STABLE
@@ -894,7 +894,7 @@ fn layout_restore(app: &mut App, args: &Value) -> ToolResult {
     }))
 }
 
-// ── v108 quick-tier pins ─────────────────────────────────────────────────
+// ── v111 quick-tier pins ─────────────────────────────────────────────────
 //
 // Contract (docs/MCP-DESIGN.md D6): every pin drives `rpc::dispatch` — the
 // real dispatcher the frame loop drains — never the tool fns, so gate order,
@@ -974,8 +974,8 @@ mod tests {
     // ── R1/R2: registry + ids ─────────────────────────────────────────────
 
     #[test]
-    fn v108_mcp_windows_list_registry() {
-        let mut app = headless_app("v108reg");
+    fn v111_mcp_windows_list_registry() {
+        let mut app = headless_app("v111reg");
         let ctx = egui::Context::default();
         // Stock roster: the four primaries, stable keys, stock dock slots
         // (default_dock = rack left/0, binds bottom/1, monitor bottom/0,
@@ -1020,8 +1020,8 @@ mod tests {
     // ── R3: params key extension, BOTH directions ─────────────────────────
 
     #[test]
-    fn v108_mcp_windows_params_key_both_ways() {
-        let mut app = headless_app("v108pk");
+    fn v111_mcp_windows_params_key_both_ways() {
+        let mut app = headless_app("v111pk");
         // Config back-compat: the unit kind still parses from its bare key.
         assert_eq!(DynKind::from_key("params"), Some(DynKind::Params));
         assert_eq!(DynKind::from_key("params:chain:2:1"), Some(DynKind::Params));
@@ -1052,8 +1052,8 @@ mod tests {
     // ── R2 + errors: bad ids, bad edges ───────────────────────────────────
 
     #[test]
-    fn v108_mcp_windows_bad_id_and_edge() {
-        let mut app = headless_app("v108bad");
+    fn v111_mcp_windows_bad_id_and_edge() {
+        let mut app = headless_app("v111bad");
         let (kind, msg) = err(&mut app, "windows.move", json!({"id": "nope", "x": 10.0, "y": 10.0}));
         assert_eq!(kind, "not_found");
         assert!(msg.contains("rack") && msg.contains("mixer"), "refusal lists live ids: {msg}");
@@ -1068,8 +1068,8 @@ mod tests {
     // ── R4: open/close round-trip ─────────────────────────────────────────
 
     #[test]
-    fn v108_mcp_windows_open_close_roundtrip() {
-        let mut app = headless_app("v108oc");
+    fn v111_mcp_windows_open_close_roundtrip() {
+        let mut app = headless_app("v111oc");
         let ctx = egui::Context::default();
         for (id, check) in [("drums", "show_drums"), ("master", "show_master")] {
             let ack = sc(&mut app, "windows.open", json!({"id": id}));
@@ -1099,8 +1099,8 @@ mod tests {
     // ── R5: move + viewport clamping ──────────────────────────────────────
 
     #[test]
-    fn v108_mcp_windows_move_clamps() {
-        let mut app = headless_app("v108mv");
+    fn v111_mcp_windows_move_clamps() {
+        let mut app = headless_app("v111mv");
         let _ctx = egui::Context::default();
         sc(&mut app, "windows.undock", json!({"id": "rack"}));
         // Far corner: clamped so >=60 px of the title band stay in-view —
@@ -1121,8 +1121,8 @@ mod tests {
     }
 
     #[test]
-    fn v108_mcp_windows_docked_move_resize_refused() {
-        let mut app = headless_app("v108dm");
+    fn v111_mcp_windows_docked_move_resize_refused() {
+        let mut app = headless_app("v111dm");
         // rack/mixer are docked per the stock layout.
         let (kind, msg) = err(&mut app, "windows.move", json!({"id": "rack", "x": 10.0, "y": 10.0}));
         assert_eq!(kind, "wrong_kind");
@@ -1147,8 +1147,8 @@ mod tests {
     // ── R7/R8: dock ranks + undock round-trip ─────────────────────────────
 
     #[test]
-    fn v108_mcp_windows_dock_rank() {
-        let mut app = headless_app("v108rk");
+    fn v111_mcp_windows_dock_rank() {
+        let mut app = headless_app("v111rk");
         // Stock: rack left/0. Pull monitor onto left rank 0 — rack shifts.
         let ack = sc(&mut app, "windows.dock", json!({"id": "monitor", "edge": "left", "rank": 0}));
         assert_eq!(ack["window"]["rank"], 0);
@@ -1173,8 +1173,8 @@ mod tests {
     }
 
     #[test]
-    fn v108_mcp_windows_undock_roundtrip() {
-        let mut app = headless_app("v108ud");
+    fn v111_mcp_windows_undock_roundtrip() {
+        let mut app = headless_app("v111ud");
         let ack = sc(&mut app, "windows.undock", json!({"id": "rack"}));
         assert_eq!(ack["window"]["docked"], false);
         let rect0 = ack["window"]["rect"].clone();
@@ -1195,8 +1195,8 @@ mod tests {
     // ── R9: layout save/restore + restart reproduction ────────────────────
 
     #[test]
-    fn v108_mcp_windows_layout_save_restore() {
-        let mut app = headless_app("v108lay");
+    fn v111_mcp_windows_layout_save_restore() {
+        let mut app = headless_app("v111lay");
         let ctx = egui::Context::default();
         // A non-trivial arrangement: drums floated at an exact spot/size,
         // rack docked bottom/0, mixer floated.
@@ -1228,8 +1228,8 @@ mod tests {
     }
 
     #[test]
-    fn v108_mcp_windows_layout_restart() {
-        let mut app = headless_app("v108rs");
+    fn v111_mcp_windows_layout_restart() {
+        let mut app = headless_app("v111rs");
         let ctx = egui::Context::default();
         sc(&mut app, "windows.open", json!({"id": "drums"}));
         tick(&mut app, &ctx);
@@ -1263,8 +1263,8 @@ mod tests {
     // ── R10: native editor boundary ───────────────────────────────────────
 
     #[test]
-    fn v108_mcp_windows_editor_boundary() {
-        let mut app = headless_app("v108ed");
+    fn v111_mcp_windows_editor_boundary() {
+        let mut app = headless_app("v111ed");
         // No live editors: list carries the (empty) editors array.
         let s = sc(&mut app, "windows.list", json!({}));
         assert_eq!(s["editors"].as_array().unwrap().len(), 0);
@@ -1298,7 +1298,7 @@ mod tests {
     // ── R2/R4: every kind's key round-trips; opens land their app field ───
 
     #[test]
-    fn v108_mcp_windows_registry_keys_roundtrip() {
+    fn v111_mcp_windows_registry_keys_roundtrip() {
         // The complete key vocabulary of the registry (v107 D4 ids):
         for key in [
             "params",
@@ -1323,7 +1323,7 @@ mod tests {
         // Simultaneous windows get DISTINCT ids resolving to their own
         // slots. The sandbox's DEFAULT open windows (show_master=true per
         // Config::default) are part of the honest baseline.
-        let mut app = headless_app("v108keys");
+        let mut app = headless_app("v111keys");
         sc(&mut app, "windows.open", json!({"id": "chain:0"}));
         sc(&mut app, "windows.open", json!({"id": "synth:1"}));
         sc(&mut app, "windows.open", json!({"id": "drums"}));
@@ -1348,8 +1348,8 @@ mod tests {
     }
 
     #[test]
-    fn v108_mcp_windows_open_dyn_fields() {
-        let mut app = headless_app("v108dyn");
+    fn v111_mcp_windows_open_dyn_fields() {
+        let mut app = headless_app("v111dyn");
         // Every dynamic kind maps 1:1 onto the field the mouse writes.
         sc(&mut app, "windows.open", json!({"id": "chain:2"}));
         assert_eq!(app.fx_window, Some(2));
@@ -1383,8 +1383,8 @@ mod tests {
     // ── R12: the read-only latch covers this family ───────────────────────
 
     #[test]
-    fn v108_mcp_windows_read_latch() {
-        let mut app = headless_app("v108latch");
+    fn v111_mcp_windows_read_latch() {
+        let mut app = headless_app("v111latch");
         app.mcp_read_only = true;
         let r = resp(&mut app, "windows.open", json!({"id": "drums"}));
         assert_eq!(r["error"]["code"], -32003, "writes refused: {r}");
@@ -1397,16 +1397,16 @@ mod tests {
 
     #[test]
     #[ignore = "slow-tier: real socket"]
-    fn v108_mcp_windows_socket_e2e() {
+    fn v111_mcp_windows_socket_e2e() {
         // v107 pump model: the worker parks on the oneshot after queueing,
         // so we sleep, run the frame-loop role (drain + one drawn frame),
         // then read the response. Deterministic, bounded, port 0.
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join("slooper-mcp-v108sock");
+        let dir = std::env::temp_dir().join("slooper-mcp-v111sock");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var(crate::paths::DATA_DIR_ENV, &dir);
-        let mut app = headless_app("v108sock");
+        let mut app = headless_app("v111sock");
         let ctx = egui::Context::default();
         app.mcp_port = 0;
         app.mcp_enabled = true;

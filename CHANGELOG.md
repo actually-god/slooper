@@ -8,6 +8,21 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **Subwindow arrangement over MCP (v111/MCP-03).** Nine agent tools drive
+  the window layer through the same UI-thread state the mouse uses:
+  `windows.list` enumerates every window by a stable machine id (the
+  display title can drift — ids never do) with open flag, dock edge/rank
+  and measured geometry; `windows.open/close` cover every drawable kind
+  (params — addressed per synth or chain row —, drum machine, master out,
+  piano roll, automation, synth pick, chain, fx slot, asset views) plus
+  plugin editors (list + close; their placement is WM territory and said
+  so in the tool text); `windows.move/resize` float windows only,
+  clamped to the viewport, and point at undock first for docked ones —
+  exactly what the mouse does; `windows.dock/undock` re-pack the tab
+  ranks per edge; and `windows.layout.save/restore` round-trip a whole
+  arrangement (dock table, strip widths, float rects, open flags) as
+  named templates that survive a restart. Bad ids answer with the live
+  id list; the read-only latch blocks all eight writers.
 - **MCP mixer, chain and rack control (v110/MCP-04).** Eleven agent
   tools ride the GUI's own setter seams: `mixer.list/get/set` (track
   vol/gain/pan/clip-color, sidechain sends and master volume in the same
