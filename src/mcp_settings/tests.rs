@@ -182,7 +182,7 @@ fn v108_settings_shortcuts_live_fill() {
     assert!(cfg_text().contains("\"Home\"") && cfg_text().contains("\"End\""), "persisted");
     let cfg = Config::load();
     let names: Vec<Option<&str>> = cfg.shortcuts.iter().map(|s| s.as_deref()).collect();
-    assert!(names.iter().any(|n| *n == Some("Home")), "restart read keeps Home");
+    assert!(names.contains(&Some("Home")), "restart read keeps Home");
 }
 
 // ── R3 gold: the live apply path is OBSERVABLY real — the MCP server
