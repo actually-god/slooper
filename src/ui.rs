@@ -820,6 +820,20 @@ const COL_BEAT_LINE: Color32 = Color32::from_gray(78);
 /// subdivision" report).
 const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
 
+/// v112: the arrangement's asset-length lookup (asset id → timeline
+/// samples) as a borrow-cheap closure for `place_auto`/`Lane::occupied`.
+/// Takes the table + sample rate as plain args so callers can pass
+/// `&arr_alen(&self.assets, self.sample_rate)` even while the receiver
+/// `&mut self.arr` is borrowed (disjoint field captures only).
+fn arr_alen<'a>(assets: &'a [Asset], sr: u32) -> impl Fn(u32) -> u64 + 'a {
+    move |id| {
+        assets
+            .get(id as usize)
+            .map(|a| a.timeline_len(sr))
+            .unwrap_or(0)
+    }
+}
+
 /// v58 palette: the named clip/track colors the arrangement menus offer
 /// (shared by all three clip kinds — audio, MIDI, automation). Stays in
 /// ui.rs with the other data palettes: kit.rs owns CHROME only (see its
@@ -4946,11 +4960,7 @@ impl App {
     fn asset_len(&self, id: u32) -> u64 {
         self.assets
             .get(id as usize)
-            .map(|a| match (&a.pattern, &a.automation) {
-                (Some(pat), _) => pat.len_samples(self.sample_rate.max(1)),
-                (None, Some(auto)) => auto.len_samples.max(0) as u64,
-                (None, None) => a.data.len() as u64,
-            })
+            .map(|a| a.timeline_len(self.sample_rate))
             .unwrap_or(0)
     }
 
@@ -6088,6 +6098,7 @@ impl App {
                     color: it.color,
                 },
                 span,
+                &arr_alen(&self.assets, self.sample_rate),
             );
             self.grow_for_lanes(t, nl0);
             let li = self.arr.tracks[t].lanes[lane].clips.len() - 1;
@@ -8030,7 +8041,12 @@ impl App {
         self.last_auto_asset = Some(id); // v34 R1
         let pos = snap_start(start, self.snap_unit());
         let nl0 = self.arr.tracks[i].lanes.len();
-        let lane = self.arr.place_auto(i, Clip::new(id, pos), len as u64);
+        let lane = self.arr.place_auto(
+                i,
+                Clip::new(id, pos),
+                len as u64,
+                &arr_alen(&self.assets, self.sample_rate),
+            );
         self.grow_for_lanes(i, nl0);
         if let Some(f) = self.rack.first_mut() {
             f.rescan();
@@ -10627,7 +10643,12 @@ impl App {
         let nl0 = self.arr.tracks[track].lanes.len();
         let lane = self
             .arr
-            .place_auto(track, Clip::new(id, pos), auto.len_samples as u64);
+            .place_auto(
+                track,
+                Clip::new(id, pos),
+                auto.len_samples as u64,
+                &arr_alen(&self.assets, self.sample_rate),
+            );
         self.grow_for_lanes(track, nl0);
         if let Some(f) = self.rack.first_mut() {
             f.rescan();
@@ -10906,7 +10927,7 @@ impl App {
             .push(Asset::midi(id, name.clone(), path, pat, false));
         let pos = snap_start(start, self.snap_unit());
         let nl0 = self.arr.tracks[t].lanes.len();
-        let lane = self.arr.place_auto(t, Clip::new(id, pos), len);
+        let lane = self.arr.place_auto(t, Clip::new(id, pos), len, &arr_alen(&self.assets, self.sample_rate));
         self.grow_for_lanes(t, nl0);
         // Re-scan so the rack shows the new file instantly.
         if let Some(f) = self.rack.first_mut() {
@@ -14034,7 +14055,12 @@ impl App {
         let pos = snap_start(self.backend.engine.pos(), self.snap_unit());
         let track = track.min(self.n_tracks - 1);
         let nl0 = self.arr.tracks[track].lanes.len();
-        let lane = self.arr.place_auto(track, Clip::new(id, pos), len);
+        let lane = self.arr.place_auto(
+            track,
+            Clip::new(id, pos),
+            len,
+            &arr_alen(&self.assets, self.sample_rate),
+        );
         self.grow_for_lanes(track, nl0);
         if let Some(f) = self.rack.first_mut() {
             f.rescan();
@@ -16663,7 +16689,12 @@ impl App {
         self.sel_asset = Some(id as usize);
         let pos = snap_start(at, self.snap_unit());
         let nl0 = self.arr.tracks[track].lanes.len();
-        let lane = self.arr.place_auto(track, Clip::new(id, pos), len);
+        let lane = self.arr.place_auto(
+            track,
+            Clip::new(id, pos),
+            len,
+            &arr_alen(&self.assets, self.sample_rate),
+        );
         self.grow_for_lanes(track, nl0);
         self.push_project();
         self.status = format!(
@@ -27239,7 +27270,12 @@ fn lane_row(
                     };
                     let id = ai as u32;
                     let nl0 = app.arr.tracks[t].lanes.len();
-                    let lane = app.arr.place_auto(t, Clip::new(id, pos), app.asset_len(id));
+                    let lane = app.arr.place_auto(
+                        t,
+                        Clip::new(id, pos),
+                        app.asset_len(id),
+                        &arr_alen(&app.assets, app.sample_rate),
+                    );
                     app.grow_for_lanes(t, nl0);
                     let li = app
                         .arr
@@ -34469,6 +34505,7 @@ mod tests {
                 color: None,
             },
             app.assets[k1].samples(),
+            &arr_alen(&app.assets, app.sample_rate),
         );
         app.sel_clips = vec![(0, lane, app.arr.tracks[0].lanes[lane].clips.len() - 1)];
         app.clipboard_copy();
@@ -40105,7 +40142,8 @@ mod tests {
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         // Two overlapping clips on track 2: the second opens a child lane.
         app.arr.insert(1, 0, Clip::new(a, 0));
-        let lane = app.arr.place_auto(1, Clip::new(a, 0), app.asset_len(a));
+        let lane =
+            app.arr.place_auto(1, Clip::new(a, 0), app.asset_len(a), &arr_alen(&app.assets, app.sample_rate));
         assert_eq!(lane, 1, "overlap opened the child lane");
         app.select_one((1, 0, 0));
         // Settle one frame so the clip-props strip exists BEFORE geometry
@@ -55970,7 +56008,8 @@ mod tests {
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
         app.arr.insert(2, 0, Clip::new(a, 0));
-        let lane = app.arr.place_auto(2, Clip::new(a, 0), app.asset_len(a));
+        let lane =
+            app.arr.place_auto(2, Clip::new(a, 0), app.asset_len(a), &arr_alen(&app.assets, app.sample_rate));
         assert_eq!(lane, 1, "overlap opened the child lane");
         frame(&mut app, &ctx, vec![]);
         let mut top2 = app.grid_anchor - app.vscroll;
@@ -58868,8 +58907,8 @@ mod tests {
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v111\""),
-            "INTERNAL_VERSION must be bumped to v111"
+            librs.contains("INTERNAL_VERSION: &str = \"v112\""),
+            "INTERNAL_VERSION must be bumped to v112"
         );
     }
 

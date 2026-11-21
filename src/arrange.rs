@@ -177,12 +177,17 @@ pub struct Lane {
 }
 
 impl Lane {
-    /// True when any clip in this lane overlaps `[pos, pos + len)`.
-    pub fn occupied(&self, pos: u64, len: u64) -> bool {
-        let end = pos.saturating_add(len);
+    /// True when any clip in this lane overlaps `[pos, pos + len.max(1))`.
+    /// Existing clips' spans resolve through `alen` (asset id → asset
+    /// samples): a probe landing on a LONGER clip's tail is an overlap,
+    /// and a probe starting past a SHORTER clip's end is not (v112 —
+    /// the right edge used to come from the probe's own `len`, which
+    /// made asymmetric-length overlaps invisible in both directions).
+    pub fn occupied(&self, pos: u64, len: u64, alen: &dyn Fn(u32) -> u64) -> bool {
+        let end = pos.saturating_add(len.max(1));
         self.clips
             .iter()
-            .any(|c| pos < c.pos.saturating_add(len.max(1)) && c.pos < end)
+            .any(|c| pos < c.end(alen(c.asset)) && c.pos < end)
     }
 }
 
@@ -281,12 +286,20 @@ impl Arrangement {
     /// Place a freshly recorded/derived take: lane 0 first; if the new clip
     /// would land on top of existing content there, the first child lane
     /// free at that span is used, and if every child overlaps, a new child
-    /// lane is created. `len` is the clip's timeline span (asset length,
-    /// or trim-adjusted). Returns the lane the clip ended up in.
-    pub fn place_auto(&mut self, t: usize, cl: Clip, len: u64) -> usize {
+    /// lane is created. `len` is the new clip's timeline span (asset
+    /// length, or trim-adjusted); `alen` resolves the EXISTING clips'
+    /// spans (asset id → asset samples) so both sides overlap-test
+    /// against their true extents. Returns the lane the clip ended up in.
+    pub fn place_auto(
+        &mut self,
+        t: usize,
+        cl: Clip,
+        len: u64,
+        alen: &dyn Fn(u32) -> u64,
+    ) -> usize {
         let tr = &mut self.tracks[t];
         let pos = cl.pos;
-        let pick = if !tr.lanes[0].occupied(pos, len) {
+        let pick = if !tr.lanes[0].occupied(pos, len, alen) {
             0
         } else {
             match tr
@@ -294,7 +307,7 @@ impl Arrangement {
                 .iter()
                 .enumerate()
                 .skip(1)
-                .find(|(_, l)| !l.occupied(pos, len))
+                .find(|(_, l)| !l.occupied(pos, len, alen))
             {
                 Some((k, _)) => k,
                 None => tr.add_lane(),
@@ -466,14 +479,14 @@ mod tests {
     fn place_auto_prefers_base_then_children_then_new() {
         let mut a = Arrangement::new();
         // Empty track -> lane 0.
-        assert_eq!(a.place_auto(3, Clip::new(0, 5_000), 1000), 0);
+        assert_eq!(a.place_auto(3, Clip::new(0, 5_000), 1000, &alen), 0);
         // Overlap on lane 0 -> first child lane.
-        assert_eq!(a.place_auto(3, Clip::new(1, 5_500), 1000), 1);
+        assert_eq!(a.place_auto(3, Clip::new(1, 5_500), 1000, &alen), 1);
         // Overlap on lanes 0 and 1 -> a new child is created.
-        assert_eq!(a.place_auto(3, Clip::new(2, 5_200), 1000), 2);
+        assert_eq!(a.place_auto(3, Clip::new(2, 5_200), 1000, &alen), 2);
         assert_eq!(a.tracks[3].lanes.len(), 3);
         // A span clear of everything goes back to lane 0.
-        assert_eq!(a.place_auto(3, Clip::new(3, 20_000), 1000), 0);
+        assert_eq!(a.place_auto(3, Clip::new(3, 20_000), 1000, &alen), 0);
         // Child lanes stack additively, never replace: every placement lives.
         let total: usize = a.tracks[3].lanes.iter().map(|l| l.clips.len()).sum();
         assert_eq!(total, 4);
@@ -482,11 +495,11 @@ mod tests {
     #[test]
     fn occupied_boundary_touch_is_not_overlap() {
         let mut a = Arrangement::new();
-        a.place_auto(0, Clip::new(0, 0), 1000);
+        a.place_auto(0, Clip::new(0, 0), 1000, &alen);
         // Clip at exactly `len` after the first touches but does not overlap.
-        assert_eq!(a.place_auto(0, Clip::new(1, 1000), 1000), 0);
+        assert_eq!(a.place_auto(0, Clip::new(1, 1000), 1000, &alen), 0);
         // One sample early forces a child lane.
-        assert_eq!(a.place_auto(0, Clip::new(2, 999), 1000), 1);
+        assert_eq!(a.place_auto(0, Clip::new(2, 999), 1000, &alen), 1);
     }
 
     // ---- v112 (t_e25e805f): occupied must consult EXISTING clips' spans ----
@@ -501,29 +514,50 @@ mod tests {
 
     #[test]
     fn v112_place_auto_dodge_longer_existing_clip() {
-        // AC1: lane 0 holds asset 0, a clip spanning [0, 8000).
+        // AC1/AC3: lane 0 holds asset 0, a clip spanning [0, 8000).
         let mut a = Arrangement::new();
         a.insert(5, 0, Clip::new(0, 0));
-        // A 1000-sample take landing deep inside that tail overlaps and
-        // must dodge to a child lane — the module doc's promise.
-        assert_eq!(a.place_auto(5, Clip::new(1, 4_000), 1_000), 1);
+        let lane = &a.tracks[5].lanes[0];
+        // Direct predicate: a probe deep inside the long clip's tail IS
+        // occupied even though the probe itself is short...
+        assert!(
+            lane.occupied(4_000, 1_000, &alen_v112),
+            "short probe inside a long clip's tail must count as occupied"
+        );
+        // ...while a probe that only TOUCHES the long clip's real end
+        // is not (boundary rule holds at the TRUE edge, not pos+len).
+        assert!(!lane.occupied(8_000, 1_000, &alen_v112));
+        // place_auto honors both: child lane inside, lane 0 on touch.
+        assert_eq!(a.place_auto(5, Clip::new(1, 4_000), 1_000, &alen_v112), 1);
+        assert_eq!(a.place_auto(5, Clip::new(2, 8_000), 1_000, &alen_v112), 0);
     }
 
     #[test]
     fn v112_place_auto_short_existing_allows_longer_incoming() {
-        // AC2/AC4: a short 1000-sample clip occupies [500, 1500).
+        // AC2/AC3/AC4: a short 1000-sample clip occupies [500, 1500).
         let mut a = Arrangement::new();
         a.insert(6, 0, Clip::new(1, 500));
-        // A longer incoming take that merely touches its end overlaps nothing
-        // and must keep lane 0 — the old code over-reported.
-        assert_eq!(a.place_auto(6, Clip::new(0, 1_500), 8_000), 0);
+        let lane = &a.tracks[6].lanes[0];
+        // The old predicate over-reported: `pos < c.pos + probe_len` let
+        // this short clip shadow the whole probe span.
+        assert!(
+            !lane.occupied(1_500, 8_000, &alen_v112),
+            "probe starting at the short clip's true end overlaps nothing"
+        );
+        // AC4 no over-correction: a longer probe that genuinely covers the
+        // short clip still counts as occupied.
+        assert!(lane.occupied(1_000, 8_000, &alen_v112));
+        // place_auto mirrors both verdicts (lane is re-read above, not
+        // held across these mutable calls).
+        assert_eq!(a.place_auto(6, Clip::new(0, 1_500), 8_000, &alen_v112), 0);
+        assert_eq!(a.place_auto(6, Clip::new(0, 1_000), 8_000, &alen_v112), 1);
     }
 
     #[test]
     fn lane_removal_keeps_base() {
         let mut a = Arrangement::new();
-        a.place_auto(1, Clip::new(0, 0), 1000); // empty track: lands on lane 0...
-        a.place_auto(1, Clip::new(0, 500), 1000); // ...the overlapping take opens lane 1
+        a.place_auto(1, Clip::new(0, 0), 1000, &alen); // empty track: lands on lane 0...
+        a.place_auto(1, Clip::new(0, 500), 1000, &alen); // ...the overlapping take opens lane 1
         assert_eq!(a.tracks[1].lanes.len(), 2);
         assert!(!a.remove_lane(1, 0), "lane 0 can never be removed");
         assert!(a.remove_lane(1, 1));
@@ -541,7 +575,7 @@ mod tests {
         assert_eq!(a.max_end(&alen), 5_900);
         assert_eq!(a.total_len(&alen, 4_800), 9_600);
         // Clips-of / remove-asset round trip.
-        a.place_auto(2, Clip::new(7, 0), 1000); // same asset, overlap -> child lane
+        a.place_auto(2, Clip::new(7, 0), 1000, &alen); // same asset, overlap -> child lane
         assert_eq!(a.clips_of(7).len(), 2);
         assert_eq!(a.remove_asset(7), 2);
         assert!(a.is_empty());
@@ -551,8 +585,8 @@ mod tests {
     #[test]
     fn clear_track_drops_children() {
         let mut a = Arrangement::new();
-        a.place_auto(4, Clip::new(0, 0), 1000);
-        a.place_auto(4, Clip::new(1, 0), 1000); // child
+        a.place_auto(4, Clip::new(0, 0), 1000, &alen);
+        a.place_auto(4, Clip::new(1, 0), 1000, &alen); // child
         a.clear_track(4);
         assert_eq!(a.tracks[4].lanes.len(), 1);
         assert!(a.tracks[4].lanes[0].clips.is_empty());
