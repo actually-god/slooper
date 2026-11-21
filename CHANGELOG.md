@@ -6,6 +6,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Auto-placement now dodges long clips (and stops dodging ghosts).**
+  The lane-occupancy test built every existing clip's right edge from the
+  incoming item's own length, so a short take landing on the tail of a
+  longer clip stacked onto lane 0 (additive double playback over the
+  overlap) while a short existing clip pushed any longer take to a
+  needless child lane. Both `Lane::occupied` and `place_auto` now resolve
+  existing spans through the asset table — the module doc's promise
+  finally holds for asymmetric lengths (v112).
+
 ### Added
 
 - **Subwindow arrangement over MCP (v111/MCP-03).** Nine agent tools drive
