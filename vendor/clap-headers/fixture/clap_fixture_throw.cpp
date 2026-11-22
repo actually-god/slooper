@@ -1,4 +1,4 @@
-// v116: throw-class CLAP fixture — FOUR deterministic plugins in one DSO,
+// v116: throw-class CLAP fixture — FIVE deterministic plugins in one DSO,
 // each raising a real C++ exception from ONE designated ABI call site, to
 // pin the ffiguard firewall over the CLAP backend (the v42 doctrine the
 // v34 backend had not inherited; card t_cb95ff24).
@@ -11,6 +11,12 @@
 //       (chunk harvest: host must degrade to "no state", not die)
 //   com.slooper.fixture-throw-load  -> clap.preset-load/2 from_location
 //       throws (host-commanded load must surface Err)
+//   com.slooper.fixture-throw-hostcb (v117, card t_a4175cb0) -> process()
+//       RE-ENTERS the host through the clap.log extension; with
+//       SLOOPER_TEST_PANIC_HOST_LOG=1 the host's log callback panics in
+//       Rust. The panic must unwind back through THIS frame into the
+//       host's ffiguard catch (park). On a plain "C" host frame it would
+//       abort instead — that is exactly the bug class v117 pins.
 //   SLOOPER_CLAP_FIXTURE_THROW_PROBE=1 at probe time ->
 //       plugin-factory.get_plugin_count throws (scan path guard; env-gated
 //       because open() also walks the factory — the gate scopes the throw
@@ -40,6 +46,7 @@ enum Kind {
    KIND_PROC_THROW,
    KIND_STATE_THROW,
    KIND_LOAD_THROW,
+   KIND_HOSTCB,
 };
 
 struct throw_fx {
@@ -59,11 +66,13 @@ THROW_DESC(s_desc_init, "com.slooper.fixture-throw-init", "Fixture ThrowInit")
 THROW_DESC(s_desc_proc, "com.slooper.fixture-throw-proc", "Fixture ThrowProc")
 THROW_DESC(s_desc_state, "com.slooper.fixture-throw-state", "Fixture ThrowState")
 THROW_DESC(s_desc_load, "com.slooper.fixture-throw-load", "Fixture ThrowLoad")
+THROW_DESC(s_desc_hostcb, "com.slooper.fixture-throw-hostcb", "Fixture ThrowHostCb")
 
 static throw_fx g_fx_init;
 static throw_fx g_fx_proc;
 static throw_fx g_fx_state;
 static throw_fx g_fx_load;
+static throw_fx g_fx_hostcb;
 
 // ---- plugin vtable arms ----
 static bool p_init(const clap_plugin_t *p) {
@@ -82,6 +91,15 @@ static clap_process_status p_process(const clap_plugin_t *p, const clap_process_
    const throw_fx *fx = static_cast<const throw_fx *>(p->plugin_data);
    if (fx->kind == KIND_PROC_THROW)
       throw std::runtime_error("slooper clap fixture throw: process");
+   if (fx->kind == KIND_HOSTCB) {
+      // v117: re-enter the HOST via the clap.log extension. When the host's
+      // log callback panics (SLOOPER_TEST_PANIC_HOST_LOG=1), the panic must
+      // unwind through THIS frame into the host's ffiguard catch.
+      const void *ext = fx->host->get_extension(fx->host, CLAP_EXT_LOG);
+      if (ext != nullptr)
+         static_cast<const clap_host_log_t *>(ext)->log(
+             fx->host, CLAP_LOG_INFO, "v117 host-cb reentry");
+   }
    return CLAP_PROCESS_CONTINUE;
 }
 static void p_on_main_thread(const clap_plugin_t *) {}
@@ -131,12 +149,12 @@ static void setup(throw_fx &fx, const clap_plugin_descriptor_t *d, Kind kind) {
 static uint32_t f_count(const clap_plugin_factory_t *) {
    if (g_env_set("SLOOPER_CLAP_FIXTURE_THROW_PROBE"))
       throw std::runtime_error("slooper clap fixture throw: probe-count");
-   return 4;
+   return 5;
 }
 static const clap_plugin_descriptor_t *f_desc(const clap_plugin_factory_t *, uint32_t i) {
-   static const clap_plugin_descriptor_t *tbl[4] = {
-      &s_desc_init, &s_desc_proc, &s_desc_state, &s_desc_load };
-   return i < 4 ? tbl[i] : nullptr;
+   static const clap_plugin_descriptor_t *tbl[5] = {
+      &s_desc_init, &s_desc_proc, &s_desc_state, &s_desc_load, &s_desc_hostcb };
+   return i < 5 ? tbl[i] : nullptr;
 }
 static const clap_plugin_t *f_create(const clap_plugin_factory_t *, const clap_host_t *host,
                                      const char *id) {
@@ -155,6 +173,10 @@ static const clap_plugin_t *f_create(const clap_plugin_factory_t *, const clap_h
    if (std::strcmp(id, "com.slooper.fixture-throw-load") == 0) {
       g_fx_load.host = host;
       return &g_fx_load.plugin;
+   }
+   if (std::strcmp(id, "com.slooper.fixture-throw-hostcb") == 0) {
+      g_fx_hostcb.host = host;
+      return &g_fx_hostcb.plugin;
    }
    return nullptr;
 }
@@ -202,6 +224,7 @@ struct Boot {
       setup(g_fx_proc, &s_desc_proc, KIND_PROC_THROW);
       setup(g_fx_state, &s_desc_state, KIND_STATE_THROW);
       setup(g_fx_load, &s_desc_load, KIND_LOAD_THROW);
+      setup(g_fx_hostcb, &s_desc_hostcb, KIND_HOSTCB);
       (void)g_inited;
    }
 } s_boot;
