@@ -43,10 +43,10 @@ use std::sync::Arc;
 pub mod jack;
 #[cfg(windows)]
 mod wasapi;
-// W12a: pure lost-stream recovery table (pinned on every OS; only the
-// WASAPI backend reads it — the W7 `any(windows, test)` pattern keeps it
-// compiling for the Linux pins without a dead module in Linux builds).
-#[cfg(any(windows, test))]
+// W12a: pure lost-stream recovery tables (pinned on every OS). WASAPI
+// reads the WASAPI half; since v118 the JACK backend reads the JACK half
+// on Linux, so the module itself compiles everywhere (the OS-only items
+// carry their own cfg inside).
 mod rt_recovery;
 
 use crate::arrange::Arrangement;
@@ -9138,7 +9138,7 @@ mod v118_tests {
             "mourn must disarm callbacks before dropping the dead client"
         );
         assert!(
-            win.contains("self.loss = rt_recovery::JackLoss::new(now)"),
+            win.contains("self.loss=rt_recovery::JackLoss::new(now)"),
             "mourn must open a fresh loss event (full budget)"
         );
     }
@@ -9222,7 +9222,7 @@ mod v118_tests {
         let a_end = a + src[a..].find("fn idle").expect("apply region end");
         let abody = &src[a..a_end];
         assert!(
-            abody.contains("rt_recovery::jack_rearm(&mut self.loss, self.now_ms());"),
+            abody.contains("rt_recovery::jack_rearm(&mut self.loss, now);"),
             "a user Apply while dead must rearm the reconnect table"
         );
     }
@@ -9245,7 +9245,7 @@ mod v118_tests {
         for shape in [
             "self.client=Some(active)",
             "announce_live(self.client(),tx)",
-            "rt_recovery::jack_revive(&mutself.loss,self.liveness.load(Ordering::Relaxed),now)",
+            "letticks=self.liveness.load(Ordering::Relaxed);rt_recovery::jack_revive(&mutself.loss,ticks,now)",
             "self.cur_in=vec![None;MAX_SLOTS];",
             "self.cur_out=vec![None;MAX_SLOTS];",
             "self.mask_in.store(0,Ordering::Relaxed);",
@@ -9631,9 +9631,9 @@ mod w12g_tests {
         );
         assert_eq!(
             jack.matches("return ManagerExit::Unavailable").count(),
-            6,
-            "jack honest-failure parks: dll guard + no server + 2 slot \
-             registrations + midi port + activate"
+            3,
+            "jack honest-failure parks: dll guard + no-server + setup-refusal \
+             (v118: the per-registration sites folded into bring_up's verdict)"
         );
         let was = code(include_str!("wasapi.rs"));
         let nul = was
