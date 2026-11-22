@@ -59195,12 +59195,12 @@ mod tests {
         assert_eq!(active("track_head_menu(ui, app,"), 2);
         // Internal version rides the series (v91 single-home law; v108 MCP-02
         // bumped it — retargeted here so the law holds, not the old number;
-        // v110 MCP-04 bump).
+        // v110 MCP-04 bump; v115 = v113 claim overtaken by merged v114, renumbered per the v111 recipe).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v113\""),
-            "INTERNAL_VERSION must be bumped to v113"
+            librs.contains("INTERNAL_VERSION: &str = \"v115\""),
+            "INTERNAL_VERSION must be bumped to v115"
         );
     }
 
