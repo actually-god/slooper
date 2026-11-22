@@ -3058,6 +3058,12 @@ impl App {
         // own key branch. Escape cancels; Delete clears the slot's binding
         // and calibration — same vocabulary as the key/MIDI cells. All keys
         // are swallowed so nothing fires behind the wizard.
+        //
+        // v124: a VALUE learn (arm_value_knob_learn) keeps `slot` at a
+        // PLACEHOLDER 0 — indexing midi_binds/knob_cal/status with it
+        // silently destroyed the unrelated action-0 binding and named the
+        // wrong subject. Value learns route to the vslot branch below and
+        // must never touch the action tables.
         if self.knob_learn.is_some() {
             let key = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
@@ -3078,14 +3084,33 @@ impl App {
                 };
                 if let Some((verb, clear)) = kl {
                     if let Some(kl) = self.knob_learn.take() {
-                        if clear {
-                            self.midi_binds[kl.slot] = None;
-                            if let Some(c) = self.knob_cal.get_mut(kl.slot) {
-                                *c = None;
+                        if let Some((idx, _track, target)) = kl.vslot.clone() {
+                            // Delete on an existing bind mirrors the rack's
+                            // ✕ unbind (remove + persist); a draft
+                            // (usize::MAX) or a stale index has nothing to
+                            // remove, so Delete just cancels there.
+                            let mut cleared = false;
+                            if clear && idx != usize::MAX && idx < self.value_binds.len() {
+                                self.value_binds.remove(idx);
+                                self.save_config();
+                                cleared = true;
                             }
-                            self.save_config();
+                            self.status = format!(
+                                "{}: {}",
+                                if cleared { verb } else { "cancelled knob learn" },
+                                crate::automation::describe_target(&target)
+                            );
+                        } else {
+                            if clear {
+                                self.midi_binds[kl.slot] = None;
+                                if let Some(c) = self.knob_cal.get_mut(kl.slot) {
+                                    *c = None;
+                                }
+                                self.save_config();
+                            }
+                            self.status =
+                                format!("{verb}: {}", MidiAction::ALL[kl.slot].label());
                         }
-                        self.status = format!("{verb}: {}", MidiAction::ALL[kl.slot].label());
                     }
                 }
             }
@@ -29560,8 +29585,13 @@ fn knob_learn_window(ui: &mut egui::Ui, app: &mut App) {
             let mut act = Act::None;
             {
                 let kl = app.knob_learn.as_ref().unwrap();
-                let action = MidiAction::ALL[kl.slot].label();
-                ui.label(RichText::new(format!("Bind knob: {action}")).strong());
+                // v124: during a VALUE learn `kl.slot` is a placeholder —
+                // the header must name the value target, not action 0.
+                let subject = match &kl.vslot {
+                    Some((_, _, target)) => crate::automation::describe_target(target),
+                    None => MidiAction::ALL[kl.slot].label(),
+                };
+                ui.label(RichText::new(format!("Bind knob: {subject}")).strong());
                 let axis = kl.bind.axis_label();
                 if !kl.has_axis {
                     ui.label("1. Move the knob or slider you want to bind.");
@@ -61591,16 +61621,6 @@ mod tests {
     // unrelated action-0 binding (`RecSelected`) AND left the value binding
     // untouched; both status and wizard header named the wrong action.
 
-    fn v124_key(key: egui::Key) -> egui::Event {
-        egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }
-    }
-
     fn v124_vb(target: &str, d1: u8) -> crate::config::ValueBind {
         crate::config::ValueBind {
             target: target.to_string(),
@@ -61643,7 +61663,7 @@ mod tests {
             app.knob_learn.as_ref().is_some_and(|k| k.vslot.is_some()),
             "wizard drives a value binding"
         );
-        frame(&mut app, &ctx, vec![v124_key(egui::Key::Delete)]);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert_eq!(
@@ -61688,7 +61708,7 @@ mod tests {
         app.midi_binds[0] = Some(act_bind);
         // Re-learn binding 0, then Delete mid-wizard.
         app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, 0);
-        frame(&mut app, &ctx, vec![v124_key(egui::Key::Delete)]);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert_eq!(app.value_binds.len(), 1, "the re-learned bind is gone");
@@ -61715,6 +61735,14 @@ mod tests {
             crate::automation::TARGET_TRACK_PAN,
             "right bind survived the restart"
         );
+        // Draft learn (idx = usize::MAX) armed OVER existing binds:
+        // Delete must cancel, never remove(usize::MAX).
+        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_PAN, 0, usize::MAX);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "draft wizard closed");
+        assert_eq!(app.value_binds.len(), 1, "draft Delete removed nothing");
+        assert_eq!(app.value_binds[0].target, crate::automation::TARGET_TRACK_PAN);
     }
 
     /// R4+R5: Escape on a value learn keeps the bind, and BOTH the wizard
@@ -61727,13 +61755,16 @@ mod tests {
         app.value_binds
             .push(v124_vb(crate::automation::TARGET_TRACK_VOL, 20));
         app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, 0);
+        // A fresh egui::Window paints its content ONE frame after it
+        // first opens — settle before reading the header galley.
+        frame(&mut app, &ctx, vec![]);
         let h = galley_centers(&mut app, &ctx, "Bind knob: track volume", false);
         assert!(!h.is_empty(), "wizard header names the value target");
         assert!(
             galley_centers(&mut app, &ctx, "Bind knob: record (selected)", false).is_empty(),
             "wizard header must never name an unrelated action"
         );
-        frame(&mut app, &ctx, vec![v124_key(egui::Key::Escape)]);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Escape, egui::Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "Escape closes the wizard");
         assert_eq!(app.value_binds.len(), 1, "Escape keeps the bind");
@@ -61768,7 +61799,7 @@ mod tests {
             hi: 120,
         });
         app.arm_knob_learn(3);
-        frame(&mut app, &ctx, vec![v124_key(egui::Key::Delete)]);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert_eq!(app.midi_binds[3], None, "action-slot bind cleared");
@@ -61790,7 +61821,7 @@ mod tests {
             d1: 88,
         });
         app.arm_knob_learn(3);
-        frame(&mut app, &ctx, vec![v124_key(egui::Key::Escape)]);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Escape, egui::Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert!(app.midi_binds[3].is_some(), "Escape does not clear");
