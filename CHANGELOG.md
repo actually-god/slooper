@@ -82,6 +82,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Successive splits walk the clip again (S).** The docs promised that
+  after a split the right half keeps the selection, so pressing S again
+  at a further playhead chops a long clip into pieces — but the
+  selection silently stayed on the left half, and the second S answered
+  "the playhead is not inside any selected clip". Every split now moves
+  the selection onto the right halves (keeping any other selected clips,
+  re-pointed at their new indices), so the documented repeated-S
+  workflow works end to end on one clip, across several clips, and
+  across tracks.
+
 - **Dense sidechain routing ducks every track during playback again.**
   The live engine kept its sidechain routing table at 256 edges while the
   mixer can legally wire every track to every track (up to 16k routes at
