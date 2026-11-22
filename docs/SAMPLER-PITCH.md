@@ -1,7 +1,10 @@
 # Sampler pitch: in-roll per-note pitch curves (sampler-pitch series)
 
-Status: SPEC (pb-1 deliverable). Consumers: **pb-2-curve-engine** (data
-model + engine), **pb-3-inroll-ui** (interaction). Card: t_ee1cea7d.
+Status: IMPLEMENTED — engine + curve data model (v101, derived-lane
+delivery), in-roll editor UI (v102), scripted-instrument delivery
+(v100 bend ABI v2, v105 poly_at ABI v3). Original spec consumers:
+**pb-2-curve-engine** (data model + engine), **pb-3-inroll-ui**
+(interaction). Card: t_ee1cea7d.
 Author: feature-creator, 2026-11-19.
 
 User report (2026-11-18): the sampler pitch bend "is not intuitive and
