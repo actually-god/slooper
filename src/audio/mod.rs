@@ -77,6 +77,14 @@ pub type PreviewVoices = Arc<Vec<(u64, u32, Arc<[f32]>)>>;
 /// 128-track project costs the same CPU as a 16-track one did before.
 pub const MAX_LOOPS: usize = 128;
 
+/// v117 (t_7609b30f): structural bound of sidechain edges one block can
+/// carry — the send matrix lets every track tap every track
+/// (MAX_LOOPS targets x MAX_LOOPS sources). NOT a truncation cap: the
+/// RT edge table is sized to EXACTLY this, so no append can ever be
+/// refused. (The pre-v117 table was fixed at 256 and silently DROPPED
+/// every edge past it — un-counted, un-noticed, while 16k are legal.)
+pub const MAX_SC_EDGES: usize = MAX_LOOPS * MAX_LOOPS;
+
 /// Preview voice id for auditions that belong to no rack asset (piano-roll
 /// note taps, edit echoes). Stopping by this id never touches asset previews.
 pub const PREVIEW_TRANSIENT: u32 = u32::MAX;
@@ -4330,6 +4338,16 @@ struct Proc {
     /// precomputes "mask != 0" so the sample loop stays branch-cheap.
     sc_apply: Vec<Vec<f32>>,
     sc_build: Vec<Vec<f32>>,
+    /// v117: per-block edge tables — materialized (source, target) pairs,
+    /// per-edge receive level and the block-constant tap scale. Taken out
+    /// and given back like sc_apply/mix_l; grown ONCE to the structural
+    /// bound MAX_SC_EDGES at the first appended edge (steady state: zero
+    /// RT allocation; unrouted projects: zero cost — never grown). The
+    /// pre-v117 [u8; 256] stack tables silently truncated past 256.
+    sc_e_src: Vec<u8>,
+    sc_e_tgt: Vec<u8>,
+    sc_e_gain: Vec<f32>,
+    sc_e_scale: Vec<f32>,
     sc_active: [bool; MAX_LOOPS],
     mon_buf: Vec<f32>,
     mon_buf2: Vec<f32>,
@@ -4525,6 +4543,10 @@ fn new_proc(
         trk_bufs2: vec![Vec::new(); MAX_LOOPS],
         sc_apply: vec![Vec::new(); MAX_LOOPS],
         sc_build: vec![Vec::new(); MAX_LOOPS],
+        sc_e_src: Vec::new(),
+        sc_e_tgt: Vec::new(),
+        sc_e_gain: Vec::new(),
+        sc_e_scale: Vec::new(),
         sc_active: [false; MAX_LOOPS],
         mon_buf: Vec::new(),
         mon_buf2: Vec::new(),
@@ -5885,13 +5907,24 @@ impl Proc {
         // (block-constant — the bus feeds a detector, steps are inaudible;
         // volume/mute/master NEVER enter it — docs/SIDECHAIN.md). A
         // project without routing costs one atomic AND per track.
-        let mut n_edge = 0usize;
-        let mut e_src = [0u8; 256];
-        let mut e_tgt = [0u8; 256];
+        // v117 (t_7609b30f): the tables are engine-owned buffers taken out
+        // and given back like sc_apply/mix_l. Grown ONCE (at the first
+        // appended edge, below) to the structural bound MAX_SC_EDGES =
+        // MAX_LOOPS x MAX_LOOPS — every legal route fits, so an append can
+        // never be refused and silent truncation is structurally impossible.
+        // Steady state allocates nothing (RT rule); an unrouted project
+        // never grows them at all. (The pre-v117 [u8; 256] stack tables
+        // dropped edge 257+ with no counter and no notice — while the
+        // render_tracks export mirror was uncapped, so exports and
+        // speakers disagreed. Pins: v117_live_edge_table_*.)
+        let mut e_src = std::mem::take(&mut self.sc_e_src);
+        let mut e_tgt = std::mem::take(&mut self.sc_e_tgt);
         // v97 (sc-4): per-edge receive level read once per block alongside
         // the masks (UI writes land next block — every SC setter is
         // block-constant by construction).
-        let mut e_gain = [1.0f32; 256];
+        let mut e_gain = std::mem::take(&mut self.sc_e_gain);
+        let mut e_scale = std::mem::take(&mut self.sc_e_scale);
+        let mut n_edge = 0usize;
         let mut sc_any = false;
         for tg in 0..MAX_LOOPS {
             let m: u128 = self.engine.sc_send(tg);
@@ -5904,7 +5937,16 @@ impl Proc {
                 // Sources with no material this block must NOT tap a
                 // stale acc[] row — they simply get no edge.
                 let sourced = (entry_mask >> s) & 1 != 0 || self.midi_live[s];
-                if (m >> s) & 1 != 0 && sourced && n_edge < e_src.len() {
+                if (m >> s) & 1 != 0 && sourced {
+                    if e_src.len() < MAX_SC_EDGES {
+                        // Grow-once (v117): the first edge ever pays the
+                        // full structural bound; every later block finds
+                        // the tables at length and allocates nothing.
+                        e_src.resize(MAX_SC_EDGES, 0);
+                        e_tgt.resize(MAX_SC_EDGES, 0);
+                        e_gain.resize(MAX_SC_EDGES, 1.0);
+                        e_scale.resize(MAX_SC_EDGES, 0.0);
+                    }
                     e_src[n_edge] = s as u8;
                     e_tgt[n_edge] = tg as u8;
                     e_gain[n_edge] = self.engine.sc_recv_gain(tg, s);
@@ -5928,7 +5970,8 @@ impl Proc {
         }
         // v97 (sc-4): fold each edge's receive level into a per-edge tap
         // scale (block-constant, same inaudibility argument as sc_fold).
-        let mut e_scale = [0.0f32; 256];
+        // v117: e_scale is the engine-owned buffer taken above — by here
+        // it is at MAX_SC_EDGES length whenever n_edge > 0.
         for k in 0..n_edge {
             e_scale[k] = sc_fold[e_src[k] as usize] * e_gain[k];
         }
@@ -6350,6 +6393,11 @@ impl Proc {
         std::mem::swap(&mut sc_apply, &mut sc_build);
         self.sc_apply = sc_apply;
         self.sc_build = sc_build;
+        // v117: edge tables back for the next block (grow-once buffers).
+        self.sc_e_src = e_src;
+        self.sc_e_tgt = e_tgt;
+        self.sc_e_gain = e_gain;
+        self.sc_e_scale = e_scale;
         self.mon_buf = mon_buf;
         self.mon_buf2 = mon_buf2;
         self.vst_tmp = vst_tmp;
@@ -8229,6 +8277,222 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         v48_tap(&o, 600, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    // ---- v117 (t_7609b30f): the LIVE SC edge table must hold EVERY route.
+    // The 128x128 send matrix (MAX_LOOPS=128, u128 masks) permits up to
+    // 16384 (source,target) edges, but process_block materialized them
+    // into a [u8; 256] stack table and dropped every edge past the 256th
+    // (target-major order) with NO counter, NO notice and NO UI cap. The
+    // offline export mirror (render_tracks) has no cap — so dense projects
+    // ducked on export but NOT on speakers, silently. These pins drive
+    // process_block directly (new_proc + stub BlockIo) — the render-based
+    // v48/v95 pins exercise the uncapped mirror, not this table.
+
+    /// v117: mono-capture stub — one block of output buffer per call.
+    struct V117Io {
+        out: Vec<f32>,
+    }
+    impl crate::backend::BlockIo for V117Io {
+        fn in_buf(&self, _slot: usize) -> *const f32 {
+            std::ptr::null()
+        }
+        fn out_buf(&self, slot: usize) -> *mut f32 {
+            if slot == 0 {
+                self.out.as_ptr() as *mut f32
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    /// v117: RT-harness proc — slot 0 carries BOTH output mask bits
+    /// (mask_out_l=1, mask_out_r=1), so the core routes it through the
+    /// mono-fold path v_m = (v_l + v_r)/sqrt2: a centre-panned click
+    /// keeps unity exactly like the v48/v95 mirror asserts absorb.
+    fn v117_proc(e: &Arc<Engine>) -> Proc {
+        let (tx, _rx): (std::sync::mpsc::SyncSender<Evt>, _) =
+            std::sync::mpsc::sync_channel(64);
+        new_proc(
+            tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(crate::meter::MeterRing::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            e.clone(),
+            48000,
+        )
+    }
+
+    fn v117_run_blocks(p: &mut Proc, len: usize, n: usize) -> Vec<f32> {
+        let mut evs: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut out = vec![0.0f32; len];
+        let mut b = 0;
+        while b < len {
+            let io = V117Io {
+                out: vec![0.0f32; n],
+            };
+            p.process_block(n, &mut evs, &io);
+            let take = n.min(len - b);
+            out[b..b + take].copy_from_slice(&io.out[..take]);
+            b += take;
+        }
+        out
+    }
+
+    #[test]
+    fn v117_live_edge_table_keys_targets_past_256() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v117sc400", "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![0.01f32; 1536]);
+        let click = v48_click(64);
+        let mut arr = Arrangement::new();
+        for s in 5..105usize {
+            arr.insert(s, 0, Clip::new(0, 0)); // constant material
+        }
+        for t in 1..=4usize {
+            arr.insert(t, 0, Clip::new(1, 1000)); // click being ducked
+        }
+        arr.insert(106, 0, Clip::new(1, 1100)); // unrouted control click
+        e.set_project(Arc::new(vec![src, click]), Arc::new(arr), 1536);
+        let mut m = 0u128;
+        for s in 5..105 {
+            m |= 1u128 << s;
+        }
+        let desc = reg.desc("v48sc").unwrap().clone();
+        for t in 1..=4usize {
+            let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+            e.set_track_fx(
+                t,
+                TrackFx {
+                    slots: Arc::new(vec![FxSlot::scripted(inst, desc.clone())]),
+                },
+            );
+            e.set_sc_send(t, m); // 100 sources each -> 400 edges total
+        }
+        // Control: same effect, NO send — must stay at unity (guards the
+        // fix against over-keying). Track 106 is OUTSIDE the 5..105
+        // sender band so the mute loop below never touches it.
+        let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+        e.set_track_fx(
+            106,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+        // v95 (sc-3): mute removes the AUDIO but keeps the KEY material —
+        // so the capture at 1000 is purely the four target clicks.
+        for s in 5..105 {
+            e.set_track_on(s, false);
+        }
+        e.set_transport(true);
+        let mut p = v117_proc(&e);
+        let out = v117_run_blocks(&mut p, 1536, 512);
+        // Target-major fill: edges 257..400 fed target 3 (only 56 of its
+        // 100 survived) and target 4 (none) under the old cap. Post-fix
+        // all four saturate: sc = 100 x 0.01 = 1.0 -> click x 0.1 each.
+        let got = out[1000];
+        assert!(
+            (got - 0.4f32).abs() < 0.02,
+            "out[1000] = {got} want 0.4 (4 saturated ducks); \
+             ~1.7 = truncated edges (t3 partial, t4 un-keyed) = THE BUG"
+        );
+        assert!(
+            (out[1100] - 1.0f32).abs() < 0.01,
+            "unrouted control must stay at unity, got {}",
+            out[1100]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v117_live_edge_table_dense_matrix_no_loss() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v117sc16k", "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![0.01f32; 1536]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(2, 1100)); // control click (unrouted)
+        for t in 1..128usize {
+            arr.insert(t, 0, Clip::new(0, 0)); // material (audible: 0.01)
+            arr.insert(t, 1, Clip::new(1, 1000)); // click being ducked
+            e.set_sc_send(t, !1u128 & !(1u128 << t)); // every other track
+        }
+        e.set_project(
+            Arc::new(vec![src, v48_click(64), v48_click(64)]),
+            Arc::new(arr),
+            1536,
+        );
+        let desc = reg.desc("v48sc").unwrap().clone();
+        for t in 0..128usize {
+            let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+            e.set_track_fx(
+                t,
+                TrackFx {
+                    slots: Arc::new(vec![FxSlot::scripted(inst, desc.clone())]),
+                },
+            );
+        }
+        e.set_transport(true);
+        let mut p = v117_proc(&e);
+        let out = v117_run_blocks(&mut p, 1536, 512);
+        // 127 targets x 126 senders = 16002 edges (98% of the structural
+        // bound). The old cap keyed only the first two targets. Post-fix
+        // every target saturates: (click 1.0 + material 0.01) x 0.1 each.
+        let want = 127.0f32 * 1.01 * 0.1;
+        let got = out[1000];
+        assert!(
+            (got - want).abs() < 0.05,
+            "out[1000] = {got} want {want}; ~126 = truncated (THE BUG)"
+        );
+        // At 1100 only the ducked material tails (+ the control click).
+        let want2 = 1.0f32 + 127.0 * 0.01 * 0.1;
+        assert!(
+            (out[1100] - want2).abs() < 0.05,
+            "out[1100] = {} want {want2}",
+            out[1100]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v117_live_edge_table_has_no_truncation_guard() {
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let body = super::w4_tests::extract_fn(&src, "pub fn process_block(");
+        // Full-body sanity anchor (same pattern as w4_rt_core): the SC tap
+        // consumption must be inside the extracted body.
+        assert!(
+            body.contains("sc_build[e_tgt[k] as usize]"),
+            "body truncated"
+        );
+        // Polarity A: the silent-drop append guard may NEVER come back —
+        // the table is sized to the structural bound, so an append that
+        // could be refused is the bug itself. concat! so this pin's own
+        // source can never satisfy its scan.
+        let forbidden = concat!("n_edge <", " e_src.len()");
+        assert!(
+            !body.contains(forbidden),
+            "process_block re-grew a silent edge-table cap: `{forbidden}`"
+        );
+        // Polarity B: the table must ACTUALLY be resized to the
+        // structural bound (MAX_LOOPS x MAX_LOOPS) — not merely mention
+        // it: the needle is the resize call itself (a comment mentioning
+        // the const while sizing to a literal passed this pin vacuously —
+        // sabotage-caught v117). The fix is present, not just the guard.
+        assert!(
+            body.contains(concat!("resize(MAX_", "SC_EDGES")),
+            "process_block must size the SC edge table to MAX_SC_EDGES"
+        );
+    }
+
 }
 
 /// WINDOWS-PORT W4 contract pins: the RT core (`Proc::process_block`) must
@@ -8240,7 +8504,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
 mod w4_tests {
     /// Extract one indented `fn` body: from `needle` to the first line that
     /// is exactly `    }` (the fn's closing brace — body lines are >= 8).
-    fn extract_fn(src: &str, needle: &str) -> String {
+    pub(super) fn extract_fn(src: &str, needle: &str) -> String {
         let start = src.find(needle).expect("fn not found");
         let rest = &src[start..];
         let end = rest
@@ -9295,5 +9559,4 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         assert_eq!(parse_plugin_target("track.vol"), None);
         assert_eq!(parse_plugin_target("synth:1x"), None);
     }
-
 }
