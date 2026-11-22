@@ -3,8 +3,9 @@
 Machine-readable orientation for agents asked to install, use, build, or
 extend this repo. Humans: see [../README.md](../README.md),
 [INSTALL.md](INSTALL.md), [USAGE.md](USAGE.md), [PLUGINS.md](PLUGINS.md).
-(This file follows the `AGENTS.md` convention — if your tooling looks for a
-root `AGENTS.md`, this is it.)
+(This file follows the `AGENTS.md` convention; there is deliberately no
+root `AGENTS.md` file — if your tooling requires one, point it at
+`docs/AGENT-GUIDE.md`.)
 
 ## What this is
 
@@ -124,7 +125,7 @@ src/            application source (Rust 2021 edition)
                   `n_tracks`, shortcut + MIDI tables + `midi_axis` cal)
   backend.rs      audio-backend contract (W4): BlockIo slot buffers + the
                   per-block rules every backend shim must follow; the RT
-                  entry point itself is `Proc::process_block` (audio.rs)
+                  entry point itself is `Proc::process_block` (audio/mod.rs)
   paths.rs        SINGLE source of base dirs (W2): config_dir()/data_dir()/
                   cache_home() — XDG+HOME on Linux, %APPDATA%/%LOCALAPPDATA%
                   on Windows, SLOOPER_DATA_DIR/SLOOPER_CONFIG_DIR override;
@@ -155,6 +156,11 @@ src/            application source (Rust 2021 edition)
                   via install_all seams, read-only latch is flag-declared,
                   never name-parsed), bridge.rs (`--mcp-bridge` stdio
                   shim). UI pumps requests; execution is UI-thread only.
+                  mcp_settings/ (v108): the `settings.*` family over
+                  Config serde reflection (live vs requires-restart
+                  tiers, `mcp_cfg_pending` overlay); ui/mcp_mixer.rs
+                  (v110): `mixer.*`/`chain.*`/`assets.*` over the GUI's
+                  own setter seams;
                   ui/mcp_windows.rs (v111): the `windows.*` family —
                   stable window ids (prim kinds + DynKind keys), open/
                   close/move/resize/dock/undock, named layout save/restore
@@ -179,7 +185,9 @@ src/            application source (Rust 2021 edition)
                   (strips, MIXER CHAIN window, synth bindings, VST plugin
                   picker), group selection + clipboard, piano-roll window,
                   settings, project prompt/browser, export, MIDI monitor)
-synths/         bundled synth scripts (piano.rs, sampler.rs, drums, pad)
+synths/         bundled synth scripts (piano, sampler, drums, granular,
+                pad, fm, additive, pluck, tri_osc — 9 scripts, all seeded
+                + updated in place)
                 + synth_api.rs
                 + THIRD-PARTY-NOTICES.md (piano model credits)
 effects/        effect-script authoring kit: template.rs (start here),
@@ -193,7 +201,8 @@ tests/packaging.sh  packaging regression test (needs a PKGBUILD; see below)
 assets/icon.png 256x256 app icon (placeholder artwork)
 slooper.desktop  freedesktop menu entry
 docs/           INSTALL.md, USAGE.md, PLUGINS.md, EFFECT-SUITE.md,
-                SIDECHAIN.md (human docs), WINDOWS-PORT.md (the W-series
+                SIDECHAIN.md, SAMPLER-PITCH.md (human docs), MCP-DESIGN.md
+                (the MCP series design spine), WINDOWS-PORT.md (the W-series
                 port log), this file. Tutorials live in the GitHub wiki
 ```
 
@@ -263,7 +272,8 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
    teardown destructors still run → heap-corruption abort at exit.
 3. **`MidiAction::ALL` is position-persistent** — persisted bindings index it
    by slot. New actions may only be APPENDED, never inserted or reordered
-   (MIDI rec was appended: `N_ACTIONS = 137`). The keyboard table persists
+   (the table length IS the contract: `N_ACTIONS = MidiAction::ALL.len()`
+   — currently 140). The keyboard table persists
    positionally too: layout changes require a width bump + a migration arm
    in `midi::migrate_shortcuts`.
 4. **Behavior specs live in tests and docs** (`README.md`, `docs/USAGE.md`,
@@ -345,7 +355,7 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 
 ## Where things are wired (quick grep targets)
 
-- Commands/events: `Cmd::` / `Evt::` in `src/audio.rs` (take placement
+- Commands/events: `Cmd::` / `Evt::` in `src/audio/mod.rs` (take placement
   lands in the manager thread's `Evt::Take` handler)
 - Take sources (v42): the mixer's `a/p/l/m/x` ticks live in `RecSrc`
   (`src/ui.rs`, persisted as `rec_src` + parallel `rec_prev`/`rec_loop`
@@ -375,7 +385,7 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   (sorted, longer length wins), `assets::mix_audio` sums sample-wise.
   Result = NEW asset `merge-a+b` (id = len) written to the primary
   rack's folder; originals untouched.
-- MPE (v42): `Config.mpe` (Settings ▸ Audio; default OFF = legacy omni)
+- MPE (v42): `Config.mpe` (Settings ▸ MPE section; default OFF = legacy omni)
   drives the
   per-device `ChannelStrategy::Mpe` — zone 0 channel 1 is OMNI for
   non-MPE sources, zone 1+ own channels 2..16; expression rides the
@@ -400,7 +410,7 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 - Synth bindings: `App::track_synth` + `synth::Registry` (`src/synth.rs`);
   VSTi bindings encode as `vst2:<abs path>` / `vst3:<abs path>`
   (`vst_synth_encode`)
-- Mixer chain: `FxSlot` (`src/audio.rs`), `App::fx_rows` / `rebuild_fx` +
+- Mixer chain: `FxSlot` (`src/audio/mod.rs`), `App::fx_rows` / `rebuild_fx` +
   the chain window (`src/ui.rs`), persistence `ChainSave` / `Config::chain`
   (migrates legacy `track_fx` + `track_vst`)
 - VST scanning/editing: `src/vsthost.rs` (`scan`, `default_vst_dirs`),
@@ -420,7 +430,7 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   the build.rs-baked `SLOOPER_EXE_PATH`; `SLOOPER_SCAN_INLINE` still
   forces in-process probes on both OSes. OS-split semantics: `w6_*` /
   `w7_*` pins.
-- Loop region math: `loop_wrap`/`region_end` (`src/audio.rs`); handles +
+- Loop region math: `loop_wrap`/`region_end` (`src/audio/mod.rs`); handles +
   modes in the grid toolbar (`src/ui.rs`, `LoopMode`)
 - Project format + migration: `src/project.rs`, `midi::migrate_shortcuts`
 - All bindable actions + key defaults: `MidiAction::ALL`, `SHORTCUT_DEFAULTS` (`src/ui.rs`)

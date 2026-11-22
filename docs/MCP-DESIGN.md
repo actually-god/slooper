@@ -410,12 +410,19 @@ header — titles/assignees are the board's):
   pin over every serialized field) + requires-restart fields surfaced, not
   half-applied + **status echo of every MCP write** (goal 1). *Decision
   here:* the card's "consider an MCP resource" is declined — §6 tools-only.
+  *shipped v108:* `src/mcp_settings/` — schema-derived surface over
+  `Config`, live vs requires-restart tiers, `McpPending`/`mcp_cfg_pending`
+  overlay so pending edits never half-apply.
 - **MCP-03** (t_5cd0d1e5, **ui-designer**) — window registry: `PrimKind`
   keys + the `params` key extension (back-compat pinned, §5) +
   `windows.list/open/close/move/resize/dock/undock/save/restore` on the dock
   table (`SideWins.dock` and `dyn_wins.dock` share the `[docked, edge,
   order]` encoding — reuse `apply_win_layout`'s conversions, no new
   encoding); plugin-editor windows list/move/close minimum per the card.
+  *shipped v111* (claimed v108, renumbered when the chain overtook the
+  claim): `src/ui/mcp_windows.rs` — nine tools, stable `win_id` keys,
+  every ack echoes post-change geometry, named layout save/restore via
+  the `WinLayout` config table.
 - **MCP-04** (t_e0c0ad5e, **ui-designer**) — `mixer.list/get/set` (u8 seam
   currency, §6), `chain.list/pick/remove` — **pick is async like the GUI's
   load path: ack immediately with state `loading`, ready-ness observable via

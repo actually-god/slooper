@@ -151,7 +151,7 @@ error instead — start your server, then relaunch.
 
 ## Optional runtime packages
 
-- **rustc** — the per-loop effects framework compiles user effect scripts with
+- **rustc** — the effects framework compiles user effect scripts with
   the system `rustc` (`--edition 2021 --crate-type cdylib`). Without rustc the
   app runs normally; custom effects just list as "compiler not found".
 - **ffmpeg** — enables exporting loops/projects as MP3 or OGG Vorbis. WAV and
@@ -161,15 +161,26 @@ error instead — start your server, then relaunch.
 
 | Path | Purpose |
 | --- | --- |
-| `$XDG_CONFIG_HOME/slooper/config.json` (fallback `~/.config/slooper/config.json`) | port selections, MIDI/keyboard bindings, effect parameter values, metronome/quantize settings |
-| `~/.local/share/slooper/effects/` | effect-script folder (created on first run, seeded with `template.rs` + the ABI contract file; the location is user-configurable in the FX window) |
+| `$XDG_CONFIG_HOME/slooper/config.json` (fallback `~/.config/slooper/config.json`) | port selections, MIDI/keyboard bindings, effect parameter values, metronome/quantize settings, backend + MCP settings |
+| `~/.local/share/slooper/effects/` | effect-script folder (created on first run, seeded with `template.rs`, the ABI contract file and the 23 bundled effects + their factory presets; app-updated copies are re-seeded in place with a `.bak`; the location is user-configurable in the FX window) |
+| `~/.local/share/slooper/synths/` | bundled script synths (piano, sampler, drums, granular, pad, fm, additive, pluck, tri-osc), same in-place update rule |
+| `~/.local/share/slooper/samples/` | seeded TR-808 pack + stock drum kit — so a drum track makes sound on first launch (the 808 pack self-heals if deleted) |
+| `~/.local/share/slooper/mcp-endpoint.json` | MCP server endpoint + token (only when the server is enabled — see the AUTOMATION (MCP) settings section) |
+| `~/.local/share/slooper-projects/` | default project folder (`project_dir` in the config) |
+| `~/.cache/slooper-synth/` (and `…-fx/`) | compiled script synths/effects cache |
+
+Windows equivalents live under `%APPDATA%\slooper` (config) and
+`%LOCALAPPDATA%\slooper` (everything else) — see the Windows section.
 
 ## Windows
 
-**Download (recommended):** grab `slooper-win64.zip` from
+**Download (recommended):** from
 [the GitHub Releases page](https://github.com/actually-god/slooper/releases)
-— unzip anywhere, run `slooper.exe`. No installer, no admin rights, no
-console window; the app icon is embedded in the exe. Windows 10+ x64.
+grab either **`slooper-<version>-win64-setup.exe`** — a machine-wide
+installer (Start-menu group, uninstall entry, desktop shortcut option) —
+or **`slooper-win64.zip`**: unzip anywhere and run `slooper.exe`, no
+installer, no admin rights. Both are the same app: no console window, the
+app icon is embedded in the exe. Windows 10+ x64.
 Config in `%APPDATA%\slooper\config.json`, data (effects, synths, cache,
 projects) under `%LOCALAPPDATA%\slooper`.
 
