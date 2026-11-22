@@ -7095,7 +7095,7 @@ mod tests {
             .position(|d| d.program_change)
             .expect("program cell");
         for &(v, want) in &[
-            (0.0f32, 0i32),
+            (0.0f32, 0usize),
             (1.0 / 3.0, 1),
             (0.5, 2),
             (1.0, 3),
@@ -7120,7 +7120,7 @@ mod tests {
         for i in 0..e.programs().len() {
             assert!(e.select_program(i), "select {i}");
             e.refresh_program();
-            assert_eq!(e.current_program(), Some(i as i32), "select->refresh round-trip {i}");
+            assert_eq!(e.current_program(), Some(i), "select->refresh round-trip {i}");
         }
     }
 
