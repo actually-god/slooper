@@ -548,6 +548,44 @@ impl Default for EvSlot {
 
 // ============================================================== host =====
 //
+/// v117 (card t_a4175cb0): the plugin->host direction firewall. Every
+/// host-implemented CLAP callback body runs inside this. A Rust panic MUST
+/// NOT unwind out of a callback frame: the catchers above are the plugin's
+/// C++ frames — libstdc++ `catch(...)` treats the Rust panic as a foreign
+/// object and `_Unwind_DeleteException` lands in std's `__rust_drop_panic`
+/// = "Rust panics must be rethrown" ABORT (measured: ffiguard's own catch
+/// cannot be the recoverable landing site for a Rust panic; and the
+/// personality installs Rust `catch_unwind` landing pads for ANY class, so
+/// a shim-level catch_unwind would break the C++ throw path instead).
+/// Catching HERE, at the boundary, converts the panic into the callback's
+/// safe default (null/false/0 — the same values a declining host returns)
+/// and leaves the plugin's call intact. The C-unwind ABI on the callbacks
+/// stays as the doctrine defense (a future callback that legitimately
+/// propagates a foreign unwind cannot re-introduce the abort at its own
+/// frame).
+#[inline]
+fn host_cb_guard<T: Default, F: FnOnce() -> T>(f: F) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            let s = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            eprintln!("[slooper] CLAP host callback panicked (degraded to default): {s}");
+            T::default()
+        }
+    }
+}
+
+/// v117: counts how often the panic trap below `host_log_cb` fires, so the
+/// pin can prove the plugin's re-entry COMPLETED (trap hit exactly N times)
+/// rather than merely that the process is still up.
+#[cfg(test)]
+pub(crate) static V117_TRAP_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // A process-wide `clap_host_t` handed to every plugin. `get_extension`
 // answers only `clap.log` (everything else is optional per spec; plugins
 // must tolerate NULL). The request_* hooks are documented no-ops.
@@ -617,13 +655,15 @@ unsafe extern "C-unwind" fn host_preset_loaded(
     location: *const c_char,
     load_key: *const c_char,
 ) {
-    if let Some(slot) = unsafe { preset_slot_of(host) } {
-        let mut report = slot.report.lock().unwrap_or_else(|p| p.into_inner());
-        *report = Some(crate::vsthost::PresetLoadEvent::Loaded {
-            location: unsafe { cstr_to_string(location) },
-            load_key: (!load_key.is_null()).then(|| unsafe { cstr_to_string(load_key) }),
-        });
-    }
+    host_cb_guard(|| {
+        if let Some(slot) = unsafe { preset_slot_of(host) } {
+            let mut report = slot.report.lock().unwrap_or_else(|p| p.into_inner());
+            *report = Some(crate::vsthost::PresetLoadEvent::Loaded {
+                location: unsafe { cstr_to_string(location) },
+                load_key: (!load_key.is_null()).then(|| unsafe { cstr_to_string(load_key) }),
+            });
+        }
+    })
 }
 
 unsafe extern "C-unwind" fn host_preset_error(
@@ -634,18 +674,20 @@ unsafe extern "C-unwind" fn host_preset_error(
     _os_error: i32,
     msg: *const c_char,
 ) {
-    if let Some(slot) = unsafe { preset_slot_of(host) } {
-        let mut report = slot.report.lock().unwrap_or_else(|p| p.into_inner());
-        *report = Some(crate::vsthost::PresetLoadEvent::Failed {
-            location: unsafe { cstr_to_string(location) },
-            load_key: (!load_key.is_null()).then(|| unsafe { cstr_to_string(load_key) }),
-            message: if msg.is_null() {
-                "plugin reported no message".to_string()
-            } else {
-                unsafe { cstr_to_string(msg) }
-            },
-        });
-    }
+    host_cb_guard(|| {
+        if let Some(slot) = unsafe { preset_slot_of(host) } {
+            let mut report = slot.report.lock().unwrap_or_else(|p| p.into_inner());
+            *report = Some(crate::vsthost::PresetLoadEvent::Failed {
+                location: unsafe { cstr_to_string(location) },
+                load_key: (!load_key.is_null()).then(|| unsafe { cstr_to_string(load_key) }),
+                message: if msg.is_null() {
+                    "plugin reported no message".to_string()
+                } else {
+                    unsafe { cstr_to_string(msg) }
+                },
+            });
+        }
+    })
 }
 
 // ======================================== v79 preset discovery ======
@@ -710,59 +752,67 @@ unsafe extern "C-unwind" fn idx_declare_filetype(
     ix: *const ffi::ClapPresetDiscoveryIndexer,
     ft: *const ffi::ClapPresetDiscoveryFiletype,
 ) -> bool {
-    let Some(ctx) = (unsafe { index_ctx_of(ix) }) else {
-        return false;
-    };
-    if ft.is_null() {
-        return false;
-    }
-    let ext = unsafe { cstr_to_string((*ft).file_extension) }.to_lowercase();
-    if let Ok(mut v) = ctx.filetypes.lock() {
-        if v.len() < 64 {
-            v.push(ext);
+    host_cb_guard(|| {
+        let Some(ctx) = (unsafe { index_ctx_of(ix) }) else {
+            return false;
+        };
+        if ft.is_null() {
+            return false;
         }
-    }
-    true
+        let ext = unsafe { cstr_to_string((*ft).file_extension) }.to_lowercase();
+        if let Ok(mut v) = ctx.filetypes.lock() {
+            if v.len() < 64 {
+                v.push(ext);
+            }
+        }
+        true
+    })
 }
 
 unsafe extern "C-unwind" fn idx_declare_location(
     ix: *const ffi::ClapPresetDiscoveryIndexer,
     loc: *const ffi::ClapPresetDiscoveryLocation,
 ) -> bool {
-    let Some(ctx) = (unsafe { index_ctx_of(ix) }) else {
-        return false;
-    };
-    if loc.is_null() {
-        return false;
-    }
-    let (kind, flags) = unsafe { ((*loc).kind, (*loc).flags) };
-    let location = unsafe {
-        if (*loc).location.is_null() {
-            None
-        } else {
-            Some(cstr_to_string((*loc).location))
+    host_cb_guard(|| {
+        let Some(ctx) = (unsafe { index_ctx_of(ix) }) else {
+            return false;
+        };
+        if loc.is_null() {
+            return false;
         }
-    };
-    if let Ok(mut v) = ctx.locations.lock() {
-        if v.len() < 32 {
-            v.push((kind, flags, location));
+        let (kind, flags) = unsafe { ((*loc).kind, (*loc).flags) };
+        let location = unsafe {
+            if (*loc).location.is_null() {
+                None
+            } else {
+                Some(cstr_to_string((*loc).location))
+            }
+        };
+        if let Ok(mut v) = ctx.locations.lock() {
+            if v.len() < 32 {
+                v.push((kind, flags, location));
+            }
         }
-    }
-    true
+        true
+    })
 }
 
 unsafe extern "C-unwind" fn idx_declare_soundpack(
     _ix: *const ffi::ClapPresetDiscoveryIndexer,
     _sp: *const ffi::ClapPresetDiscoverySoundpack,
 ) -> bool {
-    true // sound packs are display metadata; the crawl does not need them
+    host_cb_guard(|| {
+        true // sound packs are display metadata; the crawl does not need them
+    })
 }
 
 unsafe extern "C-unwind" fn idx_get_extension(
     _ix: *const ffi::ClapPresetDiscoveryIndexer,
     _id: *const c_char,
 ) -> *const c_void {
-    std::ptr::null() // no indexer extensions offered (invalidation etc. unhosted)
+    host_cb_guard(|| {
+        std::ptr::null() // no indexer extensions offered (invalidation etc. unhosted)
+    })
 }
 
 unsafe extern "C-unwind" fn recv_on_error(
@@ -770,11 +820,13 @@ unsafe extern "C-unwind" fn recv_on_error(
     _os_error: i32,
     msg: *const c_char,
 ) {
-    if let Some(ctx) = unsafe { run_ctx_of(recv) } {
-        if ctx.errors.len() < 16 {
-            ctx.errors.push(unsafe { cstr_to_string(msg) });
+    host_cb_guard(|| {
+        if let Some(ctx) = unsafe { run_ctx_of(recv) } {
+            if ctx.errors.len() < 16 {
+                ctx.errors.push(unsafe { cstr_to_string(msg) });
+            }
         }
-    }
+    })
 }
 
 unsafe extern "C-unwind" fn recv_begin_preset(
@@ -782,48 +834,58 @@ unsafe extern "C-unwind" fn recv_begin_preset(
     name: *const c_char,
     load_key: *const c_char,
 ) -> bool {
-    let Some(ctx) = (unsafe { run_ctx_of(recv) }) else {
-        return false;
-    };
-    if name.is_null() {
-        return true; // name is mandatory; ignore incomplete entries
-    }
-    if ctx.out.len() >= DISCOVERY_MAX_PRESETS {
-        return false; // tells the provider to stop calling back
-    }
-    ctx.out.push(PresetLocation {
-        name: unsafe { cstr_to_string(name) },
-        load_key: unsafe {
-            if load_key.is_null() {
-                None
-            } else {
-                Some(cstr_to_string(load_key))
-            }
-        },
-        kind: ctx.kind,
-        location: ctx.location.clone(),
-        factory: ctx.factory,
-    });
-    true
+    host_cb_guard(|| {
+        let Some(ctx) = (unsafe { run_ctx_of(recv) }) else {
+            return false;
+        };
+        if name.is_null() {
+            return true; // name is mandatory; ignore incomplete entries
+        }
+        if ctx.out.len() >= DISCOVERY_MAX_PRESETS {
+            return false; // tells the provider to stop calling back
+        }
+        ctx.out.push(PresetLocation {
+            name: unsafe { cstr_to_string(name) },
+            load_key: unsafe {
+                if load_key.is_null() {
+                    None
+                } else {
+                    Some(cstr_to_string(load_key))
+                }
+            },
+            kind: ctx.kind,
+            location: ctx.location.clone(),
+            factory: ctx.factory,
+        });
+        true
+    })
 }
 
 unsafe extern "C-unwind" fn recv_pid(
     _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _pid: *const ffi::ClapUniversalPluginId,
 ) {
+    host_cb_guard(|| {
+    })
 }
 unsafe extern "C-unwind" fn recv_str1(
     _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _s: *const c_char,
 ) {
+    host_cb_guard(|| {
+    })
 }
 unsafe extern "C-unwind" fn recv_ts(_r: *const ffi::ClapPresetDiscoveryMetadataReceiver, _a: u64, _b: u64) {
+    host_cb_guard(|| {
+    })
 }
 unsafe extern "C-unwind" fn recv_str2(
     _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _a: *const c_char,
     _b: *const c_char,
 ) {
+    host_cb_guard(|| {
+    })
 }
 
 /// One `get_metadata` call against one file (or the plugin container).
@@ -892,42 +954,49 @@ unsafe extern "C-unwind" fn host_get_extension(
     _host: *const ffi::ClapHost,
     id: *const c_char,
 ) -> *const c_void {
-    if id.is_null() {
-        return std::ptr::null();
-    }
-    let id = CStr::from_ptr(id);
-    if id.to_bytes() == b"clap.log" {
-        return &HOST.log as *const _ as *const c_void;
-    }
-    // v67: clap.preset-load - the plugin's notification channel for
-    // presets IT loaded (the CLAP v1 ABI has no host-side enumeration).
-    // Primary + compat ids both answered.
-    if id == ffi::CLAP_EXT_PRESET_LOAD_C || id == ffi::CLAP_EXT_PRESET_LOAD_COMPAT_C {
-        return &PRESET_LOAD as *const _ as *const c_void;
-    }
-    std::ptr::null()
+    host_cb_guard(|| {
+        if id.is_null() {
+            return std::ptr::null();
+        }
+        let id = CStr::from_ptr(id);
+        if id.to_bytes() == b"clap.log" {
+            return &HOST.log as *const _ as *const c_void;
+        }
+        // v67: clap.preset-load - the plugin's notification channel for
+        // presets IT loaded (the CLAP v1 ABI has no host-side enumeration).
+        // Primary + compat ids both answered.
+        if id == ffi::CLAP_EXT_PRESET_LOAD_C || id == ffi::CLAP_EXT_PRESET_LOAD_COMPAT_C {
+            return &PRESET_LOAD as *const _ as *const c_void;
+        }
+        std::ptr::null()
+    })
 }
 
-unsafe extern "C-unwind" fn host_noop(_host: *const ffi::ClapHost) {}
+unsafe extern "C-unwind" fn host_noop(_host: *const ffi::ClapHost) { host_cb_guard(|| {}) }
 
 unsafe extern "C-unwind" fn host_log_cb(_host: *const ffi::ClapHost, severity: u32, msg: *const c_char) {
-    if msg.is_null() {
-        return;
-    }
-    let m = CStr::from_ptr(msg).to_string_lossy();
-    // v117 test trap (pin v117_clap_host_log_panic_parks_and_survives): a
-    // host-side panic re-entered from plugin code during a guarded trip
-    // must reach the ffiguard catch (park) — never the old abort. The C-unwind
-    // frame is what makes the difference; this trap is how the pin proves it.
-    #[cfg(test)]
-    if std::env::var_os("SLOOPER_TEST_PANIC_HOST_LOG").is_some() {
-        panic!("v117 test trap: panic inside the CLAP host log callback");
-    }
-    // Fatal/error always print; lower severities behind an env flag so a
-    // chatty plugin cannot spam a release session.
-    if severity <= 2 || std::env::var_os("SLOOPER_CLAP_LOG").is_some() {
-        eprintln!("[clap:{severity}] {m}");
-    }
+    host_cb_guard(|| {
+        if msg.is_null() {
+            return;
+        }
+        let m = CStr::from_ptr(msg).to_string_lossy();
+        // v117 test trap (pin v117_clap_host_log_panic_survives): panic the
+        // host callback while plugin frames sit below it on the stack. The
+        // host_cb_guard boundary catch must convert this into the default
+        // return; remove the boundary catch and the SAME trap unwinds into
+        // the plugin's C++ layer and ABORTS the process ("Rust panics must
+        // be rethrown") — that is the bug class this pin holds shut.
+        #[cfg(test)]
+        if std::env::var_os("SLOOPER_TEST_PANIC_HOST_LOG").is_some() {
+            V117_TRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("v117 test trap: panic inside the CLAP host log callback");
+        }
+        // Fatal/error always print; lower severities behind an env flag so a
+        // chatty plugin cannot spam a release session.
+        if severity <= 2 || std::env::var_os("SLOOPER_CLAP_LOG").is_some() {
+            eprintln!("[clap:{severity}] {m}");
+        }
+    })
 }
 
 // ====================================================== lib/entry cache ===
@@ -1127,39 +1196,45 @@ struct OutBuf {
 const OUT_RING: usize = 256;
 
 unsafe extern "C-unwind" fn cb_in_size(list: *const ffi::ClapInputEvents) -> u32 {
-    let b = unsafe { &*((*list).ctx as *const InBuf) };
-    b.ptrs.len() as u32
+    host_cb_guard(|| {
+        let b = unsafe { &*((*list).ctx as *const InBuf) };
+        b.ptrs.len() as u32
+    })
 }
 
 unsafe extern "C-unwind" fn cb_in_get(
     list: *const ffi::ClapInputEvents,
     index: u32,
 ) -> *const ffi::ClapEventHeader {
-    let b = unsafe { &*((*list).ctx as *const InBuf) };
-    match b.ptrs.get(index as usize) {
-        Some(p) => *p,
-        None => std::ptr::null(),
-    }
+    host_cb_guard(|| {
+        let b = unsafe { &*((*list).ctx as *const InBuf) };
+        match b.ptrs.get(index as usize) {
+            Some(p) => *p,
+            None => std::ptr::null(),
+        }
+    })
 }
 
 unsafe extern "C-unwind" fn cb_out_try_push(
     list: *const ffi::ClapOutputEvents,
     event: *const ffi::ClapEventHeader,
 ) -> bool {
-    let b = unsafe { &mut *((*list).ctx as *mut OutBuf) };
-    b.received += 1;
-    let n = unsafe { (*event).size as usize };
-    if n == 0 || n > ffi::EVENT_SLOT {
-        return false;
-    }
-    let dst = &mut b.slots[b.head];
-    // Overwrite the oldest slot when full: output events are advisory in v1.
-    unsafe {
-        std::ptr::copy_nonoverlapping(event as *const u8, dst.0.as_mut_ptr(), n);
-    }
-    b.head = (b.head + 1) % OUT_RING;
-    b.count = (b.count + 1).min(OUT_RING);
-    true
+    host_cb_guard(|| {
+        let b = unsafe { &mut *((*list).ctx as *mut OutBuf) };
+        b.received += 1;
+        let n = unsafe { (*event).size as usize };
+        if n == 0 || n > ffi::EVENT_SLOT {
+            return false;
+        }
+        let dst = &mut b.slots[b.head];
+        // Overwrite the oldest slot when full: output events are advisory in v1.
+        unsafe {
+            std::ptr::copy_nonoverlapping(event as *const u8, dst.0.as_mut_ptr(), n);
+        }
+        b.head = (b.head + 1) % OUT_RING;
+        b.count = (b.count + 1).min(OUT_RING);
+        true
+    })
 }
 
 // ============================================================ RT state ====
@@ -1883,10 +1958,12 @@ impl StageEntry for ClapStageEntry {
             data: *const c_void,
             n: u64,
         ) -> i64 {
-            let buf = unsafe { &mut *((*stream).ctx as *mut Vec<u8>) };
-            let src = unsafe { std::slice::from_raw_parts(data as *const u8, n as usize) };
-            buf.extend_from_slice(src);
-            n as i64
+            host_cb_guard(|| {
+                let buf = unsafe { &mut *((*stream).ctx as *mut Vec<u8>) };
+                let src = unsafe { std::slice::from_raw_parts(data as *const u8, n as usize) };
+                buf.extend_from_slice(src);
+                n as i64
+                    })
         }
         let os = ffi::ClapOStream {
             ctx: &mut buf as *mut Vec<u8> as *mut c_void,
@@ -2255,20 +2332,22 @@ fn open_inner(
                 buffer: *mut c_void,
                 n: u64,
             ) -> i64 {
-                let c = unsafe { &mut *((*stream).ctx as *mut Cur) };
-                let avail = (c.bytes.len() - c.pos).min(n as usize);
-                if avail == 0 {
-                    return 0;
-                }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        c.bytes.as_ptr().add(c.pos),
-                        buffer as *mut u8,
-                        avail,
-                    );
-                }
-                c.pos += avail;
-                avail as i64
+                host_cb_guard(|| {
+                    let c = unsafe { &mut *((*stream).ctx as *mut Cur) };
+                    let avail = (c.bytes.len() - c.pos).min(n as usize);
+                    if avail == 0 {
+                        return 0;
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            c.bytes.as_ptr().add(c.pos),
+                            buffer as *mut u8,
+                            avail,
+                        );
+                    }
+                    c.pos += avail;
+                    avail as i64
+                            })
             }
             let mut cur = Cur {
                 bytes: bytes.to_vec(),
@@ -3284,45 +3363,105 @@ pub(crate) mod tests {
             let bad = format!("extern \"C\" fn {pfx}");
             assert!(!src.contains(&bad), "a plain-\"C\" callback survived with prefix {pfx}");
         }
+        // Boundary firewall (the layer that makes a host-side panic
+        // RECOVERABLE): every host-impl callback body runs inside
+        // host_cb_guard — checked per name (window: fn head to the next
+        // top-level item) plus a global count that no wrap can quietly
+        // vanish or double up.
+        let mut guarded_n = 0;
+        for n in [
+            "host_preset_loaded",
+            "host_preset_error",
+            "host_get_extension",
+            "host_noop",
+            "host_log_cb",
+            "cb_in_size",
+            "cb_in_get",
+            "cb_out_try_push",
+            "idx_declare_filetype",
+            "idx_declare_location",
+            "idx_declare_soundpack",
+            "idx_get_extension",
+            "recv_on_error",
+            "recv_begin_preset",
+            "recv_pid",
+            "recv_str1",
+            "recv_ts",
+            "recv_str2",
+            "wr",
+            "rd",
+        ] {
+            let key = format!("fn {n}(");
+            let i = src.find(&key).unwrap_or_else(|| panic!("host callback {n} vanished"));
+            let rest = &src[i..];
+            let mut end = ["\nunsafe extern", "\nfn ", "\nstatic ", "\n/// ", "\n// "]
+                .iter()
+                .filter_map(|m| rest.find(m))
+                .min()
+                .unwrap_or(rest.len());
+            if n == "wr" || n == "rd" {
+                // fn-LOCAL callbacks: the top-level markers sit far outside
+                // their bodies — cap the window so a sibling's guard can
+                // never stand in for their own.
+                end = end.min(1200);
+            }
+            let body = &rest[..end];
+            assert!(
+                body.contains("host_cb_guard("),
+                "host callback {n} body must run inside host_cb_guard"
+            );
+            guarded_n += 1;
+        }
+        assert_eq!(guarded_n, 20, "full class inventoried");
+        // concat!-split needle: the raw source bytes of this very assert
+        // must not match the pattern it counts (vacuity guard).
+        let wraps = src.matches(concat!("host_cb_guard", "(|| ")).count();
+        assert_eq!(wraps, 20, "every host-impl callback body must be wrapped (found {wraps})");
     }
 
-    /// End-to-end proof of WHAT the attribute buys: with the panic trap
-    /// armed, the fixture plugin's re-entry into `host->log` panics INSIDE
-    /// the host frame while plugin frames sit between it and our guard.
-    /// C-unwind: the panic unwinds through the plugin frame into
-    /// ffiguard::guarded — the entry PARKS, emits silence, the process
-    /// stays ALIVE. On a plain "C" frame (pre-v117 or sabotaged) this pin
-    /// does not fail soft: it SIGABRTs the test process — that IS the bug
-    /// class (v116 sabotage doctrine).
+    /// End-to-end proof of what the boundary catch buys: with the panic
+    /// trap armed, the fixture plugin's re-entry into `host->log` panics
+    /// INSIDE the host frame while plugin frames sit below it on the stack.
+    /// The `host_cb_guard` boundary catch converts the panic into the
+    /// callback's default return: the plugin's `process()` completes, the
+    /// block renders (echo passthrough — the fixture never writes output),
+    /// the entry is UNTOUCHED. Pre-v117 (plain-"C" frame) the panic aborted
+    /// at the callback frame; with C-unwind but NO boundary catch it
+    /// aborts in std's `__rust_drop_panic` after the plugin's catch-all
+    /// swallows it ("Rust panics must be rethrown") — both sabotages make
+    /// this pin SIGABRT (it cannot fail soft; that IS the bug class).
     #[cfg(not(windows))]
     #[test]
-    fn v117_clap_host_log_panic_parks_and_survives() {
+    fn v117_clap_host_log_panic_survives() {
+        use std::sync::atomic::Ordering::Relaxed;
         let e = throw_entry("hostcb");
+        let hits0 = V117_TRAP_HITS.load(Relaxed);
         assert!(!e.is_dead(), "fresh entry is not parked");
         std::env::set_var("SLOOPER_TEST_PANIC_HOST_LOG", "1");
         let input = [1.0f32; 1024];
         let mut out = [0.0f32; 1024];
         e.process(&input, &mut out);
         std::env::remove_var("SLOOPER_TEST_PANIC_HOST_LOG");
-        assert!(
-            e.is_dead(),
-            "a panic inside the host log callback, re-entered from plugin code, must PARK the entry"
+        // (a) The plugin re-entered host->log once per internal 512-frame
+        // block (1024 fed = 2), every panic was caught, and process()
+        // RETURNED — pre-fix the first trip never returned (SIGABRT).
+        assert_eq!(
+            V117_TRAP_HITS.load(Relaxed),
+            hits0 + 2,
+            "the fixture must re-enter the host log once per armed 512-block"
         );
-        assert!(out.iter().all(|s| *s == 0.0), "the caught trip must emit silence");
-        // Parked stays parked (no re-entry into the plugin):
+        assert!(!e.is_dead(), "a caught host-side panic must not park the plugin entry");
+        // (b) Entry fully healthy after the catches: trap-off trips run the
+        // same callback without re-arming.
         let mut out2 = [0.0f32; 512];
         e.process(&input[..512], &mut out2);
-        assert!(out2.iter().all(|s| *s == 0.0), "parked entry stays bypassed");
-        assert!(e.is_dead());
-        // Negative control: the process lives and a healthy entry (another
-        // DSO) still renders through the SAME guarded machinery.
+        assert_eq!(V117_TRAP_HITS.load(Relaxed), hits0 + 2, "trap-off trips must not hit the trap");
+        assert!(!e.is_dead());
+        // (c) Negative control: a healthy entry (another DSO) renders.
         let g = fixture_entry("gain");
         let mut gout = [0.0f32; 512];
         g.process(&input[..512], &mut gout);
-        assert!(
-            gout[500].abs() > 0.5,
-            "the gain fixture must still pass audio after the caught host-cb panic"
-        );
+        assert!(gout[500].abs() > 0.5, "the gain fixture must still pass audio");
         assert!(!g.is_dead());
     }
 }
