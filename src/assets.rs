@@ -40,6 +40,20 @@ impl Asset {
         self.data.len() as u64
     }
 
+    /// Timeline length of this asset as the arrangement model sees it:
+    /// MIDI patterns are measured at the project `sample_rate`, automation
+    /// curves carry their length in samples, audio is the decoded buffer.
+    /// `App::asset_len` and every `place_auto`/occupancy alen closure
+    /// resolve through this one dispatch so lane logic can never disagree
+    /// with what the grid paints (v112).
+    pub fn timeline_len(&self, sample_rate: u32) -> u64 {
+        match (&self.pattern, &self.automation) {
+            (Some(pat), _) => pat.len_samples(sample_rate.max(1)),
+            (None, Some(auto)) => auto.len_samples.max(0) as u64,
+            (None, None) => self.data.len() as u64,
+        }
+    }
+
     /// Mono audio asset bound to a file (fresh imports / recordings).
     pub fn audio(id: u32, name: String, path: PathBuf, data: Arc<[f32]>, dirty: bool) -> Asset {
         Asset {
