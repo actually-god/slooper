@@ -11,6 +11,12 @@
 //! - Plugin libraries are NEVER dlclosed and their instances are never
 //!   destroyed (no Drop) — a JUCE/Steinberg toolkit teardown while another
 //!   instance is alive is unrecoverable. Entries leak, on purpose.
+//! - v116: EVERY call into the plugin (open/probe handshake, RT
+//!   process/start_processing, chunk save, preset-load, discovery) runs
+//!   inside `crate::ffiguard::guarded` — CLAP ecosystems are C++, and a
+//!   throw reaching a Rust frame would std::terminate the DAW. The catch
+//!   turns the fault into a load error, a bypassed (parked) entry, or an
+//!   empty verdict, with a status echo on stderr. (VST doctrine, v42.)
 //! - All instantiation happens on the shared plugin GUI thread under
 //!   `vst_loader_lock()` (plugin factories touch process-global state).
 //! - The audio thread allocates nothing and takes no locks: one
@@ -34,7 +40,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::vsthost::{
@@ -1019,6 +1025,7 @@ fn features_say_instrument(feats: &[String]) -> bool {
 /// Probe one `.clap` file; one [`ScanProbe`] per plugin inside it. NEVER
 /// instantiates: descriptors answer metadata without a plugin object
 /// (the v17 "never touch a live library twice" rule at its safest).
+#[derive(Debug)]
 pub struct ScanProbe {
     pub plugin_id: String,
     pub name: String,
@@ -1034,7 +1041,16 @@ pub fn probe(path: &Path) -> Result<Vec<ScanProbe>, String> {
 /// `probe` WITHOUT the loader lock — v37: this is the body the forked
 /// scan child runs (it inherits the lock as held-by-nobody and MUST NOT
 /// re-take it; the parent holds it across the fork).
+/// v116: guarded — a C++ throw from the factory calls must reach the scan
+/// as a probe ERROR (file listed as unloadable), never as std::terminate.
 pub(crate) fn probe_unlocked(path: &Path) -> Result<Vec<ScanProbe>, String> {
+    match crate::ffiguard::guarded(|| probe_inner(path)) {
+        Ok(r) => r,
+        Err(e) => Err(format!("CLAP plugin threw during probe (bridge lost?): {e}")),
+    }
+}
+
+fn probe_inner(path: &Path) -> Result<Vec<ScanProbe>, String> {
     let entry = entry_for(path)?;
     let factory =
         unsafe { factory_of(entry) }.ok_or_else(|| "no clap.plugin-factory".to_string())?;
@@ -1170,7 +1186,11 @@ struct RtState {
     /// Consecutive process() errors; a plugin that keeps failing is parked
     /// in passthrough rather than called forever.
     err_streak: u32,
-    dead: bool,
+    /// v116: parked (dead) — set on the audio thread by the RT guard or
+    /// the error streak; AtomicBool + Relaxed so `StageEntry::is_dead`
+    /// (UI/engine bypass display) reads it across threads, matching the
+    /// `RtStageEntry::dead` contract.
+    dead: AtomicBool,
     note_id: i32,
     /// v103 (card t_62c5a14e): bend-range trio — see vsthost::RtState;
     /// same currency rule (queue() rescales roll-space 0xE0, RPN0 rides
@@ -1499,8 +1519,11 @@ impl ClapStageEntry {
     }
 
     /// Process ONE internal 512-frame block on the audio thread.
+    /// v116: the plugin vtable trips here run inside the [`guarded`] block
+    /// loop in [`StageEntry::process`] — a C++ throw unwinds to the host
+    /// catch, which PARKS the entry before the next call reaches this fn.
     unsafe fn process_block(&self, s: &mut RtState) {
-        if s.dead {
+        if s.dead.load(Ordering::Relaxed) {
             s.stage_ol.fill(0.0);
             s.stage_or.fill(0.0);
             return;
@@ -1508,7 +1531,7 @@ impl ClapStageEntry {
         if !s.started {
             // First block on the REAL audio thread: activate processing.
             if !((*self.plugin).start_processing)(self.plugin) {
-                s.dead = true;
+                s.dead.store(true, Ordering::Relaxed);
                 s.stage_ol.fill(0.0);
                 return;
             }
@@ -1538,7 +1561,7 @@ impl ClapStageEntry {
             if s.err_streak > 8 {
                 // A plugin that fails block after block is broken or was
                 // refused: park it in passthrough instead of spinning.
-                s.dead = true;
+                s.dead.store(true, Ordering::Relaxed);
             }
             s.stage_ol.fill(0.0);
             s.stage_or.fill(0.0);
@@ -1645,6 +1668,12 @@ impl ClapStageEntry {
 }
 
 impl StageEntry for ClapStageEntry {
+    /// v116: an RT guard catch PARKS the entry — surface that through the
+    /// v42 seam so engine/UI bypass display treats a dead CLAP exactly
+    /// like a dead VST (Relaxed mirror, same discipline as RtStageEntry).
+    fn is_dead(&self) -> bool {
+        unsafe { (*self.state.get()).dead.load(Ordering::Relaxed) }
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1718,7 +1747,20 @@ impl StageEntry for ClapStageEntry {
             return v.clone();
         }
         let _loader = vst_loader_lock();
-        let v = unsafe { self.discover_unlocked() };
+        // v116: the discovery handshake (provider count/init/get_metadata)
+        // is plugin code — guarded. A caught throw caches the EMPTY list:
+        // retrying per UI refresh would only re-throw, and the parameters
+        // window just shows no presets (echo on stderr).
+        let v = match crate::ffiguard::guarded(|| unsafe { self.discover_unlocked() }) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[slooper] CLAP plugin threw during preset discovery (bridge lost?): {e} \u{201c}{}\u{201d} — no presets listed",
+                    self.name
+                );
+                Vec::new()
+            }
+        };
         *cache = Some(v.clone());
         v
     }
@@ -1751,20 +1793,33 @@ impl StageEntry for ClapStageEntry {
             None => None,
         };
         let _loader = vst_loader_lock();
-        let ok = unsafe {
+        // v116: from_location is plugin code — guarded. A caught throw
+        // surfaces as a plain load ERROR (the PARAMETERS window echoes it);
+        // the report slot is drained either way so a swallowed throw can
+        // not leave a ghost report for the pump to echo later.
+        let trip = crate::ffiguard::guarded(|| unsafe {
             ((*self.preset_load).from_location)(
                 self.plugin,
                 kind,
                 loc_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
                 key_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             )
-        };
+        });
         let report = self
             .preset_slot
             .report
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        let ok = match trip {
+            Ok(ok) => ok,
+            Err(e) => {
+                return Err(format!(
+                    "CLAP plugin \u{201c}{}\u{201d} threw during preset load (bridge lost?): {e}",
+                    self.name
+                ))
+            }
+        };
         if ok {
             if let Some(PresetLoadEvent::Failed { message, .. }) = report {
                 return Err(message); // accepted, then contradicted: error wins
@@ -1815,7 +1870,20 @@ impl StageEntry for ClapStageEntry {
             ctx: &mut buf as *mut Vec<u8> as *mut c_void,
             write: wr,
         };
-        let ok = unsafe { ((*self.state_ext).save)(self.plugin, &os) };
+        let ok = match crate::ffiguard::guarded(|| unsafe {
+            ((*self.state_ext).save)(self.plugin, &os)
+        }) {
+            Ok(ok) => ok,
+            // v116: a save-time throw (dead bridge) degrades to "no state"
+            // — the entry is NOT parked (GUI-side fault, RT may be fine).
+            Err(e) => {
+                eprintln!(
+                    "[slooper] CLAP plugin threw during state save (bridge lost?): {e} \u{201c}{}\u{201d} — state not captured",
+                    self.name
+                );
+                return None;
+            }
+        };
         ok.then_some(buf)
     }
 
@@ -1832,29 +1900,50 @@ impl StageEntry for ClapStageEntry {
             s.echo.drop_front(dropped);
         }
 
-        while s.in_ring.len() >= VST_BLOCK {
-            s.in_ring.drain_into(&mut s.stage_l);
-            s.stage_r.copy_from_slice(&s.stage_l);
-            s.stage_ol.fill(0.0);
-            s.stage_or.fill(0.0);
-            // v103: adopt range change, announce eagerly on ch0 (see the
-            // vsthost process_inner twin for the full contract).
-            let br = s.bend_range.load(Ordering::Relaxed);
-            if br != s.bend_seen {
-                if s.bend_seen != u8::MAX {
-                    s.bend_announced = 0;
+        // v116: FIREWALL BOUNDARY for the CLAP RT path — the twin of the
+        // v42 guard at `RtStageEntry::process`. A plugin that throws
+        // (dead wine bridge, hostile C++ internals) is caught here, PARKED,
+        // and bypassed from the next block on; the DAW survives. The loop
+        // region is deliberately destructor-free on the unwind path (all
+        // buffers live in `RtState`), so the foreign exception only runs
+        // drop glue on plugin frames on its way to the C++ catch.
+        if let Err(e) = crate::ffiguard::guarded(|| {
+            while s.in_ring.len() >= VST_BLOCK {
+                s.in_ring.drain_into(&mut s.stage_l);
+                s.stage_r.copy_from_slice(&s.stage_l);
+                s.stage_ol.fill(0.0);
+                s.stage_or.fill(0.0);
+                // v103: adopt range change, announce eagerly on ch0 (see the
+                // vsthost process_inner twin for the full contract).
+                let br = s.bend_range.load(Ordering::Relaxed);
+                if br != s.bend_seen {
+                    if s.bend_seen != u8::MAX {
+                        s.bend_announced = 0;
+                    }
+                    for m in crate::vsthost::rpn0_burst(0, br) {
+                        self.push_q(s, m, s.abs_processed);
+                    }
+                    s.bend_announced |= 1;
+                    s.bend_seen = br;
                 }
-                for m in crate::vsthost::rpn0_burst(0, br) {
-                    self.push_q(s, m, s.abs_processed);
-                }
-                s.bend_announced |= 1;
-                s.bend_seen = br;
+                // SAFETY: audio thread only; `s` is the single live RtState.
+                unsafe { self.process_block(s) };
+                s.abs_processed += VST_BLOCK as i64;
+                let got = s.stage_ol.len().min(VST_BLOCK);
+                s.out_ring.push_slice(&s.stage_ol[..got]);
             }
-            // SAFETY: audio thread only; `s` is the single live RtState.
-            unsafe { self.process_block(s) };
-            s.abs_processed += VST_BLOCK as i64;
-            let got = s.stage_ol.len().min(VST_BLOCK);
-            s.out_ring.push_slice(&s.stage_ol[..got]);
+        }) {
+            s.dead.store(true, Ordering::Relaxed);
+            // A throw can interrupt `fill_events` mid-staging: drop the
+            // staged list so the plugin is never handed stale event slots.
+            s.ev_count = 0;
+            s.inbuf_data.ptrs.clear();
+            eprintln!(
+                "[slooper] CLAP plugin threw during process (bridge lost?): {e} \u{201c}{}\u{201d} bypassed; remove and re-add it to restore sound",
+                self.name
+            );
+            output[..n].fill(0.0);
+            return;
         }
 
         let mut off = 0usize;
@@ -1909,7 +1998,25 @@ pub fn open(
 
 /// [`open`]'s body WITHOUT the loader lock: `vsthost::open_inner` calls
 /// this while already holding it (the lock is not reentrant).
+/// v116: guarded end-to-end — the WHOLE handshake is plugin code (factory
+/// walk, create_plugin, init, get_extension, params, ports, activate,
+/// state.load). Any throw becomes a load ERROR (chain row shows the
+/// failure), never std::terminate. A half-built instance stays leaked
+/// (standing policy — destroy semantics of a thrown init are plugin-defined).
 pub(crate) fn open_unlocked(
+    path: &Path,
+    plugin_id: Option<&str>,
+    sample_rate: u32,
+    saved: Option<&[f32]>,
+    state: Option<&[u8]>,
+) -> Result<std::sync::Arc<ClapStageEntry>, String> {
+    match crate::ffiguard::guarded(|| open_inner(path, plugin_id, sample_rate, saved, state)) {
+        Ok(r) => r,
+        Err(e) => Err(format!("CLAP plugin threw during open (bridge lost?): {e}")),
+    }
+}
+
+fn open_inner(
     path: &Path,
     plugin_id: Option<&str>,
     sample_rate: u32,
@@ -2220,7 +2327,7 @@ pub(crate) fn open_unlocked(
         last_pg: u64::MAX, // force first-block sync of every cell
         started: false,
         err_streak: 0,
-        dead: false,
+        dead: AtomicBool::new(false),
         note_id: 0,
         bend_range: bend_range.clone(),
         bend_seen: u8::MAX,
@@ -2825,5 +2932,170 @@ pub(crate) mod tests {
         );
         assert_eq!(e.plug_value(8), Some(100.0), "pressure preserved");
         assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
+    }
+
+    // ================================================================ v116
+    // ffiguard coverage over the CLAP backend (card t_cb95ff24): a C++
+    // throw from ANY plugin call site must be caught, surfaced, and
+    // survived — never std::terminate. The fixtures are real C++ throws
+    // (clap_fixture_throw.cpp), so pre-guard these pins don't fail soft:
+    // they ABORT the test process (that IS the bug class). unix-only:
+    // Windows builds compile the no-shim `guarded` fallback by design.
+
+    /// Compile the throw-class fixture (C++: `$CXX` || `c++`) into
+    /// `target/clap-fixture/fixture-throw.clap`, mtime-stale like
+    /// [`fixture_clap`]; None + silent skip when no C++ compiler exists.
+    #[cfg(not(windows))]
+    pub fn fixture_clap_throw() -> Option<PathBuf> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src = manifest.join("vendor/clap-headers/fixture/clap_fixture_throw.cpp");
+        let out_dir = manifest.join("target/clap-fixture");
+        let out = out_dir.join("fixture-throw.clap");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let stale = match (std::fs::metadata(&out), std::fs::metadata(&src)) {
+            (Ok(o), Ok(s)) => o.modified().ok()? < s.modified().ok()?,
+            _ => true,
+        };
+        if stale {
+            let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
+            let status = std::process::Command::new(cxx)
+                .arg("-shared")
+                .arg("-fPIC")
+                .arg("-O1")
+                .arg("-I")
+                .arg(manifest.join("vendor/clap-headers/include"))
+                .arg(&src)
+                .arg("-o")
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .ok()?;
+            if !status.success() {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    #[cfg(not(windows))]
+    fn throw_entry(which: &str) -> std::sync::Arc<ClapStageEntry> {
+        let p = fixture_clap_throw().expect("throw fixture compiled");
+        let id = format!("com.slooper.fixture-throw-{which}");
+        open(&p, Some(&id), 48_000, None, None).unwrap_or_else(|e| panic!("open {id}: {e}"))
+    }
+
+    /// R1: a throw from `process()` on the audio thread must land in the
+    /// guard, PARK the entry (visible through the v42 `is_dead` seam),
+    /// emit silence, and keep the process ALIVE — the exact scenario that
+    /// pre-v116 took the whole DAW down. Negative control: the park is
+    /// per-entry; a healthy plugin still renders.
+    #[cfg(not(windows))]
+    #[test]
+    fn v116_clap_process_throw_parks_and_survives() {
+        let e = throw_entry("proc");
+        assert!(!e.is_dead(), "fresh entry is not parked");
+        let input = [1.0f32; 1024];
+        let mut out = [0.0f32; 1024];
+        e.process(&input, &mut out);
+        assert!(e.is_dead(), "a process() throw must PARK the entry");
+        assert!(
+            out.iter().all(|s| *s == 0.0),
+            "the throwing call must emit silence"
+        );
+        // Parked stays parked: no further plugin trips, permanent silence.
+        let mut out2 = [0.0f32; 512];
+        e.process(&input[..512], &mut out2);
+        assert!(out2.iter().all(|s| *s == 0.0), "parked entry stays bypassed");
+        assert!(e.is_dead());
+        // Negative control: a healthy entry (different DSO) still produces.
+        let g = fixture_entry("gain");
+        let mut gout = [0.0f32; 512];
+        g.process(&input[..512], &mut gout);
+        assert!(
+            gout[500].abs() > 0.5,
+            "the gain fixture must still pass audio after the caught throw"
+        );
+        assert!(!g.is_dead());
+    }
+
+    /// R2: a throw from `init()` inside the open handshake must surface as
+    /// a load ERROR — the caller (chain row / synth pick) reports failure,
+    /// and the backend is usable afterwards.
+    #[cfg(not(windows))]
+    #[test]
+    fn v116_clap_open_throw_init_returns_err() {
+        let p = fixture_clap_throw().expect("throw fixture compiled");
+        let r = open(&p, Some("com.slooper.fixture-throw-init"), 48_000, None, None);
+        let e = r.expect_err("a throwing init() must surface as a load ERROR");
+        assert!(e.contains("threw"), "error must name the fault class: {e}");
+        // Negative polarity: the backend lives — other plugins still open.
+        let g = fixture_entry("gain");
+        assert!(!g.descs().is_empty(), "healthy plugin opened normally");
+        assert!(!g.is_dead());
+    }
+
+    /// R3: a throw from a plugin-factory call during SCAN must reach the
+    /// scan as a probe ERROR (the file is reported unloadable, the scan
+    /// continues). Env-gated trap scopes the throw to the probe pin only.
+    #[cfg(not(windows))]
+    #[test]
+    fn v116_clap_probe_throw_returns_err() {
+        let p = fixture_clap_throw().expect("throw fixture compiled");
+        std::env::set_var("SLOOPER_CLAP_FIXTURE_THROW_PROBE", "1");
+        let r = probe(&p);
+        std::env::remove_var("SLOOPER_CLAP_FIXTURE_THROW_PROBE");
+        let e = r.expect_err("a throwing factory call must surface as a probe ERROR");
+        assert!(e.contains("threw"), "error must name the fault class: {e}");
+        // With the trap off the SAME file probes clean — 4 descriptors.
+        let ok = probe(&p).expect("the DSO must probe fine after the caught throw");
+        assert_eq!(ok.len(), 4, "all four throw descriptors listed");
+    }
+
+    /// R4: a throw during state SAVE (chunk harvest, GUI/save thread)
+    /// degrades to "no state captured" — and does NOT park the RT entry
+    /// (the audio thread may be perfectly healthy).
+    #[cfg(not(windows))]
+    #[test]
+    fn v116_clap_chunk_throw_returns_none() {
+        let e = throw_entry("state");
+        assert!(e.chunk().is_none(), "a throwing save() must degrade to no-state");
+        assert!(!e.is_dead(), "a GUI-side save fault must not park the RT entry");
+        assert!(e.chunk().is_none(), "second save also survives as None");
+        assert!(!e.is_dead(), "the entry is still alive for RT");
+    }
+
+    /// R5: a throw from `clap.preset-load/2` `from_location()` (host-
+    /// commanded load, control thread) surfaces as a plain Err for the
+    /// PARAMETERS window echo; the report slot is drained so no ghost
+    /// plugin-side load echoes later.
+    #[cfg(not(windows))]
+    #[test]
+    fn v116_clap_preset_load_throw_returns_err() {
+        let e = throw_entry("load");
+        assert!(e.supports_preset_load(), "the fixture vends the extension");
+        let msg = e
+            .load_preset_location(PRESET_KIND_PLUGIN, None, None)
+            .expect_err("a throwing from_location must surface as Err");
+        assert!(msg.contains("threw"), "error must name the fault class: {msg}");
+        assert!(
+            e.take_preset_report().is_none(),
+            "the Err path must drain the report slot (no ghost echo)"
+        );
+        assert!(!e.is_dead(), "a control-thread load fault must not park RT");
+    }
+
+    /// R6: a throw from the LAZY preset-discovery handshake yields an
+    /// EMPTY list, cached — a UI refresh must not re-enter the throwing
+    /// provider every paint.
+    #[cfg(not(windows))]
+    #[test]
+    fn v116_clap_discovery_throw_caches_empty() {
+        let e = throw_entry("load");
+        let v = e.preset_locations();
+        assert!(v.is_empty(), "a throwing discovery provider must yield no locations");
+        // Second call is served from the cache — no re-throw, still empty.
+        let v2 = e.preset_locations();
+        assert!(v2.is_empty(), "the empty verdict is CACHED (no throw storm)");
+        assert!(!e.is_dead(), "discovery faults must not park the RT entry");
     }
 }
