@@ -9280,4 +9280,20 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         assert!(e.fx_table()[1].slots[0].bypass, "table carries the mute");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn v113_target_parser_grammar() {
+        use super::{parse_plugin_target, PluginTarget};
+        assert_eq!(parse_plugin_target("fx:0:1"), Some(PluginTarget::Fx(0, 1)));
+        assert_eq!(parse_plugin_target("fx:12:3"), Some(PluginTarget::Fx(12, 3)));
+        assert_eq!(parse_plugin_target("synth:7"), Some(PluginTarget::Synth(7)));
+        // v113 neutralization sentinel: never routable, never a false
+        // auto-miss either (parse fails => the pass ignores it).
+        assert_eq!(parse_plugin_target("fx:gone:0"), None);
+        assert_eq!(parse_plugin_target("fx:1"), None);
+        assert_eq!(parse_plugin_target("fx:a:b"), None);
+        assert_eq!(parse_plugin_target("track.vol"), None);
+        assert_eq!(parse_plugin_target("synth:1x"), None);
+    }
+
 }
