@@ -61582,4 +61582,223 @@ mod tests {
         );
     }
 
+    // ============ v124: value-knob learn Delete must not hit action 0 (card t_79cbbdf7) ============
+    //
+    // arm_value_knob_learn builds KnobLearn{slot: 0, vslot: Some(..)} — the
+    // 0 is a PLACEHOLDER. The key branch used to run
+    // `midi_binds[kl.slot] = None` for every knob wizard, so pressing Delete
+    // while binding a MIDI knob to a project value silently destroyed the
+    // unrelated action-0 binding (`RecSelected`) AND left the value binding
+    // untouched; both status and wizard header named the wrong action.
+
+    fn v124_key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn v124_vb(target: &str, d1: u8) -> crate::config::ValueBind {
+        crate::config::ValueBind {
+            target: target.to_string(),
+            track: 0,
+            bind: crate::midi::MidiBind { ty: 1, ch: 0, d1 },
+            kind: 0,
+            lo: 0,
+            hi: 127,
+        }
+    }
+
+    /// R1+R3+R4: Delete during a value-knob DRAFT learn (armed through the
+    /// real rack UI) cancels the wizard, adds nothing, and must NOT touch
+    /// the unrelated action-0 MIDI binding or calibration. The status line
+    /// names the value target, never the action.
+    #[test]
+    fn v124_value_knob_delete_keeps_action0_binding() {
+        let mut app = headless_app("v124vbdel");
+        let ctx = egui::Context::default();
+        // Unrelated action-0 state: a binding AND a knob calibration.
+        let act_bind = crate::midi::MidiBind {
+            ty: 1,
+            ch: 2,
+            d1: 77,
+        };
+        app.midi_binds[0] = Some(act_bind);
+        app.knob_cal[0] = Some(MidiAxisCal {
+            slot: 0,
+            lo: 10,
+            hi: 100,
+        });
+        // Arm a value-knob learn via the bindings rack (v29 UI-path idiom).
+        app.vb_target = Some(crate::automation::TARGET_TRACK_VOL.to_string());
+        app.open_auto_editor(None);
+        frame(&mut app, &ctx, vec![]);
+        let b = galley_centers(&mut app, &ctx, "bind knob", false);
+        assert!(!b.is_empty(), "rack offers the knob widget");
+        click_pt(&mut app, &ctx, b[0]);
+        assert!(
+            app.knob_learn.as_ref().is_some_and(|k| k.vslot.is_some()),
+            "wizard drives a value binding"
+        );
+        frame(&mut app, &ctx, vec![v124_key(egui::Key::Delete)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "wizard closed");
+        assert_eq!(
+            app.midi_binds[0],
+            Some(act_bind),
+            "action-0 binding SURVIVED the value-learn Delete"
+        );
+        assert!(
+            app.knob_cal[0].is_some(),
+            "action-0 knob calibration SURVIVED"
+        );
+        assert!(app.value_binds.is_empty(), "draft cancel adds nothing");
+        assert!(
+            app.status.contains("track volume"),
+            "status names the value target: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("record (selected)"),
+            "status must never name action 0: {}",
+            app.status
+        );
+    }
+
+    /// R2+R4: Delete during a value-knob RE-LEARN removes exactly that
+    /// ValueBind (mirrors the rack ✕ unbind), persists via save_config, and
+    /// leaves the other bindings alone.
+    #[test]
+    fn v124_value_knob_delete_unbinds_value_bind() {
+        let mut app = headless_app("v124vbdel2");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.value_binds
+            .push(v124_vb(crate::automation::TARGET_TRACK_VOL, 20));
+        app.value_binds
+            .push(v124_vb(crate::automation::TARGET_TRACK_PAN, 21));
+        let act_bind = crate::midi::MidiBind {
+            ty: 1,
+            ch: 2,
+            d1: 77,
+        };
+        app.midi_binds[0] = Some(act_bind);
+        // Re-learn binding 0, then Delete mid-wizard.
+        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, 0);
+        frame(&mut app, &ctx, vec![v124_key(egui::Key::Delete)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "wizard closed");
+        assert_eq!(app.value_binds.len(), 1, "the re-learned bind is gone");
+        assert_eq!(
+            app.value_binds[0].target,
+            crate::automation::TARGET_TRACK_PAN,
+            "the other bind rides through"
+        );
+        assert_eq!(
+            app.midi_binds[0],
+            Some(act_bind),
+            "action-0 binding untouched"
+        );
+        assert!(
+            app.status.contains("track volume"),
+            "status names the value target: {}",
+            app.status
+        );
+        // The clear is persisted (the branch calls save_config).
+        let back = App::new(Backend::start());
+        assert_eq!(back.value_binds.len(), 1, "removal persisted");
+        assert_eq!(
+            back.value_binds[0].target,
+            crate::automation::TARGET_TRACK_PAN,
+            "right bind survived the restart"
+        );
+    }
+
+    /// R4+R5: Escape on a value learn keeps the bind, and BOTH the wizard
+    /// header and the status name the value target — never action 0.
+    #[test]
+    fn v124_value_knob_escape_names_target() {
+        let mut app = headless_app("v124vbesc");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.value_binds
+            .push(v124_vb(crate::automation::TARGET_TRACK_VOL, 20));
+        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, 0);
+        let h = galley_centers(&mut app, &ctx, "Bind knob: track volume", false);
+        assert!(!h.is_empty(), "wizard header names the value target");
+        assert!(
+            galley_centers(&mut app, &ctx, "Bind knob: record (selected)", false).is_empty(),
+            "wizard header must never name an unrelated action"
+        );
+        frame(&mut app, &ctx, vec![v124_key(egui::Key::Escape)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "Escape closes the wizard");
+        assert_eq!(app.value_binds.len(), 1, "Escape keeps the bind");
+        assert!(
+            app.status.contains("track volume"),
+            "status names the value target: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("record (selected)"),
+            "status must never name action 0: {}",
+            app.status
+        );
+    }
+
+    /// R6 (regression guard): the ACTION-slot wizard keeps its old
+    /// vocabulary — Delete clears midi_binds[slot] + knob_cal[slot] and
+    /// names the action; Escape cancels without clearing.
+    #[test]
+    fn v124_action_knob_delete_still_clears_slot() {
+        let mut app = headless_app("v124actdel");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.midi_binds[3] = Some(crate::midi::MidiBind {
+            ty: 1,
+            ch: 3,
+            d1: 88,
+        });
+        app.knob_cal[3] = Some(MidiAxisCal {
+            slot: 3,
+            lo: 5,
+            hi: 120,
+        });
+        app.arm_knob_learn(3);
+        frame(&mut app, &ctx, vec![v124_key(egui::Key::Delete)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "wizard closed");
+        assert_eq!(app.midi_binds[3], None, "action-slot bind cleared");
+        assert!(app.knob_cal[3].is_none(), "action-slot calibration cleared");
+        assert!(
+            app.status.contains("cleared knob binding"),
+            "verb kept: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains(&MidiAction::ALL[3].label()),
+            "status names the action: {}",
+            app.status
+        );
+        // Escape: cancel without clearing.
+        app.midi_binds[3] = Some(crate::midi::MidiBind {
+            ty: 1,
+            ch: 3,
+            d1: 88,
+        });
+        app.arm_knob_learn(3);
+        frame(&mut app, &ctx, vec![v124_key(egui::Key::Escape)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "wizard closed");
+        assert!(app.midi_binds[3].is_some(), "Escape does not clear");
+        assert!(
+            app.status.contains(&MidiAction::ALL[3].label()),
+            "Escape status names the action: {}",
+            app.status
+        );
+    }
+
 }
