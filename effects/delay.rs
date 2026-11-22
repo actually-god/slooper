@@ -192,8 +192,14 @@ extern "C" fn process_st(
     let wet_l = echo * level * duckg;
     let wet_r = read_head(&s.buf, s.widx, s.dt * (1.0 + pp)) as f64 * level * duckg;
 
-    let ol = mid * (1.0 - mix) + wet_l * mix * out;
-    let orv = side + mid * (1.0 - mix) + wet_r * mix * out;
+    // v125 FIX (card t_d201dfe7): rebuild the pair as L=mid+side,
+    // R=mid-side, both scaled by (1-mix). The old form dropped `side`
+    // from L and added it UNSCALED to R — a hard-R source vanished from
+    // the right channel at mix=0, and dry content still leaked into R
+    // even at mix=1.0 (the opposite of the header's promise above).
+    let dm = 1.0 - mix;
+    let ol = (mid + side) * dm + wet_l * mix * out;
+    let orv = (mid - side) * dm + wet_r * mix * out;
     if !(ol.is_finite() && orv.is_finite()) {
         s.lp = 0.0;
         s.hp_y = 0.0;

@@ -185,9 +185,14 @@ extern "C" fn process_st(
     st.pwet = ((wetl + wetr) * 0.5) as f32;
     st.wptr = (st.wptr + 1) & RING_MASK;
 
-    let dry = mid * (1.0 - mix);
-    let ol = (dry + wetl * mix) * out;
-    let orv = (dry + side * (1.0 - mix) + wetr * mix) * out;
+    // v125 FIX (card t_d201dfe7): the pair must be rebuilt as L=mid+side,
+    // R=mid-side. The old form dropped `side` from L and ADDED it to R,
+    // so the dry R literally was the LEFT input: mix=0 was no pass-through
+    // and hard-panned sources vanished from their own channel (mono feeds
+    // have side=0, which is why every mono pin kept passing).
+    let dm = 1.0 - mix;
+    let ol = ((mid + side) * dm + wetl * mix) * out;
+    let orv = ((mid - side) * dm + wetr * mix) * out;
     if !(ol.is_finite() && orv.is_finite()) {
         st.lp = 0.0;
         st.pwet = 0.0;
