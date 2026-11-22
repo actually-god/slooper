@@ -7091,7 +7091,9 @@ impl App {
             if t.is_empty() {
                 format!("{} (edit)", self.assets[idx].name)
             } else {
-                t.to_string()
+                // v121: the name is user-typed — fold it like a project
+                // name so NTFS accepts the file ('/' can't escape either).
+                project::sanitize_name(t)
             }
         };
         let dir = self.record_dir();
@@ -7604,13 +7606,34 @@ impl App {
             .trim_start_matches('/')
             .chars()
             .filter(|c| *c != '\0')
+            // v121: folder names are user-typed too — fold every
+            // NTFS-reserved char; '/' stays as the nesting separator.
+            .map(|c| {
+                if project::is_windows_reserved(c) {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect();
         if clean.is_empty() {
             self.status = "new folder: empty name".into();
             return;
         }
+        // Never walk out of the rack folder. NOTE (v121): a bare
+        // starts_with does NOT catch "a/../b" — Path comparison is
+        // component-lexical and the join keeps the '..' after the
+        // matching prefix — so '..' components in the typed name are
+        // rejected outright (checked on `clean`, the typed part, so a
+        // root that itself contains ".." still works).
+        if Path::new(&clean)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            self.status = "new folder: illegal path".into();
+            return;
+        }
         let p = Path::new(&root).join(&clean);
-        // Never walk out of the rack folder.
         if !p.starts_with(Path::new(&root)) {
             self.status = "new folder: illegal path".into();
             return;
@@ -48664,6 +48687,81 @@ mod tests {
         };
         assert_eq!(again.len(), n * 2, "export kept the ping-pong length");
         assert!(!app.assets[0].dirty, "original kick.wav still pristine");
+    }
+
+    #[test]
+    fn v121_save_as_folds_reserved_in_stem() {
+        // v121 class sibling: the sample "Save As" name is user-typed
+        // too — "kick: pp" is NTFS-illegal (os error 123 on Windows) and
+        // a raw '/' would escape the folder even on Linux. The saved
+        // stem must go through the same folding contract as project
+        // names (project::sanitize_name).
+        let mut app = headless_app("v121saveas");
+        let samples = std::env::temp_dir().join("sp-uity-v121saveas/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/kick.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&samples.join("kit-a/kick.wav"));
+        let key = samples
+            .join("kit-a/kick.wav")
+            .to_string_lossy()
+            .into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        app.record_target = samples.join("kit-a").display().to_string();
+        app.se_save_as(&key, "kick: pp");
+        assert!(
+            samples.join("kit-a/kick- pp.wav").exists(),
+            "reserved ':' must fold in the saved stem"
+        );
+        assert!(
+            !samples.join("kit-a/kick: pp.wav").exists(),
+            "the raw reserved-char name must never reach disk"
+        );
+    }
+
+    #[test]
+    fn v121_rack_sub_add_folds_reserved() {
+        // v121 class sibling: rack sub-folder names are user-typed too —
+        // create_dir_all must receive a name NTFS accepts, while the
+        // deliberate '/' nesting and the traversal guard stay intact.
+        let mut app = headless_app("v121subadd");
+        let sandbox = std::env::temp_dir().join("sp-uity-v121subadd");
+        let root = sandbox.join("rack");
+        // Sweep the WHOLE sandbox: the escape probe's target sits next to
+        // the rack dir, and a leftover from an older (pre-guard) run must
+        // not decide the verdict.
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::fs::create_dir_all(&root).unwrap();
+        app.rack[0].path = root.display().to_string();
+        app.rack[0].rescan();
+        app.rack_sub_add(0, "kicks: hard");
+        assert!(
+            root.join("kicks- hard").is_dir(),
+            "reserved ':' must fold in a sub-folder name: {:?}",
+            std::fs::read_dir(&root).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        app.rack_sub_add(0, "drums/kicks? 2");
+        assert!(
+            root.join("drums").join("kicks- 2").is_dir(),
+            "'/' keeps nesting; '?' folds"
+        );
+        // The traversal guard must survive the folding.
+        app.rack_sub_add(0, "../escape");
+        assert_eq!(app.status, "new folder: illegal path");
+        assert!(
+            !root.parent().unwrap().join("escape").exists(),
+            "no folder may be created outside the rack root"
+        );
     }
 
     // ---- v50 R2: clip-extension paints silence, not stretched content ----

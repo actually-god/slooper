@@ -194,13 +194,26 @@ impl Project {
     }
 }
 
-/// Strip characters that would be hostile in a file name.
+/// True for characters the Win32 file API rejects in a name on NTFS:
+/// `< > : " | ? *` (the separators `/` `\` are handled by the callers —
+/// Windows treats them as path delimiters, not fold candidates). NTFS has
+/// no escape hatch for these while POSIX does, so folding them on BOTH
+/// OSes is deliberate: the same name then names the same file on every
+/// machine, whereas OS-gated folding would let Linux create projects that
+/// are unopenable on Windows.
+pub fn is_windows_reserved(c: char) -> bool {
+    matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+}
+
+/// Strip characters that would be hostile in a file name: separators and
+/// control chars fold to '-', every NTFS-reserved char folds to '-'
+/// (v121 — both-OS saves), trailing/leading dots and spaces trim.
 pub fn sanitize_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()
         .map(|c| {
-            if c.is_control() || c == '/' || c == '\\' {
+            if c.is_control() || c == '/' || c == '\\' || is_windows_reserved(c) {
                 '-'
             } else {
                 c
@@ -681,5 +694,51 @@ mod tests {
             "bend ranges survive the project file (explicit 0 kept)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v121_sanitize_folds_windows_reserved() {
+        // Polarity A (v121): every character the Win32 file API rejects
+        // on NTFS must fold to '-'. The folding is UNCONDITIONAL — no
+        // cfg(windows) — so the same project name names the same file on
+        // both OSes; OS-gated folding would let Linux create projects
+        // that are unopenable on Windows.
+        for c in ['<', '>', ':', '"', '|', '?', '*'] {
+            assert_eq!(
+                sanitize_name(&format!("Mix{c} master")),
+                "Mix- master",
+                "reserved char {c:?} must fold to '-'"
+            );
+        }
+        assert_eq!(sanitize_name("take? final"), "take- final");
+        assert_eq!(sanitize_name("Mix: master? *hard*"), "Mix- master- -hard-");
+        // The component that reaches fs::write / create_dir_all must be
+        // NTFS-legal, or Windows save fails with os error 123.
+        let p = project_path(Path::new("/p"), "Mix: master");
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "Mix- master.slooper");
+    }
+
+    #[test]
+    fn v121_sanitize_keeps_safe_names_untouched() {
+        // Polarity B (v121): ONLY hostile chars fold — everything NTFS
+        // accepts passes byte-identically (unicode names, spaces,
+        // internal dots, dashes, percents, parens).
+        for ok in [
+            "Mix master",
+            "song-v2_final",
+            "ep.1 mix",
+            "Ünïcode 88 音",
+            "40% duck",
+            "it's (final)",
+        ] {
+            assert_eq!(sanitize_name(ok), ok, "safe name {ok:?} must pass through");
+        }
+        // The pre-existing contract is unchanged: separators and control
+        // chars fold, edge dots/spaces trim, empty falls back.
+        assert_eq!(sanitize_name("my song/2"), "my song-2");
+        assert_eq!(sanitize_name("a\\b"), "a-b");
+        assert_eq!(sanitize_name("../../etc/passwd"), "-..-etc-passwd");
+        assert_eq!(sanitize_name("  trim me.  "), "trim me");
+        assert_eq!(sanitize_name("   "), "project");
     }
 }
