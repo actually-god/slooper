@@ -37488,8 +37488,12 @@ mod tests {
             false,
         ));
         // Four sequential 30k clips back-to-back (no gap): 0, 30k, 60k, 90k.
+        // BOUNDED play_len each — an open-ended clip runs the whole asset
+        // and would overlap (and split with) its neighbours.
         for pos in [0u64, 30_000, 60_000, 90_000] {
-            app.arr.insert(0, 0, Clip::new(a, pos));
+            let mut cl = Clip::new(a, pos);
+            cl.play_len = Some(30_000);
+            app.arr.insert(0, 0, cl);
         }
         app.sel_clips = vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)];
         frame_keys(&mut app, &ctx, vec![]);
