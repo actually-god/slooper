@@ -82,6 +82,18 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Dense sidechain routing ducks every track during playback again.**
+  The live engine kept its sidechain routing table at 256 edges while the
+  mixer can legally wire every track to every track (up to 16k routes at
+  128 tracks): past the 256th route the send simply did nothing — no
+  ducking, no warning, no counter. Worse, EXPORTS were computed by a
+  separate, uncapped path, so the bounced file ducked correctly while the
+  speakers did not, hiding the bug from anyone who only checked the
+  render. The routing table now always holds every legal route (grown
+  once, no per-block cost, zero cost for projects without routing), so
+  truncation is structurally impossible; pins drive the live engine at
+  400 and 16,002 edges and demand every target's key arrives.
+
 - **Dense MIDI bursts no longer vanish inside VST2 plugins.** When more
   than 64 channel-voice messages came due in one ~12 ms block aimed at a
   single VST2 plugin — a big chord stack, a dense multi-lane pattern
