@@ -12,8 +12,10 @@
 #                                           spec, packaged in a fedora
 #                                           container from the floor exe)
 #     slooper-win64.zip                    (MSVC release exe + README +
-#                                           LICENSE — exe carries the
-#                                           embedded icon via winresource)
+#                                           LICENSE + LICENSE-GPL-2.0 +
+#                                           THIRD-PARTY-NOTICES — exe
+#                                           carries the embedded icon
+#                                           via winresource)
 #     slooper-<ver>-win64-setup.exe        (NSIS installer: machine-wide,
 #                                           uninstall entry, Start menu,
 #                                           optional desktop shortcut)
@@ -114,7 +116,10 @@ jobs:
           cp target/release/slooper "$P/usr/bin/slooper"
           cp slooper.desktop "$P/usr/share/applications/slooper.desktop"
           cp assets/icon.png "$P/usr/share/pixmaps/slooper.png"
-          cp README.md LICENSE docs/INSTALL.md "$P/"
+          # GPL-2 compliance (t_2d1da517): the embedded piano blob derives
+          # from the GPL-2 TimGM6mb soundfont, so every medium must carry
+          # the notice + full license text on-media, not just in the repo.
+          cp README.md LICENSE docs/INSTALL.md LICENSE-GPL-2.0.txt synths/THIRD-PARTY-NOTICES.md "$P/"
           tar --zstd -cf "slooper-$VERSION-linux-x86_64.tar.zst" "$P"
           # W13d: the deb steps below need the same version string
           echo "SLOOPER_VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -169,6 +174,8 @@ jobs:
           Copy-Item target/winrel/slooper.exe stage/slooper.exe
           Copy-Item README.md stage/README.md
           Copy-Item LICENSE stage/LICENSE
+          Copy-Item LICENSE-GPL-2.0.txt stage/LICENSE-GPL-2.0.txt
+          Copy-Item synths/THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md
           Compress-Archive -Path stage/* -DestinationPath slooper-win64.zip -Force
       # W12e follow-up (PE walk of the first winrel artifact): the MSVC exe
       # carries a CODEVIEW/RSDS record naming `slooper.pdb` but NO debug
