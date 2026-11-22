@@ -20,23 +20,30 @@
 
 /// The last patch `Cmd::Apply` brought up: `(ins, outs)` exactly as
 /// `ManagerBackend::apply` receives it.
+#[cfg(any(windows, test))] // WASAPI-side item (see module gate note in mod.rs)
 pub type Patch = (Vec<String>, Vec<(String, u8)>);
 
 /// RT thread died via the stop event (or nothing died).
+#[cfg(any(windows, test))]
 pub const FAULT_NONE: u32 = 0;
 /// Generic stream error (GetBuffer/GetNextPacketSize/… failed).
+#[cfg(any(windows, test))]
 pub const FAULT_STREAM: u32 = 1;
 /// The endpoint was invalidated (device unplugged / taken exclusive /
 /// our own wait handles died).
+#[cfg(any(windows, test))]
 pub const FAULT_DEVICE: u32 = 2;
 
 /// Auto-reapplies allowed per fault streak.
+#[cfg(any(windows, test))]
 pub const RETRY_BUDGET: u32 = 2;
 /// A stream that stayed up this long resets the budget: a device that
 /// survives and then dies is a NEW story, not a death loop.
+#[cfg(any(windows, test))]
 pub const SURVIVED_SECS: u64 = 10;
 
 /// What the manager's idle hook does after reaping a dead RT thread.
+#[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum IdleRecovery {
     /// Do nothing (clean stop, or no recorded patch to recover).
@@ -52,6 +59,7 @@ pub enum IdleRecovery {
 /// The whole recovery decision, pure so every arm is pinnable on Linux.
 /// `still_present` = every endpoint label of `last` resolves in the CURRENT
 /// enumeration; `budget` = reaps remaining (caller resets it on survival).
+#[cfg(any(windows, test))]
 pub fn plan(fault: u32, last: Option<&Patch>, still_present: bool, budget: u32) -> IdleRecovery {
     if fault == FAULT_NONE {
         return IdleRecovery::Nothing; // stop event: nothing failed
