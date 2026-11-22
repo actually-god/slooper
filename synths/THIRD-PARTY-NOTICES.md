@@ -15,8 +15,11 @@ from that soundfont; the zone selection, loop points and player code are
 slooper's own. The soundfont is licensed under the GNU GPL version 2 (see
 the `debian/copyright` file of the upstream source package for the
 authoritative notice); the sample data shipped inside `piano.rs` is
-therefore covered by GPL-2 as well. The full GPL-2 text is at
-https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt .
+therefore covered by GPL-2 as well. The full GPL-2 text ships in this
+repo as `LICENSE-GPL-2.0.txt`
+(https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt) — every release
+artifact (tarball, .deb, .rpm, win64 zip, NSIS installer) carries this
+notice plus that text on-media.
 
 ## fan455_piano_synthesis — model of earlier releases (≤ 0.7)
 

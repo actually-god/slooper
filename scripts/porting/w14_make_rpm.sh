@@ -48,15 +48,22 @@ cp -a "$PKG/usr/bin/slooper"               "$SRC/usr/bin/"
 cp -a "$PKG/usr/share/applications/slooper.desktop" "$SRC/usr/share/applications/"
 cp -a "$PKG/usr/share/pixmaps/slooper.png" "$SRC/usr/share/pixmaps/"
 tar -C "$SRC" -czf "$SRC/slooper-$RPMVER-usr.tar.gz" usr
+# License docs ride as separate sources (t_2d1da517): the embedded piano
+# blob derives from the GPL-2 TimGM6mb soundfont, so the rpm must ship
+# notice + full GPL-2 text in its docdir.
+cp -a "$PKG/LICENSE" "$PKG/LICENSE-GPL-2.0.txt" "$PKG/THIRD-PARTY-NOTICES.md" "$SRC/"
 
 cat > "$ROOT/SPECS/slooper.spec" <<EOF
 Name:           slooper
 Version:        $RPMVER
 Release:        $RPMREL%{?dist}
 Summary:        Clip-based DAW with MIDI and keyboard control (JACK)
-License:        MIT
+License:        MIT and GPL-2.0-only
 URL:            https://github.com/actually-god/slooper
 Source0:        slooper-%{version}-usr.tar.gz
+Source1:        LICENSE
+Source2:        LICENSE-GPL-2.0.txt
+Source3:        THIRD-PARTY-NOTICES.md
 BuildArch:      x86_64
 
 # Hard deps ride rpm's automatic requires (the binary's real NEEDED set).
@@ -87,6 +94,9 @@ install -d %{buildroot}/usr/bin %{buildroot}/usr/share/applications %{buildroot}
 install -m 755 usr/bin/slooper                   %{buildroot}/usr/bin/
 install -m 644 usr/share/applications/slooper.desktop %{buildroot}/usr/share/applications/
 install -m 644 usr/share/pixmaps/slooper.png      %{buildroot}/usr/share/pixmaps/
+# t_2d1da517: GPL-2 notice + text must travel on-media with the binary
+install -d %{buildroot}%{_docdir}/slooper
+install -m 644 %{SOURCE1} %{SOURCE2} %{SOURCE3} %{buildroot}%{_docdir}/slooper/
 
 %post
 touch --no-create %{_datadir}/icons/hicolor &>/dev/null || :
@@ -103,6 +113,9 @@ update-desktop-database -q %{_datadir}/applications &>/dev/null || :
 /usr/bin/slooper
 /usr/share/applications/slooper.desktop
 /usr/share/pixmaps/slooper.png
+%doc %{_docdir}/slooper/LICENSE
+%doc %{_docdir}/slooper/LICENSE-GPL-2.0.txt
+%doc %{_docdir}/slooper/THIRD-PARTY-NOTICES.md
 
 %changelog
 * $(date +'%a %b %d %Y') actually-god <actually-god@users.noreply.github.com> - $RPMVER-$RPMREL
@@ -119,6 +132,9 @@ BUILT="$(find "$ROOT/RPMS" -name 'slooper-*.x86_64.rpm' | head -1)"
 # payload actually contains the binary (verify the artifact, not the build)
 test "$(rpm -qp --qf '%{NAME}-%{VERSION}' "$BUILT")" = "slooper-$RPMVER"
 rpm -qpl "$BUILT" | grep -qx '/usr/bin/slooper' || { echo "FATAL: rpm payload missing /usr/bin/slooper" >&2; exit 4; }
+# t_2d1da517 license-disclosure assert: read the built payload
+rpm -qpl "$BUILT" | grep -q '/usr/share/doc/slooper/LICENSE-GPL-2.0.txt' || { echo "FATAL: rpm payload missing LICENSE-GPL-2.0.txt" >&2; exit 5; }
+rpm -qpl "$BUILT" | grep -q '/usr/share/doc/slooper/THIRD-PARTY-NOTICES.md' || { echo "FATAL: rpm payload missing THIRD-PARTY-NOTICES.md" >&2; exit 5; }
 OUT="$(pwd)/$(basename "$BUILT")"
 cp "$BUILT" "$OUT"
 echo "$OUT"
