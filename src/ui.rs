@@ -61621,6 +61621,24 @@ mod tests {
     // unrelated action-0 binding (`RecSelected`) AND left the value binding
     // untouched; both status and wizard header named the wrong action.
 
+    /// Press AND release in one pass: egui's `begin_pass` re-flags a
+    /// pressed key as `repeat: true` while it sits in `keys_down`, and
+    /// `keys_down` only clears on a release event — a headless pin that
+    /// never releases a key has every SECOND press of that key silently
+    /// swallowed as auto-repeat (egui-0.36.2 input_state/mod.rs:410).
+    fn v124_tap(key: egui::Key) -> Vec<egui::Event> {
+        vec![
+            key_ev(key, egui::Modifiers::NONE),
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
     fn v124_vb(target: &str, d1: u8) -> crate::config::ValueBind {
         crate::config::ValueBind {
             target: target.to_string(),
@@ -61663,7 +61681,7 @@ mod tests {
             app.knob_learn.as_ref().is_some_and(|k| k.vslot.is_some()),
             "wizard drives a value binding"
         );
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
+        frame_keys(&mut app, &ctx, v124_tap(egui::Key::Delete));
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert_eq!(
@@ -61708,7 +61726,7 @@ mod tests {
         app.midi_binds[0] = Some(act_bind);
         // Re-learn binding 0, then Delete mid-wizard.
         app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, 0);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
+        frame_keys(&mut app, &ctx, v124_tap(egui::Key::Delete));
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert_eq!(app.value_binds.len(), 1, "the re-learned bind is gone");
@@ -61727,6 +61745,14 @@ mod tests {
             "status names the value target: {}",
             app.status
         );
+        // Draft learn (idx = usize::MAX) armed OVER existing binds:
+        // Delete must cancel, never remove(usize::MAX).
+        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_PAN, 0, usize::MAX);
+        frame_keys(&mut app, &ctx, v124_tap(egui::Key::Delete));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.knob_learn.is_none(), "draft wizard closed");
+        assert_eq!(app.value_binds.len(), 1, "draft Delete removed nothing");
+        assert_eq!(app.value_binds[0].target, crate::automation::TARGET_TRACK_PAN);
         // The clear is persisted (the branch calls save_config).
         let back = App::new(Backend::start());
         assert_eq!(back.value_binds.len(), 1, "removal persisted");
@@ -61735,14 +61761,6 @@ mod tests {
             crate::automation::TARGET_TRACK_PAN,
             "right bind survived the restart"
         );
-        // Draft learn (idx = usize::MAX) armed OVER existing binds:
-        // Delete must cancel, never remove(usize::MAX).
-        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_PAN, 0, usize::MAX);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
-        frame(&mut app, &ctx, vec![]);
-        assert!(app.knob_learn.is_none(), "draft wizard closed");
-        assert_eq!(app.value_binds.len(), 1, "draft Delete removed nothing");
-        assert_eq!(app.value_binds[0].target, crate::automation::TARGET_TRACK_PAN);
     }
 
     /// R4+R5: Escape on a value learn keeps the bind, and BOTH the wizard
@@ -61764,7 +61782,7 @@ mod tests {
             galley_centers(&mut app, &ctx, "Bind knob: record (selected)", false).is_empty(),
             "wizard header must never name an unrelated action"
         );
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Escape, egui::Modifiers::NONE)]);
+        frame_keys(&mut app, &ctx, v124_tap(egui::Key::Escape));
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "Escape closes the wizard");
         assert_eq!(app.value_binds.len(), 1, "Escape keeps the bind");
@@ -61799,7 +61817,7 @@ mod tests {
             hi: 120,
         });
         app.arm_knob_learn(3);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Delete, egui::Modifiers::NONE)]);
+        frame_keys(&mut app, &ctx, v124_tap(egui::Key::Delete));
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert_eq!(app.midi_binds[3], None, "action-slot bind cleared");
@@ -61821,7 +61839,7 @@ mod tests {
             d1: 88,
         });
         app.arm_knob_learn(3);
-        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::Escape, egui::Modifiers::NONE)]);
+        frame_keys(&mut app, &ctx, v124_tap(egui::Key::Escape));
         frame(&mut app, &ctx, vec![]);
         assert!(app.knob_learn.is_none(), "wizard closed");
         assert!(app.midi_binds[3].is_some(), "Escape does not clear");
