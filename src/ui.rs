@@ -48764,6 +48764,209 @@ mod tests {
         );
     }
 
+    // ---- v122: EXPORT scope radios — three rows, two bools, one checked ----
+
+    /// One EXPORT-window frame: the three scope-label galley rects (painted
+    /// order: selection, track, whole) plus every painted checked-radio dot
+    /// (egui paints a checked radio as ONE small filled strokeless circle,
+    /// radius `icon_width_inner`/3 ≈ 2.7; the outer ring is radius ≥ 7 and
+    /// filter-classified away by radius/stroke, never by color — safe under
+    /// the 0.36 Area fade-in premultiply).
+    fn v122_radio_snapshot(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> (Vec<egui::Rect>, Vec<egui::Pos2>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut rows: Vec<egui::Rect> = Vec::new();
+        let mut dots: Vec<egui::Pos2> = Vec::new();
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let txt = t.galley.text();
+                    if txt.contains("Current selection (")
+                        || txt.ends_with(" (selected)")
+                        || txt == "Whole project"
+                    {
+                        let local = t.galley.rect;
+                        rows.push(egui::Rect::from_min_size(
+                            t.pos + local.min.to_vec2(),
+                            local.size(),
+                        ));
+                    }
+                }
+                egui::epaint::Shape::Circle(c) => {
+                    if c.radius < 4.0
+                        && c.fill != egui::Color32::TRANSPARENT
+                        && c.stroke.width < 0.5
+                    {
+                        dots.push(c.center);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        rows.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+        (rows, dots)
+    }
+
+    /// Dots anchored to each label row (row order: sel, track, whole).
+    fn v122_dots_per_row(rows: &[egui::Rect], dots: &[egui::Pos2]) -> Vec<usize> {
+        rows.iter()
+            .map(|r| {
+                dots.iter()
+                    .filter(|p| {
+                        (p.y - r.center().y).abs() <= 8.0
+                            && p.x > r.min.x - 40.0
+                            && p.x < r.max.x
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// R1+R4: exactly one radio paints checked in every mode — never the
+    /// old double-checked pair (the Track row shared `export_whole`
+    /// inverted, so it lit up together with "Current selection").
+    #[test]
+    fn v122_export_radio_shows_exactly_one_checked() {
+        let mut app = headless_app("v122one");
+        clear_canvas(&mut app);
+        app.show_export = true;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Fresh app = track mode: only the Track row checked.
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(rows.len(), 3, "all three scope rows painted");
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![0, 1, 0],
+            "fresh state = track mode, one dot on the Track row"
+        );
+        // Selection mode: the bug painted [1,1,0] (double-checked pair).
+        app.export_sel = true;
+        frame(&mut app, &ctx, vec![]);
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![1, 0, 0],
+            "selection mode must light ONLY the selection row"
+        );
+        // Whole mode.
+        app.export_sel = false;
+        app.export_whole = true;
+        frame(&mut app, &ctx, vec![]);
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![0, 0, 1],
+            "whole mode must light ONLY the whole row"
+        );
+    }
+
+    /// R2: the dead click is dead no more — with "Current selection"
+    /// active, clicking "Track N (selected)" used to be a no-op (the bool
+    /// already held `false`, so `.changed()` never fired and `export_sel`
+    /// was never cleared); the single-track mode was only reachable via
+    /// "Whole project".
+    #[test]
+    fn v122_export_radio_track_reachable_from_selection() {
+        let mut app = headless_app("v122reach");
+        clear_canvas(&mut app);
+        app.show_export = true;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Track -> selection.
+        click_last(&mut app, &ctx, "Current selection (");
+        assert!(app.export_sel && !app.export_whole, "sel click");
+        // Selection -> track (THE unreachable click).
+        click_last(&mut app, &ctx, " (selected)");
+        assert!(
+            !app.export_sel && !app.export_whole,
+            "clicking 'Track N (selected)' from selection mode must select single-track mode"
+        );
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![0, 1, 0],
+            "after the click the Track row is the only checked radio"
+        );
+        // Track -> whole -> selection round trip.
+        click_last_exact(&mut app, &ctx, "Whole project");
+        assert!(!app.export_sel && app.export_whole, "whole click");
+        click_last(&mut app, &ctx, "Current selection (");
+        assert!(app.export_sel && !app.export_whole, "sel round trip");
+    }
+
+    /// R3: every clicked arm sets BOTH bools — 3 starting modes × 3 rows,
+    /// each click lands exactly that radio's (export_sel, export_whole).
+    #[test]
+    fn v122_export_radio_click_matrix_sets_both_bools() {
+        let mut app = headless_app("v122matrix");
+        clear_canvas(&mut app);
+        app.show_export = true;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let cases: [((bool, bool), [(&str, (bool, bool)); 3]); 3] = [
+            // from track (0,0):
+            (
+                (false, false),
+                [
+                    ("Current selection (", (true, false)),
+                    (" (selected)", (false, false)),
+                    ("Whole project", (false, true)),
+                ],
+            ),
+            // from selection (1,0):
+            (
+                (true, false),
+                [
+                    ("Current selection (", (true, false)),
+                    (" (selected)", (false, false)),
+                    ("Whole project", (false, true)),
+                ],
+            ),
+            // from whole (0,1):
+            (
+                (false, true),
+                [
+                    ("Current selection (", (true, false)),
+                    (" (selected)", (false, false)),
+                    ("Whole project", (false, true)),
+                ],
+            ),
+        ];
+        for (start, clicks) in cases {
+            for (needle, want) in clicks {
+                app.export_sel = start.0;
+                app.export_whole = start.1;
+                frame(&mut app, &ctx, vec![]);
+                if needle == "Whole project" {
+                    // exact: the weak explanation label ("Whole project =
+                    // every sounding track…") contains the same words.
+                    click_last_exact(&mut app, &ctx, needle);
+                } else {
+                    click_last(&mut app, &ctx, needle);
+                }
+                assert_eq!(
+                    (app.export_sel, app.export_whole),
+                    want,
+                    "start {start:?} + click {needle:?}"
+                );
+            }
+        }
+    }
+
     // ---- v50 R2: clip-extension paints silence, not stretched content ----
 
     /// One frame with the pointer parked: every painted line segment with
