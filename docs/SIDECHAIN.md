@@ -48,7 +48,9 @@ Everything runs on the realtime thread with zero allocations and no locks:
   The tap is block-constant in gain/pan (no per-sample ramp): it only
   ever feeds a detector, so steps are inaudible by construction.
   Zero cost when no routing exists: edges expand to (source, target)
-  pairs once per block (`e_src`/`e_tgt`, 256 entries) and are filtered
+  pairs once per block (`e_src`/`e_tgt`, v117: grow-once tables sized to
+  the structural bound `MAX_SC_EDGES` = 128×128 — every legal route fits,
+  nothing is ever truncated) and are filtered
   to sources that actually carry material this block — a muted or
   stopped source with clips/MIDI still expands edges (its key flows!),
   a source with nothing to play contributes nothing.
@@ -154,10 +156,19 @@ export therefore duck identically.
   until a stereo key consumer exists it is a key-level trim, ±0…−3 dB.
 * Muted MIDI sources key only through dedicated synth instances (above).
 * 128 tracks max ⇒ exactly one `u128` per track; no per-target edge
-  budget tuning needed at this scale.
+  budget tuning needed at this scale. v117: the live edge table carries
+  the FULL 128×128 route space (16384 edges, grow-once buffers) — the
+  pre-v117 fixed 256-entry table silently dropped everything past the
+  cap while the offline export mirror was uncapped, so exports ducked
+  but speakers did not; truncation is now structurally impossible.
 
 ## Tests
 
+* `v117_live_edge_table_*` (`audio/mod.rs`): the LIVE path driven
+  directly (`new_proc` + stub `BlockIo`) — 400-edge and 16,002-edge
+  rigs demand every routed target's key arrives (pre-v117 the 256-entry
+  table keyed only the first two), plus a source-scan pin that the
+  append-time cap never returns.
 * `fx.rs`: v2 example compiles and loads, `sidechain` flag set; v1
   scripts still load through the v1 path.
 * `e2e_sidechain_ducks_target_track`: real JACK loop — key panned hard

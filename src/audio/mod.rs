@@ -77,6 +77,14 @@ pub type PreviewVoices = Arc<Vec<(u64, u32, Arc<[f32]>)>>;
 /// 128-track project costs the same CPU as a 16-track one did before.
 pub const MAX_LOOPS: usize = 128;
 
+/// v117 (t_7609b30f): structural bound of sidechain edges one block can
+/// carry — the send matrix lets every track tap every track
+/// (MAX_LOOPS targets x MAX_LOOPS sources). NOT a truncation cap: the
+/// RT edge table is sized to EXACTLY this, so no append can ever be
+/// refused. (The pre-v117 table was fixed at 256 and silently DROPPED
+/// every edge past it — un-counted, un-noticed, while 16k are legal.)
+pub const MAX_SC_EDGES: usize = MAX_LOOPS * MAX_LOOPS;
+
 /// Preview voice id for auditions that belong to no rack asset (piano-roll
 /// note taps, edit echoes). Stopping by this id never touches asset previews.
 pub const PREVIEW_TRANSIENT: u32 = u32::MAX;
@@ -4330,6 +4338,16 @@ struct Proc {
     /// precomputes "mask != 0" so the sample loop stays branch-cheap.
     sc_apply: Vec<Vec<f32>>,
     sc_build: Vec<Vec<f32>>,
+    /// v117: per-block edge tables — materialized (source, target) pairs,
+    /// per-edge receive level and the block-constant tap scale. Taken out
+    /// and given back like sc_apply/mix_l; grown ONCE to the structural
+    /// bound MAX_SC_EDGES at the first appended edge (steady state: zero
+    /// RT allocation; unrouted projects: zero cost — never grown). The
+    /// pre-v117 [u8; 256] stack tables silently truncated past 256.
+    sc_e_src: Vec<u8>,
+    sc_e_tgt: Vec<u8>,
+    sc_e_gain: Vec<f32>,
+    sc_e_scale: Vec<f32>,
     sc_active: [bool; MAX_LOOPS],
     mon_buf: Vec<f32>,
     mon_buf2: Vec<f32>,
@@ -4525,6 +4543,10 @@ fn new_proc(
         trk_bufs2: vec![Vec::new(); MAX_LOOPS],
         sc_apply: vec![Vec::new(); MAX_LOOPS],
         sc_build: vec![Vec::new(); MAX_LOOPS],
+        sc_e_src: Vec::new(),
+        sc_e_tgt: Vec::new(),
+        sc_e_gain: Vec::new(),
+        sc_e_scale: Vec::new(),
         sc_active: [false; MAX_LOOPS],
         mon_buf: Vec::new(),
         mon_buf2: Vec::new(),
@@ -5885,13 +5907,24 @@ impl Proc {
         // (block-constant — the bus feeds a detector, steps are inaudible;
         // volume/mute/master NEVER enter it — docs/SIDECHAIN.md). A
         // project without routing costs one atomic AND per track.
-        let mut n_edge = 0usize;
-        let mut e_src = [0u8; 256];
-        let mut e_tgt = [0u8; 256];
+        // v117 (t_7609b30f): the tables are engine-owned buffers taken out
+        // and given back like sc_apply/mix_l. Grown ONCE (at the first
+        // appended edge, below) to the structural bound MAX_SC_EDGES =
+        // MAX_LOOPS x MAX_LOOPS — every legal route fits, so an append can
+        // never be refused and silent truncation is structurally impossible.
+        // Steady state allocates nothing (RT rule); an unrouted project
+        // never grows them at all. (The pre-v117 [u8; 256] stack tables
+        // dropped edge 257+ with no counter and no notice — while the
+        // render_tracks export mirror was uncapped, so exports and
+        // speakers disagreed. Pins: v117_live_edge_table_*.)
+        let mut e_src = std::mem::take(&mut self.sc_e_src);
+        let mut e_tgt = std::mem::take(&mut self.sc_e_tgt);
         // v97 (sc-4): per-edge receive level read once per block alongside
         // the masks (UI writes land next block — every SC setter is
         // block-constant by construction).
-        let mut e_gain = [1.0f32; 256];
+        let mut e_gain = std::mem::take(&mut self.sc_e_gain);
+        let mut e_scale = std::mem::take(&mut self.sc_e_scale);
+        let mut n_edge = 0usize;
         let mut sc_any = false;
         for tg in 0..MAX_LOOPS {
             let m: u128 = self.engine.sc_send(tg);
@@ -5904,7 +5937,16 @@ impl Proc {
                 // Sources with no material this block must NOT tap a
                 // stale acc[] row — they simply get no edge.
                 let sourced = (entry_mask >> s) & 1 != 0 || self.midi_live[s];
-                if (m >> s) & 1 != 0 && sourced && n_edge < e_src.len() {
+                if (m >> s) & 1 != 0 && sourced {
+                    if e_src.len() < MAX_SC_EDGES {
+                        // Grow-once (v117): the first edge ever pays the
+                        // full structural bound; every later block finds
+                        // the tables at length and allocates nothing.
+                        e_src.resize(MAX_SC_EDGES, 0);
+                        e_tgt.resize(MAX_SC_EDGES, 0);
+                        e_gain.resize(MAX_SC_EDGES, 1.0);
+                        e_scale.resize(MAX_SC_EDGES, 0.0);
+                    }
                     e_src[n_edge] = s as u8;
                     e_tgt[n_edge] = tg as u8;
                     e_gain[n_edge] = self.engine.sc_recv_gain(tg, s);
@@ -5928,7 +5970,8 @@ impl Proc {
         }
         // v97 (sc-4): fold each edge's receive level into a per-edge tap
         // scale (block-constant, same inaudibility argument as sc_fold).
-        let mut e_scale = [0.0f32; 256];
+        // v117: e_scale is the engine-owned buffer taken above — by here
+        // it is at MAX_SC_EDGES length whenever n_edge > 0.
         for k in 0..n_edge {
             e_scale[k] = sc_fold[e_src[k] as usize] * e_gain[k];
         }
@@ -6350,6 +6393,11 @@ impl Proc {
         std::mem::swap(&mut sc_apply, &mut sc_build);
         self.sc_apply = sc_apply;
         self.sc_build = sc_build;
+        // v117: edge tables back for the next block (grow-once buffers).
+        self.sc_e_src = e_src;
+        self.sc_e_tgt = e_tgt;
+        self.sc_e_gain = e_gain;
+        self.sc_e_scale = e_scale;
         self.mon_buf = mon_buf;
         self.mon_buf2 = mon_buf2;
         self.vst_tmp = vst_tmp;
@@ -8256,9 +8304,10 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         }
     }
 
-    /// v117: RT-harness proc — slot 0 is a mono-fold output (both mask
-    /// bits clear means L-only; mask_out_l=1, mask_out_r=1 folds (l+r)/sqrt2
-    /// so a centre-panned click keeps unity like the v48/v95 mirror asserts).
+    /// v117: RT-harness proc — slot 0 carries BOTH output mask bits
+    /// (mask_out_l=1, mask_out_r=1), so the core routes it through the
+    /// mono-fold path v_m = (v_l + v_r)/sqrt2: a centre-panned click
+    /// keeps unity exactly like the v48/v95 mirror asserts absorb.
     fn v117_proc(e: &Arc<Engine>) -> Proc {
         let (tx, _rx): (std::sync::mpsc::SyncSender<Evt>, _) =
             std::sync::mpsc::sync_channel(64);
@@ -8309,7 +8358,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         for t in 1..=4usize {
             arr.insert(t, 0, Clip::new(1, 1000)); // click being ducked
         }
-        arr.insert(6, 0, Clip::new(1, 1100)); // unrouted control click
+        arr.insert(106, 0, Clip::new(1, 1100)); // unrouted control click
         e.set_project(Arc::new(vec![src, click]), Arc::new(arr), 1536);
         let mut m = 0u128;
         for s in 5..105 {
@@ -8327,10 +8376,11 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
             e.set_sc_send(t, m); // 100 sources each -> 400 edges total
         }
         // Control: same effect, NO send — must stay at unity (guards the
-        // fix against over-keying).
+        // fix against over-keying). Track 106 is OUTSIDE the 5..105
+        // sender band so the mute loop below never touches it.
         let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
         e.set_track_fx(
-            6,
+            106,
             TrackFx {
                 slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
             },
