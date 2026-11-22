@@ -48408,6 +48408,77 @@ mod tests {
         assert!(!app.assets[0].dirty, "original kick.wav still pristine");
     }
 
+    #[test]
+    fn v121_save_as_folds_reserved_in_stem() {
+        // v121 class sibling: the sample "Save As" name is user-typed
+        // too — "kick: pp" is NTFS-illegal (os error 123 on Windows) and
+        // a raw '/' would escape the folder even on Linux. The saved
+        // stem must go through the same folding contract as project
+        // names (project::sanitize_name).
+        let mut app = headless_app("v121saveas");
+        let samples = std::env::temp_dir().join("sp-uity-v121saveas/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/kick.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&samples.join("kit-a/kick.wav"));
+        let key = samples
+            .join("kit-a/kick.wav")
+            .to_string_lossy()
+            .into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        app.record_target = samples.join("kit-a").display().to_string();
+        app.se_save_as(&key, "kick: pp");
+        assert!(
+            samples.join("kit-a/kick- pp.wav").exists(),
+            "reserved ':' must fold in the saved stem"
+        );
+        assert!(
+            !samples.join("kit-a/kick: pp.wav").exists(),
+            "the raw reserved-char name must never reach disk"
+        );
+    }
+
+    #[test]
+    fn v121_rack_sub_add_folds_reserved() {
+        // v121 class sibling: rack sub-folder names are user-typed too —
+        // create_dir_all must receive a name NTFS accepts, while the
+        // deliberate '/' nesting and the traversal guard stay intact.
+        let mut app = headless_app("v121subadd");
+        let root = std::env::temp_dir().join("sp-uity-v121subadd/rack");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        app.rack[0].path = root.display().to_string();
+        app.rack[0].rescan();
+        app.rack_sub_add(0, "kicks: hard");
+        assert!(
+            root.join("kicks- hard").is_dir(),
+            "reserved ':' must fold in a sub-folder name: {:?}",
+            std::fs::read_dir(&root).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        app.rack_sub_add(0, "drums/kicks? 2");
+        assert!(
+            root.join("drums").join("kicks- 2").is_dir(),
+            "'/' keeps nesting; '?' folds"
+        );
+        // The traversal guard must survive the folding.
+        app.rack_sub_add(0, "../escape");
+        assert_eq!(app.status, "new folder: illegal path");
+        assert!(
+            !root.parent().unwrap().join("escape").exists(),
+            "no folder may be created outside the rack root"
+        );
+    }
+
     // ---- v50 R2: clip-extension paints silence, not stretched content ----
 
     /// One frame with the pointer parked: every painted line segment with
