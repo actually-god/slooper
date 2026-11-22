@@ -115,6 +115,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   project"). Each option now shows its own checked state — exactly one is
   ever filled — and clicking any of them selects exactly that scope.
 
+- **Renaming or moving a sample keeps its baked edits.** Renaming a rack
+  file (or moving it into another folder — or moving whole folders) used
+  to orphan the sample editor's stored edit and its pristine source: the
+  settings were keyed by the file's old path, so the next project load
+  silently dropped every fade, gain, reverse and normalize baked onto
+  that sample — and a "restore" source copy was left stranded. The edit
+  now follows the file wherever the rack takes it (an open editor window
+  rides along too), the project records it under the new path, and
+  deleting a file forgets its edit instead of letting a later file at the
+  same path inherit it.
+
 - **Successive splits walk the clip again (S).** The docs promised that
   after a split the right half keeps the selection, so pressing S again
   at a further playhead chops a long clip into pieces — but the
