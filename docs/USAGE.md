@@ -735,6 +735,7 @@ output mix are never delayed, so nothing drifts.
 | Symptom | Fix |
 | --- | --- |
 | "no JACK server" / connection error on launch | Start PipeWire or `jackd` first — slooper never starts a server itself (`NO_START` by design). |
+| Audio stops after a PipeWire/JACK restart (USB-DAC unplug, profile switch) | The status line says "JACK server lost — reconnecting…": slooper notices the dead server and reconnects by itself, re-wiring your ports when the server is back (usually a couple of seconds). If it stops trying ("reconnect attempts stopped"), re-pick the ports in Settings → AUDIO (or restart slooper) to force a fresh attempt. |
 | No sound although the engine shows ready | ☰ settings → tick output (and input) ports → **Apply Selection**. Selections persist, but if your hardware changed, re-apply. |
 | Record button does nothing | Takes write into the **primary (first) rack folder** before they can become clips — the bundled 808 pack covers you by default, but if you removed every folder, press **+ folder**; the status line names the reason. |
 | Recorded clip starts early/late | Settings → latency (ms); and check **auto-quantize**/**snap** for grid drift you can *hear*. |

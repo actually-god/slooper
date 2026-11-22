@@ -638,18 +638,19 @@ fn chain_pick(app: &mut App, args: &Value) -> ToolResult {
             let rows = &mut app.fx_rows[t];
             let row = rows.remove(from);
             rows.insert(to, row);
-            // A pending plugin load remembers its ROW INDEX — shift every
-            // entry at/after the hole except our fresh row's own slot.
-            for ent in app.vst_pending_gui.iter_mut() {
-                if ent.0 != t {
-                    continue;
+            // v115: ONE drift seam (was: a pending-load-only loop, the v110
+            // lesson) — pending loads, curves, bindings and live views all
+            // ride the identical map: the fresh row lands on `to`, rows in
+            // [to, from) slide down one.
+            app.remap_fx_rows(t, &|r| {
+                if r == from {
+                    Some(to)
+                } else if r >= to && r < from {
+                    Some(r + 1)
+                } else {
+                    Some(r)
                 }
-                if ent.1 == from {
-                    ent.1 = to;
-                } else if ent.1 >= to && ent.1 < from {
-                    ent.1 += 1;
-                }
-            }
+            });
             app.rebuild_fx(t);
             app.save_config();
         }

@@ -19,6 +19,22 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **JACK server-death detection + auto-reconnect (v118).** When the
+  JACK/PipeWire-JACK server dies mid-session — the routine desktop events
+  (USB-DAC unplug, device-profile switch, PipeWire restart) that used to
+  leave Linux users in permanent silence until they restarted slooper —
+  the status line now says **"JACK server lost — reconnecting…"** and the
+  app rebuilds its client by itself: the server's own shutdown notification
+  plus a process-block liveness backstop feed a bounded reconnect loop
+  that re-wires your exact port selection (and the MIDI auto-links) the
+  moment the server answers, re-announces the possibly-new sample rate,
+  and echoes **"JACK server recovered — audio restored"**. A server that
+  is simply *down* is retried patiently (no attempt budget — audio comes
+  back by itself); a server that is *refusing* gets three rebuilds before
+  the app stops and says so, and re-picking your ports in Settings retries
+  immediately. This is the Linux twin of the Windows WASAPI recovery
+  contract (W12a); the decision table ships pinned in
+  `src/audio/rt_recovery.rs` on both platforms.
 - **Subwindow arrangement over MCP (v111/MCP-03).** Nine agent tools drive
   the window layer through the same UI-thread state the mouse uses:
   `windows.list` enumerates every window by a stable machine id (the
@@ -92,6 +108,86 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   follow in later updates.
 
 ### Fixed
+
+- **The EXPORT dialog's scope choice is one radio again.** The three
+  scope options shared two state flags, so "Track N (selected)" lit up
+  **at the same time** as "Current selection" — and clicking it there did
+  nothing: single-track export became unreachable once you had picked
+  "Current selection" (the only way back was a detour through "Whole
+  project"). Each option now shows its own checked state — exactly one is
+  ever filled — and clicking any of them selects exactly that scope.
+
+- **Renaming or moving a sample keeps its baked edits.** Renaming a rack
+  file (or moving it into another folder — or moving whole folders) used
+  to orphan the sample editor's stored edit and its pristine source: the
+  settings were keyed by the file's old path, so the next project load
+  silently dropped every fade, gain, reverse and normalize baked onto
+  that sample — and a "restore" source copy was left stranded. The edit
+  now follows the file wherever the rack takes it (an open editor window
+  rides along too), the project records it under the new path, and
+  deleting a file forgets its edit instead of letting a later file at the
+  same path inherit it.
+
+- **Successive splits walk the clip again (S).** The docs promised that
+  after a split the right half keeps the selection, so pressing S again
+  at a further playhead chops a long clip into pieces — but the
+  selection silently stayed on the left half, and the second S answered
+  "the playhead is not inside any selected clip". Every split now moves
+  the selection onto the right halves (keeping any other selected clips,
+  re-pointed at their new indices), so the documented repeated-S
+  workflow works end to end on one clip, across several clips, and
+  across tracks.
+
+- **Dense sidechain routing ducks every track during playback again.**
+  The live engine kept its sidechain routing table at 256 edges while the
+  mixer can legally wire every track to every track (up to 16k routes at
+  128 tracks): past the 256th route the send simply did nothing — no
+  ducking, no warning, no counter. Worse, EXPORTS were computed by a
+  separate, uncapped path, so the bounced file ducked correctly while the
+  speakers did not, hiding the bug from anyone who only checked the
+  render. The routing table now always holds every legal route (grown
+  once, no per-block cost, zero cost for projects without routing), so
+  truncation is structurally impossible; pins drive the live engine at
+  400 and 16,002 edges and demand every target's key arrives.
+
+- **Dense MIDI bursts no longer vanish inside VST2 plugins.** When more
+  than 64 channel-voice messages came due in one ~12 ms block aimed at a
+  single VST2 plugin — a big chord stack, a dense multi-lane pattern
+  summed onto one instrument, controller floods after a seek — every
+  message past the 64th was silently lost: the host had already drained
+  its whole due batch from the queue but handed the plugin only the
+  first 64, and the drop counter never heard about it. A lost note-off
+  left a note ringing until the next panic; a lost note-on left a dead
+  voice. The single per-block `processEvents` batch now grows to carry
+  every due event in one call (VST3 and CLAP hosts were already
+  honest), verified with 200-simultaneous-note-on and split-across-
+  blocks pins that demand every message, in order, drops still 0.
+
+- **Automation and MIDI knobs now follow the chain when you edit it.**
+  Automation curves and MIDI value bindings address plugin parameters by
+  chain position, so removing or reordering an effect used to leave them
+  silently driving the WRONG plugin — delete one row and every curve below
+  it jumped a slot, and the automation manager still showed the old plugin
+  name. Chain edits (remove, reorder, dead-script cleanup, and the MCP
+  `chain.pick`/`chain.remove` tools alike) now retarget every curve and
+  binding with the rows they follow, rewrite the saved curve files so the
+  fix survives a restart, move open windows and in-flight plugin loads
+  too, and echo what moved ("· 2 curve(s) retargeted, 1 binding(s)
+  removed"). A curve aimed at a row that is gone is defused (it can never
+  be silently captured by a later-added plugin) and reported; if the
+  transport ever hits a curve that cannot reach its target, the status bar
+  shows an orange "automation target lost" badge naming the dead targets
+  until the chain or the binding is fixed.
+- **Installing Rust while slooper is running now just works.** The
+  compiler availability check used to ask `rustc` exactly once per
+  session and trust that answer forever: install or repair Rust after
+  starting slooper and every scripted effect and synth kept showing the
+  "install Rust" hint until you restarted the app (and after uninstalling
+  Rust, slooper kept promising it was there). The check now refreshes
+  itself: a missing compiler is noticed again about once a second, and a
+  compile attempt that fails re-checks immediately, so the hint appears
+  and disappears as the toolchain truly comes and goes — no restart.
+
 
 - **Per-note aftertouch now reaches CLAP instruments.** A MPE controller's
   note-by-note pressure (polyphonic aftertouch — the message that bends

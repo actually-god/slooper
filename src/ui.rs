@@ -1153,6 +1153,52 @@ fn chain_row_label(row: &ChainRow) -> String {
     }
 }
 
+/// v115: tally of one `remap_fx_rows` pass — a chain layout shift that
+/// moved (or killed) routing must announce itself in the status echo.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FxRemap {
+    pub(crate) curves: usize,
+    pub(crate) orphaned: usize,
+    pub(crate) binds: usize,
+    pub(crate) dropped_binds: usize,
+    pub(crate) shared: usize,
+    pub(crate) file_fails: usize,
+}
+
+impl FxRemap {
+    /// Status-line suffix (empty when nothing moved). `·` U+00B7 is a
+    /// font-proven glyph (v35 coverage probe list).
+    pub(crate) fn note(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.curves > 0 {
+            parts.push(format!("{} curve(s) retargeted", self.curves));
+        }
+        if self.binds > 0 {
+            parts.push(format!("{} binding(s) retargeted", self.binds));
+        }
+        if self.orphaned > 0 {
+            parts.push(format!("{} curve(s) lost their row", self.orphaned));
+        }
+        if self.dropped_binds > 0 {
+            parts.push(format!("{} binding(s) removed", self.dropped_binds));
+        }
+        if self.shared > 0 {
+            parts.push(format!(
+                "{} shared curve(s) untouched \u{2014} check the Automation window",
+                self.shared
+            ));
+        }
+        if self.file_fails > 0 {
+            parts.push(format!("{} curve file(s) unwritable", self.file_fails));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{b7} {}", parts.join(", "))
+        }
+    }
+}
+
 /// v61: the ONE row→save conversion. `save_config`, project saves and
 /// track templates all route through it so the persisted chain shape can
 /// never drift between entry points.
@@ -2010,6 +2056,9 @@ pub struct App {
     /// v16: chain rows (track, row) awaiting their load completion, then
     /// the v0.10 auto-open of the plugin's own GUI.
     vst_pending_gui: Vec<(usize, usize)>,
+    /// v115: rising-edge latch for the auto-miss status line (the yellow
+    /// badge is engine-state; this only prevents echo spam per frame).
+    auto_miss_seen: bool,
     /// v33: async ♪-synth binding opens. Track slot while a loader runs.
     /// The UI must NEVER block on a plugin open — a cold bridged
     /// instrument takes seconds and froze the whole app during picker/
@@ -2585,6 +2634,7 @@ impl App {
             vst_scan: Vec::new(),
             vst_scan_rx: None,
             vst_pending_gui: Vec::new(),
+            auto_miss_seen: false,
             vst_synth_open: (0..MAX_LOOPS).map(|_| None).collect(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
@@ -4660,8 +4710,22 @@ impl App {
             let label = chain_row_label(&self.fx_rows[i][k]);
             self.fx_rows[i].remove(k);
             self.rebuild_fx(i);
+            // v115: rows below k slid UP — curves, bindings, live views and
+            // pending loads ride the same map (positional targets are the
+            // only identity they ever had).
+            let echo = self
+                .remap_fx_rows(i, &|r| {
+                    if r < k {
+                        Some(r)
+                    } else if r == k {
+                        None
+                    } else {
+                        Some(r - 1)
+                    }
+                })
+                .note();
             self.save_config();
-            self.status = format!("removed \u{201c}{label}\u{201d} from track {} chain", i + 1);
+            self.status = format!("removed \u{201c}{label}\u{201d} from track {} chain{echo}", i + 1);
         }
     }
 
@@ -4685,9 +4749,22 @@ impl App {
         let label = chain_row_label(&self.fx_rows[i][k]);
         self.fx_rows[i].swap(k, j);
         self.rebuild_fx(i);
+        // v115: the swap moves two rows — anything targeting either must
+        // follow or the curve silently drives the other plugin.
+        let echo = self
+            .remap_fx_rows(i, &|r| {
+                if r == k {
+                    Some(j)
+                } else if r == j {
+                    Some(k)
+                } else {
+                    Some(r)
+                }
+            })
+            .note();
         self.save_config();
         self.status = format!(
-            "moved \u{201c}{label}\u{201d} {} the track {} chain",
+            "moved \u{201c}{label}\u{201d} {} the track {} chain{echo}",
             if dir < 0 { "up" } else { "down" },
             i + 1
         );
@@ -4872,11 +4949,36 @@ impl App {
     /// Drop chain rows pointing at scripts the registry no longer loads.
     fn prune_dead_script_rows(&mut self) {
         for i in 0..MAX_LOOPS {
+            // v115: retain() COMPACTS — every survivor below a dead row
+            // slides up, so curves/bindings/views ride a per-track
+            // old->new map computed from the same liveness decision.
+            let map: Vec<Option<usize>> = {
+                let mut next = 0usize;
+                self.fx_rows[i]
+                    .iter()
+                    .map(|r| {
+                        let alive = match r {
+                            ChainRow::Script { stem, .. } => {
+                                self.fx_registry.desc(stem).is_some()
+                            }
+                            ChainRow::Vst { .. } => true,
+                        };
+                        if alive {
+                            let at = next;
+                            next += 1;
+                            Some(at)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
             self.fx_rows[i].retain(|r| match r {
                 ChainRow::Script { stem, .. } => self.fx_registry.desc(stem).is_some(),
                 ChainRow::Vst { .. } => true,
             });
             self.rebuild_fx(i);
+            self.remap_fx_rows(i, &|r| map.get(r).copied().flatten());
         }
     }
 
@@ -5725,6 +5827,10 @@ impl App {
     /// S / toolbar: split every selected clip at the playhead. Clips the
     /// playhead does not cross stay untouched; the right halves keep the
     /// selection, so repeating S walks a long clip into pieces.
+    /// v120: that promise was broken — the selection kept the OLD indices
+    /// (the left halves), so a second S echoed "not inside any selected
+    /// clip". The remap below moves every split id onto its right half and
+    /// shifts the kept ids past each insertion that landed before them.
     fn split_selection(&mut self) {
         if self.sel_clips.is_empty() {
             self.status = "split: select a clip first (S splits at the playhead)".into();
@@ -5733,25 +5839,56 @@ impl App {
         let ph = self.backend.engine.pos();
         let mut ids = self.sel_clips.clone();
         ids.sort();
-        let mut n = 0usize;
-        // Reverse order: inserting at c+1 never disturbs earlier indices.
-        for (t, k, c) in ids.into_iter().rev() {
-            let Some(cl) = self.arr.tracks[t].lanes[k].clips.get(c) else {
+        // v120: decide every split BEFORE applying so each kept id can be
+        // remapped afterwards (the halves are returned by value, the scan
+        // does not mutate the lane).
+        let mut splits: Vec<(usize, usize, usize, Clip, Clip)> = Vec::new();
+        for &(t, k, c) in &ids {
+            let Some(cl) = self
+                .arr
+                .tracks
+                .get(t)
+                .and_then(|tr| tr.lanes.get(k))
+                .and_then(|ln| ln.clips.get(c))
+                .copied()
+            else {
                 continue;
             };
             let alen = self.asset_len(cl.asset);
-            let Some((l, r)) = cl.split_at(ph, alen) else {
-                continue;
-            };
-            let lane = &mut self.arr.tracks[t].lanes[k];
-            lane.clips[c] = l;
-            lane.clips.insert(c + 1, r);
-            n += 1;
+            if let Some((l, r)) = cl.split_at(ph, alen) {
+                splits.push((t, k, c, l, r));
+            }
         }
+        let n = splits.len();
         if n == 0 {
             self.status = "split: the playhead is not inside any selected clip".into();
             return;
         }
+        // Reverse order: inserting at c+1 never disturbs earlier indices.
+        for &(t, k, c, ref l, ref r) in splits.iter().rev() {
+            let lane = &mut self.arr.tracks[t].lanes[k];
+            lane.clips[c] = *l;
+            lane.clips.insert(c + 1, *r);
+        }
+        // v120: rebuild the selection on the RIGHT halves. A split id
+        // (t,k,c) lands at c+1, then each EARLIER split in the same lane
+        // (c' < c) shifted it once more; an unsplit id stays put but is
+        // shifted by those same earlier insertions (c' + 1 <= c).
+        let remap = |id: &(usize, usize, usize)| -> (usize, usize, usize) {
+            let (t, k, c) = *id;
+            let shift = splits
+                .iter()
+                .filter(|(t2, k2, c2, _, _)| *t2 == t && *k2 == k && *c2 < c)
+                .count();
+            let right = splits.iter().any(|(t2, k2, c2, _, _)| {
+                *t2 == t && *k2 == k && *c2 == c
+            });
+            (t, k, c + shift + usize::from(right))
+        };
+        let mut sel: Vec<(usize, usize, usize)> = ids.iter().map(remap).collect();
+        sel.sort();
+        sel.dedup();
+        self.sel_clips = sel;
         self.sel_anchor = self.sel_clips.first().copied();
         self.push_project();
         self.status = format!("split {n} clip(s) at the playhead");
@@ -6797,6 +6934,8 @@ impl App {
         if let Some(q) = rekey(&self.record_target.clone()) {
             self.record_target = q;
         }
+        // v122: the sample-edit maps are path-keyed too — same subtree mapping.
+        self.rekey_path_state(|p| rekey(p));
         // Which rack root does the destination live in, and what is the
         // moved folder's NEW root-relative key there?
         let dest_root = self
@@ -6965,7 +7104,9 @@ impl App {
             if t.is_empty() {
                 format!("{} (edit)", self.assets[idx].name)
             } else {
-                t.to_string()
+                // v121: the name is user-typed — fold it like a project
+                // name so NTFS accepts the file ('/' can't escape either).
+                project::sanitize_name(t)
             }
         };
         let dir = self.record_dir();
@@ -7422,6 +7563,50 @@ impl App {
         }
     }
 
+    /// v122: every piece of App state keyed by an asset's PATH string must
+    /// follow the file when the rack seams move it: the stored
+    /// `sample_edits`, the pristine `se_source`, an open editor window,
+    /// and a pending deferred commit. `remap` is consulted for every
+    /// existing key; `Some(new)` moves the entry. (The `wave` min/max
+    /// cache is keyed by TABLE INDEX and caches `a.data` — none of these
+    /// seams touch either, so it can never go stale here; contrast
+    /// `transform_asset`, which drops it because it MUTATES data.)
+    fn rekey_path_state(&mut self, remap: impl Fn(&str) -> Option<String>) {
+        let keys: std::collections::BTreeSet<String> = self
+            .sample_edits
+            .keys()
+            .chain(self.se_source.keys())
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(n) = remap(&k) {
+                if n == k {
+                    continue;
+                }
+                if let Some(e) = self.sample_edits.remove(&k) {
+                    self.sample_edits.insert(n.clone(), e);
+                }
+                if let Some(s) = self.se_source.remove(&k) {
+                    self.se_source.insert(n.clone(), s);
+                }
+            }
+        }
+        if let Some(n) = self.sample_edit_win.clone().and_then(|p| remap(&p)) {
+            self.sample_edit_win = Some(n);
+        }
+        if let Some(n) = self.se_defer.clone().and_then(|p| remap(&p)) {
+            self.se_defer = Some(n);
+        }
+    }
+
+    /// v122: forget the path-keyed edit/source of a file that is gone —
+    /// otherwise a file later created at the same path silently INHERITS
+    /// the dead file's edit (e.g. a re-recorded take reversing itself).
+    fn forget_path_state(&mut self, path: &str) {
+        self.sample_edits.remove(path);
+        self.se_source.remove(path);
+    }
+
     fn rack_rename(&mut self, old: &str, new_stem: &str) {
         let new_stem = project::sanitize_name(new_stem);
         let oldp = PathBuf::from(old);
@@ -7457,6 +7642,14 @@ impl App {
             a.path = np.clone();
             a.name = new_stem.clone();
         }
+        // v122: the edits + pristine source are keyed by the path string —
+        // they must follow the file or they detach silently: the save rides
+        // a dead key and the next load drops the rendered edit.
+        {
+            let old_k = old.to_string();
+            let new_k = np.to_string_lossy().into_owned();
+            self.rekey_path_state(|p| (p == old_k).then(|| new_k.clone()));
+        }
         for f in self.rack.iter_mut() {
             f.rescan();
         }
@@ -7478,13 +7671,34 @@ impl App {
             .trim_start_matches('/')
             .chars()
             .filter(|c| *c != '\0')
+            // v121: folder names are user-typed too — fold every
+            // NTFS-reserved char; '/' stays as the nesting separator.
+            .map(|c| {
+                if project::is_windows_reserved(c) {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect();
         if clean.is_empty() {
             self.status = "new folder: empty name".into();
             return;
         }
+        // Never walk out of the rack folder. NOTE (v121): a bare
+        // starts_with does NOT catch "a/../b" — Path comparison is
+        // component-lexical and the join keeps the '..' after the
+        // matching prefix — so '..' components in the typed name are
+        // rejected outright (checked on `clean`, the typed part, so a
+        // root that itself contains ".." still works).
+        if Path::new(&clean)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            self.status = "new folder: illegal path".into();
+            return;
+        }
         let p = Path::new(&root).join(&clean);
-        // Never walk out of the rack folder.
         if !p.starts_with(Path::new(&root)) {
             self.status = "new folder: illegal path".into();
             return;
@@ -7566,6 +7780,12 @@ impl App {
         if let Some(a) = self.assets.iter_mut().find(|a| a.path == oldp) {
             a.path = np.clone();
         }
+        // v122: same path-keyed state follows the moved file (v122 class).
+        {
+            let old_k = old.to_string();
+            let new_k = np.to_string_lossy().into_owned();
+            self.rekey_path_state(|p| (p == old_k).then(|| new_k.clone()));
+        }
         for f in self.rack.iter_mut() {
             f.rescan();
         }
@@ -7583,6 +7803,10 @@ impl App {
         if let Some(k) = self.assets.iter().position(|a| a.path == p) {
             self.remove_asset_at(k);
         }
+        // v122: forget the path-keyed edit/source of the deleted file — a
+        // stale key would silently RE-APPLY the old edit to any file that
+        // later appears at this path (a re-recorded take).
+        self.forget_path_state(path);
         if p.exists() {
             if let Err(e) = std::fs::remove_file(&p) {
                 self.status = format!("delete: {e}");
@@ -17644,6 +17868,200 @@ impl App {
         }
     }
 
+    /// v115: per-chain-edit tally from `remap_fx_rows` — feeds the status
+    /// echo so a layout shift that moved routing is never silent.
+    fn remap_fx_rows(&mut self, t: usize, map: &dyn Fn(usize) -> Option<usize>) -> FxRemap {
+        use crate::audio::{parse_plugin_target, PluginTarget};
+        let mut out = FxRemap::default();
+        // (1) value_binds — the only table that KNOWS its owner track.
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, vb) in self.value_binds.iter_mut().enumerate() {
+            if vb.track as usize != t {
+                continue;
+            }
+            let Some(PluginTarget::Fx(r, j)) = parse_plugin_target(&vb.target) else {
+                continue;
+            };
+            match map(r) {
+                Some(n) => {
+                    let nu = format!("fx:{n}:{j}");
+                    if nu != vb.target {
+                        vb.target = nu;
+                        out.binds += 1;
+                    }
+                }
+                None => drop.push(i),
+            }
+        }
+        for i in drop.iter().rev() {
+            self.value_binds.remove(*i);
+            out.dropped_binds += 1;
+        }
+        // (2) automation assets — the table is global, so ownership is
+        // derived from WHICH TRACKS' CLIPS consume the curve. A curve fed
+        // only to track `t` rides the map; one shared with another track is
+        // left alone (remapping would silently break the other consumer —
+        // the echo reports it so the user can fix the intent).
+        let mut cons: std::collections::BTreeMap<u32, (usize, usize)> = Default::default();
+        for lane in &self.arr.tracks[t].lanes {
+            for c in &lane.clips {
+                if let Some(a) = self.assets.get(c.asset as usize).and_then(|a| a.automation.as_ref())
+                {
+                    if let Some(PluginTarget::Fx(r, j)) = parse_plugin_target(&a.target) {
+                        cons.insert(c.asset, (r, j));
+                    }
+                }
+            }
+        }
+        let mut shared: std::collections::BTreeSet<u32> = Default::default();
+        if !cons.is_empty() {
+            for (tr, track) in self.arr.tracks.iter().enumerate() {
+                if tr == t {
+                    continue;
+                }
+                for lane in &track.lanes {
+                    for c in &lane.clips {
+                        if cons.contains_key(&c.asset) {
+                            shared.insert(c.asset);
+                        }
+                    }
+                }
+            }
+        }
+        let mut touched = false;
+        for (id, (r, j)) in cons.iter() {
+            if shared.contains(id) {
+                out.shared += 1;
+                continue;
+            }
+            let mapped = map(*r);
+            // The destroyed-row case must not leave `fx:k:j` behind: a
+            // later append into the freed index would silently capture the
+            // old curve. `fx:gone:<j>` never parses as a row => never routes,
+            // yet stays human-readable in the automation manager.
+            let nu_target = match mapped {
+                Some(n) => format!("fx:{n}:{j}"),
+                None => format!("fx:gone:{j}"),
+            };
+            let Some(curve) = self.assets.get(*id as usize).and_then(|a| a.automation.clone())
+            else {
+                continue;
+            };
+            if curve.target == nu_target {
+                continue;
+            }
+            let nu = std::sync::Arc::new(crate::automation::Automation {
+                target: nu_target,
+                ..(*curve).clone()
+            });
+            let path = self.assets[*id as usize].path.clone();
+            self.assets[*id as usize].automation = Some(nu.clone());
+            // Persistence: `.slauto` IS the durable medium (project saves
+            // re-read the file) — an in-memory-only rewrite would resurrect
+            // the stale target on restart.
+            match nu.to_json().map(|s| std::fs::write(&path, s)) {
+                Ok(Ok(())) => {}
+                _ => out.file_fails += 1,
+            }
+            if mapped.is_none() {
+                out.orphaned += 1;
+            } else {
+                out.curves += 1;
+            }
+            touched = true;
+        }
+        if touched {
+            let auto = std::sync::Arc::new(
+                self.assets
+                    .iter()
+                    .map(|a| a.automation.clone())
+                    .collect::<Vec<_>>(),
+            );
+            self.backend.cmd(Cmd::SetAutoAssets(auto));
+        }
+        // (3) live views + pending loads that hold a ROW INDEX (same trap
+        // class v110 fixed for MCP relocation; now every mutator shares it).
+        // The script editor is defensively remapped here, but every current
+        // mutator calls rebuild_fx first, which RETIRES editors of the track
+        // anyway (v33 instance-swap rule) — so a script editor can never
+        // outlive a shift; params windows and pending loads CAN, and ride
+        // the map.
+        if let Some(ed) = self.fx_editor.as_ref() {
+            if ed.loop_i == t && map(ed.slot).is_none() {
+                self.fx_editor = None;
+            }
+        }
+        if let Some(ed) = self.fx_editor.as_mut() {
+            if ed.loop_i == t {
+                if let Some(n) = map(ed.slot) {
+                    ed.slot = n;
+                }
+            }
+        }
+        if let Some(GuiTarget::Chain(t2, r)) = self.params_win {
+            if t2 == t {
+                self.params_win = map(r).map(|n| GuiTarget::Chain(t2, n));
+            }
+        }
+        self.vst_pending_gui.retain_mut(|(t2, r)| {
+            if *t2 != t {
+                return true;
+            }
+            match map(*r) {
+                Some(n) => {
+                    *r = n;
+                    true
+                }
+                None => false,
+            }
+        });
+        // Un-stick the RT badge once nothing is dead any more (a later miss
+        // re-arms it on its own).
+        if self.backend.engine.auto_miss() && self.dead_auto_targets().is_empty() {
+            self.backend.engine.clear_auto_miss();
+        }
+        out
+    }
+
+    /// v115: live automation clips whose well-formed plugin target cannot
+    /// route with TODAY's layout (RT semantics: fx = row exists on the
+    /// clip's track; synth = track has a bound instrument). Deduped,
+    /// clip-track order. Malformed targets stay silent — RT ignores them.
+    fn dead_auto_targets(&self) -> Vec<(usize, String)> {
+        use crate::audio::{parse_plugin_target, PluginTarget};
+        let mut seen: std::collections::BTreeSet<(usize, String)> = Default::default();
+        let mut out = Vec::new();
+        for (tr, track) in self.arr.tracks.iter().enumerate() {
+            for lane in &track.lanes {
+                for c in &lane.clips {
+                    let Some(a) = self
+                        .assets
+                        .get(c.asset as usize)
+                        .and_then(|a| a.automation.as_ref())
+                    else {
+                        continue;
+                    };
+                    let Some(tgt) = parse_plugin_target(&a.target) else {
+                        continue;
+                    };
+                    let lands = match tgt {
+                        PluginTarget::Fx(r, _j) => self
+                            .fx_rows
+                            .get(tr)
+                            .is_some_and(|rows| rows.get(r).is_some()),
+                        PluginTarget::Synth(_i) => {
+                            self.track_synth.get(tr).is_some_and(|s| s.is_some())
+                        }
+                    };
+                    if !lands && seen.insert((tr, a.target.clone())) {
+                        out.push((tr, a.target.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// v42: the "what should this project load?" chooser shown after
     /// picking a .slooper file. The arrangement rides along with the
     /// import itself; these toggles pick the setup slices.
@@ -19434,6 +19852,41 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 let xruns = app.backend.xruns.load(Ordering::Relaxed);
                 if xruns > 0 {
                     ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
+                }
+                // v115: automation targets dead-drifted by chain edits (RT
+                // raised the sticky flag; a remap scan clears it again).
+                if app.backend.engine.auto_miss() {
+                    ui.label(RichText::new("automation target lost").color(Color32::ORANGE))
+                        .on_hover_text(
+                            "An automation curve aims at a chain slot that no \
+                             longer exists (the plugin was removed or moved). \
+                             The curve stays silent until rebound in the \
+                             Automation window or the chain is fixed.",
+                        );
+                    if !app.auto_miss_seen {
+                        app.auto_miss_seen = true;
+                        let dead = app.dead_auto_targets();
+                        if !dead.is_empty() {
+                            let list: Vec<String> = dead
+                                .iter()
+                                .take(3)
+                                .map(|(t, tg)| format!("trk {} {tg}", t + 1))
+                                .collect();
+                            let more = if dead.len() > 3 {
+                                format!(" +{}", dead.len() - 3)
+                            } else {
+                                String::new()
+                            };
+                            app.status = format!(
+                                "automation cannot reach {}{more} \u{2014} that chain slot is gone",
+                                list.join(", ")
+                            );
+                        } else {
+                            app.status = "automation cannot reach one of its targets \u{2014} check the Automation window".to_string();
+                        }
+                    }
+                } else {
+                    app.auto_miss_seen = false;
                 }
 
                 // ---- transport ----
@@ -29324,26 +29777,40 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
         .show(ui, |ui| {
             ui.label(RichText::new("What to export:").strong());
             let n_sel = app.sel_clips.len();
+            // v122: three radios, two bools — checked flags computed
+            // explicitly per row (track mode = NEITHER bool) and EVERY
+            // clicked arm sets BOTH bools. The old code shared
+            // `export_whole` with the Track row inverted, so Track lit up
+            // double-checked next to "Current selection" and clicking it
+            // in that state was a no-op — single-track export was only
+            // reachable by detouring through "Whole project".
+            let (mode_sel, mode_whole) = (app.export_sel, app.export_whole);
             if ui
-                .radio_value(&mut app.export_sel, true, format!("Current selection ({n_sel} clip(s))"))
-                .changed()
-                && app.export_sel
+                .add(egui::RadioButton::new(
+                    mode_sel,
+                    format!("Current selection ({n_sel} clip(s))"),
+                ))
+                .clicked()
             {
+                app.export_sel = true;
                 app.export_whole = false;
             }
             if ui
-                .radio_value(
-                    &mut app.export_whole,
-                    false,
+                .add(egui::RadioButton::new(
+                    !mode_sel && !mode_whole,
                     format!("Track {} (selected)", app.selected + 1),
-                )
-                .changed()
-                && !app.export_whole
+                ))
+                .clicked()
             {
                 app.export_sel = false;
+                app.export_whole = false;
             }
-            if ui.radio_value(&mut app.export_whole, true, "Whole project").changed() && app.export_whole {
+            if ui
+                .add(egui::RadioButton::new(mode_whole, "Whole project"))
+                .clicked()
+            {
                 app.export_sel = false;
+                app.export_whole = true;
             }
             if app.export_sel && n_sel == 0 {
                 ui.label(
@@ -37037,6 +37504,229 @@ mod tests {
             !has_text(&mut app, &ctx, "sine \u{b7}"),
             "strip hides without a selection"
         );
+    }
+
+    /// v120 (card t_64efd07c): the doc promises "the right halves keep the
+    /// selection, so repeating S walks a long clip into pieces" — a single
+    /// split worked but the selection stayed on the left half, so the
+    /// SECOND S echoed "not inside any selected clip". Drives bare S keys
+    /// through frame_keys (the real key seam) with seek_to between presses;
+    /// asserts the selection remaps onto each new right half at every step.
+    #[test]
+    fn v120_repeated_s_walks_long_clip() {
+        let mut app = headless_app("v120walk");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 96_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "walk".into(),
+            std::path::PathBuf::from("/tmp/v120-walk.wav"),
+            data,
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.select_one((0, 0, 0));
+        frame_keys(&mut app, &ctx, vec![]);
+
+        // --- S #1 at 48k: split, and the RIGHT half is what stays selected.
+        app.backend.engine.seek_to(48_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(lane.clips.len(), 2, "S #1 split the clip");
+            assert_eq!(
+                app.sel_clips,
+                vec![(0, 0, 1)],
+                "selection moved onto the right half (was: left-half index)"
+            );
+            assert_eq!(app.sel_anchor, Some((0, 0, 1)), "anchor follows the walk");
+            assert_eq!(lane.clips[1].pos, 48_000, "index 1 is the right half");
+            assert!(
+                !app.status.contains("not inside"),
+                "echo after a real split: {}",
+                app.status
+            );
+        }
+
+        // --- S #2 further right: the DOCUMENTED workflow — walks again.
+        app.backend.engine.seek_to(72_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(
+                lane.clips.len(),
+                3,
+                "S #2 split the right half (repeat-S walk broken): status {}",
+                app.status
+            );
+            assert!(
+                app.status.starts_with("split 1 clip(s)"),
+                "S #2 echo: {}",
+                app.status
+            );
+            assert_eq!(
+                app.sel_clips,
+                vec![(0, 0, 2)],
+                "selection on the newest right half"
+            );
+            assert_eq!(lane.clips[2].pos, 72_000);
+            assert_eq!(lane.clips[2].cut, 72_000, "right half resumes the source");
+        }
+
+        // --- S #3 once more: the walk keeps going, and identity holds
+        // (each piece's pos chain proves the selection tracked the right
+        // pieces, not re-split leftovers).
+        app.backend.engine.seek_to(84_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(lane.clips.len(), 4, "S #3 keeps walking");
+            assert_eq!(app.sel_clips, vec![(0, 0, 3)]);
+            assert_eq!(lane.clips[3].pos, 84_000);
+            assert_eq!(
+                lane.clips.iter().map(|c| c.pos).collect::<Vec<_>>(),
+                vec![0, 48_000, 72_000, 84_000]
+            );
+        }
+
+        // --- Playhead BACK on a deselected (left) piece: correct refusal —
+        // the walk selection only covers the right halves.
+        app.backend.engine.seek_to(24_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert!(
+            app.status.contains("not inside"),
+            "left pieces are deselected: {}",
+            app.status
+        );
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips.len(),
+            4,
+            "refused S changed nothing"
+        );
+    }
+
+    /// v120: a multi-clip selection where only ONE clip is crossed keeps
+    /// the other three selected, with indices shifted past the insertion —
+    /// and the shifted ids still NAME the same clips (identity check via
+    /// pos, not just index arithmetic).
+    #[test]
+    fn v120_split_keeps_unsplit_ids_shifted() {
+        let mut app = headless_app("v120keep");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 120_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "four".into(),
+            std::path::PathBuf::from("/tmp/v120-four.wav"),
+            data,
+            false,
+        ));
+        // Four sequential 30k clips back-to-back (no gap): 0, 30k, 60k, 90k.
+        // BOUNDED play_len each — an open-ended clip runs the whole asset
+        // and would overlap (and split with) its neighbours.
+        for pos in [0u64, 30_000, 60_000, 90_000] {
+            let mut cl = Clip::new(a, pos);
+            cl.play_len = Some(30_000);
+            app.arr.insert(0, 0, cl);
+        }
+        app.sel_clips = vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)];
+        frame_keys(&mut app, &ctx, vec![]);
+
+        app.backend.engine.seek_to(45_000); // crosses ONLY clip 1 (30k..60k)
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(lane.clips.len(), 5, "one split inserted a fifth clip");
+            assert_eq!(
+                app.sel_clips,
+                vec![(0, 0, 0), (0, 0, 2), (0, 0, 3), (0, 0, 4)],
+                "unsplit ids shifted past the insertion; split id -> right half"
+            );
+            assert_eq!(app.sel_anchor, Some((0, 0, 0)), "anchor = first kept id");
+            // Identity: every selected id still names its original clip
+            // body (kept A, B's right half, then C and D shifted one slot
+            // right — NOT their pre-split neighbours).
+            let pos_of = |c: usize| lane.clips[c].pos;
+            assert_eq!(pos_of(0), 0, "kept clip A");
+            assert_eq!(pos_of(2), 45_000, "B's right half");
+            assert_eq!(pos_of(3), 60_000, "kept clip C shifted 2->3");
+            assert_eq!(pos_of(4), 90_000, "kept clip D shifted 3->4");
+            assert_eq!(lane.clips[1].play_len, Some(15_000), "B's left half is 30k..45k");
+        }
+
+        // Second S at the SAME playhead: B's right half (45k..60k) is now
+        // crossed at its start? No — 45k is its pos, and pos is NOT inside;
+        // boundary semantics unchanged: clip count stays 5.
+        let before = app.arr.tracks[0].lanes[0].clips.len();
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips.len(),
+            before,
+            "playhead exactly at a selected clip's start is not inside it: {}",
+            app.status
+        );
+
+        // Boundary contract at a kept clip's interior start point:
+        app.backend.engine.seek_to(75_000); // inside clip C (60k..90k), selected
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.arr.tracks[0].lanes[0].clips.len(), 6, "kept clip C splits next");
+        assert_eq!(
+            app.sel_clips,
+            vec![(0, 0, 0), (0, 0, 2), (0, 0, 4), (0, 0, 5)],
+            "C -> right half; D shifts again; untouched ids stay put"
+        );
+    }
+
+    /// v120: the walk across TWO TRACKS — one selection entry per track,
+    /// both crossed by the same playhead; every S must remap BOTH entries
+    /// onto their right halves (per-(track,lane) index remapping).
+    #[test]
+    fn v120_split_right_half_selection_multilane() {
+        let mut app = headless_app("v120multi");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 96_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "dual".into(),
+            std::path::PathBuf::from("/tmp/v120-dual.wav"),
+            data,
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.arr.insert(1, 0, Clip::new(a, 0));
+        app.sel_clips = vec![(0, 0, 0), (1, 0, 0)];
+        frame_keys(&mut app, &ctx, vec![]);
+
+        app.backend.engine.seek_to(24_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.sel_clips, vec![(0, 0, 1), (1, 0, 1)], "both right halves selected");
+        assert!(
+            app.status.starts_with("split 2 clip(s)"),
+            "echo: {}",
+            app.status
+        );
+
+        app.backend.engine.seek_to(48_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.sel_clips, vec![(0, 0, 2), (1, 0, 2)], "walk #2 on both tracks");
+
+        app.backend.engine.seek_to(72_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.sel_clips, vec![(0, 0, 3), (1, 0, 3)], "walk #3 on both tracks");
+        for t in 0..2 {
+            let lane = &app.arr.tracks[t].lanes[0];
+            assert_eq!(lane.clips.len(), 4, "track {t} walked to four pieces");
+            assert_eq!(
+                lane.clips.iter().map(|c| c.pos).collect::<Vec<_>>(),
+                vec![0, 24_000, 48_000, 72_000]
+            );
+        }
     }
 
     // ===================== v0.10 acceptance pins =====================
@@ -48115,6 +48805,284 @@ mod tests {
         assert!(!app.assets[0].dirty, "original kick.wav still pristine");
     }
 
+    #[test]
+    fn v121_save_as_folds_reserved_in_stem() {
+        // v121 class sibling: the sample "Save As" name is user-typed
+        // too — "kick: pp" is NTFS-illegal (os error 123 on Windows) and
+        // a raw '/' would escape the folder even on Linux. The saved
+        // stem must go through the same folding contract as project
+        // names (project::sanitize_name).
+        let mut app = headless_app("v121saveas");
+        let samples = std::env::temp_dir().join("sp-uity-v121saveas/samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/kick.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&samples.join("kit-a/kick.wav"));
+        let key = samples
+            .join("kit-a/kick.wav")
+            .to_string_lossy()
+            .into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        app.record_target = samples.join("kit-a").display().to_string();
+        app.se_save_as(&key, "kick: pp");
+        assert!(
+            samples.join("kit-a/kick- pp.wav").exists(),
+            "reserved ':' must fold in the saved stem"
+        );
+        assert!(
+            !samples.join("kit-a/kick: pp.wav").exists(),
+            "the raw reserved-char name must never reach disk"
+        );
+    }
+
+    #[test]
+    fn v121_rack_sub_add_folds_reserved() {
+        // v121 class sibling: rack sub-folder names are user-typed too —
+        // create_dir_all must receive a name NTFS accepts, while the
+        // deliberate '/' nesting and the traversal guard stay intact.
+        let mut app = headless_app("v121subadd");
+        let sandbox = std::env::temp_dir().join("sp-uity-v121subadd");
+        let root = sandbox.join("rack");
+        // Sweep the WHOLE sandbox: the escape probe's target sits next to
+        // the rack dir, and a leftover from an older (pre-guard) run must
+        // not decide the verdict.
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::fs::create_dir_all(&root).unwrap();
+        app.rack[0].path = root.display().to_string();
+        app.rack[0].rescan();
+        app.rack_sub_add(0, "kicks: hard");
+        assert!(
+            root.join("kicks- hard").is_dir(),
+            "reserved ':' must fold in a sub-folder name: {:?}",
+            std::fs::read_dir(&root).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        app.rack_sub_add(0, "drums/kicks? 2");
+        assert!(
+            root.join("drums").join("kicks- 2").is_dir(),
+            "'/' keeps nesting; '?' folds"
+        );
+        // The traversal guard must survive the folding.
+        app.rack_sub_add(0, "../escape");
+        assert_eq!(app.status, "new folder: illegal path");
+        assert!(
+            !root.parent().unwrap().join("escape").exists(),
+            "no folder may be created outside the rack root"
+        );
+    }
+
+    // ---- v122: EXPORT scope radios — three rows, two bools, one checked ----
+
+    /// One EXPORT-window frame: the three scope-label galley rects (painted
+    /// order: selection, track, whole) plus every painted checked-radio dot
+    /// (egui paints a checked radio as ONE small filled strokeless circle,
+    /// radius `icon_width_inner`/3 ≈ 2.7; the outer ring is radius ≥ 7 and
+    /// filter-classified away by radius/stroke, never by color — safe under
+    /// the 0.36 Area fade-in premultiply).
+    fn v122_radio_snapshot(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> (Vec<egui::Rect>, Vec<egui::Pos2>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut rows: Vec<egui::Rect> = Vec::new();
+        let mut dots: Vec<egui::Pos2> = Vec::new();
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let txt = t.galley.text();
+                    if txt.contains("Current selection (")
+                        || txt.ends_with(" (selected)")
+                        || txt == "Whole project"
+                    {
+                        let local = t.galley.rect;
+                        rows.push(egui::Rect::from_min_size(
+                            t.pos + local.min.to_vec2(),
+                            local.size(),
+                        ));
+                    }
+                }
+                egui::epaint::Shape::Circle(c)
+                    if c.radius < 4.0
+                        && c.fill != egui::Color32::TRANSPARENT
+                        && c.stroke.width < 0.5 =>
+                {
+                    dots.push(c.center);
+                }
+                _ => {}
+            }
+        }
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        rows.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+        (rows, dots)
+    }
+
+    /// Dots anchored to each label row (row order: sel, track, whole).
+    fn v122_dots_per_row(rows: &[egui::Rect], dots: &[egui::Pos2]) -> Vec<usize> {
+        rows.iter()
+            .map(|r| {
+                dots.iter()
+                    .filter(|p| {
+                        (p.y - r.center().y).abs() <= 8.0
+                            && p.x > r.min.x - 40.0
+                            && p.x < r.max.x
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// R1+R4: exactly one radio paints checked in every mode — never the
+    /// old double-checked pair (the Track row shared `export_whole`
+    /// inverted, so it lit up together with "Current selection").
+    #[test]
+    fn v122_export_radio_shows_exactly_one_checked() {
+        let mut app = headless_app("v122one");
+        clear_canvas(&mut app);
+        app.show_export = true;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Fresh app = track mode: only the Track row checked.
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(rows.len(), 3, "all three scope rows painted");
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![0, 1, 0],
+            "fresh state = track mode, one dot on the Track row"
+        );
+        // Selection mode: the bug painted [1,1,0] (double-checked pair).
+        app.export_sel = true;
+        frame(&mut app, &ctx, vec![]);
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![1, 0, 0],
+            "selection mode must light ONLY the selection row"
+        );
+        // Whole mode.
+        app.export_sel = false;
+        app.export_whole = true;
+        frame(&mut app, &ctx, vec![]);
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![0, 0, 1],
+            "whole mode must light ONLY the whole row"
+        );
+    }
+
+    /// R2: the dead click is dead no more — with "Current selection"
+    /// active, clicking "Track N (selected)" used to be a no-op (the bool
+    /// already held `false`, so `.changed()` never fired and `export_sel`
+    /// was never cleared); the single-track mode was only reachable via
+    /// "Whole project".
+    #[test]
+    fn v122_export_radio_track_reachable_from_selection() {
+        let mut app = headless_app("v122reach");
+        clear_canvas(&mut app);
+        app.show_export = true;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // Track -> selection.
+        click_last(&mut app, &ctx, "Current selection (");
+        assert!(app.export_sel && !app.export_whole, "sel click");
+        // Selection -> track (THE unreachable click).
+        click_last(&mut app, &ctx, " (selected)");
+        assert!(
+            !app.export_sel && !app.export_whole,
+            "clicking 'Track N (selected)' from selection mode must select single-track mode"
+        );
+        let (rows, dots) = v122_radio_snapshot(&mut app, &ctx);
+        assert_eq!(
+            v122_dots_per_row(&rows, &dots),
+            vec![0, 1, 0],
+            "after the click the Track row is the only checked radio"
+        );
+        // Track -> whole -> selection round trip.
+        click_last_exact(&mut app, &ctx, "Whole project");
+        assert!(!app.export_sel && app.export_whole, "whole click");
+        click_last(&mut app, &ctx, "Current selection (");
+        assert!(app.export_sel && !app.export_whole, "sel round trip");
+    }
+
+    /// R3: every clicked arm sets BOTH bools — 3 starting modes × 3 rows,
+    /// each click lands exactly that radio's (export_sel, export_whole).
+    #[test]
+    fn v122_export_radio_click_matrix_sets_both_bools() {
+        let mut app = headless_app("v122matrix");
+        clear_canvas(&mut app);
+        app.show_export = true;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        type Case = ((bool, bool), [(&'static str, (bool, bool)); 3]);
+        let cases: [Case; 3] = [
+            // from track (0,0):
+            (
+                (false, false),
+                [
+                    ("Current selection (", (true, false)),
+                    (" (selected)", (false, false)),
+                    ("Whole project", (false, true)),
+                ],
+            ),
+            // from selection (1,0):
+            (
+                (true, false),
+                [
+                    ("Current selection (", (true, false)),
+                    (" (selected)", (false, false)),
+                    ("Whole project", (false, true)),
+                ],
+            ),
+            // from whole (0,1):
+            (
+                (false, true),
+                [
+                    ("Current selection (", (true, false)),
+                    (" (selected)", (false, false)),
+                    ("Whole project", (false, true)),
+                ],
+            ),
+        ];
+        for (start, clicks) in cases {
+            for (needle, want) in clicks {
+                app.export_sel = start.0;
+                app.export_whole = start.1;
+                frame(&mut app, &ctx, vec![]);
+                if needle == "Whole project" {
+                    // exact: the weak explanation label ("Whole project =
+                    // every sounding track…") contains the same words.
+                    click_last_exact(&mut app, &ctx, needle);
+                } else {
+                    click_last(&mut app, &ctx, needle);
+                }
+                assert_eq!(
+                    (app.export_sel, app.export_whole),
+                    want,
+                    "start {start:?} + click {needle:?}"
+                );
+            }
+        }
+    }
+
     // ---- v50 R2: clip-extension paints silence, not stretched content ----
 
     /// One frame with the pointer parked: every painted line segment with
@@ -58903,12 +59871,12 @@ mod tests {
         assert_eq!(active("track_head_menu(ui, app,"), 2);
         // Internal version rides the series (v91 single-home law; v108 MCP-02
         // bumped it — retargeted here so the law holds, not the old number;
-        // v110 MCP-04 bump).
+        // v110 MCP-04 bump; v115 = v113 claim overtaken by merged v114, renumbered per the v111 recipe).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v112\""),
-            "INTERNAL_VERSION must be bumped to v112"
+            librs.contains("INTERNAL_VERSION: &str = \"v115\""),
+            "INTERNAL_VERSION must be bumped to v115"
         );
     }
 
@@ -59861,4 +60829,563 @@ mod tests {
         settle_plugin_drop();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- v115: chain-layout drift — `fx:<row>:<idx>` targets follow the chain ----
+
+    /// v115 helper: automation asset backed by a REAL `.slauto` file (the
+    /// durable medium the remap must rewrite) + a clip on (track, lane).
+    fn v115_curve(app: &mut App, tag: &str, target: &str, track: usize, lane: usize) -> u32 {
+        use crate::automation::{Automation, Node};
+        let dir = std::env::temp_dir().join(format!("sp-uity-{tag}")).join("auto");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("c-{}.slauto", app.assets.len()));
+        let a = Automation {
+            target: target.into(),
+            len_samples: 4096,
+            nodes: vec![Node { t: 0, v: 0.5, c: 0.0 }, Node { t: 4096, v: 0.5, c: 0.0 }],
+        };
+        std::fs::write(&path, a.to_json().unwrap()).unwrap();
+        let id = app.assets.len() as u32;
+        app.assets.push(Asset::automation_asset(
+            id,
+            format!("curve{id}"),
+            path,
+            Arc::new(a),
+            false,
+        ));
+        app.arr.insert(track, lane, Clip::new(id, 0));
+        id
+    }
+
+    fn v115_bind(app: &mut App, target: &str, track: u32) {
+        app.value_binds.push(crate::config::ValueBind {
+            target: target.into(),
+            track,
+            bind: crate::midi::MidiBind { ty: 1, ch: 0, d1: 7 },
+            kind: 0,
+            lo: 0,
+            hi: 127,
+        });
+    }
+
+    fn v115_target(app: &App, id: u32) -> String {
+        app.assets[id as usize]
+            .automation
+            .as_ref()
+            .map(|a| a.target.clone())
+            .unwrap_or_default()
+    }
+
+    fn v115_hold_row(app: &mut App, track: usize) {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.fx_rows[track].push(ChainRow::Vst {
+            state: None,
+            path: "/fake/held.vst3".into(),
+            kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
+            name: "Held".into(),
+            params: Vec::new(),
+            entry: None,
+            open_rx: Some(rx),
+            program: None,
+            bypass: false,
+        });
+    }
+
+    #[test]
+    fn v115_remove_shifts_fx_targets() {
+        let mut app = headless_app("v115rem");
+        for stem in ["chorus", "space_echo", "enhancer"] {
+            app.add_fx_script(0, stem);
+        }
+        assert_eq!(app.fx_rows[0].len(), 3);
+        // Curves on the shifting row 2 and the doomed row 0; an
+        // identically-shaped target on track 1 must stay put.
+        let moved = v115_curve(&mut app, "v115rem", "fx:2:1", 0, 0);
+        let doomed = v115_curve(&mut app, "v115rem", "fx:0:0", 0, 0);
+        let foreign = v115_curve(&mut app, "v115rem", "fx:2:0", 1, 0);
+        for stem in ["chorus", "space_echo", "enhancer"] {
+            app.add_fx_script(1, stem); // track 1 chain: its curve must LIVE there
+        }
+        v115_bind(&mut app, "fx:1:0", 0); // shifts
+        v115_bind(&mut app, "fx:0:1", 0); // its row dies -> bind goes
+        v115_bind(&mut app, "fx:2:2", 1); // foreign track
+        app.remove_fx_row(0, 0);
+        assert_eq!(v115_target(&app, moved), "fx:1:1", "curve rides the shift");
+        assert_eq!(v115_target(&app, foreign), "fx:2:0", "other track untouched");
+        assert_eq!(
+            v115_target(&app, doomed),
+            "fx:gone:0",
+            "a doomed curve can never capture a future appended row"
+        );
+        assert_eq!(app.value_binds.len(), 2, "only the dead-row bind drops");
+        assert_eq!(app.value_binds[0].target, "fx:0:0", "binding rides the shift");
+        assert_eq!(app.value_binds[1].target, "fx:2:2", "foreign bind untouched");
+        assert!(app.status.contains("1 curve(s) retargeted"), "{}", app.status);
+        assert!(app.status.contains("1 binding(s) retargeted"), "{}", app.status);
+        assert!(app.status.contains("1 curve(s) lost their row"), "{}", app.status);
+        assert!(app.status.contains("1 binding(s) removed"), "{}", app.status);
+        assert!(app.dead_auto_targets().is_empty(), "post-shift scan must be clean");
+    }
+
+    #[test]
+    fn v115_move_swaps_fx_targets() {
+        let mut app = headless_app("v115mv");
+        for stem in ["chorus", "space_echo", "enhancer"] {
+            app.add_fx_script(0, stem);
+        }
+        let top = v115_curve(&mut app, "v115mv", "fx:0:0", 0, 0);
+        let mid = v115_curve(&mut app, "v115mv", "fx:1:2", 0, 0);
+        let tail = v115_curve(&mut app, "v115mv", "fx:2:1", 0, 0);
+        v115_bind(&mut app, "fx:1:0", 0);
+        app.move_fx_row(0, 0, 1); // rows 0 <-> 1
+        assert_eq!(v115_target(&app, top), "fx:1:0");
+        assert_eq!(v115_target(&app, mid), "fx:0:2");
+        assert_eq!(v115_target(&app, tail), "fx:2:1", "outside the swap");
+        assert_eq!(app.value_binds[0].target, "fx:0:0");
+        assert!(app.status.contains("2 curve(s) retargeted"), "{}", app.status);
+        assert!(app.status.contains("1 binding(s) retargeted"), "{}", app.status);
+    }
+
+    #[test]
+    fn v115_shared_curve_not_remapped() {
+        let mut app = headless_app("v115sh");
+        for stem in ["chorus", "space_echo", "enhancer"] {
+            app.add_fx_script(0, stem);
+        }
+        // ONE asset, clips on BOTH tracks: the target means a DIFFERENT
+        // plugin per chain, so no in-place remap can serve both consumers —
+        // it must be left alone AND reported.
+        let id = v115_curve(&mut app, "v115sh", "fx:2:1", 0, 0);
+        app.arr.insert(1, 0, Clip::new(id, 0));
+        let path = app.assets[id as usize].path.clone();
+        app.remove_fx_row(0, 0);
+        assert_eq!(v115_target(&app, id), "fx:2:1", "shared curve never silently retargets");
+        assert!(app.status.contains("1 shared curve(s) untouched"), "{}", app.status);
+        let raw = std::fs::read_to_string(&path).expect("curve file");
+        assert!(raw.contains("fx:2:1"), "the shared FILE is untouched too");
+        let dead = app.dead_auto_targets();
+        assert!(
+            dead.iter().any(|(t, tg)| *t == 0 && tg == "fx:2:1"),
+            "the shortened chain must show the orphan: {dead:?}"
+        );
+    }
+
+    #[test]
+    fn v115_remap_persists_slauto() {
+        let mut app = headless_app("v115disk");
+        app.add_fx_script(0, "chorus");
+        app.add_fx_script(0, "space_echo");
+        let id = v115_curve(&mut app, "v115disk", "fx:1:0", 0, 0);
+        let path = app.assets[id as usize].path.clone();
+        app.remove_fx_row(0, 0);
+        let raw = std::fs::read_to_string(&path).expect("curve file");
+        let disk = crate::automation::Automation::from_json(&raw).unwrap();
+        assert_eq!(disk.target, "fx:0:0", "the FILE is the durable truth");
+    }
+
+    #[test]
+    fn v115_views_follow_chain_shift() {
+        let mut app = headless_app("v115view");
+        for stem in ["chorus", "space_echo", "enhancer"] {
+            app.add_fx_script(0, stem);
+        }
+        // A params window pinned to row 2, a plugin load pending on row 1,
+        // and a script editor on row 2 — which the rebuild's instance swap
+        // retires (v33): a script editor NEVER survives a chain mutation.
+        app.open_fx_editor(0, 2);
+        assert!(app.fx_editor.is_some(), "script editor opens headless");
+        app.params_win = Some(GuiTarget::Chain(0, 2));
+        v115_hold_row(&mut app, 0); // row 3
+        app.vst_pending_gui.push((0, 1));
+        app.remove_fx_row(0, 0);
+        assert!(app.fx_editor.is_none(), "editor retired by the rebuild (never left on a stale slot)");
+        assert!(matches!(app.params_win, Some(GuiTarget::Chain(0, 1))), "params window follows: {:?}", app.params_win);
+        assert_eq!(app.vst_pending_gui, vec![(0usize, 0usize)], "pending load follows its row");
+        // Deleting the params window's row CLOSES it (never retargets chrome).
+        app.remove_fx_row(0, 1);
+        assert!(app.fx_editor.is_none(), "editor of a destroyed row closes");
+        assert!(app.params_win.is_none(), "params window on a destroyed row closes");
+        assert_eq!(app.vst_pending_gui, vec![(0usize, 0usize)], "survivor keeps its row");
+        app.remove_fx_row(0, 0);
+        assert!(app.vst_pending_gui.is_empty(), "pending load of a destroyed row is dropped");
+    }
+
+    #[test]
+    fn v115_prune_shifts_targets() {
+        let mut app = headless_app("v115prune");
+        app.fx_rows[0].push(ChainRow::Script {
+            stem: "definitely_not_a_stem".into(),
+            params: Vec::new(),
+            bypass: false,
+        });
+        app.add_fx_script(0, "chorus");
+        let id = v115_curve(&mut app, "v115prune", "fx:1:0", 0, 0);
+        app.prune_dead_script_rows();
+        assert_eq!(app.fx_rows[0].len(), 1);
+        assert_eq!(v115_target(&app, id), "fx:0:0", "survivor slid up — so did its curve");
+    }
+
+    #[test]
+    fn v115_auto_miss_badge_and_status() {
+        use std::sync::atomic::Ordering;
+        let mut app = headless_app("v115miss");
+        let ctx = egui::Context::default();
+        let _id = v115_curve(&mut app, "v115miss", "fx:9:0", 0, 0);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.dead_auto_targets().iter().any(|(t, tg)| *t == 0 && tg == "fx:9:0"),
+            "empty chain => fx:9:0 is dead"
+        );
+        // The NULL headless engine never runs RT — drive the very atomic the
+        // RT pass drives (same seam), then let one frame mirror it.
+        app.backend.engine.auto_miss_flag().store(true, Ordering::Relaxed);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !galley_centers(&mut app, &ctx, "automation target lost", true).is_empty(),
+            "yellow badge paints in the status bar"
+        );
+        assert!(app.status.contains("trk 1 fx:9:0"), "{}", app.status);
+        // One shot: the echo must not re-stamp a later status change.
+        app.status = "cleared".into();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.status, "cleared", "rising-edge latch, not per-frame spam");
+        // User rebinding the curve + any chain edit clears the badge
+        // (the remap pass scans and un-sticks when nothing is dead).
+        let nu = crate::automation::Automation {
+            target: crate::automation::TARGET_TRACK_VOL.into(),
+            ..(**app.assets[_id as usize].automation.as_ref().unwrap()).clone()
+        };
+        app.assets[_id as usize].automation = Some(Arc::new(nu));
+        app.add_fx_script(0, "chorus");
+        app.add_fx_script(0, "space_echo");
+        app.move_fx_row(0, 0, 1); // rides remap_fx_rows -> clear scan
+        assert!(!app.backend.engine.auto_miss(), "flag un-sticks when everything lands");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_centers(&mut app, &ctx, "automation target lost", true).is_empty(),
+            "badge is gone once the flag clears"
+        );
+    }
+
+    // ---- v122: rack file ops must re-key path-keyed sample-edit state ----
+
+    #[test]
+    fn v122_rename_rekeys_sample_edits() {
+        // v122 P1 (card t_57a5612f): rack_rename moved the file and the
+        // asset entry but left sample_edits/se_source keyed by the OLD
+        // path — the edit detached silently, rode the project under a
+        // dead key, and died at the next load (se_apply key miss).
+        let mut app = headless_app("v122rn");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122rn")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        // W14 scan-form: chained single-component joins.
+        let wav = samples.join("kit-a").join("revme.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let old_key = wav.to_string_lossy().into_owned();
+        // Commit through the real edit seam (menu entry pinned by
+        // v50_edit_sample_menu_*; this pin owns the rename re-key).
+        app.sample_edit_win = Some(old_key.clone());
+        app.se_defer = Some(old_key.clone());
+        app.sample_edits.insert(
+            old_key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&old_key);
+        assert!(
+            app.se_source.contains_key(&old_key),
+            "setup: pristine source cached under the edit"
+        );
+        let edited = app.assets[0].data.to_vec();
+        app.rack_rename(&old_key, "revved");
+        let wav2 = samples.join("kit-a").join("revved.wav");
+        let new_key = wav2.to_string_lossy().into_owned();
+        assert!(
+            wav2.exists() && !wav.exists(),
+            "rename moved the file on disk"
+        );
+        assert!(
+            !app.sample_edits.contains_key(&old_key),
+            "old key must not survive: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.sample_edits.contains_key(&new_key),
+            "the edit must follow the file"
+        );
+        assert!(
+            app.se_source.contains_key(&new_key),
+            "the pristine source must follow too"
+        );
+        assert_eq!(
+            app.sample_edit_win.as_deref(),
+            Some(new_key.as_str()),
+            "an open editor follows the rename (never silently closes)"
+        );
+        assert_eq!(
+            app.se_defer.as_deref(),
+            Some(new_key.as_str()),
+            "a pending deferred commit follows the rename"
+        );
+        // The rebuilt project records the edit under the NEW path...
+        let pr = app.build_project("v122rn".into());
+        assert!(
+            pr.sample_edits.contains_key(&new_key)
+                && !pr.sample_edits.contains_key(&old_key),
+            "edits ride the project under the new key"
+        );
+        // ...and a reload over fresh (pristine) assets re-renders it —
+        // this round trip is the exact user-data-loss case.
+        let mut app2 = headless_app("v122rn2");
+        app2.rack[0].path = samples.display().to_string();
+        app2.rack[0].rescan();
+        let _ = app2.ensure_asset(&wav2);
+        app2.restore_sample_edits(&pr.sample_edits);
+        assert_eq!(
+            app2.assets[0].data.to_vec(),
+            edited,
+            "reload must re-render the renamed sample's edit"
+        );
+    }
+
+    #[test]
+    fn v122_move_rekeys_sample_edits() {
+        // v122 class sibling: rack_move relocates the file (and the asset
+        // path) but the path-keyed edit/source maps kept the OLD path.
+        let mut app = headless_app("v122mv");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122mv")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        let wav = samples.join("kit-a").join("revme.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let old_key = wav.to_string_lossy().into_owned();
+        app.sample_edits.insert(
+            old_key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&old_key);
+        let edited = app.assets[0].data.to_vec();
+        app.rack_move(&old_key, &samples.join("kit-b"));
+        let wav2 = samples.join("kit-b").join("revme.wav");
+        let new_key = wav2.to_string_lossy().into_owned();
+        assert!(
+            wav2.exists() && !wav.exists(),
+            "move relocated the file"
+        );
+        assert!(
+            !app.sample_edits.contains_key(&old_key)
+                && app.sample_edits.contains_key(&new_key),
+            "the edit must follow the move: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.se_source.contains_key(&new_key),
+            "the pristine source must follow the move"
+        );
+        let pr = app.build_project("v122mv".into());
+        assert!(
+            pr.sample_edits.contains_key(&new_key),
+            "project records the edit under the moved path"
+        );
+        let mut app2 = headless_app("v122mv2");
+        app2.rack[0].path = samples.display().to_string();
+        app2.rack[0].rescan();
+        let _ = app2.ensure_asset(&wav2);
+        app2.restore_sample_edits(&pr.sample_edits);
+        assert_eq!(
+            app2.assets[0].data.to_vec(),
+            edited,
+            "reload re-renders the moved sample's edit"
+        );
+    }
+
+    #[test]
+    fn v122_dir_move_rekeys_subtree() {
+        // v122 class sibling: rack_dir_move already re-keys assets,
+        // record_target and folder bookkeeping through its subtree
+        // closure — but not the path-keyed sample-edit maps. Nested
+        // files must re-key by prefix; a sibling subtree stays put.
+        let mut app = headless_app("v122dm");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122dm")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        v28_wav(&samples, "kit-a/deep/hat.wav");
+        v28_wav(&samples, "kit-b/keep.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        // Keys only — no asset load needed; the maps are the contract.
+        let ka = samples
+            .join("kit-a")
+            .join("revme.wav")
+            .to_string_lossy()
+            .into_owned();
+        let kd = samples
+            .join("kit-a")
+            .join("deep")
+            .join("hat.wav")
+            .to_string_lossy()
+            .into_owned();
+        let kb = samples
+            .join("kit-b")
+            .join("keep.wav")
+            .to_string_lossy()
+            .into_owned();
+        for k in [&ka, &kd, &kb] {
+            app.sample_edits.insert(
+                k.clone(),
+                SampleEdit {
+                    reverse: true,
+                    ..Default::default()
+                },
+            );
+            app.se_source
+                .insert(k.clone(), std::sync::Arc::from(vec![0.25f32; 64]));
+        }
+        app.rack_dir_move(&samples.display().to_string(), "kit-a", &samples.join("box"));
+        let box_a = samples
+            .join("box")
+            .join("kit-a")
+            .join("revme.wav")
+            .to_string_lossy()
+            .into_owned();
+        let box_d = samples
+            .join("box")
+            .join("kit-a")
+            .join("deep")
+            .join("hat.wav")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !app.sample_edits.contains_key(&ka) && app.sample_edits.contains_key(&box_a),
+            "moved file's edit re-keyed under the new subtree: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.sample_edits.contains_key(&box_d),
+            "NESTED file re-keyed by prefix"
+        );
+        assert!(
+            app.sample_edits.contains_key(&kb),
+            "sibling subtree untouched"
+        );
+        assert!(
+            app.se_source.contains_key(&box_a) && !app.se_source.contains_key(&ka),
+            "pristine-source map follows the subtree"
+        );
+        assert!(
+            !app.se_source.contains_key(&kd)
+                && app.se_source.contains_key(&box_d),
+            "nested pristine-source entry re-keyed with the subtree"
+        );
+    }
+
+    #[test]
+    fn v122_rack_del_forgets_path_state() {
+        // v122 class sibling: unlinking a file must forget its path state
+        // — a stale key would silently RE-APPLY the old edit if a file
+        // later appears at the same path (e.g. a re-recorded take).
+        let mut app = headless_app("v122del");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122del")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        let wav = samples.join("hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let key = wav.to_string_lossy().into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        assert!(app.se_source.contains_key(&key), "setup: source cached");
+        app.rack_del(&key);
+        assert!(!wav.exists(), "file unlinked");
+        assert!(
+            !app.sample_edits.contains_key(&key),
+            "deleted file's edit must not linger to resurrect"
+        );
+        assert!(
+            !app.se_source.contains_key(&key),
+            "deleted file's pristine source must not linger"
+        );
+    }
+
+    /// v122 class invariant (source scan): every rack seam that MOVES or
+    /// deletes a sample file must re-key / forget the path-keyed state.
+    /// Bodies are scanned LIVE-line only (commented-out calls must not
+    /// count — the v12e active_call trap); needles are concat!-split and
+    /// the tests module is cut so the pin never reads its own literals.
+    #[test]
+    fn v122_path_rekey_sites_live() {
+        let src = include_str!("ui.rs");
+        let cut = ["\nmod tests", "\n    mod tests", "\npub(crate) mod tests"]
+            .iter()
+            .filter_map(|p| src.find(p))
+            .min()
+            .unwrap_or(src.len());
+        let lines: Vec<&str> = src[..cut]
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .collect();
+        let body = |sig: &str| -> String {
+            let i = lines
+                .iter()
+                .position(|l| l.starts_with(sig))
+                .unwrap_or_else(|| panic!("{sig} not found"));
+            let mut out: Vec<&str> = Vec::new();
+            for l in &lines[i + 1..] {
+                if l.starts_with("fn ") || l.starts_with("pub fn ") {
+                    break;
+                }
+                out.push(*l);
+            }
+            out.join("\n")
+        };
+        let rekey = concat!("self.", "rekey_path_state(");
+        let forget = concat!("self.", "forget_path_state(");
+        for sig in ["fn rack_rename(", "fn rack_move(", "fn rack_dir_move("] {
+            assert!(
+                body(sig).contains(rekey),
+                "{sig} must re-key sample_edits/se_source under the moved path"
+            );
+        }
+        assert!(
+            body("fn rack_del(").contains(forget),
+            "rack_del must forget the deleted file's path state"
+        );
+    }
+
 }
