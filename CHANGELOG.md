@@ -82,6 +82,21 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Automation and MIDI knobs now follow the chain when you edit it.**
+  Automation curves and MIDI value bindings address plugin parameters by
+  chain position, so removing or reordering an effect used to leave them
+  silently driving the WRONG plugin — delete one row and every curve below
+  it jumped a slot, and the automation manager still showed the old plugin
+  name. Chain edits (remove, reorder, dead-script cleanup, and the MCP
+  `chain.pick`/`chain.remove` tools alike) now retarget every curve and
+  binding with the rows they follow, rewrite the saved curve files so the
+  fix survives a restart, move open windows and in-flight plugin loads
+  too, and echo what moved ("· 2 curve(s) retargeted, 1 binding(s)
+  removed"). A curve aimed at a row that is gone is defused (it can never
+  be silently captured by a later-added plugin) and reported; if the
+  transport ever hits a curve that cannot reach its target, the status bar
+  shows an orange "automation target lost" badge naming the dead targets
+  until the chain or the binding is fixed.
 - **Installing Rust while slooper is running now just works.** The
   compiler availability check used to ask `rustc` exactly once per
   session and trust that answer forever: install or repair Rust after
@@ -91,6 +106,7 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   itself: a missing compiler is noticed again about once a second, and a
   compile attempt that fails re-checks immediately, so the hint appears
   and disappears as the toolchain truly comes and goes — no restart.
+
 
 - **Per-note aftertouch now reaches CLAP instruments.** A MPE controller's
   note-by-note pressure (polyphonic aftertouch — the message that bends

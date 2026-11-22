@@ -6005,9 +6005,9 @@ fn v110_e2e_mixer_seam_vol_heard_live_rt() {
     drop(active);
 }
 
-// ---- v113: RT auto-miss surfacing (engine-direct, live server) ----
+// ---- v115: RT auto-miss surfacing (engine-direct, live server) ----
 
-fn v113_auto_arr(target: &str) -> (Arrangement, std::sync::Arc<Vec<Option<std::sync::Arc<slooper::automation::Automation>>>>) {
+fn v115_auto_arr(target: &str) -> (Arrangement, std::sync::Arc<Vec<Option<std::sync::Arc<slooper::automation::Automation>>>>) {
     use slooper::automation::{Automation, Node};
     let a = Automation {
         target: target.into(),
@@ -6022,10 +6022,10 @@ fn v113_auto_arr(target: &str) -> (Arrangement, std::sync::Arc<Vec<Option<std::s
 /// A well-formed `fx:7:0` target over an empty chain can never route — the
 /// automation pass must raise the engine's sticky auto-miss flag.
 #[test]
-fn v113_e2e_auto_miss_flag_rises() {
+fn v115_e2e_auto_miss_flag_rises() {
     let _g = e2e_lock();
     let Some((b, _name, _sr)) = start_backend() else { return };
-    let (arr, auto) = v113_auto_arr("fx:7:0");
+    let (arr, auto) = v115_auto_arr("fx:7:0");
     b.cmd(Cmd::SetProject { assets: Arc::new(Vec::new()), arr: Arc::new(arr), len: 4096 });
     b.cmd(Cmd::SetAutoAssets(auto));
     b.cmd(Cmd::PlayAll);
@@ -6044,10 +6044,10 @@ fn v113_e2e_auto_miss_flag_rises() {
 /// Negative control: the same harness with a mixer target always routes —
 /// the flag must stay down (no false badge).
 #[test]
-fn v113_e2e_auto_miss_quiet_when_landing() {
+fn v115_e2e_auto_miss_quiet_when_landing() {
     let _g = e2e_lock();
     let Some((b, _name, _sr)) = start_backend() else { return };
-    let (arr, auto) = v113_auto_arr(slooper::automation::TARGET_TRACK_VOL);
+    let (arr, auto) = v115_auto_arr(slooper::automation::TARGET_TRACK_VOL);
     b.cmd(Cmd::SetProject { assets: Arc::new(Vec::new()), arr: Arc::new(arr), len: 4096 });
     b.cmd(Cmd::SetAutoAssets(auto));
     b.cmd(Cmd::PlayAll);

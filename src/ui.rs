@@ -1139,7 +1139,7 @@ fn chain_row_label(row: &ChainRow) -> String {
     }
 }
 
-/// v113: tally of one `remap_fx_rows` pass — a chain layout shift that
+/// v115: tally of one `remap_fx_rows` pass — a chain layout shift that
 /// moved (or killed) routing must announce itself in the status echo.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct FxRemap {
@@ -2042,7 +2042,7 @@ pub struct App {
     /// v16: chain rows (track, row) awaiting their load completion, then
     /// the v0.10 auto-open of the plugin's own GUI.
     vst_pending_gui: Vec<(usize, usize)>,
-    /// v113: rising-edge latch for the auto-miss status line (the yellow
+    /// v115: rising-edge latch for the auto-miss status line (the yellow
     /// badge is engine-state; this only prevents echo spam per frame).
     auto_miss_seen: bool,
     /// v33: async ♪-synth binding opens. Track slot while a loader runs.
@@ -4696,7 +4696,7 @@ impl App {
             let label = chain_row_label(&self.fx_rows[i][k]);
             self.fx_rows[i].remove(k);
             self.rebuild_fx(i);
-            // v113: rows below k slid UP — curves, bindings, live views and
+            // v115: rows below k slid UP — curves, bindings, live views and
             // pending loads ride the same map (positional targets are the
             // only identity they ever had).
             let echo = self
@@ -4735,7 +4735,7 @@ impl App {
         let label = chain_row_label(&self.fx_rows[i][k]);
         self.fx_rows[i].swap(k, j);
         self.rebuild_fx(i);
-        // v113: the swap moves two rows — anything targeting either must
+        // v115: the swap moves two rows — anything targeting either must
         // follow or the curve silently drives the other plugin.
         let echo = self
             .remap_fx_rows(i, &|r| {
@@ -4935,7 +4935,7 @@ impl App {
     /// Drop chain rows pointing at scripts the registry no longer loads.
     fn prune_dead_script_rows(&mut self) {
         for i in 0..MAX_LOOPS {
-            // v113: retain() COMPACTS — every survivor below a dead row
+            // v115: retain() COMPACTS — every survivor below a dead row
             // slides up, so curves/bindings/views ride a per-track
             // old->new map computed from the same liveness decision.
             let map: Vec<Option<usize>> = {
@@ -17715,7 +17715,7 @@ impl App {
         }
     }
 
-    /// v113: per-chain-edit tally from `remap_fx_rows` — feeds the status
+    /// v115: per-chain-edit tally from `remap_fx_rows` — feeds the status
     /// echo so a layout shift that moved routing is never silent.
     fn remap_fx_rows(&mut self, t: usize, map: &dyn Fn(usize) -> Option<usize>) -> FxRemap {
         use crate::audio::{parse_plugin_target, PluginTarget};
@@ -17799,7 +17799,7 @@ impl App {
             }
             let nu = std::sync::Arc::new(crate::automation::Automation {
                 target: nu_target,
-                ..(&*curve).clone()
+                ..(*curve).clone()
             });
             let path = self.assets[*id as usize].path.clone();
             self.assets[*id as usize].automation = Some(nu.clone());
@@ -17870,7 +17870,7 @@ impl App {
         out
     }
 
-    /// v113: live automation clips whose well-formed plugin target cannot
+    /// v115: live automation clips whose well-formed plugin target cannot
     /// route with TODAY's layout (RT semantics: fx = row exists on the
     /// clip's track; synth = track has a bound instrument). Deduped,
     /// clip-track order. Malformed targets stay silent — RT ignores them.
@@ -19700,7 +19700,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 if xruns > 0 {
                     ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
                 }
-                // v113: automation targets dead-drifted by chain edits (RT
+                // v115: automation targets dead-drifted by chain edits (RT
                 // raised the sticky flag; a remap scan clears it again).
                 if app.backend.engine.auto_miss() {
                     ui.label(RichText::new("automation target lost").color(Color32::ORANGE))
@@ -60154,11 +60154,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- v113: chain-layout drift — `fx:<row>:<idx>` targets follow the chain ----
+    // ---- v115: chain-layout drift — `fx:<row>:<idx>` targets follow the chain ----
 
-    /// v113 helper: automation asset backed by a REAL `.slauto` file (the
+    /// v115 helper: automation asset backed by a REAL `.slauto` file (the
     /// durable medium the remap must rewrite) + a clip on (track, lane).
-    fn v113_curve(app: &mut App, tag: &str, target: &str, track: usize, lane: usize) -> u32 {
+    fn v115_curve(app: &mut App, tag: &str, target: &str, track: usize, lane: usize) -> u32 {
         use crate::automation::{Automation, Node};
         let dir = std::env::temp_dir().join(format!("sp-uity-{tag}")).join("auto");
         std::fs::create_dir_all(&dir).unwrap();
@@ -60181,7 +60181,7 @@ mod tests {
         id
     }
 
-    fn v113_bind(app: &mut App, target: &str, track: u32) {
+    fn v115_bind(app: &mut App, target: &str, track: u32) {
         app.value_binds.push(crate::config::ValueBind {
             target: target.into(),
             track,
@@ -60192,7 +60192,7 @@ mod tests {
         });
     }
 
-    fn v113_target(app: &App, id: u32) -> String {
+    fn v115_target(app: &App, id: u32) -> String {
         app.assets[id as usize]
             .automation
             .as_ref()
@@ -60200,7 +60200,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn v113_hold_row(app: &mut App, track: usize) {
+    fn v115_hold_row(app: &mut App, track: usize) {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.fx_rows[track].push(ChainRow::Vst {
             state: None,
@@ -60217,28 +60217,28 @@ mod tests {
     }
 
     #[test]
-    fn v113_remove_shifts_fx_targets() {
-        let mut app = headless_app("v113rem");
+    fn v115_remove_shifts_fx_targets() {
+        let mut app = headless_app("v115rem");
         for stem in ["chorus", "space_echo", "enhancer"] {
             app.add_fx_script(0, stem);
         }
         assert_eq!(app.fx_rows[0].len(), 3);
         // Curves on the shifting row 2 and the doomed row 0; an
         // identically-shaped target on track 1 must stay put.
-        let moved = v113_curve(&mut app, "v113rem", "fx:2:1", 0, 0);
-        let doomed = v113_curve(&mut app, "v113rem", "fx:0:0", 0, 0);
-        let foreign = v113_curve(&mut app, "v113rem", "fx:2:0", 1, 0);
+        let moved = v115_curve(&mut app, "v115rem", "fx:2:1", 0, 0);
+        let doomed = v115_curve(&mut app, "v115rem", "fx:0:0", 0, 0);
+        let foreign = v115_curve(&mut app, "v115rem", "fx:2:0", 1, 0);
         for stem in ["chorus", "space_echo", "enhancer"] {
             app.add_fx_script(1, stem); // track 1 chain: its curve must LIVE there
         }
-        v113_bind(&mut app, "fx:1:0", 0); // shifts
-        v113_bind(&mut app, "fx:0:1", 0); // its row dies -> bind goes
-        v113_bind(&mut app, "fx:2:2", 1); // foreign track
+        v115_bind(&mut app, "fx:1:0", 0); // shifts
+        v115_bind(&mut app, "fx:0:1", 0); // its row dies -> bind goes
+        v115_bind(&mut app, "fx:2:2", 1); // foreign track
         app.remove_fx_row(0, 0);
-        assert_eq!(v113_target(&app, moved), "fx:1:1", "curve rides the shift");
-        assert_eq!(v113_target(&app, foreign), "fx:2:0", "other track untouched");
+        assert_eq!(v115_target(&app, moved), "fx:1:1", "curve rides the shift");
+        assert_eq!(v115_target(&app, foreign), "fx:2:0", "other track untouched");
         assert_eq!(
-            v113_target(&app, doomed),
+            v115_target(&app, doomed),
             "fx:gone:0",
             "a doomed curve can never capture a future appended row"
         );
@@ -60253,38 +60253,38 @@ mod tests {
     }
 
     #[test]
-    fn v113_move_swaps_fx_targets() {
-        let mut app = headless_app("v113mv");
+    fn v115_move_swaps_fx_targets() {
+        let mut app = headless_app("v115mv");
         for stem in ["chorus", "space_echo", "enhancer"] {
             app.add_fx_script(0, stem);
         }
-        let top = v113_curve(&mut app, "v113mv", "fx:0:0", 0, 0);
-        let mid = v113_curve(&mut app, "v113mv", "fx:1:2", 0, 0);
-        let tail = v113_curve(&mut app, "v113mv", "fx:2:1", 0, 0);
-        v113_bind(&mut app, "fx:1:0", 0);
+        let top = v115_curve(&mut app, "v115mv", "fx:0:0", 0, 0);
+        let mid = v115_curve(&mut app, "v115mv", "fx:1:2", 0, 0);
+        let tail = v115_curve(&mut app, "v115mv", "fx:2:1", 0, 0);
+        v115_bind(&mut app, "fx:1:0", 0);
         app.move_fx_row(0, 0, 1); // rows 0 <-> 1
-        assert_eq!(v113_target(&app, top), "fx:1:0");
-        assert_eq!(v113_target(&app, mid), "fx:0:2");
-        assert_eq!(v113_target(&app, tail), "fx:2:1", "outside the swap");
+        assert_eq!(v115_target(&app, top), "fx:1:0");
+        assert_eq!(v115_target(&app, mid), "fx:0:2");
+        assert_eq!(v115_target(&app, tail), "fx:2:1", "outside the swap");
         assert_eq!(app.value_binds[0].target, "fx:0:0");
         assert!(app.status.contains("2 curve(s) retargeted"), "{}", app.status);
         assert!(app.status.contains("1 binding(s) retargeted"), "{}", app.status);
     }
 
     #[test]
-    fn v113_shared_curve_not_remapped() {
-        let mut app = headless_app("v113sh");
+    fn v115_shared_curve_not_remapped() {
+        let mut app = headless_app("v115sh");
         for stem in ["chorus", "space_echo", "enhancer"] {
             app.add_fx_script(0, stem);
         }
         // ONE asset, clips on BOTH tracks: the target means a DIFFERENT
         // plugin per chain, so no in-place remap can serve both consumers —
         // it must be left alone AND reported.
-        let id = v113_curve(&mut app, "v113sh", "fx:2:1", 0, 0);
+        let id = v115_curve(&mut app, "v115sh", "fx:2:1", 0, 0);
         app.arr.insert(1, 0, Clip::new(id, 0));
         let path = app.assets[id as usize].path.clone();
         app.remove_fx_row(0, 0);
-        assert_eq!(v113_target(&app, id), "fx:2:1", "shared curve never silently retargets");
+        assert_eq!(v115_target(&app, id), "fx:2:1", "shared curve never silently retargets");
         assert!(app.status.contains("1 shared curve(s) untouched"), "{}", app.status);
         let raw = std::fs::read_to_string(&path).expect("curve file");
         assert!(raw.contains("fx:2:1"), "the shared FILE is untouched too");
@@ -60296,11 +60296,11 @@ mod tests {
     }
 
     #[test]
-    fn v113_remap_persists_slauto() {
-        let mut app = headless_app("v113disk");
+    fn v115_remap_persists_slauto() {
+        let mut app = headless_app("v115disk");
         app.add_fx_script(0, "chorus");
         app.add_fx_script(0, "space_echo");
-        let id = v113_curve(&mut app, "v113disk", "fx:1:0", 0, 0);
+        let id = v115_curve(&mut app, "v115disk", "fx:1:0", 0, 0);
         let path = app.assets[id as usize].path.clone();
         app.remove_fx_row(0, 0);
         let raw = std::fs::read_to_string(&path).expect("curve file");
@@ -60309,8 +60309,8 @@ mod tests {
     }
 
     #[test]
-    fn v113_views_follow_chain_shift() {
-        let mut app = headless_app("v113view");
+    fn v115_views_follow_chain_shift() {
+        let mut app = headless_app("v115view");
         for stem in ["chorus", "space_echo", "enhancer"] {
             app.add_fx_script(0, stem);
         }
@@ -60320,7 +60320,7 @@ mod tests {
         app.open_fx_editor(0, 2);
         assert!(app.fx_editor.is_some(), "script editor opens headless");
         app.params_win = Some(GuiTarget::Chain(0, 2));
-        v113_hold_row(&mut app, 0); // row 3
+        v115_hold_row(&mut app, 0); // row 3
         app.vst_pending_gui.push((0, 1));
         app.remove_fx_row(0, 0);
         assert!(app.fx_editor.is_none(), "editor retired by the rebuild (never left on a stale slot)");
@@ -60336,26 +60336,26 @@ mod tests {
     }
 
     #[test]
-    fn v113_prune_shifts_targets() {
-        let mut app = headless_app("v113prune");
+    fn v115_prune_shifts_targets() {
+        let mut app = headless_app("v115prune");
         app.fx_rows[0].push(ChainRow::Script {
             stem: "definitely_not_a_stem".into(),
             params: Vec::new(),
             bypass: false,
         });
         app.add_fx_script(0, "chorus");
-        let id = v113_curve(&mut app, "v113prune", "fx:1:0", 0, 0);
+        let id = v115_curve(&mut app, "v115prune", "fx:1:0", 0, 0);
         app.prune_dead_script_rows();
         assert_eq!(app.fx_rows[0].len(), 1);
-        assert_eq!(v113_target(&app, id), "fx:0:0", "survivor slid up — so did its curve");
+        assert_eq!(v115_target(&app, id), "fx:0:0", "survivor slid up — so did its curve");
     }
 
     #[test]
-    fn v113_auto_miss_badge_and_status() {
+    fn v115_auto_miss_badge_and_status() {
         use std::sync::atomic::Ordering;
-        let mut app = headless_app("v113miss");
+        let mut app = headless_app("v115miss");
         let ctx = egui::Context::default();
-        let _id = v113_curve(&mut app, "v113miss", "fx:9:0", 0, 0);
+        let _id = v115_curve(&mut app, "v115miss", "fx:9:0", 0, 0);
         frame(&mut app, &ctx, vec![]);
         assert!(
             app.dead_auto_targets().iter().any(|(t, tg)| *t == 0 && tg == "fx:9:0"),
@@ -60378,7 +60378,7 @@ mod tests {
         // (the remap pass scans and un-sticks when nothing is dead).
         let nu = crate::automation::Automation {
             target: crate::automation::TARGET_TRACK_VOL.into(),
-            ..(&**app.assets[_id as usize].automation.as_ref().unwrap()).clone()
+            ..(**app.assets[_id as usize].automation.as_ref().unwrap()).clone()
         };
         app.assets[_id as usize].automation = Some(Arc::new(nu));
         app.add_fx_script(0, "chorus");
