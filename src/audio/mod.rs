@@ -43,10 +43,10 @@ use std::sync::Arc;
 pub mod jack;
 #[cfg(windows)]
 mod wasapi;
-// W12a: pure lost-stream recovery table (pinned on every OS; only the
-// WASAPI backend reads it — the W7 `any(windows, test)` pattern keeps it
-// compiling for the Linux pins without a dead module in Linux builds).
-#[cfg(any(windows, test))]
+// W12a: pure lost-stream recovery tables (pinned on every OS). WASAPI
+// reads the WASAPI half; since v118 the JACK backend reads the JACK half
+// on Linux, so the module itself compiles everywhere (the OS-only items
+// carry their own cfg inside).
 mod rt_recovery;
 
 use crate::arrange::Arrangement;
@@ -76,6 +76,14 @@ pub type PreviewVoices = Arc<Vec<(u64, u32, Arc<[f32]>)>>;
 /// the per-sample mix path iterates a compact ACTIVE-track list so an empty
 /// 128-track project costs the same CPU as a 16-track one did before.
 pub const MAX_LOOPS: usize = 128;
+
+/// v117 (t_7609b30f): structural bound of sidechain edges one block can
+/// carry — the send matrix lets every track tap every track
+/// (MAX_LOOPS targets x MAX_LOOPS sources). NOT a truncation cap: the
+/// RT edge table is sized to EXACTLY this, so no append can ever be
+/// refused. (The pre-v117 table was fixed at 256 and silently DROPPED
+/// every edge past it — un-counted, un-noticed, while 16k are legal.)
+pub const MAX_SC_EDGES: usize = MAX_LOOPS * MAX_LOOPS;
 
 /// Preview voice id for auditions that belong to no rack asset (piano-roll
 /// note taps, edit echoes). Stopping by this id never touches asset previews.
@@ -1041,6 +1049,13 @@ pub struct Engine {
     /// v0.11 R5: automation asset table (parallel to `assets`) + gen.
     auto: std::sync::Mutex<Arc<Vec<Option<Arc<crate::automation::Automation>>>>>,
     auto_gen: AtomicU64,
+    /// v115: sticky — a well-formed `fx:`/`synth:` automation target was
+    /// unreachable while its clip played (chain layout drift: the row is
+    /// gone, the curve still fires). RT only ever does a cheap `store(true)`
+    /// in the per-block pass (xruns precedent); the GUI mirrors it as a
+    /// status badge + one-shot status line, and clears it once a scan finds
+    /// every target landing again.
+    auto_miss: Arc<AtomicBool>,
     /// Per-track synth bindings (scripted or VSTi) + the fallback instance
     /// (bundled piano) used by unbound tracks.
     synths: std::sync::Mutex<Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]>>,
@@ -1223,6 +1238,7 @@ impl Engine {
             midi_gen: AtomicU64::new(0),
             auto: std::sync::Mutex::new(Arc::new(Vec::new())),
             auto_gen: AtomicU64::new(0),
+            auto_miss: Arc::new(AtomicBool::new(false)),
             synths: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
             synths_gen: AtomicU64::new(0),
             default_synth: std::sync::Mutex::new(None),
@@ -1819,6 +1835,20 @@ impl Engine {
     }
     pub fn auto_gen(&self) -> u64 {
         self.auto_gen.load(Ordering::Relaxed)
+    }
+
+    /// v115: cheap handle for the RT block (it only ever `store(true)`).
+    pub fn auto_miss_flag(&self) -> Arc<AtomicBool> {
+        self.auto_miss.clone()
+    }
+    /// v115: is a dead automation target on record?
+    pub fn auto_miss(&self) -> bool {
+        self.auto_miss.load(Ordering::Relaxed)
+    }
+    /// v115: GUI calls this once a scan confirms every automation target
+    /// lands again (a later RT miss re-arms the flag on its own).
+    pub fn clear_auto_miss(&self) {
+        self.auto_miss.store(false, Ordering::Relaxed)
     }
 
     /// Bind/unbind one track's synthesizer (unbound tracks fall back to the
@@ -4308,6 +4338,16 @@ struct Proc {
     /// precomputes "mask != 0" so the sample loop stays branch-cheap.
     sc_apply: Vec<Vec<f32>>,
     sc_build: Vec<Vec<f32>>,
+    /// v117: per-block edge tables — materialized (source, target) pairs,
+    /// per-edge receive level and the block-constant tap scale. Taken out
+    /// and given back like sc_apply/mix_l; grown ONCE to the structural
+    /// bound MAX_SC_EDGES at the first appended edge (steady state: zero
+    /// RT allocation; unrouted projects: zero cost — never grown). The
+    /// pre-v117 [u8; 256] stack tables silently truncated past 256.
+    sc_e_src: Vec<u8>,
+    sc_e_tgt: Vec<u8>,
+    sc_e_gain: Vec<f32>,
+    sc_e_scale: Vec<f32>,
     sc_active: [bool; MAX_LOOPS],
     mon_buf: Vec<f32>,
     mon_buf2: Vec<f32>,
@@ -4315,6 +4355,9 @@ struct Proc {
     /// v0.11 R5: automation asset table refresh pair.
     auto_cache: Arc<Vec<Option<Arc<crate::automation::Automation>>>>,
     auto_cache_gen: u64,
+    /// v115: shared with Engine — set (never cleared) by the automation
+    /// pass when a live clip's well-formed plugin target cannot route.
+    auto_miss: Arc<AtomicBool>,
     /// v34 R11: last control-rate pass; held while the transport is
     /// stopped so automation does not snap back on pause.
     auto_last: AutoOut,
@@ -4500,6 +4543,10 @@ fn new_proc(
         trk_bufs2: vec![Vec::new(); MAX_LOOPS],
         sc_apply: vec![Vec::new(); MAX_LOOPS],
         sc_build: vec![Vec::new(); MAX_LOOPS],
+        sc_e_src: Vec::new(),
+        sc_e_tgt: Vec::new(),
+        sc_e_gain: Vec::new(),
+        sc_e_scale: Vec::new(),
         sc_active: [false; MAX_LOOPS],
         mon_buf: Vec::new(),
         mon_buf2: Vec::new(),
@@ -4510,6 +4557,7 @@ fn new_proc(
         auto_cache: engine.auto_assets(),
         auto_last: AutoOut::default(),
         auto_cache_gen: engine.auto_gen(),
+        auto_miss: engine.auto_miss_flag(),
         midi_ev: Vec::new(),
         // One row per track, EXACTLY like trk_bufs: `render_midi_block`
         // indexes `midi_scratch[t]` the moment the first note stages, and an
@@ -4590,6 +4638,38 @@ fn seed_fx_rt(table: &[TrackFx]) -> Vec<Vec<FxRt>> {
                 .collect()
         })
         .collect()
+}
+
+/// v115: how a plugin-parameter automation target parsed. ONE grammar
+/// shared by the RT router and the GUI dead-target scan (ui.rs) so both
+/// sides agree on what "well-formed" means. `fx:<row>:<idx>` / `synth:<idx>`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PluginTarget {
+    Synth(usize),
+    Fx(usize, usize),
+}
+
+pub fn parse_plugin_target(t: &str) -> Option<PluginTarget> {
+    if let Some(idx) = t.strip_prefix("synth:") {
+        return idx.parse::<usize>().ok().map(PluginTarget::Synth);
+    }
+    let rest = t.strip_prefix("fx:")?;
+    let (row_s, idx_s) = rest.split_once(':')?;
+    Some(PluginTarget::Fx(
+        row_s.parse::<usize>().ok()?,
+        idx_s.parse::<usize>().ok()?,
+    ))
+}
+
+/// v115: verdict of one routing attempt. Only `Unroutable` (well-formed id,
+/// slot/handle gone — the chain-layout drift class) counts as an auto-miss;
+/// `Malformed` is a save/import bug that never changes with the chain, and
+/// `Landed` of course counts nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RouteVerdict {
+    Landed,
+    Unroutable,
+    Malformed,
 }
 
 impl Proc {
@@ -4753,7 +4833,14 @@ impl Proc {
                             out.tempo = Some((v.round() as i64).clamp(20, 300) as u32)
                         }
                         other => {
-                            let _ = self.route_plugin_param(t, other, v);
+                            // v115: a well-formed target whose slot vanished
+                            // (chain edited under a live curve) used to die
+                            // swallowed here. Raise the sticky flag once per
+                            // block — the GUI badge + status scan surfaces
+                            // it; never log/allocate on RT.
+                            if self.route_plugin_param(t, other, v) == RouteVerdict::Unroutable {
+                                self.auto_miss.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -4763,41 +4850,38 @@ impl Proc {
     }
 
     /// Write one automated value to a `synth:<idx>` / `fx:<row>:<idx>`
-    /// target on track `t`. False for unknown or malformed ids.
-    fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> bool {
-        if let Some(idx) = target.strip_prefix("synth:") {
-            let Ok(idx) = idx.parse::<usize>() else {
-                return false;
-            };
-            let Some(Some(handle)) = self.synths_cache.get(t).cloned() else {
-                return false;
-            };
-            match handle.as_ref() {
-                SynthHandle::Script(i) => i.set_param(idx, v),
-                SynthHandle::Vst(e) => e.set_param_rt(idx, v),
+    /// target on track `t`. v115: the verdict distinguishes "this chain has
+    /// no such slot anymore" (Unroutable — what the auto-miss badge mirrors)
+    /// from a target string that never parsed (Malformed — silence).
+    fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> RouteVerdict {
+        let Some(parsed) = parse_plugin_target(target) else {
+            return RouteVerdict::Malformed;
+        };
+        match parsed {
+            PluginTarget::Synth(idx) => {
+                let Some(Some(handle)) = self.synths_cache.get(t).cloned() else {
+                    return RouteVerdict::Unroutable;
+                };
+                match handle.as_ref() {
+                    SynthHandle::Script(i) => i.set_param(idx, v),
+                    SynthHandle::Vst(e) => e.set_param_rt(idx, v),
+                }
+                RouteVerdict::Landed
             }
-            return true;
-        }
-        if let Some(rest) = target.strip_prefix("fx:") {
-            let Some((row_s, idx_s)) = rest.split_once(':') else {
-                return false;
-            };
-            let (Ok(row), Ok(idx)) = (row_s.parse::<usize>(), idx_s.parse::<usize>()) else {
-                return false;
-            };
-            let Some(tf) = self.fx_cache.get(t) else {
-                return false;
-            };
-            let Some(slot) = tf.slots().get(row) else {
-                return false;
-            };
-            match &slot.kind {
-                FxKind::Scripted { inst, .. } => inst.set_param(idx, v),
-                FxKind::Vst(e) => e.set_param_rt(idx, v),
+            PluginTarget::Fx(row, idx) => {
+                let Some(tf) = self.fx_cache.get(t) else {
+                    return RouteVerdict::Unroutable;
+                };
+                let Some(slot) = tf.slots().get(row) else {
+                    return RouteVerdict::Unroutable;
+                };
+                match &slot.kind {
+                    FxKind::Scripted { inst, .. } => inst.set_param(idx, v),
+                    FxKind::Vst(e) => e.set_param_rt(idx, v),
+                }
+                RouteVerdict::Landed
             }
-            return true;
         }
-        false
     }
 
     fn collect_clips(
@@ -5823,13 +5907,24 @@ impl Proc {
         // (block-constant — the bus feeds a detector, steps are inaudible;
         // volume/mute/master NEVER enter it — docs/SIDECHAIN.md). A
         // project without routing costs one atomic AND per track.
-        let mut n_edge = 0usize;
-        let mut e_src = [0u8; 256];
-        let mut e_tgt = [0u8; 256];
+        // v117 (t_7609b30f): the tables are engine-owned buffers taken out
+        // and given back like sc_apply/mix_l. Grown ONCE (at the first
+        // appended edge, below) to the structural bound MAX_SC_EDGES =
+        // MAX_LOOPS x MAX_LOOPS — every legal route fits, so an append can
+        // never be refused and silent truncation is structurally impossible.
+        // Steady state allocates nothing (RT rule); an unrouted project
+        // never grows them at all. (The pre-v117 [u8; 256] stack tables
+        // dropped edge 257+ with no counter and no notice — while the
+        // render_tracks export mirror was uncapped, so exports and
+        // speakers disagreed. Pins: v117_live_edge_table_*.)
+        let mut e_src = std::mem::take(&mut self.sc_e_src);
+        let mut e_tgt = std::mem::take(&mut self.sc_e_tgt);
         // v97 (sc-4): per-edge receive level read once per block alongside
         // the masks (UI writes land next block — every SC setter is
         // block-constant by construction).
-        let mut e_gain = [1.0f32; 256];
+        let mut e_gain = std::mem::take(&mut self.sc_e_gain);
+        let mut e_scale = std::mem::take(&mut self.sc_e_scale);
+        let mut n_edge = 0usize;
         let mut sc_any = false;
         for tg in 0..MAX_LOOPS {
             let m: u128 = self.engine.sc_send(tg);
@@ -5842,7 +5937,16 @@ impl Proc {
                 // Sources with no material this block must NOT tap a
                 // stale acc[] row — they simply get no edge.
                 let sourced = (entry_mask >> s) & 1 != 0 || self.midi_live[s];
-                if (m >> s) & 1 != 0 && sourced && n_edge < e_src.len() {
+                if (m >> s) & 1 != 0 && sourced {
+                    if e_src.len() < MAX_SC_EDGES {
+                        // Grow-once (v117): the first edge ever pays the
+                        // full structural bound; every later block finds
+                        // the tables at length and allocates nothing.
+                        e_src.resize(MAX_SC_EDGES, 0);
+                        e_tgt.resize(MAX_SC_EDGES, 0);
+                        e_gain.resize(MAX_SC_EDGES, 1.0);
+                        e_scale.resize(MAX_SC_EDGES, 0.0);
+                    }
                     e_src[n_edge] = s as u8;
                     e_tgt[n_edge] = tg as u8;
                     e_gain[n_edge] = self.engine.sc_recv_gain(tg, s);
@@ -5866,7 +5970,8 @@ impl Proc {
         }
         // v97 (sc-4): fold each edge's receive level into a per-edge tap
         // scale (block-constant, same inaudibility argument as sc_fold).
-        let mut e_scale = [0.0f32; 256];
+        // v117: e_scale is the engine-owned buffer taken above — by here
+        // it is at MAX_SC_EDGES length whenever n_edge > 0.
         for k in 0..n_edge {
             e_scale[k] = sc_fold[e_src[k] as usize] * e_gain[k];
         }
@@ -6288,6 +6393,11 @@ impl Proc {
         std::mem::swap(&mut sc_apply, &mut sc_build);
         self.sc_apply = sc_apply;
         self.sc_build = sc_build;
+        // v117: edge tables back for the next block (grow-once buffers).
+        self.sc_e_src = e_src;
+        self.sc_e_tgt = e_tgt;
+        self.sc_e_gain = e_gain;
+        self.sc_e_scale = e_scale;
         self.mon_buf = mon_buf;
         self.mon_buf2 = mon_buf2;
         self.vst_tmp = vst_tmp;
@@ -8167,6 +8277,222 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
         v48_tap(&o, 600, 1.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    // ---- v117 (t_7609b30f): the LIVE SC edge table must hold EVERY route.
+    // The 128x128 send matrix (MAX_LOOPS=128, u128 masks) permits up to
+    // 16384 (source,target) edges, but process_block materialized them
+    // into a [u8; 256] stack table and dropped every edge past the 256th
+    // (target-major order) with NO counter, NO notice and NO UI cap. The
+    // offline export mirror (render_tracks) has no cap — so dense projects
+    // ducked on export but NOT on speakers, silently. These pins drive
+    // process_block directly (new_proc + stub BlockIo) — the render-based
+    // v48/v95 pins exercise the uncapped mirror, not this table.
+
+    /// v117: mono-capture stub — one block of output buffer per call.
+    struct V117Io {
+        out: Vec<f32>,
+    }
+    impl crate::backend::BlockIo for V117Io {
+        fn in_buf(&self, _slot: usize) -> *const f32 {
+            std::ptr::null()
+        }
+        fn out_buf(&self, slot: usize) -> *mut f32 {
+            if slot == 0 {
+                self.out.as_ptr() as *mut f32
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    /// v117: RT-harness proc — slot 0 carries BOTH output mask bits
+    /// (mask_out_l=1, mask_out_r=1), so the core routes it through the
+    /// mono-fold path v_m = (v_l + v_r)/sqrt2: a centre-panned click
+    /// keeps unity exactly like the v48/v95 mirror asserts absorb.
+    fn v117_proc(e: &Arc<Engine>) -> Proc {
+        let (tx, _rx): (std::sync::mpsc::SyncSender<Evt>, _) =
+            std::sync::mpsc::sync_channel(64);
+        new_proc(
+            tx,
+            Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(crate::meter::MeterRing::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            e.clone(),
+            48000,
+        )
+    }
+
+    fn v117_run_blocks(p: &mut Proc, len: usize, n: usize) -> Vec<f32> {
+        let mut evs: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut out = vec![0.0f32; len];
+        let mut b = 0;
+        while b < len {
+            let io = V117Io {
+                out: vec![0.0f32; n],
+            };
+            p.process_block(n, &mut evs, &io);
+            let take = n.min(len - b);
+            out[b..b + take].copy_from_slice(&io.out[..take]);
+            b += take;
+        }
+        out
+    }
+
+    #[test]
+    fn v117_live_edge_table_keys_targets_past_256() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v117sc400", "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![0.01f32; 1536]);
+        let click = v48_click(64);
+        let mut arr = Arrangement::new();
+        for s in 5..105usize {
+            arr.insert(s, 0, Clip::new(0, 0)); // constant material
+        }
+        for t in 1..=4usize {
+            arr.insert(t, 0, Clip::new(1, 1000)); // click being ducked
+        }
+        arr.insert(106, 0, Clip::new(1, 1100)); // unrouted control click
+        e.set_project(Arc::new(vec![src, click]), Arc::new(arr), 1536);
+        let mut m = 0u128;
+        for s in 5..105 {
+            m |= 1u128 << s;
+        }
+        let desc = reg.desc("v48sc").unwrap().clone();
+        for t in 1..=4usize {
+            let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+            e.set_track_fx(
+                t,
+                TrackFx {
+                    slots: Arc::new(vec![FxSlot::scripted(inst, desc.clone())]),
+                },
+            );
+            e.set_sc_send(t, m); // 100 sources each -> 400 edges total
+        }
+        // Control: same effect, NO send — must stay at unity (guards the
+        // fix against over-keying). Track 106 is OUTSIDE the 5..105
+        // sender band so the mute loop below never touches it.
+        let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+        e.set_track_fx(
+            106,
+            TrackFx {
+                slots: Arc::new(vec![FxSlot::scripted(inst, desc)]),
+            },
+        );
+        // v95 (sc-3): mute removes the AUDIO but keeps the KEY material —
+        // so the capture at 1000 is purely the four target clicks.
+        for s in 5..105 {
+            e.set_track_on(s, false);
+        }
+        e.set_transport(true);
+        let mut p = v117_proc(&e);
+        let out = v117_run_blocks(&mut p, 1536, 512);
+        // Target-major fill: edges 257..400 fed target 3 (only 56 of its
+        // 100 survived) and target 4 (none) under the old cap. Post-fix
+        // all four saturate: sc = 100 x 0.01 = 1.0 -> click x 0.1 each.
+        let got = out[1000];
+        assert!(
+            (got - 0.4f32).abs() < 0.02,
+            "out[1000] = {got} want 0.4 (4 saturated ducks); \
+             ~1.7 = truncated edges (t3 partial, t4 un-keyed) = THE BUG"
+        );
+        assert!(
+            (out[1100] - 1.0f32).abs() < 0.01,
+            "unrouted control must stay at unity, got {}",
+            out[1100]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v117_live_edge_table_dense_matrix_no_loss() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let (reg, dir) = v48_reg("v117sc16k", "v48sc", V48_SC_SRC);
+        let e = Engine::new();
+        e.set_sample_rate(48000);
+        let src: Arc<[f32]> = Arc::from(vec![0.01f32; 1536]);
+        let mut arr = Arrangement::new();
+        arr.insert(0, 0, Clip::new(2, 1100)); // control click (unrouted)
+        for t in 1..128usize {
+            arr.insert(t, 0, Clip::new(0, 0)); // material (audible: 0.01)
+            arr.insert(t, 1, Clip::new(1, 1000)); // click being ducked
+            e.set_sc_send(t, !1u128 & !(1u128 << t)); // every other track
+        }
+        e.set_project(
+            Arc::new(vec![src, v48_click(64), v48_click(64)]),
+            Arc::new(arr),
+            1536,
+        );
+        let desc = reg.desc("v48sc").unwrap().clone();
+        for t in 0..128usize {
+            let inst = reg.create_instance("v48sc", 48000.0, &[0.0]).unwrap();
+            e.set_track_fx(
+                t,
+                TrackFx {
+                    slots: Arc::new(vec![FxSlot::scripted(inst, desc.clone())]),
+                },
+            );
+        }
+        e.set_transport(true);
+        let mut p = v117_proc(&e);
+        let out = v117_run_blocks(&mut p, 1536, 512);
+        // 127 targets x 126 senders = 16002 edges (98% of the structural
+        // bound). The old cap keyed only the first two targets. Post-fix
+        // every target saturates: (click 1.0 + material 0.01) x 0.1 each.
+        let want = 127.0f32 * 1.01 * 0.1;
+        let got = out[1000];
+        assert!(
+            (got - want).abs() < 0.05,
+            "out[1000] = {got} want {want}; ~126 = truncated (THE BUG)"
+        );
+        // At 1100 only the ducked material tails (+ the control click).
+        let want2 = 1.0f32 + 127.0 * 0.01 * 0.1;
+        assert!(
+            (out[1100] - want2).abs() < 0.05,
+            "out[1100] = {} want {want2}",
+            out[1100]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v117_live_edge_table_has_no_truncation_guard() {
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let body = super::w4_tests::extract_fn(&src, "pub fn process_block(");
+        // Full-body sanity anchor (same pattern as w4_rt_core): the SC tap
+        // consumption must be inside the extracted body.
+        assert!(
+            body.contains("sc_build[e_tgt[k] as usize]"),
+            "body truncated"
+        );
+        // Polarity A: the silent-drop append guard may NEVER come back —
+        // the table is sized to the structural bound, so an append that
+        // could be refused is the bug itself. concat! so this pin's own
+        // source can never satisfy its scan.
+        let forbidden = concat!("n_edge <", " e_src.len()");
+        assert!(
+            !body.contains(forbidden),
+            "process_block re-grew a silent edge-table cap: `{forbidden}`"
+        );
+        // Polarity B: the table must ACTUALLY be resized to the
+        // structural bound (MAX_LOOPS x MAX_LOOPS) — not merely mention
+        // it: the needle is the resize call itself (a comment mentioning
+        // the const while sizing to a literal passed this pin vacuously —
+        // sabotage-caught v117). The fix is present, not just the guard.
+        assert!(
+            body.contains(concat!("resize(MAX_", "SC_EDGES")),
+            "process_block must size the SC edge table to MAX_SC_EDGES"
+        );
+    }
+
 }
 
 /// WINDOWS-PORT W4 contract pins: the RT core (`Proc::process_block`) must
@@ -8178,7 +8504,7 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
 mod w4_tests {
     /// Extract one indented `fn` body: from `needle` to the first line that
     /// is exactly `    }` (the fn's closing brace — body lines are >= 8).
-    fn extract_fn(src: &str, needle: &str) -> String {
+    pub(super) fn extract_fn(src: &str, needle: &str) -> String {
         let start = src.find(needle).expect("fn not found");
         let rest = &src[start..];
         let end = rest
@@ -8682,6 +9008,258 @@ mod w12a_tests {
     }
 }
 
+/// v118 (card t_0bba9aaa): the Linux JACK path must NOTICE a dead server
+/// and RECONNECT. The pure decision table is pinned in `rt_recovery`
+/// itself (v118_jack_* there); these are the source-wiring scans — the
+/// w12a/w5 pattern: OS-neutral text scans every suite runs, each red if
+/// its seam gets sabotaged. `code()` strips comments so doc prose can
+/// never satisfy a needle (the w12e active-call lesson).
+#[cfg(test)]
+mod v118_tests {
+    fn code() -> String {
+        include_str!("jack.rs")
+            .replace("\r\n", "\n")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whitespace-free window, w12a style: robust against wrapping.
+    fn squish(src: &str, from: usize, len: usize) -> String {
+        src[from..from + len]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn v118_jack_shutdown_latches_death_flag() {
+        // The jack crate registers jack_on_info_shutdown in activate_async
+        // and surfaces it ONLY as NotificationHandler::shutdown; our
+        // handler must implement it and latch the shared flag — the
+        // primary (fast, ~1 idle tick) death signal.
+        let src = code();
+        let s = src
+            .find("unsafe fn shutdown(&mut self")
+            .expect("Notif::shutdown absent — server death is never noticed via the callback");
+        // exactly one shutdown impl in the file
+        assert_eq!(src[s + 1..].find("unsafe fn shutdown(&mut self"), None);
+        let win = squish(&src, s, 400);
+        assert!(
+            win.contains("self.server_dead.store(true,Ordering::SeqCst);"),
+            "shutdown must latch the death flag (no allocate, no block)"
+        );
+    }
+
+    #[test]
+    fn v118_jack_process_beats_the_liveness_counter() {
+        // Backstop signal: the RT shim bumps a counter every block; the
+        // idle tick's `jack_alive` rule detects silence. Exactly ONE
+        // bump site, inside the ProcessHandler impl (the RT entry).
+        let src = code();
+        assert_eq!(
+            src.matches("self.liveness.fetch_add(1, Ordering::Relaxed);")
+                .count(),
+            1
+        );
+        let impl_at = src
+            .find("impl ProcessHandler for JackProc {")
+            .expect("shim missing");
+        let bump = src
+            .find("self.liveness.fetch_add")
+            .expect("no liveness bump");
+        let proc_at = src[impl_at..]
+            .find("fn process(")
+            .map(|o| impl_at + o)
+            .expect("process missing");
+        assert!(bump > proc_at, "liveness bump must live inside process()");
+    }
+
+    #[test]
+    fn v118_jack_idle_asks_the_loss_table() {
+        // The manager idle hook: liveness check -> mourn (once) -> step
+        // the reconnect table -> rebuild. Same wiring contract shape as
+        // w12a_idle_asks_the_recovery_table.
+        let src = code();
+        let start = src
+            .find("fn idle(&mut self, tx: &SyncSender<Evt>) {")
+            .expect("idle lost its recovery-aware body");
+        let end = start
+            + src[start..]
+                .find("fn teardown")
+                .expect("idle region end");
+        let body = &src[start..end];
+        for shape in [
+            "rt_recovery::jack_alive(",
+            "self.mourn(now, tx)",
+            "rt_recovery::jack_loss_step(&mut self.loss, now)",
+            "self.rebuild(now, tx)",
+            // the pre-existing duty must survive: MIDI rescan on the live path
+            "rescan_midi_sources(c.as_client(), tx, midi_sources)",
+        ] {
+            assert!(body.contains(shape), "idle recovery lost `{shape}`");
+        }
+        // Exactly one death transition per tick pass.
+        assert_eq!(src.matches("self.mourn(now, tx)").count(), 1);
+    }
+
+    #[test]
+    fn v118_jack_user_gets_exactly_one_message_per_stage() {
+        // Status-line contract (R2/R3): one death announcement, one
+        // recovery echo, one give-up line, one queued-apply echo — each
+        // literal appears exactly ONCE in the backend, so no code path
+        // can spam or silently skip it.
+        let src = code();
+        for phrase in [
+            "JACK server lost",
+            "JACK server recovered",
+            "reconnect attempts stopped",
+            "port selection queued for the next reconnect",
+        ] {
+            assert_eq!(
+                src.matches(phrase).count(),
+                1,
+                "status phrase `{phrase}` must appear exactly once"
+            );
+        }
+        // The death announcement is an Evt::Error carrying that phrase,
+        // sent from mourn (the transition fn) — not from a per-tick arm.
+        let m = src
+            .find("fn mourn(&mut self, now: u64, tx: &SyncSender<Evt>)")
+            .expect("mourn missing");
+        let win = squish(&src, m, 1200);
+        assert!(
+            win.contains("Evt::Error(msg)") || win.contains("Evt::Error(msg.into())"),
+            "mourn must announce via Evt::Error"
+        );
+        assert!(
+            win.contains("clear_all_callbacks"),
+            "mourn must disarm callbacks before dropping the dead client"
+        );
+        assert!(
+            win.contains("self.loss=rt_recovery::JackLoss::new(now)"),
+            "mourn must open a fresh loss event (full budget)"
+        );
+    }
+
+    #[test]
+    fn v118_jack_bootstrap_single_entry() {
+        // R6: ONE bootstrap for boot and every rebuild — the reconnect
+        // can never drift from the initial path. Unique-call-site counts
+        // (the w12a/w5 idiom), comment-stripped so doc prose cannot
+        // satisfy them.
+        let src = code();
+        assert_eq!(
+            src.matches("Client::new(CLIENT_NAME").count(),
+            1,
+            "bootstrap consolidated: exactly one jack client creation site"
+        );
+        assert_eq!(
+            src.matches("bring_up(").count(),
+            3,
+            "bring_up defined once, called from run() and rebuild()"
+        );
+        // The Ready/ports announcement is likewise shared (boot + rebuild
+        // report identically), and the SR push lives ONLY in bring_up.
+        assert_eq!(src.matches("Evt::Ready").count(), 1);
+        assert_eq!(src.matches("engine.set_sample_rate(sr)").count(), 1);
+        // Boot failure wording byte-preserved (the W5/W12f UX contract).
+        for shape in [
+            "No JACK/PipeWire-JACK server available",
+            "failed to register input slot in",
+            "failed to register output slot out",
+            "failed to create MIDI input port",
+            "failed to activate JACK client",
+        ] {
+            assert!(src.contains(shape), "boot failure wording lost: `{shape}`");
+        }
+        assert_eq!(
+            src.matches("return ManagerExit::Unavailable").count(),
+            3,
+            "dll guard + NoServer + Setup park (setup sites folded into bring_up)"
+        );
+    }
+
+    #[test]
+    fn v118_jack_dead_session_plumbing_is_dead_safe() {
+        // R5: once a dead client is REACHABLE (client == None while the
+        // loop still runs), every hook must survive it. teardown once
+        // panicked its expect() on this path.
+        let src = code();
+        let t = src
+            .find("fn teardown(&mut self) {")
+            .expect("teardown missing");
+        let t_end = t + src[t..].find("struct RawPorts").expect("teardown region end");
+        let body = &src[t..t_end];
+        assert!(
+            body.contains("if let Some(client) = self.client.take()"),
+            "teardown must tolerate an already-dead client (no expect-panic)"
+        );
+        assert!(
+            !body.contains("self.client()"),
+            "teardown must not call the expect() accessor before the take"
+        );
+        let r = src
+            .find("fn refresh(&mut self, tx: &SyncSender<Evt>) {")
+            .expect("refresh missing");
+        let r_end = r + src[r..].find("fn apply(").expect("refresh region end");
+        let rbody = &src[r..r_end];
+        assert!(
+            rbody.contains("if let Some(c) = &self.client"),
+            "refresh must be a no-op while the client is dead"
+        );
+        assert!(!rbody.contains("self.client()"), "same expect trap");
+        // R4/R5: apply remembers the desired patch (single site) and a
+        // dead-but-recoverable session rearms the table instead of
+        // erroring at the user.
+        assert_eq!(
+            src.matches("self.desired = Some((ins.to_vec(), outs.to_vec()));")
+                .count(),
+            1
+        );
+        let a = src.find("fn apply(&mut self").expect("apply missing");
+        let a_end = a + src[a..].find("fn idle").expect("apply region end");
+        let abody = &src[a..a_end];
+        assert!(
+            abody.contains("rt_recovery::jack_rearm(&mut self.loss, now);"),
+            "a user Apply while dead must rearm the reconnect table"
+        );
+    }
+
+    #[test]
+    fn v118_jack_rebuild_restores_live_state() {
+        // R4: success path rewires EVERYTHING through the new client:
+        // patch bookkeeping + RT masks reset, replay through the real
+        // apply seam, Ready/ports re-announced, table revived. Failure
+        // path classifies the stage (absent vs refusing) for the budget.
+        let src = code();
+        let r = src
+            .find("fn rebuild(&mut self, now: u64, tx: &SyncSender<Evt>)")
+            .expect("rebuild missing");
+        let r_end = r
+            + src[r..]
+                .find("impl ManagerBackend for JackSession")
+                .expect("rebuild region end");
+        let body = squish(&src, r, r_end - r);
+        for shape in [
+            "self.client=Some(active)",
+            "announce_live(self.client(),tx)",
+            "letticks=self.liveness.load(Ordering::Relaxed);rt_recovery::jack_revive(&mutself.loss,ticks,now)",
+            "self.cur_in=vec![None;MAX_SLOTS];",
+            "self.cur_out=vec![None;MAX_SLOTS];",
+            "self.mask_in.store(0,Ordering::Relaxed);",
+            "self.mask_out_l.store(0,Ordering::Relaxed);",
+            "self.mask_out_r.store(0,Ordering::Relaxed);",
+            "self.apply(&i,&o,tx)",
+            "rt_recovery::jack_rebuild_failed(&mutself.loss,false,now)",
+            "rt_recovery::jack_rebuild_failed(&mutself.loss,true,now)",
+        ] {
+            assert!(body.contains(shape), "rebuild lost `{shape}`");
+        }
+    }
+}
+
 /// W12f structural + logic pins (WINDOWS-PORT): native JACK on Windows.
 /// Pure decision cores (backend resolution, DLL discovery path logic) run
 /// on EVERY OS; OS-gated pins run where they apply; source scans lock the
@@ -9053,9 +9631,9 @@ mod w12g_tests {
         );
         assert_eq!(
             jack.matches("return ManagerExit::Unavailable").count(),
-            6,
-            "jack honest-failure parks: dll guard + no server + 2 slot \
-             registrations + midi port + activate"
+            3,
+            "jack honest-failure parks: dll guard + no-server + setup-refusal \
+             (v118: the per-registration sites folded into bring_up's verdict)"
         );
         let was = code(include_str!("wasapi.rs"));
         let nul = was
@@ -9217,5 +9795,20 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         e.set_track_fx(1, chain_on);
         assert!(e.fx_table()[1].slots[0].bypass, "table carries the mute");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v115_target_parser_grammar() {
+        use super::{parse_plugin_target, PluginTarget};
+        assert_eq!(parse_plugin_target("fx:0:1"), Some(PluginTarget::Fx(0, 1)));
+        assert_eq!(parse_plugin_target("fx:12:3"), Some(PluginTarget::Fx(12, 3)));
+        assert_eq!(parse_plugin_target("synth:7"), Some(PluginTarget::Synth(7)));
+        // v115 neutralization sentinel: never routable, never a false
+        // auto-miss either (parse fails => the pass ignores it).
+        assert_eq!(parse_plugin_target("fx:gone:0"), None);
+        assert_eq!(parse_plugin_target("fx:1"), None);
+        assert_eq!(parse_plugin_target("fx:a:b"), None);
+        assert_eq!(parse_plugin_target("track.vol"), None);
+        assert_eq!(parse_plugin_target("synth:1x"), None);
     }
 }

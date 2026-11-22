@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 // The C-ABI contract. Compiled twice: once into slooper (this include)
 // and once into every effect script (via its `include!("effect_api.rs")`),
@@ -797,17 +797,50 @@ fn has_scripts(dir: &Path) -> bool {
 }
 
 /// True when `rustc` can be launched (effects cannot compile without it).
+///
+/// v114: the answer used to latch on the FIRST probe for the whole session
+/// (`OnceLock`), so installing or repairing Rust while slooper ran left
+/// every scripted effect/synth stuck on the W3 hint until an app restart
+/// (and a removed toolchain kept claiming availability forever). Now the
+/// cache is self-healing: a NEGATIVE answer is re-probed at most once per
+/// second (a miss is an instant exec failure, so the banner path costs
+/// ~nothing; an install is picked up within a second, no restart), and a
+/// POSITIVE answer is held until a compile attempt actually fails —
+/// [`rustc_probe_stale()`] then forces the fresh probe, so a toolchain
+/// that vanished mid-session is caught at the first failed compile.
 pub fn rustc_available() -> bool {
-    static OK: OnceLock<bool> = OnceLock::new();
-    *OK.get_or_init(|| {
-        Command::new("rustc")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    rustc_probe_cached(false)
+}
+
+/// Forget the cached [`rustc_available()`] answer, re-probe NOW, and
+/// return the fresh verdict. The compile paths (fx + synth) call this on
+/// every rustc failure leg: a spawn error or a non-zero exit contradicts
+/// any cached "available", and the W3 banner should reflect the truth on
+/// the very next frame.
+pub fn rustc_probe_stale() -> bool {
+    rustc_probe_cached(true)
+}
+
+fn rustc_probe_cached(force: bool) -> bool {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if !force {
+        if let Some((at, ok)) = *cache {
+            if ok || at.elapsed() < std::time::Duration::from_secs(1) {
+                return ok;
+            }
+        }
+    }
+    let ok = Command::new("rustc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    *cache = Some((std::time::Instant::now(), ok));
+    ok
 }
 
 /// What to tell the user when `rustc` cannot be launched (W3). Linux
@@ -1570,8 +1603,16 @@ fn compile_effect(src: &Path, out: &Path) -> Result<(), String> {
         .arg(&tmp)
         .arg(src)
         .output()
-        .map_err(|e| format!("could not run rustc: {e} — {}", rustc_install_hint()))?;
+        .map_err(|e| {
+            // v114: a spawn failure contradicts any cached "available" —
+            // drop the latch so the next frame shows the W3 banner.
+            rustc_probe_stale();
+            format!("could not run rustc: {e} — {}", rustc_install_hint())
+        })?;
     if !output.status.success() {
+        // v114: the toolchain ran but may itself be broken/gone — refresh
+        // availability so a vanished rustc stops being claimed.
+        rustc_probe_stale();
         let err = String::from_utf8_lossy(&output.stderr);
         let err = trim_head(err.trim(), 1800);
         std::fs::write(crate::paths::build_sidecar(out, "failed"), &err).ok();
@@ -5121,4 +5162,142 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+}
+
+#[cfg(test)]
+/// v114 (card t_d3820fa6): the rustc availability probe must be
+/// self-healing — installing/repairing/removed Rust mid-session flips the
+/// W3 answer WITHOUT an app restart. These pins swap PATH inside the
+/// shared libtest process; the suite is single-threaded
+/// (`.cargo/config.toml`), and the guard restores PATH and re-probes the
+/// cache back to TRUE on the way out — even on panic — so every later
+/// script-compiling pin still sees a healthy toolchain (R5).
+mod v114_probe_tests {
+    use super::{rustc_available, rustc_probe_stale};
+
+    /// Points PATH at a private empty dir (rustc unresolvable), restores
+    /// the real PATH + refreshes the probe cache to TRUE on drop.
+    struct PathSwap {
+        saved: Option<std::ffi::OsString>,
+        empty: std::path::PathBuf,
+    }
+    impl PathSwap {
+        fn to_empty() -> Self {
+            let saved = std::env::var_os("PATH");
+            // scratch OUTSIDE the repo (v32 trap (e): never poison CWD)
+            let empty = std::env::temp_dir().join(format!(
+                "slooper-v114-empty-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&empty).unwrap();
+            std::env::set_var("PATH", &empty);
+            Self { saved, empty }
+        }
+        fn restore(&mut self) {
+            match &self.saved {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+    impl Drop for PathSwap {
+        fn drop(&mut self) {
+            self.restore();
+            // Leave the shared cache TRUE for later pins, panic or not:
+            // PATH is back, so this probe reflects the real host.
+            rustc_probe_stale();
+            let _ = std::fs::remove_dir(&self.empty);
+        }
+    }
+
+    #[test]
+    fn v114_rustc_probe_negative_answer_expires() {
+        let mut swap = PathSwap::to_empty();
+        assert!(
+            !rustc_probe_stale(),
+            "R1 setup: an unreachable rustc must probe as unavailable"
+        );
+        swap.restore();
+        // R2: inside the TTL window the cached NO is served — the banner
+        // path never spawns `rustc --version` per frame.
+        assert!(
+            !rustc_available(),
+            "R2: negative answers must be rate-limited, not re-probed per call"
+        );
+        // R1: past the TTL the next read re-probes and finds the toolchain
+        // — no app restart needed after an install.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            rustc_available(),
+            "R1: an installed toolchain must be picked up without an app restart"
+        );
+    }
+
+    #[test]
+    fn v114_rustc_probe_stale_sees_vanished_toolchain() {
+        // Healthy box (cargo test itself needs rustc): start positive.
+        assert!(rustc_available(), "R3 setup: rustc is present under cargo test");
+        let mut swap = PathSwap::to_empty();
+        // R3: positives are NOT re-probed periodically — a healthy machine
+        // pays no spawn cost; only a failed compile triggers a re-probe.
+        assert!(
+            rustc_available(),
+            "R3: cached positives stay served (no periodic spawn)"
+        );
+        // The compile paths call this on BOTH rustc failure legs (pin below):
+        // the forced probe sees the vanished toolchain immediately.
+        assert!(
+            !rustc_probe_stale(),
+            "R3: the failed-compile re-probe must see the vanished toolchain"
+        );
+        swap.restore();
+        assert!(
+            rustc_probe_stale(),
+            "R5: probe cache left TRUE for the rest of the suite"
+        );
+    }
+
+    #[test]
+    fn v114_rustc_probe_stale_wired_into_compile_paths() {
+        // Active-line counting (W12e trap: a `//`-commented call must NOT
+        // count). Both failure legs of both compile fns must actively call
+        // the hook — sabotage-proven by hand-commenting one call site.
+        fn active_calls(src: &str, marker: &str) -> usize {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    l.contains(marker) && !t.starts_with("//") && !t.starts_with("///")
+                })
+                .count()
+        }
+        for (path, fname, marker) in [
+            ("src/fx.rs", "compile_effect", "rustc_probe_stale();"),
+            ("src/synth.rs", "compile_synth", "crate::fx::rustc_probe_stale();"),
+        ] {
+            let full = std::fs::read_to_string(std::path::Path::new(env!(
+                "CARGO_MANIFEST_DIR"
+            ))
+            .join(path))
+            .unwrap();
+            let start = full
+                .find(&format!("fn {fname}("))
+                .unwrap_or_else(|| panic!("{fname} not found in {path}"));
+            // Slice to the next TOP-LEVEL fn so the body is exact — other
+            // occurrences of the marker (this test's own literals!) must
+            // never count (vacuous-pin trap).
+            let rest = &full[start..];
+            let end = ["\nfn ", "\nunsafe fn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|p| rest[1..].find(p).map(|i| i + 1))
+                .min()
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            let n = active_calls(body, marker);
+            assert!(
+                n >= 2,
+                "{path}: {fname} must actively call the probe hook on BOTH \
+                 failure legs (spawn map_err + non-zero status); found {n}"
+            );
+        }
+    }
 }
