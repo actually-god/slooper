@@ -6923,6 +6923,8 @@ impl App {
         if let Some(q) = rekey(&self.record_target.clone()) {
             self.record_target = q;
         }
+        // v122: the sample-edit maps are path-keyed too — same subtree mapping.
+        self.rekey_path_state(|p| rekey(p));
         // Which rack root does the destination live in, and what is the
         // moved folder's NEW root-relative key there?
         let dest_root = self
@@ -7550,6 +7552,50 @@ impl App {
         }
     }
 
+    /// v122: every piece of App state keyed by an asset's PATH string must
+    /// follow the file when the rack seams move it: the stored
+    /// `sample_edits`, the pristine `se_source`, an open editor window,
+    /// and a pending deferred commit. `remap` is consulted for every
+    /// existing key; `Some(new)` moves the entry. (The `wave` min/max
+    /// cache is keyed by TABLE INDEX and caches `a.data` — none of these
+    /// seams touch either, so it can never go stale here; contrast
+    /// `transform_asset`, which drops it because it MUTATES data.)
+    fn rekey_path_state(&mut self, remap: impl Fn(&str) -> Option<String>) {
+        let keys: std::collections::BTreeSet<String> = self
+            .sample_edits
+            .keys()
+            .chain(self.se_source.keys())
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(n) = remap(&k) {
+                if n == k {
+                    continue;
+                }
+                if let Some(e) = self.sample_edits.remove(&k) {
+                    self.sample_edits.insert(n.clone(), e);
+                }
+                if let Some(s) = self.se_source.remove(&k) {
+                    self.se_source.insert(n.clone(), s);
+                }
+            }
+        }
+        if let Some(n) = self.sample_edit_win.clone().and_then(|p| remap(&p)) {
+            self.sample_edit_win = Some(n);
+        }
+        if let Some(n) = self.se_defer.clone().and_then(|p| remap(&p)) {
+            self.se_defer = Some(n);
+        }
+    }
+
+    /// v122: forget the path-keyed edit/source of a file that is gone —
+    /// otherwise a file later created at the same path silently INHERITS
+    /// the dead file's edit (e.g. a re-recorded take reversing itself).
+    fn forget_path_state(&mut self, path: &str) {
+        self.sample_edits.remove(path);
+        self.se_source.remove(path);
+    }
+
     fn rack_rename(&mut self, old: &str, new_stem: &str) {
         let new_stem = project::sanitize_name(new_stem);
         let oldp = PathBuf::from(old);
@@ -7584,6 +7630,14 @@ impl App {
         if let Some(a) = self.assets.iter_mut().find(|a| a.path == oldp) {
             a.path = np.clone();
             a.name = new_stem.clone();
+        }
+        // v122: the edits + pristine source are keyed by the path string —
+        // they must follow the file or they detach silently: the save rides
+        // a dead key and the next load drops the rendered edit.
+        {
+            let old_k = old.to_string();
+            let new_k = np.to_string_lossy().into_owned();
+            self.rekey_path_state(|p| (p == old_k).then(|| new_k.clone()));
         }
         for f in self.rack.iter_mut() {
             f.rescan();
@@ -7715,6 +7769,12 @@ impl App {
         if let Some(a) = self.assets.iter_mut().find(|a| a.path == oldp) {
             a.path = np.clone();
         }
+        // v122: same path-keyed state follows the moved file (v122 class).
+        {
+            let old_k = old.to_string();
+            let new_k = np.to_string_lossy().into_owned();
+            self.rekey_path_state(|p| (p == old_k).then(|| new_k.clone()));
+        }
         for f in self.rack.iter_mut() {
             f.rescan();
         }
@@ -7732,6 +7792,10 @@ impl App {
         if let Some(k) = self.assets.iter().position(|a| a.path == p) {
             self.remove_asset_at(k);
         }
+        // v122: forget the path-keyed edit/source of the deleted file — a
+        // stale key would silently RE-APPLY the old edit to any file that
+        // later appears at this path (a re-recorded take).
+        self.forget_path_state(path);
         if p.exists() {
             if let Err(e) = std::fs::remove_file(&p) {
                 self.status = format!("delete: {e}");
