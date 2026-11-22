@@ -98,6 +98,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **The EXPORT dialog's scope choice is one radio again.** The three
+  scope options shared two state flags, so "Track N (selected)" lit up
+  **at the same time** as "Current selection" — and clicking it there did
+  nothing: single-track export became unreachable once you had picked
+  "Current selection" (the only way back was a detour through "Whole
+  project"). Each option now shows its own checked state — exactly one is
+  ever filled — and clicking any of them selects exactly that scope.
+
 - **Successive splits walk the clip again (S).** The docs promised that
   after a split the right half keeps the selection, so pressing S again
   at a further playhead chops a long clip into pieces — but the
