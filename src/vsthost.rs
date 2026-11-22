@@ -7344,4 +7344,73 @@ mod tests {
         assert_eq!(rt.v2_probe(9006), 7, "and its pressure");
         assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
     }
+
+    /// v115 (card t_056d6714): the VST2 per-block `processEvents` batch
+    /// must carry EVERY due event, whatever the count. The old
+    /// `EV_BATCH_MAX = 64` clamp was a SILENT DROP: the partition had
+    /// already drained all due events out of `pending_midi` this block,
+    /// so events 65+ were neither delivered, nor deferred, nor counted
+    /// into `midi_drops`. The w6 fixture counts note-ons (9007) and the
+    /// largest `num_events` ever seen in ONE `processEvents` call (9008)
+    /// — the latter also pins the v37 R4 rule that a single call per
+    /// block carries them all (multiple calls let queue-REPLACING
+    /// plugins drop earlier batches).
+    #[test]
+    fn v115_vst2_burst_beyond_old_cap_delivers_every_event() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v115burst");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; VST_BLOCK * 2];
+        let mut outp = vec![0.0f32; VST_BLOCK * 2];
+        // Fresh-instance reset (req 5): BOTH probes read 0 right after
+        // open — the counters are per-instance, never cross-test.
+        assert_eq!(rt.v2_probe(9007), 0, "fresh instance has seen no note-ons");
+        assert_eq!(rt.v2_probe(9008), 0, "fresh instance has seen no MIDI batch");
+        // Clean block first: absorbs the v103 ch0-init RPN burst — a
+        // legitimate early batch of CCs (the note-on counter stays 0).
+        e.process(&inp, &mut outp);
+        assert_eq!(rt.v2_probe(9007), 0, "the init RPN burst carries no note-ons");
+        // 200 ch0 note-ons at the SAME sample in one block: 3x the cap.
+        let evs: Vec<(usize, [u8; 3])> = (0..200)
+            .map(|k| (7, [0x90u8, (k % 128) as u8, (k % 120 + 1) as u8]))
+            .collect();
+        e.process_with_midi(&inp, &mut outp, &evs);
+        assert_eq!(rt.v2_probe(9007), 200, "every due note-on reaches the plugin (the old cap lost 136 of 200)");
+        assert_eq!(rt.v2_probe(9008), 200, "ONE call per block carries them all (v37 R4)");
+        assert_eq!(e.midi_drops(), 0, "drop-free below the queue cap — and the counter tells the truth");
+    }
+
+    /// v115: the partition stays correct beyond the old cap — every event
+    /// in ITS OWN block. 300 note-ons across two internal blocks (150
+    /// due, 150 future): the first block delivers exactly its own 150
+    /// (batch 150 — not 64, not 300), the next block the remainder.
+    #[test]
+    fn v115_vst2_beyond_cap_partition_stays_time_ordered() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v115span");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; VST_BLOCK];
+        let mut outp = vec![0.0f32; VST_BLOCK];
+        e.process(&inp, &mut outp); // absorb the init RPN burst
+        let mut evs: Vec<(usize, [u8; 3])> =
+            (0..150).map(|k| (3, [0x90u8, (k % 128) as u8, 90])).collect();
+        evs.extend((0..150).map(|k| (600, [0x90u8, (k % 128) as u8, 100])));
+        e.process_with_midi(&inp, &mut outp, &evs);
+        assert_eq!(rt.v2_probe(9007), 150, "first block carries ONLY its own due events: no early drain");
+        assert_eq!(rt.v2_probe(9008), 150, "batch size = the block's 150 due: not clamped to 64, no spillover");
+        e.process(&inp, &mut outp);
+        assert_eq!(rt.v2_probe(9007), 300, "the future-due half lands in its own block: deferred, never dropped");
+        assert_eq!(rt.v2_probe(9008), 150, "and in one batch of its own, still correctly sized");
+        assert_eq!(e.midi_drops(), 0, "the drop-free invariant holds above 64 events/block");
+    }
 }
