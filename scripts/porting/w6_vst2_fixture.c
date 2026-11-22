@@ -99,6 +99,15 @@ static void w6_copy64(char *dst, const char *src) {
 #define W6OP_ProbePoly 9004      /* count of 0xA0 messages seen           */
 #define W6OP_ProbePolyNote 9005  /* (channel << 8) | note (-1 = never)    */
 #define W6OP_ProbePolyPress 9006 /* last poly-AT pressure (-1 = never)    */
+/* v115 (card t_056d6714): batch-cap observer. The host's VST2 path once
+ * clamped its one per-block processEvents batch to 64 pointers — the
+ * partition had ALREADY drained every due event out of the host queue,
+ * so events 65+ were NEITHER delivered, NOR deferred, NOR counted.
+ * Track the note-on count and the largest num_events seen in a SINGLE
+ * call so a pin can assert "every due event, delivered in one call"
+ * (v37 R4). */
+#define W6OP_ProbeNoteOns 9007 /* count of 0x9x messages seen          */
+#define W6OP_ProbeMaxBatch 9008 /* largest single-call num_events seen   */
 
 static int g_rpn_sel_msb = -1; /* last CC101 value            */
 static int g_rpn_active = 0;   /* slot 0/0 currently selected */
@@ -110,6 +119,8 @@ static int g_poly_msgs = 0; /* v104: 0xA0 count                */
 static int g_poly_ch = -1;  /* v104: last poly-AT channel      */
 static int g_poly_note = -1; /* v104: last poly-AT note        */
 static int g_poly_press = -1; /* v104: last poly-AT pressure   */
+static int g_note_ons = 0;   /* v115: 0x9x count               */
+static int g_max_batch = 0;  /* v115: largest single-call n    */
 
 /* Mirror of vst2::api::MidiEvent's leading fields (repr C): six i32s of
  * header + note fields, then the 3 midi bytes. */
@@ -126,6 +137,10 @@ typedef struct {
 
 static void w6_note_midi(const uint8_t *m) {
     int status = m[0] & 0xF0;
+    if (status == 0x90) { /* v115: note-on batch-cap observer */
+        g_note_ons++;
+        return;
+    }
     if (status == 0xE0) {
         g_bend = ((m[2] << 7) | m[1]) + 1; /* +1: 0 means "never" */
         return;
@@ -160,6 +175,8 @@ static void w6_process_events(void *ptr) {
         n = 0;
     if (n > 4096)
         n = 4096;
+    if (n > g_max_batch) /* v115: one call's batch size, pinned per block */
+        g_max_batch = n;
     for (int i = 0; i < n; i++) {
         w6_midi_event *m = (w6_midi_event *)ev->events[i];
         /* EventType::Midi = 1 (vendored api enum). */
@@ -214,6 +231,10 @@ static long w6_dispatch(W6AEffect *e, int opcode, int index, long value,
         return g_poly_note < 0 ? -1 : ((g_poly_ch << 8) | g_poly_note);
     case W6OP_ProbePolyPress:
         return g_poly_press;
+    case W6OP_ProbeNoteOns:
+        return g_note_ons;
+    case W6OP_ProbeMaxBatch:
+        return g_max_batch;
     default:
         return 0;
     }
@@ -266,6 +287,9 @@ W6EXPORT void *VSTPluginMain(void *host_callback) {
     g_poly_ch = -1;
     g_poly_note = -1;
     g_poly_press = -1;
+    /* v115: batch-cap observer statics too. */
+    g_note_ons = 0;
+    g_max_batch = 0;
     g_fx.magic = 0x56737450; /* 'VstP' */
     g_fx.dispatcher = w6_dispatch;
     g_fx.process = w6_process;

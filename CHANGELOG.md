@@ -82,6 +82,19 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Dense MIDI bursts no longer vanish inside VST2 plugins.** When more
+  than 64 channel-voice messages came due in one ~12 ms block aimed at a
+  single VST2 plugin — a big chord stack, a dense multi-lane pattern
+  summed onto one instrument, controller floods after a seek — every
+  message past the 64th was silently lost: the host had already drained
+  its whole due batch from the queue but handed the plugin only the
+  first 64, and the drop counter never heard about it. A lost note-off
+  left a note ringing until the next panic; a lost note-on left a dead
+  voice. The single per-block `processEvents` batch now grows to carry
+  every due event in one call (VST3 and CLAP hosts were already
+  honest), verified with 200-simultaneous-note-on and split-across-
+  blocks pins that demand every message, in order, drops still 0.
+
 - **Automation and MIDI knobs now follow the chain when you edit it.**
   Automation curves and MIDI value bindings address plugin parameters by
   chain position, so removing or reordering an effect used to leave them
