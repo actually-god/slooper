@@ -201,8 +201,8 @@ tests/packaging.sh  packaging regression test (needs a PKGBUILD; see below)
 assets/icon.png 256x256 app icon (placeholder artwork)
 slooper.desktop  freedesktop menu entry
 docs/           INSTALL.md, USAGE.md, PLUGINS.md, EFFECT-SUITE.md,
-                SIDECHAIN.md (human docs), MCP-DESIGN.md (the MCP series
-                design spine), WINDOWS-PORT.md (the W-series
+                SIDECHAIN.md, SAMPLER-PITCH.md (human docs), MCP-DESIGN.md
+                (the MCP series design spine), WINDOWS-PORT.md (the W-series
                 port log), this file. Tutorials live in the GitHub wiki
 ```
 
@@ -385,7 +385,7 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   (sorted, longer length wins), `assets::mix_audio` sums sample-wise.
   Result = NEW asset `merge-a+b` (id = len) written to the primary
   rack's folder; originals untouched.
-- MPE (v42): `Config.mpe` (Settings ▸ Audio; default OFF = legacy omni)
+- MPE (v42): `Config.mpe` (Settings ▸ MPE section; default OFF = legacy omni)
   drives the
   per-device `ChannelStrategy::Mpe` — zone 0 channel 1 is OMNI for
   non-MPE sources, zone 1+ own channels 2..16; expression rides the

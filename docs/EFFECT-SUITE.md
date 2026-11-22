@@ -94,7 +94,7 @@ you can edit — see [USAGE.md](USAGE.md#presets).
 - **Headroom**: `out` trims are per-slot; the master out window
   (top bar ▸ Windows) carries the session limiter + meters.
 - **Latency**: nothing here adds reported latency; lookahead is zero
-  (v3 sidechaining is one audio block late by design — ~2.6 ms at
+  (the sidechain key is one audio block late by design — ~2.6 ms at
   48 kHz/128, far under any detector's attack).
 - **Preset format**: one JSON per preset in `user presets/`, named
   `{plugin stem}-{preset name}.json`, values in native units — see
