@@ -7056,7 +7056,9 @@ impl App {
             if t.is_empty() {
                 format!("{} (edit)", self.assets[idx].name)
             } else {
-                t.to_string()
+                // v121: the name is user-typed — fold it like a project
+                // name so NTFS accepts the file ('/' can't escape either).
+                project::sanitize_name(t)
             }
         };
         let dir = self.record_dir();
@@ -7569,13 +7571,34 @@ impl App {
             .trim_start_matches('/')
             .chars()
             .filter(|c| *c != '\0')
+            // v121: folder names are user-typed too — fold every
+            // NTFS-reserved char; '/' stays as the nesting separator.
+            .map(|c| {
+                if project::is_windows_reserved(c) {
+                    '-'
+                } else {
+                    c
+                }
+            })
             .collect();
         if clean.is_empty() {
             self.status = "new folder: empty name".into();
             return;
         }
+        // Never walk out of the rack folder. NOTE (v121): a bare
+        // starts_with does NOT catch "a/../b" — Path comparison is
+        // component-lexical and the join keeps the '..' after the
+        // matching prefix — so '..' components in the typed name are
+        // rejected outright (checked on `clean`, the typed part, so a
+        // root that itself contains ".." still works).
+        if Path::new(&clean)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            self.status = "new folder: illegal path".into();
+            return;
+        }
         let p = Path::new(&root).join(&clean);
-        // Never walk out of the rack folder.
         if !p.starts_with(Path::new(&root)) {
             self.status = "new folder: illegal path".into();
             return;
@@ -48454,8 +48477,12 @@ mod tests {
         // create_dir_all must receive a name NTFS accepts, while the
         // deliberate '/' nesting and the traversal guard stay intact.
         let mut app = headless_app("v121subadd");
-        let root = std::env::temp_dir().join("sp-uity-v121subadd/rack");
-        let _ = std::fs::remove_dir_all(&root);
+        let sandbox = std::env::temp_dir().join("sp-uity-v121subadd");
+        let root = sandbox.join("rack");
+        // Sweep the WHOLE sandbox: the escape probe's target sits next to
+        // the rack dir, and a leftover from an older (pre-guard) run must
+        // not decide the verdict.
+        let _ = std::fs::remove_dir_all(&sandbox);
         std::fs::create_dir_all(&root).unwrap();
         app.rack[0].path = root.display().to_string();
         app.rack[0].rescan();
