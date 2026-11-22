@@ -137,6 +137,11 @@ pub fn run(
     exit
 }
 
+/// The patch the user last asked for, kept so a server-loss rebuild can
+/// replay it through the real apply seam (v118 R4): input port names +
+/// (output port name, L/R route bitmask) pairs — same shapes `apply` takes.
+type Patch = (Vec<String>, Vec<(String, u8)>);
+
 /// Everything a rebuilt client needs, owned by the session so `idle` can
 /// re-run the bootstrap without access to `run`'s locals (v118). Masks are
 /// shared (not re-made): the live Proc and `apply_layout` must keep seeing
@@ -602,7 +607,7 @@ struct JackSession {
     liveness: Arc<AtomicU64>,
     server_dead: Arc<AtomicBool>,
     loss: rt_recovery::JackLoss,
-    desired: Option<(Vec<String>, Vec<(String, u8)>)>,
+    desired: Option<Patch>,
     t0: std::time::Instant,
     recover: Option<RecoverCtx>,
 }
