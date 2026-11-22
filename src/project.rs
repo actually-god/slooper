@@ -194,13 +194,26 @@ impl Project {
     }
 }
 
-/// Strip characters that would be hostile in a file name.
+/// True for characters the Win32 file API rejects in a name on NTFS:
+/// `< > : " | ? *` (the separators `/` `\` are handled by the callers —
+/// Windows treats them as path delimiters, not fold candidates). NTFS has
+/// no escape hatch for these while POSIX does, so folding them on BOTH
+/// OSes is deliberate: the same name then names the same file on every
+/// machine, whereas OS-gated folding would let Linux create projects that
+/// are unopenable on Windows.
+pub fn is_windows_reserved(c: char) -> bool {
+    matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+}
+
+/// Strip characters that would be hostile in a file name: separators and
+/// control chars fold to '-', every NTFS-reserved char folds to '-'
+/// (v121 — both-OS saves), trailing/leading dots and spaces trim.
 pub fn sanitize_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()
         .map(|c| {
-            if c.is_control() || c == '/' || c == '\\' {
+            if c.is_control() || c == '/' || c == '\\' || is_windows_reserved(c) {
                 '-'
             } else {
                 c
