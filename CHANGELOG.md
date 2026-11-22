@@ -98,6 +98,15 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **The master clip LED can be turned off now.** A single sample that
+  ever hit full scale lit the red CLIP indicator in MASTER OUT for the
+  rest of the session — nothing could clear it short of restarting
+  slooper, so the panel kept accusing the mix long after the one
+  transient that set it off. Click the red LED (or the meter column that
+  paints it) to reset the latch, or let the "reset I" button do it along
+  with the integrated-loudness reset; every affordance explains itself
+  on hover and answers in the status line.
+
 - **The EXPORT dialog's scope choice is one radio again.** The three
   scope options shared two state flags, so "Track N (selected)" lit up
   **at the same time** as "Current selection" — and clicking it there did
