@@ -3956,6 +3956,143 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v125 regression (card t_d201dfe7): the v3 STEREO dry paths of the
+    /// two flagship stock FX mis-reconstructed the mid/side pair. The
+    /// chorus dropped the side from L and ADDED it to R — the dry R
+    /// literally was the LEFT input, so a hard-R source vanished from
+    /// the right channel; the delay added an UNSCALED `side` to R, so
+    /// dry content leaked into R even at mix = 1.0. Both headers had
+    /// promised the opposite ("the dry keeps its real (l, r)"). Mono
+    /// pins are blind to the whole class (side = 0), so this pin drives
+    /// real pairs: hard-L, hard-R and a decorrelated noise pair at
+    /// mix = 0 must be frame-exact identity (mix = 0 zeroes the wet
+    /// term exactly, so no tolerance games are needed), and the delay
+    /// at mix = 1 with wet trim 0 must leave R dead silent through a
+    /// hard-R burst — isolating the dry term. A second un-muted burst
+    /// demands the ping-pong echo still arrives in a window far from
+    /// the instance start (the anti-mute guard: the silent-run assert
+    /// must never pass because the effect is dead).
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v125_st_dry_passthrough() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v125stdry");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+
+        // Deterministic decorrelated noise pair (dsp-audio-probe LCG).
+        fn lcg(s: &mut u32) -> f32 {
+            *s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+            *s as f32 / 2147483647.0 * 1.2 - 0.6
+        }
+        let defaults = |stem: &str| -> [f32; MAX_PARAMS] {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            for (k, pd) in reg.desc(stem).unwrap().params.iter().enumerate() {
+                dp[k] = pd.default;
+            }
+            dp
+        };
+
+        // ---- R1/R2: mix=0 must be the TRUE stereo pass-through -------
+        // Param slots: chorus [.., mix=5, out=6, ..], delay [.., duck=5,
+        // level=6, mix=7, out=8, ..] — positional by the PARAMS table.
+        for (stem, mix_i) in [("chorus", 5usize), ("delay", 7usize)] {
+            let inst = reg
+                .create_instance(stem, sr, &[])
+                .unwrap_or_else(|| panic!("{stem}: no instance"));
+            let mut dp = defaults(stem);
+            dp[mix_i] = 0.0; // fully dry
+            dp[mix_i + 1] = 1.0; // out trim = 1
+            let (mut sl, mut srr) = (0x12345u32, 0xFEDCBAu32);
+            let (mut el, mut er) = (0.0f32, 0.0f32);
+            for i in 0..1500 {
+                let (l, r) = if i < 100 {
+                    (0.8, 0.0)
+                } else if i < 200 {
+                    // the v125 bug killed THIS segment: R-dry was mid+side = li
+                    (0.0, 0.8)
+                } else {
+                    (lcg(&mut sl), lcg(&mut srr))
+                };
+                let (ol, or) = unsafe { inst.call_sample_st(l, r, &dp, 0.0) };
+                el = el.max((ol - l).abs());
+                er = er.max((or - r).abs());
+            }
+            assert!(
+                el < 1e-5,
+                "{stem}: mix=0 LEFT rail not identity (max dev {el}) — dry L must rebuild mid+side",
+            );
+            assert!(
+                er < 1e-5,
+                "{stem}: mix=0 RIGHT rail not identity (max dev {er}) — dry R must rebuild mid-side (the v125 bug fed it mid+side = the LEFT input)",
+            );
+            drop(inst);
+        }
+
+        // ---- R3: delay mix=1 must not leak the side into R -----------
+        // Wet trim 0 isolates the dry term exactly (wet = read*level, so
+        // 0 zeroes even the early-instance read_head extrapolation the
+        // delay does before the first tap matures — a separate pre-existing
+        // startup transient, follow-up filed, not this card's contract).
+        // Old code: R carried `side` ( = -r/2 ≈ -12 dBFS) unscaled at
+        // mix = 1 for the whole hard-R burst.
+        {
+            let inst = reg.create_instance("delay", sr, &[]).expect("delay l1 inst");
+            let mut dp = defaults("delay");
+            dp[7] = 1.0; // mix = 1
+            dp[8] = 1.0; // out trim = 1
+            dp[6] = 0.0; // wet trim = 0: only the dry term can appear
+            let burst = (0.15 * sr) as usize;
+            let mut sn = 0x5EEDu32;
+            let mut leak = 0.0f32;
+            for i in 0..burst {
+                let r = lcg(&mut sn);
+                let (_ol, or) = unsafe { inst.call_sample_st(0.0, r, &dp, 0.0) };
+                if i > (0.04 * sr) as usize {
+                    leak = leak.max(or.abs());
+                }
+            }
+            drop(inst);
+            assert!(
+                leak < 1e-4,
+                "delay mix=1 leaks {leak} of dry side into R — the side term must scale with (1-mix)",
+            );
+        }
+
+        // ---- R4 guard: the ping-pong wet is really there -------------
+        // Same burst at full wet (defaults), 5 ms tap so the echo train
+        // matures long before the measured window (i >= 30 ms is past
+        // every startup tap in this configuration). Demand R content.
+        {
+            let inst = reg.create_instance("delay", sr, &[]).expect("delay l2 inst");
+            let mut dp = defaults("delay");
+            dp[7] = 1.0; // mix = 1
+            dp[8] = 1.0; // out trim = 1
+            dp[0] = 5.0; // time = 5 ms: echo train fully alive at 30 ms
+            let mut sn = 0x5EEDu32;
+            let mut tail = 0.0f32;
+            for i in 0..(0.15 * sr) as usize {
+                let r = lcg(&mut sn);
+                let (_ol, or) = unsafe { inst.call_sample_st(0.0, r, &dp, 0.0) };
+                if i > (0.03 * sr) as usize {
+                    tail = tail.max(or.abs());
+                }
+            }
+            drop(inst);
+            assert!(
+                tail > 0.05,
+                "delay mix=1 shows no R ping-pong echo content ({tail}) — the wet path must survive the dry-path fix",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Native Suite tier 5 pins (docs/EFFECT-SUITE.md): space_echo went ABI-v3
     /// STEREO (algorithmic-room task). Impulse-STRUCTURE shape per the
     /// tier-4 rule — energy gates are blind to dead loops, and here they
