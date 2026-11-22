@@ -638,7 +638,7 @@ fn chain_pick(app: &mut App, args: &Value) -> ToolResult {
             let rows = &mut app.fx_rows[t];
             let row = rows.remove(from);
             rows.insert(to, row);
-            // v113: ONE drift seam (was: a pending-load-only loop, the v110
+            // v115: ONE drift seam (was: a pending-load-only loop, the v110
             // lesson) — pending loads, curves, bindings and live views all
             // ride the identical map: the fresh row lands on `to`, rows in
             // [to, from) slide down one.

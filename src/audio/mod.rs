@@ -1041,7 +1041,7 @@ pub struct Engine {
     /// v0.11 R5: automation asset table (parallel to `assets`) + gen.
     auto: std::sync::Mutex<Arc<Vec<Option<Arc<crate::automation::Automation>>>>>,
     auto_gen: AtomicU64,
-    /// v113: sticky — a well-formed `fx:`/`synth:` automation target was
+    /// v115: sticky — a well-formed `fx:`/`synth:` automation target was
     /// unreachable while its clip played (chain layout drift: the row is
     /// gone, the curve still fires). RT only ever does a cheap `store(true)`
     /// in the per-block pass (xruns precedent); the GUI mirrors it as a
@@ -1829,15 +1829,15 @@ impl Engine {
         self.auto_gen.load(Ordering::Relaxed)
     }
 
-    /// v113: cheap handle for the RT block (it only ever `store(true)`).
+    /// v115: cheap handle for the RT block (it only ever `store(true)`).
     pub fn auto_miss_flag(&self) -> Arc<AtomicBool> {
         self.auto_miss.clone()
     }
-    /// v113: is a dead automation target on record?
+    /// v115: is a dead automation target on record?
     pub fn auto_miss(&self) -> bool {
         self.auto_miss.load(Ordering::Relaxed)
     }
-    /// v113: GUI calls this once a scan confirms every automation target
+    /// v115: GUI calls this once a scan confirms every automation target
     /// lands again (a later RT miss re-arms the flag on its own).
     pub fn clear_auto_miss(&self) {
         self.auto_miss.store(false, Ordering::Relaxed)
@@ -4337,7 +4337,7 @@ struct Proc {
     /// v0.11 R5: automation asset table refresh pair.
     auto_cache: Arc<Vec<Option<Arc<crate::automation::Automation>>>>,
     auto_cache_gen: u64,
-    /// v113: shared with Engine — set (never cleared) by the automation
+    /// v115: shared with Engine — set (never cleared) by the automation
     /// pass when a live clip's well-formed plugin target cannot route.
     auto_miss: Arc<AtomicBool>,
     /// v34 R11: last control-rate pass; held while the transport is
@@ -4618,7 +4618,7 @@ fn seed_fx_rt(table: &[TrackFx]) -> Vec<Vec<FxRt>> {
         .collect()
 }
 
-/// v113: how a plugin-parameter automation target parsed. ONE grammar
+/// v115: how a plugin-parameter automation target parsed. ONE grammar
 /// shared by the RT router and the GUI dead-target scan (ui.rs) so both
 /// sides agree on what "well-formed" means. `fx:<row>:<idx>` / `synth:<idx>`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4639,7 +4639,7 @@ pub fn parse_plugin_target(t: &str) -> Option<PluginTarget> {
     ))
 }
 
-/// v113: verdict of one routing attempt. Only `Unroutable` (well-formed id,
+/// v115: verdict of one routing attempt. Only `Unroutable` (well-formed id,
 /// slot/handle gone — the chain-layout drift class) counts as an auto-miss;
 /// `Malformed` is a save/import bug that never changes with the chain, and
 /// `Landed` of course counts nothing.
@@ -4811,7 +4811,7 @@ impl Proc {
                             out.tempo = Some((v.round() as i64).clamp(20, 300) as u32)
                         }
                         other => {
-                            // v113: a well-formed target whose slot vanished
+                            // v115: a well-formed target whose slot vanished
                             // (chain edited under a live curve) used to die
                             // swallowed here. Raise the sticky flag once per
                             // block — the GUI badge + status scan surfaces
@@ -4828,7 +4828,7 @@ impl Proc {
     }
 
     /// Write one automated value to a `synth:<idx>` / `fx:<row>:<idx>`
-    /// target on track `t`. v113: the verdict distinguishes "this chain has
+    /// target on track `t`. v115: the verdict distinguishes "this chain has
     /// no such slot anymore" (Unroutable — what the auto-miss badge mirrors)
     /// from a target string that never parsed (Malformed — silence).
     fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> RouteVerdict {
@@ -9282,12 +9282,12 @@ let desc = reg.desc("v80quarter").unwrap().clone();
     }
 
     #[test]
-    fn v113_target_parser_grammar() {
+    fn v115_target_parser_grammar() {
         use super::{parse_plugin_target, PluginTarget};
         assert_eq!(parse_plugin_target("fx:0:1"), Some(PluginTarget::Fx(0, 1)));
         assert_eq!(parse_plugin_target("fx:12:3"), Some(PluginTarget::Fx(12, 3)));
         assert_eq!(parse_plugin_target("synth:7"), Some(PluginTarget::Synth(7)));
-        // v113 neutralization sentinel: never routable, never a false
+        // v115 neutralization sentinel: never routable, never a false
         // auto-miss either (parse fails => the pass ignores it).
         assert_eq!(parse_plugin_target("fx:gone:0"), None);
         assert_eq!(parse_plugin_target("fx:1"), None);

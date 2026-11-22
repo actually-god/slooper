@@ -552,8 +552,8 @@ fn v110_mcp_assets_assign_sampler_keymap_pad() {
 }
 
 #[test]
-fn v113_mcp_reloc_remaps_targets() {
-    let mut app = headless_app("v113reloc");
+fn v115_mcp_reloc_remaps_targets() {
+    let mut app = headless_app("v115reloc");
     // A loading row sits at 0 with routing already aimed at it.
     let (_tx, rx) = std::sync::mpsc::channel();
     app.fx_rows[0].push(crate::ui::ChainRow::Vst {
@@ -569,7 +569,7 @@ fn v113_mcp_reloc_remaps_targets() {
         bypass: false,
     });
     app.vst_pending_gui.push((0, 0));
-    let dir = std::env::temp_dir().join("sp-uity-v113reloc").join("auto");
+    let dir = std::env::temp_dir().join("sp-uity-v115reloc").join("auto");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("c.slauto");
     let a = crate::automation::Automation {
