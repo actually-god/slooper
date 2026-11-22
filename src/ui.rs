@@ -9517,9 +9517,8 @@ impl App {
                     self.meter_i = None;
                     self.meter_lra = None;
                     self.clear_clip_led();
-                    self.status = "integrated loudness + clip LED reset \u{2014} new \
-                                   measurement started"
-                        .into();
+                    self.status =
+                        "integrated loudness + clip LED reset \u{2014} new measurement started".into();
                 }
                 let (peak_l, peak_r, clip) = match self.meter_state.as_ref() {
                     Some(ms) => (db_of(ms.l_hold), db_of(ms.r_hold), ms.clip),
@@ -61086,7 +61085,7 @@ mod tests {
     /// R3: "reset I" resets the clip LED along with the integrated
     /// measurement it already owned.
     #[test]
-    fn v123_reset_I_clears_clip_too() {
+    fn v123_reset_button_clears_clip_too() {
         let (mut app, ctx) = v123_clip_app("v123reset");
         let row = galley_at(&mut app, &ctx, "reset I").expect("reset I painted");
         click_pt(&mut app, &ctx, row.center());
