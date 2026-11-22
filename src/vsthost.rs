@@ -2266,8 +2266,18 @@ pub(crate) const VST3_K_IS_PROGRAM_CHANGE: u32 = 1 << 15;
 
 /// Normalized program-change value -> program index (the VST3 mapping both
 /// this host and the v66 fixture use: `index / (count - 1)`, nearest).
+///
+/// v119 (t_9ffd5d49): this is the TOTAL inverse mapping — every
+/// normalized->index program read in the host routes through here (the
+/// open/snapshot probes AND `refresh_program`'s mirror read). `count < 2`
+/// has exactly one valid program; a non-finite `v` (a NaN/inf cell a
+/// misbehaving plugin pushes through the relay) maps to program 0 so no
+/// caller ever feeds an FP-int cast a NaN — the pre-v119 inline f32 math
+/// in `refresh_program` could reach `NaN as i32` (saturating to 0 on x64
+/// today, unverified-by-construct on other codegen: the UB-cast class
+/// this doctrine closes).
 pub(crate) fn norm_to_program(v: f64, count: usize) -> i32 {
-    if count <= 1 {
+    if count <= 1 || !v.is_finite() {
         return 0;
     }
     ((v * (count - 1) as f64).round() as i32).clamp(0, count as i32 - 1)
@@ -3824,8 +3834,16 @@ impl RtStageEntry {
         // read adopts editor-side program changes exactly like the v62
         // VST2 dispatch read adopts plugin-editor changes.
         if let Some(k) = self.program_param {
-            let n = (self.programs.len() - 1) as f32;
-            let idx = (self.params.get(k) * n).round().clamp(0.0, n) as i32;
+            // v119: read through the SHARED guarded mapping instead of
+            // inline f32 math. The old code scaled by (len-1) unguarded:
+            // a single-program plugin made the clamp chain degenerate,
+            // and a non-finite mirror cell (NaN/inf from a misbehaving
+            // plugin's relay) turned the expression into `NaN as i32` —
+            // a UB-class FP-int cast. norm_to_program maps count<2 and
+            // non-finite input to program 0 and is what the open/
+            // snapshot path already uses, so this read now agrees with
+            // its writers in every case (pins v119_*).
+            let idx = norm_to_program(self.params.get(k) as f64, self.programs.len());
             self.program.store(idx, Ordering::Relaxed);
             return;
         }
@@ -6976,6 +6994,134 @@ mod tests {
         assert!(e.select_program(0));
         e.refresh_program();
         assert_eq!(e.current_program(), Some(0));
+    }
+
+    // ---- v119 (t_9ffd5d49): total program-index mapping ----------------
+    //
+    // Pre-v119, refresh_program kept its OWN inline copy of the
+    // normalized->index mapping: `let n = (len-1) as f32;
+    // (get(k)*n).round().clamp(0.0, n) as i32` — no count<2 guard (the
+    // sibling select_program guards `.max(1)`; norm_to_program guards
+    // `count <= 1`), so a single-program plugin got a degenerate clamp
+    // chain, and — the real class — a non-finite mirror cell (NaN/inf
+    // relayed by a misbehaving plugin) produced `NaN as i32`: an FP-int
+    // cast on NaN. Today x64 saturates that to 0; by construct nothing
+    // guaranteed it. v119 makes norm_to_program the single TOTAL source
+    // and routes every program-index read through it.
+
+    /// The shared mapping must be TOTAL: count<2 and non-finite input
+    /// resolve to program 0 before any FP-int cast; the finite mapping
+    /// (nearest, clamp to [0, count-1]) is unchanged from pre-fix.
+    #[test]
+    fn v119_norm_to_program_is_total() {
+        for &v in &[0.0f64, 1.0, 0.5, -3.0, 1e30] {
+            assert_eq!(norm_to_program(v, 1), 0, "single program: v={v} must land on 0");
+            assert_eq!(norm_to_program(v, 0), 0, "no programs: v={v} must land on 0");
+        }
+        for &count in &[0usize, 1, 2, 4] {
+            assert_eq!(norm_to_program(f64::NAN, count), 0, "NaN never reaches the cast");
+            assert_eq!(norm_to_program(f64::INFINITY, count), 0, "+inf likewise");
+            assert_eq!(norm_to_program(f64::NEG_INFINITY, count), 0, "-inf likewise");
+        }
+        assert_eq!(norm_to_program(0.0, 4), 0);
+        assert_eq!(norm_to_program(1.0 / 3.0, 4), 1);
+        assert_eq!(norm_to_program(0.5, 5), 2, "nearest, ties away from zero");
+        assert_eq!(norm_to_program(1.0, 4), 3);
+        assert_eq!(norm_to_program(2.0, 4), 3, "clamped high");
+        assert_eq!(norm_to_program(-0.5, 4), 0, "clamped low");
+        assert_eq!(norm_to_program(f32::MAX as f64, 4), 3, "huge finite stays defined");
+    }
+
+    /// Anti-drift invariant: the program-index mapping is SINGLE-SOURCE.
+    /// refresh_program must route through norm_to_program (no inline
+    /// (len-1) f32 math), and norm_to_program must keep its totality
+    /// guard. Sabotage-proven both polarities: restoring the old inline
+    /// line trips the negative needle; deleting the call or the guard
+    /// trips a positive one.
+    #[test]
+    fn v119_program_mapping_single_source() {
+        let src = include_str!("./vsthost.rs");
+        // Extract a function body by brace matching from its signature.
+        fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("no {sig:?} in source"));
+            let open = start + src[start..].find('{').expect("opening brace");
+            let mut depth = 0usize;
+            for (i, ch) in src[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open..open + i + 1];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced body for {sig:?}");
+        }
+        // concat! splits every needle so no polarity can pass vacuously
+        // off this pin's own literals (same-file source-scan doctrine).
+        let refresh = body_of(src, "pub fn refresh_program(&self)");
+        assert!(
+            refresh.contains(concat!("norm_to_program(self.", "params.get(k) as f64")),
+            "refresh_program must route the program read through the shared mapping"
+        );
+        assert!(
+            !refresh.contains(concat!("(self.programs.len()", " - 1) as f32")),
+            "no inline (len-1) mapping may return to refresh_program"
+        );
+        let shared = body_of(src, "pub(crate) fn norm_to_program");
+        assert!(
+            shared.contains(concat!("count <= 1 || ", "!v.is_finite()")),
+            "norm_to_program must keep the count<2 + non-finite guard"
+        );
+    }
+
+    /// Behavior through the REAL v66 VST3 fixture (4 programs): finite
+    /// mirror edits adopt exactly as the v66 relay pin showed, a
+    /// non-finite cell resolves to a DEFINED program 0 (no poison, no
+    /// panic), and the select -> mirror -> refresh round-trip holds for
+    /// every program — writer and reader agree.
+    #[test]
+    fn v119_refresh_program_vst3_mirror() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let e = &load.entry;
+        let k = e
+            .descs()
+            .iter()
+            .position(|d| d.program_change)
+            .expect("program cell");
+        for &(v, want) in &[
+            (0.0f32, 0i32),
+            (1.0 / 3.0, 1),
+            (0.5, 2),
+            (1.0, 3),
+            (2.0, 3),
+            (-0.5, 0),
+        ] {
+            e.params().set(k, v);
+            e.refresh_program();
+            assert_eq!(
+                e.current_program(),
+                Some(want),
+                "mirror {v} adopts as program {want}"
+            );
+        }
+        // Non-finite mirror cell: defined 0, never garbage.
+        for &poison in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            e.params().set(k, poison);
+            e.refresh_program();
+            assert_eq!(e.current_program(), Some(0), "non-finite cell resolves to program 0");
+        }
+        // Writer/read round-trip through the mirror, every program.
+        for i in 0..e.programs().len() {
+            assert!(e.select_program(i), "select {i}");
+            e.refresh_program();
+            assert_eq!(e.current_program(), Some(i as i32), "select->refresh round-trip {i}");
+        }
     }
 
     // ---- v78 (TS-015): multi-part runtime program change ----------------
