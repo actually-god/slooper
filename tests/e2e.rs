@@ -6004,3 +6004,54 @@ fn v110_e2e_mixer_seam_vol_heard_live_rt() {
     b.cmd(Cmd::StopAll);
     drop(active);
 }
+
+// ---- v113: RT auto-miss surfacing (engine-direct, live server) ----
+
+fn v113_auto_arr(target: &str) -> (Arrangement, std::sync::Arc<Vec<Option<std::sync::Arc<slooper::automation::Automation>>>>) {
+    use slooper::automation::{Automation, Node};
+    let a = Automation {
+        target: target.into(),
+        len_samples: 4096,
+        nodes: vec![Node { t: 0, v: 0.5, c: 0.0 }, Node { t: 4096, v: 0.5, c: 0.0 }],
+    };
+    let mut arr = Arrangement::new();
+    arr.insert(0, 0, Clip::new(0, 0));
+    (arr, std::sync::Arc::new(vec![Some(std::sync::Arc::new(a))]))
+}
+
+/// A well-formed `fx:7:0` target over an empty chain can never route — the
+/// automation pass must raise the engine's sticky auto-miss flag.
+#[test]
+fn v113_e2e_auto_miss_flag_rises() {
+    let _g = e2e_lock();
+    let Some((b, _name, _sr)) = start_backend() else { return };
+    let (arr, auto) = v113_auto_arr("fx:7:0");
+    b.cmd(Cmd::SetProject { assets: Arc::new(Vec::new()), arr: Arc::new(arr), len: 4096 });
+    b.cmd(Cmd::SetAutoAssets(auto));
+    b.cmd(Cmd::PlayAll);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if b.engine.auto_miss() {
+            b.cmd(Cmd::StopAll);
+            return; // flag rose — the drift class is surfaced
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    b.cmd(Cmd::StopAll);
+    panic!("auto_miss never rose for an unroutable fx target over a playing clip");
+}
+
+/// Negative control: the same harness with a mixer target always routes —
+/// the flag must stay down (no false badge).
+#[test]
+fn v113_e2e_auto_miss_quiet_when_landing() {
+    let _g = e2e_lock();
+    let Some((b, _name, _sr)) = start_backend() else { return };
+    let (arr, auto) = v113_auto_arr(slooper::automation::TARGET_TRACK_VOL);
+    b.cmd(Cmd::SetProject { assets: Arc::new(Vec::new()), arr: Arc::new(arr), len: 4096 });
+    b.cmd(Cmd::SetAutoAssets(auto));
+    b.cmd(Cmd::PlayAll);
+    std::thread::sleep(Duration::from_millis(400));
+    b.cmd(Cmd::StopAll);
+    assert!(!b.engine.auto_miss(), "landing targets must never raise the badge");
+}
