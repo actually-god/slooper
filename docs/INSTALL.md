@@ -151,7 +151,7 @@ error instead — start your server, then relaunch.
 
 ## Optional runtime packages
 
-- **rustc** — the per-loop effects framework compiles user effect scripts with
+- **rustc** — the effects framework compiles user effect scripts with
   the system `rustc` (`--edition 2021 --crate-type cdylib`). Without rustc the
   app runs normally; custom effects just list as "compiler not found".
 - **ffmpeg** — enables exporting loops/projects as MP3 or OGG Vorbis. WAV and
