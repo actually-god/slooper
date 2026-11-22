@@ -29677,26 +29677,40 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
         .show(ui, |ui| {
             ui.label(RichText::new("What to export:").strong());
             let n_sel = app.sel_clips.len();
+            // v122: three radios, two bools — checked flags computed
+            // explicitly per row (track mode = NEITHER bool) and EVERY
+            // clicked arm sets BOTH bools. The old code shared
+            // `export_whole` with the Track row inverted, so Track lit up
+            // double-checked next to "Current selection" and clicking it
+            // in that state was a no-op — single-track export was only
+            // reachable by detouring through "Whole project".
+            let (mode_sel, mode_whole) = (app.export_sel, app.export_whole);
             if ui
-                .radio_value(&mut app.export_sel, true, format!("Current selection ({n_sel} clip(s))"))
-                .changed()
-                && app.export_sel
+                .add(egui::RadioButton::new(
+                    mode_sel,
+                    format!("Current selection ({n_sel} clip(s))"),
+                ))
+                .clicked()
             {
+                app.export_sel = true;
                 app.export_whole = false;
             }
             if ui
-                .radio_value(
-                    &mut app.export_whole,
-                    false,
+                .add(egui::RadioButton::new(
+                    !mode_sel && !mode_whole,
                     format!("Track {} (selected)", app.selected + 1),
-                )
-                .changed()
-                && !app.export_whole
+                ))
+                .clicked()
             {
                 app.export_sel = false;
+                app.export_whole = false;
             }
-            if ui.radio_value(&mut app.export_whole, true, "Whole project").changed() && app.export_whole {
+            if ui
+                .add(egui::RadioButton::new(mode_whole, "Whole project"))
+                .clicked()
+            {
                 app.export_sel = false;
+                app.export_whole = true;
             }
             if app.export_sel && n_sel == 0 {
                 ui.label(
