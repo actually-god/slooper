@@ -8,6 +8,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Chorus and delay now pass a true stereo image through.** Both v3
+  dry paths rebuilt the mid/side pair wrong: the chorus dropped the side
+  from the left and *added* it to the right (the dry right channel
+  literally carried the left input), and the delay added its side term
+  unscaled, so dry content leaked into the right even with mix at 100%.
+  A hard-panned source through either flagship effect vanished from its
+  own channel and collapsed toward centre; mono was unaffected, which is
+  why every existing pin kept passing. Both now reconstruct L=mid+side,
+  R=mid-side scaled by (1-mix) — mix 0 is a true pass-through and mix 1
+  a true wet (v125, pinned by `v125_st_dry_passthrough`).
 - **Auto-placement now dodges long clips (and stops dodging ghosts).**
   The lane-occupancy test built every existing clip's right edge from the
   incoming item's own length, so a short take landing on the tail of a
