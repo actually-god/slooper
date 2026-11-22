@@ -3837,8 +3837,8 @@ impl RtStageEntry {
             // v119: read through the SHARED guarded mapping instead of
             // inline f32 math. The old code scaled by (len-1) unguarded:
             // a single-program plugin made the clamp chain degenerate,
-            // and a non-finite mirror cell (NaN/inf from a misbehaving
-            // plugin's relay) turned the expression into `NaN as i32` —
+            // and a NaN mirror cell (VstParams::set's clamp is
+            // NaN-preserving) turned the expression into `NaN as i32` —
             // a UB-class FP-int cast. norm_to_program maps count<2 and
             // non-finite input to program 0 and is what the open/
             // snapshot path already uses, so this read now agrees with
@@ -7003,10 +7003,13 @@ mod tests {
     // (get(k)*n).round().clamp(0.0, n) as i32` — no count<2 guard (the
     // sibling select_program guards `.max(1)`; norm_to_program guards
     // `count <= 1`), so a single-program plugin got a degenerate clamp
-    // chain, and — the real class — a non-finite mirror cell (NaN/inf
-    // relayed by a misbehaving plugin) produced `NaN as i32`: an FP-int
-    // cast on NaN. Today x64 saturates that to 0; by construct nothing
-    // guaranteed it. v119 makes norm_to_program the single TOTAL source
+    // chain, and — the real class — a NaN mirror cell produced
+    // `NaN as i32`: an FP-int cast on NaN. (VstParams::set's
+    // clamp(0.0,1.0) is NaN-preserving, so a relayed NaN survives to
+    // the cell; ±inf is normalized to finite by that same clamp —
+    // both facts asserted by the fixture pin below.) Today x64
+    // saturates the cast to 0; by construct nothing guaranteed it.
+    // v119 makes norm_to_program the single TOTAL source
     // and routes every program-index read through it.
 
     /// The shared mapping must be TOTAL: count<2 and non-finite input
@@ -7110,12 +7113,25 @@ mod tests {
                 "mirror {v} adopts as program {want}"
             );
         }
-        // Non-finite mirror cell: defined 0, never garbage.
-        for &poison in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            e.params().set(k, poison);
-            e.refresh_program();
-            assert_eq!(e.current_program(), Some(0), "non-finite cell resolves to program 0");
-        }
+        // Non-finite mirror cells stay DEFINED, each via the boundary
+        // that actually holds (measured, not assumed): VstParams::set
+        // clamps ±inf to finite 1.0/0.0 AT THE WRITE (Rust clamp passes
+        // NaN through — NaN vs bounds compares false), so NaN is the
+        // only non-finite value that ever reaches the mapping, and the
+        // shared guard resolves it to program 0 before any FP-int cast.
+        e.params().set(k, f32::NAN);
+        e.refresh_program();
+        assert_eq!(e.current_program(), Some(0), "NaN cell: guard resolves program 0");
+        e.params().set(k, f32::INFINITY);
+        e.refresh_program();
+        assert_eq!(
+            e.current_program(),
+            Some(e.programs().len() - 1),
+            "+inf: set() clamps the cell to 1.0 -> last program"
+        );
+        e.params().set(k, f32::NEG_INFINITY);
+        e.refresh_program();
+        assert_eq!(e.current_program(), Some(0), "-inf: set() clamps the cell to 0.0 -> first program");
         // Writer/read round-trip through the mirror, every program.
         for i in 0..e.programs().len() {
             assert!(e.select_program(i), "select {i}");
