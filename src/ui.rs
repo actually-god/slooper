@@ -60965,4 +60965,324 @@ mod tests {
         );
     }
 
+    // ---- v122: rack file ops must re-key path-keyed sample-edit state ----
+
+    #[test]
+    fn v122_rename_rekeys_sample_edits() {
+        // v122 P1 (card t_57a5612f): rack_rename moved the file and the
+        // asset entry but left sample_edits/se_source keyed by the OLD
+        // path — the edit detached silently, rode the project under a
+        // dead key, and died at the next load (se_apply key miss).
+        let mut app = headless_app("v122rn");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122rn")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        // W14 scan-form: chained single-component joins.
+        let wav = samples.join("kit-a").join("revme.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let old_key = wav.to_string_lossy().into_owned();
+        // Commit through the real edit seam (menu entry pinned by
+        // v50_edit_sample_menu_*; this pin owns the rename re-key).
+        app.sample_edit_win = Some(old_key.clone());
+        app.se_defer = Some(old_key.clone());
+        app.sample_edits.insert(
+            old_key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&old_key);
+        assert!(
+            app.se_source.contains_key(&old_key),
+            "setup: pristine source cached under the edit"
+        );
+        let edited = app.assets[0].data.to_vec();
+        app.rack_rename(&old_key, "revved");
+        let wav2 = samples.join("kit-a").join("revved.wav");
+        let new_key = wav2.to_string_lossy().into_owned();
+        assert!(
+            wav2.exists() && !wav.exists(),
+            "rename moved the file on disk"
+        );
+        assert!(
+            !app.sample_edits.contains_key(&old_key),
+            "old key must not survive: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.sample_edits.contains_key(&new_key),
+            "the edit must follow the file"
+        );
+        assert!(
+            app.se_source.contains_key(&new_key),
+            "the pristine source must follow too"
+        );
+        assert_eq!(
+            app.sample_edit_win.as_deref(),
+            Some(new_key.as_str()),
+            "an open editor follows the rename (never silently closes)"
+        );
+        assert_eq!(
+            app.se_defer.as_deref(),
+            Some(new_key.as_str()),
+            "a pending deferred commit follows the rename"
+        );
+        // The rebuilt project records the edit under the NEW path...
+        let pr = app.build_project("v122rn".into());
+        assert!(
+            pr.sample_edits.contains_key(&new_key)
+                && !pr.sample_edits.contains_key(&old_key),
+            "edits ride the project under the new key"
+        );
+        // ...and a reload over fresh (pristine) assets re-renders it —
+        // this round trip is the exact user-data-loss case.
+        let mut app2 = headless_app("v122rn2");
+        app2.rack[0].path = samples.display().to_string();
+        app2.rack[0].rescan();
+        let _ = app2.ensure_asset(&wav2);
+        app2.restore_sample_edits(&pr.sample_edits);
+        assert_eq!(
+            app2.assets[0].data.to_vec(),
+            edited,
+            "reload must re-render the renamed sample's edit"
+        );
+    }
+
+    #[test]
+    fn v122_move_rekeys_sample_edits() {
+        // v122 class sibling: rack_move relocates the file (and the asset
+        // path) but the path-keyed edit/source maps kept the OLD path.
+        let mut app = headless_app("v122mv");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122mv")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        let wav = samples.join("kit-a").join("revme.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let old_key = wav.to_string_lossy().into_owned();
+        app.sample_edits.insert(
+            old_key.clone(),
+            SampleEdit {
+                pingpong: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&old_key);
+        let edited = app.assets[0].data.to_vec();
+        app.rack_move(&old_key, &samples.join("kit-b"));
+        let wav2 = samples.join("kit-b").join("revme.wav");
+        let new_key = wav2.to_string_lossy().into_owned();
+        assert!(
+            wav2.exists() && !wav.exists(),
+            "move relocated the file"
+        );
+        assert!(
+            !app.sample_edits.contains_key(&old_key)
+                && app.sample_edits.contains_key(&new_key),
+            "the edit must follow the move: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.se_source.contains_key(&new_key),
+            "the pristine source must follow the move"
+        );
+        let pr = app.build_project("v122mv".into());
+        assert!(
+            pr.sample_edits.contains_key(&new_key),
+            "project records the edit under the moved path"
+        );
+        let mut app2 = headless_app("v122mv2");
+        app2.rack[0].path = samples.display().to_string();
+        app2.rack[0].rescan();
+        let _ = app2.ensure_asset(&wav2);
+        app2.restore_sample_edits(&pr.sample_edits);
+        assert_eq!(
+            app2.assets[0].data.to_vec(),
+            edited,
+            "reload re-renders the moved sample's edit"
+        );
+    }
+
+    #[test]
+    fn v122_dir_move_rekeys_subtree() {
+        // v122 class sibling: rack_dir_move already re-keys assets,
+        // record_target and folder bookkeeping through its subtree
+        // closure — but not the path-keyed sample-edit maps. Nested
+        // files must re-key by prefix; a sibling subtree stays put.
+        let mut app = headless_app("v122dm");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122dm")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "kit-a/revme.wav");
+        v28_wav(&samples, "kit-a/deep/hat.wav");
+        v28_wav(&samples, "kit-b/keep.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        // Keys only — no asset load needed; the maps are the contract.
+        let ka = samples
+            .join("kit-a")
+            .join("revme.wav")
+            .to_string_lossy()
+            .into_owned();
+        let kd = samples
+            .join("kit-a")
+            .join("deep")
+            .join("hat.wav")
+            .to_string_lossy()
+            .into_owned();
+        let kb = samples
+            .join("kit-b")
+            .join("keep.wav")
+            .to_string_lossy()
+            .into_owned();
+        for k in [&ka, &kd, &kb] {
+            app.sample_edits.insert(
+                k.clone(),
+                SampleEdit {
+                    reverse: true,
+                    ..Default::default()
+                },
+            );
+            app.se_source
+                .insert(k.clone(), std::sync::Arc::from(vec![0.25f32; 64]));
+        }
+        app.rack_dir_move(&samples.display().to_string(), "kit-a", &samples.join("box"));
+        let box_a = samples
+            .join("box")
+            .join("kit-a")
+            .join("revme.wav")
+            .to_string_lossy()
+            .into_owned();
+        let box_d = samples
+            .join("box")
+            .join("kit-a")
+            .join("deep")
+            .join("hat.wav")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !app.sample_edits.contains_key(&ka) && app.sample_edits.contains_key(&box_a),
+            "moved file's edit re-keyed under the new subtree: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.sample_edits.contains_key(&box_d),
+            "NESTED file re-keyed by prefix"
+        );
+        assert!(
+            app.sample_edits.contains_key(&kb),
+            "sibling subtree untouched"
+        );
+        assert!(
+            app.se_source.contains_key(&box_a) && !app.se_source.contains_key(&ka),
+            "pristine-source map follows the subtree"
+        );
+        assert!(
+            !app.se_source.contains_key(&kd)
+                && app.se_source.contains_key(&box_d),
+            "nested pristine-source entry re-keyed with the subtree"
+        );
+    }
+
+    #[test]
+    fn v122_rack_del_forgets_path_state() {
+        // v122 class sibling: unlinking a file must forget its path state
+        // — a stale key would silently RE-APPLY the old edit if a file
+        // later appears at the same path (e.g. a re-recorded take).
+        let mut app = headless_app("v122del");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v122del")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        let wav = samples.join("hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let key = wav.to_string_lossy().into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        assert!(app.se_source.contains_key(&key), "setup: source cached");
+        app.rack_del(&key);
+        assert!(!wav.exists(), "file unlinked");
+        assert!(
+            !app.sample_edits.contains_key(&key),
+            "deleted file's edit must not linger to resurrect"
+        );
+        assert!(
+            !app.se_source.contains_key(&key),
+            "deleted file's pristine source must not linger"
+        );
+    }
+
+    /// v122 class invariant (source scan): every rack seam that MOVES or
+    /// deletes a sample file must re-key / forget the path-keyed state.
+    /// Bodies are scanned LIVE-line only (commented-out calls must not
+    /// count — the v12e active_call trap); needles are concat!-split and
+    /// the tests module is cut so the pin never reads its own literals.
+    #[test]
+    fn v122_path_rekey_sites_live() {
+        let src = include_str!("ui.rs");
+        let cut = ["\nmod tests", "\n    mod tests", "\npub(crate) mod tests"]
+            .iter()
+            .filter_map(|p| src.find(p))
+            .min()
+            .unwrap_or(src.len());
+        let lines: Vec<&str> = src[..cut]
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .collect();
+        let body = |sig: &str| -> String {
+            let i = lines
+                .iter()
+                .position(|l| l.starts_with(sig))
+                .unwrap_or_else(|| panic!("{sig} not found"));
+            let mut out: Vec<&str> = Vec::new();
+            for l in &lines[i + 1..] {
+                if l.starts_with("fn ") || l.starts_with("pub fn ") {
+                    break;
+                }
+                out.push(*l);
+            }
+            out.join("\n")
+        };
+        let rekey = concat!("self.", "rekey_path_state(");
+        let forget = concat!("self.", "forget_path_state(");
+        for sig in ["fn rack_rename(", "fn rack_move(", "fn rack_dir_move("] {
+            assert!(
+                body(sig).contains(rekey),
+                "{sig} must re-key sample_edits/se_source under the moved path"
+            );
+        }
+        assert!(
+            body("fn rack_del(").contains(forget),
+            "rack_del must forget the deleted file's path state"
+        );
+    }
+
 }
