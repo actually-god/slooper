@@ -60965,4 +60965,166 @@ mod tests {
         );
     }
 
+    // ============ v123: master CLIP LED reset affordance (card t_82199210) ============
+
+    /// v123: fresh app, MASTER OUT open, clip latch SET. `meter_state` is
+    /// seeded by hand (sample_rate stays 0 in the NULL-audio app, so
+    /// `App::update` never touches the ring nor the state — nothing else
+    /// can race the latch).
+    fn v123_clip_app(tag: &str) -> (App, egui::Context) {
+        let mut app = headless_app(tag);
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.meter_state = Some(crate::meter::MasterMeter::new(48_000));
+        app.meter_state.as_mut().unwrap().feed(&[1.0f32, -1.0f32]);
+        assert!(app.meter_state.as_ref().unwrap().clip, "latch set for the pin");
+        frame(&mut app, &ctx, vec![]);
+        (app, ctx)
+    }
+
+    /// Both painted renderings of the latch: the small square in the peak
+    /// row (~7 px) and the full-width band atop the meter column. Color
+    /// (235, 60, 50) is used by those two paint sites ONLY (the meter bar
+    /// segments are (232, 84, 60) — outside the probe's ±3 tolerance).
+    fn v123_led_rects(app: &mut App, ctx: &egui::Context) -> Vec<egui::Rect> {
+        painted_rects(app, ctx, (235, 60, 50))
+    }
+
+    /// R1: the small clip LED is clickable and clears the latch, echoing.
+    #[test]
+    fn v123_clip_led_click_clears() {
+        let (mut app, ctx) = v123_clip_app("v123led");
+        let leds = v123_led_rects(&mut app, &ctx);
+        let small = leds
+            .iter()
+            .find(|r| r.width() < 12.0)
+            .copied()
+            .expect("small clip LED painted next to the peak readout");
+        assert!(
+            leds.iter().any(|r| r.width() > 40.0),
+            "the meter column paints the same latch as a full-width band"
+        );
+        click_pt(&mut app, &ctx, small.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.meter_state.as_ref().unwrap().clip,
+            "clicking the LED must clear the latch"
+        );
+        assert!(
+            app.status.contains("clip LED cleared"),
+            "status was {:?}",
+            app.status
+        );
+        assert!(
+            v123_led_rects(&mut app, &ctx).is_empty(),
+            "both LED renderings must go out together"
+        );
+    }
+
+    /// R2: the meter column (the twin render of the same state) also
+    /// clears; a click when nothing is lit answers honestly.
+    #[test]
+    fn v123_meter_column_click_clears() {
+        let (mut app, ctx) = v123_clip_app("v123meter");
+        let band = v123_led_rects(&mut app, &ctx)
+            .into_iter()
+            .find(|r| r.width() > 40.0)
+            .expect("meter column clip band painted");
+        click_pt(&mut app, &ctx, band.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.meter_state.as_ref().unwrap().clip,
+            "clicking the meter column must clear the latch"
+        );
+        assert!(
+            app.status.contains("clip LED cleared"),
+            "status was {:?}",
+            app.status
+        );
+        click_pt(&mut app, &ctx, band.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("was not lit"),
+            "a click on a clean meter must say so; status was {:?}",
+            app.status
+        );
+    }
+
+    /// R3: "reset I" resets the clip LED along with the integrated
+    /// measurement it already owned.
+    #[test]
+    fn v123_reset_I_clears_clip_too() {
+        let (mut app, ctx) = v123_clip_app("v123reset");
+        let row = galley_at(&mut app, &ctx, "reset I").expect("reset I painted");
+        click_pt(&mut app, &ctx, row.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.meter_state.as_ref().unwrap().clip,
+            "'reset I' must reset the clip LED too"
+        );
+        assert!(app.meter_i.is_none(), "integrated still resets");
+        assert!(
+            app.status.contains("new measurement started") && app.status.contains("clip"),
+            "the echo must cover both resets; status was {:?}",
+            app.status
+        );
+    }
+
+    /// R4: both affordances hover-explain what lit the LED and how to
+    /// clear it (goal 1 — every hover carries feedback).
+    #[test]
+    fn v123_clip_affordance_hovers_explain() {
+        let (mut app, ctx) = v123_clip_app("v123hover");
+        let leds = v123_led_rects(&mut app, &ctx);
+        let band = leds
+            .iter()
+            .find(|r| r.width() > 40.0)
+            .copied()
+            .expect("band");
+        let small = leds
+            .iter()
+            .find(|r| r.width() < 12.0)
+            .copied()
+            .expect("LED");
+        let t1 = hover_until_tip(&mut app, &ctx, band.center(), &["click to clear"]);
+        assert!(
+            t1.iter().any(|t| t.contains("click to clear")),
+            "the meter column must teach the clear gesture; galleys: {t1:?}"
+        );
+        let t2 = hover_until_tip(&mut app, &ctx, small.center(), &["full scale"]);
+        assert!(
+            t2.iter()
+                .any(|t| t.contains("full scale") && t.contains("click to clear")),
+            "the clip LED must explain what lit it and how to clear it; galleys: {t2:?}"
+        );
+    }
+
+    /// R5: the ONE clear seam — three affordances, one behavior, pinned
+    /// as source so a future fork reddens here.
+    #[test]
+    fn v123_clip_clear_seam_shared() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        let seam_def = prod.matches("fn clear_clip_led(").count();
+        let seam_calls = prod.matches("clear_clip_led(").count();
+        let clear_writes = prod.matches("clip = false").count();
+        let hover_copy = prod.matches("click to clear").count();
+        assert_eq!(seam_def, 1, "one clear_clip_led definition");
+        assert_eq!(
+            seam_calls, 4,
+            "definition + 3 call sites (reset button, LED, meter column)"
+        );
+        assert_eq!(
+            clear_writes, 1,
+            "exactly one clip-latch write in ui.rs (inside the seam)"
+        );
+        assert_eq!(hover_copy, 2, "both LED affordances carry the 'click to clear' copy");
+        let a = prod.find("reset I").expect("reset I button");
+        let win = &prod[a..(a + 400).min(prod.len())];
+        assert!(win.contains("clip"), "the 'reset I' hover must mention the clip reset");
+    }
+
 }
