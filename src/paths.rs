@@ -504,4 +504,110 @@ mod tests {
         // without shipping anything.
         assert!(wf.contains(r#"draft: ${{ github.event_name == 'workflow_dispatch' }}"#));
     }
+
+    // ---- GPL-2 sample-blob compliance (t_2d1da517): the embedded piano
+    // blob derives from the GPL-2 TimGM6mb soundfont, so EVERY release
+    // medium must carry the notice + full license text on-media — the
+    // repo tree alone does not travel with a released artifact.
+
+    #[test]
+    fn gpl2_tree_carries_the_real_gnu_gpl_v2_text() {
+        let t = w11_repo_file("LICENSE-GPL-2.0.txt");
+        assert!(t.contains("GNU GENERAL PUBLIC LICENSE"), "missing license title");
+        assert!(t.contains("Version 2, June 1991"), "not the GPLv2 header");
+        assert!(
+            t.contains("TERMS AND CONDITIONS FOR COPYING, DISTRIBUTION AND MODIFICATION"),
+            "missing the terms section"
+        );
+        assert!(t.contains("END OF TERMS AND CONDITIONS"), "truncated body");
+        assert!(
+            t.contains("How to Apply These Terms to Your New Programs"),
+            "missing the how-to-apply appendix"
+        );
+        assert!(t.len() > 17000, "GPL text suspiciously short ({} bytes)", t.len());
+    }
+
+    #[test]
+    fn gpl2_tarball_stage_ships_notice_and_gpl_text() {
+        let wf = w11_repo_file(".github/workflows/release.yml");
+        assert!(
+            wf.contains(r#"cp README.md LICENSE docs/INSTALL.md LICENSE-GPL-2.0.txt synths/THIRD-PARTY-NOTICES.md "$P/""#),
+            "the tar.zst staging step must copy the GPL-2 text + notice into the package root"
+        );
+    }
+
+    #[test]
+    fn gpl2_deb_stages_licenses_into_docdir_and_self_checks_them() {
+        let s = w11_repo_file("scripts/porting/w13d_make_deb.sh");
+        assert!(
+            s.contains(r#"mkdir -p "$ROOT/usr/share/doc/slooper""#),
+            "deb must stage a docdir"
+        );
+        assert!(
+            s.contains(r#""$PKG/LICENSE" "$PKG/LICENSE-GPL-2.0.txt" "$PKG/THIRD-PARTY-NOTICES.md""#),
+            "deb docdir must get LICENSE + GPL text + notice"
+        );
+        assert!(
+            s.contains("usr/share/doc/slooper/LICENSE-GPL-2.0.txt"),
+            "deb self-check must assert the GPL text inside the built payload"
+        );
+        assert!(
+            s.contains("usr/share/doc/slooper/THIRD-PARTY-NOTICES.md"),
+            "deb self-check must assert the notice inside the built payload"
+        );
+    }
+
+    #[test]
+    fn gpl2_rpm_declares_gpl_license_and_ships_the_docs() {
+        let s = w11_repo_file("scripts/porting/w14_make_rpm.sh");
+        assert!(
+            s.contains("License:        MIT and GPL-2.0-only"),
+            "rpm License tag must disclose the GPL-2.0 component"
+        );
+        assert!(s.contains("Source1:        LICENSE"), "rpm spec must declare the doc sources");
+        assert!(
+            s.contains("%doc %{_docdir}/slooper/LICENSE-GPL-2.0.txt"),
+            "rpm %files must package the GPL text"
+        );
+        assert!(
+            s.contains("%doc %{_docdir}/slooper/THIRD-PARTY-NOTICES.md"),
+            "rpm %files must package the notice"
+        );
+        assert!(
+            s.contains("/usr/share/doc/slooper/THIRD-PARTY-NOTICES.md"),
+            "rpm self-check must assert the notice inside the built payload"
+        );
+    }
+
+    #[test]
+    fn gpl2_win_zip_stage_ships_notice_and_gpl_text() {
+        let wf = w11_repo_file(".github/workflows/release.yml");
+        assert!(
+            wf.contains("Copy-Item LICENSE-GPL-2.0.txt stage/LICENSE-GPL-2.0.txt"),
+            "win64 zip must stage the GPL text"
+        );
+        assert!(
+            wf.contains("Copy-Item synths/THIRD-PARTY-NOTICES.md stage/THIRD-PARTY-NOTICES.md"),
+            "win64 zip must stage the notice"
+        );
+    }
+
+    #[test]
+    fn gpl2_nsis_installer_files_and_uninstalls_both() {
+        let n = w11_repo_file("packaging/slooper.nsi");
+        assert!(n.contains(r#"File "${SLOOPER_SRC}\LICENSE-GPL-2.0.txt""#), "installer must ship the GPL text");
+        assert!(n.contains(r#"File "${SLOOPER_SRC}\THIRD-PARTY-NOTICES.md""#), "installer must ship the notice");
+        assert!(n.contains(r#"Delete "$INSTDIR\LICENSE-GPL-2.0.txt""#), "uninstall must remove the GPL text");
+        assert!(n.contains(r#"Delete "$INSTDIR\THIRD-PARTY-NOTICES.md""#), "uninstall must remove the notice");
+    }
+
+    #[test]
+    fn gpl2_notice_points_at_the_on_media_text_file() {
+        let n = w11_repo_file("synths/THIRD-PARTY-NOTICES.md");
+        assert!(n.contains("TimGM6mb"), "notice lost its provenance anchor");
+        assert!(
+            n.contains("LICENSE-GPL-2.0.txt"),
+            "notice must point at the text file that ships beside it"
+        );
+    }
 }

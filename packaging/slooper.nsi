@@ -3,7 +3,10 @@
 ;
 ;   makensis -DSLOOPER_VER=<ver> -DSLOOPER_SRC=<staged-dir> packaging\slooper.nsi
 ;
-; staged dir = the win job's stage\ tree (slooper.exe + README + LICENSE).
+; staged dir = the win job's stage\ tree (slooper.exe + README + LICENSE
+; + LICENSE-GPL-2.0.txt + THIRD-PARTY-NOTICES.md — the piano sample blob
+; derives from the GPL-2 TimGM6mb soundfont, so notice + license text must
+; live in $INSTDIR next to the exe).
 ; Machine-wide install (elevation via RequestExecutionLevel admin), with
 ; uninstall registry entry, Start-menu group and an optional desktop
 ; shortcut. Unicode build; x64-only build refuses to install to
@@ -72,6 +75,8 @@ Section "slooper"
   File "${SLOOPER_SRC}\slooper.exe"
   File "${SLOOPER_SRC}\README.md"
   File "${SLOOPER_SRC}\LICENSE"
+  File "${SLOOPER_SRC}\LICENSE-GPL-2.0.txt"
+  File "${SLOOPER_SRC}\THIRD-PARTY-NOTICES.md"
 
   CreateDirectory "$SMPROGRAMS\slooper"
   CreateShortcut "$SMPROGRAMS\slooper\slooper.lnk" "$INSTDIR\slooper.exe" "" "$INSTDIR\slooper.exe" 0
@@ -105,6 +110,8 @@ Section "Uninstall"
   Delete "$INSTDIR\slooper.exe"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\LICENSE-GPL-2.0.txt"
+  Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

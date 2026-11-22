@@ -39,9 +39,16 @@ esac
 ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
 mkdir -p "$ROOT/DEBIAN"
-# ONLY the usr/ subtree goes into the package — README/LICENSE at the
-# staging root belong to the tar.zst, not to /.
+# The usr/ subtree plus a doc dir — README/INSTALL at the staging root
+# belong to the tar.zst, not to /. The licenses are the exception: the
+# embedded piano blob derives from the GPL-2 TimGM6mb soundfont
+# (synths/THIRD-PARTY-NOTICES.md), and a distribution carrying GPL-2 data
+# must ship notice + license text on-media; Debian convention puts them
+# under /usr/share/doc/<pkg>/.
 cp -a "$PKG/usr" "$ROOT/usr"
+mkdir -p "$ROOT/usr/share/doc/slooper"
+cp -a "$PKG/LICENSE" "$PKG/LICENSE-GPL-2.0.txt" "$PKG/THIRD-PARTY-NOTICES.md" \
+  "$ROOT/usr/share/doc/slooper/"
 
 cat > "$ROOT/DEBIAN/control" <<EOF
 Package: slooper
@@ -74,4 +81,9 @@ dpkg-deb --root-owner-group -Zzstd -b "$ROOT" "$OUT" >/dev/null
 # and never silently rewrites the version we computed
 test "$(dpkg-deb -f "$OUT" Version)" = "$DEBVER"
 test "$(dpkg-deb -f "$OUT" Package)" = "slooper"
+# license-disclosure assert (t_2d1da517): read the built payload, not the
+# staging command's exit code — a deb without the GPL-2 docs is a
+# compliance defect, not a cosmetic miss.
+dpkg-deb -c "$OUT" | grep -q 'usr/share/doc/slooper/LICENSE-GPL-2.0.txt' || { echo "FATAL: deb payload missing LICENSE-GPL-2.0.txt" >&2; exit 5; }
+dpkg-deb -c "$OUT" | grep -q 'usr/share/doc/slooper/THIRD-PARTY-NOTICES.md' || { echo "FATAL: deb payload missing THIRD-PARTY-NOTICES.md" >&2; exit 5; }
 echo "$OUT"

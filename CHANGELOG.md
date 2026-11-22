@@ -19,7 +19,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   a fresh one it just cancels, and the action-slot wizard is untouched
   (v124).
 
-
+- **Every release artifact now carries the piano sample's GPL-2 notice
+  and license text.** The embedded piano blob derives from the GPL-2
+  TimGM6mb soundfont, but the disclosure lived only inside the repo tree
+  — the shipped tarball, deb, rpm, win64 zip and installer carried just
+  the MIT `LICENSE`. Now `LICENSE-GPL-2.0.txt` + `THIRD-PARTY-NOTICES.md`
+  stage into all five artifact lists (deb/rpm under the doc directory),
+  and the packaging scripts assert the docs inside the *built payload*
+  (pinned by `gpl2_*`).
 - **Chorus and delay now pass a true stereo image through.** Both v3
   dry paths rebuilt the mid/side pair wrong: the chorus dropped the side
   from the left and *added* it to the right (the dry right channel
