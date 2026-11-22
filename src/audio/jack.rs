@@ -7,7 +7,7 @@
 //! device-side contract is documented in `src/backend.rs` and on
 //! `super::ManagerBackend`.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
@@ -18,6 +18,7 @@ use ::jack::{
 };
 
 use super::*;
+use super::rt_recovery;
 
 pub const CLIENT_NAME: &str = "slooper";
 const MIDI_PORT_SHORT: &str = "midi_in";
@@ -68,116 +69,44 @@ pub fn run(
         let _ = evt_tx.send(Evt::Unavailable(msg));
         return ManagerExit::Unavailable;
     }
-    let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!(
-                "No JACK/PipeWire-JACK server available: {}",
-                describe_err(e)
-            );
+    // Output slots carry independent L / R bits (see `Cmd::Apply`).
+    let mask_in = Arc::new(AtomicU64::new(0));
+    let mask_out_l = Arc::new(AtomicU64::new(0));
+    let mask_out_r = Arc::new(AtomicU64::new(0));
+    // v118 liveness slots: created ONCE per manager thread and re-handled
+    // into every rebuild. The RT shim bumps `liveness` once per audio block;
+    // the server's shutdown notification latches `server_dead`. The idle
+    // tick watches both (pure rule: `rt_recovery::jack_alive`).
+    let liveness = Arc::new(AtomicU64::new(0));
+    let server_dead = Arc::new(AtomicBool::new(false));
+    let ctx = RecoverCtx {
+        gain,
+        peak,
+        meter,
+        midi_drops,
+        xruns,
+        engine: engine.clone(),
+        mask_in: mask_in.clone(),
+        mask_out_l: mask_out_l.clone(),
+        mask_out_r: mask_out_r.clone(),
+        liveness: liveness.clone(),
+        server_dead: server_dead.clone(),
+    };
+    let active = match bring_up(evt_tx, &ctx) {
+        Ok(a) => a,
+        Err(BringUpErr::NoServer(msg)) => {
+            let msg = format!("No JACK/PipeWire-JACK server available: {msg}");
             eprintln!("[slooper] {}", msg);
             let _ = evt_tx.send(Evt::Unavailable(msg));
             return ManagerExit::Unavailable;
         }
-    };
-    if status.contains(ClientStatus::NAME_NOT_UNIQUE) {
-        eprintln!("[slooper] client renamed to '{}'", client.name());
-    }
-
-    // Register the fixed slot pool + MIDI port before activation. Pool ports
-    // live for the whole client lifetime, so their raw pointers are stable and
-    // can be cached in the realtime handler (no lookups, no allocation in RT).
-    let mut ins_raw = [std::ptr::null_mut(); MAX_SLOTS];
-    let mut outs_raw = [std::ptr::null_mut(); MAX_SLOTS];
-    for i in 0..MAX_SLOTS {
-        match client.register_port(&format!("in{i}"), AudioIn::default()) {
-            Ok(p) => ins_raw[i] = p.raw(),
-            Err(e) => {
-                let _ = evt_tx.send(Evt::Error(format!(
-                    "failed to register input slot in{i}: {}",
-                    describe_err(e)
-                )));
-                return ManagerExit::Unavailable;
-            }
-        }
-        match client.register_port(&format!("out{i}"), AudioOut::default()) {
-            Ok(p) => outs_raw[i] = p.raw(),
-            Err(e) => {
-                let _ = evt_tx.send(Evt::Error(format!(
-                    "failed to register output slot out{i}: {}",
-                    describe_err(e)
-                )));
-                return ManagerExit::Unavailable;
-            }
-        }
-    }
-
-    let midi_port = match client.register_port(MIDI_PORT_SHORT, MidiIn::default()) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = evt_tx.send(Evt::Error(format!(
-                "failed to create MIDI input port: {}",
-                describe_err(e)
-            )));
+        Err(BringUpErr::Setup(msg)) => {
+            let _ = evt_tx.send(Evt::Error(msg));
             return ManagerExit::Unavailable;
         }
     };
-
-    let mask_in = Arc::new(AtomicU64::new(0));
-    // Output slots carry independent L / R bits (see `Cmd::Apply`).
-    let mask_out_l = Arc::new(AtomicU64::new(0));
-    let mask_out_r = Arc::new(AtomicU64::new(0));
-    let notif = Notif {
-        tx: evt_tx.clone(),
-        xruns: xruns.clone(),
-    };
-    // Sample rate is queryable before activation; the metronome grid is
-    // sized from it.
-    let sr = client.sample_rate();
-    engine.set_sample_rate(sr);
-    let proc = JackProc {
-        proc: new_proc(
-            evt_tx.clone(),
-            gain,
-            peak,
-            meter,
-            midi_drops,
-            mask_in.clone(),
-            mask_out_l.clone(),
-            mask_out_r.clone(),
-            engine.clone(),
-            sr,
-        ),
-        midi_in: midi_port,
-        ports: RawPorts {
-            ins: ins_raw,
-            outs: outs_raw,
-        },
-        midi_ev_scratch: Vec::new(),
-    };
-
-    let active = match client.activate_async(notif, proc) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = evt_tx.send(Evt::Error(format!(
-                "failed to activate JACK client: {}",
-                describe_err(e)
-            )));
-            return ManagerExit::Unavailable;
-        }
-    };
-
-    let client_name = active.as_client().name().to_string();
     let sample_rate = active.as_client().sample_rate();
-    eprintln!(
-        "[slooper] JACK client '{}' active @ {} Hz",
-        client_name, sample_rate
-    );
-    let _ = evt_tx.send(Evt::Ready {
-        client_name: client_name.clone(),
-        sample_rate,
-    });
-    send_ports(active.as_client(), evt_tx);
+    announce_live(active.as_client(), evt_tx);
 
     // Remote MIDI sources currently wired into our midi_in port. Devices often
     // reappear on a fresh port name every connect, so this set is re-derived
@@ -196,10 +125,175 @@ pub fn run(
         mask_out_l,
         mask_out_r,
         midi_sources,
+        liveness,
+        server_dead,
+        desired: None,
+        loss: rt_recovery::JackLoss::new(0),
+        t0: std::time::Instant::now(),
+        recover: Some(ctx),
     };
     let exit = super::manager_loop(cmd_rx, evt_tx, &engine, sample_rate, &mut session);
     session.teardown();
     exit
+}
+
+/// The patch the user last asked for, kept so a server-loss rebuild can
+/// replay it through the real apply seam (v118 R4): input port names +
+/// (output port name, L/R route bitmask) pairs — same shapes `apply` takes.
+type Patch = (Vec<String>, Vec<(String, u8)>);
+
+/// Everything a rebuilt client needs, owned by the session so `idle` can
+/// re-run the bootstrap without access to `run`'s locals (v118). Masks are
+/// shared (not re-made): the live Proc and `apply_layout` must keep seeing
+/// the same slots across rebuilds — rebuild zeroes and re-establishes them.
+struct RecoverCtx {
+    gain: Arc<AtomicU32>,
+    peak: Arc<AtomicU32>,
+    meter: Arc<crate::meter::MeterRing>,
+    midi_drops: Arc<AtomicU64>,
+    xruns: Arc<AtomicU64>,
+    engine: Arc<Engine>,
+    mask_in: Arc<AtomicU64>,
+    mask_out_l: Arc<AtomicU64>,
+    mask_out_r: Arc<AtomicU64>,
+    liveness: Arc<AtomicU64>,
+    server_dead: Arc<AtomicBool>,
+}
+
+/// `bring_up` failure stage. The distinction drives the v118 budget:
+/// `NoServer` means the reconnect PROBE itself failed (server absent —
+/// retry forever, paced), `Setup` means the server answered but the
+/// client could not come up (budgeted).
+enum BringUpErr {
+    NoServer(String),
+    Setup(String),
+}
+
+/// THE client bootstrap (v118 consolidation): fresh client -> register the
+/// fixed slot pool + MIDI port -> activate with handlers sharing the
+/// session's liveness slots. ONE entry for first boot AND every
+/// post-server-loss rebuild, so the reconnect can never drift from the
+/// boot path (the unique-call-site pins v118/w5 enforce it). Registration
+/// order and failure wording match the pre-v118 `run` byte-for-byte.
+fn bring_up(
+    evt_tx: &SyncSender<Evt>,
+    ctx: &RecoverCtx,
+) -> Result<AsyncClient<Notif, JackProc>, BringUpErr> {
+    let RecoverCtx {
+        gain,
+        peak,
+        meter,
+        midi_drops,
+        xruns,
+        engine,
+        mask_in,
+        mask_out_l,
+        mask_out_r,
+        liveness,
+        server_dead,
+    } = ctx;
+    let (client, status) = match Client::new(CLIENT_NAME, ClientOptions::NO_START_SERVER) {
+        Ok(c) => c,
+        Err(e) => return Err(BringUpErr::NoServer(describe_err(e))),
+    };
+    if status.contains(ClientStatus::NAME_NOT_UNIQUE) {
+        eprintln!("[slooper] client renamed to '{}'", client.name());
+    }
+
+    // Register the fixed slot pool + MIDI port before activation. Pool ports
+    // live for the whole client lifetime, so their raw pointers are stable and
+    // can be cached in the realtime handler (no lookups, no allocation in RT).
+    let mut ins_raw = [std::ptr::null_mut(); MAX_SLOTS];
+    let mut outs_raw = [std::ptr::null_mut(); MAX_SLOTS];
+    for i in 0..MAX_SLOTS {
+        match client.register_port(&format!("in{i}"), AudioIn::default()) {
+            Ok(p) => ins_raw[i] = p.raw(),
+            Err(e) => {
+                return Err(BringUpErr::Setup(format!(
+                    "failed to register input slot in{i}: {}",
+                    describe_err(e)
+                )))
+            }
+        }
+        match client.register_port(&format!("out{i}"), AudioOut::default()) {
+            Ok(p) => outs_raw[i] = p.raw(),
+            Err(e) => {
+                return Err(BringUpErr::Setup(format!(
+                    "failed to register output slot out{i}: {}",
+                    describe_err(e)
+                )))
+            }
+        }
+    }
+
+    let midi_port = match client.register_port(MIDI_PORT_SHORT, MidiIn::default()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(BringUpErr::Setup(format!(
+                "failed to create MIDI input port: {}",
+                describe_err(e)
+            )))
+        }
+    };
+
+    // Sample rate is queryable before activation; the metronome grid is
+    // sized from it, and setting it HERE is what re-tunes the engine after
+    // a reconnect at a different server rate.
+    let sr = client.sample_rate();
+    engine.set_sample_rate(sr);
+    let notif = Notif {
+        tx: evt_tx.clone(),
+        xruns: xruns.clone(),
+        server_dead: server_dead.clone(),
+    };
+    let proc = JackProc {
+        proc: new_proc(
+            evt_tx.clone(),
+            gain.clone(),
+            peak.clone(),
+            meter.clone(),
+            midi_drops.clone(),
+            mask_in.clone(),
+            mask_out_l.clone(),
+            mask_out_r.clone(),
+            engine.clone(),
+            sr,
+        ),
+        midi_in: midi_port,
+        ports: RawPorts {
+            ins: ins_raw,
+            outs: outs_raw,
+        },
+        midi_ev_scratch: Vec::new(),
+        liveness: liveness.clone(),
+    };
+    // The death flag is per-client: a fresh client starts alive. Store
+    // BEFORE activate so a death racing activation can only set it after.
+    server_dead.store(false, Ordering::SeqCst);
+    match client.activate_async(notif, proc) {
+        Ok(a) => Ok(a),
+        Err(e) => Err(BringUpErr::Setup(format!(
+            "failed to activate JACK client: {}",
+            describe_err(e)
+        ))),
+    }
+}
+
+/// Tell the GUI the client is live: status log, `Evt::Ready` (name + rate —
+/// the GUI re-derives its grid from it) and the current port list. Shared
+/// by first boot and every rebuild, so both report identically.
+fn announce_live(client: &Client, tx: &SyncSender<Evt>) {
+    let client_name = client.name().to_string();
+    let sample_rate = client.sample_rate();
+    eprintln!(
+        "[slooper] JACK client '{}' active @ {} Hz",
+        client_name, sample_rate
+    );
+    let _ = tx.send(Evt::Ready {
+        client_name,
+        sample_rate,
+    });
+    send_ports(client, tx);
 }
 
 /// Connect with retries: PipeWire-JACK does not accept connections on a
@@ -503,6 +597,19 @@ struct JackSession {
     mask_out_l: Arc<AtomicU64>,
     mask_out_r: Arc<AtomicU64>,
     midi_sources: Vec<String>,
+    // v118 server-loss recovery. `liveness`/`server_dead` are the RT-side
+    // signals (process beat / shutdown latch); `loss` is the reconnect
+    // bookkeeping decided by `rt_recovery`; `desired` is the last patch the
+    // user asked for — the blueprint a rebuild replays; `t0` is the single
+    // clock origin for all `*_ms` table fields; `recover` is Some for the
+    // whole life of the manager thread (teardown drops the client itself),
+    // and its Option-ness marks a session that may still come back.
+    liveness: Arc<AtomicU64>,
+    server_dead: Arc<AtomicBool>,
+    loss: rt_recovery::JackLoss,
+    desired: Option<Patch>,
+    t0: std::time::Instant,
+    recover: Option<RecoverCtx>,
 }
 
 impl JackSession {
@@ -512,13 +619,113 @@ impl JackSession {
             .expect("jack session used after teardown")
             .as_client()
     }
+
+    /// The single clock origin for every `JackLoss` *_ms field.
+    fn now_ms(&self) -> u64 {
+        self.t0.elapsed().as_millis() as u64
+    }
+
+    /// Server-death transition (v118), entered exactly once per loss event
+    /// (the only caller runs with a `Some` client and this immediately
+    /// takes it out). Announce once, then disarm every callback BEFORE the
+    /// handler memory can die, let any already-dispatched callback drain
+    /// (same UAF rule as `teardown`), and close the dead client. The fresh
+    /// `JackLoss` re-arms the full budget: a new death is a new story.
+    fn mourn(&mut self, now: u64, tx: &SyncSender<Evt>) {
+        if let Some(client) = self.client.take() {
+            unsafe { clear_all_callbacks(client.as_client().raw()) };
+            let msg = "JACK server lost — reconnecting…";
+            eprintln!("[slooper] {msg}");
+            let _ = tx.try_send(Evt::Error(msg.into()));
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(client);
+        }
+        self.loss = rt_recovery::JackLoss::new(now);
+        // Every remote MIDI link died with the client; force a full rescan
+        // once the new one is up.
+        self.midi_sources.clear();
+    }
+
+    /// Dead-state action decided by `rt_recovery::jack_loss_step`: attempt
+    /// the full `bring_up`. Success re-seats all patch bookkeeping (the new
+    /// client has zero connections — masks zero, cur_* cleared) and replays
+    /// the desired patch through the REAL apply seam; failure is classified
+    /// by stage so the budget only burns when the server is actually there
+    /// and refusing (card t_0bba9aaa R3/R4).
+    fn rebuild(&mut self, now: u64, tx: &SyncSender<Evt>) {
+        let Some(ctx) = self.recover.as_ref() else {
+            return;
+        };
+        match bring_up(tx, ctx) {
+            Ok(active) => {
+                self.client = Some(active);
+                self.cur_in = vec![None; MAX_SLOTS];
+                self.cur_out = vec![None; MAX_SLOTS];
+                self.mask_in.store(0, Ordering::Relaxed);
+                self.mask_out_l.store(0, Ordering::Relaxed);
+                self.mask_out_r.store(0, Ordering::Relaxed);
+                announce_live(self.client(), tx);
+                let ticks = self.liveness.load(Ordering::Relaxed);
+                rt_recovery::jack_revive(&mut self.loss, ticks, now);
+                let name = self.client().name();
+                let sr = self.client().sample_rate();
+                let _ = tx.try_send(Evt::Notice(format!(
+                    "JACK server recovered — audio restored ({name} @ {sr} Hz)"
+                )));
+                if let Some((i, o)) = self.desired.clone() {
+                    self.apply(&i, &o, tx);
+                }
+            }
+            Err(BringUpErr::NoServer(_)) => {
+                // Server still absent: never burns budget, keeps probing at
+                // the paced cadence. Silence on the wire is deliberate —
+                // the mourn message already told the story, and re-sending
+                // it every second would only push other echoes off the bar.
+                rt_recovery::jack_rebuild_failed(&mut self.loss, false, now);
+            }
+            Err(BringUpErr::Setup(msg)) => {
+                eprintln!("[slooper] JACK reconnect refused: {msg}");
+                if rt_recovery::jack_rebuild_failed(&mut self.loss, true, now) {
+                    let _ = tx.try_send(Evt::Error(
+                        "JACK server keeps refusing the client — reconnect attempts stopped; \
+                         re-pick the ports in Settings or restart slooper to retry"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 impl ManagerBackend for JackSession {
     fn refresh(&mut self, tx: &SyncSender<Evt>) {
-        send_ports(self.client(), tx);
+        // Dead-safe (v118): while the server is gone there is nothing to
+        // enumerate; the live list returns with `announce_live` after a
+        // successful rebuild.
+        if let Some(c) = &self.client {
+            send_ports(c.as_client(), tx);
+        }
     }
     fn apply(&mut self, ins: &[String], outs: &[(String, u8)], tx: &SyncSender<Evt>) {
+        // v118: remember the blueprint a server-loss rebuild replays — in
+        // EVERY case, live or dead (single site, so a dead session's fresh
+        // selection is never lost).
+        self.desired = Some((ins.to_vec(), outs.to_vec()));
+        if self.client.is_none() {
+            if self.recover.is_some() {
+                // Server gone, session recoverable: an explicit user action
+                // outranks a give-up and pulls the first attempt forward to
+                // the next idle tick.
+                let now = self.now_ms();
+                rt_recovery::jack_rearm(&mut self.loss, now);
+                let _ = tx.try_send(Evt::Notice(
+                    "JACK server down — port selection queued for the next reconnect".into(),
+                ));
+            } else {
+                let _ = tx.try_send(Evt::Error("audio backend already shut down".into()));
+            }
+            return;
+        }
         // destructure so the client borrow stays field-disjoint from the patch
         // state `apply_layout` mutates (borrow-checker-visible, WINDOWS-PORT W5)
         let JackSession {
@@ -542,27 +749,62 @@ impl ManagerBackend for JackSession {
                 mask_out_r,
                 tx,
             ),
-            // session used after teardown: nothing live to apply to
+            // client died between the guard and the destructuring: cannot
+            // happen on this thread (no other writer), keep it loud anyway
             None => {
                 let _ = tx.try_send(Evt::Error("audio backend already shut down".into()));
             }
         }
     }
     fn idle(&mut self, tx: &SyncSender<Evt>) {
-        let JackSession {
-            client,
-            midi_sources,
-            ..
-        } = self;
-        if let Some(c) = client.as_ref() {
-            rescan_midi_sources(c.as_client(), tx, midi_sources);
+        // v118: every tick first checks the RT liveness pair — the
+        // shutdown-callback flag (fast path, ~1 tick after the server dies)
+        // and the process-block counter (backstop for a hard-killed server
+        // that never fires it). A live client keeps its duties; a dead one
+        // transitions once (mourn) and then steps the reconnect table.
+        let now = self.now_ms();
+        if self.client.is_some() {
+            let dead_flag = self.server_dead.load(Ordering::SeqCst);
+            let ticks = self.liveness.load(Ordering::Relaxed);
+            if !dead_flag
+                && rt_recovery::jack_alive(
+                    self.loss.live_ticks,
+                    ticks,
+                    self.loss.last_live_ms,
+                    now,
+                )
+            {
+                if ticks != self.loss.live_ticks {
+                    self.loss.live_ticks = ticks;
+                    self.loss.last_live_ms = now;
+                }
+                let JackSession {
+                    client,
+                    midi_sources,
+                    ..
+                } = self;
+                if let Some(c) = client.as_ref() {
+                    rescan_midi_sources(c.as_client(), tx, midi_sources);
+                }
+                return;
+            }
+            self.mourn(now, tx);
+        }
+        if self.recover.is_some()
+            && rt_recovery::jack_loss_step(&mut self.loss, now) == rt_recovery::JackRecovery::Rebuild
+        {
+            self.rebuild(now, tx);
         }
     }
     fn teardown(&mut self) {
+        // v118: with server-loss recovery, a client can already be gone
+        // here — take() first and skip everything if so (the expect()
+        // accessor below this point once panicked on exactly that path).
+        if let Some(client) = self.client.take() {
         // Teardown: null out every callback before the handler context is freed.
         // The jack crate's deactivate only clears thread-init/process, so without
         // this a late notification would call into freed memory on PipeWire-JACK.
-        unsafe { clear_all_callbacks(self.client().raw()) };
+        unsafe { clear_all_callbacks(client.as_client().raw()) };
         // Nulling the pointers does NOT cancel an invocation PipeWire-JACK has
         // already dispatched: its thread may have loaded the callback + context
         // pointer microseconds ago. Closing the client right now frees the jack
@@ -572,16 +814,17 @@ impl ManagerBackend for JackSession {
         // dispatched callback runs against still-live state, then close.
         std::thread::sleep(std::time::Duration::from_millis(250));
 
-        if let Some(client) = self.client.take() {
             drop(client); // deactivates + closes the client
         }
     }
 }
 
-/// Notification handler: keeps the GUI port list live and counts xruns.
+/// Notification handler: keeps the GUI port list live, counts xruns, and
+/// latches server death (v118) for the manager thread to act on.
 struct Notif {
     tx: SyncSender<Evt>,
     xruns: Arc<AtomicU64>,
+    server_dead: Arc<AtomicBool>,
 }
 
 impl NotificationHandler for Notif {
@@ -601,6 +844,17 @@ impl NotificationHandler for Notif {
         // try_send: never block JACK's client thread on a full channel.
         let _ = self.tx.try_send(Evt::Xrun);
         Control::Continue
+    }
+
+    /// The server killed this client (jack crate's `jack_on_info_shutdown`,
+    /// registered by `activate_async`). Fires on the client thread in an
+    /// async-signal-ish context and libjack guarantees no further process
+    /// callbacks afterwards — so latch the flag and let the manager's idle
+    /// tick (<= 250 ms) do the mourning, messaging, and reconnect. Nothing
+    /// here allocates, blocks, or talks to the channel.
+    unsafe fn shutdown(&mut self, _status: ClientStatus, reason: &str) {
+        eprintln!("[slooper] JACK shutdown notification: {reason}");
+        self.server_dead.store(true, Ordering::SeqCst);
     }
 }
 
@@ -626,6 +880,8 @@ struct JackProc {
     midi_in: Port<MidiIn>,
     ports: RawPorts,
     midi_ev_scratch: Vec<(u32, Vec<u8>)>,
+    // v118: blocks-served counter shared with the session (see run()).
+    liveness: Arc<AtomicU64>,
 }
 
 /// JACK shim (WINDOWS-PORT W4): the ONLY job left here is JACK plumbing —
@@ -635,6 +891,11 @@ struct JackProc {
 /// entry point and `crate::backend::BlockIo`.
 impl ProcessHandler for JackProc {
     fn process(&mut self, _client: &Client, ps: &ProcessScope) -> Control {
+        // Liveness beat for the manager's idle tick: an active client whose
+        // server is alive receives this callback even with zero connections
+        // and no traffic (measured on PipeWire-JACK: 47 blocks/s @
+        // 48k/1024) — so a stopped counter is unambiguous server loss.
+        self.liveness.fetch_add(1, Ordering::Relaxed);
         // The borrowed `RawMidi`s die with this loop; the engine sees owned
         // events (same one-`Vec`-per-event allocation count as before W4).
         let mut evs = std::mem::take(&mut self.midi_ev_scratch);
