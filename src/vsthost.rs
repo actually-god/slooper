@@ -2421,6 +2421,15 @@ struct RtState {
     // The Box is load-bearing (address stability), hence no Vec::into_boxed-slice style fix.
     #[allow(clippy::vec_box)]
     ev_pool: Vec<Box<vst2::api::Event>>,
+    /// VST2-only: the per-block `processEvents` flexible-array buffer —
+    /// the two leading pointer slots hold the `api::Events` header
+    /// (num_events + C pad, reserved), slots 2.. carry one event pointer
+    /// each (v115/t_056d6714: replaces a fixed 64-slot stack array whose
+    /// clamp silently DROPPED due events 65+ — the partition had already
+    /// drained them from `pending_midi`, and `midi_drops` never saw
+    /// them). Grows once to the largest block, never shrinks — same
+    /// amortized, no-steady-state-alloc doctrine as `ev_pool`.
+    ev_batch: Vec<*mut vst2::api::Event>,
     /// v103: entry-shared pitch-bend range (UI writes via set_bend_range).
     bend_range: Arc<AtomicU8>,
     /// Range the RT thread has adopted; u8::MAX until the first block
@@ -3241,6 +3250,7 @@ fn assemble(
         abs_processed: 0,
         midi_drops: midi_drops.clone(),
         ev_pool: Vec::new(),
+        ev_batch: Vec::new(),
         bend_range: bend_range.clone(),
         bend_seen: u8::MAX,
         bend_announced: 0,
@@ -4197,9 +4207,10 @@ impl RtStageEntry {
 
     /// Hand this internal block's due channel-voice messages to the plugin,
     /// each with its true offset (`delta_frames` / `send_midi_at`) inside
-    /// the block about to render. VST2 gets raw `api::Events` (batches of
-    /// 2 — the C struct's fixed pointer array); VST3 goes through the
-    /// runner's command ring (pushes never block; a full ring is COUNTED).
+    /// the block about to render. VST2 gets raw `api::Events` — ONE call
+    /// per block whose flexible pointer array spans EVERY due event
+    /// (v115); VST3 goes through the runner's command ring (pushes never
+    /// block; a full ring is COUNTED).
     fn deliver_midi(&self, s: &mut RtState) {
         if s.pending_midi.is_empty() {
             return;
@@ -4227,10 +4238,11 @@ impl RtStageEntry {
         // same sample, and equal positions must keep that order.
         s.deliver.sort_by_key(|q| q.pos);
         // Destructure so the delivery loops below may touch `deliver`,
-        // `ev_pool` and `backend` as disjoint fields at once.
+        // `ev_pool`, `ev_batch` and `backend` as disjoint fields at once.
         let RtState {
             deliver,
             ev_pool,
+            ev_batch,
             backend,
             midi_drops,
             ..
@@ -4317,29 +4329,55 @@ impl RtStageEntry {
         // dead note, losing a note-off left one ringing forever ("no
         // sustain, every note the same short blip"). The VST2 flexible
         // array pattern: header + N pointers laid out like `api::Events`.
-        const EV_BATCH_MAX: usize = 64;
-        #[repr(C)]
-        struct EvBatch {
-            num_events: i32,
-            _pad: [u8; 4],
-            _reserved: isize,
-            events: [*mut vst2::api::Event; EV_BATCH_MAX],
-        }
-        // The pool grows once, then every event is a reuse.
-        while ev_pool.len() < deliver.len() {
-            // Zeroed raw event: a benign null record until overwritten.
-            ev_pool.push(Box::new(unsafe { std::mem::zeroed() }));
-        }
+        // v115 (card t_056d6714): the batch is built in `ev_batch`, grown
+        // to the DUE COUNT — never clamped to a fixed capacity. The
+        // partition above already drained every due event out of
+        // `pending_midi`, so a smaller batch silently DROPPED the
+        // overflow: neither delivered, nor deferred, nor counted into
+        // `midi_drops` (the old 64-slot stack array capped a queue the
+        // module advertises as drop-free up to `MIDI_QUEUE_CAP`). The
+        // buffer is the spec's flexible-array shape itself: the
+        // `api::Events` header (whose trailing 2-slot placeholder the
+        // spec says to enlarge) laid into the leading two pointer slots,
+        // then one pointer per due event.
         if let Backend::V2(inst) = backend {
             use vst2::{api, plugin::Plugin};
-            let n = deliver.len().min(EV_BATCH_MAX);
-            let mut batch = EvBatch {
-                num_events: n as i32,
-                _pad: [0; 4],
-                _reserved: 0,
-                events: [std::ptr::null_mut(); EV_BATCH_MAX],
-            };
-            for (k, q) in deliver[..n].iter().enumerate() {
+            let n = deliver.len();
+            // The pool grows once, then every event is a reuse.
+            while ev_pool.len() < n {
+                // Zeroed raw event: a benign null record until overwritten.
+                ev_pool.push(Box::new(unsafe { std::mem::zeroed() }));
+            }
+            // Header mirror: layout-identical to `api::Events`' prefix
+            // (num_events i32 + C pad + isize reserved = 16 bytes, 8-
+            // aligned — i.e. exactly two pointer slots of the buffer).
+            #[repr(C)]
+            struct EvHead {
+                num_events: i32,
+                _pad: [u8; 4],
+                _reserved: isize,
+            }
+            const _: () = assert!(
+                std::mem::size_of::<EvHead>() == 2 * std::mem::size_of::<*mut ()>()
+                    && std::mem::align_of::<EvHead>() == std::mem::align_of::<*mut ()>()
+            );
+            // Grow once to the largest block, never shrinks (RT doctrine,
+            // like `ev_pool`). Min 4 slots so a whole `&api::Events`
+            // stays in bounds even for a single event (n=1 => 3 slots
+            // would under-run the type's 2-slot placeholder array).
+            while ev_batch.len() < (2 + n).max(4) {
+                ev_batch.push(std::ptr::null_mut());
+            }
+            let base = ev_batch.as_mut_ptr();
+            {
+                // SAFETY: `base` is 8-aligned with >= 4 slots; EvHead is
+                // asserted to be exactly two aligned pointer slots wide.
+                let head = unsafe { &mut *(base as *mut EvHead) };
+                head.num_events = n as i32;
+                head._pad = [0; 4];
+                head._reserved = 0;
+            }
+            for (k, q) in deliver.iter().enumerate() {
                 let delta = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1);
                 let me = api::MidiEvent {
                     event_type: api::EventType::Midi,
@@ -4359,12 +4397,13 @@ impl RtStageEntry {
                 let mut raw: api::Event = unsafe { std::mem::transmute(me) };
                 raw.event_type = api::EventType::Midi;
                 *ev_pool[k] = raw;
-                batch.events[k] = ev_pool[k].as_mut();
+                // SAFETY: buffer grown above to >= 2 + n slots.
+                unsafe { std::ptr::write(base.add(2 + k), ev_pool[k].as_mut()) };
             }
-            // `EvBatch`'s prefix is layout-identical to `api::Events` with
-            // the trailing pointer array enlarged — exactly what the VST2
-            // spec prescribes for >2 events.
-            let events = unsafe { &*(&batch as *const EvBatch as *const api::Events) };
+            // `ev_batch`'s prefix is layout-identical to `api::Events`
+            // with the trailing pointer array enlarged to n — exactly
+            // what the VST2 spec prescribes for >2 events.
+            let events = unsafe { &*(base as *const api::Events) };
             inst.0.process_events(events);
         }
     }
@@ -7343,5 +7382,74 @@ mod tests {
         assert_eq!(rt.v2_probe(9005), (5 << 8) | 36, "last message wins");
         assert_eq!(rt.v2_probe(9006), 7, "and its pressure");
         assert_eq!(e.midi_drops(), 0, "the queue never overflowed");
+    }
+
+    /// v115 (card t_056d6714): the VST2 per-block `processEvents` batch
+    /// must carry EVERY due event, whatever the count. The old
+    /// `EV_BATCH_MAX = 64` clamp was a SILENT DROP: the partition had
+    /// already drained all due events out of `pending_midi` this block,
+    /// so events 65+ were neither delivered, nor deferred, nor counted
+    /// into `midi_drops`. The w6 fixture counts note-ons (9007) and the
+    /// largest `num_events` ever seen in ONE `processEvents` call (9008)
+    /// — the latter also pins the v37 R4 rule that a single call per
+    /// block carries them all (multiple calls let queue-REPLACING
+    /// plugins drop earlier batches).
+    #[test]
+    fn v115_vst2_burst_beyond_old_cap_delivers_every_event() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v115burst");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; VST_BLOCK * 2];
+        let mut outp = vec![0.0f32; VST_BLOCK * 2];
+        // Fresh-instance reset (req 5): BOTH probes read 0 right after
+        // open — the counters are per-instance, never cross-test.
+        assert_eq!(rt.v2_probe(9007), 0, "fresh instance has seen no note-ons");
+        assert_eq!(rt.v2_probe(9008), 0, "fresh instance has seen no MIDI batch");
+        // Clean block first: absorbs the v103 ch0-init RPN burst — a
+        // legitimate early batch of CCs (the note-on counter stays 0).
+        e.process(&inp, &mut outp);
+        assert_eq!(rt.v2_probe(9007), 0, "the init RPN burst carries no note-ons");
+        // 200 ch0 note-ons at the SAME sample in one block: 3x the cap.
+        let evs: Vec<(usize, [u8; 3])> = (0..200)
+            .map(|k| (7, [0x90u8, (k % 128) as u8, (k % 120 + 1) as u8]))
+            .collect();
+        e.process_with_midi(&inp, &mut outp, &evs);
+        assert_eq!(rt.v2_probe(9007), 200, "every due note-on reaches the plugin (the old cap lost 136 of 200)");
+        assert_eq!(rt.v2_probe(9008), 200, "ONE call per block carries them all (v37 R4)");
+        assert_eq!(e.midi_drops(), 0, "drop-free below the queue cap — and the counter tells the truth");
+    }
+
+    /// v115: the partition stays correct beyond the old cap — every event
+    /// in ITS OWN block. 300 note-ons across two internal blocks (150
+    /// due, 150 future): the first block delivers exactly its own 150
+    /// (batch 150 — not 64, not 300), the next block the remainder.
+    #[test]
+    fn v115_vst2_beyond_cap_partition_stays_time_ordered() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v115span");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; VST_BLOCK];
+        let mut outp = vec![0.0f32; VST_BLOCK];
+        e.process(&inp, &mut outp); // absorb the init RPN burst
+        let mut evs: Vec<(usize, [u8; 3])> =
+            (0..150).map(|k| (3, [0x90u8, (k % 128) as u8, 90])).collect();
+        evs.extend((0..150).map(|k| (600, [0x90u8, (k % 128) as u8, 100])));
+        e.process_with_midi(&inp, &mut outp, &evs);
+        assert_eq!(rt.v2_probe(9007), 150, "first block carries ONLY its own due events: no early drain");
+        assert_eq!(rt.v2_probe(9008), 150, "batch size = the block's 150 due: not clamped to 64, no spillover");
+        e.process(&inp, &mut outp);
+        assert_eq!(rt.v2_probe(9007), 300, "the future-due half lands in its own block: deferred, never dropped");
+        assert_eq!(rt.v2_probe(9008), 150, "and in one batch of its own, still correctly sized");
+        assert_eq!(e.midi_drops(), 0, "the drop-free invariant holds above 64 events/block");
     }
 }
