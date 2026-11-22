@@ -9458,6 +9458,20 @@ impl App {
         }
     }
 
+    /// v123: the ONE clip-LED clear seam — "reset I", the small clip LED
+    /// and the meter column all route here, so the three affordances can
+    /// never drift. True when an actually-lit LED was cleared (callers
+    /// echo accordingly).
+    fn clear_clip_led(&mut self) -> bool {
+        if let Some(ms) = self.meter_state.as_mut() {
+            if ms.clip {
+                ms.clip = false;
+                return true;
+            }
+        }
+        false
+    }
+
     /// v39/v44 R4: MASTER OUT — THE master section (the mixer no longer
     /// duplicates any of it). ONE body shared by the floating window and
     /// the docked panel. Order of importance left to right:
@@ -9493,8 +9507,7 @@ impl App {
                 if ui
                     .small_button("reset I")
                     .on_hover_text(
-                        "Reset integrated loudness + LRA — start a fresh \
-                         measurement pass.",
+                        "Reset integrated loudness + LRA and the clip LED \u{b7} start a fresh measurement pass.",
                     )
                     .clicked()
                 {
@@ -9503,8 +9516,10 @@ impl App {
                     }
                     self.meter_i = None;
                     self.meter_lra = None;
-                    self.status =
-                        "integrated loudness reset \u{2014} new measurement started".into();
+                    self.clear_clip_led();
+                    self.status = "integrated loudness + clip LED reset \u{2014} new \
+                                   measurement started"
+                        .into();
                 }
                 let (peak_l, peak_r, clip) = match self.meter_state.as_ref() {
                     Some(ms) => (db_of(ms.l_hold), db_of(ms.r_hold), ms.clip),
@@ -9519,7 +9534,7 @@ impl App {
                 )
                 .on_hover_text(
                     "Sample peak hold per channel, post master gain (dBFS). \
-                     Red clip LED lights on any full-scale sample.",
+                     Red clip LED lights on any full-scale sample; click the LED to clear.",
                 );
                 ui.horizontal(|ui| {
                     ui.label(
@@ -9532,18 +9547,26 @@ impl App {
                         .small(),
                     );
                     if clip {
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                        let (r, led_r) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::click());
                         ui.painter().rect_filled(
                             r.shrink(1.5),
                             1.0,
                             Color32::from_rgb(235, 60, 50),
                         );
+                        let led = led_r.on_hover_text(
+                            "clip LED \u{b7} a sample reached full scale \u{b7} click to clear",
+                        );
+                        if led.clicked() && self.clear_clip_led() {
+                            self.status = "clip LED cleared".into();
+                        }
                     }
                 });
             });
             ui.separator();
             // ---- vertical stereo meters (console master-strip look) ----
-            let (mrect, _) = ui.allocate_exact_size(egui::vec2(58.0, meter_h), Sense::hover());
+            let (mrect, m_r) =
+                ui.allocate_exact_size(egui::vec2(58.0, meter_h), Sense::click());
             let (l_amp, r_amp) = match self.meter_state.as_ref() {
                 Some(ms) => (ms.l_peak, ms.r_peak),
                 None => (0.0, 0.0),
@@ -9563,6 +9586,16 @@ impl App {
                     .unwrap_or(-120.0),
                 self.meter_state.as_ref().is_some_and(|m| m.clip),
             );
+            let mresp = m_r.on_hover_text(
+                "master meters \u{2014} level + peak hold; click to clear the clip LED",
+            );
+            if mresp.clicked() {
+                if self.clear_clip_led() {
+                    self.status = "clip LED cleared".into();
+                } else {
+                    self.status = "clip LED was not lit".into();
+                }
+            }
             ui.separator();
             // v49 R1: live loudness readouts, ONE label per number, the
             // unit (LUFS / LU) spelled out where it is used — the bare
