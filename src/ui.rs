@@ -1139,6 +1139,52 @@ fn chain_row_label(row: &ChainRow) -> String {
     }
 }
 
+/// v113: tally of one `remap_fx_rows` pass — a chain layout shift that
+/// moved (or killed) routing must announce itself in the status echo.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FxRemap {
+    pub(crate) curves: usize,
+    pub(crate) orphaned: usize,
+    pub(crate) binds: usize,
+    pub(crate) dropped_binds: usize,
+    pub(crate) shared: usize,
+    pub(crate) file_fails: usize,
+}
+
+impl FxRemap {
+    /// Status-line suffix (empty when nothing moved). `·` U+00B7 is a
+    /// font-proven glyph (v35 coverage probe list).
+    pub(crate) fn note(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.curves > 0 {
+            parts.push(format!("{} curve(s) retargeted", self.curves));
+        }
+        if self.binds > 0 {
+            parts.push(format!("{} binding(s) retargeted", self.binds));
+        }
+        if self.orphaned > 0 {
+            parts.push(format!("{} curve(s) lost their row", self.orphaned));
+        }
+        if self.dropped_binds > 0 {
+            parts.push(format!("{} binding(s) removed", self.dropped_binds));
+        }
+        if self.shared > 0 {
+            parts.push(format!(
+                "{} shared curve(s) untouched \u{2014} check the Automation window",
+                self.shared
+            ));
+        }
+        if self.file_fails > 0 {
+            parts.push(format!("{} curve file(s) unwritable", self.file_fails));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{b7} {}", parts.join(", "))
+        }
+    }
+}
+
 /// v61: the ONE row→save conversion. `save_config`, project saves and
 /// track templates all route through it so the persisted chain shape can
 /// never drift between entry points.
@@ -1996,6 +2042,9 @@ pub struct App {
     /// v16: chain rows (track, row) awaiting their load completion, then
     /// the v0.10 auto-open of the plugin's own GUI.
     vst_pending_gui: Vec<(usize, usize)>,
+    /// v113: rising-edge latch for the auto-miss status line (the yellow
+    /// badge is engine-state; this only prevents echo spam per frame).
+    auto_miss_seen: bool,
     /// v33: async ♪-synth binding opens. Track slot while a loader runs.
     /// The UI must NEVER block on a plugin open — a cold bridged
     /// instrument takes seconds and froze the whole app during picker/
@@ -2571,6 +2620,7 @@ impl App {
             vst_scan: Vec::new(),
             vst_scan_rx: None,
             vst_pending_gui: Vec::new(),
+            auto_miss_seen: false,
             vst_synth_open: (0..MAX_LOOPS).map(|_| None).collect(),
             vst_scanned: false,
             vst_dirs: cfg.vst_dirs.clone(),
@@ -4646,8 +4696,22 @@ impl App {
             let label = chain_row_label(&self.fx_rows[i][k]);
             self.fx_rows[i].remove(k);
             self.rebuild_fx(i);
+            // v113: rows below k slid UP — curves, bindings, live views and
+            // pending loads ride the same map (positional targets are the
+            // only identity they ever had).
+            let echo = self
+                .remap_fx_rows(i, &|r| {
+                    if r < k {
+                        Some(r)
+                    } else if r == k {
+                        None
+                    } else {
+                        Some(r - 1)
+                    }
+                })
+                .note();
             self.save_config();
-            self.status = format!("removed \u{201c}{label}\u{201d} from track {} chain", i + 1);
+            self.status = format!("removed \u{201c}{label}\u{201d} from track {} chain{echo}", i + 1);
         }
     }
 
@@ -4671,9 +4735,22 @@ impl App {
         let label = chain_row_label(&self.fx_rows[i][k]);
         self.fx_rows[i].swap(k, j);
         self.rebuild_fx(i);
+        // v113: the swap moves two rows — anything targeting either must
+        // follow or the curve silently drives the other plugin.
+        let echo = self
+            .remap_fx_rows(i, &|r| {
+                if r == k {
+                    Some(j)
+                } else if r == j {
+                    Some(k)
+                } else {
+                    Some(r)
+                }
+            })
+            .note();
         self.save_config();
         self.status = format!(
-            "moved \u{201c}{label}\u{201d} {} the track {} chain",
+            "moved \u{201c}{label}\u{201d} {} the track {} chain{echo}",
             if dir < 0 { "up" } else { "down" },
             i + 1
         );
@@ -4858,11 +4935,36 @@ impl App {
     /// Drop chain rows pointing at scripts the registry no longer loads.
     fn prune_dead_script_rows(&mut self) {
         for i in 0..MAX_LOOPS {
+            // v113: retain() COMPACTS — every survivor below a dead row
+            // slides up, so curves/bindings/views ride a per-track
+            // old->new map computed from the same liveness decision.
+            let map: Vec<Option<usize>> = {
+                let mut next = 0usize;
+                self.fx_rows[i]
+                    .iter()
+                    .map(|r| {
+                        let alive = match r {
+                            ChainRow::Script { stem, .. } => {
+                                self.fx_registry.desc(stem).is_some()
+                            }
+                            ChainRow::Vst { .. } => true,
+                        };
+                        if alive {
+                            let at = next;
+                            next += 1;
+                            Some(at)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
             self.fx_rows[i].retain(|r| match r {
                 ChainRow::Script { stem, .. } => self.fx_registry.desc(stem).is_some(),
                 ChainRow::Vst { .. } => true,
             });
             self.rebuild_fx(i);
+            self.remap_fx_rows(i, &|r| map.get(r).copied().flatten());
         }
     }
 
@@ -17613,6 +17715,195 @@ impl App {
         }
     }
 
+    /// v113: per-chain-edit tally from `remap_fx_rows` — feeds the status
+    /// echo so a layout shift that moved routing is never silent.
+    fn remap_fx_rows(&mut self, t: usize, map: &dyn Fn(usize) -> Option<usize>) -> FxRemap {
+        use crate::audio::{parse_plugin_target, PluginTarget};
+        let mut out = FxRemap::default();
+        // (1) value_binds — the only table that KNOWS its owner track.
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, vb) in self.value_binds.iter_mut().enumerate() {
+            if vb.track as usize != t {
+                continue;
+            }
+            let Some(PluginTarget::Fx(r, j)) = parse_plugin_target(&vb.target) else {
+                continue;
+            };
+            match map(r) {
+                Some(n) => {
+                    let nu = format!("fx:{n}:{j}");
+                    if nu != vb.target {
+                        vb.target = nu;
+                        out.binds += 1;
+                    }
+                }
+                None => drop.push(i),
+            }
+        }
+        for i in drop.iter().rev() {
+            self.value_binds.remove(*i);
+            out.dropped_binds += 1;
+        }
+        // (2) automation assets — the table is global, so ownership is
+        // derived from WHICH TRACKS' CLIPS consume the curve. A curve fed
+        // only to track `t` rides the map; one shared with another track is
+        // left alone (remapping would silently break the other consumer —
+        // the echo reports it so the user can fix the intent).
+        let mut cons: std::collections::BTreeMap<u32, (usize, usize)> = Default::default();
+        for lane in &self.arr.tracks[t].lanes {
+            for c in &lane.clips {
+                if let Some(a) = self.assets.get(c.asset as usize).and_then(|a| a.automation.as_ref())
+                {
+                    if let Some(PluginTarget::Fx(r, j)) = parse_plugin_target(&a.target) {
+                        cons.insert(c.asset, (r, j));
+                    }
+                }
+            }
+        }
+        let mut shared: std::collections::BTreeSet<u32> = Default::default();
+        if !cons.is_empty() {
+            for (tr, track) in self.arr.tracks.iter().enumerate() {
+                if tr == t {
+                    continue;
+                }
+                for lane in &track.lanes {
+                    for c in &lane.clips {
+                        if cons.contains_key(&c.asset) {
+                            shared.insert(c.asset);
+                        }
+                    }
+                }
+            }
+        }
+        let mut touched = false;
+        for (id, (r, j)) in cons.iter() {
+            if shared.contains(id) {
+                out.shared += 1;
+                continue;
+            }
+            let mapped = map(*r);
+            // The destroyed-row case must not leave `fx:k:j` behind: a
+            // later append into the freed index would silently capture the
+            // old curve. `fx:gone:<j>` never parses as a row => never routes,
+            // yet stays human-readable in the automation manager.
+            let nu_target = match mapped {
+                Some(n) => format!("fx:{n}:{j}"),
+                None => format!("fx:gone:{j}"),
+            };
+            let Some(curve) = self.assets.get(*id as usize).and_then(|a| a.automation.clone())
+            else {
+                continue;
+            };
+            if curve.target == nu_target {
+                continue;
+            }
+            let nu = std::sync::Arc::new(crate::automation::Automation {
+                target: nu_target,
+                ..(&*curve).clone()
+            });
+            let path = self.assets[*id as usize].path.clone();
+            self.assets[*id as usize].automation = Some(nu.clone());
+            // Persistence: `.slauto` IS the durable medium (project saves
+            // re-read the file) — an in-memory-only rewrite would resurrect
+            // the stale target on restart.
+            match nu.to_json().map(|s| std::fs::write(&path, s)) {
+                Ok(Ok(())) => {}
+                _ => out.file_fails += 1,
+            }
+            if mapped.is_none() {
+                out.orphaned += 1;
+            } else {
+                out.curves += 1;
+            }
+            touched = true;
+        }
+        if touched {
+            let auto = std::sync::Arc::new(
+                self.assets
+                    .iter()
+                    .map(|a| a.automation.clone())
+                    .collect::<Vec<_>>(),
+            );
+            self.backend.cmd(Cmd::SetAutoAssets(auto));
+        }
+        // (3) live views + pending loads that hold a ROW INDEX (same trap
+        // class v110 fixed for MCP relocation; now every mutator shares it).
+        if let Some(ed) = self.fx_editor.as_ref() {
+            if ed.loop_i == t && map(ed.slot).is_none() {
+                self.fx_editor = None;
+            }
+        }
+        if let Some(ed) = self.fx_editor.as_mut() {
+            if ed.loop_i == t {
+                if let Some(n) = map(ed.slot) {
+                    ed.slot = n;
+                }
+            }
+        }
+        if let Some(GuiTarget::Chain(t2, r)) = self.params_win {
+            if t2 == t {
+                self.params_win = map(r).map(|n| GuiTarget::Chain(t2, n));
+            }
+        }
+        self.vst_pending_gui.retain_mut(|(t2, r)| {
+            if *t2 != t {
+                return true;
+            }
+            match map(*r) {
+                Some(n) => {
+                    *r = n;
+                    true
+                }
+                None => false,
+            }
+        });
+        // Un-stick the RT badge once nothing is dead any more (a later miss
+        // re-arms it on its own).
+        if self.backend.engine.auto_miss() && self.dead_auto_targets().is_empty() {
+            self.backend.engine.clear_auto_miss();
+        }
+        out
+    }
+
+    /// v113: live automation clips whose well-formed plugin target cannot
+    /// route with TODAY's layout (RT semantics: fx = row exists on the
+    /// clip's track; synth = track has a bound instrument). Deduped,
+    /// clip-track order. Malformed targets stay silent — RT ignores them.
+    fn dead_auto_targets(&self) -> Vec<(usize, String)> {
+        use crate::audio::{parse_plugin_target, PluginTarget};
+        let mut seen: std::collections::BTreeSet<(usize, String)> = Default::default();
+        let mut out = Vec::new();
+        for (tr, track) in self.arr.tracks.iter().enumerate() {
+            for lane in &track.lanes {
+                for c in &lane.clips {
+                    let Some(a) = self
+                        .assets
+                        .get(c.asset as usize)
+                        .and_then(|a| a.automation.as_ref())
+                    else {
+                        continue;
+                    };
+                    let Some(tgt) = parse_plugin_target(&a.target) else {
+                        continue;
+                    };
+                    let lands = match tgt {
+                        PluginTarget::Fx(r, _j) => self
+                            .fx_rows
+                            .get(tr)
+                            .is_some_and(|rows| rows.get(r).is_some()),
+                        PluginTarget::Synth(_i) => {
+                            self.track_synth.get(tr).is_some_and(|s| s.is_some())
+                        }
+                    };
+                    if !lands && seen.insert((tr, a.target.clone())) {
+                        out.push((tr, a.target.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// v42: the "what should this project load?" chooser shown after
     /// picking a .slooper file. The arrangement rides along with the
     /// import itself; these toggles pick the setup slices.
@@ -19403,6 +19694,41 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 let xruns = app.backend.xruns.load(Ordering::Relaxed);
                 if xruns > 0 {
                     ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
+                }
+                // v113: automation targets dead-drifted by chain edits (RT
+                // raised the sticky flag; a remap scan clears it again).
+                if app.backend.engine.auto_miss() {
+                    ui.label(RichText::new("automation target lost").color(Color32::ORANGE))
+                        .on_hover_text(
+                            "An automation curve aims at a chain slot that no \
+                             longer exists (the plugin was removed or moved). \
+                             The curve stays silent until rebound in the \
+                             Automation window or the chain is fixed.",
+                        );
+                    if !app.auto_miss_seen {
+                        app.auto_miss_seen = true;
+                        let dead = app.dead_auto_targets();
+                        if !dead.is_empty() {
+                            let list: Vec<String> = dead
+                                .iter()
+                                .take(3)
+                                .map(|(t, tg)| format!("trk {} {tg}", t + 1))
+                                .collect();
+                            let more = if dead.len() > 3 {
+                                format!(" +{}", dead.len() - 3)
+                            } else {
+                                String::new()
+                            };
+                            app.status = format!(
+                                "automation cannot reach {}{more} \u{2014} that chain slot is gone",
+                                list.join(", ")
+                            );
+                        } else {
+                            app.status = "automation cannot reach one of its targets \u{2014} check the Automation window".to_string();
+                        }
+                    }
+                } else {
+                    app.auto_miss_seen = false;
                 }
 
                 // ---- transport ----
