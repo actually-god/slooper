@@ -48816,13 +48816,12 @@ mod tests {
                         ));
                     }
                 }
-                egui::epaint::Shape::Circle(c) => {
+                egui::epaint::Shape::Circle(c)
                     if c.radius < 4.0
                         && c.fill != egui::Color32::TRANSPARENT
-                        && c.stroke.width < 0.5
-                    {
-                        dots.push(c.center);
-                    }
+                        && c.stroke.width < 0.5 =>
+                {
+                    dots.push(c.center);
                 }
                 _ => {}
             }
@@ -48931,7 +48930,8 @@ mod tests {
         app.show_export = true;
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        let cases: [((bool, bool), [(&str, (bool, bool)); 3]); 3] = [
+        type Case = ((bool, bool), [(&'static str, (bool, bool)); 3]);
+        let cases: [Case; 3] = [
             // from track (0,0):
             (
                 (false, false),
