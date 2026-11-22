@@ -8,6 +8,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Cancel-a-knob-learn no longer wipes an unrelated key binding.**
+  Pressing **Delete** while binding a MIDI knob to a project value
+  (volume, pan, an FX parameter) used to silently clear the **action-0**
+  MIDI binding — "record (selected)" — because the value wizard shares
+  the action wizard's slot field and used it as its index; the value
+  binding you actually meant to cancel stayed bound, and the status line
+  (and the wizard header) named the wrong thing. Delete now mirrors the
+  bindings rack: on a re-learn it unbinds exactly that value binding, on
+  a fresh one it just cancels, and the action-slot wizard is untouched
+  (v124).
+
 - **Auto-placement now dodges long clips (and stops dodging ghosts).**
   The lane-occupancy test built every existing clip's right edge from the
   incoming item's own length, so a short take landing on the tail of a
