@@ -1025,6 +1025,7 @@ fn features_say_instrument(feats: &[String]) -> bool {
 /// Probe one `.clap` file; one [`ScanProbe`] per plugin inside it. NEVER
 /// instantiates: descriptors answer metadata without a plugin object
 /// (the v17 "never touch a live library twice" rule at its safest).
+#[derive(Debug)]
 pub struct ScanProbe {
     pub plugin_id: String,
     pub name: String,
