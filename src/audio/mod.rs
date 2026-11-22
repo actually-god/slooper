@@ -8482,10 +8482,13 @@ pub extern "C" fn slooper_effect_info_v2() -> *const EffectInfoV2 { &DESC2 }
             !body.contains(forbidden),
             "process_block re-grew a silent edge-table cap: `{forbidden}`"
         );
-        // Polarity B: the table must be sized to the structural bound
-        // (MAX_LOOPS x MAX_LOOPS) — the fix is present, not just the guard.
+        // Polarity B: the table must ACTUALLY be resized to the
+        // structural bound (MAX_LOOPS x MAX_LOOPS) — not merely mention
+        // it: the needle is the resize call itself (a comment mentioning
+        // the const while sizing to a literal passed this pin vacuously —
+        // sabotage-caught v117). The fix is present, not just the guard.
         assert!(
-            body.contains(concat!("MAX_", "SC_EDGES")),
+            body.contains(concat!("resize(MAX_", "SC_EDGES")),
             "process_block must size the SC edge table to MAX_SC_EDGES"
         );
     }
