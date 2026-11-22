@@ -550,3 +550,64 @@ fn v110_mcp_assets_assign_sampler_keymap_pad() {
     assert_eq!(e["error"], "wrong_kind", "track 3 has no script synth bound");
     assert!(app.sampler_maps.get(3).map(|m| m.is_none()).unwrap_or(true));
 }
+
+#[test]
+fn v115_mcp_reloc_remaps_targets() {
+    let mut app = headless_app("v115reloc");
+    // A loading row sits at 0 with routing already aimed at it.
+    let (_tx, rx) = std::sync::mpsc::channel();
+    app.fx_rows[0].push(crate::ui::ChainRow::Vst {
+        state: None,
+        path: "/fake/held.vst3".into(),
+        kind: crate::vsthost::VstKind::V3,
+        plugin_id: None,
+        name: "Held".into(),
+        params: Vec::new(),
+        entry: None,
+        open_rx: Some(rx),
+        program: None,
+        bypass: false,
+    });
+    app.vst_pending_gui.push((0, 0));
+    let dir = std::env::temp_dir().join("sp-uity-v115reloc").join("auto");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.slauto");
+    let a = crate::automation::Automation {
+        target: "fx:0:1".into(),
+        len_samples: 4096,
+        nodes: vec![
+            crate::automation::Node { t: 0, v: 0.5, c: 0.0 },
+            crate::automation::Node { t: 4096, v: 0.5, c: 0.0 },
+        ],
+    };
+    std::fs::write(&path, a.to_json().unwrap()).unwrap();
+    let id = app.assets.len() as u32;
+    app.assets.push(crate::assets::Asset::automation_asset(
+        id,
+        "c".into(),
+        path,
+        std::sync::Arc::new(a),
+        false,
+    ));
+    app.arr.insert(0, 0, crate::arrange::Clip::new(id, 0));
+    app.value_binds.push(crate::config::ValueBind {
+        target: "fx:0:1".into(),
+        track: 0,
+        bind: crate::midi::MidiBind { ty: 1, ch: 0, d1: 7 },
+        kind: 0,
+        lo: 0,
+        hi: 127,
+    });
+    // Insert a script at slot 0: the loading row AND its routing shift to 1.
+    let pick = structured(&mut app, "chain.pick", json!({"track": 0, "plugin": "chorus", "slot": 0}));
+    assert_eq!(pick["rows"][1]["name"], "Held");
+    assert_eq!(app.vst_pending_gui, vec![(0usize, 1usize)], "v110 contract preserved via the shared seam");
+    assert_eq!(app.assets[id as usize].automation.as_ref().unwrap().target, "fx:1:1", "curve follows");
+    assert_eq!(app.value_binds[0].target, "fx:1:1", "binding follows");
+    // And chain.remove on this track rides the same seam end-to-end.
+    let rm = structured(&mut app, "chain.remove", json!({"track": 0, "slot": 0}));
+    assert_eq!(rm["removed"], "chorus");
+    assert_eq!(app.assets[id as usize].automation.as_ref().unwrap().target, "fx:0:1", "shift back down");
+    assert_eq!(app.value_binds[0].target, "fx:0:1");
+    assert_eq!(app.vst_pending_gui, vec![(0usize, 0usize)]);
+}

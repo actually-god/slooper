@@ -1041,6 +1041,13 @@ pub struct Engine {
     /// v0.11 R5: automation asset table (parallel to `assets`) + gen.
     auto: std::sync::Mutex<Arc<Vec<Option<Arc<crate::automation::Automation>>>>>,
     auto_gen: AtomicU64,
+    /// v115: sticky — a well-formed `fx:`/`synth:` automation target was
+    /// unreachable while its clip played (chain layout drift: the row is
+    /// gone, the curve still fires). RT only ever does a cheap `store(true)`
+    /// in the per-block pass (xruns precedent); the GUI mirrors it as a
+    /// status badge + one-shot status line, and clears it once a scan finds
+    /// every target landing again.
+    auto_miss: Arc<AtomicBool>,
     /// Per-track synth bindings (scripted or VSTi) + the fallback instance
     /// (bundled piano) used by unbound tracks.
     synths: std::sync::Mutex<Arc<[Option<Arc<SynthHandle>>; MAX_LOOPS]>>,
@@ -1223,6 +1230,7 @@ impl Engine {
             midi_gen: AtomicU64::new(0),
             auto: std::sync::Mutex::new(Arc::new(Vec::new())),
             auto_gen: AtomicU64::new(0),
+            auto_miss: Arc::new(AtomicBool::new(false)),
             synths: std::sync::Mutex::new(Arc::new(core::array::from_fn(|_| None))),
             synths_gen: AtomicU64::new(0),
             default_synth: std::sync::Mutex::new(None),
@@ -1819,6 +1827,20 @@ impl Engine {
     }
     pub fn auto_gen(&self) -> u64 {
         self.auto_gen.load(Ordering::Relaxed)
+    }
+
+    /// v115: cheap handle for the RT block (it only ever `store(true)`).
+    pub fn auto_miss_flag(&self) -> Arc<AtomicBool> {
+        self.auto_miss.clone()
+    }
+    /// v115: is a dead automation target on record?
+    pub fn auto_miss(&self) -> bool {
+        self.auto_miss.load(Ordering::Relaxed)
+    }
+    /// v115: GUI calls this once a scan confirms every automation target
+    /// lands again (a later RT miss re-arms the flag on its own).
+    pub fn clear_auto_miss(&self) {
+        self.auto_miss.store(false, Ordering::Relaxed)
     }
 
     /// Bind/unbind one track's synthesizer (unbound tracks fall back to the
@@ -4315,6 +4337,9 @@ struct Proc {
     /// v0.11 R5: automation asset table refresh pair.
     auto_cache: Arc<Vec<Option<Arc<crate::automation::Automation>>>>,
     auto_cache_gen: u64,
+    /// v115: shared with Engine — set (never cleared) by the automation
+    /// pass when a live clip's well-formed plugin target cannot route.
+    auto_miss: Arc<AtomicBool>,
     /// v34 R11: last control-rate pass; held while the transport is
     /// stopped so automation does not snap back on pause.
     auto_last: AutoOut,
@@ -4510,6 +4535,7 @@ fn new_proc(
         auto_cache: engine.auto_assets(),
         auto_last: AutoOut::default(),
         auto_cache_gen: engine.auto_gen(),
+        auto_miss: engine.auto_miss_flag(),
         midi_ev: Vec::new(),
         // One row per track, EXACTLY like trk_bufs: `render_midi_block`
         // indexes `midi_scratch[t]` the moment the first note stages, and an
@@ -4590,6 +4616,38 @@ fn seed_fx_rt(table: &[TrackFx]) -> Vec<Vec<FxRt>> {
                 .collect()
         })
         .collect()
+}
+
+/// v115: how a plugin-parameter automation target parsed. ONE grammar
+/// shared by the RT router and the GUI dead-target scan (ui.rs) so both
+/// sides agree on what "well-formed" means. `fx:<row>:<idx>` / `synth:<idx>`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PluginTarget {
+    Synth(usize),
+    Fx(usize, usize),
+}
+
+pub fn parse_plugin_target(t: &str) -> Option<PluginTarget> {
+    if let Some(idx) = t.strip_prefix("synth:") {
+        return idx.parse::<usize>().ok().map(PluginTarget::Synth);
+    }
+    let rest = t.strip_prefix("fx:")?;
+    let (row_s, idx_s) = rest.split_once(':')?;
+    Some(PluginTarget::Fx(
+        row_s.parse::<usize>().ok()?,
+        idx_s.parse::<usize>().ok()?,
+    ))
+}
+
+/// v115: verdict of one routing attempt. Only `Unroutable` (well-formed id,
+/// slot/handle gone — the chain-layout drift class) counts as an auto-miss;
+/// `Malformed` is a save/import bug that never changes with the chain, and
+/// `Landed` of course counts nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RouteVerdict {
+    Landed,
+    Unroutable,
+    Malformed,
 }
 
 impl Proc {
@@ -4753,7 +4811,14 @@ impl Proc {
                             out.tempo = Some((v.round() as i64).clamp(20, 300) as u32)
                         }
                         other => {
-                            let _ = self.route_plugin_param(t, other, v);
+                            // v115: a well-formed target whose slot vanished
+                            // (chain edited under a live curve) used to die
+                            // swallowed here. Raise the sticky flag once per
+                            // block — the GUI badge + status scan surfaces
+                            // it; never log/allocate on RT.
+                            if self.route_plugin_param(t, other, v) == RouteVerdict::Unroutable {
+                                self.auto_miss.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -4763,41 +4828,38 @@ impl Proc {
     }
 
     /// Write one automated value to a `synth:<idx>` / `fx:<row>:<idx>`
-    /// target on track `t`. False for unknown or malformed ids.
-    fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> bool {
-        if let Some(idx) = target.strip_prefix("synth:") {
-            let Ok(idx) = idx.parse::<usize>() else {
-                return false;
-            };
-            let Some(Some(handle)) = self.synths_cache.get(t).cloned() else {
-                return false;
-            };
-            match handle.as_ref() {
-                SynthHandle::Script(i) => i.set_param(idx, v),
-                SynthHandle::Vst(e) => e.set_param_rt(idx, v),
+    /// target on track `t`. v115: the verdict distinguishes "this chain has
+    /// no such slot anymore" (Unroutable — what the auto-miss badge mirrors)
+    /// from a target string that never parsed (Malformed — silence).
+    fn route_plugin_param(&self, t: usize, target: &str, v: f32) -> RouteVerdict {
+        let Some(parsed) = parse_plugin_target(target) else {
+            return RouteVerdict::Malformed;
+        };
+        match parsed {
+            PluginTarget::Synth(idx) => {
+                let Some(Some(handle)) = self.synths_cache.get(t).cloned() else {
+                    return RouteVerdict::Unroutable;
+                };
+                match handle.as_ref() {
+                    SynthHandle::Script(i) => i.set_param(idx, v),
+                    SynthHandle::Vst(e) => e.set_param_rt(idx, v),
+                }
+                RouteVerdict::Landed
             }
-            return true;
-        }
-        if let Some(rest) = target.strip_prefix("fx:") {
-            let Some((row_s, idx_s)) = rest.split_once(':') else {
-                return false;
-            };
-            let (Ok(row), Ok(idx)) = (row_s.parse::<usize>(), idx_s.parse::<usize>()) else {
-                return false;
-            };
-            let Some(tf) = self.fx_cache.get(t) else {
-                return false;
-            };
-            let Some(slot) = tf.slots().get(row) else {
-                return false;
-            };
-            match &slot.kind {
-                FxKind::Scripted { inst, .. } => inst.set_param(idx, v),
-                FxKind::Vst(e) => e.set_param_rt(idx, v),
+            PluginTarget::Fx(row, idx) => {
+                let Some(tf) = self.fx_cache.get(t) else {
+                    return RouteVerdict::Unroutable;
+                };
+                let Some(slot) = tf.slots().get(row) else {
+                    return RouteVerdict::Unroutable;
+                };
+                match &slot.kind {
+                    FxKind::Scripted { inst, .. } => inst.set_param(idx, v),
+                    FxKind::Vst(e) => e.set_param_rt(idx, v),
+                }
+                RouteVerdict::Landed
             }
-            return true;
         }
-        false
     }
 
     fn collect_clips(
@@ -9218,4 +9280,20 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         assert!(e.fx_table()[1].slots[0].bypass, "table carries the mute");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn v115_target_parser_grammar() {
+        use super::{parse_plugin_target, PluginTarget};
+        assert_eq!(parse_plugin_target("fx:0:1"), Some(PluginTarget::Fx(0, 1)));
+        assert_eq!(parse_plugin_target("fx:12:3"), Some(PluginTarget::Fx(12, 3)));
+        assert_eq!(parse_plugin_target("synth:7"), Some(PluginTarget::Synth(7)));
+        // v115 neutralization sentinel: never routable, never a false
+        // auto-miss either (parse fails => the pass ignores it).
+        assert_eq!(parse_plugin_target("fx:gone:0"), None);
+        assert_eq!(parse_plugin_target("fx:1"), None);
+        assert_eq!(parse_plugin_target("fx:a:b"), None);
+        assert_eq!(parse_plugin_target("track.vol"), None);
+        assert_eq!(parse_plugin_target("synth:1x"), None);
+    }
+
 }
