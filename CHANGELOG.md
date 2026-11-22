@@ -8,6 +8,22 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **JACK server-death detection + auto-reconnect (v118).** When the
+  JACK/PipeWire-JACK server dies mid-session — the routine desktop events
+  (USB-DAC unplug, device-profile switch, PipeWire restart) that used to
+  leave Linux users in permanent silence until they restarted slooper —
+  the status line now says **"JACK server lost — reconnecting…"** and the
+  app rebuilds its client by itself: the server's own shutdown notification
+  plus a process-block liveness backstop feed a bounded reconnect loop
+  that re-wires your exact port selection (and the MIDI auto-links) the
+  moment the server answers, re-announces the possibly-new sample rate,
+  and echoes **"JACK server recovered — audio restored"**. A server that
+  is simply *down* is retried patiently (no attempt budget — audio comes
+  back by itself); a server that is *refusing* gets three rebuilds before
+  the app stops and says so, and re-picking your ports in Settings retries
+  immediately. This is the Linux twin of the Windows WASAPI recovery
+  contract (W12a); the decision table ships pinned in
+  `src/audio/rt_recovery.rs` on both platforms.
 - **Subwindow arrangement over MCP (v111/MCP-03).** Nine agent tools drive
   the window layer through the same UI-thread state the mouse uses:
   `windows.list` enumerates every window by a stable machine id (the

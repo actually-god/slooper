@@ -43,10 +43,10 @@ use std::sync::Arc;
 pub mod jack;
 #[cfg(windows)]
 mod wasapi;
-// W12a: pure lost-stream recovery table (pinned on every OS; only the
-// WASAPI backend reads it — the W7 `any(windows, test)` pattern keeps it
-// compiling for the Linux pins without a dead module in Linux builds).
-#[cfg(any(windows, test))]
+// W12a: pure lost-stream recovery tables (pinned on every OS). WASAPI
+// reads the WASAPI half; since v118 the JACK backend reads the JACK half
+// on Linux, so the module itself compiles everywhere (the OS-only items
+// carry their own cfg inside).
 mod rt_recovery;
 
 use crate::arrange::Arrangement;
@@ -9008,6 +9008,258 @@ mod w12a_tests {
     }
 }
 
+/// v118 (card t_0bba9aaa): the Linux JACK path must NOTICE a dead server
+/// and RECONNECT. The pure decision table is pinned in `rt_recovery`
+/// itself (v118_jack_* there); these are the source-wiring scans — the
+/// w12a/w5 pattern: OS-neutral text scans every suite runs, each red if
+/// its seam gets sabotaged. `code()` strips comments so doc prose can
+/// never satisfy a needle (the w12e active-call lesson).
+#[cfg(test)]
+mod v118_tests {
+    fn code() -> String {
+        include_str!("jack.rs")
+            .replace("\r\n", "\n")
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whitespace-free window, w12a style: robust against wrapping.
+    fn squish(src: &str, from: usize, len: usize) -> String {
+        src[from..from + len]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn v118_jack_shutdown_latches_death_flag() {
+        // The jack crate registers jack_on_info_shutdown in activate_async
+        // and surfaces it ONLY as NotificationHandler::shutdown; our
+        // handler must implement it and latch the shared flag — the
+        // primary (fast, ~1 idle tick) death signal.
+        let src = code();
+        let s = src
+            .find("unsafe fn shutdown(&mut self")
+            .expect("Notif::shutdown absent — server death is never noticed via the callback");
+        // exactly one shutdown impl in the file
+        assert_eq!(src[s + 1..].find("unsafe fn shutdown(&mut self"), None);
+        let win = squish(&src, s, 400);
+        assert!(
+            win.contains("self.server_dead.store(true,Ordering::SeqCst);"),
+            "shutdown must latch the death flag (no allocate, no block)"
+        );
+    }
+
+    #[test]
+    fn v118_jack_process_beats_the_liveness_counter() {
+        // Backstop signal: the RT shim bumps a counter every block; the
+        // idle tick's `jack_alive` rule detects silence. Exactly ONE
+        // bump site, inside the ProcessHandler impl (the RT entry).
+        let src = code();
+        assert_eq!(
+            src.matches("self.liveness.fetch_add(1, Ordering::Relaxed);")
+                .count(),
+            1
+        );
+        let impl_at = src
+            .find("impl ProcessHandler for JackProc {")
+            .expect("shim missing");
+        let bump = src
+            .find("self.liveness.fetch_add")
+            .expect("no liveness bump");
+        let proc_at = src[impl_at..]
+            .find("fn process(")
+            .map(|o| impl_at + o)
+            .expect("process missing");
+        assert!(bump > proc_at, "liveness bump must live inside process()");
+    }
+
+    #[test]
+    fn v118_jack_idle_asks_the_loss_table() {
+        // The manager idle hook: liveness check -> mourn (once) -> step
+        // the reconnect table -> rebuild. Same wiring contract shape as
+        // w12a_idle_asks_the_recovery_table.
+        let src = code();
+        let start = src
+            .find("fn idle(&mut self, tx: &SyncSender<Evt>) {")
+            .expect("idle lost its recovery-aware body");
+        let end = start
+            + src[start..]
+                .find("fn teardown")
+                .expect("idle region end");
+        let body = &src[start..end];
+        for shape in [
+            "rt_recovery::jack_alive(",
+            "self.mourn(now, tx)",
+            "rt_recovery::jack_loss_step(&mut self.loss, now)",
+            "self.rebuild(now, tx)",
+            // the pre-existing duty must survive: MIDI rescan on the live path
+            "rescan_midi_sources(c.as_client(), tx, midi_sources)",
+        ] {
+            assert!(body.contains(shape), "idle recovery lost `{shape}`");
+        }
+        // Exactly one death transition per tick pass.
+        assert_eq!(src.matches("self.mourn(now, tx)").count(), 1);
+    }
+
+    #[test]
+    fn v118_jack_user_gets_exactly_one_message_per_stage() {
+        // Status-line contract (R2/R3): one death announcement, one
+        // recovery echo, one give-up line, one queued-apply echo — each
+        // literal appears exactly ONCE in the backend, so no code path
+        // can spam or silently skip it.
+        let src = code();
+        for phrase in [
+            "JACK server lost",
+            "JACK server recovered",
+            "reconnect attempts stopped",
+            "port selection queued for the next reconnect",
+        ] {
+            assert_eq!(
+                src.matches(phrase).count(),
+                1,
+                "status phrase `{phrase}` must appear exactly once"
+            );
+        }
+        // The death announcement is an Evt::Error carrying that phrase,
+        // sent from mourn (the transition fn) — not from a per-tick arm.
+        let m = src
+            .find("fn mourn(&mut self, now: u64, tx: &SyncSender<Evt>)")
+            .expect("mourn missing");
+        let win = squish(&src, m, 1200);
+        assert!(
+            win.contains("Evt::Error(msg)") || win.contains("Evt::Error(msg.into())"),
+            "mourn must announce via Evt::Error"
+        );
+        assert!(
+            win.contains("clear_all_callbacks"),
+            "mourn must disarm callbacks before dropping the dead client"
+        );
+        assert!(
+            win.contains("self.loss=rt_recovery::JackLoss::new(now)"),
+            "mourn must open a fresh loss event (full budget)"
+        );
+    }
+
+    #[test]
+    fn v118_jack_bootstrap_single_entry() {
+        // R6: ONE bootstrap for boot and every rebuild — the reconnect
+        // can never drift from the initial path. Unique-call-site counts
+        // (the w12a/w5 idiom), comment-stripped so doc prose cannot
+        // satisfy them.
+        let src = code();
+        assert_eq!(
+            src.matches("Client::new(CLIENT_NAME").count(),
+            1,
+            "bootstrap consolidated: exactly one jack client creation site"
+        );
+        assert_eq!(
+            src.matches("bring_up(").count(),
+            3,
+            "bring_up defined once, called from run() and rebuild()"
+        );
+        // The Ready/ports announcement is likewise shared (boot + rebuild
+        // report identically), and the SR push lives ONLY in bring_up.
+        assert_eq!(src.matches("Evt::Ready").count(), 1);
+        assert_eq!(src.matches("engine.set_sample_rate(sr)").count(), 1);
+        // Boot failure wording byte-preserved (the W5/W12f UX contract).
+        for shape in [
+            "No JACK/PipeWire-JACK server available",
+            "failed to register input slot in",
+            "failed to register output slot out",
+            "failed to create MIDI input port",
+            "failed to activate JACK client",
+        ] {
+            assert!(src.contains(shape), "boot failure wording lost: `{shape}`");
+        }
+        assert_eq!(
+            src.matches("return ManagerExit::Unavailable").count(),
+            3,
+            "dll guard + NoServer + Setup park (setup sites folded into bring_up)"
+        );
+    }
+
+    #[test]
+    fn v118_jack_dead_session_plumbing_is_dead_safe() {
+        // R5: once a dead client is REACHABLE (client == None while the
+        // loop still runs), every hook must survive it. teardown once
+        // panicked its expect() on this path.
+        let src = code();
+        let t = src
+            .find("fn teardown(&mut self) {")
+            .expect("teardown missing");
+        let t_end = t + src[t..].find("struct RawPorts").expect("teardown region end");
+        let body = &src[t..t_end];
+        assert!(
+            body.contains("if let Some(client) = self.client.take()"),
+            "teardown must tolerate an already-dead client (no expect-panic)"
+        );
+        assert!(
+            !body.contains("self.client()"),
+            "teardown must not call the expect() accessor before the take"
+        );
+        let r = src
+            .find("fn refresh(&mut self, tx: &SyncSender<Evt>) {")
+            .expect("refresh missing");
+        let r_end = r + src[r..].find("fn apply(").expect("refresh region end");
+        let rbody = &src[r..r_end];
+        assert!(
+            rbody.contains("if let Some(c) = &self.client"),
+            "refresh must be a no-op while the client is dead"
+        );
+        assert!(!rbody.contains("self.client()"), "same expect trap");
+        // R4/R5: apply remembers the desired patch (single site) and a
+        // dead-but-recoverable session rearms the table instead of
+        // erroring at the user.
+        assert_eq!(
+            src.matches("self.desired = Some((ins.to_vec(), outs.to_vec()));")
+                .count(),
+            1
+        );
+        let a = src.find("fn apply(&mut self").expect("apply missing");
+        let a_end = a + src[a..].find("fn idle").expect("apply region end");
+        let abody = &src[a..a_end];
+        assert!(
+            abody.contains("rt_recovery::jack_rearm(&mut self.loss, now);"),
+            "a user Apply while dead must rearm the reconnect table"
+        );
+    }
+
+    #[test]
+    fn v118_jack_rebuild_restores_live_state() {
+        // R4: success path rewires EVERYTHING through the new client:
+        // patch bookkeeping + RT masks reset, replay through the real
+        // apply seam, Ready/ports re-announced, table revived. Failure
+        // path classifies the stage (absent vs refusing) for the budget.
+        let src = code();
+        let r = src
+            .find("fn rebuild(&mut self, now: u64, tx: &SyncSender<Evt>)")
+            .expect("rebuild missing");
+        let r_end = r
+            + src[r..]
+                .find("impl ManagerBackend for JackSession")
+                .expect("rebuild region end");
+        let body = squish(&src, r, r_end - r);
+        for shape in [
+            "self.client=Some(active)",
+            "announce_live(self.client(),tx)",
+            "letticks=self.liveness.load(Ordering::Relaxed);rt_recovery::jack_revive(&mutself.loss,ticks,now)",
+            "self.cur_in=vec![None;MAX_SLOTS];",
+            "self.cur_out=vec![None;MAX_SLOTS];",
+            "self.mask_in.store(0,Ordering::Relaxed);",
+            "self.mask_out_l.store(0,Ordering::Relaxed);",
+            "self.mask_out_r.store(0,Ordering::Relaxed);",
+            "self.apply(&i,&o,tx)",
+            "rt_recovery::jack_rebuild_failed(&mutself.loss,false,now)",
+            "rt_recovery::jack_rebuild_failed(&mutself.loss,true,now)",
+        ] {
+            assert!(body.contains(shape), "rebuild lost `{shape}`");
+        }
+    }
+}
+
 /// W12f structural + logic pins (WINDOWS-PORT): native JACK on Windows.
 /// Pure decision cores (backend resolution, DLL discovery path logic) run
 /// on EVERY OS; OS-gated pins run where they apply; source scans lock the
@@ -9379,9 +9631,9 @@ mod w12g_tests {
         );
         assert_eq!(
             jack.matches("return ManagerExit::Unavailable").count(),
-            6,
-            "jack honest-failure parks: dll guard + no server + 2 slot \
-             registrations + midi port + activate"
+            3,
+            "jack honest-failure parks: dll guard + no-server + setup-refusal \
+             (v118: the per-registration sites folded into bring_up's verdict)"
         );
         let was = code(include_str!("wasapi.rs"));
         let nul = was
