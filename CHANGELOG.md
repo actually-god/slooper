@@ -82,6 +82,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Installing Rust while slooper is running now just works.** The
+  compiler availability check used to ask `rustc` exactly once per
+  session and trust that answer forever: install or repair Rust after
+  starting slooper and every scripted effect and synth kept showing the
+  "install Rust" hint until you restarted the app (and after uninstalling
+  Rust, slooper kept promising it was there). The check now refreshes
+  itself: a missing compiler is noticed again about once a second, and a
+  compile attempt that fails re-checks immediately, so the hint appears
+  and disappears as the toolchain truly comes and goes — no restart.
+
 - **Per-note aftertouch now reaches CLAP instruments.** A MPE controller's
   note-by-note pressure (polyphonic aftertouch — the message that bends
   one held note while its neighbours stay still) was forwarded to VST2 and
