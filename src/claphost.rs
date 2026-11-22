@@ -117,6 +117,20 @@ mod ffi {
         pub features: *const *const c_char,
     }
 
+    // v117 (card t_a4175cb0): EVERY field below whose fn is implemented by
+    // THIS file is `extern "C-unwind"`, and so are all Rust-implemented
+    // callback fields in the other host-side vtables here (log, preset-load,
+    // event lists, streams, discovery indexer/receiver). These fns run when
+    // PLUGIN code calls back into the host; a plain "C" ABI frame carries a
+    // `panic_cannot_unwind` guard, so a Rust panic inside one aborts (no
+    // ffiguard catch can ever see it) and a C++ throw from the plugin cannot
+    // unwind through it either. C-unwind keeps the vtable layout identical —
+    // the callee just promises an unwindable frame. rustc E0308s across the
+    // unwind ABI (no fn-pointer coercion between "C" and "C-unwind"), so
+    // decl and impl can never drift apart silently. Plugin-IMPLEMENTED
+    // vtables (entry/factory/plugin/provider) stay plain "C": we only call
+    // those, and `crate::ffiguard::guarded` at the call site is their
+    // firewall (v116). Do not add a new host-side callback on plain "C".
     #[repr(C)]
     pub struct ClapHost {
         pub clap_version: ClapVersion,
@@ -126,16 +140,16 @@ mod ffi {
         pub url: *const c_char,
         pub version: *const c_char,
         pub get_extension:
-            unsafe extern "C" fn(host: *const ClapHost, id: *const c_char) -> *const c_void,
-        pub request_restart: unsafe extern "C" fn(host: *const ClapHost),
-        pub request_process: unsafe extern "C" fn(host: *const ClapHost),
-        pub request_callback: unsafe extern "C" fn(host: *const ClapHost),
+            unsafe extern "C-unwind" fn(host: *const ClapHost, id: *const c_char) -> *const c_void,
+        pub request_restart: unsafe extern "C-unwind" fn(host: *const ClapHost),
+        pub request_process: unsafe extern "C-unwind" fn(host: *const ClapHost),
+        pub request_callback: unsafe extern "C-unwind" fn(host: *const ClapHost),
     }
 
     #[repr(C)]
     pub struct ClapHostLog {
         /// severity: 0 fatal .. 5 trace (clap.log)
-        pub log: unsafe extern "C" fn(host: *const ClapHost, severity: u32, message: *const c_char),
+        pub log: unsafe extern "C-unwind" fn(host: *const ClapHost, severity: u32, message: *const c_char),
     }
 
     #[repr(C)]
@@ -225,8 +239,8 @@ mod ffi {
     #[repr(C)]
     pub struct ClapInputEvents {
         pub ctx: *mut c_void,
-        pub size: unsafe extern "C" fn(list: *const ClapInputEvents) -> u32,
-        pub get: unsafe extern "C" fn(
+        pub size: unsafe extern "C-unwind" fn(list: *const ClapInputEvents) -> u32,
+        pub get: unsafe extern "C-unwind" fn(
             list: *const ClapInputEvents,
             index: u32,
         ) -> *const ClapEventHeader,
@@ -236,7 +250,7 @@ mod ffi {
     #[repr(C)]
     pub struct ClapOutputEvents {
         pub ctx: *mut c_void,
-        pub try_push: unsafe extern "C" fn(
+        pub try_push: unsafe extern "C-unwind" fn(
             list: *const ClapOutputEvents,
             event: *const ClapEventHeader,
         ) -> bool,
@@ -247,7 +261,7 @@ mod ffi {
     /// load location (`on_error`).
     #[repr(C)]
     pub struct ClapHostPresetLoad {
-        pub on_error: unsafe extern "C" fn(
+        pub on_error: unsafe extern "C-unwind" fn(
             host: *const ClapHost,
             location_kind: u32,
             location: *const c_char,
@@ -255,7 +269,7 @@ mod ffi {
             os_error: i32,
             msg: *const c_char,
         ),
-        pub loaded: unsafe extern "C" fn(
+        pub loaded: unsafe extern "C-unwind" fn(
             host: *const ClapHost,
             location_kind: u32,
             location: *const c_char,
@@ -326,42 +340,42 @@ mod ffi {
     #[repr(C)]
     pub struct ClapPresetDiscoveryMetadataReceiver {
         pub receiver_data: *mut c_void,
-        pub on_error: unsafe extern "C" fn(
+        pub on_error: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             os_error: i32,
             error_message: *const c_char,
         ),
-        pub begin_preset: unsafe extern "C" fn(
+        pub begin_preset: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             name: *const c_char,
             load_key: *const c_char,
         ) -> bool,
-        pub add_plugin_id: unsafe extern "C" fn(
+        pub add_plugin_id: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             plugin_id: *const ClapUniversalPluginId,
         ),
-        pub set_soundpack_id: unsafe extern "C" fn(
+        pub set_soundpack_id: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             soundpack_id: *const c_char,
         ),
-        pub add_creator: unsafe extern "C" fn(
+        pub add_creator: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             creator: *const c_char,
         ),
-        pub set_description: unsafe extern "C" fn(
+        pub set_description: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             description: *const c_char,
         ),
-        pub set_timestamps: unsafe extern "C" fn(
+        pub set_timestamps: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             creation_time: u64,
             modification_time: u64,
         ),
-        pub add_feature: unsafe extern "C" fn(
+        pub add_feature: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             feature: *const c_char,
         ),
-        pub add_extra_info: unsafe extern "C" fn(
+        pub add_extra_info: unsafe extern "C-unwind" fn(
             receiver: *const ClapPresetDiscoveryMetadataReceiver,
             key: *const c_char,
             value: *const c_char,
@@ -394,19 +408,19 @@ mod ffi {
         pub url: *const c_char,
         pub version: *const c_char,
         pub indexer_data: *mut c_void,
-        pub declare_filetype: unsafe extern "C" fn(
+        pub declare_filetype: unsafe extern "C-unwind" fn(
             indexer: *const ClapPresetDiscoveryIndexer,
             filetype: *const ClapPresetDiscoveryFiletype,
         ) -> bool,
-        pub declare_location: unsafe extern "C" fn(
+        pub declare_location: unsafe extern "C-unwind" fn(
             indexer: *const ClapPresetDiscoveryIndexer,
             location: *const ClapPresetDiscoveryLocation,
         ) -> bool,
-        pub declare_soundpack: unsafe extern "C" fn(
+        pub declare_soundpack: unsafe extern "C-unwind" fn(
             indexer: *const ClapPresetDiscoveryIndexer,
             soundpack: *const ClapPresetDiscoverySoundpack,
         ) -> bool,
-        pub get_extension: unsafe extern "C" fn(
+        pub get_extension: unsafe extern "C-unwind" fn(
             indexer: *const ClapPresetDiscoveryIndexer,
             extension_id: *const c_char,
         ) -> *const c_void,
@@ -502,14 +516,14 @@ mod ffi {
     pub struct ClapIStream {
         pub ctx: *mut c_void,
         pub read:
-            unsafe extern "C" fn(s: *const ClapIStream, buffer: *mut c_void, size: u64) -> i64,
+            unsafe extern "C-unwind" fn(s: *const ClapIStream, buffer: *mut c_void, size: u64) -> i64,
     }
 
     #[repr(C)]
     pub struct ClapOStream {
         pub ctx: *mut c_void,
         pub write:
-            unsafe extern "C" fn(s: *const ClapOStream, buffer: *const c_void, size: u64) -> i64,
+            unsafe extern "C-unwind" fn(s: *const ClapOStream, buffer: *const c_void, size: u64) -> i64,
     }
 
     #[repr(C)]
@@ -597,7 +611,7 @@ unsafe fn preset_slot_of(host: *const ffi::ClapHost) -> Option<&'static PresetSl
     Some(unsafe { &*(data as *const PresetSlot) })
 }
 
-unsafe extern "C" fn host_preset_loaded(
+unsafe extern "C-unwind" fn host_preset_loaded(
     host: *const ffi::ClapHost,
     _location_kind: u32,
     location: *const c_char,
@@ -612,7 +626,7 @@ unsafe extern "C" fn host_preset_loaded(
     }
 }
 
-unsafe extern "C" fn host_preset_error(
+unsafe extern "C-unwind" fn host_preset_error(
     host: *const ffi::ClapHost,
     _location_kind: u32,
     location: *const c_char,
@@ -692,7 +706,7 @@ unsafe fn run_ctx_of<'a>(
     Some(unsafe { &mut *(d as *mut RunCtx) })
 }
 
-unsafe extern "C" fn idx_declare_filetype(
+unsafe extern "C-unwind" fn idx_declare_filetype(
     ix: *const ffi::ClapPresetDiscoveryIndexer,
     ft: *const ffi::ClapPresetDiscoveryFiletype,
 ) -> bool {
@@ -711,7 +725,7 @@ unsafe extern "C" fn idx_declare_filetype(
     true
 }
 
-unsafe extern "C" fn idx_declare_location(
+unsafe extern "C-unwind" fn idx_declare_location(
     ix: *const ffi::ClapPresetDiscoveryIndexer,
     loc: *const ffi::ClapPresetDiscoveryLocation,
 ) -> bool {
@@ -737,21 +751,21 @@ unsafe extern "C" fn idx_declare_location(
     true
 }
 
-unsafe extern "C" fn idx_declare_soundpack(
+unsafe extern "C-unwind" fn idx_declare_soundpack(
     _ix: *const ffi::ClapPresetDiscoveryIndexer,
     _sp: *const ffi::ClapPresetDiscoverySoundpack,
 ) -> bool {
     true // sound packs are display metadata; the crawl does not need them
 }
 
-unsafe extern "C" fn idx_get_extension(
+unsafe extern "C-unwind" fn idx_get_extension(
     _ix: *const ffi::ClapPresetDiscoveryIndexer,
     _id: *const c_char,
 ) -> *const c_void {
     std::ptr::null() // no indexer extensions offered (invalidation etc. unhosted)
 }
 
-unsafe extern "C" fn recv_on_error(
+unsafe extern "C-unwind" fn recv_on_error(
     recv: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _os_error: i32,
     msg: *const c_char,
@@ -763,7 +777,7 @@ unsafe extern "C" fn recv_on_error(
     }
 }
 
-unsafe extern "C" fn recv_begin_preset(
+unsafe extern "C-unwind" fn recv_begin_preset(
     recv: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     name: *const c_char,
     load_key: *const c_char,
@@ -793,19 +807,19 @@ unsafe extern "C" fn recv_begin_preset(
     true
 }
 
-unsafe extern "C" fn recv_pid(
+unsafe extern "C-unwind" fn recv_pid(
     _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _pid: *const ffi::ClapUniversalPluginId,
 ) {
 }
-unsafe extern "C" fn recv_str1(
+unsafe extern "C-unwind" fn recv_str1(
     _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _s: *const c_char,
 ) {
 }
-unsafe extern "C" fn recv_ts(_r: *const ffi::ClapPresetDiscoveryMetadataReceiver, _a: u64, _b: u64) {
+unsafe extern "C-unwind" fn recv_ts(_r: *const ffi::ClapPresetDiscoveryMetadataReceiver, _a: u64, _b: u64) {
 }
-unsafe extern "C" fn recv_str2(
+unsafe extern "C-unwind" fn recv_str2(
     _r: *const ffi::ClapPresetDiscoveryMetadataReceiver,
     _a: *const c_char,
     _b: *const c_char,
@@ -874,7 +888,7 @@ fn filetype_match(exts: &[String], path: &Path) -> bool {
     }
 }
 
-unsafe extern "C" fn host_get_extension(
+unsafe extern "C-unwind" fn host_get_extension(
     _host: *const ffi::ClapHost,
     id: *const c_char,
 ) -> *const c_void {
@@ -894,13 +908,21 @@ unsafe extern "C" fn host_get_extension(
     std::ptr::null()
 }
 
-unsafe extern "C" fn host_noop(_host: *const ffi::ClapHost) {}
+unsafe extern "C-unwind" fn host_noop(_host: *const ffi::ClapHost) {}
 
-unsafe extern "C" fn host_log_cb(_host: *const ffi::ClapHost, severity: u32, msg: *const c_char) {
+unsafe extern "C-unwind" fn host_log_cb(_host: *const ffi::ClapHost, severity: u32, msg: *const c_char) {
     if msg.is_null() {
         return;
     }
     let m = CStr::from_ptr(msg).to_string_lossy();
+    // v117 test trap (pin v117_clap_host_log_panic_parks_and_survives): a
+    // host-side panic re-entered from plugin code during a guarded trip
+    // must reach the ffiguard catch (park) — never the old abort. The C-unwind
+    // frame is what makes the difference; this trap is how the pin proves it.
+    #[cfg(test)]
+    if std::env::var_os("SLOOPER_TEST_PANIC_HOST_LOG").is_some() {
+        panic!("v117 test trap: panic inside the CLAP host log callback");
+    }
     // Fatal/error always print; lower severities behind an env flag so a
     // chatty plugin cannot spam a release session.
     if severity <= 2 || std::env::var_os("SLOOPER_CLAP_LOG").is_some() {
@@ -1104,12 +1126,12 @@ struct OutBuf {
 
 const OUT_RING: usize = 256;
 
-unsafe extern "C" fn cb_in_size(list: *const ffi::ClapInputEvents) -> u32 {
+unsafe extern "C-unwind" fn cb_in_size(list: *const ffi::ClapInputEvents) -> u32 {
     let b = unsafe { &*((*list).ctx as *const InBuf) };
     b.ptrs.len() as u32
 }
 
-unsafe extern "C" fn cb_in_get(
+unsafe extern "C-unwind" fn cb_in_get(
     list: *const ffi::ClapInputEvents,
     index: u32,
 ) -> *const ffi::ClapEventHeader {
@@ -1120,7 +1142,7 @@ unsafe extern "C" fn cb_in_get(
     }
 }
 
-unsafe extern "C" fn cb_out_try_push(
+unsafe extern "C-unwind" fn cb_out_try_push(
     list: *const ffi::ClapOutputEvents,
     event: *const ffi::ClapEventHeader,
 ) -> bool {
@@ -1856,7 +1878,7 @@ impl StageEntry for ClapStageEntry {
         }
         let _loader = vst_loader_lock();
         let mut buf: Vec<u8> = Vec::new();
-        unsafe extern "C" fn wr(
+        unsafe extern "C-unwind" fn wr(
             stream: *const ffi::ClapOStream,
             data: *const c_void,
             n: u64,
@@ -2228,7 +2250,7 @@ fn open_inner(
                 bytes: Vec<u8>,
                 pos: usize,
             }
-            unsafe extern "C" fn rd(
+            unsafe extern "C-unwind" fn rd(
                 stream: *const ffi::ClapIStream,
                 buffer: *mut c_void,
                 n: u64,
@@ -3046,9 +3068,10 @@ pub(crate) mod tests {
         std::env::remove_var("SLOOPER_CLAP_FIXTURE_THROW_PROBE");
         let e = r.expect_err("a throwing factory call must surface as a probe ERROR");
         assert!(e.contains("threw"), "error must name the fault class: {e}");
-        // With the trap off the SAME file probes clean — 4 descriptors.
+        // With the trap off the SAME file probes clean — 5 descriptors
+        // (v117 added fixture-throw-hostcb: four -> five).
         let ok = probe(&p).expect("the DSO must probe fine after the caught throw");
-        assert_eq!(ok.len(), 4, "all four throw descriptors listed");
+        assert_eq!(ok.len(), 5, "all five throw descriptors listed");
     }
 
     /// R4: a throw during state SAVE (chunk harvest, GUI/save thread)
@@ -3097,5 +3120,209 @@ pub(crate) mod tests {
         let v2 = e.preset_locations();
         assert!(v2.is_empty(), "the empty verdict is CACHED (no throw storm)");
         assert!(!e.is_dead(), "discovery faults must not park the RT entry");
+    }
+
+    // ================================================================ v117
+    // C-unwind ABI over the ENTIRE CLAP host-callback surface (card
+    // t_a4175cb0): every fn WE implement that PLUGIN code calls must be
+    // `extern "C-unwind"`, else a Rust panic inside it hits the
+    // `panic_cannot_unwind` guard = std::abort (no ffiguard catch is ever
+    // reached), and a C++ throw cannot unwind through it either. The ffiguard
+    // rule from 2026-11-08, applied retroactively to the v34 backend.
+
+    /// Compile-time ABI pin. Measured rustc behaviour: NO coercion exists
+    /// between `extern "C"` and `extern "C-unwind"` fn pointers (E0308 in
+    /// BOTH directions), so every binding and vtable literal below compiles
+    /// ONLY while the callback item AND its vtable field carry the exact
+    /// C-unwind type. Reverting either side — or forgetting one straggler —
+    /// fails the whole test binary at compile time: that IS the pin firing
+    /// (verify by hand-reverting one definition, `cargo test --lib
+    /// v117_clap_host_cbs_are_cunwind` must then fail to COMPILE, restore,
+    /// green again).
+    #[test]
+    fn v117_clap_host_cbs_are_cunwind() {
+        use std::os::raw::{c_char, c_void};
+        // --- item side: every nameable host-impl callback, exact signature
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, u32, *const c_char, *const c_char) = host_preset_loaded;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, u32, *const c_char, *const c_char, i32, *const c_char) = host_preset_error;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, *const c_char) -> *const c_void = host_get_extension;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost) = host_noop;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, u32, *const c_char) = host_log_cb;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapInputEvents) -> u32 = cb_in_size;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapInputEvents, u32) -> *const ffi::ClapEventHeader = cb_in_get;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapOutputEvents, *const ffi::ClapEventHeader) -> bool = cb_out_try_push;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const ffi::ClapPresetDiscoveryFiletype) -> bool = idx_declare_filetype;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const ffi::ClapPresetDiscoveryLocation) -> bool = idx_declare_location;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const ffi::ClapPresetDiscoverySoundpack) -> bool = idx_declare_soundpack;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const c_char) -> *const c_void = idx_get_extension;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, i32, *const c_char) = recv_on_error;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char, *const c_char) -> bool = recv_begin_preset;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const ffi::ClapUniversalPluginId) = recv_pid;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char) = recv_str1;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, u64, u64) = recv_ts;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char, *const c_char) = recv_str2;
+        // --- vtable side: construct every HOST-IMPLEMENTED vtable exactly
+        // as prod does (field decl types must match the items byte-for-byte)
+        // and read each fn-pointer field back at the C-unwind type.
+        let vt_log = ffi::ClapHostLog { log: host_log_cb };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, u32, *const c_char) = vt_log.log;
+        let vt_pl = ffi::ClapHostPresetLoad { on_error: host_preset_error, loaded: host_preset_loaded };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, u32, *const c_char, *const c_char, i32, *const c_char) = vt_pl.on_error;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, u32, *const c_char, *const c_char) = vt_pl.loaded;
+        let vt_host = ffi::ClapHost {
+            clap_version: ffi::ClapVersion { major: 1, minor: 2, revision: 0 },
+            host_data: std::ptr::null_mut(),
+            name: std::ptr::null(),
+            vendor: std::ptr::null(),
+            url: std::ptr::null(),
+            version: std::ptr::null(),
+            get_extension: host_get_extension,
+            request_restart: host_noop,
+            request_process: host_noop,
+            request_callback: host_noop,
+        };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost, *const c_char) -> *const c_void = vt_host.get_extension;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost) = vt_host.request_restart;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost) = vt_host.request_process;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapHost) = vt_host.request_callback;
+        let vt_in = ffi::ClapInputEvents { ctx: std::ptr::null_mut(), size: cb_in_size, get: cb_in_get };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapInputEvents) -> u32 = vt_in.size;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapInputEvents, u32) -> *const ffi::ClapEventHeader = vt_in.get;
+        let vt_out = ffi::ClapOutputEvents { ctx: std::ptr::null_mut(), try_push: cb_out_try_push };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapOutputEvents, *const ffi::ClapEventHeader) -> bool = vt_out.try_push;
+        let vt_recv = ffi::ClapPresetDiscoveryMetadataReceiver {
+            receiver_data: std::ptr::null_mut(),
+            on_error: recv_on_error,
+            begin_preset: recv_begin_preset,
+            add_plugin_id: recv_pid,
+            set_soundpack_id: recv_str1,
+            add_creator: recv_str1,
+            set_description: recv_str1,
+            set_timestamps: recv_ts,
+            add_feature: recv_str1,
+            add_extra_info: recv_str2,
+        };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, i32, *const c_char) = vt_recv.on_error;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char, *const c_char) -> bool = vt_recv.begin_preset;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const ffi::ClapUniversalPluginId) = vt_recv.add_plugin_id;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char) = vt_recv.set_soundpack_id;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char) = vt_recv.add_creator;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char) = vt_recv.set_description;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, u64, u64) = vt_recv.set_timestamps;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char) = vt_recv.add_feature;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryMetadataReceiver, *const c_char, *const c_char) = vt_recv.add_extra_info;
+        let vt_ix = ffi::ClapPresetDiscoveryIndexer {
+            clap_version: ffi::ClapVersion { major: 1, minor: 2, revision: 0 },
+            name: std::ptr::null(),
+            vendor: std::ptr::null(),
+            url: std::ptr::null(),
+            version: std::ptr::null(),
+            indexer_data: std::ptr::null_mut(),
+            declare_filetype: idx_declare_filetype,
+            declare_location: idx_declare_location,
+            declare_soundpack: idx_declare_soundpack,
+            get_extension: idx_get_extension,
+        };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const ffi::ClapPresetDiscoveryFiletype) -> bool = vt_ix.declare_filetype;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const ffi::ClapPresetDiscoveryLocation) -> bool = vt_ix.declare_location;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const ffi::ClapPresetDiscoverySoundpack) -> bool = vt_ix.declare_soundpack;
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapPresetDiscoveryIndexer, *const c_char) -> *const c_void = vt_ix.get_extension;
+        // Stream callbacks: the prod `wr`/`rd` items are fn-LOCAL (not
+        // nameable here); these dummies prove the FIELD types are C-unwind
+        // (a plain-"C" field would E0308 on this very assignment).
+        unsafe extern "C-unwind" fn v117_dummy_rd(_s: *const ffi::ClapIStream, _b: *mut c_void, _n: u64) -> i64 { 0 }
+        unsafe extern "C-unwind" fn v117_dummy_wr(_s: *const ffi::ClapOStream, _b: *const c_void, _n: u64) -> i64 { 0 }
+        let vt_is = ffi::ClapIStream { ctx: std::ptr::null_mut(), read: v117_dummy_rd };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapIStream, *mut c_void, u64) -> i64 = vt_is.read;
+        let vt_os = ffi::ClapOStream { ctx: std::ptr::null_mut(), write: v117_dummy_wr };
+        let _: unsafe extern "C-unwind" fn(*const ffi::ClapOStream, *const c_void, u64) -> i64 = vt_os.write;
+    }
+
+    /// Source-scan polarity (belt to the type pin's braces): every host-impl
+    /// callback DEFINITION exists in C-unwind form, and NO plain-"C"
+    /// definition of the class (host_/cb_/idx_/recv_ prefixes + the two
+    /// fn-local stream callbacks) survives anywhere in the file. Needles are
+    /// assembled at RUN time via format! — the pin's own text never contains
+    /// a matchable needle (vacuity guard per the source-pin doctrine).
+    #[test]
+    fn v117_clap_host_cbs_plain_c_absent() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/claphost.rs"));
+        for n in [
+            "host_preset_loaded",
+            "host_preset_error",
+            "host_get_extension",
+            "host_noop",
+            "host_log_cb",
+            "cb_in_size",
+            "cb_in_get",
+            "cb_out_try_push",
+            "idx_declare_filetype",
+            "idx_declare_location",
+            "idx_declare_soundpack",
+            "idx_get_extension",
+            "recv_on_error",
+            "recv_begin_preset",
+            "recv_pid",
+            "recv_str1",
+            "recv_ts",
+            "recv_str2",
+        ] {
+            let want = format!("extern \"C-unwind\" fn {n}");
+            assert!(src.contains(&want), "host callback {n} must be defined extern C-unwind");
+            let bad = format!("extern \"C\" fn {n}");
+            assert!(!src.contains(&bad), "host callback {n} must NOT have a plain-\"C\" definition");
+        }
+        // fn-local stream callbacks (chunk save / state load):
+        for n in ["wr(", "rd("] {
+            let want = format!("unsafe extern \"C-unwind\" fn {n}");
+            assert!(src.contains(&want), "stream callback {n} must be defined extern C-unwind");
+            let bad = format!("unsafe extern \"C\" fn {n}");
+            assert!(!src.contains(&bad), "stream callback {n} must NOT have a plain-\"C\" definition");
+        }
+        // Class straggler net: no plain-"C" definition of ANY host prefix.
+        for pfx in ["host_", "cb_", "idx_", "recv_"] {
+            let bad = format!("extern \"C\" fn {pfx}");
+            assert!(!src.contains(&bad), "a plain-\"C\" callback survived with prefix {pfx}");
+        }
+    }
+
+    /// End-to-end proof of WHAT the attribute buys: with the panic trap
+    /// armed, the fixture plugin's re-entry into `host->log` panics INSIDE
+    /// the host frame while plugin frames sit between it and our guard.
+    /// C-unwind: the panic unwinds through the plugin frame into
+    /// ffiguard::guarded — the entry PARKS, emits silence, the process
+    /// stays ALIVE. On a plain "C" frame (pre-v117 or sabotaged) this pin
+    /// does not fail soft: it SIGABRTs the test process — that IS the bug
+    /// class (v116 sabotage doctrine).
+    #[cfg(not(windows))]
+    #[test]
+    fn v117_clap_host_log_panic_parks_and_survives() {
+        let e = throw_entry("hostcb");
+        assert!(!e.is_dead(), "fresh entry is not parked");
+        std::env::set_var("SLOOPER_TEST_PANIC_HOST_LOG", "1");
+        let input = [1.0f32; 1024];
+        let mut out = [0.0f32; 1024];
+        e.process(&input, &mut out);
+        std::env::remove_var("SLOOPER_TEST_PANIC_HOST_LOG");
+        assert!(
+            e.is_dead(),
+            "a panic inside the host log callback, re-entered from plugin code, must PARK the entry"
+        );
+        assert!(out.iter().all(|s| *s == 0.0), "the caught trip must emit silence");
+        // Parked stays parked (no re-entry into the plugin):
+        let mut out2 = [0.0f32; 512];
+        e.process(&input[..512], &mut out2);
+        assert!(out2.iter().all(|s| *s == 0.0), "parked entry stays bypassed");
+        assert!(e.is_dead());
+        // Negative control: the process lives and a healthy entry (another
+        // DSO) still renders through the SAME guarded machinery.
+        let g = fixture_entry("gain");
+        let mut gout = [0.0f32; 512];
+        g.process(&input[..512], &mut gout);
+        assert!(
+            gout[500].abs() > 0.5,
+            "the gain fixture must still pass audio after the caught host-cb panic"
+        );
+        assert!(!g.is_dead());
     }
 }
