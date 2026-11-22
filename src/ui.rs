@@ -5817,6 +5817,10 @@ impl App {
     /// S / toolbar: split every selected clip at the playhead. Clips the
     /// playhead does not cross stay untouched; the right halves keep the
     /// selection, so repeating S walks a long clip into pieces.
+    /// v120: that promise was broken — the selection kept the OLD indices
+    /// (the left halves), so a second S echoed "not inside any selected
+    /// clip". The remap below moves every split id onto its right half and
+    /// shifts the kept ids past each insertion that landed before them.
     fn split_selection(&mut self) {
         if self.sel_clips.is_empty() {
             self.status = "split: select a clip first (S splits at the playhead)".into();
@@ -5825,25 +5829,56 @@ impl App {
         let ph = self.backend.engine.pos();
         let mut ids = self.sel_clips.clone();
         ids.sort();
-        let mut n = 0usize;
-        // Reverse order: inserting at c+1 never disturbs earlier indices.
-        for (t, k, c) in ids.into_iter().rev() {
-            let Some(cl) = self.arr.tracks[t].lanes[k].clips.get(c) else {
+        // v120: decide every split BEFORE applying so each kept id can be
+        // remapped afterwards (the halves are returned by value, the scan
+        // does not mutate the lane).
+        let mut splits: Vec<(usize, usize, usize, Clip, Clip)> = Vec::new();
+        for &(t, k, c) in &ids {
+            let Some(cl) = self
+                .arr
+                .tracks
+                .get(t)
+                .and_then(|tr| tr.lanes.get(k))
+                .and_then(|ln| ln.clips.get(c))
+                .copied()
+            else {
                 continue;
             };
             let alen = self.asset_len(cl.asset);
-            let Some((l, r)) = cl.split_at(ph, alen) else {
-                continue;
-            };
-            let lane = &mut self.arr.tracks[t].lanes[k];
-            lane.clips[c] = l;
-            lane.clips.insert(c + 1, r);
-            n += 1;
+            if let Some((l, r)) = cl.split_at(ph, alen) {
+                splits.push((t, k, c, l, r));
+            }
         }
+        let n = splits.len();
         if n == 0 {
             self.status = "split: the playhead is not inside any selected clip".into();
             return;
         }
+        // Reverse order: inserting at c+1 never disturbs earlier indices.
+        for &(t, k, c, ref l, ref r) in splits.iter().rev() {
+            let lane = &mut self.arr.tracks[t].lanes[k];
+            lane.clips[c] = *l;
+            lane.clips.insert(c + 1, *r);
+        }
+        // v120: rebuild the selection on the RIGHT halves. A split id
+        // (t,k,c) lands at c+1, then each EARLIER split in the same lane
+        // (c' < c) shifted it once more; an unsplit id stays put but is
+        // shifted by those same earlier insertions (c' + 1 <= c).
+        let remap = |id: &(usize, usize, usize)| -> (usize, usize, usize) {
+            let (t, k, c) = *id;
+            let shift = splits
+                .iter()
+                .filter(|(t2, k2, c2, _, _)| *t2 == t && *k2 == k && *c2 < c)
+                .count();
+            let right = splits.iter().any(|(t2, k2, c2, _, _)| {
+                *t2 == t && *k2 == k && *c2 == c
+            });
+            (t, k, c + shift + usize::from(right))
+        };
+        let mut sel: Vec<(usize, usize, usize)> = ids.iter().map(remap).collect();
+        sel.sort();
+        sel.dedup();
+        self.sel_clips = sel;
         self.sel_anchor = self.sel_clips.first().copied();
         self.push_project();
         self.status = format!("split {n} clip(s) at the playhead");
@@ -37331,6 +37366,229 @@ mod tests {
             !has_text(&mut app, &ctx, "sine \u{b7}"),
             "strip hides without a selection"
         );
+    }
+
+    /// v120 (card t_64efd07c): the doc promises "the right halves keep the
+    /// selection, so repeating S walks a long clip into pieces" — a single
+    /// split worked but the selection stayed on the left half, so the
+    /// SECOND S echoed "not inside any selected clip". Drives bare S keys
+    /// through frame_keys (the real key seam) with seek_to between presses;
+    /// asserts the selection remaps onto each new right half at every step.
+    #[test]
+    fn v120_repeated_s_walks_long_clip() {
+        let mut app = headless_app("v120walk");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 96_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "walk".into(),
+            std::path::PathBuf::from("/tmp/v120-walk.wav"),
+            data,
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.select_one((0, 0, 0));
+        frame_keys(&mut app, &ctx, vec![]);
+
+        // --- S #1 at 48k: split, and the RIGHT half is what stays selected.
+        app.backend.engine.seek_to(48_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(lane.clips.len(), 2, "S #1 split the clip");
+            assert_eq!(
+                app.sel_clips,
+                vec![(0, 0, 1)],
+                "selection moved onto the right half (was: left-half index)"
+            );
+            assert_eq!(app.sel_anchor, Some((0, 0, 1)), "anchor follows the walk");
+            assert_eq!(lane.clips[1].pos, 48_000, "index 1 is the right half");
+            assert!(
+                !app.status.contains("not inside"),
+                "echo after a real split: {}",
+                app.status
+            );
+        }
+
+        // --- S #2 further right: the DOCUMENTED workflow — walks again.
+        app.backend.engine.seek_to(72_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(
+                lane.clips.len(),
+                3,
+                "S #2 split the right half (repeat-S walk broken): status {}",
+                app.status
+            );
+            assert!(
+                app.status.starts_with("split 1 clip(s)"),
+                "S #2 echo: {}",
+                app.status
+            );
+            assert_eq!(
+                app.sel_clips,
+                vec![(0, 0, 2)],
+                "selection on the newest right half"
+            );
+            assert_eq!(lane.clips[2].pos, 72_000);
+            assert_eq!(lane.clips[2].cut, 72_000, "right half resumes the source");
+        }
+
+        // --- S #3 once more: the walk keeps going, and identity holds
+        // (each piece's pos chain proves the selection tracked the right
+        // pieces, not re-split leftovers).
+        app.backend.engine.seek_to(84_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(lane.clips.len(), 4, "S #3 keeps walking");
+            assert_eq!(app.sel_clips, vec![(0, 0, 3)]);
+            assert_eq!(lane.clips[3].pos, 84_000);
+            assert_eq!(
+                lane.clips.iter().map(|c| c.pos).collect::<Vec<_>>(),
+                vec![0, 48_000, 72_000, 84_000]
+            );
+        }
+
+        // --- Playhead BACK on a deselected (left) piece: correct refusal —
+        // the walk selection only covers the right halves.
+        app.backend.engine.seek_to(24_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert!(
+            app.status.contains("not inside"),
+            "left pieces are deselected: {}",
+            app.status
+        );
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips.len(),
+            4,
+            "refused S changed nothing"
+        );
+    }
+
+    /// v120: a multi-clip selection where only ONE clip is crossed keeps
+    /// the other three selected, with indices shifted past the insertion —
+    /// and the shifted ids still NAME the same clips (identity check via
+    /// pos, not just index arithmetic).
+    #[test]
+    fn v120_split_keeps_unsplit_ids_shifted() {
+        let mut app = headless_app("v120keep");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 120_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "four".into(),
+            std::path::PathBuf::from("/tmp/v120-four.wav"),
+            data,
+            false,
+        ));
+        // Four sequential 30k clips back-to-back (no gap): 0, 30k, 60k, 90k.
+        // BOUNDED play_len each — an open-ended clip runs the whole asset
+        // and would overlap (and split with) its neighbours.
+        for pos in [0u64, 30_000, 60_000, 90_000] {
+            let mut cl = Clip::new(a, pos);
+            cl.play_len = Some(30_000);
+            app.arr.insert(0, 0, cl);
+        }
+        app.sel_clips = vec![(0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 0, 3)];
+        frame_keys(&mut app, &ctx, vec![]);
+
+        app.backend.engine.seek_to(45_000); // crosses ONLY clip 1 (30k..60k)
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        {
+            let lane = &app.arr.tracks[0].lanes[0];
+            assert_eq!(lane.clips.len(), 5, "one split inserted a fifth clip");
+            assert_eq!(
+                app.sel_clips,
+                vec![(0, 0, 0), (0, 0, 2), (0, 0, 3), (0, 0, 4)],
+                "unsplit ids shifted past the insertion; split id -> right half"
+            );
+            assert_eq!(app.sel_anchor, Some((0, 0, 0)), "anchor = first kept id");
+            // Identity: every selected id still names its original clip
+            // body (kept A, B's right half, then C and D shifted one slot
+            // right — NOT their pre-split neighbours).
+            let pos_of = |c: usize| lane.clips[c].pos;
+            assert_eq!(pos_of(0), 0, "kept clip A");
+            assert_eq!(pos_of(2), 45_000, "B's right half");
+            assert_eq!(pos_of(3), 60_000, "kept clip C shifted 2->3");
+            assert_eq!(pos_of(4), 90_000, "kept clip D shifted 3->4");
+            assert_eq!(lane.clips[1].play_len, Some(15_000), "B's left half is 30k..45k");
+        }
+
+        // Second S at the SAME playhead: B's right half (45k..60k) is now
+        // crossed at its start? No — 45k is its pos, and pos is NOT inside;
+        // boundary semantics unchanged: clip count stays 5.
+        let before = app.arr.tracks[0].lanes[0].clips.len();
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(
+            app.arr.tracks[0].lanes[0].clips.len(),
+            before,
+            "playhead exactly at a selected clip's start is not inside it: {}",
+            app.status
+        );
+
+        // Boundary contract at a kept clip's interior start point:
+        app.backend.engine.seek_to(75_000); // inside clip C (60k..90k), selected
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.arr.tracks[0].lanes[0].clips.len(), 6, "kept clip C splits next");
+        assert_eq!(
+            app.sel_clips,
+            vec![(0, 0, 0), (0, 0, 2), (0, 0, 4), (0, 0, 5)],
+            "C -> right half; D shifts again; untouched ids stay put"
+        );
+    }
+
+    /// v120: the walk across TWO TRACKS — one selection entry per track,
+    /// both crossed by the same playhead; every S must remap BOTH entries
+    /// onto their right halves (per-(track,lane) index remapping).
+    #[test]
+    fn v120_split_right_half_selection_multilane() {
+        let mut app = headless_app("v120multi");
+        let ctx = egui::Context::default();
+        frame_keys(&mut app, &ctx, vec![]);
+        let data: std::sync::Arc<[f32]> = vec![0.25f32; 96_000].into();
+        let a = app.assets.len() as u32;
+        app.assets.push(crate::assets::Asset::audio(
+            a,
+            "dual".into(),
+            std::path::PathBuf::from("/tmp/v120-dual.wav"),
+            data,
+            false,
+        ));
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.arr.insert(1, 0, Clip::new(a, 0));
+        app.sel_clips = vec![(0, 0, 0), (1, 0, 0)];
+        frame_keys(&mut app, &ctx, vec![]);
+
+        app.backend.engine.seek_to(24_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.sel_clips, vec![(0, 0, 1), (1, 0, 1)], "both right halves selected");
+        assert!(
+            app.status.starts_with("split 2 clip(s)"),
+            "echo: {}",
+            app.status
+        );
+
+        app.backend.engine.seek_to(48_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.sel_clips, vec![(0, 0, 2), (1, 0, 2)], "walk #2 on both tracks");
+
+        app.backend.engine.seek_to(72_000);
+        frame_keys(&mut app, &ctx, vec![key_ev(egui::Key::S, egui::Modifiers::NONE)]);
+        assert_eq!(app.sel_clips, vec![(0, 0, 3), (1, 0, 3)], "walk #3 on both tracks");
+        for t in 0..2 {
+            let lane = &app.arr.tracks[t].lanes[0];
+            assert_eq!(lane.clips.len(), 4, "track {t} walked to four pieces");
+            assert_eq!(
+                lane.clips.iter().map(|c| c.pos).collect::<Vec<_>>(),
+                vec![0, 24_000, 48_000, 72_000]
+            );
+        }
     }
 
     // ===================== v0.10 acceptance pins =====================
