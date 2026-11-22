@@ -725,12 +725,18 @@ fn compile_synth(src: &Path, out: &Path) -> Result<(), String> {
         .arg(src)
         .output()
         .map_err(|e| {
+            // v114: a spawn failure contradicts any cached "available" —
+            // drop the latch so the next frame shows the W3 banner.
+            crate::fx::rustc_probe_stale();
             format!(
                 "could not run rustc: {e} — {}",
                 crate::fx::rustc_install_hint()
             )
         })?;
     if !output.status.success() {
+        // v114: the toolchain ran but may itself be broken/gone — refresh
+        // availability so a vanished rustc stops being claimed.
+        crate::fx::rustc_probe_stale();
         let err = String::from_utf8_lossy(&output.stderr);
         std::fs::write(crate::paths::build_sidecar(out, "failed"), err.as_bytes()).ok();
         let mut err: String = err.trim().chars().take(1800).collect();
