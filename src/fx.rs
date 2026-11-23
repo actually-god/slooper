@@ -4293,6 +4293,195 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v130 regression (card t_8722d32c): vol shape 4 ("hold") latched on
+    /// `(th2 + 1e-12) < hold_th` while hold_th started at 0.0 and th2 stays
+    /// in [0,1) — the condition could NEVER fire. `hold` stayed 1.0, so
+    /// vol_l/vol_r were constant 1.0 and the volume wheel was DEAD at any
+    /// depth/rate. v130: "hold" = sample & hold stepped waveform — a new
+    /// deterministic LCG gain latched exactly once per vol-LFO cycle
+    /// (latching the sine at wrap phase instead would just pin a constant,
+    /// so the card's sketch shape stays dead). Pins feed l = r = 0.5 with
+    /// pan depth 0 / cent 0, so the settled pan is the house centre and
+    /// out / (0.5/sqrt2) IS the vol gain. Slew 1 ms, 0.5 s settle skipped.
+    /// A1 segments piecewise constant; A2 alive + span (pre-fix: pinned
+    /// 1.0, zero steps — fails here); A3 exactly one step per cycle at
+    /// 4 Hz; A4 L/R locked sample-exact despite phase off 0.5; A5 depth
+    /// authority (dep 0 -> unity, dep 0.5 -> [0.5, 1]); A6 two instances
+    /// bit-identical (deterministic, no std::rand); A7 sine still smooth
+    /// (non-hold shapes untouched); A8 pan wheel alive while vsh=4.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v130_autopan_hold_latches() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v130aph");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+        let hc = std::f32::consts::FRAC_1_SQRT_2; // settled pan gain per side
+
+        // Param slots: [pan shape, pan rate, pan depth, centre, phase off,
+        // vol shape, vol rate, vol depth, slew, gain, host].
+        let mk = |vsh: f32, vdep: f32, phoff: f32, pdep: f32, prate: f32| -> [f32; MAX_PARAMS] {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            dp[1] = prate;
+            dp[2] = pdep;
+            dp[4] = phoff;
+            dp[5] = vsh;
+            dp[6] = 4.0; // vol rate 4 Hz -> one wrap per 12000 samples
+            dp[7] = vdep;
+            dp[8] = 1.0; // slew 1 ms: settles in ~15 ms
+            dp[9] = 1.0; // output trim unity
+            dp
+        };
+        // Raw pair stream, 0.5 s slew-settle skipped.
+        let run = |dp: &[f32; MAX_PARAMS], n: usize| -> (Vec<f32>, Vec<f32>) {
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan hold inst");
+            let settle = (0.5 * sr) as usize;
+            let mut vl = Vec::with_capacity(n);
+            let mut vr = Vec::with_capacity(n);
+            for i in 0..(settle + n) {
+                let (ol, or) = unsafe { inst.call_sample_st(0.5, 0.5, dp, 0.0) };
+                if i >= settle {
+                    vl.push(ol);
+                    vr.push(or);
+                }
+            }
+            drop(inst);
+            (vl, vr)
+        };
+        // Normalised vol gain (pan settled at the house centre).
+        let gain_of = |v: &[f32]| -> Vec<f32> {
+            v.iter().map(|&o| o / (0.5 * hc)).collect()
+        };
+        // Sample indices where the piecewise gain steps (in-segment diff
+        // is exact 0 after the slew fixed point, steps are ~0.1+).
+        let steps = |v: &[f32]| -> Vec<usize> {
+            (1..v.len())
+                .filter(|&i| (v[i] - v[i - 1]).abs() > 1e-4)
+                .collect()
+        };
+
+        // ---- A1/A2/A3/A4: stepped, alive, one step per cycle ---------
+        // (phase off 0.5 rides along: hold must step BOTH sides together)
+        let dp = mk(4.0, 1.0, 0.5, 0.0, 0.005);
+        let (vl, vr) = run(&dp, (4.0 * sr) as usize); // 16 vol cycles
+        let g = gain_of(&vl);
+        let b = steps(&g);
+        assert!(
+            b.len() >= 14 && b.len() <= 18,
+            "v130 A3: 4 Hz hold over 16 cycles must step ~16 times — got {} steps {b:?} (pre-fix the latch NEVER fired: hold pinned at 1.0, ZERO steps, dead tremolo)",
+            b.len(),
+        );
+        for w in b.windows(2) {
+            assert!(
+                (11985usize..=12015).contains(&(w[1] - w[0])),
+                "v130 A3: step gap {} samples is not one 4 Hz cycle (12000 +-15) — hold must re-latch exactly once per vol-LFO cycle",
+                w[1] - w[0],
+            );
+        }
+        // A1: inside a segment the gain is bit-identical (piecewise const).
+        let mut edge = 0usize;
+        let mut worst_seg = 0.0f32;
+        for &bb in b.iter().chain(std::iter::once(&g.len())) {
+            for i in (edge + 1).min(bb)..bb {
+                worst_seg = worst_seg.max((g[i] - g[i - 1]).abs());
+            }
+            edge = bb;
+        }
+        assert!(
+            worst_seg < 1e-6,
+            "v130 A1: in-segment gain wanders {worst_seg} — hold segments must be constant between wraps",
+        );
+        // A2: the steps span real depth (pre-fix: constant 1.0).
+        let seg_g: Vec<f32> = std::iter::once(0)
+            .chain(b.clone())
+            .map(|s| g[s.min(g.len() - 1)])
+            .collect();
+        let mean = seg_g.iter().sum::<f32>() / seg_g.len() as f32;
+        let sd = (seg_g.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / seg_g.len() as f32).sqrt();
+        let lo = seg_g.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = seg_g.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            sd > 0.05 && lo < 0.45 && hi > 0.55,
+            "v130 A2: hold at vdep=1 must modulate broadly — std {sd}, span [{lo}, {hi}] over {} steps (pre-fix everything sat at 1.0)",
+            seg_g.len(),
+        );
+
+        // ---- A4: L/R locked together despite phase off ---------------
+        for i in 0..vl.len() {
+            let dl = vl[i] / (0.5 * hc);
+            let dr = vr[i] / (0.5 * hc);
+            assert!(
+                (dl - dr).abs() < 1e-5,
+                "v130 A4: vsh=4 at phase off 0.5 must step BOTH sides together — L {dl} vs R {dr} at {i}"
+            );
+            if i > 100 {
+                break; // the parity class is global; a prefix proves it
+            }
+        }
+
+        // ---- A5: depth authority --------------------------------------
+        let (v0, _) = run(&mk(4.0, 0.0, 0.0, 0.0, 0.005), (1.0 * sr) as usize);
+        let g0 = gain_of(&v0);
+        let dev = g0.iter().fold(0.0f32, |m, &x| m.max((x - 1.0).abs()));
+        assert!(
+            dev < 1e-4,
+            "v130 A5: vdep=0 must be unity gain whatever hold latches — worst dev {dev}",
+        );
+        let (vh, _) = run(&mk(4.0, 0.5, 0.0, 0.0, 0.005), (3.0 * sr) as usize);
+        let gh = gain_of(&vh);
+        let hlo = gh.iter().cloned().fold(f32::MAX, f32::min);
+        let hhi = gh.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            hlo > 0.5 - 1e-3 && hhi <= 1.0 + 1e-3,
+            "v130 A5: vdep=0.5 steps must live in [0.5, 1] — got [{hlo}, {hhi}]",
+        );
+
+        // ---- A6: deterministic — same params, same step sequence -----
+        let (va, _) = run(&mk(4.0, 1.0, 0.0, 0.0, 0.005), (0.6 * sr) as usize);
+        let (vb, _) = run(&mk(4.0, 1.0, 0.0, 0.0, 0.005), (0.6 * sr) as usize);
+        assert!(
+            va == vb,
+            "v130 A6: two fresh instances with the same params must produce the IDENTICAL hold sequence (deterministic DSP)",
+        );
+
+        // ---- A7: non-hold shapes stay smooth -------------------------
+        let (vs, _) = run(&mk(0.0, 1.0, 0.0, 0.0, 0.005), (1.0 * sr) as usize);
+        let gs = gain_of(&vs);
+        let smooth = (1..gs.len())
+            .filter(|&i| (gs[i] - gs[i - 1]).abs() > 1e-6)
+            .count() as f64
+            / gs.len() as f64;
+        assert!(
+            smooth > 0.95,
+            "v130 A7: vsh=0 sine must change every sample (smooth tremolo) — only {smooth:.3} of samples move (hold plumbing leaked into the smooth path)",
+        );
+
+        // ---- A8: the pan wheel stays alive while vol holds -----------
+        {
+            let dpp = mk(4.0, 0.0, 0.0, 1.0, 2.0); // vol depth 0, pan swings
+            let (pl, pr) = run(&dpp, (1.2 * sr) as usize);
+            let mut lo8 = f32::MAX;
+            let mut hi8 = f32::MIN;
+            for i in (0.2 * sr) as usize..pl.len() {
+                lo8 = lo8.min(pr[i] - pl[i]);
+                hi8 = hi8.max(pr[i] - pl[i]);
+            }
+            assert!(
+                hi8 > 0.30 && lo8 < -0.30,
+                "v130 A8: vsh=4 must leave the PAN wheel working (2 Hz depth 1 swings +-0.3) — got [{lo8}, {hi8}]",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Native Suite tier 5 pins (docs/EFFECT-SUITE.md): space_echo went ABI-v3
     /// STEREO (algorithmic-room task). Impulse-STRUCTURE shape per the
     /// tier-4 rule — energy gates are blind to dead loops, and here they
