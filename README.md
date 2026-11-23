@@ -47,6 +47,9 @@ tarball.
   bindings) saves to a single `.slooper` JSON file; audio is never embedded.
 - **MIDI binding & shortcuts** — every action binds to a live-captured MIDI
   note/CC/PC or key; everything rebindable and persistent.
+- **Agent control over MCP (optional)** — a built-in, loopback-only MCP
+  server lets Claude Desktop or a coding agent drive the running instance;
+  off by default, with a read-only latch — [docs/MCP.md](docs/MCP.md).
 - **Export** — a single track, the whole project, or just the current
   selection as WAV/FLAC (built in) or MP3/OGG (via ffmpeg).
 - **Bundled TR-808 pack** — 24 one-shots plus an 808-Kit preset, so a drum
@@ -85,6 +88,7 @@ troubleshooting: **[docs/INSTALL.md](docs/INSTALL.md)**.
 | --- | --- |
 | [docs/INSTALL.md](docs/INSTALL.md) | install & audio-server setup, Linux + Windows |
 | [docs/USAGE.md](docs/USAGE.md) | walkthrough + reference: recording, piano roll, quantize, shortcuts, MIDI control |
+| [docs/MCP.md](docs/MCP.md) | driving slooper from an AI agent over MCP — enable flow, token, bridge, tool reference |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | scripted synths, VST/CLAP hosting, presets |
 | [docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md) | the 23 bundled effects, and writing your own |
 | [docs/SIDECHAIN.md](docs/SIDECHAIN.md) | sidechain routing |
