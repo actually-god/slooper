@@ -493,6 +493,11 @@ pub struct MasterMeter {
     pub clip: bool,
     /// Total frames fed (telemetry / "meter alive" test).
     pub frames_fed: u64,
+    /// v131: the rate this meter's windows were built for. LUFS block
+    /// size, K-weighting and `bin_hz` all freeze at construction, so
+    /// the UI compares this against the live backend rate and REPLACES
+    /// the meter when they differ (live reconnect / hot-swap).
+    pub sr: u32,
 }
 
 impl MasterMeter {
@@ -506,6 +511,7 @@ impl MasterMeter {
             r_hold: -120.0,
             clip: false,
             frames_fed: 0,
+            sr,
         }
     }
 
