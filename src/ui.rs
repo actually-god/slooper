@@ -61582,4 +61582,74 @@ mod tests {
         );
     }
 
+    /// v126 regression (card t_d0a6e1a7): the card's EXACT user symptom,
+    /// end to end. Delete an edited sample, re-import a fresh file at the
+    /// same path, and reload the project's stored edits — the new sample
+    /// must stay PRISTINE. v122 dropped the map keys at the seam
+    /// (`v122_rack_del_forgets_path_state` asserts the removal itself);
+    /// this pin owns the persistence + re-import outcome the bug report
+    /// describes ("a brand-new sample silently plays reversed"): the
+    /// stale key surviving `build_project` is the on-disk vector, and
+    /// `restore_sample_edits` at reload is what bakes it into the data.
+    #[test]
+    fn v126_rack_del_reimport_is_pristine() {
+        let mut app = headless_app("v126del");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v126del")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        let wav = samples.join("hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let key = wav.to_string_lossy().into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        let edited = app.assets[0].data.to_vec();
+        app.rack_del(&key);
+        assert!(!wav.exists(), "setup: file unlinked");
+        // The saved project must not carry edits for a deleted sample —
+        // a surviving key here is what resurrected the phantom edit at
+        // the next load (on-disk vector of the bug).
+        let pr = app.build_project("v126del".into());
+        assert!(
+            !pr.sample_edits.contains_key(&key),
+            "project save must not carry the deleted sample's edit: {:?}",
+            pr.sample_edits.keys().collect::<Vec<_>>()
+        );
+        // Same-name re-import: a NEW file at the deleted path, decoded
+        // into a fresh app, then the stored edits reloaded over it.
+        v28_wav(&samples, "hat.wav");
+        // Identical bytes under a key the edit map never held — the
+        // positive pristine reference.
+        v28_wav(&samples, "untouched.wav");
+        let mut app2 = headless_app("v126del2");
+        app2.rack[0].path = samples.display().to_string();
+        app2.rack[0].rescan();
+        let _ = app2.ensure_asset(&wav);
+        let other = samples.join("untouched.wav");
+        let _ = app2.ensure_asset(&other);
+        app2.restore_sample_edits(&pr.sample_edits);
+        let fresh = app2.assets[0].data.to_vec();
+        assert_eq!(
+            fresh,
+            app2.assets[1].data.to_vec(),
+            "the re-imported sample must equal a pristine decode of the same bytes"
+        );
+        assert_ne!(
+            fresh, edited,
+            "the deleted sample's reverse edit must NOT bake into the re-imported file"
+        );
+    }
+
 }
