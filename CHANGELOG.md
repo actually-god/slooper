@@ -8,6 +8,18 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Echo + Reverb's `damp` knob now does what its label says.** The knob
+  is documented (and displayed) as a damping corner in Hz — higher =
+  brighter tail, exactly like the sibling `tone` knob — but the comb
+  loop received `1 − exp(−2π·damp/sr)` instead of the filter coefficient
+  itself, so dragging `damp` up DARKENED the room. The wiring now mirrors
+  the tone path, and the factory rooms were rebalanced to their named
+  intent (measured mid-tail ladder): *Practice Hall* opens to 0.82/9000,
+  *Opera House* settles at 0.86/2800, *Cathedral* deepens to 0.94/1200 —
+  bright hall → auditorium → opera → dark cathedral now descends in
+  exactly that tonal order (pinned by `v133_space_echo_*`; the older
+  `v14_*` forensic flavors were retargeted to the same effective loop
+  coefficients across the law change).
 - **A preset name that sanitizes to nothing is now refused instead of
   written as an invisible file.** Typing pure punctuation ("!!!") into a
   hosted plugin's parameter-preset box reported "saved" while writing a
