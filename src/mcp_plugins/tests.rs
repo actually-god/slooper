@@ -1,5 +1,5 @@
-//! v109/MCP-05 pins (board t_3f374341): the plugins/plugin/sampler/drum/midi
-//! tool family. Acceptance pass = scratch/slooper-v109/REQUIREMENTS.md.
+//! v128/MCP-05 pins (board t_3f374341): the plugins/plugin/sampler/drum/midi
+//! tool family. Acceptance pass = scratch/slooper-v128/REQUIREMENTS.md.
 //! Tier-1 doctrine (v32): pins drive the TOOL layer (call), never the
 //! implementers; writes are asserted through the read tools / live state
 //! the GUI itself reads.
@@ -14,7 +14,7 @@ use std::sync::{Arc, Once};
 /// endpoint file (same recipe as the mcp02 pins).
 fn isolated_data_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "sp-v109-{}-{:x}",
+        "sp-v128-{}-{:x}",
         tag,
         std::process::id()
     ));
@@ -100,7 +100,7 @@ fn render(inst: &Arc<crate::synth::Instance>, note: u8, vel: u8) -> Vec<f32> {
 // ── R1/R2: catalog parity + instances + schemas ─────────────────────────
 
 #[test]
-fn v109_plugins_list_catalog_parity() {
+fn v128_plugins_list_catalog_parity() {
     let _d = isolated_data_dir("list");
     let mut app = headless_app("mcp05-list");
     let out = structured(&mut app, "plugins.list", json!({"kind": "effect"}));
@@ -158,7 +158,7 @@ fn v109_plugins_list_catalog_parity() {
 }
 
 #[test]
-fn v109_plugins_instances_addresses() {
+fn v128_plugins_instances_addresses() {
     let (mut app, _dir) = fixture("inst");
     app.mcp05_set_track_synth(0, "drums");
     app.mcp05_add_fx_script(0, "delay");
@@ -193,7 +193,7 @@ fn v109_plugins_instances_addresses() {
 }
 
 #[test]
-fn v109_plugin_params_roundtrip_and_status_echo() {
+fn v128_plugin_params_roundtrip_and_status_echo() {
     let (mut app, _dir) = fixture("param");
     app.mcp05_add_fx_script(0, "delay");
     let p = structured(&mut app, "plugin.params", json!({"track": 0, "row": 0}));
@@ -228,7 +228,7 @@ fn v109_plugin_params_roundtrip_and_status_echo() {
 }
 
 #[test]
-fn v109_plugin_param_validation_errors() {
+fn v128_plugin_param_validation_errors() {
     let (mut app, _dir) = fixture("val");
     app.mcp05_add_fx_script(0, "vfilter");
     // param index beyond the table
@@ -293,7 +293,7 @@ fn v109_plugin_param_validation_errors() {
 
 #[test]
 #[ignore = "slow-tier: plugin script spawn + DSP render"]
-fn v109_plugin_param_set_fx_audible() {
+fn v128_plugin_param_set_fx_audible() {
     let (mut app, _dir) = fixture("fxaud");
     app.mcp05_add_fx_script(0, "vfilter");
     let inst = app.mcp05_fx_live(0, 0).expect("live vfilter");
@@ -345,7 +345,7 @@ fn v109_plugin_param_set_fx_audible() {
 
 #[test]
 #[ignore = "slow-tier: piano script spawn + DSP render"]
-fn v109_plugin_param_set_synth_audible() {
+fn v128_plugin_param_set_synth_audible() {
     let (mut app, _dir) = fixture("sndaud");
     app.mcp05_set_track_synth(0, "piano");
     let inst = match app.mcp05_synth_handle(0).expect("bound piano").as_ref() {
@@ -393,7 +393,7 @@ fn v109_plugin_param_set_synth_audible() {
 // ── R4: preset storage round-trips (real bar storage, sanitize honored) ──
 
 #[test]
-fn v109_fx_preset_roundtrip_and_sanitize() {
+fn v128_fx_preset_roundtrip_and_sanitize() {
     let (mut app, _dir) = fixture("fxpre");
     app.mcp05_add_fx_script(0, "delay");
     // change two params through the tool
@@ -466,7 +466,7 @@ fn v109_fx_preset_roundtrip_and_sanitize() {
 }
 
 #[test]
-fn v109_synth_preset_roundtrip() {
+fn v128_synth_preset_roundtrip() {
     let (mut app, dir) = fixture("synpre");
     app.mcp05_set_track_synth(0, "piano");
     let p = structured(&mut app, "plugin.params", json!({"track": 0}));
@@ -507,10 +507,10 @@ fn v109_synth_preset_roundtrip() {
 }
 
 #[test]
-fn v109_sampler_map_preset_roundtrip() {
+fn v128_sampler_map_preset_roundtrip() {
     let (mut app, dir) = fixture("mappre");
     app.mcp05_set_track_synth(0, "sampler");
-    let a0 = app.mcp05_test_add_audio_asset("a0.wav", PathBuf::from("/tmp/v109-a0.wav"));
+    let a0 = app.mcp05_test_add_audio_asset("a0.wav", PathBuf::from("/tmp/v128-a0.wav"));
     app.mcp05_sampler_map_commit(0, crate::config::SamplerMapSave { slots: vec![], mode: 0 });
     structured(
         &mut app,
@@ -549,11 +549,11 @@ fn v109_sampler_map_preset_roundtrip() {
 // ── R5: sampler map / layers / drum pads / midi notes ────────────────────
 
 #[test]
-fn v109_sampler_map_set_get_layers() {
+fn v128_sampler_map_set_get_layers() {
     let (mut app, _dir) = fixture("smap");
     app.mcp05_set_track_synth(0, "sampler");
-    let a0 = app.mcp05_test_add_audio_asset("kick.wav", PathBuf::from("/tmp/v109-kick.wav"));
-    let a1 = app.mcp05_test_add_audio_asset("snare.wav", PathBuf::from("/tmp/v109-snare.wav"));
+    let a0 = app.mcp05_test_add_audio_asset("kick.wav", PathBuf::from("/tmp/v128-kick.wav"));
+    let a1 = app.mcp05_test_add_audio_asset("snare.wav", PathBuf::from("/tmp/v128-snare.wav"));
     let _ = a1;
     let out = structured(&mut app, "sampler.map.get", json!({"track": 0}));
     assert_eq!(out["has_map"], false, "fresh track has no map: {out}");
@@ -571,7 +571,7 @@ fn v109_sampler_map_set_get_layers() {
     structured(
         &mut app,
         "sampler.map.set",
-        json!({"track": 0, "slot": 1, "path": "/tmp/v109-snare.wav", "root": 54, "vel": 90}),
+        json!({"track": 0, "slot": 1, "path": "/tmp/v128-snare.wav", "root": 54, "vel": 90}),
     );
     let out = structured(&mut app, "sampler.map.get", json!({"track": 0}));
     assert_eq!(out["slots"][1]["asset_id"], 1);
@@ -604,10 +604,10 @@ fn v109_sampler_map_set_get_layers() {
 }
 
 #[test]
-fn v109_sampler_validation_errors() {
+fn v128_sampler_validation_errors() {
     let (mut app, _dir) = fixture("sval");
     app.mcp05_set_track_synth(0, "sampler");
-    app.mcp05_test_add_audio_asset("k.wav", PathBuf::from("/tmp/v109-k.wav"));
+    app.mcp05_test_add_audio_asset("k.wav", PathBuf::from("/tmp/v128-k.wav"));
     // asset ids are rack table indices (R6 example error verbatim)
     let m = is_error(
         &mut app,
@@ -662,7 +662,7 @@ fn v109_sampler_validation_errors() {
         "invalid_params",
     );
     // MIDI assets are not audio-slot material
-    let pid = app.mcp05_test_add_pattern_asset("p.mid", PathBuf::from("/tmp/v109-p.mid"));
+    let pid = app.mcp05_test_add_pattern_asset("p.mid", PathBuf::from("/tmp/v128-p.mid"));
     is_error(
         &mut app,
         "sampler.map.set",
@@ -673,7 +673,7 @@ fn v109_sampler_validation_errors() {
 
 #[test]
 #[ignore = "slow-tier: sampler script spawn + DSP render"]
-fn v109_sampler_map_asset_and_velocity_audio() {
+fn v128_sampler_map_asset_and_velocity_audio() {
     // R3 sampler half: via MCP tools ONLY, pick slots/roots/layers, then
     // render and PROVE which asset (root select) and which layer (velocity
     // cutoff) the engine played — the v51 tone pair as the sound source.
@@ -688,8 +688,8 @@ fn v109_sampler_map_asset_and_velocity_audio() {
     });
     let (mut app, _dir) = fixture("smaud");
     app.mcp05_set_track_synth(0, "sampler");
-    let a0 = app.mcp05_test_add_audio_asset("low200.wav", PathBuf::from("/tmp/v109-lo.wav"));
-    let a1 = app.mcp05_test_add_audio_asset("hi800.wav", PathBuf::from("/tmp/v109-hi.wav"));
+    let a0 = app.mcp05_test_add_audio_asset("low200.wav", PathBuf::from("/tmp/v128-lo.wav"));
+    let a1 = app.mcp05_test_add_audio_asset("hi800.wav", PathBuf::from("/tmp/v128-hi.wav"));
     structured(
         &mut app,
         "sampler.map.set",
@@ -735,11 +735,11 @@ fn v109_sampler_map_asset_and_velocity_audio() {
 }
 
 #[test]
-fn v109_drum_kit_pad_and_preset_roundtrip() {
+fn v128_drum_kit_pad_and_preset_roundtrip() {
     let (mut app, _dir) = fixture("drum");
     app.mcp05_set_track_synth(0, "drums");
     app.mcp05_set_track_synth(1, "drums");
-    let kick = app.mcp05_test_add_audio_asset("808kick.wav", PathBuf::from("/tmp/v109-808.wav"));
+    let kick = app.mcp05_test_add_audio_asset("808kick.wav", PathBuf::from("/tmp/v128-808.wav"));
     let out = structured(&mut app, "drum.kit.get", json!({"track": 0}));
     let npads = out["count"].as_u64().unwrap() as usize;
     assert!(npads >= 8, "stock kit has pads: {out}");
@@ -771,15 +771,15 @@ fn v109_drum_kit_pad_and_preset_roundtrip() {
     let saved = structured(
         &mut app,
         "drum.preset.save",
-        json!({"track": 0, "name": "v109 kit"}),
+        json!({"track": 0, "name": "v128 kit"}),
     );
-    assert_eq!(saved["name"], "v109-kit");
+    assert_eq!(saved["name"], "v128-kit");
     let list = structured(&mut app, "drum.preset.list", json!({}));
-    assert!(list["presets"].as_array().unwrap().iter().any(|x| x == "v109-kit"));
+    assert!(list["presets"].as_array().unwrap().iter().any(|x| x == "v128-kit"));
     let loaded = structured(
         &mut app,
         "drum.preset.load",
-        json!({"track": 1, "name": "v109 kit"}),
+        json!({"track": 1, "name": "v128 kit"}),
     );
     assert_eq!(loaded["pads"][0]["name"], "BOOM", "{loaded}");
     assert_eq!(loaded["pads"][0]["vel"], 95);
@@ -792,7 +792,7 @@ fn v109_drum_kit_pad_and_preset_roundtrip() {
 }
 
 #[test]
-fn v109_midi_note_set_commit_and_errors() {
+fn v128_midi_note_set_commit_and_errors() {
     let (mut app, dir) = fixture("midi");
     let mid = dir.join("seq.mid");
     let pid = app.mcp05_test_add_pattern_asset("seq.mid", mid.clone());
@@ -854,7 +854,7 @@ fn v109_midi_note_set_commit_and_errors() {
 
 #[test]
 #[ignore = "slow-tier: real socket + worker thread + frame pump"]
-fn v109_mcp_socket_plugins_surface_e2e() {
+fn v128_mcp_socket_plugins_surface_e2e() {
     // v107 pumping model: the worker parses + queues + parks on the oneshot;
     // we sleep briefly, drain on THIS thread (= frame-loop role), read.
     let _dir = isolated_data_dir("sock");
@@ -909,7 +909,7 @@ fn v109_mcp_socket_plugins_surface_e2e() {
         serde_json::from_slice(&raw[split + 4..]).expect("JSON body")
     }
 
-    // tools/list carries the whole v109 family
+    // tools/list carries the whole v128 family
     let v = wire(&mut app, port, &token, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string());
     let names: Vec<&str> = v["result"]["tools"]
         .as_array()
