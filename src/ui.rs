@@ -14658,7 +14658,7 @@ impl App {
         );
     }
 
-    // ── v109/MCP-05: pub(crate) seams for crate::mcp_plugins ─────────────
+    // ── v128/MCP-05: pub(crate) seams for crate::mcp_plugins ─────────────
     // Thin delegations ONLY: the MCP tool layer reaches plugin state
     // exclusively through these, so every table invariant (drum_resolve,
     // push_sampler_map, fx_save_pending, update_piano_roll_asset →
@@ -60165,7 +60165,7 @@ mod tests {
         // Internal version rides the series (v91 single-home law; v108 MCP-02
         // bumped it — retargeted here so the law holds, not the old number;
         // v110 MCP-04 bump; v115 = v113 claim overtaken by merged v114, renumbered per the v111 recipe;
-        // v128 = MCP-05 claimed v109, renumbered when the chain overtook (v127 in flight)).
+        // v128 = MCP-05 claimed v128, renumbered when the chain overtook (v127 in flight)).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(

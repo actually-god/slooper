@@ -1,4 +1,4 @@
-//! v109/MCP-05 — full control of the NATIVE (bundled script) plugins over
+//! v128/MCP-05 — full control of the NATIVE (bundled script) plugins over
 //! MCP (board card t_3f374341; docs/MCP-DESIGN.md §10): `plugins.*`,
 //! `plugin.*`, `sampler.*`, `drum.*`, `midi.*`.
 //!
@@ -11,7 +11,7 @@
 //! same getter the read tools use) and every accepted write echoes
 //! `app.status` (goal-1 doctrine).
 //!
-//! **Param currency (v109 decision, REQUIREMENTS.md deviation #1):**
+//! **Param currency (v128 decision, REQUIREMENTS.md deviation #1):**
 //! values are the param's DECLARED desc range — the engine's actual
 //! storage currency (`set_param` stores the desc value; preset files and
 //! `plugin.params` read-backs speak the same numbers). Every schema entry

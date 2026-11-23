@@ -1195,7 +1195,7 @@ impl FxEditor {
                 return;
             }
         };
-        // v109: the apply loops moved to `fx::apply_preset_pairs` — the MCP
+        // v128: the apply loops moved to `fx::apply_preset_pairs` — the MCP
         // plugin.preset.load runs the SAME code through the ui.rs seam
         // (one loader, v59 doctrine). The `applied` count keeps its old
         // meaning: positional hits (label matches refine, never count).

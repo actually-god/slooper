@@ -624,13 +624,13 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// v109: the ONE preset-pairs applier — positional order first, then label
+/// v128: the ONE preset-pairs applier — positional order first, then label
 /// matches (clamped to the declared range). Used by the fxgui editor's
 /// user-preset load AND the MCP `plugin.preset.load` (via the ui.rs seam),
 /// so the two entry points cannot drift (v59 doctrine: shared behavior =
 /// shared function). Returns the (param, clamped value) pairs applied, in
 /// application order (positionals then label hits — a param may be written
-/// twice, the label value wins, exactly like the pre-v109 fxgui loop).
+/// twice, the label value wins, exactly like the pre-v128 fxgui loop).
 pub fn apply_preset_pairs(inst: &Instance, desc: &EffectDesc, pairs: &[(String, f64)]) -> Vec<(usize, f32)> {
     let mut applied = Vec::new();
     // Index order first…
