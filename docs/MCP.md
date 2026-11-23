@@ -98,8 +98,8 @@ On Windows the same works with `curl.exe` in PowerShell.
 - **The DAW never dies for an agent bug**: every tool runs inside a panic
   firewall (`-32000`, server keeps serving) and touches app state only on
   the UI frame loop, through the same setter seams the GUI uses.
-- **Read-only latch**: while ticked, write tools answer `-32003`
-  (`read_only`) until you untick it.
+- **Read-only latch**: while ticked, write tools answer JSON-RPC error
+  `-32003` until you untick it.
 
 ## Conventions the tools follow
 
@@ -528,7 +528,7 @@ No arguments.
 | status line `MCP could not start on port N` | another program holds the port — pick a different number or leave `0`. |
 | `-32001` / `-32002` | the app's frame loop is backed up (heavy render, a modal editor). The app is not dead; retry shortly. |
 | `405 Method Not Allowed` | wrong verb or path — it is `POST /mcp` only. |
-| write refused with `read_only` | the read-only latch is ticked in Settings ▸ AUTOMATION. |
+| write refused with `-32003` | the read-only latch is ticked in Settings ▸ AUTOMATION. |
 
 ## See also
 
