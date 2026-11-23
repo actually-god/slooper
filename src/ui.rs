@@ -333,6 +333,26 @@ fn default_drum_kit() -> Vec<DrumPad> {
         .collect()
 }
 
+/// v129 (card t_b47cb577): the leaf of a path/key after ANY separator.
+/// Rack scan paths carry '\\' on Windows while internal folder keys are
+/// '/'-form, so every rsplit on a single '/' silently produced/moved
+/// FULL paths there (the documented mixed-separator trap). Splitting on
+/// BOTH chars is safe on either OS: no path component ever contains '/'
+/// (all OSes) nor '\\' (NTFS forbids it in names), and the pins are then
+/// cross-OS deterministic — unlike `Path::file_stem`, which only honours
+/// '\\' on Windows and cannot be proven on a Linux runner.
+fn path_leaf_any_sep(s: &str) -> &str {
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
+}
+
+/// v129: display stem for sample labels — leaf + the exact-".wav" trim
+/// the kit labels always did (a multi-dot stem like "kick.backup.wav"
+/// keeps "kick.backup"; deliberately NOT file_stem, which would also
+/// chop ".gz" etc. and change Linux output).
+fn sample_stem_label(s: &str) -> String {
+    path_leaf_any_sep(s).trim_end_matches(".wav").to_string()
+}
+
 /// True when a kit is byte-for-byte the stock kit (never saved).
 fn kit_is_stock(kit: &[DrumPad]) -> bool {
     let saves: Vec<crate::config::DrumPadSave> = kit.iter().map(pad_to_save).collect();
@@ -6886,7 +6906,9 @@ impl App {
         }
         let sep = std::path::MAIN_SEPARATOR_STR;
         let src = PathBuf::from(from_root).join(from_dir.replace('/', sep));
-        let name = from_dir.rsplit('/').next().unwrap_or(from_dir);
+        // v129: leaf law is separator-independent (folder keys are
+        // '/'-form, but never assume it here — see path_leaf_any_sep).
+        let name = path_leaf_any_sep(from_dir);
         let np = dest_dir.join(name);
         // v76 R2f: both guards echo — a silent drop-back looked identical
         // to a successful move.
@@ -16121,12 +16143,9 @@ impl App {
             .filter(|a| !a.is_midi() && !a.is_auto())
             .map(|a| {
                 let path = a.path.to_string_lossy().to_string();
-                let nm = path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("?")
-                    .trim_end_matches(".wav")
-                    .to_string();
+                // v129: stem label via the shared separator-safe law
+                // (a slash-only rsplit showed full backslash paths on Windows).
+                let nm = sample_stem_label(&path);
                 (path, nm)
             })
             .collect();
@@ -16174,12 +16193,9 @@ impl App {
                             }
                         }
                         let cur_path = kit[p].asset_path.clone();
-                        let label = cur_path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("(sound)")
-                            .trim_end_matches(".wav")
-                            .to_string();
+                        // v129: separator-safe stem label (was a slash-only
+                        // rsplit — full path on Windows scans, card t_b47cb577).
+                        let label = sample_stem_label(&cur_path);
                         egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
                             .selected_text(label)
                             .width(110.0)
@@ -16232,7 +16248,8 @@ impl App {
                                         self.status = format!(
                                             "drum kit: pad {} <- imported {}",
                                             p + 1,
-                                            sp.rsplit('/').next().unwrap_or(&sp)
+                                            // v129: same separator-safe stem law.
+                                            sample_stem_label(&sp)
                                         );
                                     }
                                     None => {
@@ -55532,6 +55549,143 @@ mod tests {
         let n = app.assets.len();
         assert!(app.assign_pad_file(&mut kit, 1, &rim).is_some());
         assert_eq!(app.assets.len(), n, "the rack dedups by path");
+    }
+
+    /// v129 (card t_b47cb577): all painted galley texts of one frame,
+    /// deduped — exact-text label asserts (the house galley readers all
+    /// match by `contains`, which a full path containing the stem passes
+    /// vacuously — exactly the bug class here).
+    fn v129_texts(app: &mut App, ctx: &egui::Context) -> Vec<String> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        texts.sort();
+        texts.dedup();
+        texts
+    }
+
+    #[test]
+    fn v129_kit_pad_labels_split_on_windows_separators() {
+        // The pad ComboBox label + dropdown rows were built with
+        // rsplit('/'); Windows rack-scan paths carry '\\', so the widget
+        // showed the FULL path. Reproduce the Windows shape ON LINUX:
+        // backslash-form rack paths + pad assignment. The fix law splits
+        // on BOTH separators, so this pin is OS-deterministic and must
+        // stay green on the windows-native parity suite unchanged.
+        let (mut app, ctx) = v65_synth_win("v129stem");
+        let samples = std::env::temp_dir().join("sp-uity-v129stem/samples");
+        let kp = samples.join("kp.wav");
+        let rim = samples.join("rim.wav");
+        std::fs::copy(samples.join("kick.wav"), &rim).expect("rim fixture");
+        std::fs::copy(samples.join("kick.wav"), &kp).expect("kp fixture");
+        let k = app.ensure_asset(&kp).expect("kp imports");
+        let r = app.ensure_asset(&rim).expect("rim imports");
+        // Retarget both rack entries to Windows scan shape ('\\ form,
+        // mixed-separator trap). Rack NAMES are kept distinct from the
+        // stems so the rack's own labels can never alias with the combo.
+        let kp_full = "C:\\Users\\mix\\Sounds\\Kick 808.wav";
+        let rim_full = "C:\\Users\\mix\\Sounds\\Rim.wav";
+        app.assets[k].path = std::path::PathBuf::from(kp_full);
+        app.assets[k].name = "zkp".into();
+        app.assets[r].path = std::path::PathBuf::from(rim_full);
+        app.assets[r].name = "zrim".into();
+        app.kit_mut(0)[0].asset_path = kp_full.to_string();
+        let mut texts = v129_texts(&mut app, &ctx);
+        // A: the pad combo's selected text is the STEM, exact.
+        assert!(
+            texts.iter().any(|t| t == "Kick 808"),
+            "pad combo label must show the stem; painted: {texts:?}"
+        );
+        // A2: no label leaks the Windows directory.
+        assert!(
+            !texts.iter().any(|t| t.contains("Sounds")),
+            "a kit label leaked the full path: {texts:?}"
+        );
+        // B: open the pad's dropdown (combo label paints last — window)
+        // and demand stem rows, popup open, still no full-path leak.
+        let c = galley_at_last(&mut app, &ctx, "Kick 808")
+            .expect("combo selected label")
+            .center();
+        click_pt(&mut app, &ctx, c);
+        texts = v129_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t == "(silent)"),
+            "pad dropdown did not open: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Rim"),
+            "dropdown row must show the stem: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Sounds")),
+            "dropdown row leaked the full path: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn v129_prod_ui_has_no_slash_only_leaf_sites() {
+        // Class sweep (card fix-sketch): no '/'-only `rsplit` leaf site
+        // survives in production ui.rs — rack scans carry '\\' on
+        // Windows and every such site silently shows/moves full paths.
+        let srcs = include_str!("ui.rs");
+        // Column-0 `mod tests` is the house boundary (a dozen source-scan
+        // pins anchor on it); fall back to the indented form defensively.
+        let cut = srcs
+            .find("\nmod tests")
+            .or_else(|| srcs.find("\n    mod tests"));
+        let prod = match cut {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        // Split via concat! so this pin's own needle cannot match itself.
+        let needle = concat!("rsplit", "(", "'", "/", "')");
+        let hit = prod.find(needle).map(|i| {
+            format!(
+                "line {}: {}",
+                prod[..i].lines().count(),
+                prod[i..].lines().next().unwrap_or("")
+            )
+        });
+        assert!(
+            hit.is_none(),
+            "'/'-only leaf site reintroduced in production ui.rs: {hit:?}"
+        );
+    }
+
+    #[test]
+    fn v129_pad_stem_label_matrix() {
+        // The label law's semantics, pinned at the helper (call sites are
+        // driven by the UI pin above). Cross-OS deterministic by design:
+        // explicit ['/', '\\'] split — `Path::file_stem` (the naive fix)
+        // would FAIL the backslash rows on Linux, which is exactly what
+        // this matrix makes impossible to ship.
+        assert_eq!(sample_stem_label("C:\\Sounds\\Kick 808.wav"), "Kick 808");
+        assert_eq!(sample_stem_label("/home/mix/Sounds/Rim.wav"), "Rim");
+        assert_eq!(sample_stem_label("C:\\Sounds/Rim.wav"), "Rim"); // mixed
+        assert_eq!(sample_stem_label("kick.backup.wav"), "kick.backup");
+        assert_eq!(sample_stem_label("noext"), "noext");
+        assert_eq!(sample_stem_label(""), "");
+        assert_eq!(path_leaf_any_sep("a/b/c"), "c");
+        assert_eq!(path_leaf_any_sep("C:\\x\\y"), "y");
+        assert_eq!(path_leaf_any_sep("plain"), "plain");
+        assert_eq!(path_leaf_any_sep(""), "");
     }
 
 
