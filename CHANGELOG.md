@@ -8,6 +8,18 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Granular tracks finally obey velocity, GLIDE and per-note aftertouch.**
+  The granular script was the last bundled instrument that read none of the
+  piano-roll expression lanes: `note_on` dropped the velocity byte on the
+  floor, and because the script never left ABI v1, the GLIDE lane (v100)
+  and the MPE pressure lane (v106) silently discarded those events too.
+  Velocity now scales grain gain by (vel/127)^1.3 like every sibling
+  (renders at vel=127 stay bit-identical — the law multiplies the grain
+  draw, never the RNG stream), a baked bend ramp glides the whole cloud,
+  and pressure thickens *and* brightens exactly the pressed voice: the
+  grain spawn rate doubles at 127 and each grain gets a brightness
+  pre-emphasis, while a val of 0 reads as pressure released, never silence
+  (pinned by `v134_*`; granular now joins the shared `v106_*` poly-AT list).
 - **Echo + Reverb's `damp` knob now does what its label says.** The knob
   is documented (and displayed) as a damping corner in Hz — higher =
   brighter tail, exactly like the sibling `tone` knob — but the comb
