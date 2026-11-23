@@ -1195,30 +1195,17 @@ impl FxEditor {
                 return;
             }
         };
-        let mut applied = 0usize;
-        // Index order first…
-        for (i, (_, v)) in pairs.iter().enumerate() {
-            if let Some(p) = self.desc.params.get(i) {
-                let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
-                self.inst.set_param(i, v);
-                self.pending.push((i, v));
-                applied += 1;
-            }
-        }
-        // …then label matches win over positional guesses.
-        for (label, v) in &pairs {
-            if let Some((k, p)) = self
-                .desc
-                .params
-                .iter()
-                .enumerate()
-                .find(|(_, p)| &p.label == label)
-            {
-                let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
-                self.inst.set_param(k, v);
-                self.pending.push((k, v));
-            }
-        }
+        // v128: the apply loops moved to `fx::apply_preset_pairs` — the MCP
+        // plugin.preset.load runs the SAME code through the ui.rs seam
+        // (one loader, v59 doctrine). The `applied` count keeps its old
+        // meaning: positional hits (label matches refine, never count).
+        let applied_list = fx::apply_preset_pairs(&self.inst, &self.desc, &pairs);
+        self.pending.extend(applied_list.iter().copied());
+        let applied = pairs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.desc.params.get(*i).is_some())
+            .count();
         self.preset_msg = if applied == 0 {
             format!("preset '{name}' has no matching parameters")
         } else {
