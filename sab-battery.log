@@ -1,0 +1,6 @@
+SAB1-no-chokepoint: summary=['test result: FAILED.'] red=[] green=[] VERDICT=MISMATCH
+SAB2-no-site-guard: summary=['test result: FAILED.'] red=[] green=[] VERDICT=MISMATCH
+SAB3-no-fx-fallback: summary=['test result: FAILED.'] red=[] green=[] VERDICT=MISMATCH
+tree-clean-after-restore: True
+RESTORE-RERUN: outcomes={} summary=['test result: ok.'] VERDICT=BAD
+BATTERY-FAIL ['SAB1-no-chokepoint', 'SAB2-no-site-guard', 'SAB3-no-fx-fallback']

@@ -8,6 +8,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **A preset name that sanitizes to nothing is now refused instead of
+  written as an invisible file.** Typing pure punctuation ("!!!") into a
+  hosted plugin's parameter-preset box reported "saved" while writing a
+  hidden `.json` that no picker could ever list. The shared preset store
+  now refuses any name that empties under sanitizing at the write
+  primitive itself, and the plugin-parameter save path echoes the same
+  "pick a preset name" refusal as the other preset surfaces before any
+  file is touched (v132, pinned by `v132_*`).
 - **Auto Pan's "hold" volume shape modulates again.** The fifth tremolo
   shape (`4 hold`) was a dead branch: its latch compared the volume LFO
   phase against a re-arm threshold that starts at zero while the phase

@@ -3861,6 +3861,16 @@ impl App {
         if name.is_empty() || name.contains('/') || name.contains("..") {
             return Err("pick a preset name (no path characters)".into());
         }
+        // v132 (t_09676c12): the v34 refusal is a RAW-name check, but
+        // `presetbar::sanitize` has no empty fallback — a punctuation-only
+        // name ("!!!") collapses to "" and the store used to write an
+        // invisible hidden `.json` no picker could ever list. Refuse on
+        // the POST-SANITIZED name, before the plugin lookup (a name that
+        // can never be listed must not touch the filesystem or the entry
+        // table), parity with the 4 sibling "type a name first" echoes.
+        if Self::sampler_preset_sanitize(name).is_empty() {
+            return Err("pick a preset name (letters or digits)".into());
+        }
         let entry = self
             .target_entry(target)
             .ok_or_else(|| "plugin is gone".to_string())?;
@@ -45045,6 +45055,27 @@ mod tests {
         // A real name against a missing plugin reports honestly.
         let gone = app.save_param_preset(GuiTarget::Synth(usize::MAX / 2), "warmup");
         assert!(matches!(&gone, Err(e) if e.contains("gone")), "{gone:?}");
+    }
+
+    /// v132 (t_09676c12): the v34 raw-name refusal only catches empty, '/'
+    /// and '..', but `presetbar::sanitize` collapses a punctuation-only name
+    /// to EMPTY ("!!!" → ""), and the store then wrote an invisible hidden
+    /// `.json` into the plugin's preset dir while the status echoed success.
+    /// The refusal must run on the POST-SANITIZED name, BEFORE the plugin
+    /// lookup (so no work and no filesystem touch happen for a name that can
+    /// never be listed). RED pre-fix: these names reached the plugin-lookup
+    /// leg ("gone") instead of being refused as a name.
+    #[test]
+    fn v132_param_preset_punctuation_name_refused() {
+        let mut app = headless_app("v132paramname");
+        for raw in ["!!!", "@#$%", "-", "?!?!"] {
+            let r = app.save_param_preset(GuiTarget::Synth(usize::MAX / 2), raw);
+            assert!(
+                matches!(&r, Err(e) if e.contains("preset name") && !e.contains("gone")),
+                "punctuation-only name {raw:?} must be refused as a NAME, \
+                 not reach the plugin: {r:?}"
+            );
+        }
     }
 
     /// v34 R15: dragging a rack row onto a sub-folder header moves the
