@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 7
+// slooper-synth-version: 8
 // drums.rs — an analog-style drum kit driven straight from MIDI notes.
 //
 // Every note is one drum, synthesized from oscillators + filtered noise
@@ -42,12 +42,24 @@
 //     snares/claps brighten (noise bandpass climbs up to 1.8x), pressed
 //     kicks/toms raise their head TENSION (pitch x1.25) — and a val of 0
 //     reads as pressure released, never silence.
+//
+// v137 (card t_3bd30160) tail discipline — every voice retires only after
+//   SEVEN time constants of its kind's slowest envelope component
+//   (e^-7 ≈ -61 dBFS, provably inaudible), fading linearly to EXACT zero
+//   over the last FADE_S seconds so `alive = false` lands on a silent
+//   sample. The old budgets (1.5-3.2 tau) hard-silenced a long-decay crash
+//   at ~-13 dB — an audible chop + DC step in the middle of the ring.
 // ---------------------------------------------------------------------------
 
 include!("synth_api.rs");
 
 const VOICES: usize = 12;
 const TAU: f64 = core::f64::consts::TAU;
+
+/// v137: linear fade-out length before the retire point — the envelope
+/// multiplier walks 1 -> 0 over this window and the kill lands on exact
+/// zero, so retirement is continuous by construction (no gate step).
+const FADE_S: f64 = 0.008;
 
 // Drum kinds.
 const KICK: u8 = 0;
@@ -462,21 +474,39 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 _ => v.alive = false,
             }
 
-            let smp = y * v.vel * lv * gain * choke;
+            v.t += 1.0 / sr;
+            v.age += 1.0 / sr;
+
+            // v137: retire at 7 time constants of the kind's SLOWEST
+            // envelope component (e^-7 ≈ -61 dBFS) + FADE_S, with a linear
+            // fade to exact zero inside that last FADE_S — so `alive =
+            // false` lands on a silent sample and never chops the ring
+            // (the old 1.5-3.2·tau gates cut a long crash at ~-13 dB).
+            // Coefficients are 7·(tau/dec): tau = the *pressure-free*
+            // constant; poly-AT only ever divides tau, so a pressure-blind
+            // budget is never early, and a 20 ms choke always dies first.
+            let budget = match v.kind {
+                CRASH => 10.5 * dec + FADE_S, // tau = 1.5*dec
+                RIDE => 4.9 * dec + FADE_S,   // tau = 0.7*dec
+                OHAT => 3.5 * dec + FADE_S,   // tau = 0.5*dec
+                KICK => 2.38 * dec + FADE_S,  // tau = 0.34*dec
+                TOM => 2.24 * dec + FADE_S,   // tau = 0.32*dec
+                SNARE => 1.12 * dec + FADE_S, // tau = 0.16*dec (noise tail)
+                CLAP => 0.98 * dec + FADE_S,  // tau = 0.14*dec
+                CHAT => 0.315 * dec + FADE_S, // tau = 0.045*dec
+                _ => FADE_S,
+            };
+            let fade = if v.t > budget - FADE_S {
+                ((budget - v.t) / FADE_S).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let smp = y * v.vel * lv * gain * choke * fade;
             if smp.is_finite() {
                 // Append (the buffer arrives zeroed — the engine mixes in).
                 unsafe { *out.add(k) += soft(smp) as f32 };
             }
-
-            v.t += 1.0 / sr;
-            v.age += 1.0 / sr;
-            // Retire long after the tail is inaudible.
-            let budget = match v.kind {
-                CRASH | RIDE => 2.0 * dec + 0.5,
-                OHAT => 0.9 * dec + 0.3,
-                _ => 0.8 * dec + 0.3,
-            };
-            if v.t > budget {
+            if v.t >= budget {
                 v.alive = false;
             }
         }
