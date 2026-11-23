@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 6
+// slooper-synth-version: 7
 // drums.rs — an analog-style drum kit driven straight from MIDI notes.
 //
 // Every note is one drum, synthesized from oscillators + filtered noise
@@ -29,6 +29,19 @@
 // 12 voices, oldest-voice stealing. process() runs on the audio thread:
 // allocation-free fixed arrays, deterministic noise (LCG per voice),
 // everything clamped so NaN cannot escape into the loop buffer.
+//
+// v136 (card t_d28458f1) contract lanes — the kit honours every expression
+// input like its melodic siblings (script ABI v3: bend + poly_at):
+//   * the piano-roll GLIDE lane (bend, ±12 st) rides the same pitch
+//     multiplier as the tune knob, so held kicks/snares/toms — and the hat
+//     fundamentals, exactly where tune goes — bend with the ramp; crash and
+//     ride stay pitch-immune, like they are for tune.
+//   * poly-AT (MPE note pressure) is per-voice and class-based: pressed
+//     open hats / crash / ride CHOKES (decay up to 4x faster), pressed
+//     closed hats brighten (DC-block corner 7.2 kHz -> 15.8), pressed
+//     snares/claps brighten (noise bandpass climbs up to 1.8x), pressed
+//     kicks/toms raise their head TENSION (pitch x1.25) — and a val of 0
+//     reads as pressure released, never silence.
 // ---------------------------------------------------------------------------
 
 include!("synth_api.rs");
@@ -55,6 +68,16 @@ struct Biquad {
 
 impl Biquad {
     fn bandpass(sr: f64, f: f64, q: f64) -> Biquad {
+        let mut b = Biquad { a0: 0.0, a1: 0.0, a2: 0.0, b1: 0.0, b2: 0.0,
+                             x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 };
+        b.set_bandpass(sr, f, q);
+        b
+    }
+    /// v136: retune IN PLACE — coefficients only, delay state kept, so a
+    /// pressure move glides the snare/clap noise band without restarting
+    /// its filter (and val 0 recomputes the exact base coefficients, so a
+    /// released voice is bit-for-bit its pressure-less self).
+    fn set_bandpass(&mut self, sr: f64, f: f64, q: f64) {
         let w = TAU * f / sr;
         let (sn, cs) = w.sin_cos();
         let al = sn / (2.0 * q);
@@ -64,8 +87,11 @@ impl Biquad {
         let b0 = 1.0 + al;
         let b1 = -2.0 * cs;
         let b2 = 1.0 - al;
-        Biquad { a0: a0 / b0, a1: a1 / b0, a2: a2 / b0, b1: b1 / b0, b2: b2 / b0,
-                 x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
+        self.a0 = a0 / b0;
+        self.a1 = a1 / b0;
+        self.a2 = a2 / b0;
+        self.b1 = b1 / b0;
+        self.b2 = b2 / b0;
     }
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
@@ -88,6 +114,8 @@ struct Voice {
     t: f64,
     age: f64,
     vel: f64,
+    /// v136: poly-AT pressure of this note, 0..1 (0 = released).
+    at: f64,
     choked: bool,
     t_choke: f64,
     // Oscillator phases / incremental states.
@@ -106,11 +134,13 @@ struct Drums {
     sr: f64,
     voices: [Voice; VOICES],
     next: usize,
+    /// v136: pitch bend (roll GLIDE lane), semitones (±12 at full).
+    bend_st: f64,
 }
 
 impl Voice {
     const DEAD: Voice = Voice {
-        alive: false, kind: 0, note: 0, t: 0.0, age: 0.0, vel: 0.0,
+        alive: false, kind: 0, note: 0, t: 0.0, age: 0.0, vel: 0.0, at: 0.0,
         choked: false, t_choke: 0.0,
         p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0,
         f0: 0.0, hp_y1: 0.0, hp_x1: 0.0, hp_y2: 0.0, hp_x2: 0.0,
@@ -156,6 +186,7 @@ extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_vo
         sr: if sr > 1.0 { sr } else { 48000.0 },
         voices: [Voice::DEAD; VOICES],
         next: 0,
+        bend_st: 0.0,
     });
     Box::into_raw(s) as *mut core::ffi::c_void
 }
@@ -249,6 +280,44 @@ extern "C" fn all_off(s: *mut core::ffi::c_void) {
 extern "C" fn cc(_s: *mut core::ffi::c_void, _ch: u8, _num: u8, _val: u8) {}
 extern "C" fn press(_s: *mut core::ffi::c_void, _ch: u8, _val: u8) {}
 
+// --- v136 (card t_d28458f1): GLIDE lane (ABI v2/v3 bend). The host decodes
+// the 14-bit bend / roll GLIDE lane to SEMITONES (full deflection = ±12) and
+// calls this immediately before the next process() block; it rides the tune
+// multiplier there, so held pitched voices bend exactly like the tune knob
+// turns — 0 st is the untouched pre-v136 arithmetic.
+#[no_mangle]
+pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
+    if s.is_null() {
+        return;
+    }
+    unsafe { &mut *(s as *mut Drums) }.bend_st = st as f64;
+}
+
+// v136: MPE note pressure (raw MIDI byte 0..=127) per held note. Class law:
+// ringing cymbals choke, hats/clap/snares brighten, kicks/toms take head
+// tension. Voices that match nothing are untouched; 0 = pressure released
+// (every law is exactly its pressure-less value there, never silence).
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let d = unsafe { &mut *(s as *mut Drums) };
+    let sr = d.sr;
+    let at = val as f64 / 127.0;
+    for v in &mut d.voices {
+        if v.alive && v.note == note {
+            v.at = at;
+            // Bright-law voices carry the pressure in their noise band.
+            match v.kind {
+                SNARE => v.bq.set_bandpass(sr, 1750.0 * (1.0 + 0.8 * at), 1.1),
+                CLAP => v.bq.set_bandpass(sr, 1250.0 * (1.0 + 0.8 * at), 1.4),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Fast tanh-ish soft clip keeps summed hits from blowing past unity.
 #[inline]
 fn soft(x: f64) -> f64 {
@@ -271,7 +340,9 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
     let l_cymb = unsafe { *params.add(6) }.clamp(0.0, 1.5) as f64;
 
     // Pitch multiplier for melodic components; metallics ignore tune.
-    let tmul = (2.0f64).powf(tune / 12.0);
+    // v136: the GLIDE lane rides this multiplier exactly like the tune
+    // knob (0 st keeps the pre-v136 arithmetic bit-for-bit).
+    let tmul = (2.0f64).powf((tune + d.bend_st) / 12.0);
     // One-pole DC-block coefficient (highpass ~6 kHz region of hats).
     let hpa = (-(TAU * 7200.0 / sr)).exp();
     let hpa = if hpa.is_finite() { hpa } else { 0.0 };
@@ -291,7 +362,8 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             let mut lv = 1.0;
             match v.kind {
                 KICK => {
-                    let fs = v.f0 * tmul * (1.0 + 2.4 * (-t / 0.026).exp());
+                    let fs = v.f0 * tmul * (1.0 + 0.25 * v.at)
+                        * (1.0 + 2.4 * (-t / 0.026).exp());
                     v.p1 += TAU * fs / sr;
                     let body = v.p1.sin();
                     let env = (-t / (0.34 * dec)).exp();
@@ -299,7 +371,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                     y = (body + click * 0.5) * env;
                 }
                 SNARE => {
-                    v.p1 += TAU * v.f0 * tmul / sr;
+                    v.p1 += TAU * v.f0 * tmul * (1.0 + 0.25 * v.at) / sr;
                     let tone = v.p1.sin();
                     let tenv = (-t / (0.085 * dec)).exp();
                     let nenv = (-t / (0.16 * dec)).exp();
@@ -322,6 +394,15 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 CHAT | OHAT => {
                     // Six square partials at metallic inharmonic ratios.
                     let x = v.f0 * tmul;
+                    // v136: pressure opens the hats brighter (DC-block
+                    // corner climbs); at 0 the shared block coefficient is
+                    // reused bit-for-bit.
+                    let ha = if v.at > 0.0 {
+                        let a = (-(TAU * 7200.0 * (1.0 + 1.2 * v.at) / sr)).exp();
+                        if a.is_finite() { a } else { hpa }
+                    } else {
+                        hpa
+                    };
                     v.p1 += TAU * x * 1.0000 / sr;
                     v.p2 += TAU * x * 1.2715 / sr;
                     v.p3 += TAU * x * 1.3576 / sr;
@@ -334,14 +415,19 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                         + ((v.p4.sin() > 0.0) as i8 as f64 - 0.5)
                         + ((v.p5.sin() > 0.0) as i8 as f64 - 0.5)
                         + ((v.p6.sin() > 0.0) as i8 as f64 - 0.5);
-                    let h = v.hp2(m / 3.0, hpa);
-                    let tau = if v.kind == CHAT { 0.045 * dec } else { 0.5 * dec };
+                    let h = v.hp2(m / 3.0, ha);
+                    let tau = if v.kind == CHAT {
+                        0.045 * dec
+                    } else {
+                        0.5 * dec / (1.0 + 3.0 * v.at) // v136: pressure chokes
+                    };
                     let env = (-t / tau).exp();
                     y = h * env;
                     lv = l_hat;
                 }
                 TOM => {
-                    let fs = v.f0 * tmul * (0.55 + 0.45 * (-t / 0.06).exp());
+                    let fs = v.f0 * tmul * (1.0 + 0.25 * v.at)
+                        * (0.55 + 0.45 * (-t / 0.06).exp());
                     v.p1 += TAU * fs / sr;
                     let env = (-t / (0.32 * dec)).exp();
                     y = v.p1.sin() * env;
@@ -362,7 +448,8 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                         + ((v.p5.sin() > 0.0) as i8 as f64 - 0.5);
                     let nse = v.noise();
                     let h = v.hp2(m * 0.2 + nse * 0.5, hpa);
-                    let tau = if v.kind == CRASH { 1.5 * dec } else { 0.7 * dec };
+                    let tau = if v.kind == CRASH { 1.5 * dec } else { 0.7 * dec }
+                        / (1.0 + 3.0 * v.at); // v136: pressure chokes
                     let env = (-t / tau).exp();
                     y = h * env * 0.8;
                     lv = l_cymb;
@@ -422,4 +509,13 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
     &DESC
+}
+
+// v136: cumulative ABI v3 table (bend + poly_at) — the same add-only ladder
+// as the sibling scripts; older hosts keep loading the frozen v1 DESC above.
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
+
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }
