@@ -22,6 +22,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   silence
   (pinned by `v136_*`; the last bundled v1 script is gone, so the v1 drop
   guard now rides a dedicated v1-only probe).
+- **Deleting a sampler-map layer no longer flickers wrong values into the
+  rows below it for one frame.** Clicking a lane's `×` removed the slot
+  in the middle of the row-paint loop, so the lanes still being painted
+  that frame showed the *shifted* slot's data — a velocity suddenly
+  reading another layer's value (or the maximum fallback) — and an edit
+  landing in that same frame could write to the wrong layer. The removal
+  now applies after the row loop: the click frame paints one consistent
+  snapshot, same-frame edits land on the row they were shown on, and the
+  next frame renumbers as before (pinned by `v135_smap_delete_*`).
+
 - **Granular tracks finally obey velocity, GLIDE and per-note aftertouch.**
   The granular script was the last bundled instrument that read none of the
   piano-roll expression lanes: `note_on` dropped the velocity byte on the
