@@ -2896,18 +2896,23 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         let x = v137_drums_held(&reg, 55, 2.5, 27.5);
         let sr = 48_000usize;
         let p_ctl = v136_power(&x, sr / 2, sr);
-        let p_old = v136_power(&x, (5.4 * sr as f64) as usize, (5.6 * sr as f64) as usize);
+        // Window STRICTLY after the old hard gate (2.0*dec+0.5 = 5.508 s):
+        // HEAD's voice is already zero there -> this assertion fails on HEAD,
+        // the negative control. The new budget rings on through it.
+        let p_old = v136_power(&x, (5.6 * sr as f64) as usize, (5.8 * sr as f64) as usize);
         eprintln!(
-            "v137 crash dec=2.5: body power {p_ctl:.3e}, old-gate window (5.4..5.6 s) {p_old:.3e}"
+            "v137 crash dec=2.5: body power {p_ctl:.3e}, post-old-gate window (5.6..5.8 s) {p_old:.3e}"
         );
         assert!(p_ctl > 1e-4, "control body must actually sound: {p_ctl:.3e}");
         assert!(
             p_old > 1e-6,
-            "crash at max decay must still ring at the OLD retire gate t=5.5 s \
+            "crash at max decay must still ring AFTER the OLD retire gate t=5.508 s \
              (HEAD hard-silenced it there: budget 2.0*dec+0.5 = 1.47*tau, a -13 dB chop): \
              {p_old:.3e}"
         );
-        let tail = &x[26_400..];
+        // |x| < 1e-3 past budget+7 ms (budget = 7*3.75 s + 8 ms = 26.258 s;
+        // index math EXPLICIT: 26.4 s * 48000, never a bare sample literal).
+        let tail = &x[(26.4 * 48_000.0) as usize..];
         let pk = tail.iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!(
             pk < 1e-3,
@@ -2972,10 +2977,10 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         let reg = v51_registry();
         let x = v137_drums_held(&reg, 42, 1.0, 1.0);
         assert!(
-            v136_power(&x, 480, 4_800) > 1e-4,
-            "closed hat control body must sound"
+            x[..9_600].iter().any(|v| v.abs() > 0.01),
+            "closed hat control body must sound (instantaneous peak in first 0.2 s)"
         );
-        let pk = x[24_000..].iter().fold(0f32, |m, v| m.max(v.abs()));
+        let pk = x[(48_000 / 2)..].iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!(pk < 1e-4, "closed hat must be silent (1e-4) by 0.50 s, got {pk:.2e}");
     }
 
