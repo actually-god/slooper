@@ -2344,29 +2344,74 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
 
     /// Contract change (same-commit retarget, the v103 bend-4 precedent):
     /// this v100 guard pinned the scripted poly-AT DROP on the bundled
-    /// sampler. v106 inverts that contract for v3-capable scripts, so the
-    /// subject moves to bundled `drums` — still a v1 script, so the
-    /// "clean, audio-invisible, panic-free drop" survives there; the
-    /// audible half lives in v106_pressure_audible_on_bundled_scripts.
+    /// sampler; v106 moved the subject to bundled `drums` — the last v1
+    /// script. v136 completes the bundled v3 migration, so the subject
+    /// moves again: a dedicated v1-ONLY probe script (tone oscillator, no
+    /// v2/v3 table) keeps the "clean, audio-invisible, panic-free drop"
+    /// alive for every third-party script the ladder must degrade for.
+    /// Fresh instances per render: the probe's phase is instance state, so
+    /// two renders on ONE instance could never be byte-equal. The audible
+    /// half lives in v106_pressure_audible_on_bundled_scripts + v136_*.
     #[test]
+    #[ignore = "slow-tier: compiles a v1-only probe script with rustc (~10 s)"]
     fn v100_poly_aftertouch_still_dropped_cleanly() {
         if !crate::fx::rustc_available() {
             return;
         }
-        let reg = v51_registry();
-        let inst = reg.create_instance("drums", 48_000.0, &[]).expect("bundled drums instance");
-        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
-        for i in 0..=100 {
-            ev.push((960 + (i * 480) as u64, 4u8, 0u8, 48u8, (i % 128) as u8));
-        }
-        ev.push((47_000, 0, 0, 48, 0));
-        let mut with_at = vec![0f32; 48_000];
-        crate::audio::render_midi_events(&inst, &mut ev, 0, with_at.len(), &mut with_at);
-        let mut ev2 = ev.clone();
-        ev2.retain(|e| e.1 != 4);
-        let mut plain = vec![0f32; 48_000];
-        crate::audio::render_midi_events(&inst, &mut ev2, 0, plain.len(), &mut plain);
-        assert!(plain.iter().any(|x| x.abs() > 0.01), "drums must actually sound for this guard");
+        let reg = v51_registry(); // seeds bundled + writes synth_api.rs
+        std::fs::write(
+            reg.dir().join("v136_v1_subject.rs"),
+            format!(
+                "{}{}",
+                V106_PROBE_HEAD,
+                r#"
+extern "C" fn po(s: *mut c_void, out: *mut f32, n: usize, _p: *const f32) {
+    let p = unsafe { &mut *(s as *mut P) };
+    let out = unsafe { core::slice::from_raw_parts_mut(out, n) };
+    let step = (std::f64::consts::TAU * 200.0 / p.sr) as f64;
+    for o in out.iter_mut() {
+        if p.on { *o += (p.ph.sin() * 0.25) as f32; }
+        p.ph += step;
+        if p.ph > std::f64::consts::TAU { p.ph -= std::f64::consts::TAU; }
+    }
+}
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: SLOOPER_SYNTH_ABI,
+    name: b"v136-v1-subject\0".as_ptr() as *const core::ffi::c_char,
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 0, params: core::ptr::null(),
+    create: cr, destroy: de, note_on: no, note_off: nf, all_off: ao,
+    cc: cc, press: pr, process: po,
+};
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
+"#
+            ),
+        )
+        .unwrap();
+        let reg = Registry::open(reg.dir().to_path_buf());
+        let render = |with_at: bool| -> Vec<f32> {
+            let inst = reg
+                .create_instance("v136_v1_subject", 48_000.0, &[])
+                .expect("v1-only probe instance");
+            let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48u8, 110u8)];
+            if with_at {
+                for i in 0..=100 {
+                    ev.push((960 + (i * 480) as u64, 4u8, 0u8, 48u8, (i % 128) as u8));
+                }
+            }
+            ev.push((47_000, 0, 0, 48, 0));
+            let mut out = vec![0f32; 48_000];
+            crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+            out
+        };
+        let plain = render(false);
+        let with_at = render(true);
+        assert!(
+            plain.iter().any(|x| x.abs() > 0.01),
+            "v1 subject must actually sound for this guard"
+        );
         assert_eq!(plain, with_at, "poly-AT must stay invisible to v1 scripts (no callback)");
     }
 
@@ -2374,6 +2419,12 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
     /// HEAR pressure — held note, AT 127 vs no AT: window power rises by
     /// the designed ~2.25x (amp x1.5). Sabotage: drop poly_at from a
     /// script (or the probe from the host) and that stem goes red.
+    ///
+    /// Drums speaks v3 too (v136, card t_d28458f1) but stays OUT of this
+    /// list ON PURPOSE: its AT laws are class-based expression — a CHOKE
+    /// for open hats/crash/ride (window power FALLS), a filter-corner
+    /// climb for hats/snare/clap, head tension for kick/tom — none is a
+    /// power lift. Its audible-and-targeted proof is the v136_* family.
     #[test]
     fn v106_pressure_audible_on_bundled_scripts() {
         if !crate::fx::rustc_available() {
@@ -2599,4 +2650,216 @@ pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 { &DESC_V3 }
             "pressure must brighten the cloud (HF tilt must climb): {tp:.4} -> {ta:.4}"
         );
     }
+
+    // ---- v136 (card t_d28458f1): the drums bundle stayed on ABI v1, so
+    // the v100 GLIDE lane and the v106 poly-AT lane were silently dead on
+    // drum tracks while every melodic sibling answered them. These pins
+    // drive the REAL bundled script through the event protocol only.
+    // Drums state is sample-exact (per-sample voice updates, integer event
+    // ticks), so byte-identity assertions are valid for the targeting half.
+
+    /// One drums render through the real event protocol. FRESH instance per
+    /// call. `at_note` stages poly-AT (kind 4) at (note, val) on the same
+    /// dense schedule the AT rounds use (960 + 480*i, like the v106 guard);
+    /// pass val=0 for the schedule-matched "pressure released" control, so
+    /// event-block-splitting parity is guaranteed between rounds.
+    fn v136_drums_render(reg: &Registry, note: u8, at_note: Option<(u8, u8)>) -> Vec<f32> {
+        let inst = reg
+            .create_instance("drums", 48_000.0, &[])
+            .expect("bundled drums instance");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, note, 110u8)];
+        if let Some((n, val)) = at_note {
+            for i in 0..=40 {
+                ev.push((960 + (i * 480) as u64, 4u8, 0u8, n, val));
+            }
+        }
+        ev.push((47_000, 0, 0, note, 0));
+        let mut out = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    fn v136_power(x: &[f32], a: usize, b: usize) -> f64 {
+        x[a..b].iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / (b - a) as f64
+    }
+
+    /// R1: the GLIDE lane reaches the kit — a baked 0->+12 st ramp near-
+    /// doubles the late-window pitch of a held pitched TOM (note 60, the
+    /// card's "pitched TOM row") and the kick body (note 36). v100 harness
+    /// discipline: dense st_to_bend ramp + zero-crossing cycles late.
+    #[test]
+    fn v136_glide_lane_bends_tom_and_kick_pitch() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        for (note, name) in [(60u8, "tom"), (36u8, "kick")] {
+            let inst = reg.create_instance("drums", 48_000.0, &[]).expect("drums");
+            let flat = v100_glide_render(&inst, note, &|_| 0.0);
+            let inst = reg.create_instance("drums", 48_000.0, &[]).expect("drums");
+            let up = v100_glide_render(&inst, note, &|f| 12.0 * f);
+            assert_ne!(flat, up, "baked bends never reached drums ({name})");
+            let late = |x: &[f32]| v100_cycles(&x[38_400..48_000]) as f64;
+            let (cf, cu) = (late(&flat), late(&up));
+            eprintln!(
+                "v136 glide {name} note {note}: late cycles {cf} -> {cu} ratio {:.3}",
+                cu / cf
+            );
+            assert!(cf >= 6.0, "{name}: flat control must carry late cycles: {cf}");
+            let r = cu / cf;
+            assert!(
+                r > 1.5 && r < 2.4,
+                "0->+12 st glide must near-double the {name}'s late pitch: got {r:.3}"
+            );
+        }
+    }
+
+    /// R2a: pressure CHOKES the ringing cymbals — open hat (46), crash (55)
+    /// and ride (51) held under AT 127 vs the schedule-matched val-0 twin:
+    /// power over the AUDIBLE span (0.1..0.4 s — the open hat retires at
+    /// ~0.81 s, so a late window would measure decay arithmetic, not the
+    /// law) collapses with tau/(1+3*at) = 4x faster decay — yet the AT
+    /// render stays non-silent (a pressure is not a mute).
+    #[test]
+    fn v136_poly_at_choke_open_hat_crash_ride() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        // Per-note (ratio window, never-mute floor window): the open hat
+        // retires ~0.81 s and rings quietly, the crash rings 2.5 s and its
+        // choke only separates LATE, the ride sits between them.
+        for (note, ra, rb, fa, fb) in [
+            (46u8, 4_800usize, 19_200usize, 960usize, 4_800usize),
+            (55, 38_400, 48_000, 4_800, 19_200),
+            (51, 19_200, 43_200, 4_800, 19_200),
+        ] {
+            let plain = v136_drums_render(&reg, note, Some((note, 0)));
+            let at = v136_drums_render(&reg, note, Some((note, 127)));
+            let (pw, pa) = (v136_power(&plain, ra, rb), v136_power(&at, ra, rb));
+            let (pe, ae) = (v136_power(&plain, fa, fb), v136_power(&at, fa, fb));
+            let r = pa / pw;
+            eprintln!(
+                "v136 at-choke note {note}: {pw:.3e} -> {pa:.3e} ratio {r:.4} | \
+                 floor early {pe:.3e} -> {ae:.3e}"
+            );
+            assert!(pw > 1e-7, "note {note} control render must actually sound: {pw}");
+            assert!(
+                r < 0.3,
+                "poly-AT at 127 must choke the ring of note {note} (tau shortens 4x): \
+                 got ratio {r:.4} (plain {pw:.6} at {pa:.6})"
+            );
+            // Never-mute, RELATIVE floor: the first ~0.1 s is before the
+            // choke law bites hard, so even at full pressure the attack
+            // must keep >=1% of the control power (a mute goes to 0).
+            assert!(
+                ae > 0.01 * pe,
+                "choke must damp, never mute note {note}: early {pe:.3e} -> {ae:.3e}"
+            );
+        }
+    }
+
+    /// R2b: head tension — pressed kick (36) and pitched tom (60) climb in
+    /// pitch exactly x1.25 at full pressure, measured as late-window zc
+    /// cycles against the schedule-matched val-0 twin.
+    #[test]
+    fn v136_poly_at_tension_pitches_tom_and_kick() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        for (note, name) in [(60u8, "tom"), (36u8, "kick")] {
+            let rel = v136_drums_render(&reg, note, Some((note, 0)));
+            let at = v136_drums_render(&reg, note, Some((note, 127)));
+            // 0.3..1.0 s: wide enough that zc quantisation (±0.5 cycle)
+            // cannot move the measured ratio off 1.25 by more than ~0.04.
+            let late = |x: &[f32]| v100_cycles(&x[14_400..48_000]) as f64;
+            let (c0, c1) = (late(&rel), late(&at));
+            eprintln!(
+                "v136 at-tension {name}: late cycles {c0} -> {c1} ratio {:.3}",
+                c1 / c0
+            );
+            assert!(c0 >= 6.0, "{name} control must carry late cycles: {c0}");
+            let r = c1 / c0;
+            assert!(
+                r > 1.12 && r < 1.4,
+                "poly-AT 127 must raise the {name} pitch by the x1.25 head-tension law: \
+                 got {r:.3} ({c0} -> {c1} cycles)"
+            );
+        }
+    }
+
+    /// R2c: brightness — a pressed closed hat (42: HF pre-emphasis at full
+    /// pressure) and a pressed clap (37: noise bandpass 1250 -> 2250 Hz)
+    /// raise the HF-vs-total tilt of the hit vs the val-0 twin. (A DC-
+    /// block-corner law was tried first and is PROVABLY tilt-blind on this
+    /// material — measured 1.004 — so brightness rides the proven v134
+    /// pre-emphasis instead; threshold 1.2 sits between the law-off
+    /// sabotage value 1.0 and the measured ~1.45.)
+    #[test]
+    fn v136_poly_at_brightens_hat_and_clap() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        // Window covers the full audible hit (hat tail is ~0.1 s); the
+        // ratio floor 1.3 is set after measuring the law (hat x1.5 cutoff
+        // -> ~1.45, clap BP x1.8 -> ~2.0) so sabotage (law off = 1.0)
+        // fails with a wide margin and libm drift cannot reach it.
+        let tilt = |x: &[f32]| -> f64 {
+            let hf: f64 = x[480..12_000]
+                .windows(2)
+                .map(|d| (d[1] as f64 - d[0] as f64).powi(2))
+                .sum::<f64>()
+                / (12_000 - 480 - 1) as f64;
+            hf / v136_power(x, 480, 12_000)
+        };
+        for (note, name) in [(42u8, "hat"), (37u8, "clap")] {
+            let rel = v136_drums_render(&reg, note, Some((note, 0)));
+            let at = v136_drums_render(&reg, note, Some((note, 127)));
+            let (tp, ta) = (tilt(&rel), tilt(&at));
+            eprintln!(
+                "v136 at-bright {name}: tilt {tp:.4} -> {ta:.4} ratio {:.3}",
+                ta / tp
+            );
+            assert!(tp > 1e-6, "{name} control must carry HF energy: {tp}");
+            assert!(
+                ta / tp > 1.2,
+                "poly-AT 127 must brighten the {name} (HF tilt must climb): \
+                 {tp:.4} -> {ta:.4}"
+            );
+        }
+    }
+
+    /// R3: pressure is per-note. AT 127 on a NON-held note must be byte-
+    /// identical to NO events at all (drums is sample-exact, so block
+    /// splits at the event ticks are audio-irrelevant), and the val-0 twin
+    /// on the held note must also be byte-identical — a released pressure
+    /// is the normal kit, never silence and never a retrigger. The held-
+    /// note 127 render must differ (targeting is not a no-op).
+    #[test]
+    fn v136_poly_at_targets_notes_and_release_is_never_silence() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let plain = v136_drums_render(&reg, 46, None);
+        let rel = v136_drums_render(&reg, 46, Some((46, 0)));
+        let wrong = v136_drums_render(&reg, 46, Some((49, 127)));
+        assert!(
+            plain.iter().any(|x| x.abs() > 0.01),
+            "open hat control render must actually sound"
+        );
+        assert_eq!(
+            plain, rel,
+            "poly-AT val 0 must not alter the sound (released pressure = normal kit)"
+        );
+        assert_eq!(
+            plain, wrong,
+            "poly-AT on a NON-held note must not touch the kit (byte-identity vs no-AT)"
+        );
+        let at = v136_drums_render(&reg, 46, Some((46, 127)));
+        assert_ne!(plain, at, "the held voice's pressure must be heard (targeting is not a no-op)");
+    }
+
 }
