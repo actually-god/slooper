@@ -12905,6 +12905,22 @@ impl App {
         let st_at = |y: f32| (((bend_c - y) / bend_amp) * 12.0).clamp(-12.0, 12.0);
         let in_bend = |pt: egui::Pos2| lane_open && bend_lane.contains(pt);
         let in_vel = |pt: egui::Pos2| vel_lane.contains(pt);
+        // v127 (t_b18cbbf5): ONE geometry law for the velocity lane. Bars
+        // paint over [vel_bar_top(v), max.y - VEL_PAD]; `vel_at_y` is its
+        // EXACT algebraic inverse, so a press/release on a painted bar-top
+        // always re-reads that bar's own velocity. The pre-fix inverse
+        // anchored at the lane floor over the full 30 px (origin AND span
+        // wrong) — a press on a vel-127 bar's painted top read 119 (~8 %).
+        const VEL_PAD: f32 = 2.0;
+        let vel_travel = VEL_LANE_H - 2.0 * VEL_PAD;
+        let vel_bar_top = |v: f32| vel_lane.max.y - VEL_PAD - v / 127.0 * vel_travel;
+        let vel_at_y = |y: f32| {
+            (((vel_lane.max.y - VEL_PAD - y) / vel_travel)
+                .clamp(0.0, 1.0)
+                * 127.0)
+                .round()
+                .max(1.0) as u8
+        };
         {
             painter.rect_filled(vel_lane, 0.0, Color32::from_gray(18));
             if lane_open {
@@ -12916,12 +12932,12 @@ impl App {
                 if x1 < grid_x0 || x0 > rect.max.x {
                     continue;
                 }
-                let h = note.vel as f32 / 127.0 * (VEL_LANE_H - 4.0);
+                let top = vel_bar_top(note.vel as f32);
                 let sel = roll.sel_notes.contains(&idx);
                 painter.rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(x0.max(grid_x0), vel_lane.max.y - 2.0 - h),
-                        egui::pos2(x1.max(x0 + 1.0), vel_lane.max.y - 2.0),
+                        egui::pos2(x0.max(grid_x0), top),
+                        egui::pos2(x1.max(x0 + 1.0), vel_lane.max.y - VEL_PAD),
                     ),
                     1.0,
                     if sel {
@@ -13303,11 +13319,7 @@ impl App {
                             roll.sel_anchor = Some(i);
                         }
                         roll.gesture = RollGesture::VelDrag { idx: i };
-                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
-                            .clamp(0.0, 1.0)
-                            * 127.0)
-                            .round()
-                            .max(1.0) as u8;
+                        let v = vel_at_y(pt.y);
                         if roll.sel_notes.contains(&i) {
                             let group: Vec<usize> = roll.sel_notes.clone();
                             for s in group {
@@ -13722,11 +13734,7 @@ impl App {
                         }
                     }
                     RollGesture::VelDrag { idx } => {
-                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
-                            .clamp(0.0, 1.0)
-                            * 127.0)
-                            .round()
-                            .max(1.0) as u8;
+                        let v = vel_at_y(pt.y);
                         if roll.sel_notes.contains(&idx) {
                             let group: Vec<usize> = roll.sel_notes.clone();
                             for s in group {
@@ -51005,6 +51013,166 @@ mod tests {
             "bar drag set velocity {v}, pointer said {want}"
         );
         assert_ne!(v, 100, "changed");
+    }
+
+    #[test]
+    fn v127_vel_lane_press_at_bar_top_hits_127() {
+        // v127 (t_b18cbbf5): the drag inverse must invert EXACTLY the paint
+        // geometry: bars span [max.y-2 - v/127*(H-4), max.y-2] — a 26 px
+        // travel with a 2 px floor inset. The old inverse anchored at the
+        // lane floor over the FULL 30 px, so pressing the painted TOP of a
+        // vel-127 bar read 119 (~8 % low). Press at MID lane first so the
+        // top assert cannot pass vacuously on an unhandled gesture.
+        let mut app = headless_app("v127veltop");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 127,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let mid = egui::pos2(grid_x0 + 80.0, bot - 15.0);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v_mid = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert!(v_mid < 127, "mid-lane press must move velocity (gesture live), got {v_mid}");
+        // Painted top of the FULL-height bar: floor inset 2 + travel 26.
+        let top = egui::pos2(grid_x0 + 80.0, bot - 2.0 - 26.0);
+        frame(&mut app, &ctx, vec![moved(top), btn(top, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(top), btn(top, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert_eq!(v, 127, "press at the painted top of a max bar must keep 127");
+    }
+
+    #[test]
+    fn v127_vel_lane_release_at_painted_top_matches() {
+        // v127: the MOVING-drag site (release value) must reproduce the
+        // velocity whose painted bar-top sits under the pointer — the card's
+        // "release value disagrees with the displayed height" contract.
+        let mut app = headless_app("v127velrel");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let want: u8 = 110;
+        let p0 = egui::pos2(grid_x0 + 80.0, bot - 5.0);
+        // Painted top for `want`: max.y - 2 - v/127*(H-4), H-4 = 26.
+        let p1 = egui::pos2(grid_x0 + 80.0, bot - 2.0 - want as f32 / 127.0 * 26.0);
+        frame(&mut app, &ctx, vec![moved(p0), btn(p0, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(p1)]);
+        frame(&mut app, &ctx, vec![moved(p1), btn(p1, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert_eq!(v, want, "release at the painted top of a {want} bar must set {want}");
+    }
+
+    #[test]
+    fn v127_vel_lane_press_at_actual_painted_top_reads_that_velocity() {
+        // v127 coupling law (strongest of the set): read the bar's ACTUAL
+        // painted top edge out of the frame's shapes, change the velocity
+        // away, then press at the remembered y — it must re-read the
+        // ORIGINAL value. Paint and drag are then verified against EACH
+        // OTHER, not just against the pin's own formula: drift on either
+        // side of the shared helper reddens a pin of this set.
+        let mut app = headless_app("v127velcouple");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 127,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        // Bar blue (90,160,230) is painted ONLY by the velocity bar.
+        let bar = painted_rect(&mut app, &ctx, (90, 160, 230)).expect("velocity bar painted");
+        assert!(
+            (bar.min.y - (bot - 2.0 - 26.0)).abs() < 0.6
+                && (bar.max.y - (bot - 2.0)).abs() < 0.6,
+            "painted bar must sit at [bot-28, bot-2], got {bar:?}"
+        );
+        let top_y = bar.min.y;
+        // Move the value away: mid-lane press → vel 64.
+        let mid = egui::pos2(grid_x0 + 80.0, bot - 15.0);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v_mid = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert!(v_mid < 127, "mid-lane press must have moved velocity, got {v_mid}");
+        // Press at the remembered 127-bar top: the ORIGINAL value returns.
+        let p = egui::pos2(grid_x0 + 80.0, top_y);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert_eq!(v, 127, "press at the ACTUAL painted top of a 127 bar must re-read 127");
+    }
+
+    #[test]
+    fn v127_vel_lane_roundtrip_sweep_exact() {
+        // v127: paint→drag round trip EXACT across the lane. V=64 is the
+        // mid-lane crossing where the OLD (buggy) inverse coincidentally
+        // agreed — which is exactly why the v52 midpoint pin never caught
+        // the drift; the other points land within 1 px of the crossing.
+        for want in [1u8, 40, 64, 96, 127] {
+            let mut app = headless_app(&format!("v127velsweep{want}"));
+            let ctx = egui::Context::default();
+            let c = v52_roll_rig(&mut app, &ctx);
+            let grid_x0 = c.min.x + 58.0;
+            let bot = c.max.y - 10.0;
+            {
+                let r = app.piano_roll.as_mut().unwrap();
+                r.pat.notes.push(crate::midipat::Note {
+                    ch: 0,
+                    note: 60,
+                    vel: 100,
+                    press: 0,
+                    start: 0,
+                    len: 480,
+                    bend: None,
+                });
+            }
+            frame(&mut app, &ctx, vec![]);
+            let p = egui::pos2(grid_x0 + 80.0, bot - 2.0 - want as f32 / 127.0 * 26.0);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
+            frame(&mut app, &ctx, vec![]);
+            let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+            assert_eq!(v, want, "round-trip press at painted top of a {want} bar");
+        }
     }
 
     #[test]
