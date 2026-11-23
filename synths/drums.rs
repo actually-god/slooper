@@ -38,7 +38,7 @@
 //     ride stay pitch-immune, like they are for tune.
 //   * poly-AT (MPE note pressure) is per-voice and class-based: pressed
 //     open hats / crash / ride CHOKES (decay up to 4x faster), pressed
-//     closed hats brighten (DC-block corner 7.2 kHz -> 15.8), pressed
+//     closed hats brighten (HF pre-emphasis), pressed
 //     snares/claps brighten (noise bandpass climbs up to 1.8x), pressed
 //     kicks/toms raise their head TENSION (pitch x1.25) — and a val of 0
 //     reads as pressure released, never silence.
@@ -116,6 +116,8 @@ struct Voice {
     vel: f64,
     /// v136: poly-AT pressure of this note, 0..1 (0 = released).
     at: f64,
+    /// v136: closed-hat brightness pre-emphasis history (previous sample).
+    hf_prev: f64,
     choked: bool,
     t_choke: f64,
     // Oscillator phases / incremental states.
@@ -141,7 +143,7 @@ struct Drums {
 impl Voice {
     const DEAD: Voice = Voice {
         alive: false, kind: 0, note: 0, t: 0.0, age: 0.0, vel: 0.0, at: 0.0,
-        choked: false, t_choke: 0.0,
+        hf_prev: 0.0, choked: false, t_choke: 0.0,
         p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0,
         f0: 0.0, hp_y1: 0.0, hp_x1: 0.0, hp_y2: 0.0, hp_x2: 0.0,
         seed: 1, bq: Biquad { a0: 0.0, a1: 0.0, a2: 0.0, b1: 0.0, b2: 0.0,
@@ -394,15 +396,6 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 CHAT | OHAT => {
                     // Six square partials at metallic inharmonic ratios.
                     let x = v.f0 * tmul;
-                    // v136: pressure opens the hats brighter (DC-block
-                    // corner climbs); at 0 the shared block coefficient is
-                    // reused bit-for-bit.
-                    let ha = if v.at > 0.0 {
-                        let a = (-(TAU * 7200.0 * (1.0 + 1.2 * v.at) / sr)).exp();
-                        if a.is_finite() { a } else { hpa }
-                    } else {
-                        hpa
-                    };
                     v.p1 += TAU * x * 1.0000 / sr;
                     v.p2 += TAU * x * 1.2715 / sr;
                     v.p3 += TAU * x * 1.3576 / sr;
@@ -415,7 +408,19 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                         + ((v.p4.sin() > 0.0) as i8 as f64 - 0.5)
                         + ((v.p5.sin() > 0.0) as i8 as f64 - 0.5)
                         + ((v.p6.sin() > 0.0) as i8 as f64 - 0.5);
-                    let h = v.hp2(m / 3.0, ha);
+                    let h = v.hp2(m / 3.0, hpa);
+                    // v136: pressure brightens the CLOSED hat by pre-
+                    // emphasis (the proven v134 brightness law — the DC-
+                    // block corner is provably tilt-blind, measured); at
+                    // 0 the path stays bit-identical (adds 0.0), and the
+                    // open hat keeps its untouched metallic body.
+                    let h = if v.kind == CHAT && v.at > 0.0 {
+                        let e = h + 2.25 * v.at * (h - v.hf_prev);
+                        v.hf_prev = h;
+                        if e.is_finite() { e } else { h }
+                    } else {
+                        h
+                    };
                     let tau = if v.kind == CHAT {
                         0.045 * dec
                     } else {

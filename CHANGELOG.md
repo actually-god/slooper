@@ -16,9 +16,10 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   ramp bends held kicks, snares and toms (and the hat fundamentals) exactly
   like the tune knob turns, and aftertouch is per-voice and class-based —
   pressed open hats, crash and ride CHOKES with up to 4x faster decay,
-  pressed closed hats, snares and claps brighten as their filter corners
-  climb, pressed kicks and toms raise their head tension by up to a major
-  third — with a pressure of 0 reading as "released", never silence
+  pressed closed hats, snares and claps brighten (HF pre-emphasis and a
+  climbing noise band), pressed kicks and toms raise their head tension
+  by up to a major third — a pressure of 0 reads as "released", never
+  silence
   (pinned by `v136_*`; the last bundled v1 script is gone, so the v1 drop
   guard now rides a dedicated v1-only probe).
 - **Granular tracks finally obey velocity, GLIDE and per-note aftertouch.**

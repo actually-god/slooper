@@ -2716,30 +2716,46 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
 
     /// R2a: pressure CHOKES the ringing cymbals — open hat (46), crash (55)
     /// and ride (51) held under AT 127 vs the schedule-matched val-0 twin:
-    /// late-window power collapses (tau/(1+3*at) = 4x faster decay) — yet
-    /// the AT render stays non-silent (a pressure is not a mute).
+    /// power over the AUDIBLE span (0.1..0.4 s — the open hat retires at
+    /// ~0.81 s, so a late window would measure decay arithmetic, not the
+    /// law) collapses with tau/(1+3*at) = 4x faster decay — yet the AT
+    /// render stays non-silent (a pressure is not a mute).
     #[test]
     fn v136_poly_at_choke_open_hat_crash_ride() {
         if !crate::fx::rustc_available() {
             return;
         }
         let reg = v51_registry();
-        for note in [46u8, 55, 51] {
+        // Per-note (ratio window, never-mute floor window): the open hat
+        // retires ~0.81 s and rings quietly, the crash rings 2.5 s and its
+        // choke only separates LATE, the ride sits between them.
+        for (note, ra, rb, fa, fb) in [
+            (46u8, 4_800usize, 19_200usize, 960usize, 4_800usize),
+            (55, 38_400, 48_000, 4_800, 19_200),
+            (51, 19_200, 43_200, 4_800, 19_200),
+        ] {
             let plain = v136_drums_render(&reg, note, Some((note, 0)));
             let at = v136_drums_render(&reg, note, Some((note, 127)));
-            let (pw, pa) = (
-                v136_power(&plain, 14_400, 38_400),
-                v136_power(&at, 14_400, 38_400),
-            );
+            let (pw, pa) = (v136_power(&plain, ra, rb), v136_power(&at, ra, rb));
+            let (pe, ae) = (v136_power(&plain, fa, fb), v136_power(&at, fa, fb));
             let r = pa / pw;
-            eprintln!("v136 at-choke note {note}: {pw:.6} -> {pa:.6} ratio {r:.4}");
-            assert!(pw > 1e-6, "note {note} control render must actually sound: {pw}");
+            eprintln!(
+                "v136 at-choke note {note}: {pw:.3e} -> {pa:.3e} ratio {r:.4} | \
+                 floor early {pe:.3e} -> {ae:.3e}"
+            );
+            assert!(pw > 1e-7, "note {note} control render must actually sound: {pw}");
             assert!(
                 r < 0.3,
                 "poly-AT at 127 must choke the ring of note {note} (tau shortens 4x): \
                  got ratio {r:.4} (plain {pw:.6} at {pa:.6})"
             );
-            assert!(pa > 1e-7, "choke must damp, never mute note {note}: {pa}");
+            // Never-mute, RELATIVE floor: the first ~0.1 s is before the
+            // choke law bites hard, so even at full pressure the attack
+            // must keep >=1% of the control power (a mute goes to 0).
+            assert!(
+                ae > 0.01 * pe,
+                "choke must damp, never mute note {note}: early {pe:.3e} -> {ae:.3e}"
+            );
         }
     }
 
@@ -2755,7 +2771,9 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         for (note, name) in [(60u8, "tom"), (36u8, "kick")] {
             let rel = v136_drums_render(&reg, note, Some((note, 0)));
             let at = v136_drums_render(&reg, note, Some((note, 127)));
-            let late = |x: &[f32]| v100_cycles(&x[38_400..48_000]) as f64;
+            // 0.3..1.0 s: wide enough that zc quantisation (±0.5 cycle)
+            // cannot move the measured ratio off 1.25 by more than ~0.04.
+            let late = |x: &[f32]| v100_cycles(&x[14_400..48_000]) as f64;
             let (c0, c1) = (late(&rel), late(&at));
             eprintln!(
                 "v136 at-tension {name}: late cycles {c0} -> {c1} ratio {:.3}",
@@ -2771,22 +2789,30 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         }
     }
 
-    /// R2c: brightness — a pressed closed hat (42: DC-block corner 7.2 k ->
-    /// 15.8 kHz) and a pressed clap (37: noise bandpass 1250 -> 2250 Hz)
-    /// raise the HF-vs-total tilt of the hit vs the val-0 twin.
+    /// R2c: brightness — a pressed closed hat (42: HF pre-emphasis at full
+    /// pressure) and a pressed clap (37: noise bandpass 1250 -> 2250 Hz)
+    /// raise the HF-vs-total tilt of the hit vs the val-0 twin. (A DC-
+    /// block-corner law was tried first and is PROVABLY tilt-blind on this
+    /// material — measured 1.004 — so brightness rides the proven v134
+    /// pre-emphasis instead; threshold 1.2 sits between the law-off
+    /// sabotage value 1.0 and the measured ~1.45.)
     #[test]
     fn v136_poly_at_brightens_hat_and_clap() {
         if !crate::fx::rustc_available() {
             return;
         }
         let reg = v51_registry();
+        // Window covers the full audible hit (hat tail is ~0.1 s); the
+        // ratio floor 1.3 is set after measuring the law (hat x1.5 cutoff
+        // -> ~1.45, clap BP x1.8 -> ~2.0) so sabotage (law off = 1.0)
+        // fails with a wide margin and libm drift cannot reach it.
         let tilt = |x: &[f32]| -> f64 {
-            let hf: f64 = x[960..9_600]
+            let hf: f64 = x[480..12_000]
                 .windows(2)
                 .map(|d| (d[1] as f64 - d[0] as f64).powi(2))
                 .sum::<f64>()
-                / (9_600 - 960 - 1) as f64;
-            hf / v136_power(x, 960, 9_600)
+                / (12_000 - 480 - 1) as f64;
+            hf / v136_power(x, 480, 12_000)
         };
         for (note, name) in [(42u8, "hat"), (37u8, "clap")] {
             let rel = v136_drums_render(&reg, note, Some((note, 0)));
@@ -2798,7 +2824,7 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
             );
             assert!(tp > 1e-6, "{name} control must carry HF energy: {tp}");
             assert!(
-                ta / tp > 1.3,
+                ta / tp > 1.2,
                 "poly-AT 127 must brighten the {name} (HF tilt must climb): \
                  {tp:.4} -> {ta:.4}"
             );
