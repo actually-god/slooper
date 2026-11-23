@@ -2393,14 +2393,17 @@ mod tests {
         let probe = |dir: &Path, stem: &str| -> (usize, f64, f64, f64) {
             let mut reg = Registry::open(dir.to_path_buf());
             reg.rescan();
-            // cathedral-ish: long decay, moderate damp, echo level 0 so the
-            // FDN alone is measured.
+            // cathedral-ish: long decay, echo level 0 so the FDN alone is
+            // measured. v133: damp 9000 keeps the pre-v133 EFFECTIVE loop
+            // coefficient (one_c(9000)≈0.308 vs the old inverted
+            // 1−one_c(2800)≈0.307) so the density/darkening calibration
+            // carries across the damp-law fix unchanged.
             let inst = reg
                 .create_instance(
                     stem,
                     48000.0,
                     &[
-                        0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 2800.0, 1.0, 1.0, 0.0, 1.0,
+                        0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 9000.0, 1.0, 1.0, 0.0, 1.0,
                     ],
                 )
                 .expect("echo instance");
@@ -3305,9 +3308,14 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let dir = temp_dir("v14snapglitch");
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
-        // Brightest shipped flavor: tone 8000, damp 1100, decay 0.9, verb 0.65.
+        // Brightest flavor: tone 8000, damp 15000, decay 0.9, verb 0.65.
+        // v133 retarget: this pin predates the damp-law fix — under the
+        // OLD inverted wiring damp=1100 WAS the bright extreme (loop
+        // coefficient 1−one_c(1100)≈0.134). 15000 is the true-Hz
+        // equivalent (one_c(15000)≈0.140), so the −73/−38.5 dBFS
+        // calibration holds across the law change.
         let bright = [
-            0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 1100.0, 1.9, 0.65, 0.3, 1.0,
+            0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 15000.0, 1.9, 0.65, 0.3, 1.0,
         ];
         let inst = reg
             .create_instance("space_echo", 48000.0, &bright)
@@ -3386,7 +3394,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         let fast = [
-            0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 900.0, 1.5, 0.6, 0.35, 1.0,
+            // v133: damp 16000 (slider max) is the true-Hz near-equivalent
+            // of the old inverted damp=900 (1−one_c(900)≈0.111 vs
+            // one_c(16000)≈0.123 at 48k) — the calibration carries over
+            // on the safe side of every HF ceiling.
+            0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 16000.0, 1.5, 0.6, 0.35, 1.0,
         ];
         let inst = reg
             .create_instance("space_echo", 48000.0, &fast)
@@ -4479,6 +4491,274 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 "v130 A8: vsh=4 must leave the PAN wheel working (2 Hz depth 1 swings +-0.3) — got [{lo8}, {hi8}]",
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================== v133 acceptance pins =====================
+    // Card t_8436a93d: the space_echo `damp` knob was wired INVERTED into
+    // the comb loop. `Comb::process` consumes the one-pole STATE
+    // coefficient (y = x·(1−c) + y·c with c = one_c(fc) = exp(−2π·fc/sr):
+    // bigger c = darker), but `process` passed `1.0 − one_c(damp)`, so
+    // turning the knob UP darkened the tail while the param META
+    // (SLOOPER_UNIT_HZ), the GUI ("damp 2.8kHz") and the room presets all
+    // promise higher = brighter — the exact law the sibling `tone` knob
+    // already honors. R2 pins the LAW at source, R1 the LAW by measurement,
+    // R3 the script↔host preset-table MIRROR, R4 the five rooms' tonal
+    // ladder (bright tight hall → vast dark cathedral) that the inversion
+    // had swapped. R5: the pre-v133 forensic flavors (v14 snap pins, the
+    // mode probe) were calibrated through the inverted law and are
+    // retargeted to the SAME effective coefficient below.
+
+    /// v133 R2 (formula law at source): the comb-loop damping coefficient
+    /// must pass `one_c(P_DAMP)` straight through — the same law the echo
+    /// loop's `tone_c` uses — and the inverted form must be gone. Both
+    /// polarities built with concat! so the assertion text itself can
+    /// never supply the needle (house source-pin rule).
+    #[test]
+    fn v133_space_echo_damp_formula_mirrors_tone() {
+        let src = include_str!("../effects/space_echo.rs");
+        let tone_law = concat!("let tone_c = one_c(g(P_TONE) as f64, sr);");
+        let damp_law = concat!("let damp_c = one_c(g(P_DAMP) as f64, sr);");
+        let inverted = concat!("let damp_c = 1.0", " - one_c(g(P_DAMP) as f64, sr);");
+        assert!(
+            src.contains(tone_law),
+            "tone path's one_c law anchor moved — retarget this pin together with the damp law, never drop it silently"
+        );
+        assert!(
+            src.contains(damp_law),
+            "damp_c must feed the comb loop the raw one_c(P_DAMP) state coefficient, mirroring the tone path"
+        );
+        assert!(
+            !src.contains(inverted),
+            "damp_c is inverted again: `1.0 - one_c(…)` makes the damp knob DARKEN when turned up while its declared unit (Hz cutoff, higher = brighter, see SLOOPER_UNIT_HZ in META) promises the opposite"
+        );
+    }
+
+    /// v133 R3 (mirror parity): the script's canvas preset row and the
+    /// host's `builtin_presets("space_echo")` are two copies of the same
+    /// five rooms — a drift makes the canvas button and the preset loader
+    /// ship different sounds. Parse the script table out of the embedded
+    /// copy and compare names + every value exactly.
+    #[test]
+    fn v133_space_echo_preset_tables_mirrored() {
+        let src = include_str!("../effects/space_echo.rs");
+        let decl = src
+            .split("const PRESETS")
+            .nth(1)
+            .expect("PRESETS table in the embedded script");
+        // Skip the type annotation (`… [f32; NPARAMS as usize]); 5]` also
+        // contains `];` — only the text after `= [` holds entries.
+        let blk = decl.split_once("= [").expect("PRESETS initializer").1;
+        let blk = blk.split("];").next().expect("PRESETS table close");
+        let mut script: Vec<(&str, Vec<f32>)> = Vec::new();
+        let mut rest = blk;
+        while let Some(q) = rest.find("(\"") {
+            rest = &rest[q + 2..];
+            let ne = rest.find("\", [").expect("preset entry name");
+            let name = &rest[..ne];
+            rest = &rest[ne + 4..];
+            let ve = rest.find(']').expect("preset values");
+            let vals: Vec<f32> = rest[..ve]
+                .split(',')
+                .map(|t| {
+                    t.trim()
+                        .parse::<f32>()
+                        .unwrap_or_else(|e| panic!("script preset {name}: value {t:?}: {e}"))
+                })
+                .collect();
+            script.push((name, vals));
+            rest = &rest[ve..];
+        }
+        let host = builtin_presets("space_echo");
+        assert_eq!(script.len(), 5, "five rooms in the script table, parsed: {script:?}");
+        assert_eq!(script.len(), host.len(), "host mirror must carry the same rooms: {script:?} vs {host:?}");
+        for (i, (sn, sv)) in script.iter().enumerate() {
+            assert_eq!(*sn, host[i].0, "room {i}: name drift between canvas table and host mirror");
+            let hv: Vec<f32> = host[i].1.iter().map(|(_, v)| *v).collect();
+            assert_eq!(sv.len(), hv.len(), "{sn}: param count drift");
+            for (k, (a, b)) in sv.iter().zip(&hv).enumerate() {
+                assert_eq!(a, b, "{sn}: param {k} drift — the canvas button and the seeded preset file would ship different rooms");
+            }
+        }
+    }
+
+    /// v133 R1 (measured law): a pure-room render gets a deterministic
+    /// LCG snap (v14's recurrence) through FEEDBACK 0 — the echo loop
+    /// never recirculates, so the room receives the snap exactly ONCE
+    /// (the pre-v133 window design, echo fb 0.5, kept re-injecting
+    /// undamped bright feed every echo round and flattened the damp
+    /// contrast to 0.1 dB behind that floor — measured in the RED pass).
+    /// Window = 200–500 ms of pure comb-loop ringing: first-difference
+    /// (HF) energy in ABSOLUTE dBFS must rise with the damp knob.
+    /// Negative control: an un-driven room is silent, so a dead tail can
+    /// never pass "darker than" vacuously; both extremes must be ALIVE.
+    /// Pre-v133 this was REVERSED — damp=200 (the knob's darkest setting
+    /// by its unit) was the brightest room in the house.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v133_space_echo_damp_brightens_with_hz() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v133dampph");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let sr = 48000usize;
+        // Only P_DAMP differs between runs (echo 0 / verb 1: room only;
+        // feedback 0 ⇒ single room injection, no echo-round feed train).
+        let mk = |damp: f32| -> [f32; 11] {
+            [0.08, 0.0, 8000.0, 0.0, 0.0, 0.85, damp, 1.0, 1.0, 0.0, 1.0]
+        };
+        let measure = |damp: f32, drive: bool| -> (f64, f64) {
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &mk(damp))
+                .expect("room instance");
+            let mut s = 12345u64;
+            for _ in 0..sr / 1667 {
+                // 0.6 ms white-noise snap (deterministic — same LCG as v14)
+                let x = if drive {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+                    0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0)
+                } else {
+                    0.0
+                };
+                let _ = inst.process_private(x);
+            }
+            for _ in 0..(sr / 5) {
+                let _ = inst.process_private(0.0); // 200 ms settle
+            }
+            let win: Vec<f32> = (0..(sr * 3 / 10)).map(|_| inst.process_private(0.0)).collect();
+            let t: &[f32] = &win;
+            let hf = 10.0
+                * (t[1..]
+                    .iter()
+                    .zip(t)
+                    .map(|(u, v)| (*u as f64 - *v as f64).powi(2))
+                    .sum::<f64>()
+                    / (t.len() - 1) as f64)
+                    .max(1e-18)
+                    .log10();
+            let rms = (t.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / t.len() as f64)
+                .sqrt();
+            drop(inst);
+            (hf, rms)
+        };
+        let (hf_dark, rms_dark) = measure(200.0, true);
+        let (hf_mid, _) = measure(4000.0, true);
+        let (hf_bright, rms_bright) = measure(16000.0, true);
+        let (hf_silence, rms_silence) = measure(200.0, false); // negative control
+        println!(
+            "V133DAMP: HF dBFS 200Hz {hf_dark:.1} / 4k {hf_mid:.1} / 16k {hf_bright:.1}; rms {rms_dark:.2e}/{rms_bright:.2e}; silence {hf_silence:.1} rms {rms_silence:.2e}"
+        );
+        assert!(
+            hf_silence < -85.0 && rms_silence < 1e-7,
+            "v133 A0 negative control: un-driven room is NOT silent — HF {hf_silence:.1} dBFS rms {rms_silence:.2e}; every brightness comparison would be vacuous"
+        );
+        assert!(
+            rms_dark > 1e-4 && rms_bright > 1e-4,
+            "v133 A1: room must be ALIVE in the capture window at both damp extremes — dark rms {rms_dark:.2e}, bright rms {rms_bright:.2e}"
+        );
+        assert!(
+            hf_bright > hf_dark + 10.0,
+            "v133 A2: damp 16000 must sit ≥10 dB ABOVE damp 200 in windowed HF — got bright {hf_bright:.1} vs dark {hf_dark:.1} dBFS (pre-v133 the 1.0−one_c wiring reversed this)"
+        );
+        assert!(
+            hf_bright > hf_mid && hf_mid > hf_dark,
+            "v133 A3: tail brightness must rise monotonically with damp — 200:{hf_dark:.1} 4000:{hf_mid:.1} 16000:{hf_bright:.1} dBFS"
+        );
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v133 R4 (factory-room tonal intent): the preset comments promise a
+    /// brightness ladder — Practice Hall "tiny bright room" down to
+    /// Cathedral "heavy air damping". With the damp knob inverted the
+    /// shipped rooms measured EXACTLY backwards (the bright hall was the
+    /// dullest room, the cathedral the brightest). Same snap, window =
+    /// 200–500 ms (each room's own slap + first echo rounds have decayed
+    /// at these preset feedbacks): windowed HF dBFS must descend strictly
+    /// along Practice Hall > Auditorium > Opera House > Cathedral.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v133_space_echo_room_presets_tone_ladder() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v133roomladder");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let sr = 48000usize;
+        let room_hf = |name: &str| -> (f64, f64) {
+            let pairs = builtin_presets("space_echo")
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("room {name} missing from builtin_presets"))
+                .1;
+            let vals: Vec<f32> = pairs.iter().map(|(_, v)| *v).collect();
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &vals)
+                .expect("room instance");
+            let mut s = 12345u64;
+            for _ in 0..sr / 1667 {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+                let x = 0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0);
+                let _ = inst.process_private(x);
+            }
+            for _ in 0..(sr / 5) {
+                let _ = inst.process_private(0.0); // 200 ms settle (R1 window)
+            }
+            let win: Vec<f32> = (0..(sr * 3 / 10)).map(|_| inst.process_private(0.0)).collect();
+            let t: &[f32] = &win;
+            let hf = 10.0
+                * (t[1..]
+                    .iter()
+                    .zip(t)
+                    .map(|(u, v)| (*u as f64 - *v as f64).powi(2))
+                    .sum::<f64>()
+                    / (t.len() - 1) as f64)
+                    .max(1e-18)
+                    .log10();
+            let rms = (t.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / t.len() as f64)
+                .sqrt();
+            drop(inst);
+            (hf, rms)
+        };
+        let ladder = ["Practice Hall", "Auditorium", "Opera House", "Cathedral"];
+        let mut measured = Vec::new();
+        for name in ladder {
+            let (hf, rms) = room_hf(name);
+            println!("V133LADDER {name}: HF {hf:.1} dBFS rms {rms:.2e}");
+            assert!(
+                rms > 2e-5,
+                "v133 A1: room {name} must be alive in the capture window (rms {rms:.2e})"
+            );
+            measured.push((name, hf));
+        }
+        // Margins set from the v133 measurement (see the V133LADDER lines);
+        // pre-v133 the order was strictly REVERSED, so any sign-aware
+        // margin pins the intent.
+        let m = |n: &str| -> f64 {
+            measured.iter().find(|(x, _)| *x == n).unwrap().1
+        };
+        assert!(
+            m("Practice Hall") > m("Auditorium") + 2.0,
+            "v133 A2: 'tiny bright room' must beat Auditorium by ≥2 dB HF — Practice {:.1} vs Aud {:.1}",
+            m("Practice Hall"),
+            m("Auditorium")
+        );
+        assert!(
+            m("Auditorium") > m("Opera House") + 2.0,
+            "v133 A3: ladder step Auditorium → Opera House must darken ≥2 dB — {:.1} vs {:.1}",
+            m("Auditorium"),
+            m("Opera House")
+        );
+        assert!(
+            m("Opera House") > m("Cathedral") + 2.0,
+            "v133 A4: 'heavy air damping' Cathedral must sit ≥2 dB UNDER Opera House — {:.1} vs {:.1}",
+            m("Opera House"),
+            m("Cathedral")
+        );
+        drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
