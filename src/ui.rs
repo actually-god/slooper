@@ -19194,9 +19194,7 @@ impl eframe::App for App {
         // The RT callback writes post-master-gain stereo; overflow drops
         // the NEWEST samples, so the audio thread never blocks.
         if self.sample_rate > 0 {
-            if self.meter_state.is_none() {
-                self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
-            }
+            self.ensure_meter_state();
             if let Some(ms) = self.meter_state.as_mut() {
                 let n = self.backend.meter.drain(&mut self.meter_drain, 4_800);
                 if n > 0 {
@@ -19223,6 +19221,31 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// v131: the master meter must follow the LIVE sample rate. LUFS
+    /// block size / K-weighting and the spectrum bin_hz all freeze at
+    /// the rate the meter was constructed with, while `sample_rate`
+    /// moves at runtime via `Evt::Ready` (server restart at another
+    /// rate, W12g hot-swap, v118 JACK rebuild). Pre-v131 the pump's
+    /// `is_none()` guard created the meter once forever: after a
+    /// 44.1↔48k reconnect the master readouts integrated wrong window
+    /// lengths and mislabeled the spectrum axis until app restart.
+    /// A replacement starts clean (integrated history, holds and clip
+    /// latch) — acceptable: the ring self-clears on fresh drain
+    /// positions and stale windows are worse than a reset. No-op at
+    /// rate 0 (null-audio tests, pre-ready boot).
+    fn ensure_meter_state(&mut self) {
+        if self.sample_rate == 0 {
+            return;
+        }
+        if self
+            .meter_state
+            .as_ref()
+            .is_none_or(|ms| ms.sr != self.sample_rate)
+        {
+            self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
+        }
+    }
+
     /// The whole window's content. Split out from [`eframe::App::ui`] so
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
@@ -62233,6 +62256,115 @@ mod tests {
         assert_ne!(
             fresh, edited,
             "the deleted sample's reverse edit must NOT bake into the re-imported file"
+        );
+    }
+
+    /// v131 (card t_84c57b60): a live backend rate change must REPLACE
+    /// the master meter. The meter's LUFS 100 ms block size, K-weighting
+    /// and spectrum bin_hz all freeze at the CONSTRUCTION rate, while
+    /// `App::sample_rate` follows the backend through `Evt::Ready` — a
+    /// meter kept across a 48k→44.1k reconnect integrates wrong windows
+    /// and labels the wrong frequencies until restart. Drives the shared
+    /// seam the eframe pump calls every frame.
+    #[test]
+    fn v131_master_meter_recreates_on_rate_change() {
+        let mut app = headless_app("v131sr1");
+        assert!(app.meter_state.is_none(), "fresh app has no meter yet");
+        app.sample_rate = 48_000;
+        app.ensure_meter_state();
+        {
+            let ms = app
+                .meter_state
+                .as_mut()
+                .expect("first known rate creates the meter");
+            assert_eq!(ms.sr, 48_000, "meter must record its construction rate");
+            assert!(
+                (ms.spectrum.bin_hz(1) - 48_000.0 / 8192.0).abs() < 1e-3,
+                "spectrum axis must derive from the construction rate: {}",
+                ms.spectrum.bin_hz(1)
+            );
+            ms.frames_fed = 7;
+            ms.clip = true;
+        }
+        // Evt::Ready after a reconnect at 44.1k (W12g hot-swap / v118
+        // JACK rebuild): the next pump must hand back a 44.1k meter.
+        app.sample_rate = 44_100;
+        app.ensure_meter_state();
+        let ms = app.meter_state.as_ref().expect("meter still exists");
+        assert_eq!(ms.sr, 44_100, "meter must follow the new backend rate");
+        assert_eq!(ms.frames_fed, 0, "replaced meter is a FRESH instance");
+        assert!(!ms.clip, "stale clip latch must not survive the replace");
+        assert!(
+            (ms.spectrum.bin_hz(1) - 44_100.0 / 8192.0).abs() < 1e-3,
+            "spectrum axis must relabel at the new rate: {}",
+            ms.spectrum.bin_hz(1)
+        );
+    }
+
+    /// Polarity B: re-pumping at the SAME rate must not churn the meter
+    /// — LUFS integrated/LRA accumulate across frames, so an
+    /// always-recreate "fix" would reset the history every frame.
+    #[test]
+    fn v131_master_meter_same_rate_keeps_instance() {
+        let mut app = headless_app("v131sr2");
+        app.sample_rate = 48_000;
+        app.ensure_meter_state();
+        app.meter_state.as_mut().unwrap().frames_fed = 1234;
+        app.ensure_meter_state();
+        app.ensure_meter_state();
+        assert_eq!(
+            app.meter_state.as_ref().unwrap().frames_fed,
+            1234,
+            "same-rate ensures must not replace the running meter"
+        );
+    }
+
+    /// No backend rate known (null-audio tests, pre-ready boot): the
+    /// pump never constructs a meter at sr 0, and a meter a pin
+    /// injected by hand stays untouched. (headless_app pre-arms
+    /// sample_rate = 48k, so the pin zeroes it explicitly.)
+    #[test]
+    fn v131_master_meter_needs_a_live_rate() {
+        let mut app = headless_app("v131sr3");
+        app.sample_rate = 0;
+        app.ensure_meter_state();
+        assert!(app.meter_state.is_none(), "no meter at sr 0");
+        app.meter_state = Some(crate::meter::MasterMeter::new(48_000));
+        app.ensure_meter_state();
+        assert_eq!(
+            app.meter_state.as_ref().unwrap().sr,
+            48_000,
+            "sr-0 ensures must not clobber an injected meter"
+        );
+    }
+
+    /// Wiring + drift: the eframe pump must call the shared seam
+    /// exactly once, `MasterMeter::new(self.sample_rate)` must have
+    /// exactly ONE production site, and the bare creation guard that
+    /// caused this bug must not return. Source scan: production = text
+    /// before the column-0 `mod tests`; needles via concat! so this
+    /// pin cannot certify itself.
+    #[test]
+    fn v131_master_meter_pump_goes_through_the_seam() {
+        let src = include_str!("ui.rs");
+        let cut = src
+            .find("\nmod tests")
+            .expect("column-0 mod tests boundary present");
+        let prod = &src[..cut];
+        let call = concat!("self.", "ensure_meter_state();");
+        let ncall = prod.matches(call).count();
+        assert_eq!(ncall, 1, "pump must call the seam exactly once, saw {ncall}");
+        let make = concat!("Master", "Meter::new(self.sample_rate)");
+        let nmake = prod.matches(make).count();
+        assert_eq!(
+            nmake, 1,
+            "exactly one production meter creation site, saw {nmake}"
+        );
+        let old = concat!("meter_state.is_none(", ")");
+        let nold = prod.matches(old).count();
+        assert_eq!(
+            nold, 0,
+            "bare is-none creation guard must not return, saw {nold}"
         );
     }
 
