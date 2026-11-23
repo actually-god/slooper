@@ -59247,6 +59247,9 @@ mod tests {
             "the release frame paints the FULL pre-removal snapshot: {joined}"
         );
         // per-row velocity identity: row i shows slot i's pre-removal v.
+        for (t, c) in &painted {
+            eprintln!("V135DUMP {t:?} ({:.1},{:.1})", c.x, c.y);
+        }
         let vels = v135_vel_galleys(&painted);
         assert_eq!(vels.len(), 3, "three velocity galleys, got {vels:?}");
         for (row, (text, _)) in vels.iter().enumerate() {
@@ -59286,13 +59289,18 @@ mod tests {
             &mut app,
             &ctx,
             vec![
+                // Release FIRST: egui resolves the release against the
+                // pointer position at that EVENT; a moved() before it
+                // would place the release over the DragValue and
+                // cancel the button click.
+                btn(x0, egui::PointerButton::Primary, false),
                 moved(vel1),
                 egui::Event::MouseWheel {
-                    unit: egui::ScrollUnit::Lines,
+                    unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(0.0, 1.0),
                     modifiers: Default::default(),
+                    phase: egui::TouchPhase::Move,
                 },
-                btn(x0, egui::PointerButton::Primary, false),
             ],
         );
         let m = app.sampler_maps[0].as_ref().unwrap();
