@@ -15354,6 +15354,17 @@ impl App {
         roots.sort_unstable();
         let mut dirty_order = false; // per-frame pushes are cheap; saves wait
         let mut probe_lane: Option<(f32, f32)> = None;
+        // v135: row whose '×' was clicked this frame. Removing
+        // `m.slots[i]` MID-loop shifted the table under everything the
+        // loop still touched: rows below kept painting from the
+        // pre-removal `infos` snapshot while their fresh slot reads
+        // (`cur_vel`) and the per-row post-closure writes (`new_asset`/
+        // `new_vel`, the lane layer-drop target) addressed the SHIFTED
+        // index — wrong velocity for one frame, and any same-frame edit
+        // landed on the wrong slot. Defer the removal to after the loop:
+        // the intra-frame pending-write pattern this function already
+        // uses per row (`new_asset`/`new_vel` locals).
+        let mut del_row: Option<usize> = None;
         // ---- lane rows ----
         for i in 0..n {
             let (name, root, resolved) = infos[i].clone();
@@ -15430,14 +15441,10 @@ impl App {
                         .on_hover_text("delete this layer")
                         .clicked()
                     {
-                        if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
-                            if i < m.slots.len() {
-                                m.slots.remove(i);
-                                self.smap_sel = None;
-                                self.push_sampler_map(t);
-                                self.save_config();
-                            }
-                        }
+                        // v135: DEFERRED — see `del_row`. Removing here
+                        // would shift every row below against the paint
+                        // snapshot and retarget their slot accesses.
+                        del_row = Some(i);
                     }
                 }
                 // Lane background (selection highlight + click-to-select
@@ -15589,6 +15596,22 @@ impl App {
                             self.save_config();
                         }
                     }
+                }
+            }
+        }
+        // v135: apply the deferred '×' removal AFTER the row loop, so
+        // every row painted and every slot the per-row closures wrote
+        // this frame addressed the one table the `infos` snapshot was
+        // taken from. The removal (model + selection + engine push +
+        // persist) lands before the frame ends; next frame repaints
+        // short one lane.
+        if let Some(i) = del_row {
+            if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
+                if i < m.slots.len() {
+                    m.slots.remove(i);
+                    self.smap_sel = None;
+                    self.push_sampler_map(t);
+                    self.save_config();
                 }
             }
         }
