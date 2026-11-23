@@ -209,16 +209,27 @@ impl PresetStore {
         let name = sanitize(raw);
         self.dir.join(format!("{name}.{}", self.ext))
     }
-    /// `mkdir -p` + pretty JSON write under the sanitized name. The
-    /// caller has already refused an empty sanitized name (its own
-    /// echo); returns the sanitized name it wrote for.
+    /// `mkdir -p` + pretty JSON write under the sanitized name; returns
+    /// the sanitized name it wrote for. v132 (t_09676c12): an EMPTY
+    /// sanitized name is refused here too — a call site that only checks
+    /// the RAW name would otherwise write a hidden `.json` that `list()`
+    /// can never show (`Path::new(".json").extension()` is None) while
+    /// the surface echoes success: the orphan-file class. Sites still
+    /// keep their own pre-refusal for a nicer echo; this is the choke
+    /// point no site may bypass.
     pub fn write_json(
         &self,
         raw: &str,
         rec: &impl serde::Serialize,
     ) -> std::io::Result<String> {
-        std::fs::create_dir_all(&self.dir)?;
         let name = sanitize(raw);
+        if name.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pick a preset name (letters or digits) — name sanitizes to empty",
+            ));
+        }
+        std::fs::create_dir_all(&self.dir)?;
         let js = serde_json::to_string_pretty(rec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(self.dir.join(format!("{name}.{}", self.ext)), js)?;
