@@ -2861,4 +2861,5 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         let at = v136_drums_render(&reg, 46, Some((46, 127)));
         assert_ne!(plain, at, "the held voice's pressure must be heard (targeting is not a no-op)");
     }
+
 }
