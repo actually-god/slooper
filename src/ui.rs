@@ -25117,7 +25117,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                             ui.close();
                                         }
                                     }
-                                    if ui.button("rename\u{2026}").on_hover_text("rename this folder on disk").clicked() {
+                                    if ui.button("rename\u{2026}").on_hover_text("rename this file on disk").clicked() {
                                         app.rack_rename =
                                             Some((apdisp.clone(), name.clone(), true));
                                         ui.close();
@@ -25132,14 +25132,14 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                                 .find(|o| o.folder == f.path)
                                                 .map(|o| o.dirs.clone())
                                                 .unwrap_or_default();
-                                            if ui.button("(primary root)").on_hover_text("move this folder into the library root").clicked() {
+                                            if ui.button("(primary root)").on_hover_text("move this file into the library root").clicked() {
                                                 mv = Some(std::path::PathBuf::from(
                                                     f.path.trim(),
                                                 ));
                                                 ui.close();
                                             }
                                             for d in f.dirs_in_order(&pref) {
-                                                if ui.button(d.as_str()).on_hover_text("move this folder here").clicked() {
+                                                if ui.button(d.as_str()).on_hover_text("move this file into this folder").clicked() {
                                                     mv = Some(
                                                         std::path::PathBuf::from(f.path.trim())
                                                             .join(d.replace(
