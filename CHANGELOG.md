@@ -8,6 +8,19 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Drum tracks finally obey the GLIDE lane and per-note aftertouch.** The
+  stock kit was the last bundled instrument still on the v1 script ABI: a
+  baked GLIDE ramp on a pitched-tom row and MPE note pressure (choke or
+  brighten a cymbal) were delivered to its track and silently dropped while
+  every melodic sibling answered them. The kit now speaks ABI v3: a bend
+  ramp bends held kicks, snares and toms (and the hat fundamentals) exactly
+  like the tune knob turns, and aftertouch is per-voice and class-based —
+  pressed open hats, crash and ride CHOKES with up to 4x faster decay,
+  pressed closed hats, snares and claps brighten as their filter corners
+  climb, pressed kicks and toms raise their head tension by up to a major
+  third — with a pressure of 0 reading as "released", never silence
+  (pinned by `v136_*`; the last bundled v1 script is gone, so the v1 drop
+  guard now rides a dedicated v1-only probe).
 - **Granular tracks finally obey velocity, GLIDE and per-note aftertouch.**
   The granular script was the last bundled instrument that read none of the
   piano-roll expression lanes: `note_on` dropped the velocity byte on the
