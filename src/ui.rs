@@ -62634,4 +62634,102 @@ mod tests {
         );
     }
 
+    /// v138 (card t_87fad80f) R1: the PROJECT-ASSET row menu operates on
+    /// the FILE (rack_rename renames it, rack_move relocates it) — the
+    /// hover copy must say so. Asset lives outside the rack scan so it
+    /// paints under "project assets"; every entry tooltips the rack-twin
+    /// file wording and never the old folder wording.
+    #[test]
+    fn v138_asset_menu_hover_says_file() {
+        let mut app = headless_app("v138menu");
+        let base = std::env::temp_dir().join("sp-uity-v138menu");
+        let samples = base.join("samples");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        v28_wav(&samples, "kit-b/filler.wav");
+        v28_wav(&outside, "kick.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let k = app.ensure_asset(&outside.join("kick.wav")).unwrap();
+        assert_eq!(app.assets[k].name, "kick");
+        frame(&mut app, &ctx, vec![]);
+        // Row must be in the project-assets section (file not rack-scanned).
+        let h = galley_centers(&mut app, &ctx, "kick", true)[0];
+        rmb(&mut app, &ctx, h);
+        let rn = galley_centers(&mut app, &ctx, "rename\u{2026}", true)[0];
+        let texts = hover_until_tip(&mut app, &ctx, rn, &["rename this file on disk"]);
+        assert!(
+            texts.iter().any(|t| t.contains("rename this file on disk")),
+            "asset-row rename must tooltip a FILE rename (rack-twin wording); galleys: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains(concat!("rename this ", "folder on disk"))),
+            "the old folder wording must be gone; galleys: {texts:?}"
+        );
+        // Open the move-to submenu; hover both destinations (no item is
+        // clicked — one popup per session, v50 trap (e)).
+        let mt = galley_centers(&mut app, &ctx, "move to", true)[0];
+        click_pt(&mut app, &ctx, mt);
+        let pr = galley_centers(&mut app, &ctx, "(primary root)", true)[0];
+        let texts = hover_until_tip(&mut app, &ctx, pr, &["move this file into the library root"]);
+        assert!(
+            texts.iter().any(|t| t.contains("move this file into the library root")),
+            "(primary root) must tooltip moving the FILE into the root folder; galleys: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains(concat!("move this ", "folder into the library root"))),
+            "the old folder wording must be gone; galleys: {texts:?}"
+        );
+        // EXACT "kit-b": the rack group header "- kit-b (1)" must not
+        // absorb the read (v29 precedent).
+        let kb = galley_centers(&mut app, &ctx, "kit-b", true)[0];
+        let texts = hover_until_tip(&mut app, &ctx, kb, &["move this file into this folder"]);
+        assert!(
+            texts.iter().any(|t| t.contains("move this file into this folder")),
+            "sub-folder row must tooltip the FILE move (rack-twin wording); galleys: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains(concat!("move this ", "folder here"))),
+            "the old folder wording must be gone; galleys: {texts:?}"
+        );
+    }
+
+    /// v138 R2: source scan (v54/v77 pattern) — the folder-worded hovers
+    /// are BANNED in the production slice and the file-worded ones occur
+    /// the expected times (rack menu + asset menu twins). Both polarities
+    /// are concat!-split so the scan can never feed on its own assert
+    /// literals; the prod slice stops at `mod tests` (column 0).
+    #[test]
+    fn v138_folder_copy_only_on_folder_rows() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => panic!("mod tests anchor vanished \u{2014} scan would eat its own literals"),
+        };
+        for old in [
+            concat!("rename this ", "folder on disk"),
+            concat!("move this ", "folder into the library root"),
+            concat!("move this ", "folder here"),
+        ] {
+            let n = prod.matches(old).count();
+            assert_eq!(n, 0, "folder-worded hover on a FILE op must not return: {old:?} x{n}");
+        }
+        for (needle, want) in [
+            (concat!("rename this ", "file on disk"), 2),
+            (concat!("move this ", "file into the library root"), 1),
+            (concat!("move this ", "file into this folder"), 2),
+        ] {
+            let n = prod.matches(needle).count();
+            assert_eq!(n, want, "hover-copy contract drift for {needle:?}: saw {n}, want {want}");
+        }
+    }
+
 }

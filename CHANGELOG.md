@@ -8,6 +8,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Project-asset context menus now say FILE where they act on files.**
+  The rename and move entries on a “project assets” row hovered
+  “rename/move this folder …” while the buttons rename or move the
+  sample FILE — hover copy is the affordance contract, and users were
+  avoiding (or fearing) a folder operation these rows never perform.
+  The wording now matches the rack-row twins: “rename this file on
+  disk”, “move this file into the library root”, “move this file into
+  this folder”.
 - **Drum tracks finally obey the GLIDE lane and per-note aftertouch.** The
   stock kit was the last bundled instrument still on the v1 script ABI: a
   baked GLIDE ramp on a pitched-tom row and MPE note pressure (choke or
