@@ -15,7 +15,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   now refuses any name that empties under sanitizing at the write
   primitive itself, and the plugin-parameter save path echoes the same
   "pick a preset name" refusal as the other preset surfaces before any
-  file is touched (pinned by `v132_*`).
+  file is touched (v132, pinned by `v132_*`).
+- **Auto Pan's "hold" volume shape modulates again.** The fifth tremolo
+  shape (`4 hold`) was a dead branch: its latch compared the volume LFO
+  phase against a re-arm threshold that starts at zero while the phase
+  itself always sits above zero, so it could never fire — the latched
+  gain stayed at unity and the volume wheel went *dead* at every rate
+  and depth (only the pan wheel kept working). `hold` is now a real
+  sample & hold: a fresh deterministic stepped gain latches exactly
+  once per LFO cycle, both channels stepping together (phase offset is
+  deliberately ignored, as the header and picker now document).
+  (v130, pinned by `v130_autopan_hold_latches`.)
 - **The master meter now follows a live sample-rate change.** The
   meter's LUFS windows and spectrum axis are baked from the sample rate
   it was built with, but creation used to be a once-ever guard — after
