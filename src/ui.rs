@@ -3868,7 +3868,7 @@ impl App {
         // the POST-SANITIZED name, before the plugin lookup (a name that
         // can never be listed must not touch the filesystem or the entry
         // table), parity with the 4 sibling "type a name first" echoes.
-        if crate::presetbar::sanitize(name).is_empty() {
+        if Self::sampler_preset_sanitize(name).is_empty() {
             return Err("pick a preset name (letters or digits)".into());
         }
         let entry = self
