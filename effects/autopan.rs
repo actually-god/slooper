@@ -17,13 +17,24 @@
 // cent offset, which made `centre` a static gain kill/boost that never
 // panned (cent=-1 muted the pair, cent=+1 hot-summed it to mono).
 //
+// v130: vol shape "hold" is a real sample & hold. Pre-v130 the latch
+// tested `(th2 + 1e-12) < hold_th` with hold_th starting at 0.0 while
+// th2 stays in [0,1) — never true, so `hold` kept its initial 1.0 and
+// the volume wheel was DEAD at any depth/rate. Now every vol-LFO phase
+// wrap latches a new deterministic LCG gain (classic stepped S&H
+// waveform): piecewise-constant tremolo, exactly one new value per
+// cycle, identical sequence every run. Both sides step together —
+// `phase off` does not apply to hold.
+//
 // Params:
 //   pan shape   — 0 sine / 1 tri / 2 square / 3 saw (quantised)
 //   pan rate Hz — 0.005..24
 //   pan depth   — 0..1 (0 = centre, 1 = full left/right)
 //   centre      — image bias -1..1 (-1 = full left, +1 = full right)
 //   phase off   — LFO phase offset 0..1 (L leads R; 0.5 = true L/R alternation)
-//   vol shape   — 0 sine / 1 tri / 2 square / 3 saw / 4 hold
+//   vol shape   — 0 sine / 1 tri / 2 square / 3 saw
+//                 / 4 hold (sample & hold: new stepped-random gain each
+//                 vol-LFO cycle; L/R step together, phase off ignored)
 //   vol rate Hz — 0.005..24
 //   vol depth   — 0..1 tremolo depth
 //   slew ms     — glide time for shape steps 1..200
@@ -47,7 +58,9 @@ struct St {
     gl: f32,  // slewed left pan gain
     gr: f32,  // slewed right pan gain
     hold: f32,
-    hold_th: f64,
+    // v130 hold (sample & hold) state, audio thread only:
+    prev_th2: f64, // vol LFO phase one sample back (wrap = re-latch)
+    sh_state: u32, // stepped-random LCG; fixed seed => replayable runs
     // Tier-6 sync state (audio thread only; see the ABI v4 contract).
     sync_beats: f64,
     sync_bps: f64,
@@ -65,7 +78,8 @@ extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
         gl: 1.0,
         gr: 1.0,
         hold: 1.0,
-        hold_th: 0.0,
+        prev_th2: f64::MAX, // sentinel: the FIRST sample latches immediately
+        sh_state: 0x9E37_79B9,
         sync_beats: 0.0,
         sync_bps: 0.0,
         sync_playing: false,
@@ -219,15 +233,23 @@ extern "C" fn process_st(
     let gl = a.cos() as f32;
     let gr = a.sin() as f32;
 
-    // Volume wheel (phase-offset L/R; hold shape latches per cycle).
+    // v130: sample & hold re-latches exactly once per vol-LFO cycle.
+    // Wrap detection covers both clocks (free accumulators and the
+    // host-sync fract); a transport seek/loop may re-latch early —
+    // musically harmless, a fresh step on arrival. Fixed-seed LCG:
+    // the same step sequence every instance, replayable pins, no
+    // std::rand on the audio thread.
+    if th2 < s.prev_th2 {
+        s.sh_state = s.sh_state.wrapping_mul(1664525).wrapping_add(1013904223);
+        s.hold = ((s.sh_state >> 8) as f32) * (1.0 / 16777216.0);
+    }
+    s.prev_th2 = th2;
+
+    // Volume wheel (phase-offset L/R; hold steps both sides together).
     let t2l = th2;
     let t2r = (th2 as f32 + phoff).fract();
     let v2l = if vsh == 4 {
-        if (th2 + 1e-12) < s.hold_th {
-            s.hold = shape(0, th2).mul_add(0.5, 0.5) as f32;
-            s.hold_th = th2 + 1.0;
-        }
-        s.hold
+        s.hold // latched once per cycle just above (v130)
     } else {
         (shape(vsh, t2l).mul_add(0.5, 0.5)) as f32
     };
