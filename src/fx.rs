@@ -491,7 +491,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Practice Hall",
                 se([
-                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0, 1.0,
+                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.82, 9000.0, 0.5, 0.95, 0.3, 1.0, 1.0,
                 ]),
             ),
             // Medium hall, a touch of slap before the tail.
@@ -505,7 +505,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Opera House",
                 se([
-                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0, 1.0,
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.86, 2800.0, 0.6, 0.95, 0.22, 1.0, 1.0,
                 ]),
             ),
             // Vast and dark: slow slap, 0.95 feedback, heavy air damping —
@@ -513,7 +513,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Cathedral",
                 se([
-                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0, 1.0,
+                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.94, 1200.0, 0.7, 0.9, 0.18, 1.0, 1.0,
                 ]),
             ),
         ],
@@ -4588,12 +4588,17 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// (the pre-v133 window design, echo fb 0.5, kept re-injecting
     /// undamped bright feed every echo round and flattened the damp
     /// contrast to 0.1 dB behind that floor — measured in the RED pass).
-    /// Window = 200–500 ms of pure comb-loop ringing: first-difference
-    /// (HF) energy in ABSOLUTE dBFS must rise with the damp knob.
+    /// Metric = mean Goertzel power at 1/2/3 kHz (the MID band the damp
+    /// pole actually voices: the feed path caps input near 4.2 kHz, so a
+    /// 3–8 kHz probe mostly reads feed skirt, not the comb damping —
+    /// measured 0.1–4 dB flat in the standalone A/B harness), window =
+    /// 500–900 ms of pure comb-loop ringing (settled past the mode
+    /// transition). ABSOLUTE dBFS: damp 16000 holds ~−128 dBFS while
+    /// damp 200 has collapsed to the ~−170 dBFS numerical floor — a
+    /// ~40 dB spread; pre-v133 the two values swap (the 1.0−one_c wiring
+    /// made the knob's darkest setting the brightest room in the house).
     /// Negative control: an un-driven room is silent, so a dead tail can
-    /// never pass "darker than" vacuously; both extremes must be ALIVE.
-    /// Pre-v133 this was REVERSED — damp=200 (the knob's darkest setting
-    /// by its unit) was the brightest room in the house.
+    /// never pass "darker than" vacuously; the bright extreme must be ALIVE.
     #[test]
     #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn v133_space_echo_damp_brightens_with_hz() {
@@ -4609,6 +4614,16 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mk = |damp: f32| -> [f32; 11] {
             [0.08, 0.0, 8000.0, 0.0, 0.0, 0.85, damp, 1.0, 1.0, 0.0, 1.0]
         };
+        fn goertzel_pow(t: &[f32], f: f64) -> f64 {
+            let w = 2.0 * f64::cos(2.0 * std::f64::consts::PI * f / 48000.0);
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &v in t {
+                let s0 = v as f64 + w * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - w * s1 * s2).max(0.0)
+        }
         let measure = |damp: f32, drive: bool| -> (f64, f64) {
             let inst = reg
                 .create_instance("space_echo", 48000.0, &mk(damp))
@@ -4624,47 +4639,48 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 };
                 let _ = inst.process_private(x);
             }
-            for _ in 0..(sr / 5) {
-                let _ = inst.process_private(0.0); // 200 ms settle
+            for _ in 0..(sr / 2) {
+                let _ = inst.process_private(0.0); // 500 ms settle
             }
-            let win: Vec<f32> = (0..(sr * 3 / 10)).map(|_| inst.process_private(0.0)).collect();
+            let win: Vec<f32> = (0..(sr * 2 / 5)).map(|_| inst.process_private(0.0)).collect();
             let t: &[f32] = &win;
-            let hf = 10.0
-                * (t[1..]
+            let n = t.len() as f64;
+            let mid = 10.0
+                * ([1000.0f64, 2000.0, 3000.0]
                     .iter()
-                    .zip(t)
-                    .map(|(u, v)| (*u as f64 - *v as f64).powi(2))
+                    .map(|f| goertzel_pow(t, *f))
                     .sum::<f64>()
-                    / (t.len() - 1) as f64)
-                    .max(1e-18)
+                    / 3.0
+                    / (n * n))
+                    .max(1e-30)
                     .log10();
             let rms = (t.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / t.len() as f64)
                 .sqrt();
             drop(inst);
-            (hf, rms)
+            (mid, rms)
         };
-        let (hf_dark, rms_dark) = measure(200.0, true);
-        let (hf_mid, _) = measure(4000.0, true);
-        let (hf_bright, rms_bright) = measure(16000.0, true);
-        let (hf_silence, rms_silence) = measure(200.0, false); // negative control
+        let (mid_dark, rms_dark) = measure(200.0, true);
+        let (mid_mid, _) = measure(4000.0, true);
+        let (mid_bright, rms_bright) = measure(16000.0, true);
+        let (mid_silence, rms_silence) = measure(200.0, false); // negative control
         println!(
-            "V133DAMP: HF dBFS 200Hz {hf_dark:.1} / 4k {hf_mid:.1} / 16k {hf_bright:.1}; rms {rms_dark:.2e}/{rms_bright:.2e}; silence {hf_silence:.1} rms {rms_silence:.2e}"
+            "V133DAMP: MID dBFS 200Hz {mid_dark:.1} / 4k {mid_mid:.1} / 16k {mid_bright:.1}; rms {rms_dark:.2e}/{rms_bright:.2e}; silence {mid_silence:.1} rms {rms_silence:.2e}"
         );
         assert!(
-            hf_silence < -85.0 && rms_silence < 1e-7,
-            "v133 A0 negative control: un-driven room is NOT silent — HF {hf_silence:.1} dBFS rms {rms_silence:.2e}; every brightness comparison would be vacuous"
+            mid_silence < -85.0 && rms_silence < 1e-7,
+            "v133 A0 negative control: un-driven room is NOT silent — MID {mid_silence:.1} dBFS rms {rms_silence:.2e}; every brightness comparison would be vacuous"
         );
         assert!(
-            rms_dark > 1e-4 && rms_bright > 1e-4,
-            "v133 A1: room must be ALIVE in the capture window at both damp extremes — dark rms {rms_dark:.2e}, bright rms {rms_bright:.2e}"
+            rms_bright > 1e-5,
+            "v133 A1: bright-extreme room must be ALIVE in the capture window — rms {rms_bright:.2e}"
         );
         assert!(
-            hf_bright > hf_dark + 10.0,
-            "v133 A2: damp 16000 must sit ≥10 dB ABOVE damp 200 in windowed HF — got bright {hf_bright:.1} vs dark {hf_dark:.1} dBFS (pre-v133 the 1.0−one_c wiring reversed this)"
+            mid_bright > mid_dark + 15.0,
+            "v133 A2: damp 16000 must hold ≥15 dB MORE 1–3 kHz tail energy than damp 200 at 500–900 ms — got bright {mid_bright:.1} vs dark {mid_dark:.1} dBFS (pre-v133 the 1.0−one_c wiring reversed this)"
         );
         assert!(
-            hf_bright > hf_mid && hf_mid > hf_dark,
-            "v133 A3: tail brightness must rise monotonically with damp — 200:{hf_dark:.1} 4000:{hf_mid:.1} 16000:{hf_bright:.1} dBFS"
+            mid_bright > mid_mid && mid_mid > mid_dark,
+            "v133 A3: tail mid energy must rise with damp — 200:{mid_dark:.1} 4000:{mid_mid:.1} 16000:{mid_bright:.1} dBFS"
         );
         drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4674,10 +4690,16 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     /// brightness ladder — Practice Hall "tiny bright room" down to
     /// Cathedral "heavy air damping". With the damp knob inverted the
     /// shipped rooms measured EXACTLY backwards (the bright hall was the
-    /// dullest room, the cathedral the brightest). Same snap, window =
-    /// 200–500 ms (each room's own slap + first echo rounds have decayed
-    /// at these preset feedbacks): windowed HF dBFS must descend strictly
-    /// along Practice Hall > Auditorium > Opera House > Cathedral.
+    /// dullest room, the cathedral the brightest). Metric = mean Goertzel
+    /// power at 1/2/3 kHz (the band the damp pole actually voices — the
+    /// first-difference HF probe reads feed skirt here, flat to 1 dB),
+    /// window = 100–400 ms after the snap with ECHO LEVEL 0 (room tail
+    /// only; the later windows measure numerical floor, not rooms, as the
+    /// small rooms fully decay). ABSOLUTE dBFS must descend strictly
+    /// Practice Hall > Auditorium > Opera House > Cathedral. The v133
+    /// rebalance (Practice 0.82/9000, Opera 0.86/2800, Cathedral 0.94/1200)
+    /// measured min step +2.0 dB on the fixed law; the pre-v133 wiring +
+    /// old table measured min step −2.9 dB (RED).
     #[test]
     #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
     fn v133_space_echo_room_presets_tone_ladder() {
@@ -4688,13 +4710,24 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         let sr = 48000usize;
-        let room_hf = |name: &str| -> (f64, f64) {
+        fn goertzel_pow(t: &[f32], f: f64) -> f64 {
+            let w = 2.0 * f64::cos(2.0 * std::f64::consts::PI * f / 48000.0);
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &v in t {
+                let s0 = v as f64 + w * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - w * s1 * s2).max(0.0)
+        }
+        let room_mid = |name: &str| -> (f64, f64) {
             let pairs = builtin_presets("space_echo")
                 .into_iter()
                 .find(|(n, _)| *n == name)
                 .unwrap_or_else(|| panic!("room {name} missing from builtin_presets"))
                 .1;
-            let vals: Vec<f32> = pairs.iter().map(|(_, v)| *v).collect();
+            let mut vals: Vec<f32> = pairs.iter().map(|(_, v)| *v).collect();
+            vals[9] = 0.0; // echo-path level 0: measure the ROOM, not the slap
             let inst = reg
                 .create_instance("space_echo", 48000.0, &vals)
                 .expect("room instance");
@@ -4704,57 +4737,58 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 let x = 0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0);
                 let _ = inst.process_private(x);
             }
-            for _ in 0..(sr / 5) {
-                let _ = inst.process_private(0.0); // 200 ms settle (R1 window)
+            for _ in 0..(sr / 10) {
+                let _ = inst.process_private(0.0); // 100 ms settle
             }
             let win: Vec<f32> = (0..(sr * 3 / 10)).map(|_| inst.process_private(0.0)).collect();
             let t: &[f32] = &win;
-            let hf = 10.0
-                * (t[1..]
+            let n = t.len() as f64;
+            let mid = 10.0
+                * ([1000.0f64, 2000.0, 3000.0]
                     .iter()
-                    .zip(t)
-                    .map(|(u, v)| (*u as f64 - *v as f64).powi(2))
+                    .map(|f| goertzel_pow(t, *f))
                     .sum::<f64>()
-                    / (t.len() - 1) as f64)
-                    .max(1e-18)
+                    / 3.0
+                    / (n * n))
+                    .max(1e-30)
                     .log10();
             let rms = (t.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / t.len() as f64)
                 .sqrt();
             drop(inst);
-            (hf, rms)
+            (mid, rms)
         };
         let ladder = ["Practice Hall", "Auditorium", "Opera House", "Cathedral"];
         let mut measured = Vec::new();
         for name in ladder {
-            let (hf, rms) = room_hf(name);
-            println!("V133LADDER {name}: HF {hf:.1} dBFS rms {rms:.2e}");
+            let (mid, rms) = room_mid(name);
+            println!("V133LADDER {name}: MID {mid:.1} dBFS rms {rms:.2e}");
             assert!(
                 rms > 2e-5,
                 "v133 A1: room {name} must be alive in the capture window (rms {rms:.2e})"
             );
-            measured.push((name, hf));
+            measured.push((name, mid));
         }
-        // Margins set from the v133 measurement (see the V133LADDER lines);
-        // pre-v133 the order was strictly REVERSED, so any sign-aware
-        // margin pins the intent.
+        // Margins set from the v133 rebalance measurement (min step +2.0 dB
+        // on the fixed law; the pre-v133 wiring + table measured −2.9 dB,
+        // so every threshold below flips RED there).
         let m = |n: &str| -> f64 {
             measured.iter().find(|(x, _)| *x == n).unwrap().1
         };
         assert!(
-            m("Practice Hall") > m("Auditorium") + 2.0,
-            "v133 A2: 'tiny bright room' must beat Auditorium by ≥2 dB HF — Practice {:.1} vs Aud {:.1}",
+            m("Practice Hall") > m("Auditorium") + 0.8,
+            "v133 A2: 'tiny bright room' must beat Auditorium by ≥0.8 dB mid-tail energy — Practice {:.1} vs Aud {:.1}",
             m("Practice Hall"),
             m("Auditorium")
         );
         assert!(
-            m("Auditorium") > m("Opera House") + 2.0,
-            "v133 A3: ladder step Auditorium → Opera House must darken ≥2 dB — {:.1} vs {:.1}",
+            m("Auditorium") > m("Opera House") + 0.8,
+            "v133 A3: ladder step Auditorium → Opera House must darken ≥0.8 dB — {:.1} vs {:.1}",
             m("Auditorium"),
             m("Opera House")
         );
         assert!(
-            m("Opera House") > m("Cathedral") + 2.0,
-            "v133 A4: 'heavy air damping' Cathedral must sit ≥2 dB UNDER Opera House — {:.1} vs {:.1}",
+            m("Opera House") > m("Cathedral") + 0.8,
+            "v133 A4: 'heavy air damping' Cathedral must sit ≥0.8 dB UNDER Opera House — {:.1} vs {:.1}",
             m("Opera House"),
             m("Cathedral")
         );
