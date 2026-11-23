@@ -869,3 +869,38 @@ fn v107_mcp_bridge_stdio_child_forwards() {
     clear_data_dir();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── docs drift guard (MCP-06 / t_4910331d) ──────────────────────────────
+
+/// docs/MCP.md is the user-facing tool reference; this pin is the drift
+/// guard that keeps it true: EVERY tool the live registry ships must have
+/// its name in the doc, and the doc's tool-count line must equal the
+/// registry. (The audit that opened this card had already miscounted a
+/// hand-typed surface at 24 while main shipped 45 — prose drifts, a pin
+/// does not. Regenerate the reference with `cargo run --example
+/// mcp_tool_dump`.)
+#[test]
+fn mcp_docs_cover_live_tool_table() {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs").join("MCP.md"),
+    )
+    .expect("docs/MCP.md exists (user-facing tool reference)");
+    let table = super::tools::table();
+    assert!(
+        !table.is_empty(),
+        "registry must be populated before asserting coverage"
+    );
+    assert!(
+        doc.contains(&format!("**{} tools**", table.len())),
+        "docs/MCP.md tool-count line is stale: registry ships {} tools \
+         (run `cargo run --example mcp_tool_dump` and re-fold the doc)",
+        table.len()
+    );
+    for t in &table {
+        assert!(
+            doc.contains(&format!("`{}`", t.name)),
+            "docs/MCP.md is missing the live tool `{}`",
+            t.name
+        );
+    }
+}

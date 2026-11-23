@@ -730,6 +730,29 @@ reaching the mic — set it to your system's capture latency and your
 button-press click lands exactly on the clip start. Monitoring and the
 output mix are never delayed, so nothing drifts.
 
+## Driving slooper from an agent (MCP)
+
+Settings → **AUTOMATION** (filter `mcp`): tick **MCP server** and a built-in
+[MCP](https://modelcontextprotocol.io) server starts on `127.0.0.1` only —
+Claude Desktop, Cline or any coding agent can then drive this running
+instance live: settings, windows, mixer, chains, the rack, plugin params,
+sampler/drum maps and MIDI patterns. Off by default; the switch applies
+immediately, no restart.
+
+The port and a bearer token are written to **`mcp-endpoint.json`** in the
+data folder (`~/.local/share/slooper/` on Linux,
+`%LOCALAPPDATA%\slooper\` on Windows). For stdio clients, point them at the
+built-in bridge — no token ever goes into the client config:
+
+```json
+{ "mcpServers": { "slooper": { "command": "slooper", "args": ["--mcp-bridge"] } } }
+```
+
+**read-only** is a hard latch: every write tool is refused while it's
+ticked, reads keep working, and the agent's connection survives the flip.
+Full enable flow, direct-HTTP details, guard rails and the complete tool
+reference: **[docs/MCP.md](MCP.md)**.
+
 ## Troubleshooting
 
 | Symptom | Fix |
