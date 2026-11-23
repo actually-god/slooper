@@ -1401,3 +1401,96 @@ mod drop_order_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod preset_name_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("v132fxgui-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// v132 (t_09676c12): saving a punctuation-only name must NEVER produce
+    /// an orphaned `{stem}-.json`, and the two echoes must never announce a
+    /// name that cannot be listed. The fx sanitizer folds an empty result to
+    /// "preset" (fallback since d6ce3e0 — which is why the card's site is
+    /// structurally dead), and `list_user_presets` filters empty tails; this
+    /// pin locks the whole symptom contract on the REAL editor seam:
+    /// blank → refused ("type a preset name first", no file), punctuation →
+    /// saved under the fallback name, listed, echo names it. Already GREEN
+    /// pre-fix (regression net for the already-fixed half); sabotage-prove =
+    /// delete the fx empty-fallback and this pin goes red.
+    #[test]
+    fn v132_save_preset_punctuation_name_never_orphans() {
+        if !fx::rustc_available() {
+            eprintln!("skipping: rustc not on PATH");
+            return;
+        }
+        let dir = temp_dir("fallback");
+        std::fs::write(
+            dir.join("space_echo.rs"),
+            include_str!("../effects/space_echo.rs"),
+        )
+        .unwrap();
+        let mut reg = fx::Registry::open(dir.clone());
+        reg.rescan();
+        let desc = reg.desc("space_echo").expect("space_echo desc").clone();
+        let inst = reg
+            .create_instance("space_echo", 48_000.0, &[])
+            .expect("space_echo instance");
+        let mut ed = FxEditor::new(
+            0,
+            0,
+            "space_echo".into(),
+            desc,
+            inst,
+            None,
+            48_000.0,
+            dir.clone(),
+        );
+
+        // Blank input: refused as a name; nothing on disk.
+        ed.save_user_preset("   ");
+        assert!(
+            ed.preset_msg.contains("type a preset name first"),
+            "{}",
+            ed.preset_msg
+        );
+        assert!(
+            !fx::user_presets_dir(&dir).join("space_echo-.json").exists(),
+            "blank save must write nothing"
+        );
+
+        // Punctuation-only: saved under the fallback name, never the orphan.
+        ed.save_user_preset("!!!");
+        assert!(
+            ed.preset_msg.contains("saved 'preset'"),
+            "echo must announce a listable name, got {:?}",
+            ed.preset_msg
+        );
+        let presets = fx::user_presets_dir(&dir);
+        assert!(
+            !presets.join("space_echo-.json").exists(),
+            "orphaned preset file written: {:?}",
+            std::fs::read_dir(&presets)
+                .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        assert!(
+            presets.join("space_echo-preset.json").exists(),
+            "fallback-named file missing"
+        );
+        assert!(
+            ed.preset_list.iter().any(|n| n == "preset"),
+            "saved preset must be listable: {:?}",
+            ed.preset_list
+        );
+        drop(ed);
+        drop(reg);
+        // Mapped libs outlive the process (never dlclosed); removal is
+        // best-effort, same policy as the fx.rs compile tests.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

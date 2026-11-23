@@ -45047,6 +45047,27 @@ mod tests {
         assert!(matches!(&gone, Err(e) if e.contains("gone")), "{gone:?}");
     }
 
+    /// v132 (t_09676c12): the v34 raw-name refusal only catches empty, '/'
+    /// and '..', but `presetbar::sanitize` collapses a punctuation-only name
+    /// to EMPTY ("!!!" → ""), and the store then wrote an invisible hidden
+    /// `.json` into the plugin's preset dir while the status echoed success.
+    /// The refusal must run on the POST-SANITIZED name, BEFORE the plugin
+    /// lookup (so no work and no filesystem touch happen for a name that can
+    /// never be listed). RED pre-fix: these names reached the plugin-lookup
+    /// leg ("gone") instead of being refused as a name.
+    #[test]
+    fn v132_param_preset_punctuation_name_refused() {
+        let mut app = headless_app("v132paramname");
+        for raw in ["!!!", "@#$%", "-", "?!?!"] {
+            let r = app.save_param_preset(GuiTarget::Synth(usize::MAX / 2), raw);
+            assert!(
+                matches!(&r, Err(e) if e.contains("preset name") && !e.contains("gone")),
+                "punctuation-only name {raw:?} must be refused as a NAME, \
+                 not reach the plugin: {r:?}"
+            );
+        }
+    }
+
     /// v34 R15: dragging a rack row onto a sub-folder header moves the
     /// file on disk (no context-menu dive).
     #[test]
