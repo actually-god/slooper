@@ -60511,7 +60511,8 @@ mod tests {
         // bumped it — retargeted here so the law holds, not the old number;
         // v110 MCP-04 bump; v115 = v113 claim overtaken by merged v114, renumbered per the v111 recipe;
         // v128 = MCP-05 claimed v128, renumbered when the chain overtook (v127 in flight);
-        // v129 pad-label lane merged with NO bump; v130 = autopan hold latch fix.
+        // v129 pad-label lane + v131 master-meter lane merged with NO bump;
+        // v130 = autopan hold latch fix (the current bump).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
