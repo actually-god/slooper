@@ -352,6 +352,13 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
    reintroduce per-clip fresh-chain passes: they cut delay/reverb tails at
    clip ends and reset chain state (pins `v48_export_*`). Routed sidechain
    sends feed the target's chain the summed dry taps of audible sources.
+11. **README human header is AGENT-LOCKED**: the block at the top of `README.md`
+   between the `BEGIN AGENT-LOCKED HUMAN HEADER` and `END AGENT-LOCKED HUMAN
+   HEADER` comments is the maintainer's own words, hand-written. Never edit,
+   reword, reformat, re-wrap, move, or delete it — not for docs-sync sweeps,
+   de-brand batches, style fixes, or "conciseness" passes (the conciseness
+   doctrine does not apply inside the block). If a docs change would otherwise
+   touch it, leave the block byte-identical and put the diff anywhere else.
 
 ## Where things are wired (quick grep targets)
 

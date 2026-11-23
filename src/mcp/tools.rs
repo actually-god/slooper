@@ -99,7 +99,7 @@ fn build() -> Vec<ToolDef> {
     crate::mcp_settings::register(&mut v); // MCP-02 (settings.*)
     crate::ui::mcp_windows::register(&mut v); // MCP-03 v111 (windows.*)
     crate::ui::mcp_mixer::register(&mut v); // MCP-04 (mixer.* chain.* assets.*)
-    // crate::mcp_plugins::register(&mut v);    // MCP-05 (plugins.* sampler.* drum.*)
+    crate::mcp_plugins::register(&mut v); // MCP-05 (plugins.* plugin.* sampler.* drum.* midi.*)
     v
 }
 

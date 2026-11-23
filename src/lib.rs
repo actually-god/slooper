@@ -31,6 +31,7 @@ pub mod fx;
 pub mod fxgui;
 pub(crate) mod kit;
 pub mod mcp;
+pub mod mcp_plugins;
 pub mod mcp_settings;
 pub mod meter;
 pub mod midi;
@@ -57,7 +58,7 @@ pub use midi::{MidiAction, MidiBind, MidiMsg};
 /// This constant is the ONLY place the internal series number lives:
 /// bump one line here per pass; the settings-panel footer reads it.
 /// Never rendered in the header (pins v91_* hold that seam).
-pub const INTERNAL_VERSION: &str = "v115";
+pub const INTERNAL_VERSION: &str = "v130";
 
 /// Arm the vendor-teardown hush (v73/S8, shared body): SIGTRAP becomes
 /// `_exit(0)`. Built for the production Unix path (below) and, as before,

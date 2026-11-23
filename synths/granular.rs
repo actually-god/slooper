@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 6
+// slooper-synth-version: 7
 // granular.rs — granular cloud engine for rack samples.
 //
 // Granular pads and textures in one engine. Like a granulator's
@@ -13,6 +13,17 @@
 // Buffer sync mirrors the bundled sampler: the rack asset (by id) is
 // re-copied at block boundaries when its identity moves, so editing the
 // sample live-refreshes the cloud.
+//
+// v134 (card t_5a1658c9) contract lanes — the cloud now honours every
+// expression input like its sibling synths:
+//   * note velocity scales the owning voice's grains by (vel/127)^1.3
+//     (vel = 127 leaves the render bit-identical to pre-v134),
+//   * the piano-roll GLIDE lane (ABI v2/v3 `bend`, ±12 st) shifts every
+//     live grain's read rate by 2^(st/12) — held clouds bend with the ramp,
+//   * poly-AT (MPE note pressure) per held note lifts that voice's cloud
+//     density (spawn rate ×(1+pressure)) and its grains' brightness
+//     (pre-emphasis up to ×1.5·pressure) — pressure is per-note and never
+//     touches other voices.
 //
 // Params:
 //   asset   — rack asset id to granulate
@@ -42,6 +53,8 @@ struct Grain {
     age: f64,    // seconds
     len: f64,    // seconds
     amp: f64,
+    prev: f64,   // v134: previous read sample (brightness pre-emphasis)
+    bright: f64, // v134: poly-AT pressure of the owning voice (0..1)
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +63,8 @@ struct Voice {
     note: u8,
     pos: f64,  // playhead (fractional samples)
     timer: f64, // seconds until next grain
+    vel: f64,  // v134: velocity gain law (vel/127)^1.3, 1.0 at 127
+    at: f64,   // v134: poly-AT pressure 0..1 (density + brightness)
 }
 
 struct Granular {
@@ -63,6 +78,7 @@ struct Granular {
     voices: [Voice; VOICES],
     grains: Vec<Grain>,
     rng: u32,
+    bend_st: f64, // v134: pitch bend (roll GLIDE lane), semitones
 }
 
 fn lcg(s: &mut u32) -> f64 {
@@ -79,11 +95,12 @@ extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_voi
         data_len: 0,
         buf: Vec::new(),
         buf_sr: 48000.0,
-        voices: [Voice { held: false, note: 0, pos: 0.0, timer: 0.0 }; VOICES],
+        voices: [Voice { held: false, note: 0, pos: 0.0, timer: 0.0, vel: 1.0, at: 0.0 }; VOICES],
         grains: (0..GRAINS)
-            .map(|_| Grain { on: false, pre: 0.0, pos: 0.0, rate: 1.0, age: 0.0, len: 0.0, amp: 0.0 })
+            .map(|_| Grain { on: false, pre: 0.0, pos: 0.0, rate: 1.0, age: 0.0, len: 0.0, amp: 0.0, prev: 0.0, bright: 0.0 })
             .collect(),
         rng: 0x5bd1_e995,
+        bend_st: 0.0,
     });
     Box::into_raw(s) as *mut core::ffi::c_void
 }
@@ -125,8 +142,10 @@ fn sync_asset(s: &mut Granular, want: i32) {
     s.buf_sr = if info.sample_rate > 1 { info.sample_rate as f64 } else { s.sr };
 }
 
-extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, _vel: u8) {
-    if s.is_null() {
+extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
+    if s.is_null() || vel == 0 {
+        // vel == 0 is MIDI's note-off, not an ultra-quiet voice (like the
+        // sibling scripts, v134).
         return;
     }
     let p = unsafe { &mut *(s as *mut Granular) };
@@ -136,6 +155,11 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, _vel: u8) {
             v.note = note;
             v.pos = 0.0; // positioned from the note in process (needs buf)
             v.timer = 0.0; // spawn first grain immediately
+            // v134: the velocity lane drives grain gain — (vel/127)^1.3 like
+            // the siblings, EXACTLY 1.0 at vel=127 so all-127 renders stay
+            // bit-identical to pre-v134 (and the RNG stream is untouched).
+            v.vel = (vel as f64 / 127.0).powf(1.3);
+            v.at = 0.0;
             break;
         }
     }
@@ -168,6 +192,35 @@ extern "C" fn all_off(s: *mut core::ffi::c_void) {
 
 extern "C" fn cc(_s: *mut core::ffi::c_void, _ch: u8, _num: u8, _val: u8) {}
 extern "C" fn press(_s: *mut core::ffi::c_void, _ch: u8, _val: u8) {}
+
+// --- v134 (card t_5a1658c9): GLIDE lane (ABI v2/v3 bend). The host decodes
+// the 14-bit bend / roll GLIDE lane to SEMITONES (full deflection = ±12) and
+// calls this immediately before the next process() block; every live grain's
+// read rate is multiplied by 2^(st/12) there, so a baked ramp bends held
+// clouds exactly like it bends the sampler's sample playback.
+#[no_mangle]
+pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
+    if s.is_null() {
+        return;
+    }
+    unsafe { &mut *(s as *mut Granular) }.bend_st = st as f64;
+}
+
+// v134: MPE note pressure (raw MIDI byte) per held note — that voice's
+// cloud spawns up to 2x as often and its new grains get brighter
+// (pre-emphasis). 0 = pressure released: back to the normal cloud.
+#[no_mangle]
+pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8) {
+    if s.is_null() {
+        return;
+    }
+    let p = unsafe { &mut *(s as *mut Granular) };
+    for v in p.voices.iter_mut() {
+        if v.held && v.note == note {
+            v.at = val as f64 / 127.0;
+        }
+    }
+}
 
 #[inline]
 fn read(buf: &[f32], pos: f64) -> f64 {
@@ -212,6 +265,9 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
 
     let spawn_every = 1.0 / density;
     let base_rate = ratio * 2.0f64.powf(pitch / 12.0);
+    // v134: GLIDE lane multiplier for live grains. 2^0 = EXACTLY 1.0, so an
+    // unbent render is bit-identical to the pre-v134 arithmetic.
+    let bend_ratio = (p.bend_st * (1.0 / 12.0)).exp2();
 
     // One pass per block: schedule grains + advance playheads (block-rate
     // granularity is fine for grain spawn timing).
@@ -225,8 +281,10 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             // (granular keyboard = position mapping).
             v.pos = (v.note as f64 / 127.0) * blen * 0.999;
         }
+        // v134: poly-AT raises this voice's cloud density (up to 2x).
+        let every = spawn_every / (1.0 + v.at);
         while v.timer <= dt {
-            v.timer += spawn_every;
+            v.timer += every;
             // grab a free grain
             if let Some(g) = p.grains.iter_mut().find(|g| !g.on) {
                 let spr = (lcg(&mut p.rng) * 2.0 - 1.0) * spray * sr;
@@ -236,12 +294,17 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 // block-rate timing a 1.5 s preview bounce collapsed every
                 // grain into one burst at the block head (body of the note
                 // rendered silence). `pre` delays start to the exact time.
-                g.pre = (v.timer - spawn_every).max(0.0) * sr;
+                g.pre = (v.timer - every).max(0.0) * sr;
                 g.pos = (v.pos + spr).rem_euclid(blen.max(1.0));
                 g.rate = base_rate * 2.0f64.powf(sc / 12.0);
                 g.age = 0.0;
                 g.len = size * (0.7 + 0.6 * lcg(&mut p.rng));
-                g.amp = 0.5 + 0.5 * lcg(&mut p.rng);
+                // v134: velocity law rides the grain (×1.0 at vel=127 — the
+                // RNG draw and its product stay bit-identical there); the
+                // voice's pressure stamps the grain's brightness.
+                g.amp = (0.5 + 0.5 * lcg(&mut p.rng)) * v.vel;
+                g.bright = v.at;
+                g.prev = 0.0;
             }
         }
         v.timer -= dt;
@@ -278,8 +341,19 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
                 1.0
             };
             let env = shape * win + (1.0 - shape) * sq;
-            acc += read(buf, g.pos) * env * g.amp;
-            g.pos += g.rate;
+            // v134: pressure brightness = per-grain pre-emphasis (HF lift
+            // up to +1.5 per sample-difference at full pressure). bright=0
+            // takes the untouched path — bit-identical to pre-v134.
+            let raw = read(buf, g.pos);
+            let gsmp = if g.bright > 0.0 {
+                let e = raw + 1.5 * g.bright * (raw - g.prev);
+                g.prev = raw;
+                e
+            } else {
+                raw
+            };
+            acc += gsmp * env * g.amp;
+            g.pos += g.rate * bend_ratio;
             g.age += 1.0 / sr;
         }
         let smp = acc * gain * 0.45;
@@ -322,4 +396,13 @@ pub static DESC: SynthInfoV1 = SynthInfoV1 {
 #[no_mangle]
 pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
     &DESC
+}
+
+// v134: cumulative ABI v3 table (bend + poly_at) — same add-only ladder as
+// the sibling scripts; older hosts keep loading the frozen v1 DESC above.
+static DESC_V3: SynthInfoV3 = SynthInfoV3 { abi: SLOOPER_SYNTH_ABI_V3, bend, poly_at };
+
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v3() -> *const SynthInfoV3 {
+    &DESC_V3
 }

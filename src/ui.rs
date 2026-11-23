@@ -333,6 +333,26 @@ fn default_drum_kit() -> Vec<DrumPad> {
         .collect()
 }
 
+/// v129 (card t_b47cb577): the leaf of a path/key after ANY separator.
+/// Rack scan paths carry '\\' on Windows while internal folder keys are
+/// '/'-form, so every rsplit on a single '/' silently produced/moved
+/// FULL paths there (the documented mixed-separator trap). Splitting on
+/// BOTH chars is safe on either OS: no path component ever contains '/'
+/// (all OSes) nor '\\' (NTFS forbids it in names), and the pins are then
+/// cross-OS deterministic — unlike `Path::file_stem`, which only honours
+/// '\\' on Windows and cannot be proven on a Linux runner.
+fn path_leaf_any_sep(s: &str) -> &str {
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
+}
+
+/// v129: display stem for sample labels — leaf + the exact-".wav" trim
+/// the kit labels always did (a multi-dot stem like "kick.backup.wav"
+/// keeps "kick.backup"; deliberately NOT file_stem, which would also
+/// chop ".gz" etc. and change Linux output).
+fn sample_stem_label(s: &str) -> String {
+    path_leaf_any_sep(s).trim_end_matches(".wav").to_string()
+}
+
 /// True when a kit is byte-for-byte the stock kit (never saved).
 fn kit_is_stock(kit: &[DrumPad]) -> bool {
     let saves: Vec<crate::config::DrumPadSave> = kit.iter().map(pad_to_save).collect();
@@ -3866,6 +3886,16 @@ impl App {
         if name.is_empty() || name.contains('/') || name.contains("..") {
             return Err("pick a preset name (no path characters)".into());
         }
+        // v132 (t_09676c12): the v34 refusal is a RAW-name check, but
+        // `presetbar::sanitize` has no empty fallback — a punctuation-only
+        // name ("!!!") collapses to "" and the store used to write an
+        // invisible hidden `.json` no picker could ever list. Refuse on
+        // the POST-SANITIZED name, before the plugin lookup (a name that
+        // can never be listed must not touch the filesystem or the entry
+        // table), parity with the 4 sibling "type a name first" echoes.
+        if Self::sampler_preset_sanitize(name).is_empty() {
+            return Err("pick a preset name (letters or digits)".into());
+        }
         let entry = self
             .target_entry(target)
             .ok_or_else(|| "plugin is gone".to_string())?;
@@ -6911,7 +6941,9 @@ impl App {
         }
         let sep = std::path::MAIN_SEPARATOR_STR;
         let src = PathBuf::from(from_root).join(from_dir.replace('/', sep));
-        let name = from_dir.rsplit('/').next().unwrap_or(from_dir);
+        // v129: leaf law is separator-independent (folder keys are
+        // '/'-form, but never assume it here — see path_leaf_any_sep).
+        let name = path_leaf_any_sep(from_dir);
         let np = dest_dir.join(name);
         // v76 R2f: both guards echo — a silent drop-back looked identical
         // to a successful move.
@@ -12930,6 +12962,22 @@ impl App {
         let st_at = |y: f32| (((bend_c - y) / bend_amp) * 12.0).clamp(-12.0, 12.0);
         let in_bend = |pt: egui::Pos2| lane_open && bend_lane.contains(pt);
         let in_vel = |pt: egui::Pos2| vel_lane.contains(pt);
+        // v127 (t_b18cbbf5): ONE geometry law for the velocity lane. Bars
+        // paint over [vel_bar_top(v), max.y - VEL_PAD]; `vel_at_y` is its
+        // EXACT algebraic inverse, so a press/release on a painted bar-top
+        // always re-reads that bar's own velocity. The pre-fix inverse
+        // anchored at the lane floor over the full 30 px (origin AND span
+        // wrong) — a press on a vel-127 bar's painted top read 119 (~8 %).
+        const VEL_PAD: f32 = 2.0;
+        let vel_travel = VEL_LANE_H - 2.0 * VEL_PAD;
+        let vel_bar_top = |v: f32| vel_lane.max.y - VEL_PAD - v / 127.0 * vel_travel;
+        let vel_at_y = |y: f32| {
+            (((vel_lane.max.y - VEL_PAD - y) / vel_travel)
+                .clamp(0.0, 1.0)
+                * 127.0)
+                .round()
+                .max(1.0) as u8
+        };
         {
             painter.rect_filled(vel_lane, 0.0, Color32::from_gray(18));
             if lane_open {
@@ -12941,12 +12989,12 @@ impl App {
                 if x1 < grid_x0 || x0 > rect.max.x {
                     continue;
                 }
-                let h = note.vel as f32 / 127.0 * (VEL_LANE_H - 4.0);
+                let top = vel_bar_top(note.vel as f32);
                 let sel = roll.sel_notes.contains(&idx);
                 painter.rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(x0.max(grid_x0), vel_lane.max.y - 2.0 - h),
-                        egui::pos2(x1.max(x0 + 1.0), vel_lane.max.y - 2.0),
+                        egui::pos2(x0.max(grid_x0), top),
+                        egui::pos2(x1.max(x0 + 1.0), vel_lane.max.y - VEL_PAD),
                     ),
                     1.0,
                     if sel {
@@ -13328,11 +13376,7 @@ impl App {
                             roll.sel_anchor = Some(i);
                         }
                         roll.gesture = RollGesture::VelDrag { idx: i };
-                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
-                            .clamp(0.0, 1.0)
-                            * 127.0)
-                            .round()
-                            .max(1.0) as u8;
+                        let v = vel_at_y(pt.y);
                         if roll.sel_notes.contains(&i) {
                             let group: Vec<usize> = roll.sel_notes.clone();
                             for s in group {
@@ -13747,11 +13791,7 @@ impl App {
                         }
                     }
                     RollGesture::VelDrag { idx } => {
-                        let v = (((vel_lane.max.y - pt.y) / VEL_LANE_H)
-                            .clamp(0.0, 1.0)
-                            * 127.0)
-                            .round()
-                            .max(1.0) as u8;
+                        let v = vel_at_y(pt.y);
                         if roll.sel_notes.contains(&idx) {
                             let group: Vec<usize> = roll.sel_notes.clone();
                             for s in group {
@@ -14681,6 +14721,267 @@ impl App {
             t + 1,
             self.kit(t).len()
         );
+    }
+
+    // ── v128/MCP-05: pub(crate) seams for crate::mcp_plugins ─────────────
+    // Thin delegations ONLY: the MCP tool layer reaches plugin state
+    // exclusively through these, so every table invariant (drum_resolve,
+    // push_sampler_map, fx_save_pending, update_piano_roll_asset →
+    // push_project, save_config) stays owned by the code above. No new
+    // semantics live in this block.
+
+    pub(crate) fn mcp05_n_tracks(&self) -> usize {
+        self.n_tracks
+    }
+    /// (path, is-MIDI-pattern, is-automation) of an asset-table id.
+    pub(crate) fn mcp05_asset_entry(&self, id: usize) -> Option<(PathBuf, bool, bool)> {
+        let a = self.assets.get(id)?;
+        Some((a.path.clone(), a.pattern.is_some(), a.automation.is_some()))
+    }
+    pub(crate) fn mcp05_asset_index(&self, path: &str) -> Option<usize> {
+        self.assets.iter().position(|a| a.path.to_string_lossy() == path)
+    }
+    pub(crate) fn mcp05_asset_stems(&self) -> Vec<String> {
+        self.assets.iter().map(|a| a.name.clone()).collect()
+    }
+    pub(crate) fn mcp05_track_synth_stem(&self, t: usize) -> Option<String> {
+        self.track_synth.get(t).cloned().flatten()
+    }
+    pub(crate) fn mcp05_synth_handle(&self, t: usize) -> Option<std::sync::Arc<SynthHandle>> {
+        self.track_synth_inst.get(t).cloned().flatten()
+    }
+    pub(crate) fn mcp05_synth_desc(&self, stem: &str) -> Option<synth::SynthDesc> {
+        self.synth_registry.desc(stem).cloned()
+    }
+    pub(crate) fn mcp05_fx_desc(&self, stem: &str) -> Option<fx::EffectDesc> {
+        self.fx_registry.desc(stem).cloned()
+    }
+    pub(crate) fn mcp05_fx_registry_stems(&self) -> Vec<String> {
+        self.fx_registry.stems()
+    }
+    pub(crate) fn mcp05_synth_registry_stems(&self) -> Vec<String> {
+        self.synth_registry.stems()
+    }
+    /// (stem-or-plugin-name, params, bypass, is_hosted) of one chain row.
+    pub(crate) fn mcp05_fx_row(&self, t: usize, r: usize) -> Option<(String, Vec<f32>, bool, bool)> {
+        match self.fx_rows.get(t)?.get(r)? {
+            ChainRow::Script { stem, params, bypass } => {
+                Some((stem.clone(), params.clone(), *bypass, false))
+            }
+            ChainRow::Vst { name, params, bypass, .. } => {
+                Some((name.clone(), params.clone(), *bypass, true))
+            }
+        }
+    }
+    pub(crate) fn mcp05_fx_chain_len(&self, t: usize) -> usize {
+        self.fx_rows.get(t).map(|v| v.len()).unwrap_or(0)
+    }
+    pub(crate) fn mcp05_fx_live(&self, t: usize, r: usize) -> Option<std::sync::Arc<fx::Instance>> {
+        self.fx_live.get(t)?.get(r).cloned().flatten()
+    }
+    /// The GUI's own value-apply seam (rows + live instance + persist),
+    /// addressed exactly like a value-bind target.
+    pub(crate) fn mcp05_fx_set_param(&mut self, t: usize, r: usize, k: usize, v: f32) -> bool {
+        self.apply_target_value(t, &format!("fx:{r}:{k}"), v)
+    }
+    pub(crate) fn mcp05_synth_set_param(&mut self, t: usize, k: usize, v: f32) -> bool {
+        self.apply_target_value(t, &format!("synth:{k}"), v)
+    }
+    /// Apply preset pairs to a live chain slot through the fxgui loader's
+    /// semantics (shared `fx::apply_preset_pairs` — one loader, v59).
+    pub(crate) fn mcp05_fx_apply_preset(
+        &mut self,
+        t: usize,
+        r: usize,
+        pairs: &[(String, f64)],
+    ) -> Result<usize, String> {
+        let inst = self
+            .fx_live
+            .get(t)
+            .and_then(|v| v.get(r))
+            .cloned()
+            .flatten()
+            .ok_or_else(|| "chain slot has no live instance".to_string())?;
+        let desc = match self.fx_rows.get(t).and_then(|v| v.get(r)) {
+            Some(ChainRow::Script { stem, .. }) => self.fx_registry.desc(stem).cloned(),
+            Some(_) => return Err("chain slot is a hosted plugin".into()),
+            None => return Err("chain slot does not exist".into()),
+        }
+        .ok_or_else(|| "effect script is not installed".to_string())?;
+        let applied = fx::apply_preset_pairs(&inst, &desc, pairs).len();
+        if let Some(ChainRow::Script { params, .. }) = self.fx_rows.get_mut(t).and_then(|v| v.get_mut(r)) {
+            *params = (0..desc.params.len()).map(|k| inst.param(k)).collect();
+        }
+        self.fx_save_pending = true;
+        self.save_config();
+        Ok(applied)
+    }
+    pub(crate) fn mcp05_fx_dir(&self) -> PathBuf {
+        self.fx_registry.dir().to_path_buf()
+    }
+    pub(crate) fn mcp05_is_sampler_track(&self, t: usize) -> bool {
+        self.track_synth
+            .get(t)
+            .cloned()
+            .flatten()
+            .and_then(|stem| {
+                self.synth_registry
+                    .desc(&stem)
+                    .map(|d| d.params.first().is_some_and(|p| p.label == "asset"))
+            })
+            .unwrap_or(false)
+    }
+    pub(crate) fn mcp05_sampler_map(&self, t: usize) -> Option<crate::config::SamplerMapSave> {
+        self.sampler_maps.get(t).cloned().flatten()
+    }
+    /// The v51 publish seam: table + live map + persistence, one call.
+    pub(crate) fn mcp05_sampler_map_commit(&mut self, t: usize, map: crate::config::SamplerMapSave) {
+        self.sampler_maps[t] = Some(map);
+        self.push_sampler_map(t);
+        self.save_config();
+    }
+    /// (pad save record, resolved rack id) per pad.
+    pub(crate) fn mcp05_kit(&self, t: usize) -> Vec<(crate::config::DrumPadSave, Option<usize>)> {
+        self.kit(t).iter().map(|p| (pad_to_save(p), p.asset)).collect()
+    }
+    pub(crate) fn mcp05_pad_set(
+        &mut self,
+        t: usize,
+        pad: usize,
+        name: Option<&str>,
+        asset_path: Option<&str>,
+        vel: Option<u8>,
+        muted: Option<bool>,
+    ) -> bool {
+        let k = self.kit_mut(t);
+        let Some(p) = k.get_mut(pad) else {
+            return false;
+        };
+        if let Some(n) = name {
+            p.name = n.to_string();
+        }
+        if let Some(ap) = asset_path {
+            p.asset_path = ap.to_string();
+        }
+        if let Some(v) = vel {
+            p.vel = v;
+        }
+        if let Some(m) = muted {
+            p.muted = m;
+        }
+        self.drum_resolve();
+        self.save_config();
+        true
+    }
+    pub(crate) fn mcp05_pattern(&self, id: usize) -> Option<crate::midipat::Pattern> {
+        self.assets.get(id)?.pattern.as_ref().map(|p| (**p).clone())
+    }
+    /// The roll's own in-place commit (sort, save .mid, table swap,
+    /// push_project → SetMidiAssets).
+    pub(crate) fn mcp05_pattern_commit(&mut self, id: usize, mut pat: crate::midipat::Pattern) {
+        self.update_piano_roll_asset(&mut pat, id as u32);
+    }
+    pub(crate) fn mcp05_synth_preset_list(&self, stem: &str) -> Vec<String> {
+        Self::list_synth_presets(stem)
+    }
+    pub(crate) fn mcp05_synth_preset_save(&mut self, t: usize, raw: &str) {
+        self.synth_preset_name = raw.to_string();
+        self.synth_preset_save(t);
+    }
+    pub(crate) fn mcp05_synth_preset_load(&mut self, t: usize, name: &str) {
+        self.synth_preset_apply(t, name);
+    }
+    pub(crate) fn mcp05_synth_preset_dir(&self, stem: &str) -> PathBuf {
+        Self::synth_preset_dir(stem)
+    }
+    pub(crate) fn mcp05_sampler_preset_list() -> Vec<String> {
+        Self::sampler_preset_list()
+    }
+    pub(crate) fn mcp05_sampler_preset_save(&mut self, t: usize, raw: &str) {
+        self.smap_preset_name = raw.to_string();
+        self.sampler_preset_save(t);
+    }
+    pub(crate) fn mcp05_sampler_preset_load(&mut self, t: usize, name: &str) {
+        self.sampler_preset_load(t, name);
+    }
+    pub(crate) fn mcp05_sampler_preset_dir() -> PathBuf {
+        Self::sampler_preset_dir()
+    }
+    pub(crate) fn mcp05_kit_preset_list() -> Vec<String> {
+        Self::list_kit_presets()
+    }
+    pub(crate) fn mcp05_kit_preset_save(&mut self, t: usize, raw: &str) {
+        self.kit_preset_name = raw.to_string();
+        self.kit_preset_save(t);
+    }
+    pub(crate) fn mcp05_kit_preset_load(&mut self, t: usize, name: &str) {
+        self.kit_preset_apply(t, name);
+    }
+    pub(crate) fn mcp05_kit_preset_dir() -> PathBuf {
+        Self::kit_preset_dir()
+    }
+    /// Test seam: the GUI's own script-FX chain-add (pins drive the real
+    /// row+live-instance construction, never a hand-built table).
+    #[cfg(test)]
+    pub(crate) fn mcp05_add_fx_script(&mut self, t: usize, stem: &str) {
+        self.add_fx_script(t, stem);
+    }
+    /// Test seam: bind a synth stem through the GUI's bind path.
+    #[cfg(test)]
+    pub(crate) fn mcp05_set_track_synth(&mut self, t: usize, stem: &str) {
+        self.set_track_synth_stem(t, stem);
+    }
+    /// Test rig: set the app's audio rate (pins drive sampler/instance
+    /// paths that gate on a live rate).
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_set_sr(&mut self, sr: u32) {
+        self.sample_rate = sr;
+    }
+    /// Test rig: push a (silent) audio asset into the rack; returns its id.
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_add_audio_asset(&mut self, name: &str, path: PathBuf) -> usize {
+        self.assets.push(crate::assets::Asset::audio(
+            self.assets.len() as u32,
+            name.into(),
+            path,
+            std::sync::Arc::from(vec![0.0f32; 8]),
+            false,
+        ));
+        self.assets.len() - 1
+    }
+    /// Test rig: push a MIDI pattern asset (the roll's in-place seam saves
+    /// the `.mid` back to `path`); returns its id.
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_add_pattern_asset(&mut self, name: &str, path: PathBuf) -> usize {
+        self.assets.push(crate::assets::Asset {
+            id: self.assets.len() as u32,
+            name: name.into(),
+            path,
+            data: std::sync::Arc::from(vec![0.0f32; 0]),
+            dirty: false,
+            pattern: Some(std::sync::Arc::new(crate::midipat::Pattern::new(120))),
+            automation: None,
+        });
+        self.assets.len() - 1
+    }
+    /// Test rig: push a HOSTED chain row (entry None — live side stays
+    /// empty) so pins prove the native-tools wrong_kind gate against the
+    /// real Vst row shape.
+    #[cfg(test)]
+    pub(crate) fn mcp05_test_add_fx_vst_row(&mut self, t: usize, name: &str) {
+        self.fx_rows[t].push(ChainRow::Vst {
+            path: "ghost.vst3".into(),
+            kind: crate::vsthost::VstKind::V3,
+            plugin_id: None,
+            name: name.into(),
+            params: vec![0.5, 0.5],
+            entry: None,
+            open_rx: None,
+            state: None,
+            program: None,
+            bypass: false,
+        });
+        self.rebuild_fx(t);
     }
     /// v69 (S1): the ONE pad-sound assignment path: an audio file enters
     /// the rack (`ensure_asset` dedups) and becomes pad `p`'s sound.
@@ -15877,12 +16178,9 @@ impl App {
             .filter(|a| !a.is_midi() && !a.is_auto())
             .map(|a| {
                 let path = a.path.to_string_lossy().to_string();
-                let nm = path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("?")
-                    .trim_end_matches(".wav")
-                    .to_string();
+                // v129: stem label via the shared separator-safe law
+                // (a slash-only rsplit showed full backslash paths on Windows).
+                let nm = sample_stem_label(&path);
                 (path, nm)
             })
             .collect();
@@ -15930,12 +16228,9 @@ impl App {
                             }
                         }
                         let cur_path = kit[p].asset_path.clone();
-                        let label = cur_path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("(sound)")
-                            .trim_end_matches(".wav")
-                            .to_string();
+                        // v129: separator-safe stem label (was a slash-only
+                        // rsplit — full path on Windows scans, card t_b47cb577).
+                        let label = sample_stem_label(&cur_path);
                         egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
                             .selected_text(label)
                             .width(110.0)
@@ -15988,7 +16283,8 @@ impl App {
                                         self.status = format!(
                                             "drum kit: pad {} <- imported {}",
                                             p + 1,
-                                            sp.rsplit('/').next().unwrap_or(&sp)
+                                            // v129: same separator-safe stem law.
+                                            sample_stem_label(&sp)
                                         );
                                     }
                                     None => {
@@ -18933,9 +19229,7 @@ impl eframe::App for App {
         // The RT callback writes post-master-gain stereo; overflow drops
         // the NEWEST samples, so the audio thread never blocks.
         if self.sample_rate > 0 {
-            if self.meter_state.is_none() {
-                self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
-            }
+            self.ensure_meter_state();
             if let Some(ms) = self.meter_state.as_mut() {
                 let n = self.backend.meter.drain(&mut self.meter_drain, 4_800);
                 if n > 0 {
@@ -18962,6 +19256,31 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// v131: the master meter must follow the LIVE sample rate. LUFS
+    /// block size / K-weighting and the spectrum bin_hz all freeze at
+    /// the rate the meter was constructed with, while `sample_rate`
+    /// moves at runtime via `Evt::Ready` (server restart at another
+    /// rate, W12g hot-swap, v118 JACK rebuild). Pre-v131 the pump's
+    /// `is_none()` guard created the meter once forever: after a
+    /// 44.1↔48k reconnect the master readouts integrated wrong window
+    /// lengths and mislabeled the spectrum axis until app restart.
+    /// A replacement starts clean (integrated history, holds and clip
+    /// latch) — acceptable: the ring self-clears on fresh drain
+    /// positions and stale windows are worse than a reset. No-op at
+    /// rate 0 (null-audio tests, pre-ready boot).
+    fn ensure_meter_state(&mut self) {
+        if self.sample_rate == 0 {
+            return;
+        }
+        if self
+            .meter_state
+            .as_ref()
+            .is_none_or(|ms| ms.sr != self.sample_rate)
+        {
+            self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
+        }
+    }
+
     /// The whole window's content. Split out from [`eframe::App::ui`] so
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
@@ -44768,6 +45087,27 @@ mod tests {
         assert!(matches!(&gone, Err(e) if e.contains("gone")), "{gone:?}");
     }
 
+    /// v132 (t_09676c12): the v34 raw-name refusal only catches empty, '/'
+    /// and '..', but `presetbar::sanitize` collapses a punctuation-only name
+    /// to EMPTY ("!!!" → ""), and the store then wrote an invisible hidden
+    /// `.json` into the plugin's preset dir while the status echoed success.
+    /// The refusal must run on the POST-SANITIZED name, BEFORE the plugin
+    /// lookup (so no work and no filesystem touch happen for a name that can
+    /// never be listed). RED pre-fix: these names reached the plugin-lookup
+    /// leg ("gone") instead of being refused as a name.
+    #[test]
+    fn v132_param_preset_punctuation_name_refused() {
+        let mut app = headless_app("v132paramname");
+        for raw in ["!!!", "@#$%", "-", "?!?!"] {
+            let r = app.save_param_preset(GuiTarget::Synth(usize::MAX / 2), raw);
+            assert!(
+                matches!(&r, Err(e) if e.contains("preset name") && !e.contains("gone")),
+                "punctuation-only name {raw:?} must be refused as a NAME, \
+                 not reach the plugin: {r:?}"
+            );
+        }
+    }
+
     /// v34 R15: dragging a rack row onto a sub-folder header moves the
     /// file on disk (no context-menu dive).
     #[test]
@@ -51038,6 +51378,166 @@ mod tests {
     }
 
     #[test]
+    fn v127_vel_lane_press_at_bar_top_hits_127() {
+        // v127 (t_b18cbbf5): the drag inverse must invert EXACTLY the paint
+        // geometry: bars span [max.y-2 - v/127*(H-4), max.y-2] — a 26 px
+        // travel with a 2 px floor inset. The old inverse anchored at the
+        // lane floor over the FULL 30 px, so pressing the painted TOP of a
+        // vel-127 bar read 119 (~8 % low). Press at MID lane first so the
+        // top assert cannot pass vacuously on an unhandled gesture.
+        let mut app = headless_app("v127veltop");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 127,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let mid = egui::pos2(grid_x0 + 80.0, bot - 15.0);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v_mid = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert!(v_mid < 127, "mid-lane press must move velocity (gesture live), got {v_mid}");
+        // Painted top of the FULL-height bar: floor inset 2 + travel 26.
+        let top = egui::pos2(grid_x0 + 80.0, bot - 2.0 - 26.0);
+        frame(&mut app, &ctx, vec![moved(top), btn(top, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(top), btn(top, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert_eq!(v, 127, "press at the painted top of a max bar must keep 127");
+    }
+
+    #[test]
+    fn v127_vel_lane_release_at_painted_top_matches() {
+        // v127: the MOVING-drag site (release value) must reproduce the
+        // velocity whose painted bar-top sits under the pointer — the card's
+        // "release value disagrees with the displayed height" contract.
+        let mut app = headless_app("v127velrel");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let want: u8 = 110;
+        let p0 = egui::pos2(grid_x0 + 80.0, bot - 5.0);
+        // Painted top for `want`: max.y - 2 - v/127*(H-4), H-4 = 26.
+        let p1 = egui::pos2(grid_x0 + 80.0, bot - 2.0 - want as f32 / 127.0 * 26.0);
+        frame(&mut app, &ctx, vec![moved(p0), btn(p0, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(p1)]);
+        frame(&mut app, &ctx, vec![moved(p1), btn(p1, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert_eq!(v, want, "release at the painted top of a {want} bar must set {want}");
+    }
+
+    #[test]
+    fn v127_vel_lane_press_at_actual_painted_top_reads_that_velocity() {
+        // v127 coupling law (strongest of the set): read the bar's ACTUAL
+        // painted top edge out of the frame's shapes, change the velocity
+        // away, then press at the remembered y — it must re-read the
+        // ORIGINAL value. Paint and drag are then verified against EACH
+        // OTHER, not just against the pin's own formula: drift on either
+        // side of the shared helper reddens a pin of this set.
+        let mut app = headless_app("v127velcouple");
+        let ctx = egui::Context::default();
+        let c = v52_roll_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let bot = c.max.y - 10.0;
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 127,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        // Bar blue (90,160,230) is painted ONLY by the velocity bar.
+        let bar = painted_rect(&mut app, &ctx, (90, 160, 230)).expect("velocity bar painted");
+        assert!(
+            (bar.min.y - (bot - 2.0 - 26.0)).abs() < 0.6
+                && (bar.max.y - (bot - 2.0)).abs() < 0.6,
+            "painted bar must sit at [bot-28, bot-2], got {bar:?}"
+        );
+        let top_y = bar.min.y;
+        // Move the value away: mid-lane press → vel 64.
+        let mid = egui::pos2(grid_x0 + 80.0, bot - 15.0);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(mid), btn(mid, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v_mid = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert!(v_mid < 127, "mid-lane press must have moved velocity, got {v_mid}");
+        // Press at the remembered 127-bar top: the ORIGINAL value returns.
+        let p = egui::pos2(grid_x0 + 80.0, top_y);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+        assert_eq!(v, 127, "press at the ACTUAL painted top of a 127 bar must re-read 127");
+    }
+
+    #[test]
+    fn v127_vel_lane_roundtrip_sweep_exact() {
+        // v127: paint→drag round trip EXACT across the lane. V=64 is the
+        // mid-lane crossing where the OLD (buggy) inverse coincidentally
+        // agreed — which is exactly why the v52 midpoint pin never caught
+        // the drift; the other points land within 1 px of the crossing.
+        for want in [1u8, 40, 64, 96, 127] {
+            let mut app = headless_app(&format!("v127velsweep{want}"));
+            let ctx = egui::Context::default();
+            let c = v52_roll_rig(&mut app, &ctx);
+            let grid_x0 = c.min.x + 58.0;
+            let bot = c.max.y - 10.0;
+            {
+                let r = app.piano_roll.as_mut().unwrap();
+                r.pat.notes.push(crate::midipat::Note {
+                    ch: 0,
+                    note: 60,
+                    vel: 100,
+                    press: 0,
+                    start: 0,
+                    len: 480,
+                    bend: None,
+                });
+            }
+            frame(&mut app, &ctx, vec![]);
+            let p = egui::pos2(grid_x0 + 80.0, bot - 2.0 - want as f32 / 127.0 * 26.0);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, true)]);
+            frame(&mut app, &ctx, vec![moved(p), btn(p, egui::PointerButton::Primary, false)]);
+            frame(&mut app, &ctx, vec![]);
+            let v = app.piano_roll.as_ref().unwrap().pat.notes[0].vel;
+            assert_eq!(v, want, "round-trip press at painted top of a {want} bar");
+        }
+    }
+
+    #[test]
     fn v52_roll_wheel_step_is_configurable() {
         let mut app = headless_app("v52velstep");
         let ctx = egui::Context::default();
@@ -55133,6 +55633,143 @@ mod tests {
         let n = app.assets.len();
         assert!(app.assign_pad_file(&mut kit, 1, &rim).is_some());
         assert_eq!(app.assets.len(), n, "the rack dedups by path");
+    }
+
+    /// v129 (card t_b47cb577): all painted galley texts of one frame,
+    /// deduped — exact-text label asserts (the house galley readers all
+    /// match by `contains`, which a full path containing the stem passes
+    /// vacuously — exactly the bug class here).
+    fn v129_texts(app: &mut App, ctx: &egui::Context) -> Vec<String> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        texts.sort();
+        texts.dedup();
+        texts
+    }
+
+    #[test]
+    fn v129_kit_pad_labels_split_on_windows_separators() {
+        // The pad ComboBox label + dropdown rows were built with
+        // rsplit('/'); Windows rack-scan paths carry '\\', so the widget
+        // showed the FULL path. Reproduce the Windows shape ON LINUX:
+        // backslash-form rack paths + pad assignment. The fix law splits
+        // on BOTH separators, so this pin is OS-deterministic and must
+        // stay green on the windows-native parity suite unchanged.
+        let (mut app, ctx) = v65_synth_win("v129stem");
+        let samples = std::env::temp_dir().join("sp-uity-v129stem/samples");
+        let kp = samples.join("kp.wav");
+        let rim = samples.join("rim.wav");
+        std::fs::copy(samples.join("kick.wav"), &rim).expect("rim fixture");
+        std::fs::copy(samples.join("kick.wav"), &kp).expect("kp fixture");
+        let k = app.ensure_asset(&kp).expect("kp imports");
+        let r = app.ensure_asset(&rim).expect("rim imports");
+        // Retarget both rack entries to Windows scan shape ('\\ form,
+        // mixed-separator trap). Rack NAMES are kept distinct from the
+        // stems so the rack's own labels can never alias with the combo.
+        let kp_full = "C:\\Users\\mix\\Sounds\\Kick 808.wav";
+        let rim_full = "C:\\Users\\mix\\Sounds\\Rim.wav";
+        app.assets[k].path = std::path::PathBuf::from(kp_full);
+        app.assets[k].name = "zkp".into();
+        app.assets[r].path = std::path::PathBuf::from(rim_full);
+        app.assets[r].name = "zrim".into();
+        app.kit_mut(0)[0].asset_path = kp_full.to_string();
+        let mut texts = v129_texts(&mut app, &ctx);
+        // A: the pad combo's selected text is the STEM, exact.
+        assert!(
+            texts.iter().any(|t| t == "Kick 808"),
+            "pad combo label must show the stem; painted: {texts:?}"
+        );
+        // A2: no label leaks the Windows directory.
+        assert!(
+            !texts.iter().any(|t| t.contains("Sounds")),
+            "a kit label leaked the full path: {texts:?}"
+        );
+        // B: open the pad's dropdown (combo label paints last — window)
+        // and demand stem rows, popup open, still no full-path leak.
+        let c = galley_at_last(&mut app, &ctx, "Kick 808")
+            .expect("combo selected label")
+            .center();
+        click_pt(&mut app, &ctx, c);
+        texts = v129_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t == "(silent)"),
+            "pad dropdown did not open: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Rim"),
+            "dropdown row must show the stem: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("Sounds")),
+            "dropdown row leaked the full path: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn v129_prod_ui_has_no_slash_only_leaf_sites() {
+        // Class sweep (card fix-sketch): no '/'-only `rsplit` leaf site
+        // survives in production ui.rs — rack scans carry '\\' on
+        // Windows and every such site silently shows/moves full paths.
+        let srcs = include_str!("ui.rs");
+        // Column-0 `mod tests` is the house boundary (a dozen source-scan
+        // pins anchor on it); fall back to the indented form defensively.
+        let cut = srcs
+            .find("\nmod tests")
+            .or_else(|| srcs.find("\n    mod tests"));
+        let prod = match cut {
+            Some(i) => &srcs[..i],
+            None => srcs,
+        };
+        // Split via concat! so this pin's own needle cannot match itself.
+        let needle = concat!("rsplit", "(", "'", "/", "')");
+        let hit = prod.find(needle).map(|i| {
+            format!(
+                "line {}: {}",
+                prod[..i].lines().count(),
+                prod[i..].lines().next().unwrap_or("")
+            )
+        });
+        assert!(
+            hit.is_none(),
+            "'/'-only leaf site reintroduced in production ui.rs: {hit:?}"
+        );
+    }
+
+    #[test]
+    fn v129_pad_stem_label_matrix() {
+        // The label law's semantics, pinned at the helper (call sites are
+        // driven by the UI pin above). Cross-OS deterministic by design:
+        // explicit ['/', '\\'] split — `Path::file_stem` (the naive fix)
+        // would FAIL the backslash rows on Linux, which is exactly what
+        // this matrix makes impossible to ship.
+        assert_eq!(sample_stem_label("C:\\Sounds\\Kick 808.wav"), "Kick 808");
+        assert_eq!(sample_stem_label("/home/mix/Sounds/Rim.wav"), "Rim");
+        assert_eq!(sample_stem_label("C:\\Sounds/Rim.wav"), "Rim"); // mixed
+        assert_eq!(sample_stem_label("kick.backup.wav"), "kick.backup");
+        assert_eq!(sample_stem_label("noext"), "noext");
+        assert_eq!(sample_stem_label(""), "");
+        assert_eq!(path_leaf_any_sep("a/b/c"), "c");
+        assert_eq!(path_leaf_any_sep("C:\\x\\y"), "y");
+        assert_eq!(path_leaf_any_sep("plain"), "plain");
+        assert_eq!(path_leaf_any_sep(""), "");
     }
 
 
@@ -59933,12 +60570,15 @@ mod tests {
         assert_eq!(active("track_head_menu(ui, app,"), 2);
         // Internal version rides the series (v91 single-home law; v108 MCP-02
         // bumped it — retargeted here so the law holds, not the old number;
-        // v110 MCP-04 bump; v115 = v113 claim overtaken by merged v114, renumbered per the v111 recipe).
+        // v110 MCP-04 bump; v115 = v113 claim overtaken by merged v114, renumbered per the v111 recipe;
+        // v128 = MCP-05 claimed v128, renumbered when the chain overtook (v127 in flight);
+        // v129 pad-label lane + v131 master-meter lane merged with NO bump;
+        // v130 = autopan hold latch fix (the current bump).
         let librs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
             .expect("lib.rs");
         assert!(
-            librs.contains("INTERNAL_VERSION: &str = \"v115\""),
-            "INTERNAL_VERSION must be bumped to v115"
+            librs.contains("INTERNAL_VERSION: &str = \"v130\""),
+            "INTERNAL_VERSION must be bumped to v130"
         );
     }
 
@@ -61847,6 +62487,185 @@ mod tests {
             app.status.contains(&MidiAction::ALL[3].label()),
             "Escape status names the action: {}",
             app.status
+        );
+    }
+
+    /// v126 regression (card t_d0a6e1a7): the card's EXACT user symptom,
+    /// end to end. Delete an edited sample, re-import a fresh file at the
+    /// same path, and reload the project's stored edits — the new sample
+    /// must stay PRISTINE. v122 dropped the map keys at the seam
+    /// (`v122_rack_del_forgets_path_state` asserts the removal itself);
+    /// this pin owns the persistence + re-import outcome the bug report
+    /// describes ("a brand-new sample silently plays reversed"): the
+    /// stale key surviving `build_project` is the on-disk vector, and
+    /// `restore_sample_edits` at reload is what bakes it into the data.
+    #[test]
+    fn v126_rack_del_reimport_is_pristine() {
+        let mut app = headless_app("v126del");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v126del")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "hat.wav");
+        let wav = samples.join("hat.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        frame(&mut app, &ctx, vec![]);
+        let key = wav.to_string_lossy().into_owned();
+        app.sample_edits.insert(
+            key.clone(),
+            SampleEdit {
+                reverse: true,
+                ..Default::default()
+            },
+        );
+        app.se_apply(&key);
+        let edited = app.assets[0].data.to_vec();
+        app.rack_del(&key);
+        assert!(!wav.exists(), "setup: file unlinked");
+        // The saved project must not carry edits for a deleted sample —
+        // a surviving key here is what resurrected the phantom edit at
+        // the next load (on-disk vector of the bug).
+        let pr = app.build_project("v126del".into());
+        assert!(
+            !pr.sample_edits.contains_key(&key),
+            "project save must not carry the deleted sample's edit: {:?}",
+            pr.sample_edits.keys().collect::<Vec<_>>()
+        );
+        // Same-name re-import: a NEW file at the deleted path, decoded
+        // into a fresh app, then the stored edits reloaded over it.
+        v28_wav(&samples, "hat.wav");
+        // Identical bytes under a key the edit map never held — the
+        // positive pristine reference.
+        v28_wav(&samples, "untouched.wav");
+        let mut app2 = headless_app("v126del2");
+        app2.rack[0].path = samples.display().to_string();
+        app2.rack[0].rescan();
+        let _ = app2.ensure_asset(&wav);
+        let other = samples.join("untouched.wav");
+        let _ = app2.ensure_asset(&other);
+        app2.restore_sample_edits(&pr.sample_edits);
+        let fresh = app2.assets[0].data.to_vec();
+        assert_eq!(
+            fresh,
+            app2.assets[1].data.to_vec(),
+            "the re-imported sample must equal a pristine decode of the same bytes"
+        );
+        assert_ne!(
+            fresh, edited,
+            "the deleted sample's reverse edit must NOT bake into the re-imported file"
+        );
+    }
+
+    /// v131 (card t_84c57b60): a live backend rate change must REPLACE
+    /// the master meter. The meter's LUFS 100 ms block size, K-weighting
+    /// and spectrum bin_hz all freeze at the CONSTRUCTION rate, while
+    /// `App::sample_rate` follows the backend through `Evt::Ready` — a
+    /// meter kept across a 48k→44.1k reconnect integrates wrong windows
+    /// and labels the wrong frequencies until restart. Drives the shared
+    /// seam the eframe pump calls every frame.
+    #[test]
+    fn v131_master_meter_recreates_on_rate_change() {
+        let mut app = headless_app("v131sr1");
+        assert!(app.meter_state.is_none(), "fresh app has no meter yet");
+        app.sample_rate = 48_000;
+        app.ensure_meter_state();
+        {
+            let ms = app
+                .meter_state
+                .as_mut()
+                .expect("first known rate creates the meter");
+            assert_eq!(ms.sr, 48_000, "meter must record its construction rate");
+            assert!(
+                (ms.spectrum.bin_hz(1) - 48_000.0 / 8192.0).abs() < 1e-3,
+                "spectrum axis must derive from the construction rate: {}",
+                ms.spectrum.bin_hz(1)
+            );
+            ms.frames_fed = 7;
+            ms.clip = true;
+        }
+        // Evt::Ready after a reconnect at 44.1k (W12g hot-swap / v118
+        // JACK rebuild): the next pump must hand back a 44.1k meter.
+        app.sample_rate = 44_100;
+        app.ensure_meter_state();
+        let ms = app.meter_state.as_ref().expect("meter still exists");
+        assert_eq!(ms.sr, 44_100, "meter must follow the new backend rate");
+        assert_eq!(ms.frames_fed, 0, "replaced meter is a FRESH instance");
+        assert!(!ms.clip, "stale clip latch must not survive the replace");
+        assert!(
+            (ms.spectrum.bin_hz(1) - 44_100.0 / 8192.0).abs() < 1e-3,
+            "spectrum axis must relabel at the new rate: {}",
+            ms.spectrum.bin_hz(1)
+        );
+    }
+
+    /// Polarity B: re-pumping at the SAME rate must not churn the meter
+    /// — LUFS integrated/LRA accumulate across frames, so an
+    /// always-recreate "fix" would reset the history every frame.
+    #[test]
+    fn v131_master_meter_same_rate_keeps_instance() {
+        let mut app = headless_app("v131sr2");
+        app.sample_rate = 48_000;
+        app.ensure_meter_state();
+        app.meter_state.as_mut().unwrap().frames_fed = 1234;
+        app.ensure_meter_state();
+        app.ensure_meter_state();
+        assert_eq!(
+            app.meter_state.as_ref().unwrap().frames_fed,
+            1234,
+            "same-rate ensures must not replace the running meter"
+        );
+    }
+
+    /// No backend rate known (null-audio tests, pre-ready boot): the
+    /// pump never constructs a meter at sr 0, and a meter a pin
+    /// injected by hand stays untouched. (headless_app pre-arms
+    /// sample_rate = 48k, so the pin zeroes it explicitly.)
+    #[test]
+    fn v131_master_meter_needs_a_live_rate() {
+        let mut app = headless_app("v131sr3");
+        app.sample_rate = 0;
+        app.ensure_meter_state();
+        assert!(app.meter_state.is_none(), "no meter at sr 0");
+        app.meter_state = Some(crate::meter::MasterMeter::new(48_000));
+        app.ensure_meter_state();
+        assert_eq!(
+            app.meter_state.as_ref().unwrap().sr,
+            48_000,
+            "sr-0 ensures must not clobber an injected meter"
+        );
+    }
+
+    /// Wiring + drift: the eframe pump must call the shared seam
+    /// exactly once, `MasterMeter::new(self.sample_rate)` must have
+    /// exactly ONE production site, and the bare creation guard that
+    /// caused this bug must not return. Source scan: production = text
+    /// before the column-0 `mod tests`; needles via concat! so this
+    /// pin cannot certify itself.
+    #[test]
+    fn v131_master_meter_pump_goes_through_the_seam() {
+        let src = include_str!("ui.rs");
+        let cut = src
+            .find("\nmod tests")
+            .expect("column-0 mod tests boundary present");
+        let prod = &src[..cut];
+        let call = concat!("self.", "ensure_meter_state();");
+        let ncall = prod.matches(call).count();
+        assert_eq!(ncall, 1, "pump must call the seam exactly once, saw {ncall}");
+        let make = concat!("Master", "Meter::new(self.sample_rate)");
+        let nmake = prod.matches(make).count();
+        assert_eq!(
+            nmake, 1,
+            "exactly one production meter creation site, saw {nmake}"
+        );
+        let old = concat!("meter_state.is_none(", ")");
+        let nold = prod.matches(old).count();
+        assert_eq!(
+            nold, 0,
+            "bare is-none creation guard must not return, saw {nold}"
         );
     }
 

@@ -491,7 +491,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Practice Hall",
                 se([
-                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.72, 7500.0, 0.5, 0.95, 0.3, 1.0, 1.0,
+                    0.07, 0.3, 8000.0, 0.05, 0.5, 0.82, 9000.0, 0.5, 0.95, 0.3, 1.0, 1.0,
                 ]),
             ),
             // Medium hall, a touch of slap before the tail.
@@ -505,7 +505,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Opera House",
                 se([
-                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.88, 3200.0, 0.6, 0.95, 0.22, 1.0, 1.0,
+                    0.2, 0.42, 3800.0, 0.15, 0.25, 0.86, 2800.0, 0.6, 0.95, 0.22, 1.0, 1.0,
                 ]),
             ),
             // Vast and dark: slow slap, 0.95 feedback, heavy air damping —
@@ -513,7 +513,7 @@ pub fn builtin_presets(stem: &str) -> Vec<(&'static str, Vec<(&'static str, f32)
             (
                 "Cathedral",
                 se([
-                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.95, 1500.0, 0.7, 0.9, 0.18, 1.0, 1.0,
+                    0.32, 0.5, 2200.0, 0.25, 0.14, 0.94, 1200.0, 0.7, 0.9, 0.18, 1.0, 1.0,
                 ]),
             ),
         ],
@@ -622,6 +622,34 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// v128: the ONE preset-pairs applier — positional order first, then label
+/// matches (clamped to the declared range). Used by the fxgui editor's
+/// user-preset load AND the MCP `plugin.preset.load` (via the ui.rs seam),
+/// so the two entry points cannot drift (v59 doctrine: shared behavior =
+/// shared function). Returns the (param, clamped value) pairs applied, in
+/// application order (positionals then label hits — a param may be written
+/// twice, the label value wins, exactly like the pre-v128 fxgui loop).
+pub fn apply_preset_pairs(inst: &Instance, desc: &EffectDesc, pairs: &[(String, f64)]) -> Vec<(usize, f32)> {
+    let mut applied = Vec::new();
+    // Index order first…
+    for (i, (_, v)) in pairs.iter().enumerate() {
+        if let Some(p) = desc.params.get(i) {
+            let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
+            inst.set_param(i, v);
+            applied.push((i, v));
+        }
+    }
+    // …then label matches win over positional guesses.
+    for (label, v) in pairs {
+        if let Some((k, p)) = desc.params.iter().enumerate().find(|(_, p)| &p.label == label) {
+            let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
+            inst.set_param(k, v);
+            applied.push((k, v));
+        }
+    }
+    applied
 }
 
 /// Pull every `"label": number` pair out of a preset file. Deliberately
@@ -2365,14 +2393,17 @@ mod tests {
         let probe = |dir: &Path, stem: &str| -> (usize, f64, f64, f64) {
             let mut reg = Registry::open(dir.to_path_buf());
             reg.rescan();
-            // cathedral-ish: long decay, moderate damp, echo level 0 so the
-            // FDN alone is measured.
+            // cathedral-ish: long decay, echo level 0 so the FDN alone is
+            // measured. v133: damp 9000 keeps the pre-v133 EFFECTIVE loop
+            // coefficient (one_c(9000)≈0.308 vs the old inverted
+            // 1−one_c(2800)≈0.307) so the density/darkening calibration
+            // carries across the damp-law fix unchanged.
             let inst = reg
                 .create_instance(
                     stem,
                     48000.0,
                     &[
-                        0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 2800.0, 1.0, 1.0, 0.0, 1.0,
+                        0.25, 0.5, 8000.0, 0.0, 0.0, 0.95, 9000.0, 1.0, 1.0, 0.0, 1.0,
                     ],
                 )
                 .expect("echo instance");
@@ -3277,9 +3308,14 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let dir = temp_dir("v14snapglitch");
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
-        // Brightest shipped flavor: tone 8000, damp 1100, decay 0.9, verb 0.65.
+        // Brightest flavor: tone 8000, damp 15000, decay 0.9, verb 0.65.
+        // v133 retarget: this pin predates the damp-law fix — under the
+        // OLD inverted wiring damp=1100 WAS the bright extreme (loop
+        // coefficient 1−one_c(1100)≈0.134). 15000 is the true-Hz
+        // equivalent (one_c(15000)≈0.140), so the −73/−38.5 dBFS
+        // calibration holds across the law change.
         let bright = [
-            0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 1100.0, 1.9, 0.65, 0.3, 1.0,
+            0.38f32, 0.62, 8000.0, 0.35, 0.55, 0.9, 15000.0, 1.9, 0.65, 0.3, 1.0,
         ];
         let inst = reg
             .create_instance("space_echo", 48000.0, &bright)
@@ -3358,7 +3394,11 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let mut reg = Registry::open(dir.clone());
         reg.rescan();
         let fast = [
-            0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 900.0, 1.5, 0.6, 0.35, 1.0,
+            // v133: damp 16000 (slider max) is the true-Hz near-equivalent
+            // of the old inverted damp=900 (1−one_c(900)≈0.111 vs
+            // one_c(16000)≈0.123 at 48k) — the calibration carries over
+            // on the safe side of every HF ceiling.
+            0.15f32, 0.9, 8000.0, 0.5, 0.6, 0.85, 16000.0, 1.5, 0.6, 0.35, 1.0,
         ];
         let inst = reg
             .create_instance("space_echo", 48000.0, &fast)
@@ -4090,6 +4130,671 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
                 "delay mix=1 shows no R ping-pong echo content ({tail}) — the wet path must survive the dry-path fix",
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v126 regression (card t_4184fd04): autopan computed a PER-SIDE
+    /// angle (`pan_l = cent + wheel`, `pan_r = cent - wheel`) and read
+    /// each side's gain from its OWN angle, so the "pan bias" slider
+    /// raised or lowered BOTH side gains together — cent=-1 muted the
+    /// pair, cent=+1 static-hot-summed it (gl=gr=1), and the slider
+    /// never moved the image. v126 biases ONE shared angle through the
+    /// house pan_gains law (gl=cos, gr=sin of (th+1)/2·pi/2): power is
+    /// 1 at every angle, cent=+-1 is a full shift at unchanged loudness,
+    /// and the wheel sweeps around the bias. Pins feed a constant
+    /// l = r = 0.5 with vol depth 0 and trim 1, so 2*out IS the side
+    /// gain; slew 1 ms, settle windows skipped.
+    /// A1/A2/A3: cent=+1 hard right, cent=-1 hard left (never the old
+    ///   silence/hot-sum), cent=0 at 1/sqrt2;
+    /// A4: gl^2+gr^2 = 1 at every bias station AND mid-sweep;
+    /// A5: the lean (gr-gl) strictly increases with cent;
+    /// A6: cent=0 depth=1 swings hard L AND hard R within 1 s;
+    ///     cent=+0.5 depth=0.5 keeps the whole sweep at/right of centre
+    ///     yet still reaches hard right — the bias moves the SWEEP;
+    /// A7: the mono v1 fallback inherits the law: cent=+1 gives 0.5x of
+    ///     the input, not the old 1.0 hot sum.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v126_autopan_centre_pans() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v126apc");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+
+        // Param slots (PARAMS table): [pan shape, pan rate, pan depth,
+        // centre, phase off, vol shape, vol rate, vol depth, slew,
+        // gain, host].
+        let base = |cent: f32, depth: f32, rate: f32| -> [f32; MAX_PARAMS] {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            dp[1] = rate;
+            dp[2] = depth;
+            dp[3] = cent;
+            dp[8] = 1.0; // slew 1 ms: settles in ~15 ms
+            dp[9] = 1.0; // output trim unity
+            dp
+        };
+        // Static bias -> (gl, gr) measured as 2x the settled outputs.
+        let station = |cent: f32| -> (f32, f32) {
+            let dp = base(cent, 0.0, 0.005);
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan inst");
+            let mut last = (0.0f32, 0.0f32);
+            for _ in 0..(0.10 * sr) as usize {
+                last = unsafe { inst.call_sample_st(0.5, 0.5, &dp, 0.0) };
+            }
+            drop(inst);
+            (last.0 * 2.0, last.1 * 2.0)
+        };
+
+        // ---- A1/A2/A3: hard endpoints + house centre --------------
+        let (gl_r, gr_r) = station(1.0);
+        assert!(
+            gl_r.abs() < 0.01 && (gr_r - 1.0).abs() < 0.01,
+            "v126 A1: cent=+1 must land hard right gl~0,gr~1 — got gl={gl_r} gr={gr_r} (pre-fix the pair sat at 1/1: a hot mono sum, never a pan)",
+        );
+        let (gl_l, gr_l) = station(-1.0);
+        assert!(
+            (gl_l - 1.0).abs() < 0.01 && gr_l.abs() < 0.01,
+            "v126 A2: cent=-1 must land hard left gl~1,gr~0 — got gl={gl_l} gr={gr_l} (pre-fix both gains hit 0: the bias muted the pair)",
+        );
+        let (gl_c, gr_c) = station(0.0);
+        let f1s2 = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (gl_c - f1s2).abs() < 0.005 && (gr_c - f1s2).abs() < 0.005,
+            "v126 A3: cent=0 depth=0 must sit at the house centre 1/sqrt2 — got gl={gl_c} gr={gr_c}",
+        );
+
+        // ---- A4: constant loudness at every bias station ----------
+        let mut stations = Vec::new();
+        let mut worst_pow = 0.0f32;
+        for &c in &[-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            let (a, b) = station(c);
+            worst_pow = worst_pow.max((a * a + b * b - 1.0).abs());
+            stations.push((c, b - a)); // lean toward R
+        }
+        assert!(
+            worst_pow < 1e-3,
+            "v126 A4: pair power gl^2+gr^2 must stay 1 across the whole bias (unchanged loudness) — worst dev {worst_pow}",
+        );
+        // Mid-sweep: bias 0.7 depth 0.9 at 0.5 Hz, power through the sweep.
+        {
+            let dp = base(0.7, 0.9, 0.5);
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan sweep inst");
+            let mut worst = 0.0f32;
+            for i in 0..(2.0 * sr) as usize {
+                let (ol, or) = unsafe { inst.call_sample_st(0.5, 0.5, &dp, 0.0) };
+                if i > (0.3 * sr) as usize {
+                    let (a, b) = (ol * 2.0, or * 2.0);
+                    worst = worst.max((a * a + b * b - 1.0).abs());
+                }
+            }
+            drop(inst);
+            assert!(
+                worst < 5e-3,
+                "v126 A4: mid-sweep (cent=0.7 depth=0.9) pair power wanders {worst} off 1 — one equal-power law must hold everywhere",
+            );
+        }
+
+        // ---- A5: the image moves monotonically with the bias -------
+        for w in stations.windows(2) {
+            assert!(
+                w[1].1 > w[0].1,
+                "v126 A5: lean (gr-gl) must strictly increase with cent — {} at cent {} vs {} at cent {}",
+                w[0].1,
+                w[0].0,
+                w[1].1,
+                w[1].0,
+            );
+        }
+
+        // ---- A6: the wheel sweeps AROUND the bias ------------------
+        let swing = |cent: f32, depth: f32| -> (f32, f32) {
+            let dp = base(cent, depth, 2.0); // 2 Hz sine, depth-biased
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan swing inst");
+            let mut lo = f32::MAX;
+            let mut hi = f32::MIN;
+            for i in 0..(1.1 * sr) as usize {
+                let (ol, or) = unsafe { inst.call_sample_st(0.5, 0.5, &dp, 0.0) };
+                if i > (0.2 * sr) as usize {
+                    lo = lo.min(or - ol);
+                    hi = hi.max(or - ol);
+                }
+            }
+            drop(inst);
+            (lo, hi)
+        };
+        let (lo0, hi0) = swing(0.0, 1.0);
+        assert!(
+            hi0 > 0.30 && lo0 < -0.30,
+            "v126 A6a: cent=0 depth=1 must swing hard L AND hard R (out_r-out_l beyond +-0.30) — got [{lo0}, {hi0}]",
+        );
+        let (lob, hib) = swing(0.5, 0.5);
+        assert!(
+            lob >= -0.02 && hib > 0.30,
+            "v126 A6b: cent=+0.5 depth=0.5 must keep the sweep at/right of centre yet still reach hard right — got [{lob}, {hib}] (bias must move the SWEEP, not the level)",
+        );
+
+        // ---- A7: mono v1 fallback inherits the fix ------------------
+        {
+            let dp = base(1.0, 0.0, 0.005);
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan mono inst");
+            let mut y = 0.0f32;
+            for _ in 0..(0.10 * sr) as usize {
+                y = unsafe { inst.call_sample(0.5, &dp) };
+            }
+            drop(inst);
+            // (gl+gr)/2 with gl=0,gr=1: exactly half the input.
+            assert!(
+                (y - 0.25).abs() < 0.02,
+                "v126 A7: mono path at cent=+1 must be 0.25 (0.5x input) — got {y} (pre-fix the fallback hot-summed to 0.5)",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v130 regression (card t_8722d32c): vol shape 4 ("hold") latched on
+    /// `(th2 + 1e-12) < hold_th` while hold_th started at 0.0 and th2 stays
+    /// in [0,1) — the condition could NEVER fire. `hold` stayed 1.0, so
+    /// vol_l/vol_r were constant 1.0 and the volume wheel was DEAD at any
+    /// depth/rate. v130: "hold" = sample & hold stepped waveform — a new
+    /// deterministic LCG gain latched exactly once per vol-LFO cycle
+    /// (latching the sine at wrap phase instead would just pin a constant,
+    /// so the card's sketch shape stays dead). Pins feed l = r = 0.5 with
+    /// pan depth 0 / cent 0, so the settled pan is the house centre and
+    /// out / (0.5/sqrt2) IS the vol gain. Slew 1 ms, 0.5 s settle skipped.
+    /// A1 segments piecewise constant; A2 alive + span (pre-fix: pinned
+    /// 1.0, zero steps — fails here); A3 exactly one step per cycle at
+    /// 4 Hz; A4 L/R locked sample-exact despite phase off 0.5; A5 depth
+    /// authority (dep 0 -> unity, dep 0.5 -> [0.5, 1]); A6 two instances
+    /// bit-identical (deterministic, no std::rand); A7 sine still smooth
+    /// (non-hold shapes untouched); A8 pan wheel alive while vsh=4.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v130_autopan_hold_latches() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v130aph");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+        let hc = std::f32::consts::FRAC_1_SQRT_2; // settled pan gain per side
+
+        // Param slots: [pan shape, pan rate, pan depth, centre, phase off,
+        // vol shape, vol rate, vol depth, slew, gain, host].
+        let mk = |vsh: f32, vdep: f32, phoff: f32, pdep: f32, prate: f32| -> [f32; MAX_PARAMS] {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            dp[1] = prate;
+            dp[2] = pdep;
+            dp[4] = phoff;
+            dp[5] = vsh;
+            dp[6] = 4.0; // vol rate 4 Hz -> one wrap per 12000 samples
+            dp[7] = vdep;
+            dp[8] = 1.0; // slew 1 ms: settles in ~15 ms
+            dp[9] = 1.0; // output trim unity
+            dp
+        };
+        // Raw pair stream, 0.5 s slew-settle skipped.
+        let run = |dp: &[f32; MAX_PARAMS], n: usize| -> (Vec<f32>, Vec<f32>) {
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan hold inst");
+            let settle = (0.5 * sr) as usize;
+            let mut vl = Vec::with_capacity(n);
+            let mut vr = Vec::with_capacity(n);
+            for i in 0..(settle + n) {
+                let (ol, or) = unsafe { inst.call_sample_st(0.5, 0.5, dp, 0.0) };
+                if i >= settle {
+                    vl.push(ol);
+                    vr.push(or);
+                }
+            }
+            drop(inst);
+            (vl, vr)
+        };
+        // Normalised vol gain (pan settled at the house centre).
+        let gain_of = |v: &[f32]| -> Vec<f32> {
+            v.iter().map(|&o| o / (0.5 * hc)).collect()
+        };
+        // Sample indices where the piecewise gain steps (in-segment diff
+        // is exact 0 after the slew fixed point, steps are ~0.1+).
+        let steps = |v: &[f32]| -> Vec<usize> {
+            (1..v.len())
+                .filter(|&i| (v[i] - v[i - 1]).abs() > 1e-4)
+                .collect()
+        };
+
+        // ---- A1/A2/A3/A4: stepped, alive, one step per cycle ---------
+        // (phase off 0.5 rides along: hold must step BOTH sides together)
+        let dp = mk(4.0, 1.0, 0.5, 0.0, 0.005);
+        let (vl, vr) = run(&dp, (4.0 * sr) as usize); // 16 vol cycles
+        let g = gain_of(&vl);
+        let b = steps(&g);
+        assert!(
+            b.len() >= 14 && b.len() <= 18,
+            "v130 A3: 4 Hz hold over 16 cycles must step ~16 times — got {} steps {b:?} (pre-fix the latch NEVER fired: hold pinned at 1.0, ZERO steps, dead tremolo)",
+            b.len(),
+        );
+        for w in b.windows(2) {
+            assert!(
+                (11985usize..=12015).contains(&(w[1] - w[0])),
+                "v130 A3: step gap {} samples is not one 4 Hz cycle (12000 +-15) — hold must re-latch exactly once per vol-LFO cycle",
+                w[1] - w[0],
+            );
+        }
+        // A1: inside a segment the gain is bit-identical (piecewise const).
+        let mut edge = 0usize;
+        let mut worst_seg = 0.0f32;
+        for &bb in b.iter().chain(std::iter::once(&g.len())) {
+            for i in (edge + 1).min(bb)..bb {
+                worst_seg = worst_seg.max((g[i] - g[i - 1]).abs());
+            }
+            edge = bb;
+        }
+        assert!(
+            worst_seg < 1e-6,
+            "v130 A1: in-segment gain wanders {worst_seg} — hold segments must be constant between wraps",
+        );
+        // A2: the steps span real depth (pre-fix: constant 1.0).
+        let seg_g: Vec<f32> = std::iter::once(0)
+            .chain(b.clone())
+            .map(|s| g[s.min(g.len() - 1)])
+            .collect();
+        let mean = seg_g.iter().sum::<f32>() / seg_g.len() as f32;
+        let sd = (seg_g.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / seg_g.len() as f32).sqrt();
+        let lo = seg_g.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = seg_g.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            sd > 0.05 && lo < 0.45 && hi > 0.55,
+            "v130 A2: hold at vdep=1 must modulate broadly — std {sd}, span [{lo}, {hi}] over {} steps (pre-fix everything sat at 1.0)",
+            seg_g.len(),
+        );
+
+        // ---- A4: L/R locked together despite phase off ---------------
+        for i in 0..vl.len() {
+            let dl = vl[i] / (0.5 * hc);
+            let dr = vr[i] / (0.5 * hc);
+            assert!(
+                (dl - dr).abs() < 1e-5,
+                "v130 A4: vsh=4 at phase off 0.5 must step BOTH sides together — L {dl} vs R {dr} at {i}"
+            );
+            if i > 100 {
+                break; // the parity class is global; a prefix proves it
+            }
+        }
+
+        // ---- A5: depth authority --------------------------------------
+        let (v0, _) = run(&mk(4.0, 0.0, 0.0, 0.0, 0.005), (1.0 * sr) as usize);
+        let g0 = gain_of(&v0);
+        let dev = g0.iter().fold(0.0f32, |m, &x| m.max((x - 1.0).abs()));
+        assert!(
+            dev < 1e-4,
+            "v130 A5: vdep=0 must be unity gain whatever hold latches — worst dev {dev}",
+        );
+        let (vh, _) = run(&mk(4.0, 0.5, 0.0, 0.0, 0.005), (3.0 * sr) as usize);
+        let gh = gain_of(&vh);
+        let hlo = gh.iter().cloned().fold(f32::MAX, f32::min);
+        let hhi = gh.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            hlo > 0.5 - 1e-3 && hhi <= 1.0 + 1e-3,
+            "v130 A5: vdep=0.5 steps must live in [0.5, 1] — got [{hlo}, {hhi}]",
+        );
+
+        // ---- A6: deterministic — same params, same step sequence -----
+        let (va, _) = run(&mk(4.0, 1.0, 0.0, 0.0, 0.005), (0.6 * sr) as usize);
+        let (vb, _) = run(&mk(4.0, 1.0, 0.0, 0.0, 0.005), (0.6 * sr) as usize);
+        assert!(
+            va == vb,
+            "v130 A6: two fresh instances with the same params must produce the IDENTICAL hold sequence (deterministic DSP)",
+        );
+
+        // ---- A7: non-hold shapes stay smooth -------------------------
+        let (vs, _) = run(&mk(0.0, 1.0, 0.0, 0.0, 0.005), (1.0 * sr) as usize);
+        let gs = gain_of(&vs);
+        let smooth = (1..gs.len())
+            .filter(|&i| (gs[i] - gs[i - 1]).abs() > 1e-6)
+            .count() as f64
+            / gs.len() as f64;
+        assert!(
+            smooth > 0.95,
+            "v130 A7: vsh=0 sine must change every sample (smooth tremolo) — only {smooth:.3} of samples move (hold plumbing leaked into the smooth path)",
+        );
+
+        // ---- A8: the pan wheel stays alive while vol holds -----------
+        {
+            let dpp = mk(4.0, 0.0, 0.0, 1.0, 2.0); // vol depth 0, pan swings
+            let (pl, pr) = run(&dpp, (1.2 * sr) as usize);
+            let mut lo8 = f32::MAX;
+            let mut hi8 = f32::MIN;
+            for i in (0.2 * sr) as usize..pl.len() {
+                lo8 = lo8.min(pr[i] - pl[i]);
+                hi8 = hi8.max(pr[i] - pl[i]);
+            }
+            assert!(
+                hi8 > 0.30 && lo8 < -0.30,
+                "v130 A8: vsh=4 must leave the PAN wheel working (2 Hz depth 1 swings +-0.3) — got [{lo8}, {hi8}]",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===================== v133 acceptance pins =====================
+    // Card t_8436a93d: the space_echo `damp` knob was wired INVERTED into
+    // the comb loop. `Comb::process` consumes the one-pole STATE
+    // coefficient (y = x·(1−c) + y·c with c = one_c(fc) = exp(−2π·fc/sr):
+    // bigger c = darker), but `process` passed `1.0 − one_c(damp)`, so
+    // turning the knob UP darkened the tail while the param META
+    // (SLOOPER_UNIT_HZ), the GUI ("damp 2.8kHz") and the room presets all
+    // promise higher = brighter — the exact law the sibling `tone` knob
+    // already honors. R2 pins the LAW at source, R1 the LAW by measurement,
+    // R3 the script↔host preset-table MIRROR, R4 the five rooms' tonal
+    // ladder (bright tight hall → vast dark cathedral) that the inversion
+    // had swapped. R5: the pre-v133 forensic flavors (v14 snap pins, the
+    // mode probe) were calibrated through the inverted law and are
+    // retargeted to the SAME effective coefficient below.
+
+    /// v133 R2 (formula law at source): the comb-loop damping coefficient
+    /// must pass `one_c(P_DAMP)` straight through — the same law the echo
+    /// loop's `tone_c` uses — and the inverted form must be gone. Both
+    /// polarities built with concat! so the assertion text itself can
+    /// never supply the needle (house source-pin rule).
+    #[test]
+    fn v133_space_echo_damp_formula_mirrors_tone() {
+        let src = include_str!("../effects/space_echo.rs");
+        // (No concat! guard here: the scanned text is effects/space_echo.rs,
+        // a DIFFERENT file than this literal's — no self-match to guard.)
+        let tone_law = "let tone_c = one_c(g(P_TONE) as f64, sr);";
+        let damp_law = "let damp_c = one_c(g(P_DAMP) as f64, sr);";
+        let inverted = concat!("let damp_c = 1.0", " - one_c(g(P_DAMP) as f64, sr);");
+        assert!(
+            src.contains(tone_law),
+            "tone path's one_c law anchor moved — retarget this pin together with the damp law, never drop it silently"
+        );
+        assert!(
+            src.contains(damp_law),
+            "damp_c must feed the comb loop the raw one_c(P_DAMP) state coefficient, mirroring the tone path"
+        );
+        assert!(
+            !src.contains(inverted),
+            "damp_c is inverted again: `1.0 - one_c(…)` makes the damp knob DARKEN when turned up while its declared unit (Hz cutoff, higher = brighter, see SLOOPER_UNIT_HZ in META) promises the opposite"
+        );
+    }
+
+    /// v133 R3 (mirror parity): the script's canvas preset row and the
+    /// host's `builtin_presets("space_echo")` are two copies of the same
+    /// five rooms — a drift makes the canvas button and the preset loader
+    /// ship different sounds. Parse the script table out of the embedded
+    /// copy and compare names + every value exactly.
+    #[test]
+    fn v133_space_echo_preset_tables_mirrored() {
+        let src = include_str!("../effects/space_echo.rs");
+        let decl = src
+            .split("const PRESETS")
+            .nth(1)
+            .expect("PRESETS table in the embedded script");
+        // Skip the type annotation (`… [f32; NPARAMS as usize]); 5]` also
+        // contains `];` — only the text after `= [` holds entries.
+        let blk = decl.split_once("= [").expect("PRESETS initializer").1;
+        let blk = blk.split("];").next().expect("PRESETS table close");
+        let mut script: Vec<(&str, Vec<f32>)> = Vec::new();
+        let mut rest = blk;
+        while let Some(q) = rest.find("(\"") {
+            rest = &rest[q + 2..];
+            let ne = rest.find("\", [").expect("preset entry name");
+            let name = &rest[..ne];
+            rest = &rest[ne + 4..];
+            let ve = rest.find(']').expect("preset values");
+            let vals: Vec<f32> = rest[..ve]
+                .split(',')
+                .map(|t| {
+                    t.trim()
+                        .parse::<f32>()
+                        .unwrap_or_else(|e| panic!("script preset {name}: value {t:?}: {e}"))
+                })
+                .collect();
+            script.push((name, vals));
+            rest = &rest[ve..];
+        }
+        let host = builtin_presets("space_echo");
+        assert_eq!(script.len(), 5, "five rooms in the script table, parsed: {script:?}");
+        assert_eq!(script.len(), host.len(), "host mirror must carry the same rooms: {script:?} vs {host:?}");
+        for (i, (sn, sv)) in script.iter().enumerate() {
+            assert_eq!(*sn, host[i].0, "room {i}: name drift between canvas table and host mirror");
+            let hv: Vec<f32> = host[i].1.iter().map(|(_, v)| *v).collect();
+            assert_eq!(sv.len(), hv.len(), "{sn}: param count drift");
+            for (k, (a, b)) in sv.iter().zip(&hv).enumerate() {
+                assert_eq!(a, b, "{sn}: param {k} drift — the canvas button and the seeded preset file would ship different rooms");
+            }
+        }
+    }
+
+    /// v133 R1 (measured law): a pure-room render gets a deterministic
+    /// LCG snap (v14's recurrence) through FEEDBACK 0 — the echo loop
+    /// never recirculates, so the room receives the snap exactly ONCE
+    /// (the pre-v133 window design, echo fb 0.5, kept re-injecting
+    /// undamped bright feed every echo round and flattened the damp
+    /// contrast to 0.1 dB behind that floor — measured in the RED pass).
+    /// Metric = mean Goertzel power at 1/2/3 kHz (the MID band the damp
+    /// pole actually voices: the feed path caps input near 4.2 kHz, so a
+    /// 3–8 kHz probe mostly reads feed skirt, not the comb damping —
+    /// measured 0.1–4 dB flat in the standalone A/B harness), window =
+    /// 500–900 ms of pure comb-loop ringing (settled past the mode
+    /// transition). ABSOLUTE dBFS: damp 16000 holds ~−128 dBFS while
+    /// damp 200 has collapsed to the ~−170 dBFS numerical floor — a
+    /// ~40 dB spread; pre-v133 the two values swap (the 1.0−one_c wiring
+    /// made the knob's darkest setting the brightest room in the house).
+    /// Negative control: an un-driven room is silent, so a dead tail can
+    /// never pass "darker than" vacuously; the bright extreme must be ALIVE.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v133_space_echo_damp_brightens_with_hz() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v133dampph");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let sr = 48000usize;
+        // Only P_DAMP differs between runs (echo 0 / verb 1: room only;
+        // feedback 0 ⇒ single room injection, no echo-round feed train).
+        let mk = |damp: f32| -> [f32; 11] {
+            [0.08, 0.0, 8000.0, 0.0, 0.0, 0.85, damp, 1.0, 1.0, 0.0, 1.0]
+        };
+        fn goertzel_pow(t: &[f32], f: f64) -> f64 {
+            let w = 2.0 * f64::cos(2.0 * std::f64::consts::PI * f / 48000.0);
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &v in t {
+                let s0 = v as f64 + w * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - w * s1 * s2).max(0.0)
+        }
+        let measure = |damp: f32, drive: bool| -> (f64, f64) {
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &mk(damp))
+                .expect("room instance");
+            let mut s = 12345u64;
+            for _ in 0..sr / 1667 {
+                // 0.6 ms white-noise snap (deterministic — same LCG as v14)
+                let x = if drive {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+                    0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0)
+                } else {
+                    0.0
+                };
+                let _ = inst.process_private(x);
+            }
+            for _ in 0..(sr / 2) {
+                let _ = inst.process_private(0.0); // 500 ms settle
+            }
+            let win: Vec<f32> = (0..(sr * 2 / 5)).map(|_| inst.process_private(0.0)).collect();
+            let t: &[f32] = &win;
+            let n = t.len() as f64;
+            let mid = 10.0
+                * ([1000.0f64, 2000.0, 3000.0]
+                    .iter()
+                    .map(|f| goertzel_pow(t, *f))
+                    .sum::<f64>()
+                    / 3.0
+                    / (n * n))
+                    .max(1e-30)
+                    .log10();
+            let rms = (t.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / t.len() as f64)
+                .sqrt();
+            drop(inst);
+            (mid, rms)
+        };
+        let (mid_dark, rms_dark) = measure(200.0, true);
+        let (mid_mid, _) = measure(4000.0, true);
+        let (mid_bright, rms_bright) = measure(16000.0, true);
+        let (mid_silence, rms_silence) = measure(200.0, false); // negative control
+        println!(
+            "V133DAMP: MID dBFS 200Hz {mid_dark:.1} / 4k {mid_mid:.1} / 16k {mid_bright:.1}; rms {rms_dark:.2e}/{rms_bright:.2e}; silence {mid_silence:.1} rms {rms_silence:.2e}"
+        );
+        assert!(
+            mid_silence < -85.0 && rms_silence < 1e-7,
+            "v133 A0 negative control: un-driven room is NOT silent — MID {mid_silence:.1} dBFS rms {rms_silence:.2e}; every brightness comparison would be vacuous"
+        );
+        assert!(
+            rms_bright > 1e-5,
+            "v133 A1: bright-extreme room must be ALIVE in the capture window — rms {rms_bright:.2e}"
+        );
+        assert!(
+            mid_bright > mid_dark + 15.0,
+            "v133 A2: damp 16000 must hold ≥15 dB MORE 1–3 kHz tail energy than damp 200 at 500–900 ms — got bright {mid_bright:.1} vs dark {mid_dark:.1} dBFS (pre-v133 the 1.0−one_c wiring reversed this)"
+        );
+        assert!(
+            mid_bright > mid_mid && mid_mid > mid_dark,
+            "v133 A3: tail mid energy must rise with damp — 200:{mid_dark:.1} 4000:{mid_mid:.1} 16000:{mid_bright:.1} dBFS"
+        );
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v133 R4 (factory-room tonal intent): the preset comments promise a
+    /// brightness ladder — Practice Hall "tiny bright room" down to
+    /// Cathedral "heavy air damping". With the damp knob inverted the
+    /// shipped rooms measured EXACTLY backwards (the bright hall was the
+    /// dullest room, the cathedral the brightest). Metric = mean Goertzel
+    /// power at 1/2/3 kHz (the band the damp pole actually voices — the
+    /// first-difference HF probe reads feed skirt here, flat to 1 dB),
+    /// window = 100–400 ms after the snap with ECHO LEVEL 0 (room tail
+    /// only; the later windows measure numerical floor, not rooms, as the
+    /// small rooms fully decay). ABSOLUTE dBFS must descend strictly
+    /// Practice Hall > Auditorium > Opera House > Cathedral. The v133
+    /// rebalance (Practice 0.82/9000, Opera 0.86/2800, Cathedral 0.94/1200)
+    /// measured min step +2.0 dB on the fixed law; the pre-v133 wiring +
+    /// old table measured min step −2.9 dB (RED).
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v133_space_echo_room_presets_tone_ladder() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v133roomladder");
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let sr = 48000usize;
+        fn goertzel_pow(t: &[f32], f: f64) -> f64 {
+            let w = 2.0 * f64::cos(2.0 * std::f64::consts::PI * f / 48000.0);
+            let (mut s1, mut s2) = (0.0f64, 0.0f64);
+            for &v in t {
+                let s0 = v as f64 + w * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            (s1 * s1 + s2 * s2 - w * s1 * s2).max(0.0)
+        }
+        let room_mid = |name: &str| -> (f64, f64) {
+            let pairs = builtin_presets("space_echo")
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("room {name} missing from builtin_presets"))
+                .1;
+            let mut vals: Vec<f32> = pairs.iter().map(|(_, v)| *v).collect();
+            vals[9] = 0.0; // echo-path level 0: measure the ROOM, not the slap
+            let inst = reg
+                .create_instance("space_echo", 48000.0, &vals)
+                .expect("room instance");
+            let mut s = 12345u64;
+            for _ in 0..sr / 1667 {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+                let x = 0.5 * ((s as f32 / 0x7FFF_FFFF as f32) * 2.0 - 1.0);
+                let _ = inst.process_private(x);
+            }
+            for _ in 0..(sr / 10) {
+                let _ = inst.process_private(0.0); // 100 ms settle
+            }
+            let win: Vec<f32> = (0..(sr * 3 / 10)).map(|_| inst.process_private(0.0)).collect();
+            let t: &[f32] = &win;
+            let n = t.len() as f64;
+            let mid = 10.0
+                * ([1000.0f64, 2000.0, 3000.0]
+                    .iter()
+                    .map(|f| goertzel_pow(t, *f))
+                    .sum::<f64>()
+                    / 3.0
+                    / (n * n))
+                    .max(1e-30)
+                    .log10();
+            let rms = (t.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / t.len() as f64)
+                .sqrt();
+            drop(inst);
+            (mid, rms)
+        };
+        let ladder = ["Practice Hall", "Auditorium", "Opera House", "Cathedral"];
+        let mut measured = Vec::new();
+        for name in ladder {
+            let (mid, rms) = room_mid(name);
+            println!("V133LADDER {name}: MID {mid:.1} dBFS rms {rms:.2e}");
+            assert!(
+                rms > 2e-5,
+                "v133 A1: room {name} must be alive in the capture window (rms {rms:.2e})"
+            );
+            measured.push((name, mid));
+        }
+        // Margins set from the v133 rebalance measurement (min step +2.0 dB
+        // on the fixed law; the pre-v133 wiring + table measured −2.9 dB,
+        // so every threshold below flips RED there).
+        let m = |n: &str| -> f64 {
+            measured.iter().find(|(x, _)| *x == n).unwrap().1
+        };
+        assert!(
+            m("Practice Hall") > m("Auditorium") + 0.8,
+            "v133 A2: 'tiny bright room' must beat Auditorium by ≥0.8 dB mid-tail energy — Practice {:.1} vs Aud {:.1}",
+            m("Practice Hall"),
+            m("Auditorium")
+        );
+        assert!(
+            m("Auditorium") > m("Opera House") + 0.8,
+            "v133 A3: ladder step Auditorium → Opera House must darken ≥0.8 dB — {:.1} vs {:.1}",
+            m("Auditorium"),
+            m("Opera House")
+        );
+        assert!(
+            m("Opera House") > m("Cathedral") + 0.8,
+            "v133 A4: 'heavy air damping' Cathedral must sit ≥0.8 dB UNDER Opera House — {:.1} vs {:.1}",
+            m("Opera House"),
+            m("Cathedral")
+        );
+        drop(reg);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

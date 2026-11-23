@@ -209,16 +209,27 @@ impl PresetStore {
         let name = sanitize(raw);
         self.dir.join(format!("{name}.{}", self.ext))
     }
-    /// `mkdir -p` + pretty JSON write under the sanitized name. The
-    /// caller has already refused an empty sanitized name (its own
-    /// echo); returns the sanitized name it wrote for.
+    /// `mkdir -p` + pretty JSON write under the sanitized name; returns
+    /// the sanitized name it wrote for. v132 (t_09676c12): an EMPTY
+    /// sanitized name is refused here too — a call site that only checks
+    /// the RAW name would otherwise write a hidden `.json` that `list()`
+    /// can never show (`Path::new(".json").extension()` is None) while
+    /// the surface echoes success: the orphan-file class. Sites still
+    /// keep their own pre-refusal for a nicer echo; this is the choke
+    /// point no site may bypass.
     pub fn write_json(
         &self,
         raw: &str,
         rec: &impl serde::Serialize,
     ) -> std::io::Result<String> {
-        std::fs::create_dir_all(&self.dir)?;
         let name = sanitize(raw);
+        if name.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pick a preset name (letters or digits) — name sanitizes to empty",
+            ));
+        }
+        std::fs::create_dir_all(&self.dir)?;
         let js = serde_json::to_string_pretty(rec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(self.dir.join(format!("{name}.{}", self.ext)), js)?;
@@ -373,4 +384,47 @@ pub fn render(
         }
     });
     act
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v132 (t_09676c12): `sanitize` has no empty fallback ("!!!" → ""), so
+    /// the write primitive must not trust call sites to have refused: a
+    /// hidden `.json` is unloadable AND unlistable (list() filters by
+    /// extension, and `Path::new(".json").extension()` is None), while the
+    /// surface echoes "saved" — the orphan-file class the card reported.
+    /// RED pre-fix: write_json happily wrote it.
+    #[test]
+    fn v132_write_json_refuses_name_collapsing_to_empty() {
+        let dir = std::env::temp_dir().join(format!("v132pstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = PresetStore::json(dir.clone());
+        // Root-cause documentation: the sanitizer really does collapse
+        // punctuation-only names to empty.
+        assert_eq!(sanitize("!!!"), "");
+        assert_eq!(sanitize("..."), "");
+        assert_eq!(sanitize("-"), "");
+        for raw in ["!!!", "...", "@#$%"] {
+            let err = store
+                .write_json(raw, &vec![(1i64, 0.5f64)])
+                .expect_err("a name that sanitizes to empty must not be written");
+            assert!(err.to_string().contains("name"), "{err}");
+        }
+        let leftovers: Vec<std::ffi::OsString> = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            !dir.join(".json").exists(),
+            "hidden orphan preset file written: {leftovers:?}"
+        );
+        // Names that survive sanitizing still round-trip untouched.
+        let nm = store
+            .write_json("Warm Room", &vec![(1i64, 0.5f64)])
+            .expect("normal name writes");
+        assert_eq!(nm, "Warm-Room");
+        assert_eq!(store.list(), vec!["Warm-Room".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
