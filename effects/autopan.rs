@@ -10,11 +10,18 @@
 // amplitude curve. `slew ms` glides the ratio changes so square wheels
 // don't click.
 //
+// v126: `centre` biases the SHARED wheel angle (th = wheel + centre)
+// and ONE equal-power law turns th into (gl, gr) — mirroring the engine
+// pan_gains: equal power at every angle, centre = 1/sqrt2 per side,
+// + = right like the track pan. Pre-v126 each side carried its own
+// cent offset, which made `centre` a static gain kill/boost that never
+// panned (cent=-1 muted the pair, cent=+1 hot-summed it to mono).
+//
 // Params:
 //   pan shape   — 0 sine / 1 tri / 2 square / 3 saw (quantised)
 //   pan rate Hz — 0.005..24
 //   pan depth   — 0..1 (0 = centre, 1 = full left/right)
-//   centre      — pan bias -1..1
+//   centre      — image bias -1..1 (-1 = full left, +1 = full right)
 //   phase off   — LFO phase offset 0..1 (L leads R; 0.5 = true L/R alternation)
 //   vol shape   — 0 sine / 1 tri / 2 square / 3 saw / 4 hold
 //   vol rate Hz — 0.005..24
@@ -200,15 +207,17 @@ extern "C" fn process_st(
         (s.th1, s.th2)
     };
 
-    // Pan wheel -> equal-power angle in [-1,1] per side.
+    // v126: ONE shared wheel angle — the wheel swings the image around
+    // `centre` (-1 = full L .. +1 = full R, the track-pan direction).
+    // House pan law (mirrors engine pan_gains): one equal-power law for
+    // both sides, so gl^2 + gr^2 = 1 at EVERY angle — biasing or
+    // sweeping moves the image at constant loudness, never mutes and
+    // never hot-sums.
     let w = shape(psh, th1); // -1..1
-    let pan_l = (cent + w * pdep).clamp(-1.0, 1.0);
-    let pan_r = (cent - w * pdep).clamp(-1.0, 1.0);
-    // Constant-power pair: a = 0.5 - pan/2 (left angle), equal-power gains.
-    let al = (0.5 - pan_l * 0.5) * core::f64::consts::FRAC_PI_2;
-    let ar = (0.5 - pan_r * 0.5) * core::f64::consts::FRAC_PI_2;
-    let gl = al.cos() as f32;
-    let gr = ar.cos() as f32;
+    let th = (w * pdep + cent).clamp(-1.0, 1.0);
+    let a = (th * 0.5 + 0.5) * core::f64::consts::FRAC_PI_2; // 0..pi/2
+    let gl = a.cos() as f32;
+    let gr = a.sin() as f32;
 
     // Volume wheel (phase-offset L/R; hold shape latches per cycle).
     let t2l = th2;
