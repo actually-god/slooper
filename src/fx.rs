@@ -4517,8 +4517,10 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
     #[test]
     fn v133_space_echo_damp_formula_mirrors_tone() {
         let src = include_str!("../effects/space_echo.rs");
-        let tone_law = concat!("let tone_c = one_c(g(P_TONE) as f64, sr);");
-        let damp_law = concat!("let damp_c = one_c(g(P_DAMP) as f64, sr);");
+        // (No concat! guard here: the scanned text is effects/space_echo.rs,
+        // a DIFFERENT file than this literal's — no self-match to guard.)
+        let tone_law = "let tone_c = one_c(g(P_TONE) as f64, sr);";
+        let damp_law = "let damp_c = one_c(g(P_DAMP) as f64, sr);";
         let inverted = concat!("let damp_c = 1.0", " - one_c(g(P_DAMP) as f64, sr);");
         assert!(
             src.contains(tone_law),
