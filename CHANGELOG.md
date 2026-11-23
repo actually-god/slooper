@@ -8,6 +8,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **The master meter now follows a live sample-rate change.** The
+  meter's LUFS windows and spectrum axis are baked from the sample rate
+  it was built with, but creation used to be a once-ever guard — after
+  reconnecting to a server running at another rate (44.1↔48k, hot-swap
+  or JACK-server rebuild) the master readouts kept integrating wrong
+  window lengths and labeling wrong frequencies until restart. The pump
+  now replaces the meter whenever the live rate differs from the one it
+  was built for (pinned by `v131_master_meter_*`).
 - **Every release artifact now carries the piano sample's GPL-2 notice
   and license text.** The embedded piano blob derives from the GPL-2
   TimGM6mb soundfont, but the disclosure lived only inside the repo tree
