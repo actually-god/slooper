@@ -386,6 +386,13 @@ const HP_FC: f64 = 28.0;
 /// Practice-Hall preset; near-zero for dark presets, matching the report
 /// that only bright settings glitch). Real rooms always absorb treble
 /// faster than they decay; one always-on pole models that floor.
+///
+/// v133 NOTE: this pole deliberately keeps the `1.0 - one_c(...)` form.
+/// Its glitch-floor calibration measured the pole AS BUILT — an effective
+/// corner near half of AIR_FC (≈4.3 kHz at 48k) — so re-formulating it to
+/// a true-Hz pole would weaken the floor and re-open the tick class. This
+/// is the ONLY place that form survives; the user-facing damp knob uses
+/// the true-Hz law.
 const AIR_FC: f64 = 6500.0;
 
 /// Room-feed brightness cap in Hz (see the feed comment in `process`).
@@ -516,7 +523,14 @@ extern "C" fn process_st(
     // copy must not hand the bank the input's raw edge. Below the cap the
     // tone knob still voices the feed exactly as before.
     let feed_c = tone_c.max(one_c(FEED_CAP_FC, sr));
-    let damp_c = 1.0 - one_c(g(P_DAMP) as f64, sr);
+    // v133: damp is the comb loop's LOWPASS CORNER in Hz — pass the
+    // one-pole STATE coefficient straight through, exactly like `tone_c`
+    // (bigger fc → smaller one_c → brighter tail). The pre-v133 wiring
+    // was `1.0 - one_c(...)`, which inverted the knob: 200 Hz became
+    // transparent and 16 kHz killed everything, while the declared unit
+    // (SLOOPER_UNIT_HZ), the GUI ("damp 2.8kHz") and the room presets
+    // all promise higher = brighter.
+    let damp_c = one_c(g(P_DAMP) as f64, sr);
     let air_c = 1.0 - one_c(AIR_FC, sr);
     // Room stretch: decay 0.5 → 1.0× comb length, decay 0.95 → ~1.95×.
     // Long tails through SHORT combs are the boxy, metallic "cathedral
