@@ -4121,6 +4121,178 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v126 regression (card t_4184fd04): autopan computed a PER-SIDE
+    /// angle (`pan_l = cent + wheel`, `pan_r = cent - wheel`) and read
+    /// each side's gain from its OWN angle, so the "pan bias" slider
+    /// raised or lowered BOTH side gains together — cent=-1 muted the
+    /// pair, cent=+1 static-hot-summed it (gl=gr=1), and the slider
+    /// never moved the image. v126 biases ONE shared angle through the
+    /// house pan_gains law (gl=cos, gr=sin of (th+1)/2·pi/2): power is
+    /// 1 at every angle, cent=+-1 is a full shift at unchanged loudness,
+    /// and the wheel sweeps around the bias. Pins feed a constant
+    /// l = r = 0.5 with vol depth 0 and trim 1, so 2*out IS the side
+    /// gain; slew 1 ms, settle windows skipped.
+    /// A1/A2/A3: cent=+1 hard right, cent=-1 hard left (never the old
+    ///   silence/hot-sum), cent=0 at 1/sqrt2;
+    /// A4: gl^2+gr^2 = 1 at every bias station AND mid-sweep;
+    /// A5: the lean (gr-gl) strictly increases with cent;
+    /// A6: cent=0 depth=1 swings hard L AND hard R within 1 s;
+    ///     cent=+0.5 depth=0.5 keeps the whole sweep at/right of centre
+    ///     yet still reaches hard right — the bias moves the SWEEP;
+    /// A7: the mono v1 fallback inherits the law: cent=+1 gives 0.5x of
+    ///     the input, not the old 1.0 hot sum.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v126_autopan_centre_pans() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v126apc");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+
+        // Param slots (PARAMS table): [pan shape, pan rate, pan depth,
+        // centre, phase off, vol shape, vol rate, vol depth, slew,
+        // gain, host].
+        let base = |cent: f32, depth: f32, rate: f32| -> [f32; MAX_PARAMS] {
+            let mut dp = [0.0f32; MAX_PARAMS];
+            dp[1] = rate;
+            dp[2] = depth;
+            dp[3] = cent;
+            dp[8] = 1.0; // slew 1 ms: settles in ~15 ms
+            dp[9] = 1.0; // output trim unity
+            dp
+        };
+        // Static bias -> (gl, gr) measured as 2x the settled outputs.
+        let station = |cent: f32| -> (f32, f32) {
+            let dp = base(cent, 0.0, 0.005);
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan inst");
+            let mut last = (0.0f32, 0.0f32);
+            for _ in 0..(0.10 * sr) as usize {
+                last = unsafe { inst.call_sample_st(0.5, 0.5, &dp, 0.0) };
+            }
+            drop(inst);
+            (last.0 * 2.0, last.1 * 2.0)
+        };
+
+        // ---- A1/A2/A3: hard endpoints + house centre --------------
+        let (gl_r, gr_r) = station(1.0);
+        assert!(
+            gl_r.abs() < 0.01 && (gr_r - 1.0).abs() < 0.01,
+            "v126 A1: cent=+1 must land hard right gl~0,gr~1 — got gl={gl_r} gr={gr_r} (pre-fix the pair sat at 1/1: a hot mono sum, never a pan)",
+        );
+        let (gl_l, gr_l) = station(-1.0);
+        assert!(
+            (gl_l - 1.0).abs() < 0.01 && gr_l.abs() < 0.01,
+            "v126 A2: cent=-1 must land hard left gl~1,gr~0 — got gl={gl_l} gr={gr_l} (pre-fix both gains hit 0: the bias muted the pair)",
+        );
+        let (gl_c, gr_c) = station(0.0);
+        let f1s2 = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (gl_c - f1s2).abs() < 0.005 && (gr_c - f1s2).abs() < 0.005,
+            "v126 A3: cent=0 depth=0 must sit at the house centre 1/sqrt2 — got gl={gl_c} gr={gr_c}",
+        );
+
+        // ---- A4: constant loudness at every bias station ----------
+        let mut stations = Vec::new();
+        let mut worst_pow = 0.0f32;
+        for &c in &[-1.0f32, -0.5, 0.0, 0.5, 1.0] {
+            let (a, b) = station(c);
+            worst_pow = worst_pow.max((a * a + b * b - 1.0).abs());
+            stations.push((c, b - a)); // lean toward R
+        }
+        assert!(
+            worst_pow < 1e-3,
+            "v126 A4: pair power gl^2+gr^2 must stay 1 across the whole bias (unchanged loudness) — worst dev {worst_pow}",
+        );
+        // Mid-sweep: bias 0.7 depth 0.9 at 0.5 Hz, power through the sweep.
+        {
+            let dp = base(0.7, 0.9, 0.5);
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan sweep inst");
+            let mut worst = 0.0f32;
+            for i in 0..(2.0 * sr) as usize {
+                let (ol, or) = unsafe { inst.call_sample_st(0.5, 0.5, &dp, 0.0) };
+                if i > (0.3 * sr) as usize {
+                    let (a, b) = (ol * 2.0, or * 2.0);
+                    worst = worst.max((a * a + b * b - 1.0).abs());
+                }
+            }
+            drop(inst);
+            assert!(
+                worst < 5e-3,
+                "v126 A4: mid-sweep (cent=0.7 depth=0.9) pair power wanders {worst} off 1 — one equal-power law must hold everywhere",
+            );
+        }
+
+        // ---- A5: the image moves monotonically with the bias -------
+        for w in stations.windows(2) {
+            assert!(
+                w[1].1 > w[0].1,
+                "v126 A5: lean (gr-gl) must strictly increase with cent — {} at cent {} vs {} at cent {}",
+                w[0].1,
+                w[0].0,
+                w[1].1,
+                w[1].0,
+            );
+        }
+
+        // ---- A6: the wheel sweeps AROUND the bias ------------------
+        let swing = |cent: f32, depth: f32| -> (f32, f32) {
+            let dp = base(cent, depth, 2.0); // 2 Hz sine, depth-biased
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan swing inst");
+            let mut lo = f32::MAX;
+            let mut hi = f32::MIN;
+            for i in 0..(1.1 * sr) as usize {
+                let (ol, or) = unsafe { inst.call_sample_st(0.5, 0.5, &dp, 0.0) };
+                if i > (0.2 * sr) as usize {
+                    lo = lo.min(or - ol);
+                    hi = hi.max(or - ol);
+                }
+            }
+            drop(inst);
+            (lo, hi)
+        };
+        let (lo0, hi0) = swing(0.0, 1.0);
+        assert!(
+            hi0 > 0.30 && lo0 < -0.30,
+            "v126 A6a: cent=0 depth=1 must swing hard L AND hard R (out_r-out_l beyond +-0.30) — got [{lo0}, {hi0}]",
+        );
+        let (lob, hib) = swing(0.5, 0.5);
+        assert!(
+            lob >= -0.02 && hib > 0.30,
+            "v126 A6b: cent=+0.5 depth=0.5 must keep the sweep at/right of centre yet still reach hard right — got [{lob}, {hib}] (bias must move the SWEEP, not the level)",
+        );
+
+        // ---- A7: mono v1 fallback inherits the fix ------------------
+        {
+            let dp = base(1.0, 0.0, 0.005);
+            let inst = reg
+                .create_instance("autopan", sr, &[])
+                .expect("autopan mono inst");
+            let mut y = 0.0f32;
+            for _ in 0..(0.10 * sr) as usize {
+                y = unsafe { inst.call_sample(0.5, &dp) };
+            }
+            drop(inst);
+            // (gl+gr)/2 with gl=0,gr=1: exactly half the input.
+            assert!(
+                (y - 0.25).abs() < 0.02,
+                "v126 A7: mono path at cent=+1 must be 0.25 (0.5x input) — got {y} (pre-fix the fallback hot-summed to 0.5)",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Native Suite tier 5 pins (docs/EFFECT-SUITE.md): space_echo went ABI-v3
     /// STEREO (algorithmic-room task). Impulse-STRUCTURE shape per the
     /// tier-4 rule — energy gates are blind to dead loops, and here they
