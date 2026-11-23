@@ -59123,6 +59123,201 @@ mod tests {
         armed
     }
 
+    /// v135 harness: like `frame()`, but ALSO returns the painted
+    /// (galley text, center) pairs of THAT exact event frame. A
+    /// follow-up `v56_texts()` pass RE-RUNS `ui_root` against the
+    /// already-mutated model — for one-frame staleness bugs that reads
+    /// a false green, so the pin must capture the shapes of the frame
+    /// whose events triggered the mutation (shapes scan BEFORE
+    /// tessellate, per egui-headless-testing).
+    fn v135_frame_texts(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            events,
+            ..Default::default()
+        };
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let texts: Vec<(String, egui::Pos2)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let local = t.galley.rect;
+                    let c = t.pos + (local.center() - local.min);
+                    return Some((t.galley.text().trim().to_string(), c));
+                }
+                None
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        texts
+    }
+
+    // ============ v135: sampler-map '×' removal is DEFERRED past the
+    // row loop (card t_ce153f73). Mid-loop `m.slots.remove(i)` shifted
+    // the table under the still-painting rows below: their `cur_vel`
+    // reads showed the shifted slot (or the 127 fallback) and any
+    // same-frame post-closure write landed on the wrong slot. Fix: a
+    // local `del_row` pending flag; the removal applies after the loop
+    // in the same frame. Pins below; REQUIREMENTS.md = scratch dir.
+
+    /// v135 shared rig: sampler track + kick/zap/snare map, distinct
+    /// per-row velocities 127/64/100 so a shifted read is VISIBLE.
+    fn v135_three_row_map(tag: &str) -> (App, egui::Context, egui::Pos2) {
+        let (mut app, ctx) = v90_setup(tag);
+        let samples = std::env::temp_dir().join(format!("sp-uity-{tag}/samples"));
+        v28_wav(&samples, "kick.wav");
+        let k = app.ensure_asset(&samples.join("kick.wav")).expect("kick");
+        let z = app.ensure_asset(&samples.join("zap.wav")).expect("zap");
+        let s = app.ensure_asset(&samples.join("snare.wav")).expect("snare");
+        app.sample_rate = 44100;
+        v90_set_map(&mut app, &[(k, 12, 127), (z, 19, 64), (s, 26, 100)]);
+        v90_open(&mut app, &ctx);
+        park_window(&mut app, &ctx, "\u{266a} sampler", egui::vec2(350.0, 180.0));
+        // Settle (v82 law), then read the row '×' centers top-down.
+        let mut xs = v135_xs(&mut app, &ctx);
+        let ys = v135_xs(&mut app, &ctx);
+        assert_eq!(
+            xs.len(),
+            ys.len(),
+            "'×' galley count must settle stable between reads"
+        );
+        for (a, b) in xs.iter().zip(ys.iter()) {
+            assert!((a.y - b.y).abs() < 1.0, "'×' rows drifting between reads");
+        }
+        xs = ys;
+        assert_eq!(xs.len(), 3, "one '×' per lane row, got {xs:?}");
+        (app, ctx, xs[0])
+    }
+
+    /// v135 helper: the per-row '×' button centers, top-down.
+    fn v135_xs(app: &mut App, ctx: &egui::Context) -> Vec<egui::Pos2> {
+        let mut xs: Vec<egui::Pos2> = v56_texts(app, ctx)
+            .into_iter()
+            .filter(|(t, _)| t == "\u{d7}")
+            .map(|(_, c)| c)
+            .collect();
+        xs.sort_by(|a, b| a.y.total_cmp(&b.y));
+        xs
+    }
+
+    /// v135 helper: the painted DragValue galleys (prefix 'v' + note
+    /// glyph suffix — the only galleys carrying ♩), top-down.
+    fn v135_vel_galleys(
+        texts: &[(String, egui::Pos2)],
+    ) -> Vec<(String, egui::Pos2)> {
+        let mut v: Vec<(String, egui::Pos2)> = texts
+            .iter()
+            .filter(|(t, _)| t.contains('\u{2669}'))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+        v
+    }
+
+    /// R2: the frame whose release '×' the row-0 click lands in must
+    /// paint ONE consistent snapshot — all three rows present, and every
+    /// row's velocity DragValue showing ITS OWN slot's value (127/64/
+    /// 100). Pre-fix the shifted table painted 127/100/127 (row 1 read
+    /// snare's 100, row 2 fell back to 127). R1 floor: the model is
+    /// removed-and-pushed by frame end.
+    #[test]
+    fn v135_smap_delete_deferred_snapshot() {
+        let (mut app, ctx, x0) = v135_three_row_map("v135snap");
+        // press '×' row 0 (click lands on the release frame below)
+        frame(&mut app, &ctx, vec![moved(x0)]);
+        frame(&mut app, &ctx, vec![moved(x0), btn(x0, egui::PointerButton::Primary, true)]);
+        let painted = v135_frame_texts(&mut app, &ctx, vec![btn(x0, egui::PointerButton::Primary, false)]);
+        // snapshot coherence: the removed row's label still paints THIS
+        // frame (removal applies at loop end) — never a half-shifted mix.
+        let joined = painted.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("|");
+        assert!(
+            joined.contains("kick") && joined.contains("zap") && joined.contains("snare"),
+            "the release frame paints the FULL pre-removal snapshot: {joined}"
+        );
+        // per-row velocity identity: row i shows slot i's pre-removal v.
+        let vels = v135_vel_galleys(&painted);
+        assert_eq!(vels.len(), 3, "three velocity galleys, got {vels:?}");
+        for (row, (text, _)) in vels.iter().enumerate() {
+            let want = ["127", "64", "100"][row];
+            assert!(
+                text.contains(want),
+                "row {row}'s DragValue must show ITS velocity {want}, \
+                 not a shifted slot's: {vels:?}"
+            );
+        }
+        // R1 floor: the deferred removal landed before the frame ended.
+        let m = app.sampler_maps[0].as_ref().unwrap();
+        assert_eq!(m.slots.len(), 2, "removal applied by frame end");
+        assert_eq!((m.slots[0].root, m.slots[1].root), (19, 26), "order kept");
+        assert_eq!(app.smap_sel, None, "selection cleared with the row");
+        let live = v90_live_map(&app);
+        assert_eq!(live.len(), 2, "engine map follows");
+    }
+
+    /// R3: a post-closure velocity write firing in the SAME frame as
+    /// the '×' click must land on the slot the frame DISPLAYED (row 1 =
+    /// zap, pre-removal index 1), never on the shifted index. Race
+    /// frame: PointerMoved onto row 1's DragValue (hover), MouseWheel
+    /// (mutates it -> new_vel), release over '×' row 0 (click). Pre-fix
+    /// the write hit the shifted slot 1 = snare and zap kept 64.
+    #[test]
+    fn v135_smap_delete_same_frame_edit_lands() {
+        let (mut app, ctx, x0) = v135_three_row_map("v135race");
+        // row 1's velocity DragValue center, freshly settled
+        let vels = v135_vel_galleys(&v56_texts(&mut app, &ctx));
+        assert_eq!(vels.len(), 3);
+        let (_, vel1) = &vels[1];
+        let vel1 = *vel1;
+        frame(&mut app, &ctx, vec![moved(x0)]);
+        frame(&mut app, &ctx, vec![moved(x0), btn(x0, egui::PointerButton::Primary, true)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                moved(vel1),
+                egui::Event::MouseWheel {
+                    unit: egui::ScrollUnit::Lines,
+                    delta: egui::vec2(0.0, 1.0),
+                    modifiers: Default::default(),
+                },
+                btn(x0, egui::PointerButton::Primary, false),
+            ],
+        );
+        let m = app.sampler_maps[0].as_ref().unwrap();
+        assert_eq!(m.slots.len(), 2, "the '×' click landed");
+        assert_ne!(m.slots[0].vel, 64, "the DISPLAYED row (zap) must have received the scroll edit");
+        assert_eq!(m.slots[1].vel, 100, "the decoy slot (snare) must be untouched");
+        assert_eq!(m.slots[0].root, 19, "zap survived as slot 0");
+    }
+
+    /// R4 floor: the frame AFTER the click self-heals visibly — the map
+    /// renumbered, the removed label gone, no phantom third row.
+    #[test]
+    fn v135_smap_delete_next_frame_self_heal() {
+        let (mut app, ctx, x0) = v135_three_row_map("v135heal");
+        frame(&mut app, &ctx, vec![moved(x0)]);
+        frame(&mut app, &ctx, vec![moved(x0), btn(x0, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![btn(x0, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        let texts: Vec<String> = v56_texts(&mut app, &ctx).into_iter().map(|(s, _)| s).collect();
+        assert!(texts.iter().any(|t| t.contains("#1") && t.contains("zap")), "#1 zap: {texts:?}");
+        assert!(texts.iter().any(|t| t.contains("#2") && t.contains("snare")), "#2 snare: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("#3")), "no phantom third row: {texts:?}");
+        assert_eq!(v135_xs(&mut app, &ctx).len(), 2, "one '×' per surviving row");
+    }
+
     /// AC1: rack audio rows initiate the egui DragAndDrop (asset-index
     /// payload), and a release over dead canvas consumes nothing.
     #[test]
