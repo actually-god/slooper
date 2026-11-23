@@ -19194,9 +19194,7 @@ impl eframe::App for App {
         // The RT callback writes post-master-gain stereo; overflow drops
         // the NEWEST samples, so the audio thread never blocks.
         if self.sample_rate > 0 {
-            if self.meter_state.is_none() {
-                self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
-            }
+            self.ensure_meter_state();
             if let Some(ms) = self.meter_state.as_mut() {
                 let n = self.backend.meter.drain(&mut self.meter_drain, 4_800);
                 if n > 0 {
@@ -19223,6 +19221,31 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// v131: the master meter must follow the LIVE sample rate. LUFS
+    /// block size / K-weighting and the spectrum bin_hz all freeze at
+    /// the rate the meter was constructed with, while `sample_rate`
+    /// moves at runtime via `Evt::Ready` (server restart at another
+    /// rate, W12g hot-swap, v118 JACK rebuild). Pre-v131 the pump's
+    /// `is_none()` guard created the meter once forever: after a
+    /// 44.1↔48k reconnect the master readouts integrated wrong window
+    /// lengths and mislabeled the spectrum axis until app restart.
+    /// A replacement starts clean (integrated history, holds and clip
+    /// latch) — acceptable: the ring self-clears on fresh drain
+    /// positions and stale windows are worse than a reset. No-op at
+    /// rate 0 (null-audio tests, pre-ready boot).
+    fn ensure_meter_state(&mut self) {
+        if self.sample_rate == 0 {
+            return;
+        }
+        if self
+            .meter_state
+            .as_ref()
+            .is_none_or(|ms| ms.sr != self.sample_rate)
+        {
+            self.meter_state = Some(crate::meter::MasterMeter::new(self.sample_rate));
+        }
+    }
+
     /// The whole window's content. Split out from [`eframe::App::ui`] so
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
@@ -62298,11 +62321,12 @@ mod tests {
 
     /// No backend rate known (null-audio tests, pre-ready boot): the
     /// pump never constructs a meter at sr 0, and a meter a pin
-    /// injected by hand stays untouched.
+    /// injected by hand stays untouched. (headless_app pre-arms
+    /// sample_rate = 48k, so the pin zeroes it explicitly.)
     #[test]
     fn v131_master_meter_needs_a_live_rate() {
         let mut app = headless_app("v131sr3");
-        assert_eq!(app.sample_rate, 0, "null-audio headless app has no rate");
+        app.sample_rate = 0;
         app.ensure_meter_state();
         assert!(app.meter_state.is_none(), "no meter at sr 0");
         app.meter_state = Some(crate::meter::MasterMeter::new(48_000));
