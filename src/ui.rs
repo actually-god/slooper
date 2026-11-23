@@ -3861,6 +3861,16 @@ impl App {
         if name.is_empty() || name.contains('/') || name.contains("..") {
             return Err("pick a preset name (no path characters)".into());
         }
+        // v132 (t_09676c12): the v34 refusal is a RAW-name check, but
+        // `presetbar::sanitize` has no empty fallback — a punctuation-only
+        // name ("!!!") collapses to "" and the store used to write an
+        // invisible hidden `.json` no picker could ever list. Refuse on
+        // the POST-SANITIZED name, before the plugin lookup (a name that
+        // can never be listed must not touch the filesystem or the entry
+        // table), parity with the 4 sibling "type a name first" echoes.
+        if crate::presetbar::sanitize(name).is_empty() {
+            return Err("pick a preset name (letters or digits)".into());
+        }
         let entry = self
             .target_entry(target)
             .ok_or_else(|| "plugin is gone".to_string())?;
