@@ -624,6 +624,34 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// v128: the ONE preset-pairs applier — positional order first, then label
+/// matches (clamped to the declared range). Used by the fxgui editor's
+/// user-preset load AND the MCP `plugin.preset.load` (via the ui.rs seam),
+/// so the two entry points cannot drift (v59 doctrine: shared behavior =
+/// shared function). Returns the (param, clamped value) pairs applied, in
+/// application order (positionals then label hits — a param may be written
+/// twice, the label value wins, exactly like the pre-v128 fxgui loop).
+pub fn apply_preset_pairs(inst: &Instance, desc: &EffectDesc, pairs: &[(String, f64)]) -> Vec<(usize, f32)> {
+    let mut applied = Vec::new();
+    // Index order first…
+    for (i, (_, v)) in pairs.iter().enumerate() {
+        if let Some(p) = desc.params.get(i) {
+            let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
+            inst.set_param(i, v);
+            applied.push((i, v));
+        }
+    }
+    // …then label matches win over positional guesses.
+    for (label, v) in pairs {
+        if let Some((k, p)) = desc.params.iter().enumerate().find(|(_, p)| &p.label == label) {
+            let v = (*v as f32).clamp(p.min.min(p.max), p.max.max(p.min));
+            inst.set_param(k, v);
+            applied.push((k, v));
+        }
+    }
+    applied
+}
+
 /// Pull every `"label": number` pair out of a preset file. Deliberately
 /// lenient (string values like "plugin"/"name" simply don't parse as
 /// numbers and are skipped): a hand-tweaked preset should still load its
