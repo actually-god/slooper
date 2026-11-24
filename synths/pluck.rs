@@ -267,8 +267,11 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 {
 
 // --- v100 (card t_52aa65b1): channel pitch bend = the piano-roll GLIDE lane.
 // The host decodes 14-bit MIDI bend to SEMITONES (full deflection = ±12) and
-// calls this before the next process() block; every sounding voice's pitch is
-// multiplied by 2^(st/12) there, so baked glide bends HELD notes live.
+// calls this before the next process() block. v151 (card t_0c4df02a) docs
+// truth: unlike the oscillator siblings, pluck uses bend_st ONLY at the
+// note_on TRIGGER frequency (see note_on) — the Karplus-Strong loop length
+// is frozen when the string is struck — so baked glide never re-pitches
+// HELD notes; it pitches notes started after the value arrives.
 #[no_mangle]
 pub extern "C" fn bend(s: *mut core::ffi::c_void, _ch: u8, st: f32) {
     if s.is_null() {

@@ -332,7 +332,11 @@ pub extern "C" fn poly_at(s: *mut core::ffi::c_void, _ch: u8, note: u8, val: u8)
     }
 }
 
-/// Fast tanh-ish soft clip keeps summed hits from blowing past unity.
+/// Per-voice soft saturation (tanh-ish): compresses each hit's OWN
+/// peaks toward |y| < 1/0.6 ≈ 1.67 before the sample enters the mix, so
+/// one hot voice can never dominate. It does NOT limit the SUM — up to
+/// VOICES shaped voices still stack past unity, and the engine's output
+/// clipper is what keeps the final mix in range.
 #[inline]
 fn soft(x: f64) -> f64 {
     x / (1.0 + x.abs() * 0.6)
@@ -353,7 +357,9 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
     let l_tom = unsafe { *params.add(5) }.clamp(0.0, 1.5) as f64;
     let l_cymb = unsafe { *params.add(6) }.clamp(0.0, 1.5) as f64;
 
-    // Pitch multiplier for melodic components; metallics ignore tune.
+    // Pitch multiplier for the melodic voices AND the hats (a hat is a
+    // tuned head too — the v136 header states this same law); only the
+    // crash/ride inharmonic banks below are pitch-immune.
     // v136: the GLIDE lane rides this multiplier exactly like the tune
     // knob (0 st keeps the pre-v136 arithmetic bit-for-bit).
     let tmul = (2.0f64).powf((tune + d.bend_st) / 12.0);

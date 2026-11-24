@@ -37,7 +37,10 @@
 // see SynthInfoV2 below for the ladder recipe):
 //   * `bend(s, ch, st)`       — channel pitch bend in SEMITONES; this is
 //     where the piano roll's GLIDE lane lands (a full deflection = ±12).
-//     Multiply voice pitch by 2^(st/12) for every live voice on `ch`.
+//     Multiply voice pitch by 2^(st/12) for every live voice on `ch` —
+//     oscillator-style voices can re-pitch each block; delay-loop models
+//     (Karplus-Strong plucks) freeze the loop length at strike time, so
+//     they apply the bend at trigger, which is ABI-legal for them.
 //
 // v3 additions (see SynthInfoV3 below — same ladder, add-only):
 //   * `poly_at(s, ch, note, val)` — PER-NOTE aftertouch (MPE note
