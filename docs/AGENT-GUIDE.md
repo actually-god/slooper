@@ -240,7 +240,25 @@ effects/        effect-script authoring kit: template.rs (start here),
                 (docs/EFFECT-SUITE.md is the roster: 23 shipping effects)
 vendor/vst2/    in-tree patched VST2 crate (see VENDOR-NOTES.md; keep the
                 entry-name + chunk patches when vendoring anything newer)
-examples/       small dev utilities run via `cargo run --example <name>`
+examples/       live dev probes run via `cargo run --example <name>`.
+                ROSTER — every file in examples/ MUST appear here AND be
+                named (`examples/<stem>`) from src/tests/docs/scripts:
+                the guard pin v144_examples_all_referenced enforces it.
+                v144 pruned 13 zero-ref vNN-era probes (midi_tester,
+                ports, oracle.c, v16_open/v16_scan/v17_appflow/
+                v17_synth probes, v20_desc_dump, v22_chunk_probe,
+                v33_midi_soak, vst_perf_probe, vst_pump_probe,
+                sinco_emu) — recoverable from git history if ever
+                wanted again; lore lives in the skill references.
+                  examples/editor_smoke    VST2 editor paints (X11 smoke)
+                  examples/plugin_audit    all plugins audibly alive
+                  examples/plugin_one      one plugin per child process
+                  examples/plugin_sustain  long-note sustain host path
+                  examples/v20_chunkdiff   chunk save/restore round-trip
+                  examples/v23_sweep       per-plugin full-surface sweep
+                  examples/v33_load_probe  plugin open-path timing
+                  examples/alv_editor_live editor-during-RT crash repro
+                  examples/mcp_tool_dump   live MCP table -> docs/MCP.md
 tests/e2e.rs    end-to-end tests that drive a LIVE JACK server
 tests/packaging.sh  packaging regression test (needs a PKGBUILD; see below)
 assets/icon.png 256x256 app icon (placeholder artwork)

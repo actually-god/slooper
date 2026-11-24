@@ -140,3 +140,84 @@ pub fn test_real_home() -> String {
     })
     .clone()
 }
+
+/// Repo-hygiene pins (vNN series). These walk the checkout on disk — keep
+/// them cheap: bounded dirs, nothing inside `target/` or `.git/`.
+#[cfg(test)]
+mod hygiene_tests {
+    /// v144 (card t_57fde1e2): every file under `examples/` must be named
+    /// UNAMBIGUOUSLY from at least one live in-tree source outside
+    /// `examples/` itself — an `examples/<stem>` or `--example <stem>`
+    /// needle — else it is a dead probe that costs `--all-targets` compile
+    /// time on every CI push while nobody can tell it from a live tool.
+    /// The finding was 13 zero-reference vNN-era probes (v16–v33 era, incl.
+    /// oracle.c) sitting there for months; CHANGELOG prose deliberately
+    /// does NOT count — history is not a pointer a rename/delete must honor.
+    /// Wanted probe: keep the file AND a roster line in docs/AGENT-GUIDE.md.
+    /// Rotten probe: delete it, archive the lore to the skill references.
+    #[test]
+    fn v144_examples_all_referenced() {
+        use std::path::{Path, PathBuf};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        for d in ["src", "tests", "docs", "scripts", "tools", ".github"] {
+            walk(&root.join(d), &mut files);
+        }
+        for f in ["README.md", "build.rs", "Cargo.toml"] {
+            let p = root.join(f);
+            if p.is_file() {
+                files.push(p);
+            }
+        }
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        for p in &files {
+            if let Ok(bytes) = std::fs::read(p) {
+                blobs.push(bytes);
+            }
+        }
+
+        let mut dead: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for e in std::fs::read_dir(root.join("examples")).unwrap() {
+            let p = e.unwrap().path();
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext != "rs" && ext != "c" {
+                continue;
+            }
+            seen += 1;
+            let stem = p.file_stem().unwrap().to_str().unwrap().to_string();
+            let n1 = format!("examples/{stem}").into_bytes();
+            let n2 = format!("--example {stem}").into_bytes();
+            let found = blobs.iter().any(|b| {
+                b.windows(n1.len()).any(|w| w == n1)
+                    || b.windows(n2.len()).any(|w| w == n2)
+            });
+            if !found {
+                dead.push(stem);
+            }
+        }
+        // Fingerprint: if the dir ever vanishes this pin must not pass
+        // vacuously on an empty roster.
+        assert!(seen >= 9, "examples/ holds only {seen} probe files — roster shrank unexpectedly");
+        assert!(
+            dead.is_empty(),
+            "dead example probes with zero `examples/<stem>` / `--example <stem>` \
+             refs outside examples/ — delete them (lore to skill state-history) or \
+             add a one-line pointer to the docs/AGENT-GUIDE.md roster: {dead:?}"
+        );
+    }
+}
