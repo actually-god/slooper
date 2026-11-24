@@ -66,9 +66,9 @@ run live and in export.
 | --- | --- |
 | **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure + subdivision · **Windows** menu · **Load / Save as / Save / Export** |
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
-| **Grid toolbar** | **loop** toggle + mode dropdown (see [Looping](#looping)), auto-quantize checkbox, **quantize** subdivision, **snap** on/off checkbox + subdivision, **♫ Piano roll** (opens the [note editor](#piano-roll)), zoom slider |
+| **Grid toolbar** | **loop** toggle + mode dropdown (see [Transport & playhead](#transport--playhead)), auto-quantize checkbox, **quantize** subdivision, **snap** on/off checkbox + subdivision, **MIX** full-page mixer toggle ([mix page](#the-mix-page-f9)), **♫ Piano roll** (opens the [note editor](#piano-roll)), zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles; MIDI clips draw their **notes** right on the grid |
-| **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll): **name · REC/STOP · on/mute · MREC · +/− child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button), an **FX** chip + enabled chain-slot buttons, and a **synth picker** + **sliders** — strips scroll in lockstep with the timeline. (The master volume/meters are NOT here — they live in the **master out** window, one place, one set of controls.) |
+| **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll): **name · REC/STOP · on/mute · MREC · +/− child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button), an **FX** chip + enabled chain-slot buttons, and a **synth picker** + **sliders** — strips scroll in lockstep with the timeline. (The master volume/meters are NOT here — they live in the **master out** window, one place, one set of controls. **F9** opens the [full-page mix page](#the-mix-page-f9).) |
 | **Bottom** | MIDI monitor (every event on `slooper:midi_in`) |
 
 Each **mixer strip** holds the track's whole control surface: the name row
@@ -88,6 +88,24 @@ separator between blocks (drag it to resize that track), one unbroken
 playhead line, and tall lanes meant for stacking lots of clips. **Right-click a track's lane area** removes that
 track's clips (assets stay in the rack; same as `C`), whether you press on
 empty grid or on a clip.
+
+### The mix page (F9)
+
+The **MIX** toggle on the grid toolbar — or **`F9`** from anywhere —
+flips the center area between the timeline grid and a **full-page
+mixer**: one channel column per track, carrying the same controls and
+the same setters as the dock strips — color chip + select + track menu,
+REC and mute, **vertical vol / gain faders** with dB readouts, a pan
+slider, the **FX** and **♪ synth** chips, and the two **send / s-pan**
+rows used by [sidechain routing](#sidechain-sends). **Shift + wheel**
+(or the trackpad sideways) scrolls the page across columns when they
+don't all fit. The mixer dock stays live beside the page and the grid
+is untouched underneath — everything is where you left it — and there
+is deliberately **no master column**: master volume and meters live
+only in [Master out](#master-out--loudness). The view is session state
+— `F9` and the MIX toggle are always on screen, so nothing about it is
+saved. Like the zoom keys, `F9` is fixed: it is not a rebindable
+action slot.
 
 ### Windows and layouts
 
@@ -303,7 +321,7 @@ Each track plays its MIDI clips through its own **synth binding** (the
   joins the rack, and replaces the live patch immediately, even while the
   track plays and MIDI streams in (no restart, no re-selection).
 - **sampler key map** — click **map** on a sampler-bound track to spread
-  **up to 8 rack samples across the keyboard**: each slot gets a root key
+  **up to 64 rack samples across the keyboard**: each slot gets a root key
   (the draggable block on the mini-keyboard, or the click-a-key editor) and
   every note plays the nearest-rooted sample pitched to fit. Two modes:
   **chromatic** (one sample across the whole range, pitched) or
@@ -316,6 +334,19 @@ Each track plays its MIDI clips through its own **synth binding** (the
   they share the preset/param machinery of effect scripts.
 - **VSTi** — any scanned VST2/VST3 *instrument* appears as
   *name (VSTi)* and is played by the track's MIDI clips.
+
+**Bend range (hosted instruments)** — pitch bends from a hardware wheel
+and pitch curves drawn in the roll are written in **semitones**, and a
+hosted instrument bends *exactly* as far as you draw: slooper programs
+its MIDI pitch-bend sensitivity (the standard RPN 0 message) to match
+and rescales the raw wheel to the same width. The **bend range** row in
+the instrument's PARAMETERS window (right-click the strip's **♪ / GUI**
+button → **user presets / parameters**) sets it per track: 0–24 st,
+default **2 st**; **off** disables bend delivery entirely; bends deeper
+than the range clamp. The range is announced on plugin load, on every
+change, and just before the first bend on each MIDI channel, and it
+saves with the session and project. Script synths need no setting — a
+full wheel deflection is always ±12 st there.
 
 The button on a plugin-bound track reads **GUI**: it opens (and toggles)
 the plugin's OWN window — every hosted generation, VST2 and VST3 alike
@@ -391,6 +422,9 @@ new asset:
   select, Ctrl/Shift-click for groups, **Ctrl + A / C / V**, Delete removes.
   Note placement follows the grid-toolbar **snap** setting (off = any
   sample).
+- **Velocity lane** — along the bottom of the note grid every note is
+  mirrored as a bar (height = velocity): drag a bar to set that note's
+  velocity; selected notes highlight gold.
 - **Preview** routes through a picked **track** — its synth *and* its
   effects chain — and fires as soon as a new note lands. Hold the note
   (mouse down) for as long as you want: the preview is an independent
@@ -412,6 +446,36 @@ new asset:
   keyboard focus when clicked — while it holds focus, main-window shortcuts
   (Space included) don't fire; the **X** in its title bar closes just the
   roll.
+
+### Pitch curves on the notes
+
+Every note can carry its own **pitch curve** — a glide drawn right ON
+the note body, no separate lane to discover:
+
+- **Draw**: hold **Z** and drag across the note. The stroke becomes the
+  curve — along the note's length in time, cents off the note's row in
+  height. Release the stroke over **another note** and the slide lands
+  exactly on that note's pitch: an 808-style note-to-note slide in one
+  gesture.
+- **Edit**: select the note and its **control points** appear as dots
+  (up to 16 points, ±2 octaves of deflection) — drag a dot; **Shift**
+  snaps its time to the grid, **Ctrl** snaps its pitch to 100-cent
+  steps. **Alt + Z** + drag warps the whole curve's magnitude at once.
+- **Clear**: **Shift + right-click** clears just the curve and keeps
+  the note (the note's right-click menu offers the same).
+- **You hear what you drew**: every commit bakes the curve and
+  re-auditions the note once through the track's synth + chain. The
+  curve travels with the note on move / clone / resize, and feeds
+  playback, the roll preview, MIDI export, and every instrument kind —
+  scripted synths, VSTi and CLAP alike. A two-point curve is exactly
+  the old straight glide, to the bit.
+- **Legacy glide strip**: glides drawn in the old separate lane
+  migrate onto their notes automatically on load. The strip itself
+  only appears for projects that still hold glides drawn in *gaps*
+  (no owning note) — those keep baking and playing exactly as before,
+  never silently rewritten.
+
+Design record and engine details: [SAMPLER-PITCH.md](SAMPLER-PITCH.md).
 
 ## Transport & playhead
 
@@ -592,6 +656,7 @@ in **any** text box, and auto-repeat never re-fires):
 | `Ctrl+D` | duplicate the selection at the playhead |
 | `Ctrl+M` | merge the selected clips (one kind) into one new asset |
 | `S` | split the selected clip(s) at the playhead |
+| `F9` | flip the main view between the grid and the full-page [mix page](#the-mix-page-f9) — fixed like the zoom keys, not a rebindable slot |
 
 While the **piano roll has focus**, `Ctrl + A/C/V` and `Delete` edit notes
 instead, and transport keys stay quiet until focus leaves the roll.
@@ -677,6 +742,23 @@ the list = first in the signal path). Open it with the strip's **FX** chip:
 
 Signal order per track: `clip × volume × gain → chain in order →
 pan → output buses`. The same chain runs during export renders.
+
+### Sidechain sends
+
+Any track's effect chain can be **keyed by any other track**: open the
+chain window and tick the keying tracks in the **Sidechain in** picker
+(a track never keys itself). Each routed chip carries a per-send
+**level slider** (0–200 %) so several keys mix into one detector —
+e.g. 50 % kick + 100 % bass. On the [mix page](#the-mix-page-f9), every
+column also carries sender-side **send** and **s-pan** rows that shape
+the key this track sends to *all* of its targets. The key is tapped
+**after** the sender's gain and pan but **before** its volume fader and
+mutes: muting or fading a sender silences its audio and never its duck.
+Routing and levels persist with the project, and live and export duck
+identically. Keys currently reach scripted effects — the bundled
+**Sidechain Compressor** is the ready-made consumer; hosted plugins
+don't see the key yet. Full tap semantics and the script ABI:
+[SIDECHAIN.md](SIDECHAIN.md).
 
 **Writing effects**: one standalone Rust file dropped into the effects
 folder — copy `template.rs` (also in [`../effects/`](../effects)), rename,
