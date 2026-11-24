@@ -19921,19 +19921,10 @@ impl App {
                 });
             if let Some(r) = resp {
                 let rect = r.response.rect;
-                // v18: same click-away rule, stated once: a fresh press of
-                // either button (or Escape) OUTSIDE the menu dismisses it.
-                // (The right-click that OPENED the menu releases on top of
-                // it, which is inside — it never dismisses itself.)
-                let click_elsewhere = armed
-                    && ui.ctx().input(|i| {
-                        (i.pointer.button_clicked(egui::PointerButton::Primary)
-                            || i.pointer.button_clicked(egui::PointerButton::Secondary)
-                            || i.key_pressed(egui::Key::Escape))
-                            && !rect
-                                .expand(4.0)
-                                .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
-                    });
+                // v18 click-away law, v152 single seam (kit::armed_outside_click):
+                // a fresh press of either button (or Escape) OUTSIDE dismisses;
+                // the right-click that OPENED the menu releases inside it.
+                let click_elsewhere = crate::kit::armed_outside_click(ui, armed, rect, 4.0, true);
                 if done || click_elsewhere || !open {
                     self.value_menu = None;
                     self.value_menu_armed = false;
@@ -23149,14 +23140,11 @@ fn palette_pass(ui: &mut egui::Ui, app: &mut App) {
         });
     if let Some(r) = resp {
         let rect = r.response.rect;
-        let click_elsewhere = armed
-            && ui.ctx().input(|i| {
-                (i.pointer.button_clicked(egui::PointerButton::Primary)
-                    || i.pointer.button_clicked(egui::PointerButton::Secondary))
-                    && !rect
-                        .expand(6.0)
-                        .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
-            });
+        // v152 single seam (kit::armed_outside_click). escape=false is the
+        // documented palette fork: its Escape is the unconditional global
+        // close above (modal — the query box owns typing), pad 6.0 forgives
+        // the wider window border.
+        let click_elsewhere = crate::kit::armed_outside_click(ui, armed, rect, 6.0, false);
         if click_elsewhere || !open {
             app.palette = None;
             app.palette_armed = false;
@@ -23226,15 +23214,9 @@ fn win_menu_pass(ui: &mut egui::Ui, app: &mut App) {
         });
     if let Some(r) = resp {
         let rect = r.response.rect;
-        let click_elsewhere = armed
-            && ui.ctx().input(|i| {
-                (i.pointer.button_clicked(egui::PointerButton::Primary)
-                    || i.pointer.button_clicked(egui::PointerButton::Secondary)
-                    || i.key_pressed(egui::Key::Escape))
-                    && !rect
-                        .expand(4.0)
-                        .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
-            });
+        // v152 single seam (kit::armed_outside_click): same click-away law
+        // as the value menu — press of either button or Escape outside dismisses.
+        let click_elsewhere = crate::kit::armed_outside_click(ui, armed, rect, 4.0, true);
         if done || click_elsewhere || !open {
             app.win_menu = None;
             app.win_menu_armed = false;
@@ -60841,6 +60823,55 @@ mod tests {
             librs.contains("INTERNAL_VERSION: &str = \"v130\""),
             "INTERNAL_VERSION must be bumped to v130"
         );
+    }
+
+    /// v152 (t_5bd4fc33) AC2/AC5: the popup dismissal predicate has ONE home.
+    /// The production slice of ui.rs calls the seam exactly 3× (value menu,
+    /// command palette, window-slot menu) and keeps ZERO hand-rolled dismissal
+    /// bodies (the hover-fallback needle is the hand-rolled body's fingerprint,
+    /// now owned solely by kit.rs), and kit.rs holds the single definition plus
+    /// the whole predicate vocabulary. Comment-safe (v94 idiom); cross-file
+    /// needles—this pin lives in ui.rs, the definition lives in kit.rs, and the
+    /// pin's own literals sit inside `mod tests` (outside the scanned slice),
+    /// so no self-assertion can satisfy either polarity.
+    #[test]
+    fn v152_dismiss_seam_single_home() {
+        fn prod_of(s: &str) -> &str {
+            s.split("\nmod tests").next().unwrap_or(s)
+        }
+        let active = |src: &str, needle: &str| -> usize {
+            prod_of(src)
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains(needle)
+                })
+                .count()
+        };
+        let ui_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs"))
+            .expect("own source");
+        let kit_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kit.rs"))
+            .expect("kit source");
+        // Exactly the three armed popups route through the seam. A 4th armed
+        // popup must route through the seam too — or document its fork AT the
+        // seam, never as a copy.
+        assert_eq!(
+            active(&ui_src, "kit::armed_outside_click(ui, armed, rect,"),
+            3,
+            "value menu + palette + window menu each call the seam once"
+        );
+        // No hand-rolled dismissal survives in ui.rs at all.
+        assert_eq!(
+            active(&ui_src, "hover_pos().unwrap_or(rect.center())"),
+            0,
+            "the hand-rolled dismissal body must not reappear in ui.rs"
+        );
+        // kit.rs is the ONE definition and owns the whole predicate.
+        assert_eq!(active(&kit_src, "fn armed_outside_click("), 1);
+        assert_eq!(active(&kit_src, "button_clicked(PointerButton::Primary)"), 1);
+        assert_eq!(active(&kit_src, "button_clicked(PointerButton::Secondary)"), 1);
+        assert_eq!(active(&kit_src, "key_pressed(Key::Escape)"), 1);
+        assert_eq!(active(&kit_src, "hover_pos().unwrap_or(rect.center())"), 1);
     }
 
     /// v97 (sc-4): a routed "Sidechain in" chip carries a per-send RECEIVE
