@@ -83,9 +83,10 @@ tarball.
   kits, sampler key maps and track templates; hosted plugins load their
   factory programs (VST2/VST3) or preset files (CLAP), and the choice
   persists with the project.
-- **Mixer** — per-track vol/gain/pan, play gate, record groups, and a master
-  fader with peak/RMS/LUFS meters and a spectrum view; full-page MIX console
-  on `F9`.
+- **Mixer** — per-track vol/gain/pan, per-track sidechain sends with
+  independent per-route receive levels, play gate, record groups, and a
+  master fader with peak/RMS/LUFS meters and a spectrum view; full-page
+  MIX console on `F9`.
 - **Dock everything** — panels dock to any edge, float, or tab-group; named
   layout templates and a `Ctrl+K` command palette.
 - **Projects** — the whole session (tracks, clips, FX chains, synths,
