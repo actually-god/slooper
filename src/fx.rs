@@ -4385,6 +4385,109 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v157 regression (card t_0c6df534): delay's read_head computed
+    /// `f = widx - frac` and cast `f.floor()` to usize with no sign
+    /// guard. While a FRESH instance's write head is younger than the
+    /// tap (first ~dt samples — 320 ms at the default time; again
+    /// after a large time-slider increase, while `dt` slews above
+    /// widx) f is negative: the cast saturates d to 0 while fr stays
+    /// ~-25000, so the linear "interp" EXTRAPOLATES
+    /// `buf[0] + (buf[1]-buf[0])*fr`. wet_r rode that into the ±4
+    /// output clamp (audible startup thump on hard-R/wide input) and
+    /// the echo term poisoned `buf = mid + echo*fb`. Fix: reads
+    /// before the head are silence (the untouched ring is zero) —
+    /// the same guard flanger's read_lin carries. A1 is the negative
+    /// control: the pre-fix run prints max|R| pinned at the clamp.
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile/render)"]
+    fn v157_delay_fresh_head_read_is_silent() {
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v157drh");
+        let mut reg = Registry::open(dir.clone());
+        for (name, src) in EXAMPLES {
+            std::fs::write(dir.join(name), *src).unwrap();
+        }
+        reg.rescan();
+        let sr = 48000.0f64;
+
+        // Hard-R decorrelated burst (dsp-audio-probe LCG).
+        fn lcg(s: &mut u32) -> f32 {
+            *s = s.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
+            *s as f32 / 2147483647.0 * 1.2 - 0.6
+        }
+
+        let inst = reg.create_instance("delay", sr, &[]).expect("delay inst");
+        let mut dp = [0.0f32; MAX_PARAMS];
+        for (k, pd) in reg.desc("delay").unwrap().params.iter().enumerate() {
+            dp[k] = pd.default;
+        }
+        dp[7] = 1.0; // mix = 1: the output IS the wet pair (v125 contract)
+        dp[8] = 1.0; // out trim = 1
+
+        let burst = (0.150 * sr) as usize;
+        let n = (1.2 * sr) as usize;
+        let mut sn = 0x5EEDu32;
+        let mut yl: Vec<f32> = Vec::with_capacity(n);
+        let mut yr: Vec<f32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = if i < burst { lcg(&mut sn) } else { 0.0 };
+            let (ol, or) = unsafe { inst.call_sample_st(0.0, r, &dp, 0.0) };
+            yl.push(ol);
+            yr.push(or);
+        }
+
+        let wmax = |a: f64, b: f64, y: &[f32]| -> f32 {
+            y[(a * sr) as usize..(b * sr) as usize]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+
+        // A1 (negative control): no echo can exist before the tap
+        // matures; pre-fix the extrapolation rode this window to the
+        // ±4 output clamp (measured max|R| ~ 4, post-fix exactly 0).
+        let early_r = wmax(0.010, 0.148, &yr);
+        assert!(
+            early_r < 0.9,
+            "delay fresh-instance read extrapolates before the write head: \
+             max|R| in [10..148] ms is {early_r} (pre-fix rides the ±4 clamp) \
+             — read_head must return silence while f < 0",
+        );
+        // A2: the feedback ring must stay sane (L is the wet-only sum).
+        let full_l = wmax(0.0, 1.2, &yl);
+        assert!(full_l < 2.0, "delay L shows ring poisoning: max|L| = {full_l}");
+        // A3: L is dead-silent until the 320 ms tap matures, and the
+        // first echo then arrives there — the fix must not kill the
+        // delay (tier4_feedback_loops_ring contract stays live).
+        let pre = wmax(0.148, 0.290, &yl);
+        let e1 = wmax(0.300, 0.340, &yl);
+        assert!(pre < 0.005, "delay echoed before its tap matured (max|L| {pre})");
+        assert!(e1 > 0.02, "delay first echo never arrived at ~320 ms ({e1})");
+        // A4: the ping-pong wet is alive too, at dt*(1+pp) = 544 ms.
+        let e1r = wmax(0.520, 0.570, &yr);
+        assert!(e1r > 0.02, "delay ping-pong R echo never arrived at ~544 ms ({e1r})");
+
+        // A5: the same guard must cover the TIME-SLEW path. widx is
+        // ~57.6 k at t=1.2 s; pushing time to 2000 ms slews dt up to
+        // 96 k samples — past the head — where the extrapolation
+        // fired again pre-fix.
+        dp[0] = 2000.0;
+        let m = (0.5 * sr) as usize;
+        let mut worst = 0.0f32;
+        for _ in 0..m {
+            let (ol, _or) = unsafe { inst.call_sample_st(0.0, 0.0, &dp, 0.0) };
+            worst = worst.max(ol.abs());
+        }
+        drop(inst);
+        assert!(
+            worst < 2.0,
+            "delay time-slew to 2000 ms re-triggers the pre-head extrapolation: \
+             max|L| over the following 500 ms is {worst}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// v126 regression (card t_4184fd04): autopan computed a PER-SIDE
     /// angle (`pan_l = cent + wheel`, `pan_r = cent - wheel`) and read
     /// each side's gain from its OWN angle, so the "pan bias" slider
