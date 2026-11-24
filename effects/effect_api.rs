@@ -3,7 +3,8 @@
 //
 // THIS FILE IS NOT AUTHORED BY HAND AS A STANDALONE PROGRAM. It is a shared
 // contract, written once into every effects folder by slooper itself and
-// embedded in the binary (src/effect_api.rs is the source of truth). Effect
+// embedded in the binary — the copy in the slooper source tree
+// (effects/effect_api.rs) is the single source of truth. Effect
 // scripts pull it in with:
 //
 //     include!("effect_api.rs");

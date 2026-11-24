@@ -45,6 +45,10 @@ pub mod quantize;
 pub mod sample_edit;
 pub mod samples808;
 pub mod synth;
+/// The synth-script ABI contract. v149 single-source policy: the ONE copy
+/// lives in synths/ (the same file include_str!'d into the binary and seeded
+/// into user folders) — do not move it back to a src/ twin.
+#[path = "../synths/synth_api.rs"]
 pub mod synth_api;
 pub mod ui;
 pub mod vstedit;

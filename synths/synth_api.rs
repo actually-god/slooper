@@ -3,7 +3,8 @@
 //
 // THIS FILE IS NOT AUTHORED BY HAND AS A STANDALONE PROGRAM. It is a shared
 // contract, written into every synths folder by slooper itself and embedded
-// in the binary (src/synth_api.rs is the source of truth). Synth scripts
+// in the binary — the copy in the slooper source tree (synths/synth_api.rs)
+// is the single source of truth. Synth scripts
 // pull it in with:
 //
 //     include!("synth_api.rs");

@@ -87,6 +87,9 @@ src/            application source (Rust 2021 edition)
                   vtable, global-Mutex compile cache, bundled piano (recorded
                   physical model) + sampler seeded/updated-in-place in the
                   synths folder (SLOOPER_SYNTHS_DIR override)
+  synth_api.rs    the synth-script ABI contract — the ONE copy lives in
+                  synths/ (compiled via #[path] + embedded via include_str!
+                  from there; v149 single source, never recreate a src/ twin)
   vsthost.rs      VST2/VST3 hosting: folder scan, block-based processing
                   (live RT 512-block queue + offline renders), parameter
                   relay via generation counter (VST2 via the patched
@@ -132,8 +135,6 @@ src/            application source (Rust 2021 edition)
                   never memoized (tests swap HOME/XDG mid-suite). Also the
                   target-suffix helpers dylib_ext()/build_sidecar() (W3) —
                   fx.rs/synth.rs never hardcode `.so` for build artifacts
-  effect_api.rs   the effect-script ABI contract (also copied into every
-                  user effects folder; scripts include! this file)
   fx.rs           effects scan/compile/cache/load, ABI validation, chains,
                   hand-rolled user-preset JSON
   fxgui.rs        child editor windows (auto sliders or scripted GUIs)
@@ -441,8 +442,9 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   modes in the grid toolbar (`src/ui.rs`, `LoopMode`)
 - Project format + migration: `src/project.rs`, `midi::migrate_shortcuts`
 - All bindable actions + key defaults: `MidiAction::ALL`, `SHORTCUT_DEFAULTS` (`src/ui.rs`)
-- Effect ABI (audio v1, v2 sidechain + GUI v1): `src/effect_api.rs`;
-  synth ABI: `synths/synth_api.rs`; suite roster + coverage map:
+- Effect ABI (audio v1, v2 sidechain + GUI v1): `effects/effect_api.rs`;
+  synth ABI: `synths/synth_api.rs` (v149: the one copy — embedded and
+  compiled from there); suite roster + coverage map:
   [EFFECT-SUITE.md](EFFECT-SUITE.md)
 - Import formats: `IMPORT_EXTENSIONS` (`src/audio_io.rs`)
 - Export formats: `ExportFormat` (`src/audio_io.rs`)
