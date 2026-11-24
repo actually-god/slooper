@@ -282,7 +282,9 @@ pub struct Instance {
     params: Box<[AtomicU32; MAX_PARAMS]>,
     param_gen: AtomicU64,
     /// v51: multi-sample key map (the bundled sampler's piano-roll state).
-    /// `map[0..map_n]` holds packed `(asset_id << 8) | root_note`; the GUI
+    /// `map[0..map_n]` holds packed `(asset_id << 16) | (velocity << 8) |
+    /// root_note` (v52 R2: the velocity byte carries per-slot velocity
+    /// layers); the GUI
     /// writes slots BEFORE bumping the count so a reader that sees the new
     /// count also sees the data. `map_mode` carries the mode in the low
     /// bits plus bit-31 "a map EXISTS" (mode 0 = hard cutoff, 1 =
@@ -3010,6 +3012,101 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
             std::fs::read_to_string(root.join("synths").join("synth_api.rs")).unwrap(),
             API_SRC,
             "embedded ABI drifted from the repo copy"
+        );
+    }
+
+    // ==== v148: the shipped load_map contract must teach the live packing ====
+    //
+    // src/synth_api.rs is re-written into every user's synths/ folder on
+    // boot (content-diff seeding) — it is the ONLY documentation of the
+    // key-map ABI third-party samplers copy from. Until v148 it still
+    // taught the pre-v52 `<< 8` slot packing while the live ABI (see
+    // host_load_map above; v52 R2) packs asset | velocity | root across
+    // three fields: scripts written to the shipped text read the
+    // velocity byte as the asset id and silently play wrong samples.
+    // Docs-only pins — the packing BEHAVIOR is covered by the v51/v52
+    // render pins; these keep the contract text, the repo mirror and the
+    // internal map doc from rotting again.
+
+    /// The exact packing expression every contract doc must now state.
+    const V148_PACKING: &str = "(asset_id << 16) | (velocity << 8) | root_note";
+
+    #[test]
+    fn v148_api_doc_teaches_the_v52_slot_packing() {
+        // Positive polarity: the shipped contract text (embedded API_SRC —
+        // the bytes that land in the user's synths/ folder) carries the
+        // live packing, the unpack recipe, and the velocity-layer
+        // semantics the bundled sampler actually implements.
+        assert!(
+            API_SRC.contains(V148_PACKING),
+            "synth_api.rs load_map doc does not state the live packing {V148_PACKING:?} — \
+             samplers written to the shipped text index wrong assets"
+        );
+        for needle in [
+            "slot >> 16",
+            "(slot >> 8) & 0xFF",
+            "slot & 0xFF",
+            "velocity layers",
+            "at/below",
+            "bracket",
+            "127 answers every note",
+        ] {
+            assert!(
+                API_SRC.contains(needle),
+                "load_map doc lacks {needle:?} — the unpack/velocity-layer contract went undocumented again"
+            );
+        }
+        // Negative polarity: the pre-v52 expression must be GONE from the
+        // file users copy. Split literal (vacuity rule: a needle must not
+        // be satisfyable by this test's own text, and the concat keeps
+        // the stale form out of greppable source too).
+        assert!(
+            !API_SRC.contains(concat!("(asset_id << 8)", " |")),
+            "the pre-v52 << 8 packing crept back into the shipped synth_api.rs contract"
+        );
+    }
+
+    #[test]
+    fn v148_repo_api_copy_matches_embedded() {
+        // "Sync synths/synth_api.rs with the src copy" was v100-era manual
+        // discipline — pin it. The EMBEDDED copy (API_SRC) is what boots
+        // into every install, so drift in the repo MIRROR is the bug.
+        // Compare LF-normalized (Windows checkouts are CRLF; include_str!
+        // and fs reads do not agree on line endings there). Paths are
+        // chained single-component joins (W14: push("a/b") is not the
+        // same PathBuf on Windows).
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("synths")
+            .join("synth_api.rs");
+        let disk = std::fs::read_to_string(&p)
+            .expect("repo API mirror exists")
+            .replace("\r\n", "\n");
+        assert_eq!(
+            disk,
+            API_SRC.replace("\r\n", "\n"),
+            "synths/synth_api.rs drifted from embedded src/synth_api.rs — every install gets \
+             the EMBEDDED copy, so sync the MIRROR"
+        );
+    }
+
+    #[test]
+    fn v148_instance_map_doc_packing_is_v52() {
+        // Same doc-rot class, INTERNAL side: the Instance.map comment
+        // above once taught the pre-v52 packing too. Reads OUR OWN file,
+        // so BOTH polarity literals are split with concat! — neither can
+        // be satisfied (nor tripped) by this test's own text.
+        let own = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("synth.rs"),
+        )
+        .expect("own source readable")
+        .replace("\r\n", "\n");
+        assert!(
+            own.contains(concat!("(asset_id << 16)", " | (velocity << 8) |")),
+            "the Instance.map doc lost the live v52 packing"
+        );
+        assert!(
+            !own.contains(concat!("(asset_id << 8)", " | root_note")),
+            "the pre-v52 << 8 packing crept back into a src/synth.rs doc comment"
         );
     }
 
