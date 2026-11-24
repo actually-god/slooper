@@ -352,8 +352,7 @@ impl ProcessHandler for MixProc {
 
 #[test]
 fn e2e_audio_mixing() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, _sr)) = start_backend() else {
+    let Some((_g, b, _client_name, _sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -382,22 +381,7 @@ fn e2e_audio_mixing() {
 
     // Apply the layout through the backend's command channel.
     // Route 3 = mono downmix (the historical output behaviour).
-    b.cmd(Cmd::Apply {
-        ins: vec![
-            format!("{client_name}:out_a"),
-            format!("{client_name}:out_b"),
-        ],
-        outs: vec![(format!("{client_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 2, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "backend did not apply the 2-in/1-out layout"
-    );
+    e2e_apply(&b, vec![format!("{client_name}:out_a"), format!("{client_name}:out_b"), ],, vec![(format!("{client_name}:sink"), 3)]);
 
     // Wait until the summed constant actually shows up at the sink.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -416,10 +400,7 @@ fn e2e_audio_mixing() {
     assert!(frames.load(Ordering::Relaxed) > 0);
 
     // Teardown: stop the backend's audio, drop clients.
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![],
-    });
+    e2e_reset(&b);
     let _ = active;
 }
 
@@ -453,8 +434,7 @@ impl ProcessHandler for MidiSrcProc {
 
 #[test]
 fn e2e_midi_monitor() {
-    let _g = e2e_lock();
-    let Some((b, client_name, _sr)) = start_backend() else {
+    let Some((_g, b, client_name, _sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -545,10 +525,7 @@ fn e2e_midi_monitor() {
     );
     assert!(note_on.describe().contains("C4"), "{}", note_on.describe());
 
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![],
-    });
+    e2e_reset(&b);
     let _ = active;
 }
 
@@ -586,8 +563,7 @@ impl ProcessHandler for SincoSrcProc {
 /// bound action — here "select loop 2", observable via `App::selected_loop`.
 #[test]
 fn e2e_midi_capture_and_fire_sinco() {
-    let _g = e2e_lock();
-    let Some((b, client_name, _sr)) = start_backend() else {
+    let Some((_g, b, client_name, _sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -786,50 +762,15 @@ fn wait_until(pred: impl Fn() -> bool, timeout: Duration, what: &str) {
 
 #[test]
 fn e2e_transport_and_clips() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let mode = Arc::new(AtomicU8::new(0));
-    let const_val = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-
-    let (client, _status) =
-        Client::new("daw_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            LoopSrcProc {
-                out: out_a,
-                sink,
-                mode: mode.clone(),
-                const_val: const_val.clone(),
-                seed: 0x1234_5678,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-
-    b.cmd(Cmd::Apply {
-        ins: vec![format!("{src_name}:out_a")],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "backend did not apply the 1-in/1-out layout"
-    );
+    let cap = e2e_capture_src(&b, "daw_test", 0x1234_5678, true, 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let const_val = cap.const_val.clone();
+    let active = cap.active;
 
     // ---- a project: one 0.5 asset on track 0 at t = 0 ----------------------
     let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 16_000]);
@@ -1025,10 +966,7 @@ fn e2e_transport_and_clips() {
     );
 
     b.cmd(Cmd::StopAll);
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![],
-    });
+    e2e_reset(&b);
     let _ = active;
 }
 
@@ -1109,47 +1047,15 @@ fn metro_clicks(x: &[f32], sr: u32) -> Vec<(usize, u8)> {
 
 #[test]
 fn e2e_midi_clip_plays_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
     // Sink client: slooper's mix must appear at our capture ring.
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("midi_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            LoopSrcProc {
-                out: out_a,
-                sink,
-                mode: Arc::new(AtomicU8::new(0)),
-                const_val: Arc::new(AtomicU32::new(0.0f32.to_bits())),
-                seed: 0x9e37_79b9,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "backend did not apply the sink layout"
-    );
+    let cap = e2e_capture_src(&b, "midi_live", 0x9e37_79b9, false, 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // The shared default synth, installed exactly as the app does it.
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
@@ -1259,48 +1165,19 @@ fn e2e_midi_clip_plays_live() {
 
 #[test]
 fn e2e_metronome() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-
-    let (client, _status) =
-        Client::new("metro_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "metronome test: output not applied"
-    );
+    let cap = e2e_capture(&b, "metro_test", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     // Let the sink settle on silence before arming the click.
     std::thread::sleep(Duration::from_millis(150));
 
     let read_range = |a: u64, c: u64| -> Vec<f32> {
-        let n = ring_n as u64;
+        let n = ring.len() as u64;
         (a..c)
             .map(|i| f32::from_bits(ring[(i % n) as usize].load(Ordering::Relaxed)))
             .collect()
@@ -1406,10 +1283,7 @@ fn e2e_metronome() {
         "metronome still clicking after stop"
     );
 
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![],
-    });
+    e2e_reset(&b);
     let _ = active;
 }
 
@@ -1422,8 +1296,7 @@ fn e2e_metronome() {
 #[test]
 fn e2e_export_writes_file() {
     use slooper::audio_io::ExportFormat;
-    let _g = e2e_lock();
-    let Some((b, _cn, sr)) = start_backend() else {
+    let Some((_g, b, _cn, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
     // A project the engine can render without any live ports: a 0.5 asset on
@@ -1570,8 +1443,7 @@ fn e2e_export_writes_file() {
 /// of "monitoring rides the selection".
 #[test]
 fn e2e_selected_loop_monitoring() {
-    let _g = e2e_lock();
-    let Some((b, _cn, _sr)) = start_backend() else {
+    let Some((_g, b, _cn, _sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -1631,22 +1503,7 @@ fn e2e_selected_loop_monitoring() {
     b.engine.set_loop_gain(0, 1.0);
     b.engine.set_loop_pan(0, 1.0);
     b.cmd(Cmd::SetSelected(0));
-    b.cmd(Cmd::Apply {
-        ins: vec![format!("{src_name}:out_a")],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { .. }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "layout not applied"
-    );
+    e2e_apply_any(&b, vec![format!("{src_name}:out_a")], vec![(format!("{src_name}:sink_l"), 1), (format!("{src_name}:sink_r"), 2), ],);
 
     let expect = |ring: &Arc<Vec<AtomicU32>>, want: f32, what: &str| {
         let mut seen = None;
@@ -1692,10 +1549,7 @@ fn e2e_selected_loop_monitoring() {
 
     b.engine.set_loop_vol(0, 1.0);
     b.engine.set_loop_pan(0, 0.5);
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![],
-    });
+    e2e_reset(&b);
     let _ = active;
 }
 
@@ -1710,7 +1564,6 @@ fn e2e_selected_loop_monitoring() {
 fn e2e_vst_insert_export() {
     use slooper::audio_io::ExportFormat;
     use slooper::vsthost::{open, VstKind};
-    let _g = e2e_lock();
     let home = std::env::var("HOME").unwrap_or_default();
     let plugin = [
         format!("{home}/.vst3/DragonflyHallReverb.vst3"),
@@ -1725,7 +1578,7 @@ fn e2e_vst_insert_export() {
     } else {
         VstKind::V2
     };
-    let Some((b, _cn, sr)) = start_backend() else {
+    let Some((_g, b, _cn, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -1833,41 +1686,14 @@ fn rms(x: &[f32]) -> f32 {
 /// note ever rendered. The body of the note lives INSIDE the instrument.
 #[test]
 fn e2e_midi_note_sustains_across_blocks() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("midi_sus", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "midi_sus", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // Default piano; one whole-note pattern (2 s), NOT a run of quarter
     // notes — attacks alone must not be able to pass this test.
@@ -1951,7 +1777,6 @@ fn e2e_midi_note_sustains_across_blocks() {
 /// voices so nothing leaks into the next run. Skips without the plugin.
 #[test]
 fn e2e_midi_vsti_sustains_live() {
-    let _g = e2e_lock();
     // v37 R4: plugin under test is selectable — point SLOOPER_E2E_VSTI at
     // any .vst3/.so instrument to replay the full sustain contract on it
     // (default: Vitalium).
@@ -1966,40 +1791,14 @@ fn e2e_midi_vsti_sustains_live() {
         eprintln!("skipping: {} not installed", path.display());
         return;
     }
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("vsti_sus", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "vsti_sus", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     let kind = if path.extension().map(|e| e == "vst3").unwrap_or(false) {
         slooper::vsthost::VstKind::V3
@@ -2074,41 +1873,14 @@ fn e2e_midi_vsti_sustains_live() {
 /// `Cmd::PreviewPlay` while the transport is stopped, then auto-stop.
 #[test]
 fn e2e_preview_renders_and_plays() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("preview_e2e", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "preview_e2e", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // Track 0 gets the bundled piano; audition one staged note (on @0,
     // off @1.5 s) through the exact UI preview path.
@@ -2211,41 +1983,14 @@ fn e2e_preview_renders_and_plays() {
 /// note cannot keep rendering after its timeline window is gone.
 #[test]
 fn e2e_midi_seek_silences_held_note() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("midi_seek", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "midi_seek", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
     let inst = reg.create_instance("piano", sr as f64, &[]).expect("piano");
@@ -2307,40 +2052,12 @@ fn e2e_midi_seek_silences_held_note() {
 /// (auto-stop + drain flag) so previews can never "run constantly".
 #[test]
 fn e2e_preview_replaces_and_drains() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("additive_e2e", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "additive_e2e", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
 
     // Two phase-independent voices (sines an octave apart) at equal level:
     // one voice peaks at ~A*F1S2; a sum of two clearly beats A*F1S2 by 3 dB.
@@ -2437,46 +2154,18 @@ fn e2e_preview_replaces_and_drains() {
 /// the "VST2 plugins silence everything" bug report.
 #[test]
 fn e2e_vst2_effect_not_silent() {
-    let _g = e2e_lock();
     let home = std::env::var("HOME").unwrap_or_default();
     let dll = std::path::PathBuf::from(&home).join(".vst/wolf-shaper-vst.so");
     if !dll.is_file() {
         eprintln!("no wolf-shaper on this host: skipping");
         return;
     }
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("vst2fx_e2e", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "vst2fx_e2e", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
 
     // Loud-ish square through the plugin (wolf-shaper needs drive to move).
     let a: Arc<[f32]> = Arc::from(
@@ -2539,41 +2228,14 @@ fn e2e_vst2_effect_not_silent() {
 /// any stop/restart.
 #[test]
 fn e2e_v13_sampler_patch_swap_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("samp_swap", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "samp_swap", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // Sampler on track 0, asset 0 = a loud flat buffer (0.9 DC).
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
@@ -2761,53 +2423,14 @@ impl ProcessHandler for LiveMidiCapProc {
 /// recording already used), and the settings gate must gate.
 #[test]
 fn e2e_live_midi_input_plays_synths() {
-    let _g = e2e_lock();
-    let Some((b, client_name, sr)) = start_backend() else {
+    let Some((_g, b, client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let stage = Arc::new(AtomicUsize::new(0));
-    let (client, _status) =
-        Client::new("midi_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let midi_out = client
-        .register_port("midi_out", MidiOut::default())
-        .unwrap();
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    client
-        .connect_ports_by_name(
-            &format!("{src_name}:midi_out"),
-            &format!("{client_name}:midi_in"),
-        )
-        .expect("connect to slooper:midi_in");
-    let active = client
-        .activate_async(
-            (),
-            LiveMidiCapProc {
-                out: midi_out,
-                stage: stage.clone(),
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "midi_live", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // The bundled piano answers on the default-selected track. NO clips
     // and the transport never starts: everything this test hears is the
@@ -2916,41 +2539,14 @@ fn e2e_live_midi_input_plays_synths() {
 /// delta at amp/block-size. Detecting |Δ| is therefore exact, not fussy.
 #[test]
 fn e2e_no_click_gain_steps() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, _sr)) = start_backend() else {
+    let Some((_g, b, _client_name, _sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("click_test", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "click_test", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // One constant 0.5 clip: any discontinuity is a single huge Δ.
     let a0: Arc<[f32]> = Arc::from(vec![0.5f32; 16_000]);
@@ -3050,8 +2646,7 @@ fn e2e_no_click_gain_steps() {
 /// a v2 script actually receives it. Unrouted, the tone is untouched.
 #[test]
 fn e2e_sidechain_ducks_target_track() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -3072,39 +2667,9 @@ fn e2e_sidechain_ducks_target_track() {
         .create_instance("sidechain_comp", sr as f64, &vals)
         .expect("sidechain_comp compiles and instantiates");
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("sc_duck", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    // Probe the RIGHT bus only: the key track is panned hard left so its
-    // own energy never touches the measured signal — the sink hears the
-    // target tone alone, which is exactly what the duck must move.
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 2)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "sc_duck", 2);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
 
     // Key: 110 Hz sine, hard LEFT (invisible to the probe, but the SC tap
     // is taken pre-pan). Target: soft DC tone hard RIGHT, -34 dBFS = under
@@ -3195,50 +2760,17 @@ fn e2e_sidechain_ducks_target_track() {
 /// disarms, the normal park/auto-stop behaviour resumes.
 #[test]
 fn e2e_v37_recording_suppresses_park_and_autostop() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, _sr)) = start_backend() else {
+    let Some((_g, b, _client_name, _sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
     // The RT callback only runs once the client owns ports (every transport
     // pin in this file wires a dummy pair first) — without this the
     // playhead never advances and the test would only measure JACK.
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let mode = Arc::new(AtomicU8::new(0));
-    let const_val = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-    let (client, _status) =
-        Client::new("daw_test_v37", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            LoopSrcProc {
-                out: out_a,
-                sink,
-                mode: mode.clone(),
-                const_val: const_val.clone(),
-                seed: 0x1234_5678,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![format!("{src_name}:out_a")],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 1, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "backend did not apply the layout"
-    );
+    let cap = e2e_capture_src(&b, "daw_test_v37", 0x1234_5678, true, 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let mode = cap.mode.clone();
+    let active = cap.active;
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![]);
     b.cmd(Cmd::SetProject {
         assets: table,
@@ -3279,40 +2811,13 @@ fn e2e_v37_recording_suppresses_park_and_autostop() {
 /// and the playing flag must drain itself when the voice retires.
 #[test]
 fn e2e_roll_audition_note_sounds_with_transport_stopped() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("audlive", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "audlive", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // Script instrument bound to TRACK 0 specifically (not the project
     // default) — the audition must route through the track's binding.
@@ -3375,40 +2880,13 @@ fn e2e_roll_audition_note_sounds_with_transport_stopped() {
 /// within a few blocks and never resurrects.
 #[test]
 fn e2e_roll_audition_stop_silences_held_note() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("audstop", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "audstop", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
     let inst = reg
         .create_instance("piano", sr as f64, &[])
@@ -3464,40 +2942,13 @@ fn e2e_roll_audition_stop_silences_held_note() {
 /// a held note-outlived its voice object and nothing could silence it).
 #[test]
 fn v46_e2e_copy_audition_release_silences() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("audcopy", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "audcopy", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
     let live = reg
         .create_instance("piano", sr as f64, &[])
@@ -3555,40 +3006,13 @@ fn v46_e2e_copy_audition_release_silences() {
 /// mixer involved at all.
 #[test]
 fn v46_e2e_default_route_hold_and_release() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("audpv", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "audpv", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
     let pv = reg
         .create_instance("piano", sr as f64, &[])
@@ -3634,40 +3058,13 @@ fn v46_e2e_default_route_hold_and_release() {
 /// through the shared instance instead of dying.
 #[test]
 fn v46_e2e_poly_track_renders_per_lane_copies() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("polyrt", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "backend did not apply the sink layout"
-    );
+    let cap = e2e_capture(&b, "polyrt", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
     let mk = || {
@@ -3788,41 +3185,13 @@ fn v46_e2e_poly_track_renders_per_lane_copies() {
 /// runs — real dlopen of the scripted cdylib, real process() per block.
 #[test]
 fn e2e_tier2_new_bundled_plugins_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("tier2_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "tier2_live", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
 
     // A real CONSTANT-ENERGY asset. Granular maps note number to a
     // playhead position (and scan drifts it), so the buffer must carry
@@ -3983,8 +3352,7 @@ impl ProcessHandler for DiffProc {
 
 #[test]
 fn e2e_tier3_stereo_spread_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -4000,43 +3368,10 @@ fn e2e_tier3_stereo_spread_live() {
         .create_instance("spread", sr as f64, &[])
         .expect("spread compiles and instantiates");
 
-    let ring_n = 1usize << 19;
-    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("st_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
-    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            DiffProc {
-                sink_l,
-                sink_r,
-                ring_sum: ring_sum.clone(),
-                ring_dif: ring_dif.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "dual-bus layout not applied"
-    );
+    let cap = e2e_capture_sumdif(&b, "st_live");
+    let ring_sum = cap.ring_sum.clone();
+    let ring_dif = cap.ring_dif.clone();
+    let widx = cap.widx.clone();
 
     // Constant-energy looping asset (toned noise).
     let n = (sr as usize) * 2;
@@ -4126,8 +3461,7 @@ fn e2e_tier3_stereo_spread_live() {
 /// registry load, FxSlot attach, looping asset, live JACK transport.
 #[test]
 fn e2e_tier4_stereo_echo_chorus_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -4150,43 +3484,10 @@ fn e2e_tier4_stereo_echo_chorus_live() {
         .create_instance("chorus", sr as f64, &[])
         .expect("chorus compiles");
 
-    let ring_n = 1usize << 19;
-    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("t4_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
-    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            DiffProc {
-                sink_l,
-                sink_r,
-                ring_sum: ring_sum.clone(),
-                ring_dif: ring_dif.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "dual-bus layout not applied"
-    );
+    let cap = e2e_capture_sumdif(&b, "t4_live");
+    let ring_sum = cap.ring_sum.clone();
+    let ring_dif = cap.ring_dif.clone();
+    let widx = cap.widx.clone();
 
     // Constant-energy looping asset (toned noise).
     let n = (sr as usize) * 2;
@@ -4283,8 +3584,7 @@ fn e2e_tier4_stereo_echo_chorus_live() {
 /// reaching the master L/R JACK buses (sum audible, difference non-zero).
 #[test]
 fn e2e_tier5_stereo_reverb_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -4300,43 +3600,10 @@ fn e2e_tier5_stereo_reverb_live() {
         .create_instance("space_echo", sr as f64, &[])
         .expect("compiles");
 
-    let ring_n = 1usize << 19;
-    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("t5_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
-    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            DiffProc {
-                sink_l,
-                sink_r,
-                ring_sum: ring_sum.clone(),
-                ring_dif: ring_dif.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "dual-bus layout not applied"
-    );
+    let cap = e2e_capture_sumdif(&b, "t5_live");
+    let ring_sum = cap.ring_sum.clone();
+    let ring_dif = cap.ring_dif.clone();
+    let widx = cap.widx.clone();
 
     // Constant-energy looping asset (toned noise), same fixture as tier 4.
     let n = (sr as usize) * 2;
@@ -4421,8 +3688,7 @@ fn e2e_tier5_stereo_reverb_live() {
 /// hard-centred, so ANY L/R difference is the effect.
 #[test]
 fn e2e_tier5b_stereo_mods_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -4437,43 +3703,10 @@ fn e2e_tier5b_stereo_mods_live() {
         assert!(d.stereo, "{stem} must load as an ABI-v3 stereo script");
     }
 
-    let ring_n = 1usize << 19;
-    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("t5b_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
-    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            DiffProc {
-                sink_l,
-                sink_r,
-                ring_sum: ring_sum.clone(),
-                ring_dif: ring_dif.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "dual-bus layout not applied"
-    );
+    let cap = e2e_capture_sumdif(&b, "t5b_live");
+    let ring_sum = cap.ring_sum.clone();
+    let ring_dif = cap.ring_dif.clone();
+    let widx = cap.widx.clone();
 
     // Constant-energy looping asset (toned noise), same fixture as tier 4/5.
     let n = (sr as usize) * 2;
@@ -4593,8 +3826,7 @@ fn e2e_tier5b_stereo_mods_live() {
 /// cover the instance side; Proc cannot be built headless).
 #[test]
 fn e2e_tier6_host_sync_live() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
@@ -4626,22 +3858,7 @@ fn e2e_tier6_host_sync_live() {
             },
         )
         .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "bus layout not applied"
-    );
+    e2e_apply(&b, vec![], vec![(format!("{src_name}:sink_l"), 1), (format!("{src_name}:sink_r"), 2), ],);
 
     // Constant-energy looping asset (toned noise, same fixture family).
     let n = (sr as usize) * 2;
@@ -4781,41 +3998,14 @@ fn e2e_tier6_host_sync_live() {
 // transport may start sound; automation alone follows the playhead.
 #[test]
 fn e2e_scrub_while_stopped_is_silent() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("scrub_stop", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { .. }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "backend did not apply the sink layout"
-    );
+    let cap = e2e_capture(&b, "scrub_stop", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // Default synth so a MIDI clip COULD sound if the gate were open.
     let reg = slooper::synth::Registry::open(slooper::synth::default_dir());
@@ -4890,8 +4080,7 @@ fn e2e_scrub_while_stopped_is_silent() {
 // ---- v50 R3: automation follows the playhead even while STOPPED -----------
 #[test]
 fn e2e_automation_follows_seek_while_stopped() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
     let _ = sr;
@@ -4964,8 +4153,7 @@ fn e2e_automation_follows_seek_while_stopped() {
 /// mirrors the offline/export identity pinned in the lib test).
 #[test]
 fn v80_rt_bypass_passthrough() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
     // Compile/load the stock compressor through the REAL registry.
@@ -4986,36 +4174,9 @@ fn v80_rt_bypass_passthrough() {
             .expect("compressor compiles and instantiates")
     };
 
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("v80bypass", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let _active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "v80bypass", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
 
     let a: Arc<[f32]> = Arc::from(
         (0..(sr as usize))
@@ -5111,6 +4272,7 @@ fn v80_rt_bypass_passthrough() {
 /// left, tone on track 1 (hard right) through the stock sidechain
 /// compressor; the probe listens to the RIGHT bus only.
 type V95Rig = (
+    std::sync::MutexGuard<'static, ()>,
     Backend,
     Arc<Vec<AtomicU32>>,
     Arc<AtomicU64>,
@@ -5119,9 +4281,9 @@ type V95Rig = (
 );
 
 fn v95_sc_setup(tag: &str) -> Option<V95Rig> {
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    };
+    \};
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5137,39 +4299,10 @@ fn v95_sc_setup(tag: &str) -> Option<V95Rig> {
         .create_instance("sidechain_comp", sr as f64, &vals)
         .expect("sidechain_comp compiles and instantiates");
     let _ = std::fs::remove_dir_all(&dir);
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    // activate_async CONSUMES the client: the returned AsyncClient (kept
-    // alive by the caller for the test's whole life) is what keeps the
-    // probe ports and the ring pumping.
-    let (client, _status) =
-        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 2)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, tag, 2);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     let n = 24_000usize;
     let key: Arc<[f32]> = Arc::from(
         (0..n)
@@ -5195,7 +4328,7 @@ fn v95_sc_setup(tag: &str) -> Option<V95Rig> {
         },
     });
     std::thread::sleep(Duration::from_millis(150));
-    Some((b, ring, widx, sr, active))
+    Some((_g, b, ring, widx, sr, active))
 }
 
 /// Open the tone, arm the send, and verify the duck baseline (returns the
@@ -5243,7 +4376,7 @@ fn v95_sc_duck_baseline(
 #[test]
 fn e2e_v95_sc_muted_sender_still_ducks() {
     let _g = e2e_lock();
-    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scmute") else {
+    let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scmute") else {
         return;
     };
     let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
@@ -5268,7 +4401,7 @@ fn e2e_v95_sc_muted_sender_still_ducks() {
 #[test]
 fn e2e_v95_sc_zero_volume_sender_ducks() {
     let _g = e2e_lock();
-    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvol0") else {
+    let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvol0") else {
         return;
     };
     let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
@@ -5292,7 +4425,7 @@ fn e2e_v95_sc_zero_volume_sender_ducks() {
 #[test]
 fn e2e_v95_sc_sender_vol_move_keeps_duck_depth() {
     let _g = e2e_lock();
-    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvolmv") else {
+    let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvolmv") else {
         return;
     };
     let _open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
@@ -5320,7 +4453,7 @@ fn e2e_v95_sc_sender_vol_move_keeps_duck_depth() {
 #[test]
 fn e2e_v95_sc_sender_gain_zero_kills_key() {
     let _g = e2e_lock();
-    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v95scg0") else {
+    let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scg0") else {
         return;
     };
     let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
@@ -5350,7 +4483,7 @@ fn e2e_v95_sc_sender_gain_zero_kills_key() {
 #[test]
 fn e2e_v97_sc_send_gain_scales_duck() {
     let _g = e2e_lock();
-    let Some((b, ring, widx, sr, _scope)) = v95_sc_setup("v97scgain") else {
+    let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v97scgain") else {
         return;
     };
     let open = v95_sc_duck_baseline(&b, &ring, &widx, sr);
@@ -5402,9 +4535,9 @@ fn e2e_v97_sc_send_gain_scales_duck() {
 /// right, stock sidechain_comp) — a 100/50 vs 50/100 send mix swaps the
 /// summed key and must move the audible duck.
 fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    };
+    \};
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5419,36 +4552,10 @@ fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
         .create_instance("sidechain_comp", sr as f64, &vals)
         .expect("sidechain_comp compiles and instantiates");
     let _ = std::fs::remove_dir_all(&dir);
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc {
-                sink,
-                ring: ring.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 2)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, tag, 2);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     let n = 24_000usize;
     let sine = |freq: f32, amp: f32| -> Arc<[f32]> {
         Arc::from(
@@ -5478,7 +4585,7 @@ fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
         },
     });
     std::thread::sleep(Duration::from_millis(150));
-    Some((b, ring, widx, sr, active))
+    Some((_g, b, ring, widx, sr, active))
 }
 
 /// v97: two routed sources mixed 50/100 vs 100/50 (unequal keys!) differ
@@ -5487,7 +4594,7 @@ fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
 #[test]
 fn e2e_v97_sc_two_source_mix_swaps_duck() {
     let _g = e2e_lock();
-    let Some((b, ring, widx, sr, _scope)) = v97_sc_setup2("v97scmix") else {
+    let Some((_g, b, ring, widx, sr, _scope)) = v97_sc_setup2("v97scmix") else {
         return;
     };
     let rms = |ms: u64| -> f32 {
@@ -5573,6 +4680,7 @@ impl ProcessHandler for V96CapProc {
 }
 
 type V96Rig = (
+    std::sync::MutexGuard<'static, ()>,
     Backend,
     Arc<Vec<AtomicU32>>,
     Arc<Vec<AtomicU32>>,
@@ -5585,9 +4693,9 @@ type V96Rig = (
 /// RIGHT with the stock sidechain compressor in its chain. The SEND
 /// MASK is armed inside the test — the before/after IS the duck proof.
 fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    };
+    \};
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5604,45 +4712,11 @@ fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
         .create_instance("sidechain_comp", sr as f64, &vals)
         .expect("sidechain_comp compiles and instantiates");
     let _ = std::fs::remove_dir_all(&dir);
-    let ring_n = 1usize << 19;
-    let ring_l: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_r: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
-    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            V96CapProc {
-                sink_l,
-                sink_r,
-                ring_l: ring_l.clone(),
-                ring_r: ring_r.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sink_l"), 1),
-            (format!("{src_name}:sink_r"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "two-bus layout not applied"
-    );
+    let cap = e2e_capture_lr(&b, tag);
+    let ring_l = cap.ring_l.clone();
+    let ring_r = cap.ring_r.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     b.engine.set_loop_pan(0, 0.0); // source hard left
     b.engine.set_loop_pan(1, 1.0); // target hard right
     b.cmd(Cmd::SetTrackEffects {
@@ -5652,7 +4726,7 @@ fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
         },
     });
     std::thread::sleep(Duration::from_millis(150));
-    Some((b, ring_l, ring_r, widx, sr, active))
+    Some((_g, b, ring_l, ring_r, widx, sr, active))
 }
 
 /// v96 (sc-2) AC-audio half: preview a selected SC pair — BOTH tracks
@@ -5662,7 +4736,7 @@ fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
 #[test]
 fn e2e_v96_multi_preview_pair_ducks() {
     let _g = e2e_lock();
-    let Some((b, ring_l, ring_r, widx, sr, _scope)) = v96_multi_preview_setup("v96mprev") else {
+    let Some((_g, b, ring_l, ring_r, widx, sr, _scope)) = v96_multi_preview_setup("v96mprev") else {
         return;
     };
     // Sustained tri_osc voices on purpose: a DECAYING piano envelope
@@ -5758,6 +4832,7 @@ impl jack::ProcessHandler for CapProcLR {
 }
 
 type V99Rig = (
+    std::sync::MutexGuard<'static, ()>,
     Backend,
     Arc<Vec<AtomicU32>>,
     Arc<Vec<AtomicU32>>,
@@ -5772,9 +4847,9 @@ type V99Rig = (
 /// B on track 2 HARD LEFT. The dual-sink capture reads bus R == A's duck
 /// and bus L == B's duck in the same frames — one sender knob, two readers.
 fn v99_sc_setup(tag: &str) -> Option<V99Rig> {
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    };
+    \};
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5818,22 +4893,7 @@ fn v99_sc_setup(tag: &str) -> Option<V99Rig> {
         .unwrap();
     // Routing bits per Cmd::Apply: 1 = the slot carries the L bus only,
     // 2 = the R bus only (hard-pan isolation — the v32 e2e rule).
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![
-            (format!("{src_name}:sinkL"), 1),
-            (format!("{src_name}:sinkR"), 2),
-        ],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 2 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "dual sink layout not applied"
-    );
+    e2e_apply(&b, vec![], vec![(format!("{src_name}:sinkL"), 1), (format!("{src_name}:sinkR"), 2), ],);
     let n = 24_000usize;
     let key: Arc<[f32]> = Arc::from(
         (0..n)
@@ -5868,7 +4928,7 @@ fn v99_sc_setup(tag: &str) -> Option<V99Rig> {
         },
     });
     std::thread::sleep(Duration::from_millis(150));
-    Some((b, ring_l, ring_r, widx, sr, active))
+    Some((_g, b, ring_l, ring_r, widx, sr, active))
 }
 
 fn v99_rms(ring: &Arc<Vec<AtomicU32>>, widx: &AtomicU64, sr: u32, ms: u64) -> f32 {
@@ -5891,7 +4951,7 @@ fn v99_both(rl: &Arc<Vec<AtomicU32>>, rr: &Arc<Vec<AtomicU32>>, widx: &AtomicU64
 #[test]
 fn e2e_v99_sc_send_gain_moves_both_targets_equally() {
     let _g = e2e_lock();
-    let Some((b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scgain") else {
+    let Some((_g, b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scgain") else {
         return;
     };
     b.cmd(Cmd::PlayAll);
@@ -5952,7 +5012,7 @@ fn e2e_v99_sc_send_gain_moves_both_targets_equally() {
 #[test]
 fn e2e_v99_sc_send_pan_folds_key_level() {
     let _g = e2e_lock();
-    let Some((b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scpan") else {
+    let Some((_g, b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scpan") else {
         return;
     };
     b.cmd(Cmd::PlayAll);
@@ -6001,36 +5061,13 @@ fn e2e_v99_sc_send_pan_folds_key_level() {
 /// density in the late window (pre-fix these renders are byte-identical).
 #[test]
 fn v100_audition_baked_glide_heard_on_scripted_synth_live_rt() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("glide100", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProc { sink, ring: ring.clone(), widx: widx.clone() },
-        )
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "glide100", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     // Host asset: 2 s of 200 Hz sine at the live rate — sustained so the
     // capture window sits inside the sample. Sampler bound to track 0 with
@@ -6108,33 +5145,13 @@ fn v100_audition_baked_glide_heard_on_scripted_synth_live_rt() {
 
 #[test]
 fn v106_poly_at_heard_live_rt() {
-    let _g = e2e_lock();
-    let Some((b, _client_name, sr)) = start_backend() else {
+    let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return; // no audio server: skip
     };
-    let ring_n = 1usize << 19;
-    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        Client::new("polyat105", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink = client.register_port("sink", AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async((), CapProc { sink, ring: ring.clone(), widx: widx.clone() })
-        .unwrap();
-    b.cmd(Cmd::Apply {
-        ins: vec![],
-        outs: vec![(format!("{src_name}:sink"), 3)],
-    });
-    assert!(
-        wait_for(
-            &b,
-            |e| matches!(e, Evt::Applied { ins: 0, outs: 1 }),
-            Duration::from_secs(5)
-        )
-        .is_some(),
-        "sink layout not applied"
-    );
+    let cap = e2e_capture(&b, "polyat105", 3);
+    let ring = cap.ring.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
 
     let sine: Arc<[f32]> = (0..(2 * sr as usize))
         .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / sr as f64).sin() as f32 * 0.5)
@@ -6203,7 +5220,7 @@ fn v106_poly_at_heard_live_rt() {
 fn v110_e2e_mixer_seam_vol_heard_live_rt() {
     let _g = e2e_lock();
     // v99 rig: track 2 = steady tone HARD RIGHT through a static comp.
-    let Some((b, _rl, rr, widx, sr, active)) = v99_sc_setup("v110vol") else {
+    let Some((_g, b, _rl, rr, widx, sr, active)) = v99_sc_setup("v110vol") else {
         return; // no audio server: skip
     };
     b.cmd(Cmd::PlayAll);
@@ -6259,8 +5276,7 @@ fn v115_auto_arr(target: &str) -> (Arrangement, std::sync::Arc<Vec<Option<std::s
 /// automation pass must raise the engine's sticky auto-miss flag.
 #[test]
 fn v115_e2e_auto_miss_flag_rises() {
-    let _g = e2e_lock();
-    let Some((b, _name, _sr)) = start_backend() else { return };
+    let Some((_g, b, _name, _sr)) = e2e_backend() else { return };
     let (arr, auto) = v115_auto_arr("fx:7:0");
     b.cmd(Cmd::SetProject { assets: Arc::new(Vec::new()), arr: Arc::new(arr), len: 4096 });
     b.cmd(Cmd::SetAutoAssets(auto));
@@ -6281,8 +5297,7 @@ fn v115_e2e_auto_miss_flag_rises() {
 /// the flag must stay down (no false badge).
 #[test]
 fn v115_e2e_auto_miss_quiet_when_landing() {
-    let _g = e2e_lock();
-    let Some((b, _name, _sr)) = start_backend() else { return };
+    let Some((_g, b, _name, _sr)) = e2e_backend() else { return };
     let (arr, auto) = v115_auto_arr(slooper::automation::TARGET_TRACK_VOL);
     b.cmd(Cmd::SetProject { assets: Arc::new(Vec::new()), arr: Arc::new(arr), len: 4096 });
     b.cmd(Cmd::SetAutoAssets(auto));
