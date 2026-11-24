@@ -1473,26 +1473,36 @@ impl ClapStageEntry {
             return;
         }
         s.deliver.sort_by_key(|q| q.pos);
-        // Snapshot: a plugin may re-enter the host (log callback) while we
-        // stage its events, and the host's log path takes rt.lock() — a
-        // borrowed iterator over `s.deliver` would alias that `&mut *s`
-        // further down. Copy the due messages out and release the borrow.
-        let deliver = std::mem::take(&mut s.deliver);
-        for q in deliver.iter() {
-            let t = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1) as u32;
-            let status = q.m[0] & 0xF0;
-            let ch = (q.m[0] & 0x0F) as i16;
+        // v141 (card t_342d8563): stage from the PERSISTENT field. The old
+        // code did `let deliver = std::mem::take(&mut s.deliver)` to release
+        // the `&mut s` borrow before the push_* calls — but the take left the
+        // field default-empty, so EVERY eventful block malloc'd a fresh Vec
+        // in the partition loop above and freed it again when the local
+        // dropped: RT heap churn exactly the class the module's "allocates
+        // nothing" rule forbids. No snapshot is needed for the plugin
+        // log-reentry aliasing that comment feared: push_* only write the
+        // event pool, they never call plugin code — the plugin runs later,
+        // in process_block, once this fn's borrow of `s` is dead. Iterate by
+        // index and copy each (m, pos) pair out so no borrow of `s.deliver`
+        // is live across a push (mirrors vsthost::deliver_midi, which has
+        // always reused its field). `s.deliver` then keeps its capacity
+        // across blocks: clear+push reallocates only while still growing.
+        for k in 0..s.deliver.len() {
+            let (m, pos) = (s.deliver[k].m, s.deliver[k].pos);
+            let t = (pos - start).clamp(0, VST_BLOCK as i64 - 1) as u32;
+            let status = m[0] & 0xF0;
+            let ch = (m[0] & 0x0F) as i16;
             match status {
-                0x90 if q.m[2] > 0 => self.push_note(
+                0x90 if m[2] > 0 => self.push_note(
                     s,
                     t,
                     ffi::CLAP_EVENT_NOTE_ON,
                     ch,
-                    q.m[1],
-                    q.m[2] as f64 / 127.0,
+                    m[1],
+                    m[2] as f64 / 127.0,
                 ),
                 // 0x90 with velocity 0 is note off by the classic convention.
-                0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, q.m[1], 0.0),
+                0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, m[1], 0.0),
                 // CC / program / pressure / pitch bend / poly AT travel as
                 // raw bytes: spec says plugins should take both forms, and
                 // every CLAP plugin on this host does. v103: pitch bend
@@ -1504,7 +1514,7 @@ impl ClapStageEntry {
                 // v42/MPE). Engine-side split (documented, decision (a)):
                 // SCRIPTED synths still have no poly-AT callback (kind-4
                 // dispatch arms drop) — follow-up feature card, not here.
-                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
+                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, m),
                 _ => {}
             }
         }
@@ -2061,7 +2071,9 @@ impl StageEntry for ClapStageEntry {
         if off < n {
             output[off..n].fill(0.0);
         }
-        // The `deliver` snapshot was consumed by fill_events this block.
+        // v141: `deliver` persists across blocks (no per-block take), so
+        // this block's staged CONTENT is dropped here; capacity stays warm
+        // for the next partition. Nothing reads it between process() calls.
         unsafe { (*self.state.get()).deliver.clear() };
     }
 
@@ -3463,5 +3475,162 @@ pub(crate) mod tests {
         g.process(&input[..512], &mut gout);
         assert!(gout[500].abs() > 0.5, "the gain fixture must still pass audio");
         assert!(!g.is_dead());
+    }
+
+    // ===================== v141 (card t_342d8563) RT deliver pool =====================
+    //
+    // fill_events used to `mem::take` its `deliver` field every block to
+    // free the `&mut s` borrow for the push_* staging calls — leaving a
+    // default Vec behind, so every eventful block malloc'd (partition
+    // grows from 0) and freed (local drop) on the audio thread. v141
+    // stages from the persistent field by index; these pins lock the
+    // pattern, the capacity trajectory, and the carry semantics.
+
+    /// Extract one method's source text: from `header` (a unique `fn NAME`
+    /// span) up to the next 4-space-indented `fn ` header. Bounding the
+    /// scan keeps a needle that legitimately appears elsewhere in the
+    /// module (or in these very pins) out of the verdict.
+    fn v141_fn_body(src: &str, header: &str) -> String {
+        let at = src
+            .find(header)
+            .unwrap_or_else(|| panic!("missing fn header {header:?}"));
+        let rest = &src[at..];
+        let end = rest.find("\n    fn ").unwrap_or(rest.len());
+        // Drop `//`-comment lines: prose may QUOTE the forbidden pattern
+        // (the fix comment documents the old call) — scan CODE only.
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// v141 R1+R5, NEGATIVE polarity: neither RT backend may destroy its
+    /// `deliver` field. The exact call string is assembled at RUN time
+    /// (format!) so this pin's own bytes never contain a matchable needle
+    /// (vacuity guard per the source-pin doctrine).
+    #[test]
+    fn v141_fill_events_no_take() {
+        let clap = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/claphost.rs"));
+        let vst = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vsthost.rs"));
+        let needle = format!("{}{}{}(&mut s.{})", "mem", "::", "take", "deliver");
+        for (file, src, header) in [
+            ("claphost.rs", clap, "fn fill_events"),
+            ("vsthost.rs", vst, "fn deliver_midi"),
+        ] {
+            let body = v141_fn_body(src, header);
+            assert!(
+                !body.contains(&needle),
+                "R1/R5: {file}::{header} must stage from the persistent field \u{2014} \
+                 heap-destroying it per block re-introduces the RT churn bug"
+            );
+        }
+    }
+
+    /// v141 R1, POSITIVE polarity: fill_events iterates the FIELD itself
+    /// (indexed copy-out), and the VST2 twin still sorts from its field —
+    /// the symmetry both pins lock. Needles assembled at RUN time.
+    #[test]
+    fn v141_fill_events_indexes_field() {
+        let clap = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/claphost.rs"));
+        let vst = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vsthost.rs"));
+        let body = v141_fn_body(clap, "fn fill_events");
+        let idx = format!("s.{}[k]", "deliver");
+        assert!(
+            body.contains(&idx),
+            "R1: fill_events must index the persistent s.deliver field \
+             (a rewrite that stages through a temp collection reddens this)"
+        );
+        let vbody = v141_fn_body(vst, "fn deliver_midi");
+        let sort = format!("s.{}.sort_by_key", "deliver");
+        assert!(
+            vbody.contains(&sort),
+            "R5: vsthost deliver_midi must keep sorting its persistent field \
+             (if the VST2 twin's pattern changed, re-derive this pin, don't delete it)"
+        );
+    }
+
+    /// v141 R2+R4, the churn measurement: drive repeated eventful blocks
+    /// through the real fixture and watch `s.deliver`'s capacity. Old
+    /// code: capacity is 0 after EVERY block (take → default field; the
+    /// taken Vec drops) — assert (1) fails. New code: capacity stays > 0
+    /// and flat (Vec::clear keeps it; push reuses it — no malloc/free at
+    /// steady state), and staged CONTENT is gone after every process().
+    #[test]
+    fn v141_deliver_capacity_persists() {
+        let e = fixture_entry("gain");
+        let mut caps: Vec<usize> = Vec::new();
+        for round in 0..4u8 {
+            // One CC due per internal 512-frame block (3 blocks pumped).
+            let ev = vec![
+                (0usize, [0xB0u8, 7, 60 + round]),
+                (512usize, [0xB0u8, 7, 90 - round]),
+                (1024usize, [0xB0u8, 7, 100 + round]),
+            ];
+            let mut out = vec![0.0f32; 1536];
+            e.process_with_midi(&[0.0f32; 1536], &mut out, &ev);
+            let s = unsafe { &*e.state.get() };
+            caps.push(s.deliver.capacity());
+            assert_eq!(
+                s.deliver.len(),
+                0,
+                "R4: no staged deliver content may survive process() (round {round})"
+            );
+            assert_eq!(s.pending.len(), 0, "round {round}: every due message was consumed");
+        }
+        assert!(
+            caps[0] > 0,
+            "R2: the partition buffer must persist IN THE FIELD across blocks \
+             (per-block take/destroy leaves capacity 0 every round: {caps:?})"
+        );
+        for w in caps.windows(2) {
+            assert_eq!(
+                w[0], w[1],
+                "R2: warm capacity must not move across eventful blocks ({caps:?})"
+            );
+        }
+        assert_eq!(e.midi_drops(), 0, "the CC stream never overflowed the queue");
+    }
+
+    /// v141 R3: the index-loop rewrite must not disturb the carry window —
+    /// a message past the current block stays pending, reaches the plugin
+    /// EXACTLY when its block comes (fixture probe-param read-back), and
+    /// never double-delivers (RPN0 burst precedes the bend it announces:
+    /// probe-rpn sees the range BEFORE probe-bend sees the bend).
+    #[test]
+    fn v141_deliver_carry_across_blocks() {
+        let e = fixture_entry("gain");
+        e.set_bend_range(5);
+        let raw = 10240u16; // +3 st in roll space
+        let ev = vec![(1024usize, [0xE0u8, (raw & 0x7F) as u8, (raw >> 7) as u8])];
+        // Pump ONE block (512 fed): the bend at base+1024 is NOT due yet.
+        e.process_with_midi(&[0.0f32; 512], &mut vec![0.0f32; 512], &ev);
+        {
+            let s = unsafe { &*e.state.get() };
+            assert_eq!(
+                s.pending.len(),
+                7,
+                "the bend rides with its 6-message RPN0 announcement, all carried"
+            );
+        }
+        assert_eq!(e.plug_value(4), Some(0.0), "the plugin saw NO bend yet");
+        // Blocks 2..4: the bend becomes due inside block 3.
+        e.process(&[0.0f32; 1536], &mut vec![0.0f32; 1536]);
+        let want = crate::vsthost::bend_rescale(raw, e.bend_range()) as f64;
+        let got = e.plug_value(4).expect("probe-bend param reads back");
+        assert!(
+            (got - want).abs() < 0.5,
+            "carried bend lands exactly once its block arrives: got {got}, want {want}"
+        );
+        assert_eq!(
+            e.plug_value(5),
+            Some(5.0),
+            "RPN0 range announcement preceded the carried bend"
+        );
+        {
+            let s = unsafe { &*e.state.get() };
+            assert_eq!(s.pending.len(), 0, "carry queue drained");
+        }
+        assert_eq!(e.midi_drops(), 0, "no overflow on the carry path");
     }
 }
