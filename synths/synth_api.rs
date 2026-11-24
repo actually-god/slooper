@@ -100,8 +100,19 @@ pub struct SynthHostV1 {
     /// v51: the multi-sample key map of the track whose synth is calling
     /// (valid synchronously while the host is inside your `process()` or
     /// `note_on()` — exactly like `load_asset`). Fill `slots[0..n]` with
-    /// the mapped samples, each packed as `(asset_id << 8) | root_note`
-    /// (asset id is a rack id, root note a MIDI number 0..=127), write
+    /// the mapped samples, each packed as
+    /// `(asset_id << 16) | (velocity << 8) | root_note` — read the parts
+    /// back with `slot >> 16` (rack asset id), `(slot >> 8) & 0xFF`
+    /// (velocity layer) and `slot & 0xFF` (root note, a MIDI number
+    /// 0..=127). The velocity byte carries per-slot velocity layers
+    /// (v52 R2): several slots may share one root note, each answering a
+    /// dynamic. Hard cutoff picks, within the winning root, the highest
+    /// layer whose velocity is at/below the played velocity (the lowest
+    /// layer answers notes under every layer); crossfade blends the two
+    /// layers whose velocities bracket the played velocity by inverse
+    /// distance (the same pitch-axis rule applies between roots). A
+    /// layer at velocity 127 answers every note, so single-layer maps
+    /// behave exactly like the pre-v52 key map. Write
     /// the map mode to `*mode` (low bits: 0 = hard cutoff, switch at the
     /// midpoint, a note exactly halfway uses the lower sample; 1 =
     /// crossfade, bend the two nearest samples to the note and mix them

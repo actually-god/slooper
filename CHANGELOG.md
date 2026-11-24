@@ -8,6 +8,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Changed
 
+- **The synth-script contract now documents the real key-map slots.**
+  The `synth_api.rs` reference slooper writes into every synths folder
+  still described the pre-v52 slot packing `(asset_id << 8) | root_note`
+  for the `load_map` host call, while the live ABI packs
+  `(asset_id << 16) | (velocity << 8) | root_note` — a third-party
+  sampler written to the shipped text reads the velocity byte as the
+  asset id and silently plays the wrong sample. The contract now states
+  the live packing, the unpack recipe and the velocity-layer semantics
+  (a 127 layer answers every note, so maps made before velocity layers
+  behave exactly as before). Existing installs pick the corrected file
+  up through the regular content-diff seeding (pins `v148_*`).
 - **The ABI contract files can no longer drift.** The two contract
   headers every script synths/effects include (`synth_api.rs`,
   `effect_api.rs`) each existed twice in the source tree as
