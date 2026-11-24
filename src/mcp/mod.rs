@@ -29,6 +29,12 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
+// v154: harness shared by EVERY MCP tool-family suite (settings/mixer/
+// plugins/windows) — single source for the tools/call envelope helper,
+// the structured/isError readers, and the socket handshake (t_e65b9296).
+#[cfg(test)]
+pub(crate) mod testkit;
+
 use std::io;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

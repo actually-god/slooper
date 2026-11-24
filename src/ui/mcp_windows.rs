@@ -906,6 +906,7 @@ fn layout_restore(app: &mut App, args: &Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::testkit::{self, call as resp, is_error, structured as sc};
 
     thread_local! {
         static TICK_T: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
@@ -933,22 +934,6 @@ mod tests {
         out.textures_delta.clear();
     }
 
-    fn resp(app: &mut App, name: &str, args: Value) -> Value {
-        let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                         "params":{"name":name,"arguments":args}});
-        crate::mcp::rpc::dispatch(&req, app).expect("response to a request")
-    }
-
-    fn sc(app: &mut App, name: &str, args: Value) -> Value {
-        let r = resp(app, name, args);
-        assert_ne!(
-            r["result"]["isError"].as_bool(),
-            Some(true),
-            "pin expects an OK result from {name}: {r}"
-        );
-        r["result"]["structuredContent"].clone()
-    }
-
     fn wins(app: &mut App) -> Vec<Value> {
         sc(app, "windows.list", json!({}))["windows"]
             .as_array()
@@ -963,11 +948,10 @@ mod tests {
     }
 
     fn err(app: &mut App, name: &str, args: Value) -> (String, String) {
-        let r = resp(app, name, args);
-        let e = &r["result"];
+        let v = is_error(app, name, args);
         (
-            e["structuredContent"]["error"].as_str().unwrap_or("").to_string(),
-            e["content"][0]["text"].as_str().unwrap_or("").to_string(),
+            v["error"].as_str().unwrap_or("").to_string(),
+            v["message"].as_str().unwrap_or("").to_string(),
         )
     }
 
@@ -1401,77 +1385,15 @@ mod tests {
         // v107 pump model: the worker parks on the oneshot after queueing,
         // so we sleep, run the frame-loop role (drain + one drawn frame),
         // then read the response. Deterministic, bounded, port 0.
-        use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join("slooper-mcp-v111sock");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var(crate::paths::DATA_DIR_ENV, &dir);
+        let _dir = testkit::isolated_data_dir("v111sock");
         let mut app = headless_app("v111sock");
         let ctx = egui::Context::default();
-        app.mcp_port = 0;
-        app.mcp_enabled = true;
-        app.mcp.as_mut().unwrap().set_wait(std::time::Duration::from_millis(800));
-        app.mcp_frame(&ctx);
-        let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
+        let (port, token) = testkit::start_mcp_socket(
+            &mut app, &ctx, Some(std::time::Duration::from_millis(800)));
 
         let mut call = |body: &str| -> (u16, Option<String>) {
-            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            sock.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
-            let req = format!(
-                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\
-                 \r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            sock.write_all(req.as_bytes()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            {
-                let mut srv = app.mcp.take().unwrap();
-                srv.drain(&mut app);
-                app.mcp = Some(srv);
-            }
-            tick(&mut app, &ctx); // the frame loop also DRAWS between calls
-            let mut raw = Vec::new();
-            sock.read_to_end(&mut raw).unwrap();
-            let split = raw.iter().position(|b| *b == b'\n').unwrap_or(0);
-            let status: u16 = String::from_utf8_lossy(&raw[..split])
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let body = raw
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|p| String::from_utf8_lossy(&raw[p + 4..]).into_owned());
-            (status, body)
+            testkit::socket_request_with(&mut app, port, &token, body, |a| tick(a, &ctx))
         };
-
-        // The family is discoverable over the wire.
-        let (st, body) = call(
-            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
-        );
-        assert_eq!(st, 200);
-        let names: Vec<String> = serde_json::from_str::<Value>(body.as_ref().unwrap())
-            .unwrap()["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
-        for w in [
-            "windows.list",
-            "windows.open",
-            "windows.close",
-            "windows.move",
-            "windows.resize",
-            "windows.dock",
-            "windows.undock",
-            "windows.layout.save",
-            "windows.layout.restore",
-        ] {
-            assert!(names.iter().any(|n| n == w), "{w} missing over the wire");
-        }
-
-        // Full round-trip, every ack carrying POST-change geometry.
         let mut tcall = |name: &str, args: Value| -> Value {
             let (st, body) = call(
                 &json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
@@ -1503,6 +1425,6 @@ mod tests {
         assert_eq!(ack["window"]["open"], false);
 
         drop(app); // McpServer::Drop closes the listener + endpoint file
-        std::env::remove_var(crate::paths::DATA_DIR_ENV);
+        testkit::clear_data_dir();
     }
 }

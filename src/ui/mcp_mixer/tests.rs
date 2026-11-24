@@ -5,48 +5,11 @@
 //! proof, not mirror poking). Requirement -> pin mapping:
 //! ~/.hermes/profiles/ui-designer/cache/scratch/slooper-v110/REQUIREMENTS.md.
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::config::Config;
-use crate::mcp::rpc;
+use crate::mcp::testkit::{call, cfg_text, is_error, structured};
 use crate::ui::{App, headless_app};
-
-fn call(app: &mut App, name: &str, args: Value) -> Value {
-    rpc::dispatch(
-        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                "params":{"name":name,"arguments":args}}),
-        app,
-    )
-    .expect("tools/call answers")
-}
-
-/// structuredContent of a tools/call response (panics loudly on -32xxx so
-/// a latch/refusal never masquerades as a result in the pins).
-fn structured(app: &mut App, name: &str, args: Value) -> Value {
-    let r = call(app, name, args);
-    assert!(r.get("error").is_none(), "unexpected JSON-RPC error: {r}");
-    r["result"]["structuredContent"].clone()
-}
-
-fn is_error(app: &mut App, name: &str, args: Value) -> Value {
-    let r = call(app, name, args);
-    assert_eq!(
-        r["result"]["isError"].as_bool(),
-        Some(true),
-        "expected a structured domain failure, got {r}"
-    );
-    let mut sc = r["result"]["structuredContent"].clone();
-    // The human text lives in content[0].text (rpc::tool_err) — surface it
-    // under "message" so pins can grep refusals for self-documentation.
-    if let Some(t) = r["result"]["content"][0]["text"].as_str() {
-        sc["message"] = json!(t);
-    }
-    sc
-}
-
-fn cfg_text() -> String {
-    std::fs::read_to_string(Config::path()).expect("config.json in the headless sandbox")
-}
 
 /// The samples folder headless_app builds (contains kick.wav, and IS the
 /// one configured rack root).

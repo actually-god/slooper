@@ -5,63 +5,20 @@
 //! the GUI itself reads.
 use super::*;
 use crate::audio::SynthHandle;
-use crate::mcp::rpc;
+use crate::mcp::testkit::{self, call, isolated_data_dir, is_error as rpc_is_error, structured};
 use crate::ui::{headless_app, App};
 use std::path::PathBuf;
 use std::sync::{Arc, Once};
 
-/// Isolated data dir for the v65/v69/v56 preset storages + the MCP bridge
-/// endpoint file (same recipe as the mcp02 pins).
-fn isolated_data_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sp-v128-{}-{:x}",
-        tag,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var(crate::paths::DATA_DIR_ENV, &dir);
-    dir
-}
-
-/// Pins drive the REAL dispatcher (v107/v108 contract), never the tool fns.
-fn call(app: &mut App, name: &str, args: Value) -> Value {
-    rpc::dispatch(
-        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                "params":{"name":name,"arguments":args}}),
-        app,
-    )
-    .expect("tools/call answers")
-}
-
-fn structured(app: &mut App, name: &str, args: Value) -> Value {
-    let r = call(app, name, args);
-    assert!(r.get("error").is_none(), "unexpected JSON-RPC error: {r}");
-    assert_ne!(
-        r["result"]["isError"].as_bool(),
-        Some(true),
-        "{name}: {}",
-        r["result"]
-    );
-    r["result"]["structuredContent"].clone()
-}
-
 fn is_error(app: &mut App, name: &str, args: Value, code: &str) -> String {
     let shown = args.to_string();
-    let r = call(app, name, args);
+    let v = rpc_is_error(app, name, args);
     assert_eq!(
-        r["result"]["isError"].as_bool(),
-        Some(true),
-        "{name} must fail on {shown}: {}",
-        r["result"]
-    );
-    assert_eq!(
-        r["result"]["structuredContent"]["error"].as_str().unwrap(),
+        v["error"].as_str().unwrap(),
         code,
-        "{name} error code on {shown}: {}",
-        r["result"]
+        "{name} error code on {shown}: {v}"
     );
-    r["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    v["message"].as_str().unwrap().to_string()
 }
 
 /// Headless app on an isolated data dir with a real sample rate.
@@ -861,56 +818,14 @@ fn v128_mcp_socket_plugins_surface_e2e() {
     let mut app = headless_app("mcp05sock");
     app.mcp05_test_set_sr(48000);
     let ctx = egui::Context::default();
-    app.mcp_port = 0;
-    app.mcp_enabled = true;
-    app.mcp.as_mut().unwrap().set_wait(std::time::Duration::from_millis(600));
-    app.mcp_frame(&ctx);
-    let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
+    let (port, token) = testkit::start_mcp_socket(
+        &mut app, &ctx, Some(std::time::Duration::from_millis(600)));
     app.mcp05_add_fx_script(0, "delay"); // UI-thread chain build (before wire)
     app.mcp05_set_track_synth(0, "sampler"); // track gate must pass for the sampler error probe
 
-    fn wire(app: &mut App, port: u16, token: &str, body: &str) -> Value {
-        use std::io::{Read, Write};
-        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        sock.set_read_timeout(Some(std::time::Duration::from_secs(8)))
-            .unwrap();
-        // Header lines composed at runtime (a prior write layer of this
-        // session mangled "Prefix: {ph}" adjacency; see v107 lore).
-        let hdr_auth = format!("{}: {} {}", "Authorization", "Bearer", token);
-        let hdr_host = format!("Host: 127.0.0.1:{}", port);
-        let hdr_len = format!("Content-Length: {}", body.len());
-        let req = [
-            "POST /mcp HTTP/1.1",
-            hdr_host.as_str(),
-            hdr_auth.as_str(),
-            "Content-Type: application/json",
-            hdr_len.as_str(),
-            "Connection: close",
-            "",
-            body,
-        ]
-        .join("\r\n");
-        sock.write_all(req.as_bytes()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        {
-            let mut srv = app.mcp.take().unwrap();
-            srv.drain(app);
-            app.mcp = Some(srv);
-        }
-        let mut raw = Vec::new();
-        sock.read_to_end(&mut raw).unwrap();
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("HTTP head");
-        let status: u16 = String::from_utf8_lossy(&raw[..split])
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        assert_eq!(status, 200, "wire status: {}", String::from_utf8_lossy(&raw[..split]));
-        serde_json::from_slice(&raw[split + 4..]).expect("JSON body")
-    }
 
     // tools/list carries the whole v128 family
-    let v = wire(&mut app, port, &token, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string());
+    let v = testkit::socket_json(&mut app, port, &token, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string());
     let names: Vec<&str> = v["result"]["tools"]
         .as_array()
         .unwrap()
@@ -948,7 +863,7 @@ fn v128_mcp_socket_plugins_surface_e2e() {
     let p = structured(&mut app, "plugin.params", json!({"track": 0, "row": 0}));
     let last = (p["count"].as_u64().unwrap() as usize) - 1;
     let hi = p["params"][last]["max"].as_f64().unwrap();
-    let v = wire(
+    let v = testkit::socket_json(
         &mut app,
         port,
         &token,
@@ -965,7 +880,7 @@ fn v128_mcp_socket_plugins_surface_e2e() {
     );
 
     // structured error over the wire: bad sampler asset id keeps its code
-    let v = wire(
+    let v = testkit::socket_json(
         &mut app,
         port,
         &token,
