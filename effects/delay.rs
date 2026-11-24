@@ -22,6 +22,13 @@
 // which the smear passed; `tier4_feedback_loops_ring` now pins real
 // impulse echoes for every feedback script. Read is head-relative here
 // and in flanger.rs; chorus/space_echo/pitchshft already read correctly.
+//
+// V157 GUARD (card t_0c6df534): a head-relative read can still point
+// BEFORE the head — first ~dt samples of a fresh instance, or while a
+// large time-slider jump slews dt above widx. read_head returns silence
+// there (the ring slots are untouched); unguarded, the negative floor
+// saturated to slot 0 and extrapolated ~-25000x, thumping hard-R/wide
+// input into the +/-4 clamp and poisoning the loop (v125 pin found it).
 include!("effect_api.rs");
 
 const NPARAMS: usize = 10;
@@ -80,6 +87,15 @@ fn read_head(buf: &[f32], widx: usize, frac: f64) -> f32 {
     // relative or the delay stops being a delay.)
     let frac = frac.clamp(1.0, (MAXD - 4) as f64);
     let f = widx as f64 - frac;
+    if f < 0.0 {
+        // The tap points BEFORE the write head: a fresh instance (first
+        // ~dt samples) or a time-slew that lifted dt above widx. Those
+        // ring slots were never written — silence. Unguarded, the cast
+        // below saturates d to 0 while fr (~-25000 at the default tap)
+        // turns the interp into an extrapolation that rode wet_r into
+        // the +/-4 output clamp and poisoned the feedback ring (v157).
+        return 0.0;
+    }
     let d = f.floor() as usize;
     let fr = f - d as f64;
     let i0 = d & D_MASK;
