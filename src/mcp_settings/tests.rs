@@ -173,12 +173,20 @@ fn v108_settings_mcp_enable_hotstarts() {
     // checkbox path (v107), so the tool write reached the REAL seam.
     app.mcp_frame(&ctx);
     assert!(app.mcp.as_ref().unwrap().is_running(), "settings.set hot-started the server");
-    // Port change hot-restarts (live, not restart-tier):
+    // Port change hot-restarts (live, not restart-tier). RETARGETED v156:
+    // the old probe wrote the SAME value (0 -> 0) and asserted the port
+    // CHANGED — that only ever held because the port-0 rebind storm
+    // re-bound every frame (t_13be8ef0). A config change is now required
+    // to rebind, so the pin performs a REAL change to an exact value.
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let fresh_port = probe.local_addr().unwrap().port();
+    drop(probe);
     let old = app.mcp.as_ref().unwrap().port().unwrap();
-    structured(&mut app, "settings.set", json!({"name": "mcp_port", "value": 0}));
+    assert_ne!(fresh_port, old, "probe grabbed a genuinely different port (old is still bound)");
+    structured(&mut app, "settings.set", json!({"name": "mcp_port", "value": fresh_port}));
     app.mcp_frame(&ctx);
-    let fresh = app.mcp.as_ref().unwrap().port().unwrap();
-    assert!(fresh > 0 && fresh != old, "port change re-binds the listener");
+    let now = app.mcp.as_ref().unwrap().port();
+    assert_eq!(now, Some(fresh_port), "port change re-binds the listener, exactly");
     structured(&mut app, "settings.set", json!({"name": "mcp_enabled", "value": false}));
     app.mcp_frame(&ctx);
     assert!(!app.mcp.as_ref().unwrap().is_running(), "off applies live too");

@@ -506,18 +506,17 @@ fn v156_mcp_port0_stable_across_frames() {
     let dir = isolated_data_dir("v156p0");
     let mut app = headless_app("v156p0");
     let ctx = egui::Context::default();
-    app.mcp_port = 0;
     app.mcp_enabled = true;
-    app.mcp_frame(&ctx);
-    let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint after start");
+    // The kit handshake owns the endpoint read (v154 single-source pin);
+    // it is exactly port-0 + enable + one frame — the advertised flow.
+    let (port, token) = testkit::start_mcp_socket(&mut app, &ctx, None);
     assert!(port > 0, "port 0 resolved to an ephemeral port");
     for frame in 2..=5 {
         app.mcp_frame(&ctx);
         let srv = app.mcp.as_ref().unwrap();
         assert!(srv.is_running(), "frame {frame}: server still running");
         assert_eq!(srv.port(), Some(port), "frame {frame}: port 0 keeps the current bind");
-        let (ep_port, ep_token) =
-            crate::mcp::bridge::read_endpoint().expect("endpoint file survives");
+        let (ep_port, ep_token) = testkit::endpoint_now();
         assert_eq!(
             (ep_port, ep_token.as_str()),
             (port, token.as_str()),
@@ -585,7 +584,7 @@ fn v156_mcp_port_change_applies_live_without_storm() {
     for frame in 2..=4 {
         app.mcp_frame(&ctx);
         assert_eq!(app.mcp.as_ref().unwrap().port(), Some(p0), "frame {frame}: 0-after-fixed must not storm");
-        let (ep, _) = crate::mcp::bridge::read_endpoint().expect("endpoint tracks the live port");
+        let (ep, _) = testkit::endpoint_now();
         assert_eq!(ep, p0, "frame {frame}: endpoint file names the live port");
     }
     // Back to a fixed value: applies live, exactly, and is stable. (f2 is

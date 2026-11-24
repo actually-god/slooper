@@ -232,6 +232,15 @@ throughout.
 
 ### Fixed
 
+- **The MCP server no longer restart-storms when its port is 0.** With
+  the port field set to **0** — the documented "pick any free port"
+  mode — the frame loop compared the *configured* port against the
+  listener's actual (ephemeral) port, which can never match: every
+  frame stopped the server, re-bound a new port, and re-rolled the
+  auth token, so the endpoint file churned through ~10 ports a second
+  and no client could ever complete a request. The bind now stays put
+  while the config reads 0, and port edits — 0→fixed or fixed→0 —
+  still apply live, each rebinding exactly once.
 - **A hosted CLAP instrument no longer mallocs on every audio block.** The
   CLAP backend destroyed its event-staging buffer at the end of every block
   and grew a fresh one the next — one malloc/free pair roughly every 12 ms
