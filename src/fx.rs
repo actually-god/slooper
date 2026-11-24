@@ -5961,6 +5961,120 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- v146: convolver folder docs must match the real DSP ----------
+    //      (card t_4d29ddbc) ---------------------------------------------
+
+    fn v146_convolver_src() -> &'static str {
+        EXAMPLES
+            .iter()
+            .find(|(n, _)| *n == "convolver.rs")
+            .map(|(_, s)| *s)
+            .expect("convolver.rs ships in EXAMPLES")
+    }
+
+    #[test]
+    fn v146_convolver_readme_tells_the_truth() {
+        // The README.txt the effect generates into the impulses folder
+        // must describe the normalization tidy() ACTUALLY runs. The old
+        // copy promised "peak-normalized" while tidy() energy-normalizes
+        // on purpose ("Energy normalization — not peak") — users matching
+        // two IRs by peak level got the opposite of the folder's own
+        // instructions. No peak promise may survive anywhere in the
+        // shipped script (the header comment carried the same claim).
+        let src = v146_convolver_src();
+        assert!(
+            src.contains("then energy-normalized"),
+            "generated README no longer states the energy normalization"
+        );
+        assert!(
+            src.contains("so a short and a long IR sit at the same loudness"),
+            "generated README lost the loudness model that explains WHY energy-normalize"
+        );
+        for stale in ["peak-normalized", "peak normalized"] {
+            assert!(!src.contains(stale), "convolver.rs still says {stale:?}");
+        }
+    }
+
+    #[test]
+    fn v146_convolver_desc_folder_hint_is_os_gated() {
+        // DESC/DESC4 must not bake one OS's impulses path into EVERY
+        // OS's effect list (Windows users were sent to
+        // ~/.local/share/... — a directory that does not exist there).
+        // The hint is ONE OS-gated const that both DESCs share.
+        let src = v146_convolver_src();
+        assert_eq!(
+            src.matches("description: DESC_TEXT.as_ptr()").count(),
+            2,
+            "DESC and DESC4 must both read the shared OS-gated const"
+        );
+        // The sentence exists in exactly two copies (one per cfg arm) —
+        // it must never get re-inlined into the DESC statics (that is
+        // how the two copies drifted apart before).
+        assert_eq!(
+            src.matches("Editor lists what loaded.").count(),
+            2,
+            "description sentence duplicated — second drift point detected"
+        );
+        // Each cfg arm carries its OWN OS's folder path, guard attached.
+        let lines: Vec<&str> = src.lines().collect();
+        let win = lines
+            .iter()
+            .position(|l| l.contains("%LOCALAPPDATA%\\\\slooper\\\\impulses - index 0"))
+            .expect("windows folder hint in DESC_TEXT");
+        let nix = lines
+            .iter()
+            .position(|l| l.contains("~/.local/share/slooper/impulses - index 0"))
+            .expect("unix folder hint in DESC_TEXT");
+        assert_eq!(lines[win - 2].trim(), "#[cfg(windows)]", "windows hint lost its cfg guard");
+        assert_eq!(lines[nix - 2].trim(), "#[cfg(not(windows))]", "unix hint lost its cfg guard");
+        assert!(lines[win].contains("Convolution reverb") && lines[nix].contains("Convolution reverb"));
+        // One copy of each hint, and the old cfg-less Linux literal is
+        // gone from every description position.
+        assert_eq!(src.matches("~/.local/share/slooper/impulses - index 0").count(), 1);
+        assert_eq!(src.matches("%LOCALAPPDATA%\\\\slooper\\\\impulses - index 0").count(), 1);
+    }
+
+    #[test]
+    fn v146_convolver_folder_artifacts_say_energy() {
+        // Runtime half of the honesty gate: create() WRITES the folder
+        // README and the loader READS the DESC — assert what a user
+        // actually meets, not just the source needles. The Windows
+        // polarity of the desc check executes on the windows-native CI
+        // suite (same pin, cfg split).
+        if !rustc_available() {
+            return;
+        }
+        let dir = temp_dir("v146conv");
+        let imp = dir.join("impulses");
+        std::env::set_var("SLOOPER_IMPULSES_DIR", &imp);
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let inst = reg
+            .create_instance("convolver", 48_000.0, &[])
+            .expect("convolver instance");
+        let readme = std::fs::read_to_string(imp.join("README.txt"))
+            .expect("create() must drop README.txt into the impulses folder");
+        assert!(
+            readme.contains("then energy-normalized"),
+            "written README lacks the energy wording:\n{readme}"
+        );
+        assert!(
+            readme.contains("so a short and a long IR sit at the same loudness"),
+            "written README lacks the loudness model:\n{readme}"
+        );
+        assert!(!readme.contains("peak-normalized"), "written README still promises peak:\n{readme}");
+        let d = reg.desc("convolver").expect("convolver desc");
+        let text = d.description.clone().unwrap_or_default();
+        #[cfg(windows)]
+        let (want, foreign) = ("%LOCALAPPDATA%\\slooper\\impulses", "~/.local/share/slooper/impulses");
+        #[cfg(not(windows))]
+        let (want, foreign) = ("~/.local/share/slooper/impulses", "%LOCALAPPDATA%");
+        assert!(text.contains(want), "effect list shows {text:?} — expected the {want:?} folder hint");
+        assert!(!text.contains(foreign), "effect list leaks the other OS's folder: {text:?}");
+        drop(inst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- W3 (WINDOWS-PORT): script artifacts follow the target suffix --------
 
     #[test]
