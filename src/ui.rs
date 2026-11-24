@@ -30281,9 +30281,7 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
                     cancelled = true;
                 }
                 if ui.button("Export").on_hover_text("render the mix to the chosen file").clicked() {
-                    eprintln!("PP exporting");
-        app.do_export();
-        eprintln!("PP export queued");
+                    app.do_export();
                     done = true;
                 }
             });
@@ -34448,9 +34446,7 @@ mod tests {
         app.export_sel = true;
         app.export_path = "/tmp/slooper-exp-sel.wav".into();
         app.sel_clips.clear();
-        eprintln!("PP exporting");
         app.do_export();
-        eprintln!("PP export queued");
         assert!(
             app.status.contains("select at least one clip"),
             "guard fired: {}",
@@ -34458,10 +34454,42 @@ mod tests {
         );
         app.arr.insert(0, 0, Clip::new(0, 0));
         app.sel_clips = vec![(0, 0, 0)];
-        eprintln!("PP exporting");
-        app.do_export();
-        eprintln!("PP export queued"); // engine writes async; just must not guard-error
+        app.do_export(); // engine writes async; just must not guard-error
         assert!(!app.show_export, "dialog closes when the export is queued");
+    }
+
+    /// v140 (card t_dfe98843): the export confirm button carried
+    /// leftover debug stderr chatter from its authoring session, printed
+    /// on EVERY user export. The status line is the only honest progress
+    /// echo, so the whole file is pinned free of those literals — the
+    /// needles are concat!-split so this pin's own bytes can never
+    /// self-match the scan (source-pin self-match trap). Positive
+    /// polarity guards the fix itself: deleting logs must never delete
+    /// the export call, and a commented-out call reddens the live-line
+    /// check (active_call doctrine).
+    #[test]
+    fn v140_export_debug_eprintln_absent() {
+        let src = include_str!("ui.rs");
+        for needle in [
+            concat!("PP ", "expo", "rting"),
+            concat!("PP ", "export que", "ued"),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "leftover debug stderr literal {needle:?} still present in ui.rs"
+            );
+        }
+        // Positive polarity: the confirm button (unique hover-text
+        // marker; the menu opener shares only the label) must still
+        // queue the export on a LIVE, non-commented line.
+        let at = src
+            .find("render the mix to the chosen file")
+            .expect("export confirm button marker vanished");
+        let win = &src[at..at + 300.min(src.len() - at)];
+        let live = win
+            .lines()
+            .any(|l| l.trim_start().starts_with("app.do_export();"));
+        assert!(live, "export confirm button no longer live-calls do_export");
     }
 
     #[test]
