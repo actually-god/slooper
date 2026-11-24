@@ -162,6 +162,13 @@ pub(crate) fn start_mcp_socket(
     crate::mcp::bridge::read_endpoint().expect("endpoint file")
 }
 
+/// Snapshot of the CURRENT endpoint file (panics if absent) — the
+/// steady-state identity probe: stability pins assert the port AND token
+/// survive consecutive frames (t_13be8ef0 class: a rebind churns both).
+pub(crate) fn endpoint_now() -> (u16, String) {
+    crate::mcp::bridge::read_endpoint().expect("endpoint file")
+}
+
 /// v107 pumping model: the worker parses, queues, and THEN parks on the
 /// oneshot — so after writing a request we sleep, execute one real
 /// `McpServer::drain` on this thread (= the frame-loop role), run the

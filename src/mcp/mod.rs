@@ -73,6 +73,12 @@ struct Running {
     accept: Option<JoinHandle<()>>,
     cmd_rx: Option<Receiver<Cmd>>,
     port: u16,
+    /// v156/t_13be8ef0: the CONFIGURED port that produced this bind —
+    /// `sync()` rebinds when the config CHANGES away from this value,
+    /// never on a 0-vs-ephemeral mismatch. The listener's real port can
+    /// never equal 0, so comparing it against the config re-stormed the
+    /// whole server every frame (stop -> rebind -> new port + token).
+    cfg_port: u16,
     token: String,
     /// Path of the endpoint file this instance wrote (deleted on stop).
     endpoint: std::path::PathBuf,
@@ -124,9 +130,15 @@ impl McpServer {
     /// transition or start failure — silence otherwise (v72 echo doctrine).
     pub fn sync(&mut self, enabled: bool, port: u16, ctx: &egui::Context) -> Option<String> {
         let want = (enabled, port);
-        // Running: stop on disable, restart on port change.
+        // Running: stop on disable, restart on a port CONFIG CHANGE
+        // (v156: compare the configured value that produced the bind, not
+        // the listener's real port — a configured 0 resolves to some
+        // ephemeral number that never equals 0, so the old comparison
+        // mismatched every frame: stop, rebind, new port, repeat, and no
+        // client could ever connect. Same-config 0 is a steady state;
+        // 0->fixed and fixed->0 each rebind exactly once.)
         let mismatch = match &self.running {
-            Some(r) => !enabled || r.port != port,
+            Some(r) => !enabled || r.cfg_port != port,
             None => false,
         };
         if mismatch {
@@ -275,6 +287,7 @@ impl McpServer {
             accept: Some(accept),
             cmd_rx: Some(cmd_rx),
             port: real_port,
+            cfg_port: port,
             token,
             endpoint,
         };
