@@ -3029,7 +3029,10 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
     // internal map doc from rotting again.
 
     /// The exact packing expression every contract doc must now state.
-    const V148_PACKING: &str = "(asset_id << 16) | (velocity << 8) | root_note";
+    /// Split with concat! so the literal cannot satisfy the self-file
+    /// `own.contains(...)` check below (a joined literal here would make
+    /// that polarity permanently vacuous — sabotage-proven 2026-11-24).
+    const V148_PACKING: &str = concat!("(asset_id << 16)", " | (velocity << 8) | root_note");
 
     #[test]
     fn v148_api_doc_teaches_the_v52_slot_packing() {
