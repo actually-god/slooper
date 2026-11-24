@@ -890,7 +890,7 @@ fn v154_mcp_testkit_helpers_single_sourced() {
     );
     // The endpoint-read handshake: ONLY the kit may own it.
     assert_eq!(
-        v154_src_files_containing(concat!("read_endpoint()", "().expect(")),
+        v154_src_files_containing(concat!("read_endpoint()", ".expect(")),
         vec!["src/mcp/testkit.rs".to_string()],
     );
     // A well-formed POST header may not be reassembled in any TEST file;
