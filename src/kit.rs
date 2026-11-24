@@ -225,8 +225,7 @@ mod tests {
     ) -> bool {
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(120.0, 80.0));
         let ctx = egui::Context::default();
-        let mut raw = egui::RawInput::default();
-        raw.events = events;
+        let raw = egui::RawInput { events, ..Default::default() };
         // egui 0.36: run_ui takes FnOnce(&mut Context) and returns FullOutput.
         // The FullOutput MUST be consumed — the first run installs the font
         // atlas and dropping an un-cleared TexturesDelta panics (0.36 trap).
