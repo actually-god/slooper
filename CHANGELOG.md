@@ -4,10 +4,188 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
-## [Unreleased]
+## [0.24.0] — unreleased
+
+The **expression release**: pitch curves you draw right on the notes,
+per-note pressure (poly-AT) reaching every instrument, sidechain
+send/receive levels, and an optional MCP server an agent can drive the
+app through — on top of a sampler-workflow, recovery and copy-correctness
+pass. 329 commits since 0.23.0, CI-green on Linux **and** Windows
+throughout.
+
+### Added
+
+- **JACK server-death detection + auto-reconnect (v118).** When the
+  JACK/PipeWire-JACK server dies mid-session — the routine desktop events
+  (USB-DAC unplug, device-profile switch, PipeWire restart) that used to
+  leave Linux users in permanent silence until they restarted slooper —
+  the status line now says **"JACK server lost — reconnecting…"** and the
+  app rebuilds its client by itself: the server's own shutdown notification
+  plus a process-block liveness backstop feed a bounded reconnect loop
+  that re-wires your exact port selection (and the MIDI auto-links) the
+  moment the server answers, re-announces the possibly-new sample rate,
+  and echoes **"JACK server recovered — audio restored"**. A server that
+  is simply *down* is retried patiently (no attempt budget — audio comes
+  back by itself); a server that is *refusing* gets three rebuilds before
+  the app stops and says so, and re-picking your ports in Settings retries
+  immediately. This is the Linux twin of the Windows WASAPI recovery
+  contract (W12a); the decision table ships pinned in
+  `src/audio/rt_recovery.rs` on both platforms.
+- **Native effect & instrument control over MCP (v128/MCP-05).**
+  Twenty-one tools for the built-in sound layer: `plugins.list` /
+  `plugins.instances` (the catalog of every bundled effect and synth,
+  with parameter schemas *derived* from the same metadata the knobs
+  show, plus everything currently loaded), `plugin.describe/params/
+  param.get/param.set` (read or write any script effect/synth parameter
+  through the GUI's own apply seam, enum-snapping and clamping
+  included), `plugin.preset.list/save/load` (the real preset-bar
+  storages, sanitizers honored), `sampler.map.get/set` +
+  `sampler.layers.add/remove` (key maps as decomposed {asset, root
+  note, velocity layer} slots), `drum.kit.get`, `drum.pad.set`,
+  `drum.preset.*`, and `midi.get/note.set/note.remove` (edit pattern
+  notes through the roll's own commit path). Deliberately native-only:
+  hosted VST/CLAP rows answer `wrong_kind` — their editors own their
+  parameters. The read-only latch blocks every writer (pinned by
+  `v128_*`).
+- **Subwindow arrangement over MCP (v111/MCP-03).** Nine agent tools drive
+  the window layer through the same UI-thread state the mouse uses:
+  `windows.list` enumerates every window by a stable machine id (the
+  display title can drift — ids never do) with open flag, dock edge/rank
+  and measured geometry; `windows.open/close` cover every drawable kind
+  (params — addressed per synth or chain row —, drum machine, master out,
+  piano roll, automation, synth pick, chain, fx slot, asset views) plus
+  plugin editors (list + close; their placement is WM territory and said
+  so in the tool text); `windows.move/resize` float windows only,
+  clamped to the viewport, and point at undock first for docked ones —
+  exactly what the mouse does; `windows.dock/undock` re-pack the tab
+  ranks per edge; and `windows.layout.save/restore` round-trip a whole
+  arrangement (dock table, strip widths, float rects, open flags) as
+  named templates that survive a restart. Bad ids answer with the live
+  id list; the read-only latch blocks all eight writers.
+- **MCP mixer, chain and rack control (v110/MCP-04).** Eleven agent
+  tools ride the GUI's own setter seams: `mixer.list/get/set` (track
+  vol/gain/pan/clip-color, sidechain sends and master volume in the same
+  MIDI-range numbers the live mixer uses — no unit fork), `chain.list/
+  pick/remove` (plugin selection with the GUI's async load semantics: the
+  call returns `loading` and readiness shows up in `chain.list`; loading
+  a sample-based plugin onto a track still auto-arms its sampler synth),
+  and `assets.list/import/remove/assign` (rack scan, WAV import, deletes
+  that stay inside the rack, and the drag-and-drop equivalents: pad,
+  sampler, channel and single key-map slot). Every write echoes the post-change state
+  back; the read-only latch blocks all of them.
+- **Settings read/write over MCP (v108/MCP-02).** Three more tools:
+  `settings.list` answers with every persisted setting — JSON type,
+  live value, requires-restart flag and unit/enum meta — auto-derived
+  from the config schema, so it can never go stale or incomplete;
+  `settings.get` reads one; `settings.set` writes one, validated
+  through serde plus the GUI's own setter seams: hot-appliable fields
+  take effect live, the rest persist for the next start and say so,
+  and unknown fields or bad values are refused with nothing changed
+  (pinned by `v108_*`).
+- **Note pressure reaches scripted synths (script ABI v3).** The
+  per-note aftertouch lane (and every recorded poly-AT event) now rides a
+  new `poly_at(ch, note, val)` callback into scripted synths — the v104
+  fix armed hosted plugins; this ships the scripted half. Version-gated
+  like v100's bend: a script opts in by exporting `slooper_synth_info_v3`
+  (one cumulative table: `{abi, bend, poly_at}`); v1/v2 scripts load and
+  behave exactly as before. `val` is the raw MIDI byte 0..=127 — the
+  script owns its curve. The seven bundled synths (piano, sampler, pad,
+  fm, additive, pluck, tri_osc) raise the pressured voice's level by up
+  to +3.5 dB; unpressed renders are byte-for-byte the old sound.
+- **Pitch curves, drawn on the notes.** The piano roll now draws and
+  edits each note's pitch curve right ON the note body: Z+drag paints a
+  freehand curve (release over another note and the slide lands on its
+  pitch, 808-style), selected notes reveal draggable control points
+  (Shift snaps time, Ctrl snaps 100-cent steps), Alt+Z warps the whole
+  curve, and Shift+right-click clears just the curve. Every edit bakes
+  and re-auditions immediately — you hear what you drew. The old
+  separate glide strip is retired: it stays visible only for legacy
+  projects whose bends lived in gaps, while everything migrated onto
+  notes paints and edits on the note.
+- **Per-note pitch curves (engine).** Sampler pitch bends now live ON
+  their note as a control-point curve (up to 16 points, ±2 octaves,
+  smooth monotone interpolation — 2-point curves are the old straight
+  sweep to the bit). Every consumer derives from one source: the baked
+  bend lane feeds VST instruments, MIDI export, and the roll preview
+  exactly as before, and scripted instruments pick it up over the same
+  channel-bend path. Projects are forward-compatible: glides drawn in
+  the old lane migrate automatically to their notes on load (glides in
+  gaps keep working as before), files save and reload with their curves
+  intact, and every bend-less pattern and old project loads byte-
+  identical. The in-roll curve editor for it shipped directly above.
+- **slooper can be driven over MCP (optional, off by default).** A new
+  Settings ▸ AUTOMATION (MCP) section hosts a built-in MCP server: when
+  enabled, an MCP client (Claude Desktop, coding agents) can connect to
+  THIS running instance and list/call tools that drive it live. It
+  binds 127.0.0.1 only; access needs the auto-generated token written
+  to `mcp-endpoint.json` in the data folder; a read-only latch refuses
+  every writing tool the moment you tick it; every enable/port/latch
+  change applies live — no restart — and echoes into the status line.
+  Stdio-only clients use `slooper --mcp-bridge`, which discovers port
+  and token from that same file, so no secret ever lands in a client
+  config. That first installment (the protocol core plus a demo echo
+  tool) has since been filled out: the settings, windows,
+  mixer/chain/rack and native-plugin families listed above all ride
+  the same spine — **45 tools live today**, each one read-only or
+  latch-gated.
+- **Per-track sidechain send level on the MIX page (v99).** Every MIX
+  channel column grew a **send** row: one slider scales the key bus
+  this track feeds to *every* chain that routes it — set the ducking
+  strength once instead of per receiver — and because the send is its
+  own control, the track's fader and mute never touch the key. It
+  rides the project (only non-default senders are stored) and exports
+  exactly as it plays (pinned by `v99_*`).
+- **Per-route receive level for sidechain sends (v97).** In a track's
+  chain window, every routed "Sidechain in" source chip carries a
+  receive slider: one source can key one chain hard and another
+  barely, independent of how loudly it is sent. Live and export
+  alike, saved with the project (pinned by `v97_*`).
+- **Preview several tracks at once (v96).** The track-pick menu
+  toggles: pick a SET of tracks — via that menu or by Shift-clicking
+  their headers — and the preview routes to all of them, staging one
+  audition voice per track on its own bus. A sidechain source and
+  its target become audible as a pair, ducking and all (pinned by
+  `v96_*`).
+- **Multi-track selection (v94).** Shift-click a track header (grid
+  or mixer strip) to add or remove it from the selection; a plain
+  click replaces it as before. The selection prunes correctly when
+  tracks are removed, and the record-group "grp" join now works from
+  it. Its first payoff is the multi-track preview above (pinned by
+  `v94_*`).
+- **Drag samples straight onto the sampler key map (v90).** Drag an
+  audio asset from the rack: drop it on a lane row to replace just
+  that velocity layer, on a key (piano strip or lane) to replace
+  every layer of that key — or add the first one if it was empty —
+  and on an empty map to create the first layer at C3. Every zone
+  explains its drop on hover; non-audio or stale drags are refused
+  with a status echo and zero state change, and a good drop lands in
+  the live map so the key auditions the new sample immediately
+  (pinned by `v90_*`).
+- **The version is in plain sight (v91).** The public version now
+  shows under the project name in the header — taken from the same
+  build metadata a hosted plugin reports to its host, so it can
+  never drift — and the Settings panel ends with an "internal
+  version: vNN" row (hover explains it) for support requests
+  (pinned by `v91_*`).
 
 ### Changed
 
+- **The documentation that ships into your folders now tells the truth.**
+  Bundled script headers are seeded straight into every user's
+  `synths/`/`effects/` folders, so a header claim is user documentation —
+  and three of them described DSP the code does not do: the drums
+  soft-clip doc promised bus-sum headroom the per-voice curve cannot
+  give (the engine's output clipper bounds the mix), the drums tune
+  comment claimed the metal hats ignore the tune multiplier (they follow
+  it; only crash and ride are pitch-immune), and the pluck's GLIDE
+  header promised live re-pitch of held notes (a Karplus-Strong string's
+  loop length is frozen at strike, so a bend lands on the *next* note —
+  delay-loop models now say so in the bend contract). Every header claim
+  is pinned against the code it documents. The preset-file marker also
+  sent users to a "Presets" section of `docs/PLUGINS.md` that does not
+  exist; it now names `docs/USAGE.md`, where the real Presets section
+  lives. Existing installs pick the corrected text up through the
+  regular content-diff seeding (pins `v151_*`, card t_0c4df02a).
 - **The synth-script contract now documents the real key-map slots.**
   The `synth_api.rs` reference slooper writes into every synths folder
   still described the pre-v52 slot packing `(asset_id << 8) | root_note`
@@ -117,7 +295,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   now applies after the row loop: the click frame paints one consistent
   snapshot, same-frame edits land on the row they were shown on, and the
   next frame renumbers as before (pinned by `v135_smap_delete_*`).
-
 - **Granular tracks finally obey velocity, GLIDE and per-note aftertouch.**
   The granular script was the last bundled instrument that read none of the
   piano-roll expression lanes: `note_on` dropped the velocity byte on the
@@ -188,7 +365,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   shared wheel angle through the app's equal-power pan law — a full
   image shift at constant loudness at either extreme (pinned by
   `v126_*`).
-
 - **Cancel-a-knob-learn no longer wipes an unrelated key binding.**
   Pressing **Delete** while binding a MIDI knob to a project value
   (volume, pan, an FX parameter) used to silently clear the **action-0**
@@ -225,165 +401,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   needless child lane. Both `Lane::occupied` and `place_auto` now resolve
   existing spans through the asset table — the module doc's promise
   finally holds for asymmetric lengths (v112).
-
-### Added
-
-- **JACK server-death detection + auto-reconnect (v118).** When the
-  JACK/PipeWire-JACK server dies mid-session — the routine desktop events
-  (USB-DAC unplug, device-profile switch, PipeWire restart) that used to
-  leave Linux users in permanent silence until they restarted slooper —
-  the status line now says **"JACK server lost — reconnecting…"** and the
-  app rebuilds its client by itself: the server's own shutdown notification
-  plus a process-block liveness backstop feed a bounded reconnect loop
-  that re-wires your exact port selection (and the MIDI auto-links) the
-  moment the server answers, re-announces the possibly-new sample rate,
-  and echoes **"JACK server recovered — audio restored"**. A server that
-  is simply *down* is retried patiently (no attempt budget — audio comes
-  back by itself); a server that is *refusing* gets three rebuilds before
-  the app stops and says so, and re-picking your ports in Settings retries
-  immediately. This is the Linux twin of the Windows WASAPI recovery
-  contract (W12a); the decision table ships pinned in
-  `src/audio/rt_recovery.rs` on both platforms.
-- **Native effect & instrument control over MCP (v128/MCP-05).**
-  Twenty-one tools for the built-in sound layer: `plugins.list` /
-  `plugins.instances` (the catalog of every bundled effect and synth,
-  with parameter schemas *derived* from the same metadata the knobs
-  show, plus everything currently loaded), `plugin.describe/params/
-  param.get/param.set` (read or write any script effect/synth parameter
-  through the GUI's own apply seam, enum-snapping and clamping
-  included), `plugin.preset.list/save/load` (the real preset-bar
-  storages, sanitizers honored), `sampler.map.get/set` +
-  `sampler.layers.add/remove` (key maps as decomposed {asset, root
-  note, velocity layer} slots), `drum.kit.get`, `drum.pad.set`,
-  `drum.preset.*`, and `midi.get/note.set/note.remove` (edit pattern
-  notes through the roll's own commit path). Deliberately native-only:
-  hosted VST/CLAP rows answer `wrong_kind` — their editors own their
-  parameters. The read-only latch blocks every writer (pinned by
-  `v128_*`).
-- **Subwindow arrangement over MCP (v111/MCP-03).** Nine agent tools drive
-  the window layer through the same UI-thread state the mouse uses:
-  `windows.list` enumerates every window by a stable machine id (the
-  display title can drift — ids never do) with open flag, dock edge/rank
-  and measured geometry; `windows.open/close` cover every drawable kind
-  (params — addressed per synth or chain row —, drum machine, master out,
-  piano roll, automation, synth pick, chain, fx slot, asset views) plus
-  plugin editors (list + close; their placement is WM territory and said
-  so in the tool text); `windows.move/resize` float windows only,
-  clamped to the viewport, and point at undock first for docked ones —
-  exactly what the mouse does; `windows.dock/undock` re-pack the tab
-  ranks per edge; and `windows.layout.save/restore` round-trip a whole
-  arrangement (dock table, strip widths, float rects, open flags) as
-  named templates that survive a restart. Bad ids answer with the live
-  id list; the read-only latch blocks all eight writers.
-- **MCP mixer, chain and rack control (v110/MCP-04).** Eleven agent
-  tools ride the GUI's own setter seams: `mixer.list/get/set` (track
-  vol/gain/pan/clip-color, sidechain sends and master volume in the same
-  MIDI-range numbers the live mixer uses — no unit fork), `chain.list/
-  pick/remove` (plugin selection with the GUI's async load semantics: the
-  call returns `loading` and readiness shows up in `chain.list`; loading
-  a sample-based plugin onto a track still auto-arms its sampler synth),
-  and `assets.list/import/remove/assign` (rack scan, WAV import, deletes
-  that stay inside the rack, and the drag-and-drop equivalents: pad,
-  sampler, channel and single key-map slot). Every write echoes the
-  Every write echoes the post-change state back; the read-only latch blocks all of them.
-  - **Settings read/write over MCP (v108/MCP-02).** Three more tools:
-    `settings.list` answers with every persisted setting — JSON type,
-    live value, requires-restart flag and unit/enum meta — auto-derived
-    from the config schema, so it can never go stale or incomplete;
-    `settings.get` reads one; `settings.set` writes one, validated
-    through serde plus the GUI's own setter seams: hot-appliable fields
-    take effect live, the rest persist for the next start and say so,
-    and unknown fields or bad values are refused with nothing changed
-    (pinned by `v108_*`).
-  - **Note pressure reaches scripted synths (script ABI v3).**
-  per-note aftertouch lane (and every recorded poly-AT event) now rides a
-  new `poly_at(ch, note, val)` callback into scripted synths — the v104
-  fix armed hosted plugins; this ships the scripted half. Version-gated
-  like v100's bend: a script opts in by exporting `slooper_synth_info_v3`
-  (one cumulative table: `{abi, bend, poly_at}`); v1/v2 scripts load and
-  behave exactly as before. `val` is the raw MIDI byte 0..=127 — the
-  script owns its curve. The seven bundled synths (piano, sampler, pad,
-  fm, additive, pluck, tri_osc) raise the pressured voice's level by up
-  to +3.5 dB; unpressed renders are byte-for-byte the old sound.
-
-- **Pitch curves, drawn on the notes.** The piano roll now draws and
-  edits each note's pitch curve right ON the note body: Z+drag paints a
-  freehand curve (release over another note and the slide lands on its
-  pitch, 808-style), selected notes reveal draggable control points
-  (Shift snaps time, Ctrl snaps 100-cent steps), Alt+Z warps the whole
-  curve, and Shift+right-click clears just the curve. Every edit bakes
-  and re-auditions immediately — you hear what you drew. The old
-  separate glide strip is retired: it stays visible only for legacy
-  projects whose bends lived in gaps, while everything migrated onto
-  notes paints and edits on the note.
-- **Per-note pitch curves (engine).** Sampler pitch bends now live ON
-  their note as a control-point curve (up to 16 points, ±2 octaves,
-  smooth monotone interpolation — 2-point curves are the old straight
-  sweep to the bit). Every consumer derives from one source: the baked
-  bend lane feeds VST instruments, MIDI export, and the roll preview
-  exactly as before, and scripted instruments pick it up over the same
-  channel-bend path. Projects are forward-compatible: glides drawn in
-  the old lane migrate automatically to their notes on load (glides in
-  gaps keep working as before), files save and reload with their curves
-  intact, and every bend-less pattern and old project loads byte-
-  identical. The in-roll curve editor for it shipped directly above.
-- **slooper can be driven over MCP (optional, off by default).** A new
-  Settings ▸ AUTOMATION (MCP) section hosts a built-in MCP server: when
-  enabled, an MCP client (Claude Desktop, coding agents) can connect to
-  THIS running instance and list/call tools that drive it live. It
-  binds 127.0.0.1 only; access needs the auto-generated token written
-  to `mcp-endpoint.json` in the data folder; a read-only latch refuses
-  every writing tool the moment you tick it; every enable/port/latch
-  change applies live — no restart — and echoes into the status line.
-  Stdio-only clients use `slooper --mcp-bridge`, which discovers port
-  and token from that same file, so no secret ever lands in a client
-  config. That first installment (the protocol core plus a demo echo
-  tool) has since been filled out: the settings, windows,
-  mixer/chain/rack and native-plugin families listed above all ride
-  the same spine — **45 tools live today**, each one read-only or
-  latch-gated.
-- **Per-track sidechain send level on the MIX page (v99).** Every MIX
-  channel column grew a **send** row: one slider scales the key bus
-  this track feeds to *every* chain that routes it — set the ducking
-  strength once instead of per receiver — and because the send is its
-  own control, the track's fader and mute never touch the key. It
-  rides the project (only non-default senders are stored) and exports
-  exactly as it plays (pinned by `v99_*`).
-- **Per-route receive level for sidechain sends (v97).** In a track's
-  chain window, every routed "Sidechain in" source chip carries a
-  receive slider: one source can key one chain hard and another
-  barely, independent of how loudly it is sent. Live and export
-  alike, saved with the project (pinned by `v97_*`).
-- **Preview several tracks at once (v96).** The track-pick menu
-  toggles: pick a SET of tracks — via that menu or by Shift-clicking
-  their headers — and the preview routes to all of them, staging one
-  audition voice per track on its own bus. A sidechain source and
-  its target become audible as a pair, ducking and all (pinned by
-  `v96_*`).
-- **Multi-track selection (v94).** Shift-click a track header (grid
-  or mixer strip) to add or remove it from the selection; a plain
-  click replaces it as before. The selection prunes correctly when
-  tracks are removed, and the record-group "grp" join now works from
-  it. Its first payoff is the multi-track preview above (pinned by
-  `v94_*`).
-- **Drag samples straight onto the sampler key map (v90).** Drag an
-  audio asset from the rack: drop it on a lane row to replace just
-  that velocity layer, on a key (piano strip or lane) to replace
-  every layer of that key — or add the first one if it was empty —
-  and on an empty map to create the first layer at C3. Every zone
-  explains its drop on hover; non-audio or stale drags are refused
-  with a status echo and zero state change, and a good drop lands in
-  the live map so the key auditions the new sample immediately
-  (pinned by `v90_*`).
-- **The version is in plain sight (v91).** The public version now
-  shows under the project name in the header — taken from the same
-  build metadata a hosted plugin reports to its host, so it can
-  never drift — and the Settings panel ends with an "internal
-  version: vNN" row (hover explains it) for support requests
-  (pinned by `v91_*`).
-
-### Fixed
-
 - **The master clip LED can be turned off now.** A single sample that
   ever hit full scale lit the red CLIP indicator in MASTER OUT for the
   rest of the session — nothing could clear it short of restarting
@@ -392,7 +409,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   paints it) to reset the latch, or let the "reset I" button do it along
   with the integrated-loudness reset; every affordance explains itself
   on hover and answers in the status line.
-
 - **The EXPORT dialog's scope choice is one radio again.** The three
   scope options shared two state flags, so "Track N (selected)" lit up
   **at the same time** as "Current selection" — and clicking it there did
@@ -400,7 +416,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   "Current selection" (the only way back was a detour through "Whole
   project"). Each option now shows its own checked state — exactly one is
   ever filled — and clicking any of them selects exactly that scope.
-
 - **Renaming or moving a sample keeps its baked edits.** Renaming a rack
   file (or moving it into another folder — or moving whole folders) used
   to orphan the sample editor's stored edit and its pristine source: the
@@ -411,7 +426,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   rides along too), the project records it under the new path, and
   deleting a file forgets its edit instead of letting a later file at the
   same path inherit it.
-
 - **Names Windows would refuse now fold, on both OSes (v121).** The
   NTFS-reserved characters (`< > : " | ? *`) sailed through name boxes
   on Linux and failed the write on Windows. They now fold to a safe
@@ -429,7 +443,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   re-pointed at their new indices), so the documented repeated-S
   workflow works end to end on one clip, across several clips, and
   across tracks.
-
 - **Dense sidechain routing ducks every track during playback again.**
   The live engine kept its sidechain routing table at 256 edges while the
   mixer can legally wire every track to every track (up to 16k routes at
@@ -441,7 +454,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   once, no per-block cost, zero cost for projects without routing), so
   truncation is structurally impossible; pins drive the live engine at
   400 and 16,002 edges and demand every target's key arrives.
-
 - **A misbehaving CLAP plugin gets isolated, not fatal (v116, v117).**
   A C++ exception thrown inside a CLAP plugin — or a panic from
   slooper's own host code at a plugin callback — reached the process
@@ -454,7 +466,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   total, so a bogus value relayed by a flaky plugin clamps to program
   0 instead of corrupting the picker (v119; pinned by `v116_*`,
   `v117_*`, `v119_*`).
-
 - **Dense MIDI bursts no longer vanish inside VST2 plugins.** When more
   than 64 channel-voice messages came due in one ~12 ms block aimed at a
   single VST2 plugin — a big chord stack, a dense multi-lane pattern
@@ -467,7 +478,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   every due event in one call (VST3 and CLAP hosts were already
   honest), verified with 200-simultaneous-note-on and split-across-
   blocks pins that demand every message, in order, drops still 0.
-
 - **Automation and MIDI knobs now follow the chain when you edit it.**
   Automation curves and MIDI value bindings address plugin parameters by
   chain position, so removing or reordering an effect used to leave them
@@ -492,18 +502,15 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   itself: a missing compiler is noticed again about once a second, and a
   compile attempt that fails re-checks immediately, so the hint appears
   and disappears as the toolchain truly comes and goes — no restart.
-
-
 - **Per-note aftertouch now reaches CLAP instruments.** A MPE controller's
   note-by-note pressure (polyphonic aftertouch — the message that bends
   one held note while its neighbours stay still) was forwarded to VST2 and
   VST3 instruments but silently dropped on the way to CLAP ones, so the
   same controller played differently depending on the plugin format. CLAP
-  instruments now receive it like every other instrument. Built-in
-  scripted instruments still ignore per-note pressure — their script
-  interface has no per-note aftertouch input yet (a follow-up will add
-  it); channel aftertouch and expression work there today.
-
+  instruments now receive it like every other instrument. Built-in scripted
+  instruments got their own per-note pressure hook later in this same
+  release (script ABI v3 — see *Note pressure reaches scripted synths*);
+  channel aftertouch and expression worked there already.
 - **Pitch bends now bend the same amount on every plugin.** A glide or
   wheel bend drawn in the piano roll is written in semitones, but hosted
   instruments received it raw and interpreted it with whatever bend range
@@ -517,7 +524,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   inside the range hear exactly their written depth, and deeper bends
   need a wider range. CLAP instruments are covered too — they previously
   received no pitch bend at all.
-
 - **The piano roll's glide lane now glides on the built-in instruments.**
   Pitch bends baked into a clip — drawn with the glide tool or recorded
   from a hardware wheel — were silently discarded for every scripted
@@ -526,7 +532,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   always received them, so the lane looked alive in the editor.) Scripted
   instruments now receive bends like MIDI: a full deflection is ±12
   semitones, and held notes shift with the line while it plays.
-
 - **Docked subwindow sizes survive restarts — for real this time.**
   Resizing a docked panel (MASTER OUT was the worst case) and relaunching
   reset it toward a minimum: every restart quietly shaved a frame's worth
@@ -539,7 +544,6 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   compromises), and reboots honoring the user's proportions instead of
   equal shares. Float↔dock toggling keeps the chosen thickness, and a
   deliberately-thin dock is no longer yanked back to the built-in width.
-
 - **Muting or fading a ducking source no longer kills the duck
   (v95).** The sidechain key used to be tapped behind the sender's
   volume fader and mute, so mixing a loud source down — or muting it
