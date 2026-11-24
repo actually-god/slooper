@@ -9952,9 +9952,12 @@ let desc = reg.desc("v80quarter").unwrap().clone();
     /// with its ABSOLUTE sample offset — the mock accumulates block
     /// lengths, which is exactly how render_midi_vst drives consecutive
     /// full `VST_BLOCK` chunks (no gaps).
+    /// Captured `(absolute_sample_offset, raw_message)` pairs with the
+    /// running block-length sum (named for clippy type_complexity).
+    type V158Staged = (usize, Vec<(usize, [u8; 3])>);
     #[derive(Default)]
     struct V158Rec {
-        got: std::sync::Mutex<(usize, Vec<(usize, [u8; 3])>)>,
+        got: std::sync::Mutex<V158Staged>,
     }
     impl crate::vsthost::StageEntry for V158Rec {
         fn name(&self) -> &str {
