@@ -3111,7 +3111,6 @@ mod tests {
                 continue;
             }
             if l.trim_start().starts_with("// SKELETON-END") {
-                inside = false;
                 break;
             }
             if inside {
