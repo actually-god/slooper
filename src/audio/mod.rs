@@ -3070,6 +3070,93 @@ fn stage_midi_events(
     }
 }
 
+/// v150 (card t_3911ce56): SINGLE SOURCE for dispatching one staged
+/// `(offset, kind, ch, d1, d2)` event onto a scripted instrument. Five RT
+/// drains used to carry this match in lockstep — it lives HERE only now.
+/// Callers sort the tuple first, so note-offs (kind 0) precede note-ons
+/// (kind 3) at one sample (a retrigger never kills its own note).
+/// v42/MPE: kind 4 = per-note aftertouch — d1 = note, d2 = pressure
+/// 0..=127 (midipat::Poly law): v104 (card t_0ab25d9a) armed HOSTED
+/// plugins with 0xA0; v106 (card t_a4df161f) routes it to scripted synths
+/// via Instance::poly_at — ABI v3 scripts get the raw byte, v1/v2 scripts
+/// no-op inside the call (the historic clean drop). Kind 5 = 14-bit bend
+/// (d1 = LSB, d2 = MSB). RT-safe: no alloc, no lock, no IO.
+#[inline]
+fn apply_script_event(inst: &crate::synth::Instance, kind: u8, ch: u8, d1: u8, d2: u8) {
+    match kind {
+        0 => inst.note_off(ch, d1),
+        1 => inst.cc(ch, d1, d2),
+        2 => inst.press(ch, d2),
+        4 => inst.poly_at(ch, d1, d2),
+        5 => inst.bend(
+            ch,
+            crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16)),
+        ),
+        _ => inst.note_on(ch, d1, d2),
+    }
+}
+
+/// v150: SINGLE SOURCE for the scripted-instrument scan/dispatch loop the
+/// offline bounces and every RT MIDI pass share. `ev` must be sorted
+/// `(offset, kind, ch, d1, d2)` events, offsets relative to `out`'s start.
+/// Audio renders between event offsets (and after the last event) via
+/// `process_into`; all events at one raw offset dispatch in tuple order,
+/// so callers get off-before-on for free. Events at or past `out.len()`
+/// still dispatch (in order) but contribute no gap audio — and the loop
+/// always consumes them (old per-site forms could spin on such an event;
+/// unreachable for today's callers, which all pre-clamp).
+/// Callers prime the instance (`process_into(&mut [], p)`) before the
+/// first event when staging matters (sampler asset sync) — that stays at
+/// the call sites. RT-safe: no alloc, no lock, no IO.
+fn drive_script_events(
+    inst: &crate::synth::Instance,
+    ev: &[(usize, u8, u8, u8, u8)],
+    p: &[f32; crate::synth::MAX_PARAMS],
+    out: &mut [f32],
+) {
+    let lim = out.len();
+    let mut cur = 0usize;
+    let mut i = 0usize;
+    while i < ev.len() {
+        let raw = ev[i].0;
+        let off = raw.min(lim);
+        if off > cur {
+            // SAFETY: single-threaded here; one instance, one call.
+            unsafe { inst.process_into(&mut out[cur..off], p) };
+            cur = off;
+        }
+        while i < ev.len() && ev[i].0 == raw {
+            let (_, kind, ch, d1, d2) = ev[i];
+            apply_script_event(inst, kind, ch, d1, d2);
+            i += 1;
+        }
+    }
+    if cur < lim {
+        unsafe { inst.process_into(&mut out[cur..], p) };
+    }
+}
+
+/// v150: SINGLE SOURCE for staging one `(kind, ch, d1, d2)` event as the
+/// 3-byte raw MIDI message `process_with_midi` consumes. v42/MPE: kind 4
+/// (per-note aftertouch) and kind 5 (14-bit bend: d1 = LSB, d2 = MSB)
+/// ride straight into the entry's raw-message queue. Note-on velocity is
+/// clamped to >= 1 (a 0-vel on must never hang a note). RT-safe.
+/// NOTE: `render_midi_vst` (offline bounce) keeps its own 4-arm matcher
+/// that DROPS kinds 4/5 into the note-on arm — known divergence, fix is
+/// tracked separately (behavior change, needs retargeted pins).
+#[inline]
+fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
+    match kind {
+        0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
+        1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+        2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
+        4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+        5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+        _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+    }
+}
+
+
 /// Render staged absolute-sample events through `inst` into `len` samples
 /// of `out` (starting at timeline `from`). Events outside the window are
 /// ignored; notes ringing at `from` simply start ringing at sample 0 of
@@ -3093,39 +3180,7 @@ pub fn render_midi_events(
         .collect();
     // Note-offs (kind 0) before note-ons (kind 3) at one sample.
     ev.sort_unstable();
-    let mut cur = 0usize;
-    let mut i = 0usize;
-    while i < ev.len() {
-        let off = ev[i].0.min(len);
-        if off > cur {
-            let end = off.min(out.len());
-            if end > cur {
-                unsafe { inst.process_into(&mut out[cur..end], &p) };
-                cur = end;
-            }
-        }
-        while i < ev.len() && ev[i].0 == off {
-            let (_, kind, ch, d1, d2) = ev[i];
-            match kind {
-                0 => inst.note_off(ch, d1),
-                1 => inst.cc(ch, d1, d2),
-                2 => inst.press(ch, d2),
-                // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
-                // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
-                // to scripted synths via Instance::poly_at: ABI v3 scripts
-                // get the raw byte, v1/v2 scripts no-op inside the call
-                // (the historic clean drop).
-                4 => inst.poly_at(ch, d1, d2),
-                5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
-                _ => inst.note_on(ch, d1, d2),
-            }
-            i += 1;
-        }
-    }
-    if cur < out.len() {
-        unsafe { inst.process_into(&mut out[cur..], &p) };
-    }
+    drive_script_events(inst, &ev, &p, out);
     inst.all_off();
 }
 
@@ -3676,44 +3731,7 @@ impl Proc {
                     }
                     mono.clear();
                     mono.resize(block_n, 0.0);
-                    let mut cur = 0usize;
-                    let mut i = 0usize;
-                    while i < midi_ev.len() {
-                        let off = midi_ev[i].0.min(block_n);
-                        if off > cur {
-                            // SAFETY: single-threaded here; one instance, one call.
-                            unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
-                            cur = off;
-                        }
-                        while i < midi_ev.len() && midi_ev[i].0 == off {
-                            let (_, kind, ch, d1, d2) = midi_ev[i];
-                            match kind {
-                                0 => inst.note_off(ch, d1),
-                                1 => inst.cc(ch, d1, d2),
-                                2 => inst.press(ch, d2),
-                                // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
-                                // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
-                                // to scripted synths via Instance::poly_at: ABI v3 scripts
-                                // get the raw byte, v1/v2 scripts no-op inside the call
-                                // (the historic clean drop).
-                                4 => inst.poly_at(ch, d1, d2),
-                                5 => {
-                                    inst.bend(
-                                        ch,
-                                        crate::midipat::bend_to_st(
-                                            ((d2 as u16) << 7) | (d1 as u16),
-                                        ),
-                                    )
-                                }
-                                _ => inst.note_on(ch, d1, d2),
-                            }
-                            i += 1;
-                        }
-                    }
-                    if cur < block_n {
-                        unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
-                    }
+                    drive_script_events(inst, midi_ev, synth_p, &mut mono[..block_n]);
                     for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
                         *r += *m;
                     }
@@ -3729,18 +3747,7 @@ impl Proc {
                     sil.resize(block_n, 0.0);
                     evq.clear();
                     for &(_off, kind, ch, d1, d2) in midi_ev.iter() {
-                        let m = match kind {
-                            0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
-                            1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                            2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
-                            // v42/MPE: per-note aftertouch and 14-bit bend
-                            // (d1 = LSB, d2 = MSB) ride straight into the
-                            // entry's raw-message queue.
-                            4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                            5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                            _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
-                        };
-                        evq.push(((_off).min(block_n), m));
+                        evq.push(((_off).min(block_n), midi3_raw(kind, ch, d1, d2)));
                     }
                     e.process_with_midi(&sil[..block_n], &mut row[..block_n], evq);
                 }
@@ -3917,37 +3924,7 @@ impl Proc {
                         }
                         mono.clear();
                         mono.resize(block_n, 0.0);
-                        let mut cur = 0usize;
-                        let mut i = 0usize;
-                        while i < midi_ev.len() {
-                            let off = midi_ev[i].0.min(block_n);
-                            if off > cur {
-                                // SAFETY: single-threaded here; one instance, one call.
-                                unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
-                                cur = off;
-                            }
-                            while i < midi_ev.len() && midi_ev[i].0 == off {
-                                let (_, kind, ch, d1, d2) = midi_ev[i];
-                                match kind {
-                                    0 => inst.note_off(ch, d1),
-                                    1 => inst.cc(ch, d1, d2),
-                                    2 => inst.press(ch, d2),
-                                    // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
-                                    // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                    // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
-                                    // to scripted synths via Instance::poly_at: ABI v3 scripts
-                                    // get the raw byte, v1/v2 scripts no-op inside the call
-                                    // (the historic clean drop).
-                                    4 => inst.poly_at(ch, d1, d2),
-                                    5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
-                                    _ => inst.note_on(ch, d1, d2),
-                                }
-                                i += 1;
-                            }
-                        }
-                        if cur < block_n {
-                            unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
-                        }
+                        drive_script_events(inst, midi_ev, synth_p, &mut mono[..block_n]);
                         for (r, m) in row[..block_n].iter_mut().zip(mono[..block_n].iter()) {
                             *r += *m;
                         }
@@ -3959,15 +3936,7 @@ impl Proc {
                         mono2.resize(block_n, 0.0);
                         evq.clear();
                         for &(_off, kind, ch, d1, d2) in midi_ev.iter() {
-                            let m = match kind {
-                                0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
-                                1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                                2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
-                                4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                                5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                                _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
-                            };
-                            evq.push(((_off).min(block_n), m));
+                            evq.push(((_off).min(block_n), midi3_raw(kind, ch, d1, d2)));
                         }
                         e.process_with_midi(&sil[..block_n], &mut mono2[..block_n], evq);
                         for (r, m) in row[..block_n].iter_mut().zip(mono2[..block_n].iter()) {
@@ -4031,51 +4000,14 @@ impl Proc {
                         // Prime like the live pass (sampler asset sync).
                         unsafe { inst.process_into(&mut [], synth_p) };
                     }
-                    let mut cur = 0usize;
-                    let mut i = 0usize;
-                    while i < ev.len() {
-                        let off = ev[i].0.min(block_n);
-                        if off > cur {
-                            unsafe { inst.process_into(&mut mono[cur..off], synth_p) };
-                            cur = off;
-                        }
-                        while i < ev.len() && ev[i].0 == off {
-                            let (_, kind, ch, d1, d2) = ev[i];
-                            match kind {
-                                0 => inst.note_off(ch, d1),
-                                1 => inst.cc(ch, d1, d2),
-                                2 => inst.press(ch, d2),
-                                // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
-                                // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
-                                // to scripted synths via Instance::poly_at: ABI v3 scripts
-                                // get the raw byte, v1/v2 scripts no-op inside the call
-                                // (the historic clean drop).
-                                4 => inst.poly_at(ch, d1, d2),
-                                5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
-                                _ => inst.note_on(ch, d1, d2),
-                            }
-                            i += 1;
-                        }
-                    }
-                    if cur < block_n {
-                        unsafe { inst.process_into(&mut mono[cur..block_n], synth_p) };
-                    }
+                    drive_script_events(inst, &ev, synth_p, &mut mono[..block_n]);
                 }
                 SynthHandle::Vst(e) => {
                     sil.clear();
                     sil.resize(block_n, 0.0);
                     evq.clear();
                     for &(off, kind, ch, d1, d2) in ev.iter() {
-                        let m = match kind {
-                            0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
-                            1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                            2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
-                            4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                            5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                            _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
-                        };
-                        evq.push((off.min(block_n), m));
+                        evq.push((off.min(block_n), midi3_raw(kind, ch, d1, d2)));
                     }
                     e.process_with_midi(&sil[..block_n], &mut mono[..block_n], evq);
                 }
@@ -4132,55 +4064,14 @@ impl Proc {
                             if has_ev {
                                 unsafe { inst.process_into(&mut [], synth_p) };
                             }
-                            let mut cur = 0usize;
-                            let mut i = 0usize;
-                            while i < ev.len() {
-                                let off = ev[i].0.min(block_n);
-                                if off > cur {
-                                    unsafe {
-                                        inst.process_into(&mut aud_pv_row[cur..off], synth_p)
-                                    };
-                                    cur = off;
-                                }
-                                while i < ev.len() && ev[i].0 == off {
-                                    let (_, kind, ch, d1, d2) = ev[i];
-                                    match kind {
-                                        0 => inst.note_off(ch, d1),
-                                        1 => inst.cc(ch, d1, d2),
-                                        2 => inst.press(ch, d2),
-                                        // v42/MPE: per-note aftertouch — d1 = note, d2 = pressure
-                                        // 0..=127 (midipat::Poly law). v104 (card t_0ab25d9a) armed
-                                        // HOSTED plugins with 0xA0; v106 (card t_a4df161f) routes it
-                                        // to scripted synths via Instance::poly_at: ABI v3 scripts
-                                        // get the raw byte, v1/v2 scripts no-op inside the call
-                                        // (the historic clean drop).
-                                        4 => inst.poly_at(ch, d1, d2),
-                                        5 => inst.bend(ch, crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16))),
-                                        _ => inst.note_on(ch, d1, d2),
-                                    }
-                                    i += 1;
-                                }
-                            }
-                            if cur < block_n {
-                                unsafe {
-                                    inst.process_into(&mut aud_pv_row[cur..block_n], synth_p)
-                                };
-                            }
+                            drive_script_events(inst, &ev, synth_p, &mut aud_pv_row[..block_n]);
                         }
                         SynthHandle::Vst(e) => {
                             sil.clear();
                             sil.resize(block_n, 0.0);
                             evq.clear();
                             for &(off, kind, ch, d1, d2) in ev.iter() {
-                                let m = match kind {
-                                    0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
-                                    1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                                    2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
-                                    4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                                    5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                                    _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
-                                };
-                                evq.push((off.min(block_n), m));
+                                evq.push((off.min(block_n), midi3_raw(kind, ch, d1, d2)));
                             }
                             e.process_with_midi(&sil[..block_n], &mut aud_pv_row[..block_n], evq);
                         }
