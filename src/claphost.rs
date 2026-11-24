@@ -68,6 +68,29 @@ mod ffi {
     pub const CLAP_PARAM_IS_ENUM: u32 = 1 << 4;
     pub const CLAP_PROCESS_ERROR: i32 = 0;
 
+    /// v155: the ext/log.h severity family (clap 1.2.2 order — the old
+    /// gate comment claimed the draft-era reverse order, fatal first;
+    /// the v155_ header-parity pin keeps these exact against the
+    /// vendored authority).
+    pub const CLAP_LOG_DEBUG: u32 = 0;
+    pub const CLAP_LOG_INFO: u32 = 1;
+    /// host_log_cb prints this severity and above unconditionally.
+    pub const CLAP_LOG_WARNING: u32 = 2;
+    pub const CLAP_LOG_ERROR: u32 = 3;
+    pub const CLAP_LOG_FATAL: u32 = 4;
+    pub const CLAP_LOG_HOST_MISBEHAVING: u32 = 5;
+    pub const CLAP_LOG_PLUGIN_MISBEHAVING: u32 = 6;
+    // Keep the full family referenced (only WARNING feeds the gate).
+    const _: [(&str, u32); 7] = [
+        ("DEBUG", CLAP_LOG_DEBUG),
+        ("INFO", CLAP_LOG_INFO),
+        ("WARNING", CLAP_LOG_WARNING),
+        ("ERROR", CLAP_LOG_ERROR),
+        ("FATAL", CLAP_LOG_FATAL),
+        ("HOST_MISBEHAVING", CLAP_LOG_HOST_MISBEHAVING),
+        ("PLUGIN_MISBEHAVING", CLAP_LOG_PLUGIN_MISBEHAVING),
+    ];
+
     pub const CLAP_NAME_SIZE: usize = 256;
     pub const CLAP_PATH_SIZE: usize = 1024;
 
@@ -148,7 +171,9 @@ mod ffi {
 
     #[repr(C)]
     pub struct ClapHostLog {
-        /// severity: 0 fatal .. 5 trace (clap.log)
+        /// severity: clap 1.2.2 order — 0 debug, 1 info, 2 warning,
+        /// 3 error, 4 fatal, 5 host-misbehaving, 6 plugin-misbehaving
+        /// (ext/log.h; v155 corrected the draft-era reverse claim)
         pub log: unsafe extern "C-unwind" fn(host: *const ClapHost, severity: u32, message: *const c_char),
     }
 
@@ -974,6 +999,17 @@ unsafe extern "C-unwind" fn host_get_extension(
 
 unsafe extern "C-unwind" fn host_noop(_host: *const ffi::ClapHost) { host_cb_guard(|| {}) }
 
+/// v155: log-severity gate for plugin output, in clap 1.2.2 order
+/// (vendor/clap-headers/include/clap/ext/log.h): DEBUG=0, INFO=1,
+/// WARNING=2, ERROR=3, FATAL=4, HOST_MISBEHAVING=5, PLUGIN_MISBEHAVING=6.
+/// Warning-and-above — and out-of-range values, so an unknown severity
+/// fails loud instead of vanishing — always print; DEBUG/INFO print only
+/// when the host enables SLOOPER_CLAP_LOG. Pure so pins can table-test
+/// it; host_log_cb supplies env_flag from a live `var_os` read.
+fn clap_log_shown(severity: u32, env_flag: bool) -> bool {
+    severity >= ffi::CLAP_LOG_WARNING || env_flag
+}
+
 unsafe extern "C-unwind" fn host_log_cb(_host: *const ffi::ClapHost, severity: u32, msg: *const c_char) {
     host_cb_guard(|| {
         if msg.is_null() {
@@ -991,9 +1027,12 @@ unsafe extern "C-unwind" fn host_log_cb(_host: *const ffi::ClapHost, severity: u
             V117_TRAP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             panic!("v117 test trap: panic inside the CLAP host log callback");
         }
-        // Fatal/error always print; lower severities behind an env flag so a
-        // chatty plugin cannot spam a release session.
-        if severity <= 2 || std::env::var_os("SLOOPER_CLAP_LOG").is_some() {
+        // v155: clap 1.2.2 numbers DEBUG=0 .. PLUGIN_MISBEHAVING=6 — the
+        // draft-era reverse order this gate once assumed inverted it
+        // (DEBUG always printing, ERROR/FATAL hidden behind the flag).
+        // Warning-and-above always print; DEBUG/INFO hide behind an env
+        // flag so a chatty plugin cannot spam a release session.
+        if clap_log_shown(severity, std::env::var_os("SLOOPER_CLAP_LOG").is_some()) {
             eprintln!("[clap:{severity}] {m}");
         }
     })
@@ -2541,6 +2580,85 @@ pub(crate) mod tests {
         assert_eq!(clap_enum_steps(0.0, 100.0), 0, "above the cap = continuous");
         assert_eq!(clap_enum_steps(0.0, 63.0), 64, "cap edge matches the sampler");
         assert_eq!(clap_enum_steps(0.0, 64.0), 0, "one past the cap declines");
+    }
+
+    /// v155: the host-log gate in clap 1.2.2 order (log.h: DEBUG=0 ..
+    /// PLUGIN_MISBEHAVING=6), NOT the draft-era reverse order that made
+    /// DEBUG always print and hide FATAL behind the env flag.
+    #[test]
+    fn v155_clap_log_severity_table() {
+        // Env OFF: WARNING(2) and above always print...
+        for sev in [2u32, 3, 4, 5, 6] {
+            assert!(clap_log_shown(sev, false), "severity {sev} must print without the env flag");
+        }
+        // ...and DEBUG(0)/INFO(1) stay behind the flag.
+        assert!(!clap_log_shown(0, false), "DEBUG must not print with env off");
+        assert!(!clap_log_shown(1, false), "INFO must not print with env off");
+        // Env ON shows every severity (the debug flag itself is unchanged).
+        for sev in [0u32, 1, 2, 3, 4, 5, 6] {
+            assert!(clap_log_shown(sev, true), "severity {sev} must print with the env flag");
+        }
+        // Unknown severities fail loud (print), never silently vanish.
+        assert!(clap_log_shown(7, false), "out-of-range severity must print");
+        assert!(clap_log_shown(u32::MAX, false), "extreme severity must print");
+    }
+
+    /// v155: the table's numbers are the vendored clap 1.2.2 header's —
+    /// pin ffi constants and the gate against `ext/log.h` so a header
+    /// bump cannot silently re-invert the gate.
+    #[test]
+    fn v155_clap_log_severity_header_parity() {
+        let h = include_str!("../vendor/clap-headers/include/clap/ext/log.h");
+        let ffi_vals = [
+            ("CLAP_LOG_DEBUG", ffi::CLAP_LOG_DEBUG),
+            ("CLAP_LOG_INFO", ffi::CLAP_LOG_INFO),
+            ("CLAP_LOG_WARNING", ffi::CLAP_LOG_WARNING),
+            ("CLAP_LOG_ERROR", ffi::CLAP_LOG_ERROR),
+            ("CLAP_LOG_FATAL", ffi::CLAP_LOG_FATAL),
+            ("CLAP_LOG_HOST_MISBEHAVING", ffi::CLAP_LOG_HOST_MISBEHAVING),
+            ("CLAP_LOG_PLUGIN_MISBEHAVING", ffi::CLAP_LOG_PLUGIN_MISBEHAVING),
+        ];
+        for (name, val) in ffi_vals {
+            assert!(h.contains(&format!("{name} = {val},")), "{name} != {val} in vendored log.h");
+        }
+        // The gate flips exactly at WARNING.
+        assert!(clap_log_shown(ffi::CLAP_LOG_WARNING, false), "WARNING prints");
+        assert!(!clap_log_shown(ffi::CLAP_LOG_INFO, false), "INFO stays gated");
+    }
+
+    /// v155: `host_log_cb` itself must route the decision through the
+    /// pure gate and keep reading the env flag live (active-code slice
+    /// of the callback body — commented-out needles don't count), and
+    /// the draft-era severity comment must stay gone.
+    #[test]
+    fn v155_clap_log_cb_wires_the_pure_gate() {
+        let src = include_str!("claphost.rs");
+        let body = src
+            .split("fn host_log_cb(")
+            .nth(1)
+            .expect("host_log_cb present")
+            .split("\n}")
+            .next()
+            .unwrap();
+        let active: String = body
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("///"))
+            })
+            .collect();
+        assert!(
+            active.contains("clap_log_shown(severity,"),
+            "host_log_cb gate must call clap_log_shown(severity, ...)"
+        );
+        assert!(
+            active.contains("var_os(\"SLOOPER_CLAP_LOG\")"),
+            "host_log_cb must keep reading SLOOPER_CLAP_LOG via a live var_os"
+        );
+        // The draft-era reverse-order comment must not come back. The
+        // needle is split so this pin's own source cannot match itself.
+        let stale = ["0 fatal ", ".. 5 trace"].concat();
+        assert!(!src.contains(&stale), "draft-era severity-order comment must stay gone");
     }
 
     /// Compile the repo's fixture plugin into `target/clap-fixture/`
