@@ -70,8 +70,9 @@ tarball.
   or any hosted VSTi/CLAP instrument — native plugin editor windows
   included.
 - **Piano roll** — draw and edit notes on the snap grid, one-click quantize,
-  velocity and glide lanes; previews through the target track's synth + FX
-  chain.
+  a velocity lane, and per-note pitch curves drawn right on the note body
+  (`Z`+drag — 808-style slides); previews through the target track's
+  synth + FX chain.
 - **23 bundled effects** — EQ, dynamics, delay/reverb, modulation,
   distortion, pitch and spectral tools, all runtime-compiled, hot-reloadable
   Rust scripts. Write your own with the same ABI.
@@ -136,6 +137,7 @@ troubleshooting: **[docs/INSTALL.md](docs/INSTALL.md)**.
 | [docs/PLUGINS.md](docs/PLUGINS.md) | scripted synths, VST/CLAP hosting, presets |
 | [docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md) | the 23 bundled effects, and writing your own |
 | [docs/SIDECHAIN.md](docs/SIDECHAIN.md) | sidechain routing |
+| [docs/SAMPLER-PITCH.md](docs/SAMPLER-PITCH.md) | per-note pitch curves — the drawn-on-note interaction and engine design |
 | [docs/AGENT-GUIDE.md](docs/AGENT-GUIDE.md) | architecture map for automation / AI agents |
 | [Wiki](https://github.com/actually-god/slooper/wiki) | step-by-step tutorials |
 
