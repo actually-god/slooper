@@ -487,6 +487,144 @@ fn v107_mcp_lifecycle_port_busy_keeps_boot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── v156 (card t_13be8ef0): port-0 steady state — the rebind-storm class ──
+//
+// The shipped bug: `sync()` compared the CONFIGURED port against the
+// listener's REAL port, so a configured 0 never matched its own ephemeral
+// bind — every frame stopped and restarted the server on a new port with
+// a re-rolled token, and no client could ever finish a request (field
+// evidence: ~10 distinct ports in the endpoint file within 1.5 s). The
+// D6 pins missed the class because every lifecycle pin called sync() at
+// most once per asserted state — never twice in steady state.
+
+#[test]
+fn v156_mcp_port0_stable_across_frames() {
+    // The storm guard: frames N..N+4 with the advertised "0 picks any
+    // free port" flow must keep ONE bind — same port, same token,
+    // endpoint file untouched — and that bind must be a live, serving
+    // socket (the reported symptom was connection-refused on EVERY call).
+    let dir = isolated_data_dir("v156p0");
+    let mut app = headless_app("v156p0");
+    let ctx = egui::Context::default();
+    app.mcp_port = 0;
+    app.mcp_enabled = true;
+    app.mcp_frame(&ctx);
+    let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint after start");
+    assert!(port > 0, "port 0 resolved to an ephemeral port");
+    for frame in 2..=5 {
+        app.mcp_frame(&ctx);
+        let srv = app.mcp.as_ref().unwrap();
+        assert!(srv.is_running(), "frame {frame}: server still running");
+        assert_eq!(srv.port(), Some(port), "frame {frame}: port 0 keeps the current bind");
+        let (ep_port, ep_token) =
+            crate::mcp::bridge::read_endpoint().expect("endpoint file survives");
+        assert_eq!(
+            (ep_port, ep_token.as_str()),
+            (port, token.as_str()),
+            "frame {frame}: endpoint file must not churn (a rebind re-rolls port AND token)"
+        );
+        assert!(
+            app.status.contains(&format!("127.0.0.1:{port} \u{2014}")),
+            "frame {frame}: status names the LIVE port (a rebind echoes a different one): {}",
+            app.status
+        );
+    }
+    // Live round-trip on the surviving bind: full handshake + discovery
+    // over the socket the endpoint file advertised (kit pump drains on
+    // this thread exactly like the frame loop).
+    let v = testkit::socket_json(
+        &mut app,
+        port,
+        &token,
+        &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pin","version":"1"}}}).to_string(),
+    );
+    assert_eq!(v["result"]["serverInfo"]["name"], "slooper");
+    let v = testkit::socket_json(
+        &mut app,
+        port,
+        &token,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}).to_string(),
+    );
+    assert!(
+        v["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "core.echo"),
+        "the surviving ephemeral bind serves tools/list"
+    );
+    assert_eq!(app.mcp.as_ref().unwrap().port(), Some(port), "round-trips did not churn the bind");
+    // Ephemeral binds hot-stop cleanly.
+    app.mcp_enabled = false;
+    app.mcp_frame(&ctx);
+    assert!(!app.mcp.as_ref().unwrap().is_running(), "disable hot-stops an ephemeral bind");
+    assert!(!crate::mcp::bridge::endpoint_path().exists(), "stop removes our endpoint file");
+    clear_data_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v156_mcp_port_change_applies_live_without_storm() {
+    // Config changes keep applying live, but ANY steady state must sit on
+    // one bind — including port 0 reached FROM a fixed value (the user
+    // typing 0 into the Settings box, not just 0-at-boot).
+    let dir = isolated_data_dir("v156chg");
+    let mut app = headless_app("v156chg");
+    let ctx = egui::Context::default();
+    // Fixed start on a grab-and-released ephemeral (pins never fight fixed ports).
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let f1 = probe.local_addr().unwrap().port();
+    drop(probe);
+    app.mcp_port = f1;
+    app.mcp_enabled = true;
+    app.mcp_frame(&ctx);
+    assert_eq!(app.mcp.as_ref().unwrap().port(), Some(f1), "fixed port binds exactly");
+    app.mcp_frame(&ctx);
+    assert_eq!(app.mcp.as_ref().unwrap().port(), Some(f1), "fixed port is stable across frames");
+    // The user types 0: the listener lands on a working bind and STAYS.
+    app.mcp_port = 0;
+    app.mcp_frame(&ctx);
+    let p0 = app.mcp.as_ref().unwrap().port().expect("port 0 binds after a fixed value");
+    assert!(p0 > 0);
+    for frame in 2..=4 {
+        app.mcp_frame(&ctx);
+        assert_eq!(app.mcp.as_ref().unwrap().port(), Some(p0), "frame {frame}: 0-after-fixed must not storm");
+        let (ep, _) = crate::mcp::bridge::read_endpoint().expect("endpoint tracks the live port");
+        assert_eq!(ep, p0, "frame {frame}: endpoint file names the live port");
+    }
+    // Back to a fixed value: applies live, exactly, and is stable. (f2 is
+    // kernel-guaranteed != p0: p0 is still bound while the probe binds.)
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let f2 = probe.local_addr().unwrap().port();
+    drop(probe);
+    app.mcp_port = f2;
+    app.mcp_frame(&ctx);
+    assert_eq!(app.mcp.as_ref().unwrap().port(), Some(f2), "0 -> fixed rebinds to the exact port");
+    app.mcp_frame(&ctx);
+    assert_eq!(app.mcp.as_ref().unwrap().port(), Some(f2), "fixed-after-0 is stable");
+    clear_data_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v156_mcp_sync_compares_configured_port() {
+    // Drift guard for the exact comparison that stormed: the running-vs-
+    // wanted check must compare the CONFIGURED port that produced the
+    // bind (Running::cfg_port), never the listener's real port — a real
+    // port can never equal 0, so the old form reborn would re-open the
+    // storm. Needles split via concat! (source-scan doctrine; the scan
+    // target is mod.rs, the pin lives in tests.rs — no self-match).
+    let body = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/mod.rs"),
+    )
+    .expect("src/mcp/mod.rs readable");
+    let want = concat!("r.cfg_", "port != port");
+    assert!(body.contains(want), "sync() must compare the CONFIGURED port: {want:?} missing");
+    let storm = concat!("r.", "port != port");
+    assert!(
+        !body.contains(storm),
+        "src/mcp/mod.rs must not compare the listener's REAL port against the config — \
+         port 0 never equals its own ephemeral bind (t_13be8ef0 rebind storm)"
+    );
+    assert!(body.contains(concat!("cfg_", "port: port")), "the bind must record the configured port it was asked for");
+}
+
 // ── tool table invariants (source-scan family, design §6 pin) ────────────
 
 #[test]
