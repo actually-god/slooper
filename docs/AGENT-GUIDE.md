@@ -138,6 +138,21 @@ src/            application source (Rust 2021 edition)
   fx.rs           effects scan/compile/cache/load, ABI validation, chains,
                   hand-rolled user-preset JSON
   fxgui.rs        child editor windows (auto sliders or scripted GUIs)
+  kit.rs          v54 design tokens — the single source for CHROME colors
+                  (ACCENT, EDGE, KIT_BG, text/edge tokens; `Kit::of` gives
+                  a surface the theme's set): never hand-write an accent
+                  RGB again, import it from here. Data palettes (clip/note/
+                  grid colors) deliberately live with their owning painter —
+                  they encode meaning, not theme.
+  presetbar.rs    v77 ONE preset/persistence bar shared by the five preset
+                  surfaces (hosted plugin params, sampler key map, track
+                  templates, script-synth sliders, drum kits): a surface
+                  supplies a `PresetBarSpec` + cached list and gets back a
+                  `PresetBarAction` it executes itself (deferred-action
+                  pattern — never here); `PresetStore` parameterizes
+                  storage, `sanitize()` is this module's traversal-safe
+                  sanitizer. Effect/automation presets keep the INTENTIONAL
+                  lenient `fx::sanitize_preset_name` fork (v142 note).
   midi.rs         MIDI message parsing, MidiBind matching, MidiAction
                   table, keyboard-shortcut layout migration (v0.1 → v0.2)
   midiin.rs       W9 Windows MIDI bus: lock-free MPMC event ring (WinMM
@@ -156,17 +171,28 @@ src/            application source (Rust 2021 edition)
                   tools.rs (global tool registry — MCP-02..05 register
                   via install_all seams, read-only latch is flag-declared,
                   never name-parsed), bridge.rs (`--mcp-bridge` stdio
-                  shim). UI pumps requests; execution is UI-thread only.
-                  mcp_settings/ (v108): the `settings.*` family over
-                  Config serde reflection (live vs requires-restart
-                  tiers, `mcp_cfg_pending` overlay); ui/mcp_mixer.rs
-                  (v110): `mixer.*`/`chain.*`/`assets.*` over the GUI's
-                  own setter seams;
-                  ui/mcp_windows.rs (v111): the `windows.*` family —
-                  stable window ids (prim kinds + DynKind keys), open/
-                  close/move/resize/dock/undock, named layout save/restore
-                  via the WinLayout config table; every ack echoes
-                  post-change geometry.
+                  shim). UI pumps requests; execution is UI-thread only. The
+                  sibling MCP families live at their own paths and keep
+                  their own entries below: `mcp_settings/` (v108),
+                  `mcp_plugins/` (v128), `ui/mcp_mixer.rs` (v110),
+                  `ui/mcp_windows.rs` (v111) — all speak this registry's
+                  UI-thread, observed-then-ack contract.
+  mcp_settings/   v108/MCP-02: `settings.list/get/set` over Config serde
+                  reflection — the config snapshot IS the field list (a
+                  new `Config` field appears automatically; the
+                  completeness pins fail until it is classified Live or
+                  Restart). Live tier applies through the GUI's own
+                  setter seams; Restart tier persists to config.json +
+                  `App::mcp_cfg_pending` overlay (re-applied across
+                  saves). Validation = full `from_value::<Config>`
+                  round-trip: a refusal changes nothing.
+  mcp_plugins/    v128/MCP-05: `plugins.*`/`plugin.*`/`sampler.*`/
+                  `drum.*`/`midi.*` for the NATIVE (bundled script)
+                  plugin instances only, over the ui.rs `mcp05_*` seams;
+                  values speak the param's declared desc-range currency
+                  (every schema carries min/max/unit/step/labels).
+                  Hosted VST/CLAP answer `wrong_kind` — their editors
+                  own their parameters.
   audio/rt_recovery.rs
                   W12a pure recovery table: the WASAPI RT thread classifies
                   its own death (none/stream/device-invalidated), the idle
@@ -186,6 +212,24 @@ src/            application source (Rust 2021 edition)
                   (strips, MIXER CHAIN window, synth bindings, VST plugin
                   picker), group selection + clipboard, piano-roll window,
                   settings, project prompt/browser, export, MIDI monitor)
+  ui/             child modules of the `ui` mod (ui.rs + ui/ dir):
+  ui/mcp_mixer.rs v110/MCP-04: `mixer.*`/`chain.*`/`assets.*` — a child
+                  module of `ui` on purpose: every write rides the exact
+                  setter seams the mouse path uses (`set_trk_vol/gain/
+                  pan/color`, the v110 `set_master_midi`/`set_sc_send_mask`
+                  homes, chain add/remove, rack + drop-assignment seams);
+                  MIDI-range int units (vol 0=-inf/115=0 dB), observed-
+                  then-ack + status echo. `tests.rs` drives the real
+                  dispatcher.
+  ui/mcp_windows.rs
+                  v111/MCP-03: the `windows.*` family — stable machine
+                  ids (four primaries by `PrimKind`, dynamic windows by
+                  `DynKind::key()` + `params:` extensions; roster indices
+                  never surface), open/close/move/resize/dock/undock +
+                  named layout save/restore via the WinLayout config
+                  table; native plugin editor windows are list/close-only
+                  (opening stays a crash-guarded GUI action); every ack
+                  echoes post-change geometry.
 synths/         bundled synth scripts (piano, sampler, drums, granular,
                 pad, fm, additive, pluck, tri_osc — 9 scripts, all seeded
                 + updated in place)
@@ -202,9 +246,10 @@ tests/packaging.sh  packaging regression test (needs a PKGBUILD; see below)
 assets/icon.png 256x256 app icon (placeholder artwork)
 slooper.desktop  freedesktop menu entry
 docs/           INSTALL.md, USAGE.md, PLUGINS.md, EFFECT-SUITE.md,
-                SIDECHAIN.md, SAMPLER-PITCH.md (human docs), MCP-DESIGN.md
-                (the MCP series design spine), WINDOWS-PORT.md (the W-series
-                port log), this file. Tutorials live in the GitHub wiki
+                SIDECHAIN.md, SAMPLER-PITCH.md, MCP.md (human docs),
+                MCP-DESIGN.md (the MCP series design spine),
+                WINDOWS-PORT.md (the W-series port log), this file.
+                Tutorials live in the GitHub wiki
 ```
 
 ## Build & test commands
@@ -360,6 +405,13 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
    de-brand batches, style fixes, or "conciseness" passes (the conciseness
    doctrine does not apply inside the block). If a docs change would otherwise
    touch it, leave the block byte-identical and put the diff anywhere else.
+12. **Chrome colors come from `kit.rs`** (v54): the accent/edge/text tokens
+   are the single authority — never hand-write an accent RGB in a painter
+   (the ~20 chrome paint sites once drifted into two near-identical blues).
+   Import from `kit::` instead. Data palettes (clip/note/grid colors that
+   encode meaning) deliberately stay with their owning painter, and
+   `KIT_BG` stays dark in BOTH themes (script canvas colors are
+   dark-authored floats).
 
 ## Where things are wired (quick grep targets)
 
@@ -457,4 +509,5 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
 | sysadmin / packager | [INSTALL.md](INSTALL.md) |
 | effect-script author | `effects/template.rs` (self-documenting) + *Track effects & plugins* in USAGE.md + bundled suite examples (`effects/`, roster in [EFFECT-SUITE.md](EFFECT-SUITE.md)) |
 | synth-script / VST author | [PLUGINS.md](PLUGINS.md) + `synths/synth_api.rs` |
+| AI agent driving the app | [MCP.md](MCP.md) (enable flow, token, bridge, tool reference) |
 | CI/automation agents | this file |
