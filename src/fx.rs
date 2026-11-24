@@ -252,9 +252,23 @@ pub fn ensure_user_presets_dir(fx_dir: &Path) -> std::io::Result<PathBuf> {
     Ok(d)
 }
 
-/// Filesystem-safe preset name: keep letters/digits/space/dot/dash/underscore
-/// (UTF-8 aware so accented names survive), collapse runs of rejected chars
-/// to a single dash, trim. Empty result becomes "preset".
+/// Filesystem-safe preset name for EFFECT/AUTOMATION presets: keep
+/// letters/digits/space/dot/underscore (UTF-8 aware so accented names
+/// survive), collapse runs of rejected chars to a single dash, trim.
+/// Empty result becomes "preset". NO length cap.
+///
+/// v142 (t_b5eb2cf3): intentional twin of [`crate::presetbar::sanitize`]
+/// (the v77 bar-surface slugger: ASCII-only, spaces→'-', cap 48, can
+/// return empty). The fork is load-bearing, NOT drift: every effect and
+/// automation preset file on existing disks — user presets AND the
+/// seeded built-ins — embeds these lenient rules in its file name
+/// ("Warm Room.json"), so re-routing through the bar sanitizer would
+/// rename or orphan them; the five bar surfaces conversely already wrote
+/// slug-form names. Both twins keep the same safety floor (single path
+/// component, no traversal, no hidden dot-names) and the byte-level fork
+/// table is pinned by `presetbar::tests::v142_sanitizers_fork_table` +
+/// `v142_preset_names_disk_roundtrip`. Do not "unify" without a
+/// migration story.
 pub fn sanitize_preset_name(raw: &str) -> String {
     let mut out = String::new();
     let mut pending_dash = false;

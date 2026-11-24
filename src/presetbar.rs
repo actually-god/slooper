@@ -17,10 +17,24 @@
 //!
 //! [`PresetStore`] parameterizes STORAGE by directory + file type, so the
 //! five list/save/load/delete twins share one implementation of the
-//! traversal-safe path math. [`sanitize`] is the v56 sanitizer moved to
-//! its single home: keep `[A-Za-z0-9-_]`, spaces→'-', collapse runs,
-//! trim, cap 48 — `"../evil"` collapses to `"evil"` (no traversal by
-//! construction).
+//! traversal-safe path math. [`sanitize`] is the v56 sanitizer and the
+//! single home for THIS module's surfaces: keep `[A-Za-z0-9-_]`,
+//! spaces→'-', collapse runs, trim, cap 48 — `"../evil"` collapses to
+//! `"evil"` (no traversal by construction).
+//!
+//! v142 (t_b5eb2cf3) honesty note: it is NOT the only preset sanitizer in
+//! the codebase. Effect/automation presets use `fx::sanitize_preset_name`
+//! (keeps spaces/dots/UTF-8 letters, no cap, `"preset"` empty-fallback),
+//! and that fork is INTENTIONAL: those preset files predate this module
+//! and their on-disk names embed the lenient rules (e.g. "Warm Room"), so
+//! re-routing them would rename or orphan existing user presets (and the
+//! seeded built-ins) with no migration — the reverse route orphans the
+//! slug-form names the five bar surfaces already wrote. Both sides keep
+//! the same safety floor (single path component, no traversal, no hidden
+//! dot-names); the exact byte-level fork table is pinned by
+//! `v142_sanitizers_fork_table` in this module's tests, together with
+//! idempotency, path-safety and the shared-name disk round-trip. Do not
+//! "unify" the two without a migration story.
 
 use std::path::{Path, PathBuf};
 
@@ -150,6 +164,17 @@ fn picker_rows(
 /// The v56 sanitizer: collapse anything filesystem-hostile.
 /// Keep `[A-Za-z0-9-_]`, map spaces and stray chars to '-', collapse
 /// runs, trim, cap at 48 chars. `"../evil"` -> `"evil"`.
+///
+/// v142 (t_b5eb2cf3): this is the single home for the [`PresetStore`]
+/// bar surfaces ONLY — effect/automation presets use the intentional
+/// lenient twin [`crate::fx::sanitize_preset_name`] (spaces/dots/UTF-8
+/// letters kept, no cap, `"preset"` fallback) because those preset
+/// files were written under those rules since v0.13. Both twins are
+/// pinned side by side in this module's tests (`v142_sanitizers_*`,
+/// `v142_preset_names_disk_roundtrip`): simple `[A-Za-z0-9-_]` names
+/// agree byte-identically across the fork; the divergences below are
+/// load-bearing data-compat, not drift. Empty output is possible
+/// ("!!!" -> ""); `PresetStore::write_json` refuses it (v132).
 pub fn sanitize(name: &str) -> String {
     let mut s: String = name
         .trim()
@@ -425,6 +450,186 @@ mod tests {
             .expect("normal name writes");
         assert_eq!(nm, "Warm-Room");
         assert_eq!(store.list(), vec!["Warm-Room".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- v142 (t_b5eb2cf3): the two preset sanitizers are ONE documented
+    // fork, not drift. `sanitize` (this module) names the five v77 bar
+    // surfaces; `fx::sanitize_preset_name` names effect/automation presets.
+    // Unifying either direction would rename or orphan preset files that
+    // already exist on user disks under the other's rules (see the header
+    // note). These pins freeze the byte-level contract: any edit to either
+    // sanitizer trips the table, and a NEW third naming scheme trips the
+    // round-trip. No behavior change here — these are pin-only.
+
+    /// Exact fork table. Rows 1-4 + the Windows-path row: names made of
+    /// simple characters agree BYTE-IDENTICALLY across the fork, so
+    /// cross-surface expectations (and any future export/migration code)
+    /// can rely on equality for that whole class. The remaining rows are
+    /// the documented divergences: spaces, symbols, dots, UTF-8 letters,
+    /// the 48-char cap (row: 60 k's), and the empty polarity.
+    #[test]
+    fn v142_sanitizers_fork_table() {
+        use crate::fx;
+        let rows: &[(&str, &str, &str)] = &[
+            // simple class: byte-identical across the fork
+            ("kick", "kick", "kick"),
+            ("kick-drum", "kick-drum", "kick-drum"),
+            ("kit_1", "kit_1", "kit_1"),
+            ("  spaced  ", "spaced", "spaced"),
+            ("C:\\evil", "C-evil", "C-evil"),
+            ("../../evil", "evil", "evil"),
+            // documented divergences (fork is load-bearing, not drift)
+            ("Warm Room", "Warm-Room", "Warm Room"), // spaces kept by fx
+            ("My Mix!", "My-Mix", "My Mix"),         // symbol + space
+            ("my file.tar.gz", "my-file-tar-gz", "my file.tar.gz"), // dots kept by fx
+            ("Café", "Caf", "Café"), // ASCII-only vs UTF-8 letters
+            ("...  ", "", "preset"), // empty polarity: "" vs fallback
+        ];
+        for (raw, want_pb, want_fx) in rows {
+            assert_eq!(&sanitize(raw), want_pb, "presetbar::sanitize({raw:?})");
+            assert_eq!(
+                &fx::sanitize_preset_name(raw),
+                want_fx,
+                "fx::sanitize_preset_name({raw:?})"
+            );
+        }
+        // Cap polarity: presetbar cuts at 48, fx has no cap. A 60-char
+        // name keeps its identity on the fx path and its first 48 on the
+        // bar path — deliberate, both stable under re-sanitizing (see the
+        // idempotency pin), and any silent cap change reddens this row.
+        let long = "k".repeat(60);
+        assert_eq!(sanitize(&long), "k".repeat(48));
+        assert_eq!(fx::sanitize_preset_name(&long), long);
+    }
+
+    /// Both sanitizers are fixed-point-stable: sanitize(sanitize(x)) ==
+    /// sanitize(x). This is what makes the round-trip below hold: a name
+    /// shown in a picker and re-saved must map to the SAME file, never a
+    /// second-collided one ("evil" -> "evil", not "evil" -> "e-...").
+    #[test]
+    fn v142_sanitizers_idempotent() {
+        use crate::fx;
+        let corpus = [
+            "kick",
+            "Warm Room",
+            "My Mix!",
+            "my file.tar.gz",
+            "Café",
+            "../../evil",
+            "a/b/../c",
+            "  ",
+            "!!!",
+            "..",
+            "k",
+        ];
+        for raw in corpus {
+            let once = sanitize(raw);
+            assert_eq!(sanitize(&once), once, "presetbar not idempotent on {raw:?}");
+            let fx_once = fx::sanitize_preset_name(raw);
+            assert_eq!(
+                fx::sanitize_preset_name(&fx_once),
+                fx_once,
+                "fx not idempotent on {raw:?}"
+            );
+        }
+        // The 48-cap is stable too (cutting an already-cut name changes
+        // nothing) — guards the cap row of the fork table from drift.
+        let long = "k".repeat(60);
+        let once = sanitize(&long);
+        assert_eq!(sanitize(&once), once);
+    }
+
+    /// Shared safety floor across the fork: whatever the naming rules,
+    /// every hostile input must collapse to ONE safe path component on
+    /// both paths — no separators, no dot-prefixed/hidden names, no "..".
+    /// fx never yields empty ("preset" fallback); presetbar MAY yield
+    /// empty, which PresetStore::write_json refuses (pinned by
+    /// v132_write_json_refuses_name_collapsing_to_empty above).
+    #[test]
+    fn v142_sanitizers_path_safe() {
+        use crate::fx;
+        let hostile = [
+            "../evil",
+            "..",
+            ".",
+            "/",
+            "\\",
+            "\\\\..",
+            "a\\b",
+            "a/b/../c",
+            "...",
+            "C:\\evil\\x",
+            "%2e%2e%2fx",
+        ];
+        for raw in hostile {
+            let out = sanitize(raw);
+            if !out.is_empty() {
+                assert!(
+                    !out.contains('/') && !out.contains('\\'),
+                    "presetbar leaked a separator: {raw:?} -> {out:?}"
+                );
+                assert!(!out.starts_with('.'), "presetbar hidden name: {out:?}");
+            }
+            let out = fx::sanitize_preset_name(raw);
+            assert!(!out.is_empty(), "fx fallback vanished on {raw:?}");
+            assert!(
+                !out.contains('/') && !out.contains('\\'),
+                "fx leaked a separator: {raw:?} -> {out:?}"
+            );
+            assert!(!out.starts_with('.'), "fx hidden name: {out:?}");
+            assert_ne!(out, "..", "fx produced a traversal component from {raw:?}");
+        }
+    }
+
+    /// The card's shared-name round-trip, on disk, for BOTH persistence
+    /// paths: save under a hostile raw name → the picker's list() shows
+    /// exactly sanitize(raw) → feeding THAT displayed name back through
+    /// the path function lands on the SAME file, and any other raw name
+    /// that collapses to the same sanitized name collides onto it
+    /// (overwrite = "save" semantics, not a second file).
+    #[test]
+    fn v142_preset_names_disk_roundtrip() {
+        use crate::fx;
+        let pid = std::process::id();
+
+        // --- bar path (PresetStore) ---
+        let dir = std::env::temp_dir().join(format!("v142bar-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = PresetStore::json(dir.clone());
+        let name = store
+            .write_json("../../evil", &vec![(1i64, 0.5f64)])
+            .expect("hostile-but-collapsible name writes");
+        assert_eq!(name, "evil");
+        assert_eq!(store.list(), vec!["evil".to_string()]);
+        // the listed (display) name round-trips to the written file...
+        let written = dir.join("evil.json");
+        assert_eq!(store.file(&store.list()[0]), written);
+        // ...and a different raw name collapsing to it hits the SAME file.
+        assert_eq!(store.file("evil!"), written);
+        let back: Vec<(i64, f64)> = store
+            .load_json("evil!")
+            .expect("collision loads the same file");
+        assert_eq!(back, vec![(1, 0.5)]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // --- fx path (effect/automation presets) ---
+        let dir = std::env::temp_dir().join(format!("v142fx-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(fx::user_presets_dir(&dir)).unwrap();
+        let written = fx::user_preset_path(&dir, "space_echo", "../../evil");
+        std::fs::write(&written, "{}").unwrap();
+        let listed = fx::list_user_presets(&dir, "space_echo");
+        assert_eq!(listed, vec!["evil".to_string()]);
+        // displayed name feeds back to the same path without the raw...
+        assert_eq!(fx::user_preset_path(&dir, "space_echo", &listed[0]), written);
+        // ...and a collapsing raw name collides onto it.
+        assert_eq!(fx::user_preset_path(&dir, "space_echo", "evil!!!"), written);
+        // a name that does NOT collapse stays a distinct file.
+        assert_ne!(
+            fx::user_preset_path(&dir, "space_echo", "evil 2"),
+            written
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
