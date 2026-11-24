@@ -102,6 +102,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   shared wheel angle through the app's equal-power pan law — a full
   image shift at constant loudness at either extreme (pinned by
   `v126_*`).
+
+- **Cancel-a-knob-learn no longer wipes an unrelated key binding.**
+  Pressing **Delete** while binding a MIDI knob to a project value
+  (volume, pan, an FX parameter) used to silently clear the **action-0**
+  MIDI binding — "record (selected)" — because the value wizard shares
+  the action wizard's slot field and used it as its index; the value
+  binding you actually meant to cancel stayed bound, and the status line
+  (and the wizard header) named the wrong thing. Delete now mirrors the
+  bindings rack: on a re-learn it unbinds exactly that value binding, on
+  a fresh one it just cancels, and the action-slot wizard is untouched
+  (v124).
 - **Every release artifact now carries the piano sample's GPL-2 notice
   and license text.** The embedded piano blob derives from the GPL-2
   TimGM6mb soundfont, but the disclosure lived only inside the repo tree
