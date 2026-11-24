@@ -8,6 +8,13 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Windows: the MIDI "Refresh" button now says what it re-scans.** In
+  Settings → MIDI INPUTS, the Refresh button hovered “re-scan the JACK
+  port list” — copy-pasted from the audio ports section above. On
+  Windows the audio list is WASAPI endpoints (JACK is an opt-in
+  backend), and this control re-scans the MIDI devices: the one button
+  you reach for after hot-plugging a MIDI keyboard named the wrong
+  subsystem. It now reads “re-scan the MIDI device list”.
 - **Cymbals and toms now decay to silence instead of being chopped.** The
   stock kit retired its voices long before their tails were inaudible — at
   the top of the decay slider a crash was hard-silenced barely halfway
