@@ -146,7 +146,6 @@ fn e2e_reset(b: &Backend) {
 struct Cap {
     ring: Arc<Vec<AtomicU32>>,
     widx: Arc<AtomicU64>,
-    src_name: String,
     active: AsyncClient<(), CapProc>,
 }
 
@@ -171,7 +170,6 @@ fn e2e_capture(b: &Backend, tag: &str, gain: u8) -> Cap {
     Cap {
         ring,
         widx,
-        src_name,
         active,
     }
 }
@@ -182,9 +180,7 @@ fn e2e_capture(b: &Backend, tag: &str, gain: u8) -> Cap {
 struct SrcCap {
     ring: Arc<Vec<AtomicU32>>,
     widx: Arc<AtomicU64>,
-    mode: Arc<AtomicU8>,
     const_val: Arc<AtomicU32>,
-    src_name: String,
     active: AsyncClient<(), LoopSrcProc>,
 }
 
@@ -221,9 +217,7 @@ fn e2e_capture_src(b: &Backend, tag: &str, seed: u32, src_in: bool, gain: u8) ->
     SrcCap {
         ring,
         widx,
-        mode,
         const_val,
-        src_name,
         active,
     }
 }
@@ -234,7 +228,8 @@ struct SdifCap {
     ring_sum: Arc<Vec<AtomicU32>>,
     ring_dif: Arc<Vec<AtomicU32>>,
     widx: Arc<AtomicU64>,
-    active: AsyncClient<(), DiffProc>,
+    // keep-alive only: no test drops/reads it, the struct's lifetime owns it
+    _active: AsyncClient<(), DiffProc>,
 }
 
 fn e2e_capture_sumdif(b: &Backend, tag: &str) -> SdifCap {
@@ -270,7 +265,7 @@ fn e2e_capture_sumdif(b: &Backend, tag: &str) -> SdifCap {
         ring_sum,
         ring_dif,
         widx,
-        active,
+        _active: active,
     }
 }
 
@@ -2797,9 +2792,6 @@ fn e2e_v37_recording_suppresses_park_and_autostop() {
     // pin in this file wires a dummy pair first) — without this the
     // playhead never advances and the test would only measure JACK.
     let cap = e2e_capture_src(&b, "daw_test_v37", 0x1234_5678, true, 3);
-    let ring = cap.ring.clone();
-    let widx = cap.widx.clone();
-    let mode = cap.mode.clone();
     let active = cap.active;
     let table: Arc<Vec<Arc<[f32]>>> = Arc::new(vec![]);
     b.cmd(Cmd::SetProject {
@@ -4313,7 +4305,7 @@ type V95Rig = (
 fn v95_sc_setup(tag: &str) -> Option<V95Rig> {
     let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    \};
+    };
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4405,7 +4397,6 @@ fn v95_sc_duck_baseline(
 /// v95: muting the KEY TRACK in the main mix must not un-key the target.
 #[test]
 fn e2e_v95_sc_muted_sender_still_ducks() {
-    let _g = e2e_lock();
     let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scmute") else {
         return;
     };
@@ -4430,7 +4421,6 @@ fn e2e_v95_sc_muted_sender_still_ducks() {
 /// v95: dragging the KEY TRACK's volume fader to zero must not un-key.
 #[test]
 fn e2e_v95_sc_zero_volume_sender_ducks() {
-    let _g = e2e_lock();
     let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvol0") else {
         return;
     };
@@ -4454,7 +4444,6 @@ fn e2e_v95_sc_zero_volume_sender_ducks() {
 /// is pre-fader: the key level — hence the depth — is fader-invariant).
 #[test]
 fn e2e_v95_sc_sender_vol_move_keeps_duck_depth() {
-    let _g = e2e_lock();
     let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scvolmv") else {
         return;
     };
@@ -4482,7 +4471,6 @@ fn e2e_v95_sc_sender_vol_move_keeps_duck_depth() {
 /// opposite key effect — gain feeds the tap, volume never does).
 #[test]
 fn e2e_v95_sc_sender_gain_zero_kills_key() {
-    let _g = e2e_lock();
     let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v95scg0") else {
         return;
     };
@@ -4512,7 +4500,6 @@ fn e2e_v95_sc_sender_gain_zero_kills_key() {
 /// assert goes red; freeze it at 1.0 and the 0.5/2.0 asserts go red.)
 #[test]
 fn e2e_v97_sc_send_gain_scales_duck() {
-    let _g = e2e_lock();
     let Some((_g, b, ring, widx, sr, _scope)) = v95_sc_setup("v97scgain") else {
         return;
     };
@@ -4567,7 +4554,7 @@ fn e2e_v97_sc_send_gain_scales_duck() {
 fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
     let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    \};
+    };
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4623,7 +4610,6 @@ fn v97_sc_setup2(tag: &str) -> Option<V95Rig> {
 /// the summed key, per pair, not as a global post-fader multiplier.
 #[test]
 fn e2e_v97_sc_two_source_mix_swaps_duck() {
-    let _g = e2e_lock();
     let Some((_g, b, ring, widx, sr, _scope)) = v97_sc_setup2("v97scmix") else {
         return;
     };
@@ -4725,7 +4711,7 @@ type V96Rig = (
 fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
     let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    \};
+    };
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4765,7 +4751,6 @@ fn v96_multi_preview_setup(tag: &str) -> Option<V96Rig> {
 /// v96_picker_multi_route_toggle + v96_multiselect_selection_routes_preview.)
 #[test]
 fn e2e_v96_multi_preview_pair_ducks() {
-    let _g = e2e_lock();
     let Some((_g, b, ring_l, ring_r, widx, sr, _scope)) = v96_multi_preview_setup("v96mprev") else {
         return;
     };
@@ -4851,7 +4836,7 @@ type V99Rig = (
 fn v99_sc_setup(tag: &str) -> Option<V99Rig> {
     let Some((_g, b, _client_name, sr)) = e2e_backend() else {
         return None; // no audio server: skip
-    \};
+    };
     let dir = std::env::temp_dir().join(format!("slooper-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4934,7 +4919,6 @@ fn v99_both(rl: &Arc<Vec<AtomicU32>>, rr: &Arc<Vec<AtomicU32>>, widx: &AtomicU64
 /// v97-family ratios with >=25 % margins.
 #[test]
 fn e2e_v99_sc_send_gain_moves_both_targets_equally() {
-    let _g = e2e_lock();
     let Some((_g, b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scgain") else {
         return;
     };
@@ -4995,7 +4979,6 @@ fn e2e_v99_sc_send_gain_moves_both_targets_equally() {
 /// at zero gain still opens both.
 #[test]
 fn e2e_v99_sc_send_pan_folds_key_level() {
-    let _g = e2e_lock();
     let Some((_g, b, ring_l, ring_r, widx, sr, _scope)) = v99_sc_setup("v99scpan") else {
         return;
     };
@@ -5202,7 +5185,6 @@ fn v106_poly_at_heard_live_rt() {
 // NULL-audio tier structurally cannot observe (Cmd queue never drains).
 #[test]
 fn v110_e2e_mixer_seam_vol_heard_live_rt() {
-    let _g = e2e_lock();
     // v99 rig: track 2 = steady tone HARD RIGHT through a static comp.
     let Some((_g, b, _rl, rr, widx, sr, active)) = v99_sc_setup("v110vol") else {
         return; // no audio server: skip
