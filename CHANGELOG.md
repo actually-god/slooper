@@ -8,6 +8,12 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Exporting no longer spams debug chatter to the terminal.** The
+  Export button still carried two leftover debug lines from its
+  authoring session — every export printed `PP exporting` and
+  `PP export queued` to stderr, log noise that names nothing. The
+  status line in the app is the real progress echo (pinned by
+  `v140_*`).
 - **Windows: the MIDI "Refresh" button now says what it re-scans.** In
   Settings → MIDI INPUTS, the Refresh button hovered “re-scan the JACK
   port list” — copy-pasted from the audio ports section above. On
