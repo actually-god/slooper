@@ -8,6 +8,15 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Cymbals and toms now decay to silence instead of being chopped.** The
+  stock kit retired its voices long before their tails were inaudible — at
+  the top of the decay slider a crash was hard-silenced barely halfway
+  through its own decay time constant (a −13 dB instant zero, an audible
+  cut and a DC step in mid-ring), and open hats fared barely better. Every
+  voice now rings for seven time constants of its slowest decay component
+  (about −61 dBFS, provably below hearing) with an 8 ms linear fade to
+  exact zero, so retirement itself is inaudible on every pad (pinned by
+  `v137_*`).
 - **Project-asset context menus now say FILE where they act on files.**
   The rename and move entries on a “project assets” row hovered
   “rename/move this folder …” while the buttons rename or move the
