@@ -232,6 +232,17 @@ throughout.
 
 ### Fixed
 
+- **Offline bounces no longer play ghost notes for bends and per-note
+  pressure.** Rendering or exporting a project that routes a MIDI clip
+  through a hosted plugin turned every **pitch bend** and **per-note
+  aftertouch** event into a bogus note: the offline render path still
+  carried the pre-v42 message map, which had no arms for those event
+  kinds, so a bend at value *X* fired a *note-on* at key *X&127* inside
+  the plugin — while live playback, which shares the newer mapper,
+  handled it correctly. Bounces now stage events through the SAME
+  single-source mapper as playback: bends reach the plugin as bends and
+  pressure as pressure, note/CC/channel-pressure bytes unchanged
+  (pinned by `v158_*`).
 - **The MCP server no longer restart-storms when its port is 0.** With
   the port field set to **0** — the documented "pick any free port"
   mode — the frame loop compared the *configured* port against the
