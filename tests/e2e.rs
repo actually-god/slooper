@@ -30,7 +30,7 @@ use jack::{
 };
 
 use slooper::arrange::{Arrangement, Clip};
-use slooper::audio::{Backend, Cmd, Evt, FxSlot, MidiEv, TrackFx};
+use slooper::audio::{Backend, Cmd, Evt, FxSlot, MidiEv, OutSel, TrackFx};
 use slooper::midi::MidiMsg;
 
 /// Serialize the e2e tests. Each drives the live audio server in real time
@@ -81,6 +81,242 @@ fn start_backend() -> Option<(Backend, String, u32)> {
             eprintln!("skipping: no JACK/PipeWire server (timed out waiting for backend)");
             None
         }
+    }
+}
+
+// ---- v153: shared bootstrap seams -----------------------------------------
+//
+// The lock, the backend start, and the capture-client construction (ring +
+// ports + handler + layout Apply/Applied handshake) live HERE. Every test
+// enters through `e2e_backend` — the E2E_LOCK acquisition cannot be
+// forgotten, and a bootstrap change (lock handling, device naming, sr
+// defaulting, port naming) is ONE edit, not dozens of drifting copies.
+// The returned guard must be bound (`_g`) and lives for the whole test:
+// the same serialization the inline `e2e_lock()` calls always gave.
+
+/// Default capture depth shared by the v153 capture fixtures.
+const RING_N: usize = 1usize << 19;
+
+/// Lock + backend in one call. `None` = no server / backend not ready:
+/// the caller returns early (skip) and the guard drops inside here.
+fn e2e_backend() -> Option<(std::sync::MutexGuard<'static, ()>, Backend, String, u32)> {
+    let g = e2e_lock();
+    let (b, client_name, sr) = start_backend()?;
+    Some((g, b, client_name, sr))
+}
+
+/// `Cmd::Apply` + wait for its exact `Evt::Applied` echo. The per-test
+/// prose messages retired with the v153 dedup — the expected counts in
+/// the failure line are the diagnosis.
+fn e2e_apply(b: &Backend, ins: Vec<String>, outs: Vec<OutSel>) {
+    let (ni, no) = (ins.len(), outs.len());
+    b.cmd(Cmd::Apply { ins, outs });
+    assert!(
+        wait_for(
+            b,
+            |e| matches!(e, Evt::Applied { ins: i, outs: o } if *i == ni && *o == no),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "layout not applied (expected ins={ni} outs={no})"
+    );
+}
+
+/// Wildcard-count variant of `e2e_apply` — kept for the two sites whose
+/// waits intentionally matched ANY `Applied` event.
+fn e2e_apply_any(b: &Backend, ins: Vec<String>, outs: Vec<OutSel>) {
+    b.cmd(Cmd::Apply { ins, outs });
+    assert!(
+        wait_for(b, |e| matches!(e, Evt::Applied { .. }), Duration::from_secs(5)).is_some(),
+        "layout not applied"
+    );
+}
+
+/// End-of-test layout reset (fire-and-forget, as the inline copies were).
+fn e2e_reset(b: &Backend) {
+    b.cmd(Cmd::Apply {
+        ins: vec![],
+        outs: vec![],
+    });
+}
+
+/// Sink-only capture client (`CapProc`): `ring` holds every sample that
+/// arrives at the applied output, as f32 bits; `widx` is the absolute
+/// write position. The layout is applied + echoed before the return.
+struct Cap {
+    ring: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+    src_name: String,
+    active: AsyncClient<(), CapProc>,
+}
+
+fn e2e_capture(b: &Backend, tag: &str, gain: u8) -> Cap {
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..RING_N).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            CapProc {
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    e2e_apply(b, vec![], vec![(format!("{src_name}:sink"), gain)]);
+    Cap {
+        ring,
+        widx,
+        src_name,
+        active,
+    }
+}
+
+/// `LoopSrcProc` client: a controllable constant/PRNG source (`out_a`)
+/// and a sink capture on ONE client. `src_in` routes out_a back into the
+/// engine (the 1-in/1-out layouts); `mode`/`const_val` stay nameable.
+struct SrcCap {
+    ring: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+    mode: Arc<AtomicU8>,
+    const_val: Arc<AtomicU32>,
+    src_name: String,
+    active: AsyncClient<(), LoopSrcProc>,
+}
+
+fn e2e_capture_src(b: &Backend, tag: &str, seed: u32, src_in: bool, gain: u8) -> SrcCap {
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..RING_N).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let mode = Arc::new(AtomicU8::new(0));
+    let const_val = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let out_a = client.register_port("out_a", AudioOut::default()).unwrap();
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            LoopSrcProc {
+                out: out_a,
+                sink,
+                mode: mode.clone(),
+                const_val: const_val.clone(),
+                seed,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    let ins = if src_in {
+        vec![format!("{src_name}:out_a")]
+    } else {
+        vec![]
+    };
+    e2e_apply(b, ins, vec![(format!("{src_name}:sink"), gain)]);
+    SrcCap {
+        ring,
+        widx,
+        mode,
+        const_val,
+        src_name,
+        active,
+    }
+}
+
+/// Stereo `DiffProc` client: sum/difference rings from `sink_l`/`sink_r`
+/// on the (1, 2) bus mapping.
+struct SdifCap {
+    ring_sum: Arc<Vec<AtomicU32>>,
+    ring_dif: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+    active: AsyncClient<(), DiffProc>,
+}
+
+fn e2e_capture_sumdif(b: &Backend, tag: &str) -> SdifCap {
+    let ring_sum: Arc<Vec<AtomicU32>> = Arc::new((0..RING_N).map(|_| AtomicU32::new(0)).collect());
+    let ring_dif: Arc<Vec<AtomicU32>> = Arc::new((0..RING_N).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            DiffProc {
+                sink_l,
+                sink_r,
+                ring_sum: ring_sum.clone(),
+                ring_dif: ring_dif.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    e2e_apply(
+        b,
+        vec![],
+        vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    );
+    SdifCap {
+        ring_sum,
+        ring_dif,
+        widx,
+        active,
+    }
+}
+
+/// Stereo `V96CapProc` client: LEFT and RIGHT buses captured to SEPARATE
+/// rings on the (1, 2) mapping (the v96/v99 sidechain rigs).
+struct LrCap {
+    ring_l: Arc<Vec<AtomicU32>>,
+    ring_r: Arc<Vec<AtomicU32>>,
+    widx: Arc<AtomicU64>,
+    active: AsyncClient<(), V96CapProc>,
+}
+
+fn e2e_capture_lr(b: &Backend, tag: &str) -> LrCap {
+    let ring_l: Arc<Vec<AtomicU32>> = Arc::new((0..RING_N).map(|_| AtomicU32::new(0)).collect());
+    let ring_r: Arc<Vec<AtomicU32>> = Arc::new((0..RING_N).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let (client, _status) =
+        Client::new(tag, ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let sink_l = client.register_port("sink_l", AudioIn::default()).unwrap();
+    let sink_r = client.register_port("sink_r", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    let active = client
+        .activate_async(
+            (),
+            V96CapProc {
+                sink_l,
+                sink_r,
+                ring_l: ring_l.clone(),
+                ring_r: ring_r.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    e2e_apply(
+        b,
+        vec![],
+        vec![
+            (format!("{src_name}:sink_l"), 1),
+            (format!("{src_name}:sink_r"), 2),
+        ],
+    );
+    LrCap {
+        ring_l,
+        ring_r,
+        widx,
+        active,
     }
 }
 
