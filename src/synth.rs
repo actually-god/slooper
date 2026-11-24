@@ -27,7 +27,11 @@ pub const MAX_PARAMS: usize = SLOOPER_MAX_SYNTH_PARAMS;
 
 /// Bundled scripts. `synth_api.rs` is rewritten (and version-pinned) on
 /// every start; the synths themselves are seeded when missing or stale.
-pub const API_SRC: &str = include_str!("synth_api.rs");
+/// The repo copy under synths/ is the single source (v149): embedded from
+/// there, so this text, the crate module (lib.rs `#[path]`) and the
+/// author-facing file can never drift
+/// (pin `v149_synth_api_folder_copy_is_the_single_source`).
+pub const API_SRC: &str = include_str!("../synths/synth_api.rs");
 pub const BUNDLED: &[(&str, &str)] = &[
     ("piano.rs", include_str!("../synths/piano.rs")),
     ("drums.rs", include_str!("../synths/drums.rs")),
@@ -2982,6 +2986,31 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         );
         let pk = x[(48_000 / 2)..].iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!(pk < 1e-4, "closed hat must be silent (1e-4) by 0.50 s, got {pk:.2e}");
+    }
+
+    #[test]
+    fn v149_synth_api_folder_copy_is_the_single_source() {
+        // v149: the old src/synth_api.rs twin is gone — the repo folder copy
+        // is embedded (API_SRC) AND compiled as the crate module (lib.rs
+        // #[path]), so text, module and seeded user copy are one file. These
+        // asserts hold by construction today; they FAIL loudly if the
+        // include/module path is ever rewired to a divergent twin, or if the
+        // deleted twin creeps back (the drift class this pin guards).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !root.join("src").join("synth_api.rs").exists(),
+            "src/synth_api.rs twin is back — synths/synth_api.rs is the single source"
+        );
+        let lib = std::fs::read_to_string(root.join("src").join("lib.rs")).unwrap();
+        assert!(
+            lib.contains(r#"#[path = "../synths/synth_api.rs"]"#),
+            "the synth_api crate module must stay rooted at the synths/ folder copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("synths").join("synth_api.rs")).unwrap(),
+            API_SRC,
+            "embedded ABI drifted from the repo copy"
+        );
     }
 
 }

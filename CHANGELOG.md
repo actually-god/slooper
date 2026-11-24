@@ -8,6 +8,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Changed
 
+- **The ABI contract files can no longer drift.** The two contract
+  headers every script synths/effects include (`synth_api.rs`,
+  `effect_api.rs`) each existed twice in the source tree as
+  byte-identical twins — and only the effect twin was guarded by a
+  test, so a future edit could have shipped a stale contract into
+  users' folders (the v0.12 seeding-class bug, one layer up). The tree
+  now holds exactly one copy of each (in `synths/` and `effects/`),
+  which the binary embeds directly, and both are pinned. No behavior
+  changes; existing installs get the one corrected header line through
+  the regular content-diff seeding (pin `v149_synth_api_*`).
 - **The convolver's folder documentation now tells the truth.** The
   README the effect generates next to its impulse files promised files
   are “peak-normalized”, while the convolver deliberately

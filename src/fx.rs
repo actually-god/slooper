@@ -24,10 +24,11 @@ use std::sync::Arc;
 
 // The C-ABI contract. Compiled twice: once into slooper (this include)
 // and once into every effect script (via its `include!("effect_api.rs")`),
-// so both sides agree on the layout by construction.
+// so both sides agree on the layout by construction. Single source: the
+// repo copy under effects/ (v149).
 mod api {
     #![allow(dead_code)]
-    include!("effect_api.rs");
+    include!("../effects/effect_api.rs");
 }
 pub use api::{
     EffectGuiV1, EffectInfoV1, EffectInfoV2, EffectInfoV3, EffectInfoV4, EffectParamV1, GuiApiV1,
@@ -96,8 +97,10 @@ impl SyncInfoV1 {
 
 /// The generated shared-contract file every script includes.
 pub const API_FILE: &str = "effect_api.rs";
-/// The contract text (single source of truth: src/effect_api.rs).
-pub const API_SRC: &str = include_str!("effect_api.rs");
+/// The contract text. The repo copy under effects/ is the single source
+/// (v149): embedded from there, so the compiled `mod api` above and the
+/// seeded text can never drift.
+pub const API_SRC: &str = include_str!("../effects/effect_api.rs");
 /// The documented starter effect, offered by the "Add template" button.
 pub const TEMPLATE_SRC: &str = include_str!("../effects/template.rs");
 /// File name the template is written under.
@@ -2207,9 +2210,18 @@ mod tests {
 
     #[test]
     fn bundled_files_stay_in_sync() {
-        // The repo copies (what PKGBUILD installs) must equal the embedded
-        // sources the app writes/creates.
+        // v149 single-source policy: every bundled text is embedded from
+        // the repo folder copy, so the equality asserts below are identity
+        // by CONSTRUCTION — they are rewiring tripwires: if an include_str!
+        // above is ever retargeted at a new twin, the mismatch fails here.
+        // (The old user-facing claim that PKGBUILD installs these folders
+        // was false — the app seeds the embedded text; the AUR package
+        // installs binary + desktop entry + icon only.)
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !root.join("src").join("effect_api.rs").exists(),
+            "src/effect_api.rs twin is back — effects/effect_api.rs is the single source"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("effects/effect_api.rs")).unwrap(),
             API_SRC
