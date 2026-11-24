@@ -359,8 +359,10 @@ extern "C" fn create(sample_rate: f64) -> *mut core::ffi::c_void {
              \n\
              Drop any .wav file here and rescan the effects (or reopen the\n\
              convolver editor): the convolver effect lists every file and the\n\
-             `ir` slider picks one. Files are resampled to the engine rate,\n\
-             truncated to 1.2 s (with a fade) and peak-normalized.\n\
+             `ir` slider picks one. Files are resampled to the engine rate\n\
+             and truncated to 1.2 s (with a fade), then energy-normalized\n\
+             so a short and a long IR sit at the same loudness (the peak\n\
+             level is NOT equalized between files).\n\
              \n\
              Index 0 is always the built-in synthetic hall. The first 7 .wav\n\
              files in this folder (sorted by name) load as indexes 1..7.\n\
@@ -538,6 +540,20 @@ extern "C" fn process(state: *mut core::ffi::c_void, input: f32, params: *const 
     }
 }
 
+/// The impulses-folder hint in the effect-list description. The old
+/// single literal baked the Linux path into EVERY OS's list — Windows
+/// users were told to fill a directory that does not exist there. Each
+/// OS now sees its real location; the editor additionally prints the
+/// LIVE path (it honors $XDG_DATA_HOME and the test override, which no
+/// static string can know). One const, shared by DESC and DESC4 — the
+/// two copies drifted once already; they never get a second drift point.
+#[cfg(windows)]
+const DESC_TEXT: &core::ffi::CStr =
+    c"Convolution reverb. Drop .wav impulses into %LOCALAPPDATA%\\slooper\\impulses - index 0 is a built-in hall. Editor lists what loaded.";
+#[cfg(not(windows))]
+const DESC_TEXT: &core::ffi::CStr =
+    c"Convolution reverb. Drop .wav impulses into ~/.local/share/slooper/impulses - index 0 is a built-in hall. Editor lists what loaded.";
+
 static PARAMS: [EffectParamV1; 4] = [
     EffectParamV1 { label: c"ir (index)".as_ptr(), min: 0.0, max: (MAX_IR - 1) as f32, default: 0.0 },
     EffectParamV1 { label: c"mix".as_ptr(), min: 0.0, max: 1.0, default: 0.35 },
@@ -549,8 +565,7 @@ pub static DESC: EffectInfoV1 = EffectInfoV1 {
     abi: SLOOPER_EFFECT_ABI,
     name: c"convolver".as_ptr(),
     author: c"slooper".as_ptr(),
-    description:
-        c"Convolution reverb. Drop .wav impulses into ~/.local/share/slooper/impulses - index 0 is a built-in hall. Editor lists what loaded.".as_ptr(),
+    description: DESC_TEXT.as_ptr(),
     n_params: 4,
     params: PARAMS.as_ptr(),
     create,
@@ -573,8 +588,7 @@ pub static DESC4: EffectInfoV4 = EffectInfoV4 {
     abi: SLOOPER_EFFECT_ABI_V4,
     name: c"convolver".as_ptr(),
     author: c"slooper".as_ptr(),
-    description:
-        c"Convolution reverb. Drop .wav impulses into ~/.local/share/slooper/impulses - index 0 is a built-in hall. Editor lists what loaded.".as_ptr(),
+    description: DESC_TEXT.as_ptr(),
     n_params: 4,
     params: PARAMS.as_ptr(),
     create,
