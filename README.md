@@ -11,11 +11,11 @@ Hey all, this header is just about the only manually written portion of this
 entire project. This open-source DAW is primarily built for live MIDI/audio
 mixing and performance, while having full capabilities you'd expect out of any
 flagship DAW. I do not plan on monetizing any part of nor addons for this
-project at any point in the future; I simply moved to linux (Arch btw) and
-wanted a DAW that I actually enjoyed using. That said, I highly recommend
-forking this project to further suit your own workflow needs. I've tried to
-ensure documentation exists everywhere both in code and for the program at
-large. If you have ideas you think would be good to implement on the wider
+project at any point in the future (it will always remain MIT licensed); I 
+simply moved to linux (Arch btw) and wanted a DAW that I actually enjoyed using. 
+That said, I highly recommend forking this project to further suit your own workflow needs. 
+I've tried to ensure documentation exists everywhere both in code and for the program at large. 
+If you have ideas you think would be good to implement on the wider
 application, either make a PR or an issue in Github.
 
 **Statement on AI:** I firmly believe in 3 things:
@@ -23,11 +23,11 @@ application, either make a PR or an issue in Github.
 1. Ethically and morally, using AI to directly create any form of art
    (pictures, videos, music, etc) is dubious at best. This does not mean I
    think AI can't be used for tools related to art; a great example of
-   another use of AI as an art tool is CorridorKey.
+   this is CorridorKey.
 2. The environmental and economic effects of data centers should be
    personally avoided when possible.
-3. AI is the ultimate conclusion of algorithmic coding assistance, just as
-   probability is the ultimate conclusion to logic.
+3. AI is the ultimate extension of algorithmic coding assistance, just as
+   probability is the ultimate extension of logic.
 
 With these in mind, this project:
 
