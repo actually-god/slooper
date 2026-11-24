@@ -278,8 +278,9 @@ criteria already speak these names (MCP-02 `settings.*`, MCP-03
 `windows.*`, MCP-04 `mixer.*`/`chain.*`/`assets.*`, MCP-05
 `plugin.*`/`sampler.*`) — the spine adopts them verbatim; **no card invents
 aliases.** Domain budget: `settings.` `windows.` `mixer.` `chain.`
-`assets.` `plugins.` `plugin.` `sampler.` `drum.` + core-level `echo`
-(MCP-01 demo). Verbs within a domain: `list`, `get`, `set`, `add`, `remove`,
+`assets.` `plugins.` `plugin.` `sampler.` `drum.` `midi.` and the
+core-level demo tool, shipped as `core.echo` (MCP-01). Verbs within a
+domain: `list`, `get`, `set`, `add`, `remove`,
 `open`, `close`, `move`, `resize`, `dock`, `undock`, `save`, `load`, `pick`,
 `import`, `describe`. A pin asserts every registered name matches
 `^[a-z_]+\.[a-z_.]+$` with a budget verb tail.
@@ -400,8 +401,9 @@ header — titles/assignees are the board's):
   `--mcp-bridge` mode in main.rs + Config fields + Settings section +
   **hot start/stop** (the card requires a live Settings toggle — §2's lazy
   start must therefore be a start/STOP pair, not start-once) + tool registry
-  that MCP-02..05 register onto without touching the core + demo `echo`
-  tool. *Forced now:* bridge ships with the core (not deferred — stdio-only
+  that MCP-02..05 register onto without touching the core + demo
+  `core.echo` tool. *Forced now:* bridge ships with the core (not
+  deferred — stdio-only
   clients are the primary user); endpoint discovery file exists from card 1
   (tests need it, so it is not a later "feature"); token file + gate order
   exactly §3; port-busy keeps booting with a status echo (card AC).
@@ -451,10 +453,14 @@ header — titles/assignees are the board's):
   running as of this writing — do not touch).
 
 Cross-card rules this spine forces on ALL of the above: pin names
-`vNN_mcp_<behavior>` with each card claiming the next free vNN at dispatch
-(v89+ were free at 2026-11-18 recon; v85–v88 and the v101/v102/v191 special
-series are taken); quick-tier default; both clippy targets; windows-native
-full suite is the merge gate; no new product dependencies (std + serde_json
+`vNN_mcp_<behavior>`; each card claims the next free vNN at dispatch
+**from git, not from this doc** — read the *shipped vNNN:* stamps on the
+rows above plus `git log --oneline origin/main`. (The 2026-11-18 recon's
+free-version map is dead history: v89–v111 all landed, and the MCP series
+itself was renumbered prefix-surgically twice when the chain overtook
+parked claims — v94→v107 `768305b`, v108→v111 `d7442d5`.) Quick-tier
+default; both clippy targets; windows-native full suite is the merge
+gate; no new product dependencies (std + serde_json
 only); ledger entry per pass in the skill's gui-cron-passes reference.
 
 ## 11. Open questions (deliberately deferred, non-blocking)
