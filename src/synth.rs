@@ -3095,4 +3095,87 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         );
     }
 
+    // ==== v151 (card t_0c4df02a): script headers describe real DSP ======
+    //
+    // The bundled scripts are embedded and content-diff-seeded into every
+    // user's synths/ folder, so a header claim IS user documentation.
+    // Three copy-paste lies shipped: the drums soft() doc promised bus-sum
+    // headroom the per-voice curve cannot give (the engine clipper is what
+    // bounds the mix), the drums tmul comment claimed all "metallics"
+    // ignore tune (hats follow tmul; only crash/ride ignore it), and
+    // pluck's v100 bend header copied the oscillator-sibling line claiming
+    // live re-pitch of HELD notes (the Karplus-Strong loop length is
+    // frozen at strike, so the value only reaches new note_on's). The
+    // other six copies of that boilerplate are TRUE (bend_ratio is
+    // computed per block in their process()) and must survive: every pin
+    // is scoped to its own file, and the pluck pin carries a positive
+    // control on tri_osc. Docs-only tripwires — the DSP behaviors are
+    // pinned by the v100/v136/v137 suites. Both polarities are concat!-
+    // split so neither the stale wording nor a marker lives greppable in
+    // this file.
+
+    fn v151_script(name: &str) -> &'static str {
+        BUNDLED
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, src)| *src)
+            .expect("bundled script present")
+    }
+
+    #[test]
+    fn v151_drums_soft_doc_states_per_voice_reality() {
+        let d = v151_script("drums.rs");
+        assert!(
+            d.contains(concat!("Per-voice soft ", "saturation")),
+            "soft()'s doc must state it shapes each VOICE's own peaks"
+        );
+        assert!(
+            !d.contains(concat!("keeps summed hits from blowing ", "past unity")),
+            "soft() cannot bound the bus sum — the engine output clipper does"
+        );
+    }
+
+    #[test]
+    fn v151_drums_tune_doc_matches_branches() {
+        let d = v151_script("drums.rs");
+        assert!(
+            d.contains(concat!("melodic voices AND the ", "hats")),
+            "the tmul comment must name the hat branch as tune-following"
+        );
+        assert!(
+            !d.contains(concat!("metallics ", "ignore tune")),
+            "false both ways: hats follow tmul, crash/ride do not"
+        );
+    }
+
+    #[test]
+    fn v151_pluck_bend_doc_is_trigger_time() {
+        let p = v151_script("pluck.rs");
+        assert!(
+            p.contains(concat!("TRIGGER ", "frequency")),
+            "pluck's bend header must say the value lands at note_on"
+        );
+        assert!(
+            !p.contains(concat!("baked glide bends ", "HELD notes live")),
+            "the KS loop is frozen at strike — held notes never re-pitch"
+        );
+        // Positive control: the wording is TRUE for the oscillator
+        // siblings; the fix must not have glob-scrubbed it out of them.
+        assert!(
+            v151_script("tri_osc.rs")
+                .contains(concat!("baked glide bends ", "HELD notes live")),
+            "oscillator siblings legitimately keep the live-bend wording"
+        );
+    }
+
+    #[test]
+    fn v151_api_bend_doc_covers_loop_models() {
+        // The shipped ABI contract doc must not demand per-block re-pitch
+        // without acknowledging the delay-loop class (pluck ships both).
+        assert!(
+            API_SRC.contains(concat!("delay-loop ", "models")),
+            "the bend contract lost its Karplus-Strong qualifier"
+        );
+    }
+
 }
