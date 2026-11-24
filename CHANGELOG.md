@@ -8,6 +8,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **A hosted CLAP instrument no longer mallocs on every audio block.** The
+  CLAP backend destroyed its event-staging buffer at the end of every block
+  and grew a fresh one the next — one malloc/free pair roughly every 12 ms
+  on the audio thread, every time a note or knob moved — because the staging
+  loop “took” the buffer out of the live state to satisfy the borrow checker.
+  Staging now iterates the persistent buffer in place, the pattern the VST2
+  backend has always used: the queue keeps its capacity between blocks and
+  is emptied, never freed. Allocator jitter is exactly the class of glitch
+  that turns into dropouts under load, and this was the last violation of
+  the CLAP module’s “the audio thread allocates nothing” rule.
 - **Exporting no longer spams debug chatter to the terminal.** The
   Export button still carried two leftover debug lines from its
   authoring session — every export printed `PP exporting` and
