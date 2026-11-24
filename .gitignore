@@ -15,3 +15,10 @@
 /*.tar.gz
 effects/.build/
 tests/fixtures/gnull-home/
+
+# Scratch logs landing in the repo-root cwd: gate batteries and sabotage
+# batteries run from the shell and print their verdicts here, and `git add -A`
+# then sweeps them into a commit (bit twice: sab-battery.log @ v132,
+# gate_*.log @ v153). Scoped to the repo root by the leading slash, so
+# nested logs (target/test-logs/ and friends) are untouched.
+/*.log
