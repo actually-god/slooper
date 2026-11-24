@@ -1,7 +1,13 @@
 /target
 *.rs.bk
 
-# makepkg artifacts (e.g. testing an AUR checkout's PKGBUILD in-tree)
+# makepkg artifacts (e.g. testing an AUR checkout's PKGBUILD in-tree).
+# /src/*.tar.gz is live, NOT a relic: an in-tree makepkg run sets
+# $srcdir=$PWD/src and drops the fetched slooper-X.Y.Z.tar.gz right there
+# (tests/packaging.sh step 8 codifies that layout; AGENT-GUIDE packaging
+# rule: never `makepkg -C` inside a checkout, -C wipes $PWD/src). Do not
+# remove this line. (A dangling v0.1 symlink once sat under this rule and
+# got mistaken for its purpose; it was deleted 2026-11-23.)
 /pkg/
 *.pkg.tar.zst
 /src/slooper-*/
