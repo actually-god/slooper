@@ -2992,12 +2992,12 @@ fn render_midi_vst(
         while i < ev.len() && ev[i].0 < done + n {
             if ev[i].0 >= done {
                 let (off, kind, ch, d1, d2) = ev[i];
-                let m = match kind {
-                    0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
-                    1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
-                    2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
-                    _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
-                };
+                // v158 (card t_6be29eaa): single-source mapper shared with
+                // every live path. The legacy 4-arm matcher this replaces
+                // had no arms for kinds 4/5 (per-note AT, 14-bit bend):
+                // the same ghost-note class the v33 lore above describes
+                // for kind 2 — a bend bounced as a note-on at key=LSB.
+                let m = midi3_raw(kind, ch, d1, d2);
                 evq.push((off - done, m));
             }
             i += 1;
@@ -3141,9 +3141,10 @@ fn drive_script_events(
 /// (per-note aftertouch) and kind 5 (14-bit bend: d1 = LSB, d2 = MSB)
 /// ride straight into the entry's raw-message queue. Note-on velocity is
 /// clamped to >= 1 (a 0-vel on must never hang a note). RT-safe.
-/// NOTE: `render_midi_vst` (offline bounce) keeps its own 4-arm matcher
-/// that DROPS kinds 4/5 into the note-on arm — known divergence, fix is
-/// tracked separately (behavior change, needs retargeted pins).
+/// v158 (card t_6be29eaa): the offline bounce (`render_midi_vst`) stages
+/// through HERE too — its legacy 4-arm matcher dropped kinds 4/5 into
+/// the note-on arm (ghost notes on every export using bend/AT); live and
+/// offline bytes can no longer drift.
 #[inline]
 fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
     match kind {
@@ -9746,11 +9747,12 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         );
     }
 
-    /// The 6-arm VST byte-mapping must exist ONCE (midi3_raw) with all four
-    /// live drains staging through it. `render_midi_vst`'s legacy 4-arm
-    /// matcher is deliberately RETAINED in v150 — its missing kind 4/5 arms
-    /// are a known behavior bug tracked on its own card (a fix needs
-    /// retargeted pins), so 0x90 must count exactly 2: midi3_raw + legacy.
+    /// The 6-arm VST byte-mapping must exist ONCE (midi3_raw) with all
+    /// live drains staging through it. v158 (card t_6be29eaa) closed the
+    /// last exception: `render_midi_vst` (offline bounce) used to carry a
+    /// legacy 4-arm matcher whose missing kind-4/5 arms fired ghost notes
+    /// on export — it now calls midi3_raw too, so 0x90 counts exactly 1
+    /// and the call sites are one definition + five.
     #[test]
     fn v150_vst_byte_map_window_appears_once() {
         let src = v150_active_src();
@@ -9766,13 +9768,13 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         );
         assert_eq!(
             src.matches(concat!("mi", "di3_raw(")).count(),
-            5,
-            "one definition + four call sites"
+            6,
+            "one definition + five call sites (v158: render_midi_vst joined)"
         );
         assert_eq!(
             src.matches(concat!("0x90 ", "| ch & 0x0F")).count(),
-            2,
-            "midi3_raw + the legacy render_midi_vst matcher (follow-up card)"
+            1,
+            "note-on staging lives only in midi3_raw (v158 retired the legacy matcher)"
         );
     }
 
@@ -9941,5 +9943,148 @@ let desc = reg.desc("v80quarter").unwrap().clone();
             "v153 ring-construction drift in tests/e2e.rs:\n{}",
             offenders.join("\n")
         );
+    }
+
+    // ==== v158 (card t_6be29eaa): offline VST bounce shares the live byte map ====
+
+    /// Recording `StageEntry` (v60-Dummy shape): captures every raw
+    /// message `render_midi_vst` stages via `process_with_midi`, tagged
+    /// with its ABSOLUTE sample offset — the mock accumulates block
+    /// lengths, which is exactly how render_midi_vst drives consecutive
+    /// full `VST_BLOCK` chunks (no gaps).
+    #[derive(Default)]
+    struct V158Rec {
+        got: std::sync::Mutex<(usize, Vec<(usize, [u8; 3])>)>,
+    }
+    impl crate::vsthost::StageEntry for V158Rec {
+        fn name(&self) -> &str {
+            "v158-rec"
+        }
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("/")
+        }
+        fn spec(&self) -> &(std::path::PathBuf, crate::vsthost::VstKind) {
+            static S: std::sync::OnceLock<(std::path::PathBuf, crate::vsthost::VstKind)> =
+                std::sync::OnceLock::new();
+            S.get_or_init(|| (std::path::PathBuf::from("/"), crate::vsthost::VstKind::V2))
+        }
+        fn kind(&self) -> crate::vsthost::VstKind {
+            crate::vsthost::VstKind::V2
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn descs(&self) -> &[crate::vsthost::VstParamDesc] {
+            &[]
+        }
+        fn params(&self) -> &std::sync::Arc<crate::vsthost::VstParams> {
+            static P: std::sync::OnceLock<std::sync::Arc<crate::vsthost::VstParams>> =
+                std::sync::OnceLock::new();
+            P.get_or_init(|| crate::vsthost::VstParams::new(&[]))
+        }
+        fn has_editor(&self) -> bool {
+            false
+        }
+        fn set_param(&self, _i: usize, _v: f32) {}
+        fn set_param_rt(&self, _i: usize, _v: f32) {}
+        fn process(&self, _i: &[f32], _o: &mut [f32]) {}
+        fn process_with_midi(&self, _i: &[f32], o: &mut [f32], events: &[(usize, [u8; 3])]) {
+            let mut g = self.got.lock().unwrap();
+            for (off, m) in events {
+                let abs = g.0 + *off;
+                g.1.push((abs, *m));
+            }
+            g.0 += o.len();
+        }
+        fn all_notes_off(&self) {}
+        fn flush(&self) {}
+        fn midi_drops(&self) -> u64 {
+            0
+        }
+    }
+
+    /// The offline bounce must stage the SAME raw bytes as the live path
+    /// (v150 single source): kind 4 -> 0xA0 and kind 5 -> 0xE0 with the
+    /// 14-bit LSB/MSB split intact — never a ghost note-on (the exact bug
+    /// class the v33 lore comment in render_midi_vst describes for kind 2,
+    /// which the legacy matcher still carried for kinds 4/5). Kinds
+    /// 0/1/2/3 stay byte-identical to the old matcher (incl. the >=1
+    /// velocity clamp), and every event lands at its own offset across
+    /// the 512-sample internal chunking.
+    #[test]
+    fn v158_render_midi_vst_mpe_kinds_reach_plugin() {
+        let rec = V158Rec::default();
+        let e: &dyn crate::vsthost::StageEntry = &rec;
+        let ev: [(u64, u8, u8, u8, u8); 8] = [
+            (10, 3, 2, 60, 100), // note-on
+            (30, 4, 2, 60, 90),  // per-note AT (v42 MPE)
+            (70, 5, 2, 0x23, 0x45), // 14-bit bend: d1 = LSB, d2 = MSB
+            (120, 1, 2, 7, 64),  // CC
+            (160, 2, 2, 0, 100), // channel pressure
+            (200, 0, 2, 60, 0),  // note-off
+            (600, 4, 2, 61, 33), // AT in the SECOND internal block
+            (700, 3, 2, 62, 0),  // note-on with vel 0 -> must clamp to 1
+        ];
+        let mut out = vec![0f32; 1024];
+        render_midi_vst(e, &ev, 0, 1024, &mut out);
+        let msgs = rec.got.lock().unwrap().1.clone();
+        let status = |m: [u8; 3]| m[0] & 0xF0;
+        let by = |st: u8| -> Vec<(usize, [u8; 3])> {
+            msgs.iter().copied().filter(|(_, m)| status(*m) == st).collect()
+        };
+        // Only the two kind-3 events may be note-ons. Pre-fix this is the
+        // smoking gun: kinds 4/5 fall into the `_` arm (5 "note-ons", the
+        // bend's LSB as a KEY = the reported ghost note).
+        assert_eq!(
+            by(0x90),
+            vec![(10, [0x92, 60, 100]), (700, [0x92, 62, 1])],
+            "only kind-3 events may stage as note-ons (ghost-note class); got {msgs:?}"
+        );
+        assert_eq!(
+            by(0xA0),
+            vec![(30, [0xA2, 60, 90]), (600, [0xA2, 61, 33])],
+            "kind-4 per-note AT must reach the plugin as 0xA0 (both blocks); got {msgs:?}"
+        );
+        assert_eq!(
+            by(0xE0),
+            vec![(70, [0xE2, 0x23, 0x45])],
+            "kind-5 bend must reach the plugin as 0xE0 LSB/MSB intact; got {msgs:?}"
+        );
+        // Regression half: the three arms the legacy matcher already had
+        // are byte-identical through midi3_raw.
+        assert!(msgs.contains(&(120, [0xB2, 7, 64])), "CC unchanged: {msgs:?}");
+        assert!(msgs.contains(&(160, [0xD2, 100, 0])), "CP unchanged: {msgs:?}");
+        assert!(msgs.contains(&(200, [0x82, 60, 0])), "note-off unchanged: {msgs:?}");
+    }
+
+    /// The legacy matcher must be GONE: render_midi_vst stages through the
+    /// module's single mapper. Source scan with comment lines stripped
+    /// (v150_active_src) so lore comments never feed the needles. The fn
+    /// name deliberately avoids the scanned needles (self-file vacuity).
+    #[test]
+    fn v158_render_midi_vst_offline_bounce_shares_the_mapper() {
+        let src = v150_active_src();
+        let start = src
+            .find(concat!("fn render_", "midi_vst("))
+            .expect("offline bounce present");
+        let end = start + 1 + src[start + 1..].find("fn ").expect("next fn after render_midi_vst");
+        let body = &src[start..end];
+        assert_eq!(
+            body.matches(concat!("mi", "di3_raw(")).count(),
+            1,
+            "render_midi_vst must stage through midi3_raw (single source with the live path)"
+        );
+        for needle in [
+            concat!("0x9", "0 | ch & 0x0F"),
+            concat!("0x8", "0 | ch & 0x0F"),
+            concat!("0xB", "0 | ch & 0x0F"),
+            concat!("0xD", "0 | ch & 0x0F"),
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                0,
+                "no local byte-map arm may survive in render_midi_vst: {needle}"
+            );
+        }
     }
 }
