@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::mcp::http;
 use crate::mcp::rpc;
+use crate::mcp::testkit::{self, clear_data_dir, isolated_data_dir, parse_http};
 use crate::mcp::tools::{ToolDef, ToolError};
 use crate::ui::headless_app;
 use crate::ui::App;
@@ -397,21 +398,6 @@ fn v107_mcp_bridge_timeout_short_wait() {
 
 // ── lifecycle (lazy start / hot stop / endpoint file / port busy) ────────
 
-/// Every lifecycle pin runs inside a temp `SLOOPER_DATA_DIR` so the
-/// endpoint file lands in the sandbox (and `mcp_enabled=false` can be
-/// asserted as ABSENCE of that file — zero-sockets proof).
-fn isolated_data_dir(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("slooper-mcp-{tag}"));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    std::env::set_var(crate::paths::DATA_DIR_ENV, &p);
-    p
-}
-
-fn clear_data_dir() {
-    std::env::remove_var(crate::paths::DATA_DIR_ENV);
-}
-
 #[test]
 fn v107_mcp_lifecycle_disabled_no_listener() {
     let dir = isolated_data_dir("v107off");
@@ -585,25 +571,6 @@ fn http_get(port: u16) -> (u16, Option<String>) {
     parse_http(&raw)
 }
 
-fn parse_http(raw: &[u8]) -> (u16, Option<String>) {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("HTTP header terminator");
-    let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let status: u16 = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = &raw[split + 4..];
-    if body.is_empty() {
-        (status, None)
-    } else {
-        (status, Some(String::from_utf8_lossy(body).into_owned()))
-    }
-}
-
 #[test]
 #[ignore = "slow-tier: real socket"]
 fn v107_mcp_socket_roundtrip_e2e() {
@@ -618,34 +585,14 @@ fn v107_mcp_socket_roundtrip_e2e() {
     let dir = isolated_data_dir("v107sock");
     let mut app = headless_app("v107sock");
     let ctx = egui::Context::default();
-    app.mcp_port = 0;
-    app.mcp_enabled = true;
     // Shrink the worker's oneshot wait (600 ms) so the frozen-frame-loop
     // -32002 path is provable on the wire without a 5 s wall-clock burn.
-    // Every other call is drained well inside 600 ms by the pump below.
-    app.mcp.as_mut().unwrap().set_wait(std::time::Duration::from_millis(600));
-    app.mcp_frame(&ctx);
-    let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
+    // Every other call is drained well inside 600 ms by the kit pump below.
+    let (port, token) = testkit::start_mcp_socket(
+        &mut app, &ctx, Some(std::time::Duration::from_millis(600)));
 
     let mut call = |body: &str| -> (u16, Option<String>) {
-        use std::io::{Read, Write};
-        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        sock.set_read_timeout(Some(std::time::Duration::from_secs(8)))
-            .unwrap();
-        let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        sock.write_all(req.as_bytes()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        {
-            let mut srv = app.mcp.take().unwrap();
-            srv.drain(&mut app);
-            app.mcp = Some(srv);
-        }
-        let mut raw = Vec::new();
-        sock.read_to_end(&mut raw).unwrap();
-        parse_http(&raw)
+        testkit::socket_request(&mut app, port, &token, body)
     };
 
     // initialize (handshake era)
@@ -716,19 +663,13 @@ fn v107_mcp_socket_roundtrip_e2e() {
     // gets the structured -32002 (the frozen-frame-loop path; AC 5 e2e).
     {
         use std::io::{Read, Write};
-        // Header built from separate args: an earlier write layer of
-        // this session mangled any "prefix: {placeholder}" adjacency
-        // into "***", so the line is composed at runtime instead.
-        let hdr_auth = format!("{}: {} {}", "Authorization", "Bearer", token);
+        // The request header is the kit's well-formed POST builder; the
+        // deliberate NO-DRAIN between write and read is the probe itself
+        // (and why this block stays hand-rolled).
         let body = "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"ping\"}";
+        let req = testkit::post_request(port, &token, body);
         let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        sock
-            .set_read_timeout(Some(std::time::Duration::from_secs(8)))
-            .unwrap();
-        let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{hdr_auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(8))).unwrap();
         sock.write_all(req.as_bytes()).unwrap();
         // Longer than the 600 ms worker wait, far shorter than the read timeout.
         std::thread::sleep(std::time::Duration::from_millis(1400));
@@ -903,4 +844,106 @@ fn mcp_docs_cover_live_tool_table() {
             t.name
         );
     }
+}
+
+// ── v154: testkit single-source tripwires (board t_e65b9296) ────────────
+//
+// These pins guard the REPO, not the app: MCP tool-family suites must keep
+// driving the harness through the shared kit instead of re-cloning it. The
+// needles are concat!-split so this pin file can never match itself
+// (v150 lesson: a source pin whose needle lives in its own file passes
+// vacuously).
+
+/// Repo-relative src paths of every .rs file containing `needle`.
+fn v154_src_files_containing(needle: &str) -> Vec<String> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut hits = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).expect("src tree readable") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                let body = std::fs::read_to_string(&p).expect("rust source readable");
+                if body.contains(needle) {
+                    hits.push(
+                        p.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+    }
+    hits.sort();
+    hits
+}
+
+#[test]
+fn v154_mcp_testkit_helpers_single_sourced() {
+    // The tools/call envelope + dispatch helper: ONLY the kit may own it.
+    assert_eq!(
+        v154_src_files_containing(concat!("expect(\"tools/call ", "answers\")")),
+        vec!["src/mcp/testkit.rs".to_string()],
+    );
+    // The endpoint-read handshake: ONLY the kit may own it.
+    assert_eq!(
+        v154_src_files_containing(concat!("read_endpoint()", ".expect(")),
+        vec!["src/mcp/testkit.rs".to_string()],
+    );
+    // A well-formed POST header may not be reassembled in any TEST file;
+    // bridge.rs/http.rs build it for production traffic (the shim client
+    // writes it, the server answers it) — testkit is the only TEST-side
+    // builder.
+    let allow = ["src/mcp/bridge.rs", "src/mcp/http.rs", "src/mcp/testkit.rs"];
+    for f in v154_src_files_containing(concat!("Content-", "Type: application/json")) {
+        assert!(
+            allow.contains(&f.as_str()),
+            "v154 regression: the MCP POST header was duplicated into {f}"
+        );
+    }
+}
+
+#[test]
+fn v154_mcp_testkit_families_import_kit() {
+    for f in [
+        "src/mcp_settings/tests.rs",
+        "src/ui/mcp_mixer/tests.rs",
+        "src/mcp_plugins/tests.rs",
+        "src/ui/mcp_windows.rs",
+    ] {
+        let body = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(f),
+        )
+        .expect("family test file readable");
+        assert!(
+            body.contains("mcp::testkit"),
+            "{f} must drive the harness through the shared testkit"
+        );
+    }
+}
+
+#[test]
+fn v154_mcp_testkit_call_envelope_contract() {
+    let mut app = headless_app("v154kit");
+    let r = testkit::call(&mut app, "core.echo", json!({"text": "hi"}));
+    assert_eq!(r["jsonrpc"], "2.0");
+    assert_eq!(r["id"], 1);
+    assert_eq!(r["result"]["structuredContent"]["echo"], "hi");
+    assert_eq!(
+        testkit::structured(&mut app, "core.echo", json!({"text": "hi"}))["echo"],
+        "hi"
+    );
+    let e = testkit::is_error(
+        &mut app,
+        "settings.set",
+        json!({"name": "metro_bpm", "value": 4000}),
+    );
+    assert_eq!(e["error"], "out_of_range");
+    assert!(
+        !e["message"].as_str().unwrap_or_default().is_empty(),
+        "the human failure text must ride in 'message': {e}"
+    );
 }

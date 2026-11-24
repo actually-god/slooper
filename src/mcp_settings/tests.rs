@@ -9,36 +9,9 @@
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::mcp::rpc;
+use crate::mcp::testkit::{self, call, cfg_text, is_error, structured};
 use crate::mcp_settings;
 use crate::ui::{headless_app, App};
-
-fn call(app: &mut App, name: &str, args: Value) -> Value {
-    rpc::dispatch(
-        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                "params":{"name":name,"arguments":args}}),
-        app,
-    )
-    .expect("tools/call answers")
-}
-
-/// structuredContent of a tools/call response (panics loudly on -32xxx so
-/// a latch/refusal never masquerades as a result in the pins).
-fn structured(app: &mut App, name: &str, args: Value) -> Value {
-    let r = call(app, name, args);
-    assert!(r.get("error").is_none(), "unexpected JSON-RPC error: {r}");
-    r["result"]["structuredContent"].clone()
-}
-
-fn is_error(app: &mut App, name: &str, args: Value) -> Value {
-    let r = call(app, name, args);
-    assert_eq!(
-        r["result"]["isError"].as_bool(),
-        Some(true),
-        "expected a structured domain failure, got {r}"
-    );
-    r["result"]["structuredContent"].clone()
-}
 
 fn settings_list(app: &mut App) -> Vec<Value> {
     let s = structured(app, "settings.list", json!({}));
@@ -48,10 +21,6 @@ fn settings_list(app: &mut App) -> Vec<Value> {
 
 fn get_value(app: &mut App, name: &str) -> Value {
     structured(app, "settings.get", json!({"name": name}))["value"].clone()
-}
-
-fn cfg_text() -> String {
-    std::fs::read_to_string(Config::path()).expect("config.json in the headless sandbox")
 }
 
 // ── R1: parity — the surface IS the serde schema ──────────────────────────
@@ -213,7 +182,7 @@ fn v108_settings_mcp_enable_hotstarts() {
     structured(&mut app, "settings.set", json!({"name": "mcp_enabled", "value": false}));
     app.mcp_frame(&ctx);
     assert!(!app.mcp.as_ref().unwrap().is_running(), "off applies live too");
-    std::env::remove_var(crate::paths::DATA_DIR_ENV);
+    testkit::clear_data_dir();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -454,57 +423,13 @@ fn v108_mcp_settings_socket_roundtrip_e2e() {
     // The card's first AC end to end: a real MCP-over-HTTP client against
     // a live lazily-started server (port 0 + endpoint file, MCP-01's
     // harness shape), driving the settings surface; then the restart read.
-    let dir = std::env::temp_dir().join("slooper-mcp-v108sock");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::env::set_var(crate::paths::DATA_DIR_ENV, &dir);
+    let dir = testkit::isolated_data_dir("v108sock");
     let mut app = headless_app("v108sock");
     let ctx = egui::Context::default();
-    app.mcp_port = 0;
-    app.mcp_enabled = true;
-    app.mcp_frame(&ctx);
-    let (port, token) = crate::mcp::bridge::read_endpoint().expect("endpoint file");
+    let (port, token) = testkit::start_mcp_socket(&mut app, &ctx, None);
 
     let mut call = |body: &str| -> (u16, Option<String>) {
-        use std::io::{Read, Write};
-        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        sock.set_read_timeout(Some(std::time::Duration::from_secs(8)))
-            .unwrap();
-        // Header built from SEPARATE format args (the auth line must never
-        // sit as a literal interpolation pair — proven CI hazard).
-        let auth = format!("Bearer {}", token);
-        let head = format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {}\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            auth,
-            body.len()
-        );
-        sock.write_all(head.as_bytes()).unwrap();
-        sock.write_all(body.as_bytes()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        {
-            let mut srv = app.mcp.take().unwrap();
-            srv.drain(&mut app);
-            app.mcp = Some(srv);
-        }
-        let mut raw = Vec::new();
-        sock.read_to_end(&mut raw).unwrap();
-        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-        let status: u16 = String::from_utf8_lossy(&raw[..split])
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
-        let body = &raw[split + 4..];
-        (
-            status,
-            if body.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(body).into_owned())
-            },
-        )
+        testkit::socket_request(&mut app, port, &token, body)
     };
     let mut rpc_over = |id: i64, method: &str, params: Value| -> Value {
         let (st, body) = call(
@@ -566,6 +491,6 @@ fn v108_mcp_settings_socket_roundtrip_e2e() {
     assert_eq!(cfg.metro_bpm, 97, "live-tier write persisted");
     assert_eq!(cfg.win_audio_backend, "wasapi", "restart-tier write persisted");
 
-    std::env::remove_var(crate::paths::DATA_DIR_ENV);
+    testkit::clear_data_dir();
     let _ = std::fs::remove_dir_all(&dir);
 }
