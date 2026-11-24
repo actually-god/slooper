@@ -8,6 +8,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Changed
 
+- **The convolver's folder documentation now tells the truth.** The
+  README the effect generates next to its impulse files promised files
+  are “peak-normalized”, while the convolver deliberately
+  ENERGY-normalizes them — that is what makes a short and a long IR sit
+  at the same loudness, and matching two IRs by peak level produced the
+  opposite of what the folder’s own instructions said. The README now
+  explains the real model, and the folder hint in the effect list
+  follows the OS: Windows users are no longer sent to
+  `~/.local/share/slooper/impulses` (a path that does not exist there)
+  but shown the real `%LOCALAPPDATA%` location. Existing installs pick
+  both up through the regular content-diff seeding (pins `v146_*`).
 - **The effect template now teaches the whole plugin ABI.** The starter
   file every user copies (`effects/template.rs`) still taught the v1-era
   contract: an “up to 8 params” limit (the real cap is
