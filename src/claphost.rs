@@ -1473,26 +1473,36 @@ impl ClapStageEntry {
             return;
         }
         s.deliver.sort_by_key(|q| q.pos);
-        // Snapshot: a plugin may re-enter the host (log callback) while we
-        // stage its events, and the host's log path takes rt.lock() — a
-        // borrowed iterator over `s.deliver` would alias that `&mut *s`
-        // further down. Copy the due messages out and release the borrow.
-        let deliver = std::mem::take(&mut s.deliver);
-        for q in deliver.iter() {
-            let t = (q.pos - start).clamp(0, VST_BLOCK as i64 - 1) as u32;
-            let status = q.m[0] & 0xF0;
-            let ch = (q.m[0] & 0x0F) as i16;
+        // v141 (card t_342d8563): stage from the PERSISTENT field. The old
+        // code did `let deliver = std::mem::take(&mut s.deliver)` to release
+        // the `&mut s` borrow before the push_* calls — but the take left the
+        // field default-empty, so EVERY eventful block malloc'd a fresh Vec
+        // in the partition loop above and freed it again when the local
+        // dropped: RT heap churn exactly the class the module's "allocates
+        // nothing" rule forbids. No snapshot is needed for the plugin
+        // log-reentry aliasing that comment feared: push_* only write the
+        // event pool, they never call plugin code — the plugin runs later,
+        // in process_block, once this fn's borrow of `s` is dead. Iterate by
+        // index and copy each (m, pos) pair out so no borrow of `s.deliver`
+        // is live across a push (mirrors vsthost::deliver_midi, which has
+        // always reused its field). `s.deliver` then keeps its capacity
+        // across blocks: clear+push reallocates only while still growing.
+        for k in 0..s.deliver.len() {
+            let (m, pos) = (s.deliver[k].m, s.deliver[k].pos);
+            let t = (pos - start).clamp(0, VST_BLOCK as i64 - 1) as u32;
+            let status = m[0] & 0xF0;
+            let ch = (m[0] & 0x0F) as i16;
             match status {
-                0x90 if q.m[2] > 0 => self.push_note(
+                0x90 if m[2] > 0 => self.push_note(
                     s,
                     t,
                     ffi::CLAP_EVENT_NOTE_ON,
                     ch,
-                    q.m[1],
-                    q.m[2] as f64 / 127.0,
+                    m[1],
+                    m[2] as f64 / 127.0,
                 ),
                 // 0x90 with velocity 0 is note off by the classic convention.
-                0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, q.m[1], 0.0),
+                0x80 | 0x90 => self.push_note(s, t, ffi::CLAP_EVENT_NOTE_OFF, ch, m[1], 0.0),
                 // CC / program / pressure / pitch bend / poly AT travel as
                 // raw bytes: spec says plugins should take both forms, and
                 // every CLAP plugin on this host does. v103: pitch bend
@@ -1504,7 +1514,7 @@ impl ClapStageEntry {
                 // v42/MPE). Engine-side split (documented, decision (a)):
                 // SCRIPTED synths still have no poly-AT callback (kind-4
                 // dispatch arms drop) — follow-up feature card, not here.
-                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, q.m),
+                0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, m),
                 _ => {}
             }
         }
@@ -2061,7 +2071,9 @@ impl StageEntry for ClapStageEntry {
         if off < n {
             output[off..n].fill(0.0);
         }
-        // The `deliver` snapshot was consumed by fill_events this block.
+        // v141: `deliver` persists across blocks (no per-block take), so
+        // this block's staged CONTENT is dropped here; capacity stays warm
+        // for the next partition. Nothing reads it between process() calls.
         unsafe { (*self.state.get()).deliver.clear() };
     }
 
