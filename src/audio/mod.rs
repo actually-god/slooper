@@ -9702,4 +9702,140 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         assert_eq!(parse_plugin_target("track.vol"), None);
         assert_eq!(parse_plugin_target("synth:1x"), None);
     }
+
+    // ==== v150 (card t_3911ce56): MIDI dispatch / byte-map single-source ====
+
+    /// This module's source with comment lines (`//`, `///`) stripped — a
+    /// needle surviving only in lore comments must not feed the counts
+    /// (v12e lesson), and the pin's own literals are split with `concat!`
+    /// (v148 lesson) so the test text contributes no occurrence.
+    fn v150_active_src() -> String {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/audio/mod.rs"
+        ))
+        .expect("module source readable");
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The scripted-instrument dispatch match + scan loop must exist ONCE
+    /// (apply_script_event / drive_script_events); every RT drain — offline
+    /// bounce, owner-map, v46 poly-lane, audition-copy, pseudo-slot — must
+    /// call the shared driver. A 6th hand-rolled window, or a drain that
+    /// diverges from the helper, trips this pin.
+    #[test]
+    fn v150_script_dispatch_window_appears_once() {
+        let src = v150_active_src();
+        assert_eq!(
+            src.matches(concat!("inst.", "poly_at(ch, d1, d2)")).count(),
+            1,
+            "the MPE dispatch arm must live only in apply_script_event"
+        );
+        assert_eq!(
+            src.matches(concat!("drive_", "script_events(inst")).count(),
+            5,
+            "all five MIDI drains must call the shared driver"
+        );
+        assert_eq!(
+            src.matches(concat!("ev[i].0 == ", "raw")).count(),
+            1,
+            "the raw-offset scan guard must live only in drive_script_events"
+        );
+    }
+
+    /// The 6-arm VST byte-mapping must exist ONCE (midi3_raw) with all four
+    /// live drains staging through it. `render_midi_vst`'s legacy 4-arm
+    /// matcher is deliberately RETAINED in v150 — its missing kind 4/5 arms
+    /// are a known behavior bug tracked on its own card (a fix needs
+    /// retargeted pins), so 0x90 must count exactly 2: midi3_raw + legacy.
+    #[test]
+    fn v150_vst_byte_map_window_appears_once() {
+        let src = v150_active_src();
+        assert_eq!(
+            src.matches(concat!("0xA0 ", "| ch & 0x0F")).count(),
+            1,
+            "per-note aftertouch staging must live only in midi3_raw"
+        );
+        assert_eq!(
+            src.matches(concat!("0xE0 ", "| ch & 0x0F")).count(),
+            1,
+            "bend staging must live only in midi3_raw"
+        );
+        assert_eq!(
+            src.matches(concat!("mi", "di3_raw(")).count(),
+            5,
+            "one definition + four call sites"
+        );
+        assert_eq!(
+            src.matches(concat!("0x90 ", "| ch & 0x0F")).count(),
+            2,
+            "midi3_raw + the legacy render_midi_vst matcher (follow-up card)"
+        );
+    }
+
+    /// drive_script_events drives a REAL loop: the inter-event gap and the
+    /// tail render audio (a broken gap renderer would go silent against the
+    /// silent negative control), nothing sounds before the note-on, events
+    /// at/past the window end dispatch without OOB or a spin, and MPE kinds
+    /// 4/5 are tolerated. Fresh instance per case — no cross-contamination.
+    #[test]
+    fn v150_drive_script_events_gap_render_and_edges() {
+        let reg = crate::synth::Registry::open(crate::synth::default_dir());
+        let fresh = || -> (std::sync::Arc<crate::synth::Instance>, [f32; crate::synth::MAX_PARAMS]) {
+            let inst = reg
+                .create_instance("piano", 44_100.0, &[])
+                .expect("bundled piano must compile and load");
+            let mut p = [0.0f32; crate::synth::MAX_PARAMS];
+            inst.read_params(&mut p);
+            (inst, p)
+        };
+        let peak = |v: &[f32]| v.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let n = 22_050usize;
+
+        // Negative control: no events -> pure silence.
+        let (inst, p) = fresh();
+        let mut out = vec![0f32; n];
+        drive_script_events(&inst, &[], &p, &mut out);
+        assert!(peak(&out) < 1e-9, "event-free drive is silent, got {}", peak(&out));
+
+        // Note-on at sample 2 rings through the tail: audio must exist well
+        // past the last event (gap + tail process_into actually render).
+        let (inst, p) = fresh();
+        let mut out = vec![0f32; n];
+        drive_script_events(&inst, &[(2usize, 3u8, 0u8, 60u8, 110u8)], &p, &mut out);
+        assert!(peak(&out) > 0.05, "a staged note must sound (peak {})", peak(&out));
+        assert!(
+            peak(&out[n * 3 / 4..]) > 0.002,
+            "the drive must keep rendering after the last event (peak {})",
+            peak(&out[n * 3 / 4..])
+        );
+
+        // Late note-on: nothing may sound before its offset.
+        let (inst, p) = fresh();
+        let mut out = vec![0f32; n];
+        drive_script_events(&inst, &[(20_000usize, 3u8, 0u8, 64u8, 110u8)], &p, &mut out);
+        assert!(
+            peak(&out[..10_000]) < 1e-9,
+            "no audio may precede the note-on (peak {})",
+            peak(&out[..10_000])
+        );
+        assert!(peak(&out[20_500..]) > 0.05, "the late note must sound (peak {})", peak(&out[20_500..]));
+
+        // Events AT and PAST the window end dispatch in order — no OOB,
+        // no spin (the helper's raw-offset guard), kinds 4/5 survive.
+        let (inst, p) = fresh();
+        let mut out = vec![0f32; n];
+        let edge = [
+            (n, 3u8, 0u8, 60u8, 100u8),
+            (n + 5, 4u8, 0u8, 60u8, 90u8),
+            (n + 9, 5u8, 0u8, 1u8, 64u8),
+            (n + 5_000, 3u8, 0u8, 61u8, 100u8),
+        ];
+        drive_script_events(&inst, &edge, &p, &mut out);
+        // (sorted raw offsets: n < n+5 < n+9 < n+5000)
+        assert_eq!(out.len(), n, "past-the-end events never extend the window");
+    }
 }
