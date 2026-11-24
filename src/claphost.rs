@@ -1511,9 +1511,14 @@ impl ClapStageEntry {
                 // (0xA0) was the same hole one status nibble over — the MPE
                 // voice message vanished for CLAP while VST2/VST3 carried
                 // it (VST2 raw batch; VST3 0xA0 => PolyAftertouch since
-                // v42/MPE). Engine-side split (documented, decision (a)):
-                // SCRIPTED synths still have no poly-AT callback (kind-4
-                // dispatch arms drop) — follow-up feature card, not here.
+                // v42/MPE). Engine-side split CLOSED by v106 (card
+                // t_a4df161f): scripted synths DO receive per-note
+                // aftertouch once their script declares a SynthInfoV3
+                // table (`slooper_synth_info_v3`) — all five engine
+                // kind-4 dispatch arms route inst.poly_at (audio/mod.rs);
+                // v1/v2 scripts keep the designed no-op (synth.rs
+                // Instance::poly_at). Do not re-claim the old gap here —
+                // guarded by the v143_poly_at_comment_block pins.
                 0xA0 | 0xB0 | 0xC0 | 0xD0 | 0xE0 => self.push_midi(s, t, m),
                 _ => {}
             }
@@ -3632,5 +3637,85 @@ pub(crate) mod tests {
             assert_eq!(s.pending.len(), 0, "carry queue drained");
         }
         assert_eq!(e.midi_drops(), 0, "no overflow on the carry path");
+    }
+
+    // ---- v143 (t_fdaacd0d): the 0xA0-arm comment must tell the engine-side
+    // truth. v104 closed the CLAP raw-MIDI hole and documented the THEN-live
+    // engine gap ("decision (a)": scripted synths get no poly-AT). v106
+    // (card t_a4df161f) CLOSED that gap: SynthInfoV3-stamped scripts receive
+    // inst.poly_at on all five kind-4 dispatch arms (audio/mod.rs), and
+    // v1/v2 scripts keep the designed no-op (synth.rs Instance::poly_at).
+    // The stale wording made MPE auditors file duplicate feature cards.
+    // These pins are comment-drift guards: NEGATIVE locks the closed-era
+    // claims out of the block, POSITIVE requires it to cite the closure.
+    // All needles are assembled at RUN time (format!) so no matchable
+    // needle sits in these pins' own bytes (source-pin vacuity doctrine).
+
+    /// The contiguous `//` comment block directly above fill_events'
+    /// raw-MIDI match arm, as one space-joined string. The walk is
+    /// bounded: it starts one full line above the arm and stops at the
+    /// first non-comment line (the 0x80/0x90 note-off arm sits above the
+    /// block), so the scan can never wander into the code or the tests.
+    fn v143_a0_arm_comment(src: &str) -> String {
+        let needle = format!("{} | 0xB0 | 0xC0 | 0xD0 | 0xE0", "0xA0");
+        let at = src
+            .find(needle.as_str())
+            .unwrap_or_else(|| panic!("raw-MIDI match arm {needle:?} is gone from fill_events"));
+        // head = everything strictly ABOVE the arm's line (drop the partial).
+        let head = &src[..src[..at].rfind('\n').unwrap_or(0)];
+        let block: Vec<String> = head
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("//"))
+            .map(|l| l.trim_start().trim_start_matches('/').trim().to_string())
+            .collect();
+        assert!(
+            block.len() >= 8,
+            "comment-block walk found only {} lines above the 0xA0 arm \u{2014} the pin's \
+             region anchor broke, fix the pin before trusting its verdicts",
+            block.len()
+        );
+        block.into_iter().rev().collect::<Vec<_>>().join(" ")
+    }
+
+    /// v143 NEGATIVE polarity: the two exact v104-era sentences that claimed
+    /// the engine gap may never re-enter the block. If either appears, an
+    /// editor is re-asserting the pre-v106 state as current.
+    #[test]
+    fn v143_poly_at_comment_block_no_stale_claim() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/claphost.rs"));
+        let block = v143_a0_arm_comment(src);
+        let stale1 = format!("still have no poly-{} callback", "AT");
+        let stale2 = format!("follow-up feature card, not {}", "here");
+        for stale in [stale1.as_str(), stale2.as_str()] {
+            assert!(
+                !block.contains(stale),
+                "the fill_events 0xA0-arm comment re-claims a CLOSED gap ({stale:?}): \
+                 v106 gave scripted synths poly-AT via SynthInfoV3 \u{2014} see synth.rs \
+                 SynthFns.poly_at + the five kind-4 arms in audio/mod.rs; audit those \
+                 before (re-)filing any poly-AT feature card"
+            );
+        }
+    }
+
+    /// v143 POSITIVE polarity: the block must document the v106 state —
+    /// the closure cite, the engine callback name, and the ABI table that
+    /// gates it. Also proves the region walk captured the block itself
+    /// (an empty region would carry none of these), so the pair closes
+    /// the vacuity loop on both polarities.
+    #[test]
+    fn v143_poly_at_comment_block_cites_v106_closure() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/claphost.rs"));
+        let block = v143_a0_arm_comment(src);
+        let v106 = format!("v10{}", "6");
+        let pa = format!("poly_{}t", "a");
+        let v3 = format!("{}InfoV3", "Synth");
+        for want in [v106.as_str(), pa.as_str(), v3.as_str()] {
+            assert!(
+                block.contains(want),
+                "the 0xA0-arm comment must document the engine-side split \u{2014} \
+                 {want:?} missing (v106/card t_a4df161f state)"
+            );
+        }
     }
 }
