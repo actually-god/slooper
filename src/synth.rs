@@ -3017,16 +3017,21 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
 
     // ==== v148: the shipped load_map contract must teach the live packing ====
     //
-    // src/synth_api.rs is re-written into every user's synths/ folder on
-    // boot (content-diff seeding) — it is the ONLY documentation of the
-    // key-map ABI third-party samplers copy from. Until v148 it still
-    // taught the pre-v52 `<< 8` slot packing while the live ABI (see
-    // host_load_map above; v52 R2) packs asset | velocity | root across
-    // three fields: scripts written to the shipped text read the
-    // velocity byte as the asset id and silently play wrong samples.
-    // Docs-only pins — the packing BEHAVIOR is covered by the v51/v52
-    // render pins; these keep the contract text, the repo mirror and the
-    // internal map doc from rotting again.
+    // The contract file (synths/synth_api.rs — the single source since
+    // v149) is embedded in the binary and re-written into every user's
+    // synths/ folder on boot (content-diff seeding) — it is the ONLY
+    // documentation of the key-map ABI third-party samplers copy from.
+    // Until v148 it still taught the pre-v52 `<< 8` slot packing while
+    // the live ABI (see host_load_map above; v52 R2) packs asset |
+    // velocity | root across three fields: scripts written to the shipped
+    // text read the velocity byte as the asset id and silently play wrong
+    // samples. Docs-only pins — the packing BEHAVIOR is covered by the
+    // v51/v52 render pins; these keep the contract text and the internal
+    // map doc from rotting again. (The original third pin here — a
+    // sync check between the src/ twin and the synths/ copy — was retired
+    // in the v149 rebase: with one file left it would compare the file
+    // with itself, and v149_synth_api_folder_copy_is_the_single_source
+    // guards the drift class structurally.)
 
     /// The exact packing expression every contract doc must now state.
     /// Split with concat! so the literal cannot satisfy the self-file
@@ -3066,29 +3071,6 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         assert!(
             !API_SRC.contains(concat!("(asset_id << 8)", " |")),
             "the pre-v52 << 8 packing crept back into the shipped synth_api.rs contract"
-        );
-    }
-
-    #[test]
-    fn v148_repo_api_copy_matches_embedded() {
-        // "Sync synths/synth_api.rs with the src copy" was v100-era manual
-        // discipline — pin it. The EMBEDDED copy (API_SRC) is what boots
-        // into every install, so drift in the repo MIRROR is the bug.
-        // Compare LF-normalized (Windows checkouts are CRLF; include_str!
-        // and fs reads do not agree on line endings there). Paths are
-        // chained single-component joins (W14: push("a/b") is not the
-        // same PathBuf on Windows).
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("synths")
-            .join("synth_api.rs");
-        let disk = std::fs::read_to_string(&p)
-            .expect("repo API mirror exists")
-            .replace("\r\n", "\n");
-        assert_eq!(
-            disk,
-            API_SRC.replace("\r\n", "\n"),
-            "synths/synth_api.rs drifted from embedded src/synth_api.rs — every install gets \
-             the EMBEDDED copy, so sync the MIRROR"
         );
     }
 
