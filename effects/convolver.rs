@@ -12,7 +12,7 @@
 // the built-in synthetic hall so the effect works with zero files. Up to
 // 7 files load (sorted by file name); they are parsed (PCM 16/24/32,
 // IEEE float 32, mono/stereo), resampled to the engine rate, faded, and
-// peak-normalized at create — nothing allocates in `process`.
+// energy-normalized at create — nothing allocates in `process`.
 //
 // DSP: partitioned convolution (overlap-save, N = 2048 / hop = 1024,
 // radix-2 FFT with precomputed tables). Latency = one hop (~21 ms at
