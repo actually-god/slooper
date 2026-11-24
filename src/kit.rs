@@ -17,7 +17,7 @@
 //! to the host verbatim, so a light canvas would silently hide them
 //! (documented for script authors in effect_api).
 
-use egui::{Color32, Response, TextStyle, Ui, Visuals};
+use egui::{Color32, Key, PointerButton, Rect, Response, TextStyle, Ui, Visuals};
 
 /// The one accent: selection frames, drag highlights, kit value readouts,
 /// the knob needle. Light-mode plugin editors borrow this same blue from
@@ -117,6 +117,47 @@ pub(crate) fn label_clipped(ui: &Ui, text: &str, avail_w: f32, style: TextStyle,
     over_w || max_h.is_some_and(|hmax| h > hmax + 1.0)
 }
 
+// ---------------------------------------------------------------------------
+// v152 (t_5bd4fc33): the ONE armed-popup dismissal predicate.
+//
+// Three ad-hoc popup windows (automation value menu, command palette,
+// window-slot menu) each hand-rolled the same "armed && click outside the
+// rect" dismissal check, and the copies immediately drifted (palette keyed
+// no Escape and forgave 6 px; the other two keyed Escape at 4 px). One
+// predicate now; the per-surface differences are EXPLICIT parameters, never
+// silent divergence.
+//
+// Contract (byte-identical to the three former copies):
+//   - `armed` gates everything: on the frame that OPENED a menu, the press
+//     that opened it must not also count as the click-away (all three
+//     surfaces keep an `*_armed` field for this one-frame exclusion).
+//   - A fresh primary press, secondary press, or (when `escape` is set) the
+//     Escape key dismisses — Escape evaluated THIRD to preserve the
+//     short-circuit order of the originals.
+//   - "Outside" = the pointer hover position (fallback: the rect center, so
+//     an Escape with no known hover never dismisses on its own) is not
+//     inside rect.expand(pad) — the pad forgives the window border/shadow.
+//
+// Surfaces that own a DIFFERENT Escape close (the command palette closes
+// unconditionally on Escape, modal: the query box owns typing, not gated by
+// armed) pass `escape = false` — the key is consumed upstream and a second
+// dismissal there would double-fire with different semantics.
+// ---------------------------------------------------------------------------
+
+/// `armed && (primary-click | secondary-click | (escape && Escape))` with the
+/// hover point OUTSIDE `rect.expand(pad)` — see the section doc for the law.
+pub(crate) fn armed_outside_click(ui: &Ui, armed: bool, rect: Rect, pad: f32, escape: bool) -> bool {
+    armed
+        && ui.ctx().input(|i| {
+            (i.pointer.button_clicked(PointerButton::Primary)
+                || i.pointer.button_clicked(PointerButton::Secondary)
+                || (escape && i.key_pressed(Key::Escape)))
+                && !rect
+                    .expand(pad)
+                    .contains(i.pointer.hover_pos().unwrap_or(rect.center()))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +206,113 @@ mod tests {
         let v = Visuals::light();
         assert_eq!(light.text, v.weak_text_color());
         assert_eq!(light.accent, v.hyperlink_color);
+    }
+
+    // ---- v152: the ONE armed-popup dismissal predicate (t_5bd4fc33) ----
+    //
+    // Driven through a REAL egui Context: events are injected as RawInput,
+    // the helper runs inside a live Area's Ui, and the verdict is read back.
+    // Semantics are pinned as the UNION of the three former hand-rolled
+    // copies (value/win menus: escape=true pad=4; palette: escape=false pad=6).
+
+    /// The rect the dismissal test runs against; `probe` renders one frame
+    /// with `events` injected and asks the seam for its verdict.
+    fn v152_verdict(
+        events: Vec<egui::Event>,
+        armed: bool,
+        pad: f32,
+        escape: bool,
+    ) -> bool {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(120.0, 80.0));
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput { events, ..Default::default() };
+        // egui 0.36: run_ui takes FnOnce(&mut Context) and returns FullOutput.
+        // The FullOutput MUST be consumed — the first run installs the font
+        // atlas and dropping an un-cleared TexturesDelta panics (0.36 trap).
+        let mut got = false;
+        let mut out = ctx.run_ui(raw, |ctx| {
+            egui::Area::new(egui::Id::new("v152_probe"))
+                .fixed_pos(egui::pos2(10.0, 10.0))
+                .show(ctx, |ui| {
+                    got = armed_outside_click(ui, armed, rect, pad, escape);
+                });
+        });
+        out.textures_delta.clear();
+        got
+    }
+
+    fn v152_click(pos: egui::Pos2, btn: egui::PointerButton) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerButton { pos, button: btn, pressed: true, modifiers: Default::default() },
+            egui::Event::PointerButton { pos, button: btn, pressed: false, modifiers: Default::default() },
+        ]
+    }
+
+    fn v152_escape(hover: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(hover),
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    const OUT: egui::Pos2 = egui::pos2(500.0, 400.0);
+    const IN: egui::Pos2 = egui::pos2(140.0, 130.0);
+
+    #[test]
+    fn v152_kit_dismiss_press_semantics() {
+        // A fresh press OUTSIDE (either button) dismisses; inside does not.
+        assert!(v152_verdict(v152_click(OUT, egui::PointerButton::Primary), true, 4.0, true));
+        assert!(v152_verdict(v152_click(OUT, egui::PointerButton::Secondary), true, 4.0, true));
+        assert!(!v152_verdict(v152_click(IN, egui::PointerButton::Primary), true, 4.0, true));
+        // No press this frame at all: never dismisses.
+        assert!(!v152_verdict(vec![egui::Event::PointerMoved(OUT)], true, 4.0, true));
+    }
+
+    #[test]
+    fn v152_kit_dismiss_armed_gate() {
+        // The opening frame is EXCLUDED: same outside press, unarmed = no dismissal.
+        assert!(!v152_verdict(v152_click(OUT, egui::PointerButton::Primary), false, 4.0, true));
+        assert!(!v152_verdict(v152_escape(OUT), false, 4.0, true));
+    }
+
+    #[test]
+    fn v152_kit_dismiss_escape_policy() {
+        // escape=true (value/win menus): Escape dismisses when the hover is
+        // outside; escape=false (palette shape — its Escape is an
+        // unconditional global handler upstream): the key never fires here.
+        assert!(v152_verdict(v152_escape(OUT), true, 4.0, true));
+        assert!(!v152_verdict(v152_escape(OUT), true, 4.0, false));
+        // Quirk frozen from ALL three originals: Escape AND'd with the
+        // outside test — hover INSIDE the menu means no dismissal.
+        assert!(!v152_verdict(v152_escape(IN), true, 4.0, true));
+        // Escape with no known hover falls back to the rect center = inside.
+        assert!(!v152_verdict(
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            true,
+            4.0,
+            true
+        ));
+    }
+
+    #[test]
+    fn v152_kit_dismiss_pad_knob() {
+        // 5 px past the rect edge: the 4 px forgiveness (menus) is crossed
+        // and dismisses; the palette's 6 px band still protects it. The pad
+        // parameter IS the documented drift — a knob, not an accident.
+        let near = egui::pos2(225.0, 130.0); // rect max.x = 220
+        assert!(v152_verdict(v152_click(near, egui::PointerButton::Primary), true, 4.0, true));
+        assert!(!v152_verdict(v152_click(near, egui::PointerButton::Primary), true, 6.0, true));
     }
 }
