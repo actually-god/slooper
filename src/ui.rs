@@ -31876,7 +31876,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         app.save_config();
                         app.status = "midi: selection applied".into();
                     }
-                    if ui.button("Refresh").on_hover_text("re-scan the JACK port list").clicked() {
+                    if ui.button("Refresh").on_hover_text("re-scan the MIDI device list").clicked() {
                         app.backend.cmd(Cmd::Refresh);
                     }
                 });
@@ -62998,6 +62998,98 @@ mod tests {
             let n = prod.matches(needle).count();
             assert_eq!(n, want, "hover-copy contract drift for {needle:?}: saw {n}, want {want}");
         }
+    }
+
+    /// v139 helper: strip `//` comment lines from a scanned slice before
+    /// needle matching (v86 rule) — the MIDI section's intro comment
+    /// legitimately mentions JACK MIDI auto-connecting on Linux, and
+    /// comment needles must not move this pin either way.
+    fn v139_code_only(sect: &str) -> String {
+        sect.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// v139 (card t_83fe50d0) R1+R3: the Windows MIDI INPUTS Refresh
+    /// button hovered "re-scan the JACK port list" \u{2014} copy-pasted from
+    /// the audio-ports section above. On Windows the audio list is WASAPI
+    /// endpoints (or opt-in native JACK) and this button re-publishes the
+    /// MIDI devices (`WasapiSession::refresh` \u{2192} publish_ports +
+    /// publish_midi) \u{2014} the one control users reach after hot-plugging a
+    /// MIDI keyboard named the wrong subsystem. SOURCE scan, not runtime:
+    /// the section is `cfg!(windows)`-gated and
+    /// w9_midi_picker_section_is_windows_only pins it to never paint on
+    /// Linux, so a Linux headless frame can never reach the hover; this
+    /// scan runs in BOTH OS suites. Needles concat!-split (self-file
+    /// vacuity doctrine); the prod slice stops at `mod tests` (column 0).
+    #[test]
+    fn v139_midi_refresh_hover_names_midi() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => panic!("mod tests anchor vanished \u{2014} scan would eat its own literals"),
+        };
+        let a = prod.find("\"MIDI INPUTS\",").expect("MIDI INPUTS header anchor");
+        let sect = &prod[a..a
+            + prod[a..]
+                .find("\"AUTOMATION (MCP)\",")
+                .expect("MIDI section end anchor")];
+        let code = v139_code_only(sect);
+        assert_eq!(
+            code.matches("ui.button(\"Refresh\")").count(),
+            1,
+            "scanner sanity: the MIDI section holds exactly one Refresh statement"
+        );
+        let midi = concat!("re-scan the MIDI ", "device list");
+        let jack = concat!("re-scan the JA", "CK port list");
+        assert_eq!(
+            code.matches(midi).count(),
+            1,
+            "the MIDI Refresh hover must name the MIDI device list exactly once"
+        );
+        assert_eq!(
+            code.matches(jack).count(),
+            0,
+            "the MIDI INPUTS section must never name the JACK subsystem"
+        );
+    }
+
+    /// v139 R2: over-sed guard \u{2014} the audio twin keeps its honest JACK
+    /// wording (its runtime arm `hover_until_tip` pin stays green
+    /// untouched), and the MIDI wording never leaks into the audio
+    /// section. Opposite polarity of the pin above: a global sed
+    /// reddens exactly one of the pair.
+    #[test]
+    fn v139_audio_ports_hover_keeps_jack() {
+        let srcs = include_str!("ui.rs");
+        let prod = match srcs.find("\nmod tests") {
+            Some(i) => &srcs[..i],
+            None => panic!("mod tests anchor vanished \u{2014} scan would eat its own literals"),
+        };
+        let a = prod.find("\"AUDIO PORTS\",").expect("AUDIO PORTS header anchor");
+        let sect = &prod[a..a
+            + prod[a..]
+                .find("\"AUDIO BACKEND\",")
+                .expect("audio section end anchor")];
+        let code = v139_code_only(sect);
+        assert_eq!(
+            code.matches("ui.button(\"Refresh\")").count(),
+            1,
+            "scanner sanity: the audio ports section holds exactly one Refresh statement"
+        );
+        let midi = concat!("re-scan the MIDI ", "device list");
+        let jack = concat!("re-scan the JA", "CK port list");
+        assert_eq!(
+            code.matches(jack).count(),
+            1,
+            "the audio Refresh hover must keep its JACK wording exactly once"
+        );
+        assert_eq!(
+            code.matches(midi).count(),
+            0,
+            "the MIDI wording must not leak into the AUDIO PORTS section"
+        );
     }
 
 }

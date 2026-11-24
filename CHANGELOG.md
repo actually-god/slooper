@@ -8,6 +8,13 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Windows: the MIDI "Refresh" button now says what it re-scans.** In
+  Settings → MIDI INPUTS, the Refresh button hovered “re-scan the JACK
+  port list” — copy-pasted from the audio ports section above. On
+  Windows the audio list is WASAPI endpoints (JACK is an opt-in
+  backend), and this control re-scans the MIDI devices: the one button
+  you reach for after hot-plugging a MIDI keyboard named the wrong
+  subsystem. It now reads “re-scan the MIDI device list”.
 - **Project-asset context menus now say FILE where they act on files.**
   The rename and move entries on a “project assets” row hovered
   “rename/move this folder …” while the buttons rename or move the
