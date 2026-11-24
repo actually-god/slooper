@@ -797,7 +797,10 @@ beat the positional pass.)
 **The built-in presets are ordinary files in that folder.** On first launch
 slooper seeds its factory presets (Radio filter, Cathedral, …) there once;
 after that they are *yours* — edit one and overwrite it, delete one for
-good, add your own beside it. Nothing is ever rewritten or resurrected. So
+good, add your own beside it. Nothing is ever rewritten or resurrected. The
+one-time seed is tracked by a `.factory-seeded` marker file in that folder:
+delete the marker (or the whole folder) and restart to bring back factory
+presets you deleted — your own files and edits are still never touched. So
 to build a preset by hand (or from a script/agent): copy any `.json` in
 that folder, adjust labels/values, give it a fresh `{stem}-…` name — it
 appears in that plugin's list immediately, no restart needed. The factory

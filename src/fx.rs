@@ -545,7 +545,8 @@ pub const BUILTIN_PRESET_STEMS: [&str; 2] = ["parametric_eq", "space_echo"];
 /// presets have already been seeded once. Its presence means "this folder
 /// belongs to the user now": deletions stay deleted and edits stay edited
 /// across launches and upgrades. Delete it (or the folder) to restore the
-/// starter set — that is the documented recovery, see `docs/PLUGINS.md`.
+/// starter set — that is the documented recovery, see `docs/USAGE.md`
+/// (section "Presets").
 pub const FACTORY_SEED_MARKER: &str = ".factory-seeded";
 
 /// Merge the factory presets into the USER preset folder (v0.13 — presets
@@ -585,7 +586,7 @@ pub fn seed_builtin_presets(fx_dir: &Path) -> usize {
         "factory presets seeded once (slooper v0.13+). This file marks the\n\
          preset folder as user-owned: nothing rewrites or re-adds files any\n\
          more. Delete it (or the folder) and restart to restore the starter\n\
-         set. Format of the preset files: see docs/PLUGINS.md (Presets).\n",
+         set. Format of the preset files: see docs/USAGE.md (Presets).\n",
     );
     written
 }
@@ -3927,6 +3928,42 @@ pub extern "C" fn slooper_effect_gui() -> *const EffectGuiV1 { &GUI }
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn factory_preset_docs_point_at_live_sections() {
+        // The preset pointer users actually read — the `.factory-seeded`
+        // marker text — must cite a doc file that carries a "Presets"
+        // section. PLUGINS.md never had one (t_51543b0e); the real section
+        // is docs/USAGE.md § "Presets", same citation as `builtin_presets`.
+        let dir = temp_dir("presetdocs");
+        assert!(seed_builtin_presets(&dir) > 0);
+        let marker = std::fs::read_to_string(user_presets_dir(&dir).join(FACTORY_SEED_MARKER))
+            .expect("marker file written by seed");
+        assert!(
+            marker.contains("docs/USAGE.md (Presets)"),
+            "marker hint lost its pointer: {marker}"
+        );
+        assert!(
+            !marker.contains("PLUGINS.md"),
+            "marker must not cite PLUGINS.md (it has no Presets section)"
+        );
+        // The cited doc must really carry the section — read the SHIPPED
+        // file, not a copy of the string.
+        let usage = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs")
+                .join("USAGE.md"),
+        )
+        .unwrap();
+        assert!(usage.contains("### Presets"), "USAGE.md lost its Presets heading");
+        // And the recovery the FACTORY_SEED_MARKER doc-comment promises
+        // must be documented there, naming the marker file itself.
+        assert!(
+            usage.contains(FACTORY_SEED_MARKER),
+            "USAGE.md must document the {FACTORY_SEED_MARKER} recovery"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
