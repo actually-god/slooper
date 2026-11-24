@@ -3096,6 +3096,195 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ---- v144: the template must teach the REAL ABI (card t_2c24475e) ----
+
+    /// Extract the fenced skeleton block (between the `// SKELETON-START`
+    /// and `// SKELETON-END` lines; the fences themselves are excluded).
+    /// Prose MENTIONS of the marker words must not match — only lines the
+    /// comment prefix starts on do.
+    fn v144_skeleton_block() -> Option<String> {
+        let mut block: Vec<&str> = Vec::new();
+        let mut inside = false;
+        for l in TEMPLATE_SRC.lines() {
+            if l.trim_start().starts_with("// SKELETON-START") {
+                inside = true;
+                continue;
+            }
+            if l.trim_start().starts_with("// SKELETON-END") {
+                break;
+            }
+            if inside {
+                block.push(l);
+            }
+        }
+        if block.is_empty() {
+            return None;
+        }
+        Some(block.join("\n"))
+    }
+
+    /// Inverse of the embedding: strip one `//` comment prefix (and one
+    /// optional following space) per line to recover real Rust source.
+    fn v144_uncommented_skeleton() -> Option<String> {
+        let b = v144_skeleton_block()?;
+        let mut out = String::new();
+        for l in b.lines() {
+            let t = l.trim_start();
+            let rest = t
+                .strip_prefix("//")
+                .map(|r| r.strip_prefix(' ').unwrap_or(r))
+                .unwrap_or(l);
+            out.push_str(rest);
+            out.push('\n');
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn v144_template_states_the_real_param_cap() {
+        // Doc-honesty pin: the starter file every user copies must teach
+        // the REAL param cap — SLOOPER_MAX_PARAMS (32) — never the stale
+        // "8" claims (effects/template.rs once said "Up to 8 total" and
+        // "n_params <= 8" while multiband shipped 14 params).
+        assert_eq!(MAX_PARAMS, 32, "the engine cap moved — update the template text");
+        assert!(
+            TEMPLATE_SRC.contains("SLOOPER_MAX_PARAMS"),
+            "template must name the cap constant, not just a number"
+        );
+        assert!(TEMPLATE_SRC.contains("(32)"), "template must state the numeric cap");
+        for stale in ["Up to 8", "n_params <= 8", "8 total", "8 params"] {
+            assert!(!TEMPLATE_SRC.contains(stale), "template still says {stale:?}");
+        }
+    }
+
+    #[test]
+    fn v144_template_documents_the_optional_ladder() {
+        // The ABI surface the plugin lane keeps extending must be
+        // DISCOVERABLE from the file users copy: every rung named.
+        for needle in [
+            "slooper_effect_info_v2",
+            "slooper_effect_info_v3",
+            "slooper_effect_info_v4",
+            "process_sc",
+            "process_st",
+            "set_sync",
+            "SyncInfoV1",
+            "ParamMetaV1",
+            "SLOOPER_UNIT_",
+            "EffectInfoV4",
+            "EffectGuiV1",
+            "slooper_effect_gui",
+        ] {
+            assert!(
+                TEMPLATE_SRC.contains(needle),
+                "template never mentions {needle:?} — the v2/v3/v4/GUI ladder went undocumented again"
+            );
+        }
+        assert!(
+            TEMPLATE_SRC.contains("newest"),
+            "template must explain the loader's newest-symbol probe"
+        );
+    }
+
+    #[test]
+    fn v144_template_skeleton_block_is_marker_clean() {
+        // The slow compile pin below un-comments BETWEEN the fences; verify
+        // the fence + comment-prefix contract and the uncomment inverse
+        // here (cheap, always runs).
+        let b = v144_skeleton_block().expect("SKELETON-START/END fenced block exists");
+        assert!(b.lines().count() >= 80, "skeleton is {} lines — too short to cover v4+GUI", b.lines().count());
+        assert!(
+            b.lines().all(|l| l.trim_start().starts_with("//")),
+            "every skeleton line must carry the comment prefix (the strip rule relies on it)"
+        );
+        let u = v144_uncommented_skeleton().expect("uncomment inverse");
+        assert!(!u.contains("SKELETON"), "marker fences must stay OUTSIDE the fenced block");
+        // Rung coverage inside the CODE, not just the prose above it.
+        for needle in [
+            "process_sc: Some(",
+            "process_st: Some(",
+            "set_sync: Some(",
+            "param_meta: META4.as_ptr()",
+            "stereo: 1,",
+            "ParamMetaV1",
+            "EffectGuiV1",
+            "SLOOPER_UNIT_PERCENT",
+        ] {
+            assert!(u.contains(needle), "uncommented skeleton lacks {needle:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "slow-tier: wall-clock heavy (script-compile)"]
+    fn v144_template_v4_skeleton_compiles_and_loads() {
+        // Honesty pin against skeleton rot (the exact failure this card
+        // documents): uncomment the ladder skeleton, append it to the
+        // template, and push it through the REAL loader. A drifted
+        // skeleton (renamed ABI field, wrong meta shape) reddens HERE,
+        // not in a user's build three releases later.
+        if !rustc_available() {
+            eprintln!("skipping: rustc not on PATH");
+            return;
+        }
+        let sk = v144_uncommented_skeleton().expect("skeleton block");
+        let dir = temp_dir("v144skel");
+        std::fs::write(dir.join(API_FILE), API_SRC).unwrap();
+        std::fs::write(dir.join("template_v4.rs"), format!("{TEMPLATE_SRC}\n{sk}")).unwrap();
+        let mut reg = Registry::open(dir.clone());
+        reg.rescan();
+        let it = reg
+            .items()
+            .iter()
+            .find(|e| e.stem == "template_v4")
+            .expect("template_v4 row");
+        assert!(it.error.is_none(), "skeleton failed to load: {}", it.error.clone().unwrap_or_default());
+
+        let d = reg.desc("template_v4").unwrap();
+        assert_eq!(d.name, "Template Tremolo v4");
+        assert!(d.stereo, "stereo: 1 must reach the descriptor");
+        assert!(!d.sidechain, "a v4 table with BOTH sc+st is never flagged sidechain (EXACT-v2 rule)");
+        assert_eq!(d.params.len(), 4);
+        assert_eq!(d.params[0].unit, SLOOPER_UNIT_PERCENT, "depth carries the % unit");
+        assert_eq!(d.params[2].labels, vec!["sine".to_string(), "tri".to_string()], "enum picker reaches the desc");
+        assert_eq!(d.params[3].step, 0.25, "step snap reaches the desc");
+        assert!(reg.gui("template_v4").is_some(), "the GUI skeleton must export a valid child window");
+
+        // Runtime sanity through the loaded table: depth 0 passes through,
+        // AND process step-quantizes the trim (1.1 snaps to 1.0) exactly
+        // like the declared meta promises.
+        let mut p = [0.0f32; MAX_PARAMS];
+        p[0] = 0.0; // depth %
+        p[1] = 4.0; // wob/beat
+        p[2] = 0.0; // shape
+        p[3] = 1.1; // out — snaps to 1.0
+        let inst = reg
+            .create_instance("template_v4", 48000.0, &p)
+            .expect("create4");
+        let y = unsafe { inst.call_sample(0.5, &p) };
+        assert!((y - 0.5).abs() < 1e-6, "depth 0 must pass through after step snap, got {y}");
+
+        // Stereo honesty: stopped transport pins the beat at 0, so the
+        // LEFT LFO sits at its cosine peak and the RIGHT lags a quarter
+        // cycle (cos(pi/2) = 0) — the pair is decorrelated, proving
+        // `stereo: 1` claims only what process_st does.
+        let mut p2 = [0.0f32; MAX_PARAMS];
+        p2[0] = 100.0; // full depth
+        p2[1] = 4.0;
+        p2[2] = 0.0;
+        p2[3] = 1.0;
+        let inst2 = reg
+            .create_instance("template_v4", 48000.0, &p2)
+            .expect("create4 #2");
+        let (l, r) = unsafe { inst2.call_sample_st(1.0, 1.0, &p2, 0.0) };
+        assert!(
+            (l - 1.0).abs() < 1e-4 && (r - 0.5).abs() < 1e-4,
+            "quarter-cycle L/R offset must decorrelate: got l={l} r={r}"
+        );
+        drop(inst);
+        drop(inst2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn gui_symbol_optional_and_validated() {
         // Optional child GUI: a script exporting it loads with a handle;

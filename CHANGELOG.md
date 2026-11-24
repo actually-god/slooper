@@ -6,6 +6,20 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ## [Unreleased]
 
+### Changed
+
+- **The effect template now teaches the whole plugin ABI.** The starter
+  file every user copies (`effects/template.rs`) still taught the v1-era
+  contract: an “up to 8 params” limit (the real cap is
+  `SLOOPER_MAX_PARAMS` = 32 — the stock parametric EQ ships 26) and no
+  mention of the sidechain, stereo, transport-sync, param-metadata or
+  custom-GUI capabilities the effect ABI has grown since. It now carries
+  an “OPTIONAL LADDER” section naming every rung and a full commented
+  ABI-v4 + custom-GUI version of its own tremolo — proven Rust: a pin
+  (`v144_*`) un-comments the skeleton, compiles it and loads it through
+  the real effect loader, so the skeleton cannot quietly drift stale the
+  way the v1-only docs did.
+
 ### Fixed
 
 - **A hosted CLAP instrument no longer mallocs on every audio block.** The
