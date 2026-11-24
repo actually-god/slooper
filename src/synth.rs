@@ -2862,4 +2862,126 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         assert_ne!(plain, at, "the held voice's pressure must be heard (targeting is not a no-op)");
     }
 
+    // ---- v137 (card t_3bd30160): the retire budgets hard-gated voices
+    // mid-tail (CRASH|RIDE 2.0*dec+0.5 vs tau 1.5*dec = a crash silenced
+    // at 1.47*tau ~ -13 dB, instant zero, no fade). The bundle now retires
+    // at 7 time constants of each kind's slowest envelope component with
+    // an 8 ms linear fade to exact zero. Pins below use the absolute-window
+    // dBFS method (dsp-audio-probe); HEAD is the negative control for R1+R2.
+
+    /// One drums render of a HELD note (no note_off — a cymbal release
+    /// chokes in 20 ms and would mask the retire behavior), chosen decay,
+    /// `secs` long. params positional: gain, tune, decay (rest defaults).
+    fn v137_drums_held(reg: &Registry, note: u8, decay: f32, secs: f64) -> Vec<f32> {
+        let inst = reg
+            .create_instance("drums", 48_000.0, &[0.9, 0.0, decay])
+            .expect("bundled drums instance");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, note, 110u8)];
+        let mut out = vec![0f32; (48_000.0 * secs) as usize];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    /// R1: at the decay slider's TOP (2.5) the old budget (2.0*dec+0.5 =
+    /// 5.5 s, while tau = 1.5*dec = 3.75 s) zeroed a held crash mid-ring.
+    /// The tail must still AUDIBLY ring at the old gate's window, and be
+    /// below an absolute floor only past the new 7*tau budget (26.258 s).
+    /// HEAD control: silent at 5.5 s (gate already fired) -> this pin fails.
+    #[test]
+    fn v137_crash_tail_survives_old_retire_gate() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let x = v137_drums_held(&reg, 55, 2.5, 27.5);
+        let sr = 48_000usize;
+        let p_ctl = v136_power(&x, sr / 2, sr);
+        // Window STRICTLY after the old hard gate (2.0*dec+0.5 = 5.508 s):
+        // HEAD's voice is already zero there -> this assertion fails on HEAD,
+        // the negative control. The new budget rings on through it.
+        let p_old = v136_power(&x, (5.6 * sr as f64) as usize, (5.8 * sr as f64) as usize);
+        eprintln!(
+            "v137 crash dec=2.5: body power {p_ctl:.3e}, post-old-gate window (5.6..5.8 s) {p_old:.3e}"
+        );
+        assert!(p_ctl > 1e-4, "control body must actually sound: {p_ctl:.3e}");
+        assert!(
+            p_old > 1e-6,
+            "crash at max decay must still ring AFTER the OLD retire gate t=5.508 s \
+             (HEAD hard-silenced it there: budget 2.0*dec+0.5 = 1.47*tau, a -13 dB chop): \
+             {p_old:.3e}"
+        );
+        // |x| < 1e-3 past budget+7 ms (budget = 7*3.75 s + 8 ms = 26.258 s;
+        // index math EXPLICIT: 26.4 s * 48000, never a bare sample literal).
+        let tail = &x[(26.4 * 48_000.0) as usize..];
+        let pk = tail.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(
+            pk < 1e-3,
+            "past the new retire budget (7*3.75 s + 8 ms) the render must be \
+             |x| < 1e-3, got tail peak {pk:.2e}"
+        );
+    }
+
+    /// R2: retirement is a faded exit for EVERY class, never a gate: for
+    /// each representative at default decay, at the retire boundary (last
+    /// loud sample) the local sample-to-sample step must stay < 1e-3.
+    /// HEAD fails this for crash (step ~2e-1), ohat and ride (~1e-2):
+    /// their budgets were 1.5-2.4 tau — audible chops inside the ring.
+    #[test]
+    fn v137_retire_is_faded_not_stepped() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sr = 48_000usize;
+        // (note, name, render secs = kind budget at dec 1.0 + margin)
+        for (note, name, secs) in [
+            (36u8, "kick", 3.2f64),
+            (38, "snare", 2.0),
+            (37, "clap", 1.8),
+            (41, "tom", 3.2),
+            (46, "ohat", 4.4),
+            (51, "ride", 5.8),
+            (55, "crash", 11.4),
+        ] {
+            let x = v137_drums_held(&reg, note, 1.0, secs);
+            let last = x.iter().rposition(|v| v.abs() > 1e-4).unwrap_or(0);
+            assert!(
+                last > sr / 10,
+                "{name}: render went quiet suspiciously early (t={:.3} s) — body regression?",
+                last as f64 / sr as f64
+            );
+            let (a, b) = (last.saturating_sub(sr / 10), (last + sr / 10).min(x.len() - 2));
+            let step = x[a..b]
+                .windows(2)
+                .fold(0f64, |m, w| m.max((w[1] as f64 - w[0] as f64).abs()));
+            eprintln!(
+                "v137 {name} note {note}: retire boundary t={:.3} s, local max step {step:.2e}",
+                last as f64 / sr as f64
+            );
+            assert!(
+                step < 1e-3,
+                "{name}: retire must be a faded exit (max local step {step:.2e} >= 1e-3 — \
+                 a hard gate cuts the tail like HEAD did)"
+            );
+        }
+    }
+
+    /// R3 guard: 7*tau discipline must not make short drums eternal — the
+    /// closed hat (tau 0.045*dec) budget at default decay is 7*0.045 + 8 ms
+    /// ~ 0.32 s; be fully silent (|x| < 1e-4) by 0.50 s.
+    #[test]
+    fn v137_chat_retires_promptly() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let x = v137_drums_held(&reg, 42, 1.0, 1.0);
+        assert!(
+            x[..9_600].iter().any(|v| v.abs() > 0.01),
+            "closed hat control body must sound (instantaneous peak in first 0.2 s)"
+        );
+        let pk = x[(48_000 / 2)..].iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(pk < 1e-4, "closed hat must be silent (1e-4) by 0.50 s, got {pk:.2e}");
+    }
+
 }
