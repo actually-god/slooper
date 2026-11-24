@@ -9838,4 +9838,108 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         // (sorted raw offsets: n < n+5 < n+9 < n+5000)
         assert_eq!(out.len(), n, "past-the-end events never extend the window");
     }
+
+    // ---- v153: tests/e2e.rs bootstrap hygiene --------------------------
+    //
+    // The e2e suite skips itself on CI runners (no live JACK server), so
+    // its dedup contract CANNOT be enforced from inside it — it is pinned
+    // here, in the quick tier, where it runs on BOTH OSes. The scan
+    // target is tests/e2e.rs; this file hosts the needles, so there is no
+    // self-file vacuity, but the literals are still concat!-split so a
+    // future move of these pins INTO the scanned file can't pass silently.
+
+    fn v153_e2e_src() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e.rs"))
+            .expect("e2e source readable")
+    }
+
+    /// `e2e_lock()`, `start_backend()` and `Client::new(` are seam-only:
+    /// the first two live ONLY inside `e2e_backend` (the lock can never be
+    /// forgotten), and raw clients only in the capture fixtures plus the
+    /// documented one-off rigs (a fixture of one is not dedup). A test
+    /// re-inlining bootstrap reddens this pin naming the offending fn.
+    #[test]
+    fn v153_e2e_bootstrap_lives_only_in_the_seams() {
+        const ALLOW_CLIENT: &[&str] = &[
+            "e2e_capture",
+            "e2e_capture_src",
+            "e2e_capture_sumdif",
+            "e2e_capture_lr",
+            // documented one-off shapes (REQUIREMENTS §4): live-MIDI stage
+            // rig, 2-source mix client, MIDI emitters, stereo monitor,
+            // tier6 sync rig (1<<20 ring + source control).
+            "e2e_live_midi_input_plays_synths",
+            "e2e_audio_mixing",
+            "e2e_midi_monitor",
+            "e2e_midi_capture_and_fire_sinco",
+            "e2e_selected_loop_monitoring",
+            "e2e_tier6_host_sync_live",
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        let mut cur = "FILE-PROLOGUE".to_string();
+        for line in v153_e2e_src().lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("fn ") {
+                cur = rest.split('(').next().unwrap_or("?").to_string();
+            }
+            let seam_hit = line.contains(concat!("= e2e_", "lock()"))
+                || line.contains(concat!("= start_", "backend()"));
+            if seam_hit && cur != "e2e_backend" {
+                offenders.push(format!("{cur}: e2e_lock/start_backend outside e2e_backend"));
+            }
+            if line.contains(concat!("Client::", "new(")) && !ALLOW_CLIENT.contains(&cur.as_str())
+            {
+                offenders.push(format!("{cur}: raw Client::new outside the fixtures"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "v153 seam bypass in tests/e2e.rs:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Capture-ring construction is fixture-owned: the inline idiom may
+    /// only appear in the four capture fixtures plus the two allow-listed
+    /// one-off rings (1<<16 monitor, 1<<20 tier6). New tests must ask the
+    /// fixtures for a ring instead of hand-rolling atomics arrays.
+    #[test]
+    fn v153_e2e_rings_are_built_in_fixtures_only() {
+        const ALLOW_INLINE: &[&str] = &[
+            "e2e_live_midi_input_plays_synths",
+            "e2e_selected_loop_monitoring",
+            "e2e_tier6_host_sync_live",
+        ];
+        const ALLOW_FIXTURE: &[&str] = &[
+            "e2e_capture",
+            "e2e_capture_src",
+            "e2e_capture_sumdif",
+            "e2e_capture_lr",
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        let mut cur = "FILE-PROLOGUE".to_string();
+        for line in v153_e2e_src().lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("fn ") {
+                cur = rest.split('(').next().unwrap_or("?").to_string();
+            }
+            let inline_ring = line.contains(concat!("(0..ring_", "n).map("));
+            let fixture_ring = line.contains(concat!("(0..RING_", "N).map("));
+            if inline_ring && !ALLOW_INLINE.contains(&cur.as_str()) {
+                offenders.push(format!("{cur}: inline ring construction (use a fixture)"));
+            }
+            if fixture_ring && !ALLOW_FIXTURE.contains(&cur.as_str()) {
+                offenders.push(format!("{cur}: RING_N use outside the fixtures"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "v153 ring-construction drift in tests/e2e.rs:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

@@ -275,7 +275,9 @@ fn e2e_capture_sumdif(b: &Backend, tag: &str) -> SdifCap {
 }
 
 /// Stereo `V96CapProc` client: LEFT and RIGHT buses captured to SEPARATE
-/// rings on the (1, 2) mapping (the v96/v99 sidechain rigs).
+/// rings so ONE rig reads two hard-panned targets' buses simultaneously.
+/// Routing bits per `Cmd::Apply`: 1 = the slot carries the L bus only,
+/// 2 = the R bus only (hard-pan isolation — the v32 e2e rule).
 struct LrCap {
     ring_l: Arc<Vec<AtomicU32>>,
     ring_r: Arc<Vec<AtomicU32>>,
@@ -381,7 +383,7 @@ fn e2e_audio_mixing() {
 
     // Apply the layout through the backend's command channel.
     // Route 3 = mono downmix (the historical output behaviour).
-    e2e_apply(&b, vec![format!("{client_name}:out_a"), format!("{client_name}:out_b"), ],, vec![(format!("{client_name}:sink"), 3)]);
+    e2e_apply(&b, vec![format!("{client_name}:out_a"), format!("{client_name}:out_b"), ], vec![(format!("{client_name}:sink"), 3)]);
 
     // Wait until the summed constant actually shows up at the sink.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -2427,10 +2429,38 @@ fn e2e_live_midi_input_plays_synths() {
         return; // no audio server: skip
     };
 
-    let cap = e2e_capture(&b, "midi_live", 3);
-    let ring = cap.ring.clone();
-    let widx = cap.widx.clone();
-    let active = cap.active;
+    // One-off rig (v153 allow-listed): the LiveMidiCapProc client is the
+    // only stage-probe client — MIDI out port wired into slooper:midi_in.
+    let ring_n = 1usize << 19;
+    let ring: Arc<Vec<AtomicU32>> = Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
+    let widx = Arc::new(AtomicU64::new(0));
+    let stage = Arc::new(AtomicUsize::new(0));
+    let (client, _status) =
+        Client::new("midi_live", ClientOptions::NO_START_SERVER).expect("no JACK server");
+    let midi_out = client
+        .register_port("midi_out", MidiOut::default())
+        .unwrap();
+    let sink = client.register_port("sink", AudioIn::default()).unwrap();
+    let src_name = client.name().to_string();
+    client
+        .connect_ports_by_name(
+            &format!("{src_name}:midi_out"),
+            &format!("{client_name}:midi_in"),
+        )
+        .expect("connect to slooper:midi_in");
+    let active = client
+        .activate_async(
+            (),
+            LiveMidiCapProc {
+                out: midi_out,
+                stage: stage.clone(),
+                sink,
+                ring: ring.clone(),
+                widx: widx.clone(),
+            },
+        )
+        .unwrap();
+    e2e_apply(&b, vec![], vec![(format!("{src_name}:sink"), 3)]);
 
     // The bundled piano answers on the default-selected track. NO clips
     // and the transport never starts: everything this test hears is the
@@ -4799,37 +4829,9 @@ fn e2e_v96_multi_preview_pair_ducks() {
 }
 
 // ---- v99 (sc-5): sender-side GENERAL send gain/pan ----------------------
-
-/// v99: two-channel capture (backend L bus + R bus, per the `Cmd::Apply`
-/// routing bits: 1 = L, 2 = R) so ONE rig reads two hard-panned targets'
-/// buses simultaneously — the sender knob must move both together.
-struct CapProcLR {
-    sink_l: jack::Port<jack::AudioIn>,
-    sink_r: jack::Port<jack::AudioIn>,
-    ring_l: Arc<Vec<AtomicU32>>,
-    ring_r: Arc<Vec<AtomicU32>>,
-    widx: Arc<AtomicU64>,
-}
-
-impl jack::ProcessHandler for CapProcLR {
-    fn process(&mut self, _c: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
-        let n = ps.n_frames() as usize;
-        if n == 0 {
-            return jack::Control::Continue;
-        }
-        let l = self.sink_l.as_slice(ps);
-        let r = self.sink_r.as_slice(ps);
-        let nring = self.ring_l.len() as u64;
-        let mut w = self.widx.load(Ordering::Relaxed);
-        for i in 0..n {
-            self.ring_l[(w % nring) as usize].store(l[i].to_bits(), Ordering::Relaxed);
-            self.ring_r[(w % nring) as usize].store(r[i].to_bits(), Ordering::Relaxed);
-            w += 1;
-        }
-        self.widx.store(w, Ordering::Relaxed);
-        jack::Control::Continue
-    }
-}
+//
+// (v153: the former CapProcLR struct was a verbatim clone of V96CapProc —
+// deleted; v99 rigs through e2e_capture_lr like v96.)
 
 type V99Rig = (
     std::sync::MutexGuard<'static, ()>,
@@ -4838,7 +4840,7 @@ type V99Rig = (
     Arc<Vec<AtomicU32>>,
     Arc<AtomicU64>,
     u32,
-    jack::AsyncClient<(), CapProcLR>,
+    AsyncClient<(), V96CapProc>,
 );
 
 /// v99 rig: ONE MUTED sender (track 0, 110 Hz @ 0.3, centred — the v95 law
@@ -4868,32 +4870,14 @@ fn v99_sc_setup(tag: &str) -> Option<V99Rig> {
         .create_instance("sidechain_comp", sr as f64, &vals)
         .expect("sidechain_comp B compiles and instantiates");
     let _ = std::fs::remove_dir_all(&dir);
-    let ring_n = 1usize << 19;
-    let ring_l: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let ring_r: Arc<Vec<AtomicU32>> =
-        Arc::new((0..ring_n).map(|_| AtomicU32::new(0)).collect());
-    let widx = Arc::new(AtomicU64::new(0));
-    let (client, _status) =
-        jack::Client::new(tag, jack::ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let sink_l = client.register_port("sinkL", jack::AudioIn::default()).unwrap();
-    let sink_r = client.register_port("sinkR", jack::AudioIn::default()).unwrap();
-    let src_name = client.name().to_string();
-    let active = client
-        .activate_async(
-            (),
-            CapProcLR {
-                sink_l,
-                sink_r,
-                ring_l: ring_l.clone(),
-                ring_r: ring_r.clone(),
-                widx: widx.clone(),
-            },
-        )
-        .unwrap();
-    // Routing bits per Cmd::Apply: 1 = the slot carries the L bus only,
-    // 2 = the R bus only (hard-pan isolation — the v32 e2e rule).
-    e2e_apply(&b, vec![], vec![(format!("{src_name}:sinkL"), 1), (format!("{src_name}:sinkR"), 2), ],);
+    // v153: same L/R split-capture rig as v96 (CapProcLR was a verbatim
+    // V96CapProc clone; sinkL/sinkR port spellings normalized to sink_l/_r —
+    // the names are local to this client).
+    let cap = e2e_capture_lr(&b, tag);
+    let ring_l = cap.ring_l.clone();
+    let ring_r = cap.ring_r.clone();
+    let widx = cap.widx.clone();
+    let active = cap.active;
     let n = 24_000usize;
     let key: Arc<[f32]> = Arc::from(
         (0..n)
