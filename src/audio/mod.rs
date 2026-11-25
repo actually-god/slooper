@@ -3209,10 +3209,12 @@ pub(crate) fn stage_edo(
             let (key, r) = crate::tune::residual(n, root, d1);
             res[c] = r;
             if r != 0.0 {
+                // The injected residual travels THROUGH midi3_raw too
+                // (kind 5 = the one bend emitter, v150 single-map doctrine).
                 let raw = crate::midipat::st_to_bend(r);
                 evq.push((
                     off.saturating_sub(1),
-                    [0xE0 | ch & 0x0F, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8],
+                    midi3_raw(5, ch, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8),
                 ));
             }
             evq.push((off, midi3_raw(3, ch, key, d2)));
@@ -3228,7 +3230,7 @@ pub(crate) fn stage_edo(
             let raw = crate::midipat::st_to_bend(st);
             evq.push((
                 off,
-                [0xE0 | ch & 0x0F, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8],
+                midi3_raw(5, ch, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8),
             ));
         }
         _ => evq.push((off, midi3_raw(kind, ch, d1, d2))),
@@ -9878,8 +9880,9 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         );
         assert_eq!(
             src.matches(concat!("mi", "di3_raw(")).count(),
-            6,
-            "one definition + five call sites (v158: render_midi_vst joined)"
+            7,
+            "one definition + six call sites, ALL inside stage_edo (v164: the \
+             EDO pass owns every mapper call; feed sites call only the wrapper)"
         );
         assert_eq!(
             src.matches(concat!("0x90 ", "| ch & 0x0F")).count(),
@@ -10174,6 +10177,9 @@ let desc = reg.desc("v80quarter").unwrap().clone();
     /// module's single mapper. Source scan with comment lines stripped
     /// (v150_active_src) so lore comments never feed the needles. The fn
     /// name deliberately avoids the scanned needles (self-file vacuity).
+    /// v164 (card t_0c73850c): the mapper is now stage_edo (which routes
+    /// every byte through midi3_raw) — the site calls the WRAPPER, never
+    /// the raw mapper directly, so the EDO pass can never be skipped.
     #[test]
     fn v158_render_midi_vst_offline_bounce_shares_the_mapper() {
         let src = v150_active_src();
@@ -10183,9 +10189,14 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         let end = start + 1 + src[start + 1..].find("fn ").expect("next fn after render_midi_vst");
         let body = &src[start..end];
         assert_eq!(
-            body.matches(concat!("mi", "di3_raw(")).count(),
+            body.matches(concat!("stage_", "edo(")).count(),
             1,
-            "render_midi_vst must stage through midi3_raw (single source with the live path)"
+            "render_midi_vst must stage through stage_edo (single source with the live path)"
+        );
+        assert_eq!(
+            body.matches(concat!("mi", "di3_raw(")).count(),
+            0,
+            "no site may bypass stage_edo and call the raw mapper"
         );
         for needle in [
             concat!("0x9", "0 | ch & 0x0F"),
