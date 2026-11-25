@@ -689,6 +689,47 @@ mod tests {
         assert!((mty + 20.0).abs() < 0.1, "post-reset momentary {mty}");
     }
 
+    /// v162 (card t_7b6ab154): perf gate for the deepened analyzer.
+    /// Prints the GUI-pump cost so the before/after numbers land in the
+    /// `Spectrum::new` comment, and asserts generous ceilings so a future
+    /// depth/algorithm drift is caught in the full tier, not in the
+    /// user's panel. Slow tier: ~1-2 s. NOTE: push/refresh run on the
+    /// UI-thread pump (ui.rs drains the MeterRing there); the RT thread
+    /// only does `MeterRing::write`, which this change does not touch.
+    #[test]
+    #[ignore = "slow-tier: perf bench, prints measured us and gates the ceiling"]
+    fn v162_spectrum_bench_refresh_cost() {
+        use std::time::Instant;
+        let sr = 48_000u32;
+        let mut s = Spectrum::new(sr);
+        let block = vec![0.5f32; 2 * 480]; // one JACK-sized RT block (stereo)
+        // Prime the circular window so push measures hot on a full buffer.
+        for _ in 0..s.n / 480 + 2 {
+            s.push(&block);
+        }
+        const N: usize = 20_000;
+        let t = Instant::now();
+        for _ in 0..N {
+            s.push(&block);
+        }
+        let push_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+        const R: usize = 3_000;
+        let t = Instant::now();
+        for _ in 0..R {
+            s.refresh(2.5);
+        }
+        let refresh_us = t.elapsed().as_secs_f64() * 1e6 / R as f64;
+        println!(
+            "v162 bench: n={} push={push_us:.2} us/480-blk refresh={refresh_us:.1} us/frame",
+            s.n
+        );
+        assert!(push_us < 20.0, "push {push_us:.2} us/block — budget risk");
+        assert!(
+            refresh_us < 4000.0,
+            "refresh {refresh_us:.1} us/frame — budget risk"
+        );
+    }
+
     #[test]
     fn spectrum_peaks_at_the_sine_bin() {
         let sr = 48_000;
