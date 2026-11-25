@@ -124,6 +124,42 @@ pub struct SynthHostV1 {
     /// legacy params), and return n (at most `max`). n == 0 with bit 31
     /// clear means no map at all — the legacy single-asset params rule.
     pub load_map: extern "C" fn(slots: *mut u64, max: u32, mode: *mut u32) -> u32,
+    /// v164 (card t_0c73850c): the live N-EDO tuning of the track whose
+    /// synth is calling — returns the FRACTIONAL 12-EDO key position of
+    /// `note` relative to A4 (the same units the old literal
+    /// `note as f64 - 69.0` produced). At the default 12-EDO tuning the
+    /// answer is bit-for-bit `note as f64 - 69.0`, so `slooper_vnote(note)`
+    /// below equals `note as f64` and an unretuned render is byte-identical.
+    /// Valid synchronously inside any callback, like `load_asset`.
+    pub tune_key: extern "C" fn(note: u8) -> f64,
+}
+
+/// v164: host vtable captured by a script's `create` (see the
+/// `slooper_vnote` helper — bundled scripts keep one call site for pitch).
+#[allow(dead_code)]
+pub static mut SLOOPER_HOST: *const SynthHostV1 = core::ptr::null();
+
+/// v164: fractional 12-EDO position (rel. A4) of `note` at the live tuning.
+/// Safe: the host pointer is captured once by `create`, strictly before
+/// the instance can reach any other thread, and never changes after.
+#[inline]
+#[allow(dead_code)]
+pub fn slooper_tune_key(note: u8) -> f64 {
+    let h = unsafe { SLOOPER_HOST };
+    if h.is_null() {
+        // No host captured (create never ran?): the pre-v164 identity.
+        return note as f64 - 69.0;
+    }
+    unsafe { ((*h).tune_key)(note) }
+}
+
+/// v164: the EDO-mapped key as a "virtual note number" — substitute it for
+/// `note as f64` in pitch arithmetic. Bit-for-bit `note as f64` at the
+/// default 12-EDO tuning.
+#[inline]
+#[allow(dead_code)]
+pub fn slooper_vnote(note: u8) -> f64 {
+    slooper_tune_key(note) + 69.0
 }
 
 #[repr(C)]

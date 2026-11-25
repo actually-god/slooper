@@ -103,6 +103,9 @@ pub const LIVE: &[&str] = &[
     "sc_recv_gain",
     "editor_probe",
     "track_bend_ranges",
+    // v164 (card t_0c73850c): EDO tuning — apply republishes the atomic.
+    "edo_n",
+    "edo_root",
     "n_tracks",
     "show_rack",
     "show_mixer",

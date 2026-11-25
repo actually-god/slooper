@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // piano.rs — the default slooper synthesizer: a REAL piano.
 //
 // A compact sample-player for the 'Piano 1' (GM acoustic grand)
@@ -175,7 +175,9 @@ fn parse(blob: &[u8]) -> (Vec<Zone>, Vec<Sample>, Vec<f32>) {
     (zones, samples, pcm)
 }
 
-extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable for the tuning callback.
+    unsafe { SLOOPER_HOST = host; }
     let blob = b64_decode(BLOB_B64);
     let (zones, samples, pcm) = parse(&blob);
     let p = Box::new(Piano {
@@ -220,7 +222,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     // The sample table stores each recording's MEASURED natural pitch
     // (cents rel. A4); rate places it exactly on the tempered key.
     let s = p.samples[z.sample as usize];
-    let cents = (note as f32 - 69.0) * 100.0 - s.cents;
+    let cents = (slooper_vnote(note) as f32 - 69.0) * 100.0 - s.cents;
     let rate = (s.sr as f64 / p.sr) * 2f64.powf(cents as f64 / 1200.0);
 
     let mut slot = 0usize;

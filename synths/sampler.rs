@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // sampler.rs — pitch-following audio-clip synthesizer (multi-sample).
 //
 // Plays ANY audio asset from the rack as an instrument. A note plays the
@@ -110,6 +110,10 @@ struct Sampler {
 }
 
 extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164 (card t_0c73850c): capture the host vtable so slooper_vnote
+    // can ask the host for the EDO-tuned key position (null stays the
+    // pre-v164 identity).
+    unsafe { SLOOPER_HOST = host; }
     let s = Box::new(Sampler {
         host,
         sr: if sr > 1.0 { sr } else { 48000.0 },
@@ -278,8 +282,13 @@ fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
         s.next = (s.next + 1) % VOICES;
         k
     });
-    // Pitch = semitone distance from THIS slot's root note.
-    let semis = note as f64 - slot.root;
+    // Pitch = semitone distance from THIS slot's root note (v164: the
+    // EDO-mapped virtual note — bit-identical at the default 12-EDO).
+    // v164 (card t_0c73850c): EDO-aware semitone offset — tuned key
+    // position minus tuned ROOT position, so the root key always sounds
+    // the sample natively and the ladder fans EDO steps around it. At the
+    // default 12-EDO this is bit-identical to `note - root`.
+    let semis = slooper_vnote(note) - slooper_vnote(slot.root as u8);
     let native = {
         let rate = s
             .cache

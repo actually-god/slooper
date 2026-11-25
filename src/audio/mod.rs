@@ -2984,6 +2984,9 @@ fn render_midi_vst(
     // note_on arm and fired ghost notes at key 0 in every export that
     // used expression.)
     let mut evq: Vec<(usize, [u8; 3])> = Vec::new();
+    // v164: this offline bounce feeds a plugin too — it gets its OWN EDO
+    // residual currency (a bounce never shares state with the live feeds).
+    let mut res = [0.0f32; 16];
     let mut i = 0usize;
     let mut done = 0usize;
     while done < out.len() {
@@ -2997,8 +3000,9 @@ fn render_midi_vst(
                 // had no arms for kinds 4/5 (per-note AT, 14-bit bend):
                 // the same ghost-note class the v33 lore above describes
                 // for kind 2 — a bend bounced as a note-on at key=LSB.
-                let m = midi3_raw(kind, ch, d1, d2);
-                evq.push((off - done, m));
+                // v164: stage_edo wraps the mapper (EDO residual + key
+                // remap, byte-identical at the default 12-EDO tuning).
+                stage_edo(&mut evq, off - done, kind, ch, d1, d2, &mut res);
             }
             i += 1;
         }
@@ -3154,6 +3158,82 @@ fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
         4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
+    }
+}
+
+/// v164 (card t_0c73850c): EDO-aware MIDI staging — the single source in
+/// front of EVERY `evq.push` that feeds a hosted plugin (four live paths +
+/// `render_midi_vst`; v150 single-source doctrine).
+///
+/// At the default 12-EDO tuning (`N == 12`, where every residual is exactly
+/// zero for ANY root) this pushes the plain [`midi3_raw`] byte and nothing
+/// else — the pre-v164 stream, byte-identical by pin
+/// (`v164_stage_n12_passthrough`).
+///
+/// With N ≠ 12 a physical key maps to the NEAREST 12-EDO key
+/// ([`crate::tune::residual`]) — note-ON *and* note-OFF (a note-off that
+/// named the physical key would never stop the played one) — and one
+/// roll-space pitch bend (midipat ±12 st law) is injected immediately
+/// before the remapped note-on. The v103 `queue()` choke point rescales it
+/// into the track's announced bend range and fires the RPN0 burst on its
+/// own; the v164 spike (`examples/edo_bend_spike.rs`, ADLplug) proved
+/// plugins LATCH that pre-note bend from the note's first sample. Lane
+/// bends (kind 5) compose with the track's last-note residual kept in
+/// `res[ch]`, so a glide moves RELATIVE to the EDO offset instead of
+/// erasing it.
+///
+/// Documented limits (raw-MIDI physics): pitch bend is CHANNEL-wide, so
+/// mono/legato lines retune exactly while chords on one channel share the
+/// last injected residual; two physical keys that share a nearest key play
+/// one voice (the later note-off stops it). A track bend range of 0 parks
+/// the injected wheel at center — residuals are then lost and the nearest
+/// key alone decides the pitch.
+pub(crate) fn stage_edo(
+    evq: &mut Vec<(usize, [u8; 3])>,
+    off: usize,
+    kind: u8,
+    ch: u8,
+    d1: u8,
+    d2: u8,
+    res: &mut [f32; 16],
+) {
+    let (n, root) = crate::tune::get();
+    if n == 12 {
+        // Bit-identical fast path for every unretuned session.
+        evq.push((off, midi3_raw(kind, ch, d1, d2)));
+        return;
+    }
+    let c = (ch & 0x0F) as usize;
+    match kind {
+        3 => {
+            let (key, r) = crate::tune::residual(n, root, d1);
+            res[c] = r;
+            if r != 0.0 {
+                // The injected residual travels THROUGH midi3_raw too
+                // (kind 5 = the one bend emitter, v150 single-map doctrine).
+                let raw = crate::midipat::st_to_bend(r);
+                evq.push((
+                    off.saturating_sub(1),
+                    midi3_raw(5, ch, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8),
+                ));
+            }
+            evq.push((off, midi3_raw(3, ch, key, d2)));
+        }
+        0 => {
+            // Stop the key we ACTUALLY played, not the physical one.
+            let (key, _) = crate::tune::residual(n, root, d1);
+            evq.push((off, midi3_raw(0, ch, key, d2)));
+        }
+        5 => {
+            let st =
+                crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16)) + res[c];
+            let raw = crate::midipat::st_to_bend(st);
+            evq.push((
+                off,
+                midi3_raw(5, ch, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8),
+            ));
+        }
+        _ => evq.push((off, midi3_raw(kind, ch, d1, d2))),
     }
 }
 
@@ -3521,6 +3601,9 @@ impl Proc {
             midi_ev,
             mono,
             midi_scratch,
+            edo_res,
+            aud_i_res,
+            aud_p_res,
             midi_live,
             midi_ring_to,
             midi_sustain,
@@ -3748,7 +3831,7 @@ impl Proc {
                     sil.resize(block_n, 0.0);
                     evq.clear();
                     for &(_off, kind, ch, d1, d2) in midi_ev.iter() {
-                        evq.push(((_off).min(block_n), midi3_raw(kind, ch, d1, d2)));
+                        stage_edo(evq, (_off).min(block_n), kind, ch, d1, d2, &mut edo_res[t]);
                     }
                     e.process_with_midi(&sil[..block_n], &mut row[..block_n], evq);
                 }
@@ -3937,7 +4020,15 @@ impl Proc {
                         mono2.resize(block_n, 0.0);
                         evq.clear();
                         for &(_off, kind, ch, d1, d2) in midi_ev.iter() {
-                            evq.push(((_off).min(block_n), midi3_raw(kind, ch, d1, d2)));
+                            stage_edo(
+                                evq,
+                                (_off).min(block_n),
+                                kind,
+                                ch,
+                                d1,
+                                d2,
+                                &mut edo_res[t],
+                            );
                         }
                         e.process_with_midi(&sil[..block_n], &mut mono2[..block_n], evq);
                         for (r, m) in row[..block_n].iter_mut().zip(mono2[..block_n].iter()) {
@@ -4008,7 +4099,7 @@ impl Proc {
                     sil.resize(block_n, 0.0);
                     evq.clear();
                     for &(off, kind, ch, d1, d2) in ev.iter() {
-                        evq.push((off.min(block_n), midi3_raw(kind, ch, d1, d2)));
+                        stage_edo(evq, off.min(block_n), kind, ch, d1, d2, &mut aud_i_res[t]);
                     }
                     e.process_with_midi(&sil[..block_n], &mut mono[..block_n], evq);
                 }
@@ -4072,7 +4163,15 @@ impl Proc {
                             sil.resize(block_n, 0.0);
                             evq.clear();
                             for &(off, kind, ch, d1, d2) in ev.iter() {
-                                evq.push((off.min(block_n), midi3_raw(kind, ch, d1, d2)));
+                                stage_edo(
+                                    evq,
+                                    off.min(block_n),
+                                    kind,
+                                    ch,
+                                    d1,
+                                    d2,
+                                    &mut *aud_p_res,
+                                );
                             }
                             e.process_with_midi(&sil[..block_n], &mut aud_pv_row[..block_n], evq);
                         }
@@ -4261,6 +4360,15 @@ struct Proc {
     midi_ev: Vec<(usize, u8, u8, u8, u8)>,
     /// Per-track synth render output for this block (mixed into `acc`).
     midi_scratch: Vec<Vec<f32>>,
+    /// v164: last-note EDO residual currency (semitones) per (track, ch)
+    /// for `stage_edo`'s lane-bend composition (see its doc). One row per
+    /// FEED CONTEXT: `edo_res` serves the shared live/poly instances,
+    /// `aud_i_res` the headless audition copies (separate instances — a
+    /// preview must not poison the live currency and vice versa),
+    /// `aud_p_res` the default-audition pseudo-slot.
+    edo_res: [[f32; 16]; MAX_LOOPS],
+    aud_i_res: [[f32; 16]; MAX_LOOPS],
+    aud_p_res: [f32; 16],
     midi_live: [bool; MAX_LOOPS],
     /// Latest staged note-off per track (timeline samples): the synth keeps
     /// rendering while the schedule is still ringing. The note sounds
@@ -4455,6 +4563,10 @@ fn new_proc(
         // indexes `midi_scratch[t]` the moment the first note stages, and an
         // empty vector there aborted the RT thread (v0.6/v0.7 MIDI crash).
         midi_scratch: vec![Vec::new(); MAX_LOOPS],
+        // v164: EDO residual currency tables (see the Proc field doc).
+        edo_res: [[0.0f32; 16]; MAX_LOOPS],
+        aud_i_res: [[0.0f32; 16]; MAX_LOOPS],
+        aud_p_res: [0.0f32; 16],
         midi_live: [false; MAX_LOOPS],
         midi_ring_to: [0u64; MAX_LOOPS],
         midi_sustain: [false; MAX_LOOPS],
@@ -9768,8 +9880,9 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         );
         assert_eq!(
             src.matches(concat!("mi", "di3_raw(")).count(),
-            6,
-            "one definition + five call sites (v158: render_midi_vst joined)"
+            7,
+            "one definition + six call sites, ALL inside stage_edo (v164: the \
+             EDO pass owns every mapper call; feed sites call only the wrapper)"
         );
         assert_eq!(
             src.matches(concat!("0x90 ", "| ch & 0x0F")).count(),
@@ -10064,6 +10177,9 @@ let desc = reg.desc("v80quarter").unwrap().clone();
     /// module's single mapper. Source scan with comment lines stripped
     /// (v150_active_src) so lore comments never feed the needles. The fn
     /// name deliberately avoids the scanned needles (self-file vacuity).
+    /// v164 (card t_0c73850c): the mapper is now stage_edo (which routes
+    /// every byte through midi3_raw) — the site calls the WRAPPER, never
+    /// the raw mapper directly, so the EDO pass can never be skipped.
     #[test]
     fn v158_render_midi_vst_offline_bounce_shares_the_mapper() {
         let src = v150_active_src();
@@ -10073,9 +10189,14 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         let end = start + 1 + src[start + 1..].find("fn ").expect("next fn after render_midi_vst");
         let body = &src[start..end];
         assert_eq!(
-            body.matches(concat!("mi", "di3_raw(")).count(),
+            body.matches(concat!("stage_", "edo(")).count(),
             1,
-            "render_midi_vst must stage through midi3_raw (single source with the live path)"
+            "render_midi_vst must stage through stage_edo (single source with the live path)"
+        );
+        assert_eq!(
+            body.matches(concat!("mi", "di3_raw(")).count(),
+            0,
+            "no site may bypass stage_edo and call the raw mapper"
         );
         for needle in [
             concat!("0x9", "0 | ch & 0x0F"),
@@ -10089,5 +10210,103 @@ let desc = reg.desc("v80quarter").unwrap().clone();
                 "no local byte-map arm may survive in render_midi_vst: {needle}"
             );
         }
+    }
+
+    // ---- v164 (card t_0c73850c): EDO staging pass ----
+
+    #[test]
+    fn v164_stage_n12_is_byte_identical() {
+        // R4 (HARD): at N=12 the staging pass is the OLD push, byte for
+        // byte, for every event kind — no bend, no remap, no extra events.
+        let back = crate::tune::get();
+        crate::tune::set(12, 60);
+        let cases: &[(u8, u8, u8, u8, [u8; 3])] = &[
+            (3, 1, 60, 99, [0x91, 60, 99]),
+            (3, 0, 9, 0, [0x90, 9, 1]),
+            (0, 1, 61, 0, [0x81, 61, 0]),
+            (1, 2, 7, 64, [0xB2, 7, 64]),
+            (2, 3, 0, 66, [0xD3, 66, 0]),
+            (4, 4, 60, 40, [0xA4, 60, 40]),
+            (5, 5, 0x15, 0x42, [0xE5, 0x15, 0x42]),
+        ];
+        for (kind, ch, d1, d2, want) in cases {
+            let mut evq: Vec<(usize, [u8; 3])> = Vec::new();
+            let mut res = [0.0f32; 16];
+            stage_edo(&mut evq, 7, *kind, *ch, *d1, *d2, &mut res);
+            assert_eq!(evq.len(), 1, "kind {kind} injected extra events");
+            assert_eq!(evq[0], (7, *want), "kind {kind} drifted");
+        }
+        crate::tune::set(back.0, back.1);
+    }
+
+    #[test]
+    fn v164_stage_24_maps_keys_and_injects_residual() {
+        // R5 (24-EDO end-to-end at the staging boundary): every key is one
+        // half-step of SOUND — key 61 (C#-quarter) plays key 60 bent +50c,
+        // key 62 plays 61 un-bent, key 84 (two physical octaves up... one
+        // EDO octave) plays 72: two physical octaves span one sounded
+        // octave, and the note-off stops the key that ACTUALLY played.
+        let back = crate::tune::get();
+        crate::tune::set(24, 60);
+        // +50 c in roll space, the ONE encoder the bend lane uses.
+        let raw = crate::midipat::st_to_bend(0.5);
+        let bend50 = [0xE1, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8];
+        let mut evq: Vec<(usize, [u8; 3])> = Vec::new();
+        let mut res = [0.0f32; 16];
+        stage_edo(&mut evq, 10, 3, 1, 61, 99, &mut res);
+        assert_eq!(
+            evq,
+            vec![(9, bend50), (10, [0x91, 60, 99])],
+            "key 61 = bend +50c then key 60"
+        );
+        assert_eq!(res[1], 0.5, "residual remembered for the bend lane");
+        evq.clear();
+        stage_edo(&mut evq, 10, 0, 1, 61, 0, &mut res);
+        assert_eq!(evq, vec![(10, [0x81, 60, 0])], "off stops the played key");
+        evq.clear();
+        stage_edo(&mut evq, 4, 3, 1, 62, 99, &mut res);
+        assert_eq!(evq, vec![(4, [0x91, 61, 99])], "key 62 sits on key 61");
+        assert_eq!(res[1], 0.0, "in-tune note clears the remembered residual");
+        evq.clear();
+        stage_edo(&mut evq, 2, 3, 1, 84, 90, &mut res);
+        assert_eq!(
+            evq,
+            vec![(2, [0x91, 72, 90])],
+            "key 84 (one EDO octave above 60) sounds key 72 — one octave"
+        );
+        crate::tune::set(back.0, back.1);
+    }
+
+    #[test]
+    fn v164_stage_lane_bend_composes_residual() {
+        // R5b: a piano-roll GLIDE never erases the EDO offset — the lane
+        // bend is re-emitted as lane + residual (the channel is shared by
+        // both, and the note itself is fixed at the nearest key).
+        let back = crate::tune::get();
+        crate::tune::set(24, 60);
+        let mut evq: Vec<(usize, [u8; 3])> = Vec::new();
+        let mut res = [0.0f32; 16];
+        stage_edo(&mut evq, 0, 3, 1, 61, 99, &mut res); // installs res=+0.5
+        assert_eq!(evq[0].0, 0, "offset 0 saturates (never wraps)");
+        evq.clear();
+        let lane = crate::midipat::st_to_bend(1.0);
+        stage_edo(
+            &mut evq,
+            5,
+            5,
+            1,
+            (lane & 0x7F) as u8,
+            ((lane >> 7) & 0x7F) as u8,
+            &mut res,
+        );
+        assert_eq!(evq.len(), 1);
+        let got = evq[0].1;
+        let want = crate::midipat::st_to_bend(1.5); // lane 1.0 + residual 0.5
+        assert_eq!(
+            got,
+            [0xE1, (want & 0x7F) as u8, ((want >> 7) & 0x7F) as u8],
+            "lane bend + EDO residual compose into ONE message"
+        );
+        crate::tune::set(back.0, back.1);
     }
 }

@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // tri_osc.rs — the subtractive synth workhorse.
 //
 // The classic three-oscillator subtractive analog is all one machine —
@@ -122,7 +122,9 @@ fn osc(p: f64, mode: i32) -> f64 {
     }
 }
 
-extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable for the tuning callback.
+    unsafe { SLOOPER_HOST = host; }
     let s = Box::new(TriOsc {
         sr: if sr > 1.0 { sr } else { 48000.0 },
         voices: [Voice::DEAD; VOICES],
@@ -167,7 +169,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     let mut v = Voice::DEAD;
     v.alive = true;
     v.note = note;
-    v.target = 440.0 * (2.0f64).powf((note as f64 - 69.0) / 12.0);
+    v.target = 440.0 * (2.0f64).powf((slooper_vnote(note) - 69.0) / 12.0);
     // Glide starts from wherever the synth last was; hard-attack snaps.
     v.freq = p.last_freq;
     v.vel = (vel.max(1) as f64 / 127.0).powf(0.7);
