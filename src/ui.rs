@@ -31535,8 +31535,9 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     "For MPE controllers (LinnStrument, SEABOARD, KeyStage, \u{2026}): \
                      pitch bend and per-note aftertouch arrive on each note's own \
                      channel and drive the instrument per voice. Recorded takes keep \
-                     both lanes. Hosted plugins support this fully; built-in scripted \
-                     synths ignore bend/poly-AT.",
+                     both lanes. Hosted plugins support this fully; the built-in \
+                     scripted synths receive both as well (script ABI v2 delivers \
+                     bend, v3 note pressure).",
                 )
                 .changed()
             {
@@ -63161,11 +63162,16 @@ mod tests {
     /// haystack and needles alike, so a re-wrapped string continuation
     /// can neither dodge a check nor fake one, and every literal is
     /// concat!-split so this pin's own bytes never contiguous-match what
-    /// it scans (source-pin self-match doctrine).
+    /// it scans (source-pin self-match doctrine). The flat strips the
+    /// backslashes together with the whitespace: a `\` string-wrap
+    /// continuation would otherwise silently split any needle spanning
+    /// a line break (this pin's first run caught exactly that).
     #[test]
     fn v160_mpe_tooltip_states_scripts_receive_expression() {
         let norm = |s: &str| -> String {
-            s.chars().filter(|c| !c.is_whitespace()).collect()
+            s.chars()
+                .filter(|c| !c.is_whitespace() && *c != '\\')
+                .collect()
         };
         let flat = norm(include_str!("ui.rs"));
         // Polarity A: the historic false claim must be absent from the
