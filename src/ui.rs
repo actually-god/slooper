@@ -63151,4 +63151,46 @@ mod tests {
         );
     }
 
+    /// v160 (card t_001be4d3): the MPE settings hover copy used to close
+    /// by telling users the built-in scripted instruments got neither
+    /// pitch bend nor per-note pressure. That went stale with script ABI
+    /// v2 (v100 delivers bend) and ABI v3 (v106 delivers poly_at): all
+    /// nine bundled scripts export the v3 table today, so the string
+    /// said the opposite of shipped behavior. A user-facing string is a
+    /// contract — pinned BOTH ways. The scan flattens whitespace out of
+    /// haystack and needles alike, so a re-wrapped string continuation
+    /// can neither dodge a check nor fake one, and every literal is
+    /// concat!-split so this pin's own bytes never contiguous-match what
+    /// it scans (source-pin self-match doctrine).
+    #[test]
+    fn v160_mpe_tooltip_states_scripts_receive_expression() {
+        let norm = |s: &str| -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        let flat = norm(include_str!("ui.rs"));
+        // Polarity A: the historic false claim must be absent from the
+        // whole file — tooltip AND any comment that could resurrect it.
+        for lie in [
+            norm(concat!("ignore bend/", "poly-AT")),
+            norm(concat!("scripted synths ", "ignore")),
+        ] {
+            assert!(
+                !flat.contains(&lie),
+                "stale MPE claim {lie:?} is back — bend & note pressure DO \
+                 reach scripted synths (script ABI v2/v3)"
+            );
+        }
+        // Polarity B: the MPE hover must keep the shipped-truth clause,
+        // exactly once (count pin — v158 name-pollution doctrine).
+        let truth = norm(concat!(
+            "built-in scripted synths receive both as well",
+            " (script ABI v2 delivers bend, v3 note pressure)"
+        ));
+        assert_eq!(
+            flat.matches(&truth).count(),
+            1,
+            "the MPE tooltip truth clause must appear exactly once"
+        );
+    }
+
 }
