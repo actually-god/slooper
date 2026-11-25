@@ -288,7 +288,7 @@ fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
     // position minus tuned ROOT position, so the root key always sounds
     // the sample natively and the ladder fans EDO steps around it. At the
     // default 12-EDO this is bit-identical to `note - root`.
-    let semis = slooper_vnote(note) - slooper_vnote(slot.root);
+    let semis = slooper_vnote(note) - slooper_vnote(slot.root as u8);
     let native = {
         let rate = s
             .cache

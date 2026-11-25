@@ -2015,9 +2015,11 @@ mod tests {
     // standard 12-EDO / root C4 — old files keep loading bit-identically.
     #[test]
     fn v164_config_edo_roundtrip_and_legacy_default() {
-        let mut cfg = Config::default();
-        cfg.edo_n = 53;
-        cfg.edo_root = 69;
+        let cfg = Config {
+            edo_n: 53,
+            edo_root: 69,
+            ..Config::default()
+        };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!((back.edo_n, back.edo_root), (53, 69));
