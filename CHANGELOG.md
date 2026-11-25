@@ -8,6 +8,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **Microtonal keyboards now read.** With the octave-divisions setting
+  off 12-EDO, every note label stays a standard note name on the rows
+  that coincide with 12-EDO ("anchor" rows — a 24-EDO C-sharp still
+  says `C#4`, and sits exactly where 12-EDO's C#4 sits), while the
+  other rows name their nearest standard note plus the signed deviation
+  in cents (`C4+50c`) and print dimmed so the two classes are obvious
+  at a glance. Piano-roll key rows, the sampler-map keyboard, status
+  lines, MIDI-monitor echoes and the root picker all draw from ONE
+  label builder, the root choice moves the anchor grid, and 12-EDO
+  rendering is byte-for-byte what it always was.
+
 - **The master spectrum can draw as one smooth line.** A
   "smooth spectrum line" toggle in SETTINGS — plus `points` / `line`
   words right above the panel in MASTER OUT — switches the trace from
