@@ -64326,8 +64326,7 @@ mod tests {
                     .job
                     .sections
                     .first()
-                    .and_then(|s| s.format.color)
-                    .map(|c| (t.galley.text().trim().to_string(), c)),
+                    .map(|s| (t.galley.text().trim().to_string(), s.format.color)),
                 _ => None,
             })
             .collect();
