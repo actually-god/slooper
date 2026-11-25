@@ -259,6 +259,8 @@ examples/       live dev probes run via `cargo run --example <name>`.
                   examples/v33_load_probe  plugin open-path timing
                   examples/alv_editor_live editor-during-RT crash repro
                   examples/mcp_tool_dump   live MCP table -> docs/MCP.md
+                  examples/v165_bend_probe v165 bend-audibility audio arbiter
+                  examples/v165_diag       v165 IMidiMapping param-route diag
 tests/e2e.rs    end-to-end tests that drive a LIVE JACK server
 tests/packaging.sh  packaging regression test (needs a PKGBUILD; see below)
 assets/icon.png 256x256 app icon (placeholder artwork)
