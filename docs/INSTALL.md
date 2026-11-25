@@ -107,7 +107,7 @@ installed):
 
 | dlopen'd | Needed for |
 | --- | --- |
-| `libjack.so` (the JACK API) | audio, in practice: install your distro's JACK package — `pipewire-jack` (Arch, Debian 12, Ubuntu 24.04+), `pipewire-jack-audio-connection-kit-libs` (Fedora) or `jack2` — slooper never spawns a server itself |
+| `libjack.so` (the JACK API) | audio, in practice: install your distro's JACK package — `pipewire-jack` (Arch, Debian 12, Ubuntu 24.04+), `pipewire-jack-audio-connection-kit-libs` (Fedora), or classic jack2 (`jack2` on Arch, `jackd2` on Debian/Ubuntu, `jack-audio-connection-kit` on Fedora) — slooper never spawns a server itself |
 | Wayland client libs | native Wayland; without them the GUI uses X11/XWayland |
 | GL / EGL drivers | any display at all (software `llvmpipe` works — see `SLOOPER_GPU_GL`) |
 
@@ -151,12 +151,15 @@ for it.
 **PipeWire (recommended).** Install PipeWire with the JACK support
 package — `pipewire-jack` on Arch and Debian 12 / Ubuntu 24.04+,
 `pipewire-jack-audio-connection-kit-libs` on Fedora; Ubuntu 22.04's
-archive has no PipeWire-JACK package, so there use jack2. These are the
-packages that provide `libjack.so.0`.
+archive has no PipeWire-JACK package, so there install the classic
+server package (`jackd2`) instead. These are the packages that provide
+`libjack.so.0`.
 Start a session as usual; PipeWire answers JACK clients automatically.
 
-**jack2.** Install `jack2`, then start a server before launching slooper,
-e.g. `jackd -d alsa` or via your GUI of choice (qjackctl).
+**Classic jack2.** Install the server package — `jack2` on Arch,
+`jackd2` on Debian/Ubuntu, `jack-audio-connection-kit` on Fedora (the
+binary is `jackd` on all three) — then start a server before launching
+slooper, e.g. `jackd -d alsa` or via your GUI of choice (qjackctl).
 
 On launch, slooper prints `JACK client 'slooper' active @ <rate> Hz` and
 shows `JACK ready` in the top bar. If no server is up, you'll see a connection
