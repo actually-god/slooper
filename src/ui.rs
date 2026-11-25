@@ -1672,13 +1672,26 @@ pub struct App {
     /// Active clip-edge drag (trim / extend, non-destructive).
     clip_resize: Option<ClipResize>,
     /// Rubber-band selection box in flight: (track, lane, x at press,
-    /// Ctrl/Shift held → keep the previous selection).
-    marquee: Option<(usize, usize, f32, bool)>,
+    /// y at press, Ctrl/Shift held → keep the previous selection).
+    /// v161: the box now spans EVERY lane its vertical extent crosses —
+    /// the origin strip stays recorded only for the pending→active gate.
+    marquee: Option<(usize, usize, f32, f32, bool)>,
     /// Empty-grid press that may still become a marquee (before the drag
     /// threshold): + selection snapshot taken at press.
-    marquee_pending: Option<(usize, usize, f32, bool, Vec<ClipId>)>,
-    /// The selection a marquee adds to (Ctrl/Shift box drag).
+    marquee_pending: Option<(usize, usize, f32, f32, bool, Vec<ClipId>)>,
+    /// The selection a marquee adds to (Ctrl/Shift box drag). v161: the
+    /// union is UNFILTERED — pre-selected clips on other tracks are part
+    /// of what "add to the previous selection" means.
     marquee_base: Vec<ClipId>,
+    /// v161: the in-flight marquee's live pointer, reported by the
+    /// origin lane strip (the only response that captured the press).
+    /// Cleared at the start of every grid pass; the multi-lane hit-test
+    /// runs at the end of that pass.
+    marquee_now: Option<egui::Pos2>,
+    /// v161: every lane strip's painted rect this grid pass, in draw
+    /// order ((track, lane) → screen rect). Rebuilt every pass; the
+    /// marquee hit-tests it so ONE drag can span tracks vertically.
+    lane_rects: Vec<((usize, usize), egui::Rect)>,
 
     // --- asset rack ---
     rack: Vec<RackFolder>,
@@ -2514,6 +2527,8 @@ impl App {
             marquee: None,
             marquee_pending: None,
             marquee_base: Vec::new(),
+            marquee_now: None,
+            lane_rects: Vec::new(),
             rack,
             rack_collapsed: cfg.rack_collapsed.iter().cloned().collect(),
             rack_dir_order: cfg.rack_dir_order.clone(),
@@ -5854,6 +5869,9 @@ impl App {
         self.clip_resize = None;
         self.marquee = None;
         self.marquee_pending = None;
+        // v161: the end-of-grid hit-test keys on marquee_now — it must
+        // die with the gesture or a stale pointer keeps re-selecting.
+        self.marquee_now = None;
         // v34 R16: the node grab holds raw (track,lane,clip) indices —
         // deleting clips/assets mid-drag must not leave it re-pointed at
         // a neighbour's node (and its guard masked every later press).
@@ -19734,6 +19752,7 @@ impl App {
             self.clip_resize = None;
             self.marquee = None;
             self.marquee_pending = None;
+            self.marquee_now = None; // v161: no live pointer outlives the drag
             self.drag_loop_handle = None;
             if self.sep_drag.take().is_some() {
                 self.save_config();
@@ -27087,6 +27106,11 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
                 // and desynchronised the two panels.
                 let sp = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
+                // v161: fresh lane-rect table + pointer report every pass
+                // (lane_row repopulates them; stale entries must never
+                // hit-test against a moved/scrolled grid).
+                app.lane_rects.clear();
+                app.marquee_now = None;
                 for t in 0..app.n_tracks {
                     track_block(ui, app, t, avail, px, sr);
                 }
@@ -27094,6 +27118,62 @@ fn central_panels(ui: &mut egui::Ui, app: &mut App) {
             });
         // The mixer panel mirrors this offset so strips stay aligned.
         app.vscroll = out.state.offset.y;
+        // v161 (user report 2026-11-25): the rubber band spans tracks.
+        // The origin strip (the pointer's owner) reported the live
+        // pointer; now that every lane rect of this pass is known, the
+        // box hit-tests EVERY lane whose rect vertically intersects the
+        // press→pointer extent, inside the same time window. A drag
+        // that stays inside the origin lane spans exactly that lane —
+        // the single-lane law is untouched. Ctrl/Shift unions the full
+        // pre-drag selection (cross-track base entries included).
+        if let (Some((_mt, _mk, mx0, my0, add)), Some(pt)) = (app.marquee, app.marquee_now) {
+            if let Some(l0) = app.lane_rects.first() {
+                let gx0 = l0.1.min.x;
+                let lx0 = gx0 - app.hscroll;
+                let x1 = pt.x.clamp(gx0, l0.1.max.x);
+                let (a, b) = (mx0.min(x1), mx0.max(x1));
+                let (yl, yh) = (my0.min(pt.y), my0.max(pt.y));
+                let p0 = s_at(lx0, a, sr, px);
+                let p1 = s_at(lx0, b, sr, px);
+                let mut ids: Vec<ClipId> = Vec::new();
+                for ((t2, k2), r2) in app.lane_rects.iter() {
+                    if r2.max.y < yl || r2.min.y > yh {
+                        continue;
+                    }
+                    if let Some(lane) = app.arr.tracks.get(*t2).and_then(|tr| tr.lanes.get(*k2)) {
+                        for (j, c) in lane.clips.iter().enumerate() {
+                            let alen = app.asset_len(c.asset);
+                            if c.pos < p1 && c.end(alen) > p0 {
+                                ids.push((*t2, *k2, j));
+                            }
+                        }
+                    }
+                }
+                if add {
+                    for b0 in &app.marquee_base {
+                        if !ids.contains(b0) {
+                            ids.push(*b0);
+                        }
+                    }
+                    ids.sort();
+                }
+                // Live preview while dragging: selection = box ∩ clips.
+                app.sel_clips = ids;
+                app.sel_anchor = app.sel_clips.first().copied();
+                // One continuous band, clamped to the painted grid area
+                // (playhead-style: painted after the ScrollArea).
+                let grid_vis =
+                    egui::Rect::from_min_max(grid_top, ui.max_rect().right_bottom());
+                let band = egui::Rect::from_min_max(egui::pos2(a, yl), egui::pos2(b, yh))
+                    .intersect(grid_vis);
+                ui.painter().rect_stroke(
+                    band,
+                    0.0,
+                    egui::Stroke::new(1.2f32, crate::kit::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
         // One continuous playhead across the whole track stack (drawn over
         // lanes AND separation bars, so it shows no break).
         let gx = x_of(grid_top.x - app.hscroll, app.backend.engine.pos(), sr, px);
@@ -27617,6 +27697,9 @@ fn lane_row(
     h: f32,
 ) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), Sense::click_and_drag());
+    // v161: publish this strip's rect for the grid-end multitrack
+    // marquee hit-test (the table is cleared at the top of each pass).
+    app.lane_rects.push(((t, k), rect));
     let x0 = rect.min.x - app.hscroll;
     let snapu = app.snap_unit();
     let clips: Vec<(Clip, String)> = app.arr.tracks[t].lanes[k]
@@ -27978,41 +28061,14 @@ fn lane_row(
     }
     ui.set_clip_rect(old_clip);
 
-    // Selection marquee (rubber box): (t, lane, x0, add) at press → x1
-    // follows the pointer; the selection is rebuilt live from the box.
-    if let Some((_mt, _mk, mx0, add)) = app.marquee {
+    // Selection marquee (rubber box) — v161: the box may now span any
+    // number of lanes, so the hit-test + painting moved to the END of
+    // the grid pass (central_panels), where every lane rect is known.
+    // This strip owns the pointer capture, so it only reports the live
+    // pointer; other strips have interact_pointer_pos() == None.
+    if app.marquee.is_some() {
         if let Some(pt) = resp.interact_pointer_pos() {
-            let x1 = pt.x.clamp(rect.min.x, rect.max.x);
-            let (a, b) = (mx0.min(x1), mx0.max(x1));
-            let p0 = s_at(x0, a, sr, px);
-            let p1 = s_at(x0, b, sr, px);
-            let ids: Vec<(usize, usize, usize)> = clips
-                .iter()
-                .enumerate()
-                .filter(|(_, (c, _))| {
-                    let alen = app.asset_len(c.asset);
-                    c.pos < p1 && c.end(alen) > p0
-                })
-                .map(|(j, _)| (t, k, j))
-                .collect();
-            let mut ids = ids;
-            if add {
-                for b0 in &app.marquee_base {
-                    if b0.0 == t && b0.1 == k && !ids.contains(b0) {
-                        ids.push(*b0);
-                    }
-                }
-                ids.sort();
-            }
-            // Live preview while dragging: selection = box ∩ clips.
-            app.sel_clips = ids;
-            app.sel_anchor = app.sel_clips.first().copied();
-            ui.painter().rect_stroke(
-                egui::Rect::from_min_max(egui::pos2(a, rect.min.y), egui::pos2(b, rect.max.y)),
-                0.0,
-                egui::Stroke::new(1.2f32, crate::kit::ACCENT),
-                egui::StrokeKind::Inside,
-            );
+            app.marquee_now = Some(pt);
         }
     }
     // ---- v18: hover reactions (cursor + trim glow) ----
@@ -28341,7 +28397,8 @@ fn lane_row(
                                 app.sel_anchor = None;
                             }
                             app.scrub_drag = true;
-                            app.marquee_pending = Some((t, k, pt.x, add, app.sel_clips.clone()));
+                            app.marquee_pending =
+                                Some((t, k, pt.x, pt.y, add, app.sel_clips.clone()));
                             app.backend.cmd(Cmd::Seek { pos });
                         }
                     }
@@ -28350,13 +28407,15 @@ fn lane_row(
         }
     } else if resp.dragged_by(egui::PointerButton::Primary) {
         // Pending marquee: leave scrub mode once the pointer really drags,
-        // so a horizontal rubber band can replace the playhead scan.
+        // so a rubber band can replace the playhead scan. v161: the box
+        // anchors at the PRESS point (x AND y) — the drag may sweep down
+        // across lanes before the x threshold trips.
         let pending = app.marquee_pending.clone();
-        if let Some((mt, mk, mx, add, base)) = pending {
+        if let Some((mt, mk, mx, my, add, base)) = pending {
             if mt == t && mk == k {
                 if let Some(pt) = resp.interact_pointer_pos() {
                     if (pt.x - mx).abs() > 6.0 {
-                        app.marquee = Some((mt, mk, mx, add));
+                        app.marquee = Some((mt, mk, mx, my, add));
                         app.marquee_base = base;
                         app.marquee_pending = None;
                         app.scrub_drag = false;
@@ -41407,6 +41466,200 @@ mod tests {
         }
         assert_eq!(n_clips(&app), 1, "nothing was destroyed en route");
     }
+    // ---- v161: multitrack rubber band (user report 2026-11-25) ----------
+    // A marquee started in one track and dragged DOWN through another
+    // must select the clips on every lane it crosses. The live hit-test
+    // used to run only in the origin lane strip (it owns the pointer
+    // capture) and saw only that lane's clips; the fix gathers every
+    // painted lane rect at the end of the grid pass and hit-tests the
+    // vertical span. Pins 1+2+4 are RED before the fix (they name the
+    // bug); pin 3 pins the unchanged single-lane law.
+
+    /// Seed: one clip (rack kick, pos 0) on track 0 AND track 1, lane 0,
+    /// settled one frame (the clip-props strip can shift the grid).
+    /// Returns the screen x of the clips' right edge (lanes start at
+    /// x~8 since v30 R6; the exact number only needs the +-40 px press
+    /// margin, so mild layout drift cannot flip the pin).
+    fn v161_seed_two_track_clips(app: &mut App, ctx: &egui::Context) -> f32 {
+        clear_canvas(app);
+        frame(app, ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.arr.insert(1, 0, Clip::new(a, 0));
+        frame(app, ctx, vec![]);
+        let sr = app.sample_rate.max(1) as f64;
+        let px = app.px_per_sec as f64;
+        (8.0 + (app.asset_len(a) as f64 / sr) * px) as f32
+    }
+
+    /// Rubber-band gesture frames: hover, press, one mid move (crosses
+    /// the 6 px scrub threshold so the marquee ARMS), then the end
+    /// position. The caller releases separately to test the live state.
+    fn v161_drag(app: &mut App, ctx: &egui::Context, press: egui::Pos2, end: egui::Pos2) {
+        let mid = egui::pos2((press.x + end.x) * 0.5, press.y);
+        frame(app, ctx, vec![moved(press)]);
+        frame(
+            app,
+            ctx,
+            vec![moved(press), btn(press, egui::PointerButton::Primary, true)],
+        );
+        frame(app, ctx, vec![moved(mid)]);
+        frame(app, ctx, vec![moved(end)]);
+    }
+
+    /// AC1 (RED before fix): one drag started in track 0 and swept down
+    /// through track 1 selects BOTH lanes' clips mid-gesture.
+    #[test]
+    fn v161_marquee_drag_spans_two_tracks() {
+        let mut app = headless_app("v161span");
+        let ctx = egui::Context::default();
+        let end_x = v161_seed_two_track_clips(&mut app, &ctx);
+        let top = app.grid_anchor - app.vscroll;
+        let y0 = top + app.track_h(0) * 0.5;
+        let top1 = top + app.track_h(0) + TRACK_SEP_HIT;
+        let y1 = top1 + app.track_h(1) * 0.5;
+        let end = egui::pos2(end_x * 0.5, y1);
+        v161_drag(&mut app, &ctx, egui::pos2(end_x + 40.0, y0), end);
+        assert!(app.marquee.is_some(), "marquee must be live mid-drag");
+        let mut sel = app.sel_clips.clone();
+        sel.sort();
+        assert_eq!(
+            sel,
+            vec![(0, 0, 0), (1, 0, 0)],
+            "one drag crossing two tracks must select BOTH lanes' clips"
+        );
+        // Release: the selection persists and the gesture is gone.
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(end, egui::PointerButton::Primary, false)],
+        );
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mut sel = app.sel_clips.clone();
+        sel.sort();
+        assert_eq!(sel, vec![(0, 0, 0), (1, 0, 0)], "selection survives release");
+        assert!(app.marquee.is_none() && app.marquee_pending.is_none());
+    }
+
+    /// AC3 (invariant, GREEN before AND after): a horizontal-only drag
+    /// inside one lane never reaches into the neighbouring track.
+    #[test]
+    fn v161_marquee_horizontal_stays_single_lane() {
+        let mut app = headless_app("v161lane");
+        let ctx = egui::Context::default();
+        let end_x = v161_seed_two_track_clips(&mut app, &ctx);
+        let top = app.grid_anchor - app.vscroll;
+        let y0 = top + app.track_h(0) * 0.5;
+        v161_drag(
+            &mut app,
+            &ctx,
+            egui::pos2(end_x + 40.0, y0),
+            egui::pos2(end_x * 0.5, y0),
+        );
+        let mut sel = app.sel_clips.clone();
+        sel.sort();
+        assert_eq!(
+            sel,
+            vec![(0, 0, 0)],
+            "a horizontal-only drag must stay inside the lane it started"
+        );
+    }
+
+    /// AC2 (RED before fix): Ctrl+marquee unions the pre-drag selection,
+    /// INCLUDING pre-selected clips on OTHER tracks (the old code
+    /// silently dropped base entries outside the origin lane).
+    #[test]
+    fn v161_marquee_ctrl_drag_keeps_cross_track_base() {
+        let mut app = headless_app("v161ctrl");
+        let ctx = egui::Context::default();
+        let end_x = v161_seed_two_track_clips(&mut app, &ctx);
+        let top = app.grid_anchor - app.vscroll;
+        let top1 = top + app.track_h(0) + TRACK_SEP_HIT;
+        // Pre-select the track-1 clip with a plain click on it.
+        let on_clip = egui::pos2(end_x * 0.5, top1 + app.track_h(1) * 0.5);
+        frame(&mut app, &ctx, vec![moved(on_clip)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(on_clip), btn(on_clip, egui::PointerButton::Primary, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(on_clip, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.sel_clips, vec![(1, 0, 0)], "click selects the track-1 clip");
+        // The clip-props strip appeared — re-sample the shifted grid.
+        let top = app.grid_anchor - app.vscroll;
+        let y0 = top + app.track_h(0) * 0.5;
+        // Ctrl+marquee INSIDE track 0 only: the track-1 base must survive.
+        let press = egui::pos2(end_x + 40.0, y0);
+        let mid = egui::pos2(end_x * 0.5, y0);
+        frame(&mut app, &ctx, vec![egui::Event::ModifiersChanged(egui::Modifiers::COMMAND)]);
+        frame(&mut app, &ctx, vec![moved(press)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(press), btn(press, egui::PointerButton::Primary, true)],
+        );
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        // One settled frame: the marquee ARMED on the frame above; the
+        // multi-lane hit-test lands at the END of the NEXT grid pass.
+        frame(&mut app, &ctx, vec![moved(mid)]);
+        assert!(app.marquee.is_some(), "ctrl+drag must arm the marquee");
+        let mut sel = app.sel_clips.clone();
+        sel.sort();
+        assert_eq!(
+            sel,
+            vec![(0, 0, 0), (1, 0, 0)],
+            "Ctrl+drag must UNION the pre-drag selection across tracks"
+        );
+    }
+
+    /// AC4: Ctrl+X mid-marquee (button still down) disarms the gesture,
+    /// cuts what the box had selected, and nothing stays armed; the
+    /// stale moves + release afterwards must not panic or resurrect a
+    /// gesture. (RED before fix: the span drag selected only the origin
+    /// lane, so only ONE of the two clips was cut.)
+    #[test]
+    fn v161_marquee_release_and_cancel_leave_no_stale_gesture() {
+        let mut app = headless_app("v161stale");
+        let ctx = egui::Context::default();
+        let end_x = v161_seed_two_track_clips(&mut app, &ctx);
+        let top = app.grid_anchor - app.vscroll;
+        let y0 = top + app.track_h(0) * 0.5;
+        let top1 = top + app.track_h(0) + TRACK_SEP_HIT;
+        let y1 = top1 + app.track_h(1) * 0.5;
+        let end = egui::pos2(end_x * 0.5, y1);
+        v161_drag(&mut app, &ctx, egui::pos2(end_x + 40.0, y0), end);
+        assert!(app.marquee.is_some(), "marquee must be live mid-drag");
+        // Ctrl+X while the primary is STILL down.
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                moved(end),
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                key_ev(egui::Key::X, egui::Modifiers::COMMAND),
+            ],
+        );
+        assert!(app.marquee.is_none(), "cancel must disarm the marquee");
+        assert!(app.marquee_pending.is_none());
+        assert_eq!(n_clips(&app), 0, "both spanned clips were cut");
+        // Stale move + release: must not panic or re-arm anything.
+        let off = egui::pos2(60.0, y0);
+        frame(&mut app, &ctx, vec![moved(off)]);
+        frame(&mut app, &ctx, vec![btn(off, egui::PointerButton::Primary, false)]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.marquee.is_none() && app.marquee_pending.is_none());
+    }
+
     // ------------------------------------------------------------- v22 ----
 
     /// v22 pin (the reported "Ctrl+C/V do not register"): the shipped app

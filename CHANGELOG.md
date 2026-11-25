@@ -8,6 +8,12 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **A rubber-band drag now selects across tracks.** Dragging from one
+  track's lane down through another used to select only clips in the
+  lane where the drag started. The box now collects every lane it
+  sweeps through, and a Ctrl/Shift drag keeps the whole pre-drag
+  selection — including clips on tracks it never touches. A drag that
+  stays inside one lane behaves exactly as before.
 - **The MPE settings tooltip now matches what ships.** It told users
   that built-in scripted synths get no pitch bend and no per-note
   aftertouch — true only before script ABI v2/v3. Bend has reached
