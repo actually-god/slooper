@@ -724,7 +724,8 @@ the list = first in the signal path). Open it with the strip's **FX** chip:
   echo+reverb, convolution reverb, chorus, flanger, phaser, auto pan, gater,
   overdrive, wave shaper, crusher, filter, enhancer, pitch shifter,
   frequency shifter, stereo spread, vocoder, sidechain compressor — the
-  full roster with every parameter is [EFFECT-SUITE.md](EFFECT-SUITE.md))
+  roster of all 23 with their key parameters is
+  [EFFECT-SUITE.md](EFFECT-SUITE.md))
   on first run; stock files are updated/added automatically on app updates
   (with a `.bak` of the overwritten stock copy), user files are never
   touched); **Plugin folders**

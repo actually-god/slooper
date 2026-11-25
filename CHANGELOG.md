@@ -796,8 +796,8 @@ systems (Linux suite + Windows-native suite + a cross-compile check).
   delay, echo + reverb, convolution reverb, chorus, flanger, phaser,
   auto pan, gater, overdrive, wave shaper, crusher, filter, enhancer,
   pitch shifter (with tuner + chromatic correction), frequency shifter,
-  stereo spread, vocoder, and a sidechain compressor. Full roster with
-  every parameter: [docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md).
+  stereo spread, vocoder, and a sidechain compressor. Roster with every
+  effect's key parameters: [docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md).
 - **Sidechain routing** — every mixer strip has an **SC** input picker;
   scripted effects and the ducking compressor/vocoder consume the key,
   and export ducks exactly like the live mix.

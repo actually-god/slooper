@@ -1,10 +1,14 @@
 # W11 (docs/WINDOWS-PORT.md): GitHub Release assets, built by CI.
 #
 #   On tag push v*:  publish a release with the shipping assets —
-#     slooper-<ver>-linux-x86_64.tar.zst   (usr/ prefix: extract into /,
-#                                           mirrors the AUR pkg layout;
-#                                           the AUR source flow is
-#                                           UNTOUCHED by this workflow)
+#     slooper-<ver>-linux-x86_64.tar.zst   (top-level slooper-<ver>-linux-
+#                                           x86_64/ folder carrying the
+#                                           usr/ tree — the user copies
+#                                           that usr/ into /, NOT a bare
+#                                           usr-prefixed tar; mirrors the
+#                                           AUR pkg layout; the AUR source
+#                                           flow is UNTOUCHED by this
+#                                           workflow)
 #     slooper-<debver>_amd64.deb            (W13d: same staged tree +
 #                                           control file, smoke-gated on
 #                                           the debian tier)
