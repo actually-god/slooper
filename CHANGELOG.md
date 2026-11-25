@@ -4,6 +4,18 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
+## [Unreleased]
+
+### Fixed
+
+- **The MPE settings tooltip now matches what ships.** It told users
+  that built-in scripted synths get no pitch bend and no per-note
+  aftertouch — true only before script ABI v2/v3. Bend has reached
+  scripted synths since v100 (script ABI v2) and per-note pressure
+  since v106 (script ABI v3), and all nine bundled scripts export the
+  v3 table today. The hover now says both reach hosted plugins **and**
+  the built-in scripted synths.
+
 ## [0.24.0] — 2026-11-24
 
 The **expression release**: pitch curves you draw right on the notes,
