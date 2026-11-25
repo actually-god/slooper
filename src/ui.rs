@@ -63558,35 +63558,42 @@ mod tests {
             time: Some(test_time()),
             ..Default::default()
         };
-        // POINTS pass: collect bar TOP corners (skip the txt-grey axis
-        // labels and the pale peak caps by colour; skip bottom corners
-        // by y). Left corners only: cell corners sit sw apart.
+        // POINTS pass: collect bar TOP corner y's per shared cell edge
+        // (skip the txt-grey axis labels and the pale peak caps by
+        // colour; skip bottom corners by y). NOTE: bar edges are SHARED
+        // — cell c-1's right top corner sits at cell c's left edge to
+        // the exact bit (sw = 25/64 is binary-exact), so each edge
+        // legitimately carries TWO bar tops: cell c-1's and cell c's.
+        // Rigor = the recorded set must be exactly that pair (no third
+        // source) and must CONTAIN this cell's own top.
         let mut out_p = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(&mm), rect, false));
         let sw = rect.width() / npts as f32;
-        let mut bar_tops: Vec<Option<f32>> = vec![None; npts];
+        let mut bar_ys: Vec<Vec<f32>> = vec![Vec::new(); npts];
         for cs in &out_p.shapes {
             if let egui::epaint::Shape::Mesh(m) = &cs.shape {
                 for v in &m.vertices {
                     let (r0, g0, b0, a0) = v.color.to_tuple();
+                    // Skip: pale peak caps, axis-label text, panel bg.
+                    // (Bar colors come from spec_color — never gray —
+                    // so these skips cannot eat the trace.)
                     let gray = (r0 as i16 - g0 as i16).abs() <= 6
                         && (g0 as i16 - b0 as i16).abs() <= 6
                         && r0 >= 200;
-                    if a0 <= 100 || gray || v.pos.y > rect.max.y - 0.5 {
+                    if a0 <= 100 || gray || (r0 == 120 && g0 == 120 && b0 == 128) || (r0 == 24 && g0 == 24 && b0 == 29)
+                        || v.pos.y > rect.max.y - 0.5
+                    {
                         continue;
                     }
                     let c = ((v.pos.x - rect.min.x) / sw).floor() as i64;
                     if c < 0 || c >= npts as i64 {
                         continue;
                     }
-                    // Corner exactly at a cell's LEFT edge: assign to the
-                    // cell whose window [x0+eps..x1-eps] contains it…
+                    // Corner exactly on a cell boundary (left edge of c).
                     let left_edge = rect.min.x + c as f32 * sw;
                     if (v.pos.x - left_edge).abs() > 0.05 {
-                        continue; // right corner of the previous cell
+                        continue;
                     }
-                    let cell = c as usize;
-                    bar_tops[cell] =
-                        Some(bar_tops[cell].map_or(v.pos.y, |y: f32| y.min(v.pos.y)));
+                    bar_ys[c as usize].push(v.pos.y);
                 }
             }
         }
@@ -63609,10 +63616,17 @@ mod tests {
                 continue;
             }
             let want = yc(mm.disp_db[c]);
-            let bar = bar_tops[c].unwrap_or_else(|| panic!("cell {c} loud but no bar painted"));
+            let ys = &bar_ys[c];
             assert!(
-                (bar - want).abs() < 0.01,
-                "points bar top must be y_of(disp_db[{c}]): {bar} vs {want}"
+                ys.iter().any(|y| (y - want).abs() < 0.01),
+                "points bar top must be y_of(disp_db[{c}]): {ys:?} must contain {want}"
+            );
+            // Rigor: every y on this edge is this cell's top or the left
+            // neighbour's — a third source (stale/foreign mesh) fails.
+            let prev = if c > 0 { yc(mm.disp_db[c - 1]) } else { want };
+            assert!(
+                ys.iter().all(|y| (y - want).abs() < 0.01 || (y - prev).abs() < 0.01),
+                "cell edge {c} carries only neighbour bar tops: {ys:?} vs {want}/{prev}"
             );
             if c < npts - 1 {
                 let knot = trace[c][0];
@@ -63705,6 +63719,11 @@ mod tests {
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
         app.show_master = true;
+        // dyn_reg is LAZY: the slot registers only once a frame draws
+        // the open master (v49 pattern) — read it after, not before.
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
         let mi =
             app.dyn_wins.iter().position(|w| w.kind == DynKind::Master).expect("master registered");
         let mwin = 4 + mi;
