@@ -1421,6 +1421,11 @@ pub struct App {
     /// main GUI's track heights + scroll. Off: strips keep a uniform height,
     /// start at the panel top and own their scroll even when docked.
     mixer_follow_tracks: bool,
+    /// v163 (card t_5cf0f288): master spectrum trace mode — false (default)
+    /// = points per display cell, true = one continuous smooth line.
+    /// Persisted; flipped ONLY through [`App::set_spectrum_line`] (inline
+    /// words above the panel + the SETTINGS checkbox share that seam).
+    spectrum_line: bool,
     /// v30 R3: scratch name for saving an automation shape preset.
     auto_preset_name: String,
     /// v30 R4: the project-value-bindings window is part of the main GUI.
@@ -2415,6 +2420,7 @@ impl App {
             show_rack: cfg.show_rack,
             show_mixer: cfg.show_mixer,
             mixer_follow_tracks: cfg.mixer_follow_tracks,
+            spectrum_line: cfg.spectrum_line,
             auto_preset_name: String::new(),
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
@@ -6456,6 +6462,7 @@ impl App {
             show_rack: self.show_rack,
             show_mixer: self.show_mixer,
             mixer_follow_tracks: self.mixer_follow_tracks,
+            spectrum_line: self.spectrum_line,
             show_midi: self.show_midi,
             show_binds: self.show_binds,
             side_wins: self.side_wins,
@@ -6870,6 +6877,7 @@ impl App {
             "show_rack" => self.show_rack = cfg.show_rack,
             "show_mixer" => self.show_mixer = cfg.show_mixer,
             "mixer_follow_tracks" => self.mixer_follow_tracks = cfg.mixer_follow_tracks,
+            "spectrum_line" => self.spectrum_line = cfg.spectrum_line,
             "show_midi" => self.show_midi = cfg.show_midi,
             "show_binds" => self.show_binds = cfg.show_binds,
             "theme" => self.light_theme = cfg.theme == "light",
@@ -9627,6 +9635,58 @@ impl App {
         false
     }
 
+    /// v163 (card t_5cf0f288): the ONE spectrum trace-mode seam — the
+    /// inline words above the panel AND the SETTINGS checkbox both route
+    /// here, so state, persistence and the status echo can never drift
+    /// (v110 "never fork the bookkeeping" law). True when the mode
+    /// actually changed; every entry point fires unconditionally and the
+    /// seam no-ops on same-state (also makes the inline pair idempotent
+    /// against double-clicks).
+    fn set_spectrum_line(&mut self, on: bool) -> bool {
+        if self.spectrum_line == on {
+            return false;
+        }
+        self.spectrum_line = on;
+        self.save_config();
+        self.status = if on {
+            "spectrum trace: smooth line".into()
+        } else {
+            "spectrum trace: points".into()
+        };
+        true
+    }
+
+    /// v163: the inline trace-mode row — ONE home, used by both master
+    /// layouts (wide and tall-narrow fold), so the affordances cannot
+    /// drift between placements. Words carry the v80 toggle contract:
+    /// hover explains each mode, the click echoes into the status line
+    /// (via the seam).
+    fn spec_trace_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("trace:").weak().small());
+            let on = self.spectrum_line;
+            let b = ui
+                .add(egui::Button::selectable(!on, "points").small())
+                .on_hover_text(
+                    "Spectrum trace: separate points per display cell \
+                     (default) \u{b7} switch to a single smooth line \
+                     through the same data.",
+                );
+            if b.clicked() {
+                self.set_spectrum_line(false);
+            }
+            let l = ui
+                .add(egui::Button::selectable(on, "line").small())
+                .on_hover_text(
+                    "Spectrum trace: one continuous smooth curve through \
+                     the same points \u{b7} switch back to points.",
+                );
+            if l.clicked() {
+                self.set_spectrum_line(true);
+            }
+        });
+    }
+
     /// v39/v44 R4: MASTER OUT — THE master section (the mixer no longer
     /// duplicates any of it). ONE body shared by the floating window and
     /// the docked panel. Order of importance left to right:
@@ -9806,26 +9866,40 @@ impl App {
             });
             if wide {
                 ui.separator();
-                // v49 R2: the wide-mode spectrum fills the WHOLE row
-                // height (it used to stop at the meter's old 130 px cap
-                // and leave the panel looking frozen while resizing).
-                let (r2, _) = ui.allocate_exact_size(
-                    egui::vec2(
-                        ui.available_width().max(150.0),
-                        body_h.max(meter_h).max(60.0),
-                    ),
-                    Sense::hover(),
-                );
-                paint_spectrum(ui, self.meter_state.as_ref(), r2);
+                // v163 (card t_5cf0f288): the trace-mode words ride
+                // DIRECTLY above the panel — the mode is a property of
+                // THIS view, flipped while looking at it (SETTINGS
+                // carries the same seam's checkbox; both route through
+                // App::set_spectrum_line, so state/save/echo cannot
+                // drift between the two affordances).
+                ui.vertical(|ui| {
+                    let y0 = ui.cursor().min.y;
+                    self.spec_trace_row(ui);
+                    let row_h = ui.cursor().min.y - y0;
+                    // v49 R2 trap (kept from main): INSIDE the horizontal
+                    // row available_height() COLLAPSES to the tallest
+                    // control column — the panel height comes from body_h,
+                    // measured BEFORE the row. Subtract only the row's
+                    // consumed height so the panel still GROWS with the
+                    // dock 1:1 (v49 pin) without overflowing the floor.
+                    let h = (body_h - row_h).max(meter_h).max(60.0);
+                    let (r2, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width().max(150.0), h),
+                        Sense::hover(),
+                    );
+                    paint_spectrum(ui, self.meter_state.as_ref(), r2, self.spectrum_line);
+                });
             }
         });
         if !wide && tall {
+            // v163: same inline toggle above the folded spectrum row.
+            self.spec_trace_row(ui);
             let h = (ui.available_height() - 8.0).max(46.0);
             let (r2, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width().max(150.0), h),
                 Sense::hover(),
             );
-            paint_spectrum(ui, self.meter_state.as_ref(), r2);
+            paint_spectrum(ui, self.meter_state.as_ref(), r2, self.spectrum_line);
         }
     }
 
@@ -19276,7 +19350,7 @@ impl eframe::App for App {
                 if n > 0 {
                     ms.feed(&self.meter_drain);
                 }
-                ms.spectrum.refresh(2.5);
+                ms.refresh_display(2.5); // v163: bins + display projection, once
                 ms.tick();
                 if self.meter_calc_at.elapsed().as_millis() >= 250 {
                     self.meter_calc_at = std::time::Instant::now();
@@ -25502,7 +25576,12 @@ fn paint_stereo_meters(
 /// that land in it), so the trace uses every pixel of the panel at any
 /// width — no 1.6 px bar gaps at small sizes, no overlapping mush at
 /// large ones — with decaying peak caps per column and a finer grid.
-fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rect: egui::Rect) {
+fn paint_spectrum(
+    ui: &mut egui::Ui,
+    ms: Option<&crate::meter::MasterMeter>,
+    rect: egui::Rect,
+    line_mode: bool,
+) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, Color32::from_rgb(24, 24, 29));
     let (f_min, f_max) = (crate::meter::SPEC_F_MIN, crate::meter::SPEC_F_MAX);
@@ -25539,18 +25618,21 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
             txt,
         );
     }
-    let db_lines: &[f32] = if rect.height() >= 120.0 {
-        &[-30.0f32, -60.0, -90.0]
+    // v163: constant strings (the old per-frame format! made the paint
+    // path allocate for text that never changes — `v163_paint_path_
+    // never_allocates` forbids it).
+    let db_lines: &[(&str, f32)] = if rect.height() >= 120.0 {
+        &[("-30 dB", -30.0f32), ("-60 dB", -60.0), ("-90 dB", -90.0)]
     } else {
-        &[-60.0f32, -90.0]
+        &[("-60 dB", -60.0), ("-90 dB", -90.0)]
     };
-    for db in db_lines {
+    for (lab, db) in db_lines {
         let y = y_of(*db);
         p.hline(rect.x_range(), y, egui::Stroke::new(1.0, grid));
         p.text(
             egui::pos2(rect.min.x + 2.0, y + 1.0),
             egui::Align2::LEFT_TOP,
-            format!("{db:.0} dB"),
+            *lab,
             egui::FontId::proportional(9.0),
             txt,
         );
@@ -25566,60 +25648,24 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
             );
         }
         Some(m) => {
-            let sp = &m.spectrum;
-            // v162 R2/R3: equal-per-octave display. The 8192 analyzer
-            // bins are projected by `Spectrum::resample_log` onto
-            // DISPLAY_POINTS log-spaced cells; because the axis is log,
-            // every cell occupies EXACTLY rect.width()/npts px, so the
-            // displayed points are uniformly spread across the whole
-            // sweep (pre-v162 bins sat at linear-Hz x positions: crowded
-            // in the high band, sparse in the low band). Full-resolution
-            // data stays behind the mapping (max-hold per cell +
-            // nearest-bin fallback — see resample_log's doc).
+            // v163 (card t_5cf0f288): the equal-per-octave display
+            // projection lives in `MasterMeter::disp_db`/`disp_pk` — the
+            // UI pump computes it ONCE per frame (`refresh_display`) and
+            // BOTH trace modes paint from those same vectors: identical
+            // data by construction, and this paint path allocates
+            // nothing (the old per-frame coldb/colpk scratch vecs lived
+            // right here). v162 R2/R3 — equal-per-octave cells with
+            // uniform on-screen spacing, max-hold + nearest-bin
+            // fallback — is unchanged; it now happens upstream, once,
+            // not per mode.
             let npts = crate::meter::DISPLAY_POINTS;
-            let mut coldb: Vec<f32> = vec![-240.0; npts];
-            let mut colpk: Vec<f32> = vec![-240.0; npts];
-            sp.resample_log(npts, f_min, f_max, &mut coldb, &mut colpk);
-            let mut mesh = egui::epaint::Mesh::default();
-            let slot_w = rect.width() / npts as f32;
-            for c in 0..npts {
-                let db = coldb[c];
-                if db < -118.0 {
-                    continue;
-                }
-                let x = rect.min.x + c as f32 * slot_w;
-                let x1 = rect.min.x + (c + 1) as f32 * slot_w;
-                let t = ((db + 120.0) / 120.0).clamp(0.0, 1.0);
-                let (a, b, tc) = if t < 0.5 {
-                    ((46.0, 130.0, 120.0), (70.0, 220.0, 200.0), t * 2.0)
+            if m.disp_db.len() == npts && m.disp_pk.len() == npts {
+                if line_mode {
+                    paint_trace_line(p, rect, &m.disp_db, &m.disp_pk, &y_of);
                 } else {
-                    ((70.0, 220.0, 200.0), (240.0, 235.0, 170.0), (t - 0.5) * 2.0)
-                };
-                let colr = Color32::from_rgb(
-                    (a.0 + (b.0 - a.0) * tc) as u8,
-                    (a.1 + (b.1 - a.1) * tc) as u8,
-                    (a.2 + (b.2 - a.2) * tc) as u8,
-                );
-                let y = y_of(db);
-                mesh.add_colored_rect(
-                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x1, rect.max.y)),
-                    colr,
-                );
-                let pk = colpk[c];
-                if pk > db + 1.5 {
-                    let yc = y_of(pk);
-                    if yc < y - 1.5 {
-                        mesh.add_colored_rect(
-                            egui::Rect::from_min_max(
-                                egui::pos2(x, yc - 1.2),
-                                egui::pos2(x1, yc),
-                            ),
-                            Color32::from_rgb(220, 220, 220),
-                        );
-                    }
+                    paint_trace_points(p, rect, &m.disp_db, &m.disp_pk, &y_of);
                 }
             }
-            p.add(egui::Shape::mesh(mesh));
             p.text(
                 egui::pos2(rect.max.x - 2.0, rect.min.y + 1.0),
                 egui::Align2::RIGHT_TOP,
@@ -25628,6 +25674,122 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
                 txt,
             );
         }
+    }
+}
+
+/// v163 (card t_5cf0f288): the ONE spectrum trace colour rule (dBFS →
+/// teal→cyan→warm gradient). Shared by BOTH trace painters so the point
+/// and line modes can never drift apart in colour.
+fn spec_color(db: f32) -> Color32 {
+    let t = ((db + 120.0) / 120.0).clamp(0.0, 1.0);
+    let (a, b, tc) = if t < 0.5 {
+        ((46.0, 130.0, 120.0), (70.0, 220.0, 200.0), t * 2.0)
+    } else {
+        ((70.0, 220.0, 200.0), (240.0, 235.0, 170.0), (t - 0.5) * 2.0)
+    };
+    Color32::from_rgb(
+        (a.0 + (b.0 - a.0) * tc) as u8,
+        (a.1 + (b.1 - a.1) * tc) as u8,
+        (a.2 + (b.2 - a.2) * tc) as u8,
+    )
+}
+
+/// v163 POINTS mode (the pre-v163 default look): one colored bar per
+/// display cell (skipping cells deeper than -118 dB) plus the pale peak
+/// cap when the hold rides >1.5 dB above the bar top. Paints from the
+/// caller's projection vectors — allocates nothing but the one egui mesh.
+fn paint_trace_points(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    coldb: &[f32],
+    colpk: &[f32],
+    y_of: &dyn Fn(f32) -> f32,
+) {
+    let mut mesh = egui::epaint::Mesh::default();
+    let npts = coldb.len();
+    let slot_w = rect.width() / npts as f32;
+    for c in 0..npts {
+        let db = coldb[c];
+        if db < -118.0 {
+            continue;
+        }
+        let x = rect.min.x + c as f32 * slot_w;
+        let x1 = rect.min.x + (c + 1) as f32 * slot_w;
+        let y = y_of(db);
+        mesh.add_colored_rect(
+            egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x1, rect.max.y)),
+            spec_color(db),
+        );
+        let pk = colpk[c];
+        if pk > db + 1.5 {
+            let yc = y_of(pk);
+            if yc < y - 1.5 {
+                mesh.add_colored_rect(
+                    egui::Rect::from_min_max(egui::pos2(x, yc - 1.2), egui::pos2(x1, yc)),
+                    Color32::from_rgb(220, 220, 220),
+                );
+            }
+        }
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// v163 (card t_5cf0f288) LINE mode: the trace is ONE continuous smooth
+/// curve through the SAME projection vectors — every display cell joins
+/// the curve (in silence it rides the floor), so it never reads as
+/// separate points. Peak hold rides the same rule as one pale continuous
+/// line. Catmull-Rom → cubic Bézier (see [`bezier_curve`]).
+fn paint_trace_line(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    coldb: &[f32],
+    colpk: &[f32],
+    y_of: &dyn Fn(f32) -> f32,
+) {
+    bezier_curve(p, rect, coldb, 1.6, |a, b| spec_color((a + b) * 0.5), y_of);
+    bezier_curve(p, rect, colpk, 1.0, |_a, _b| Color32::from_rgb(220, 220, 220), y_of);
+}
+
+/// v163: stroke one Catmull-Rom-smooth curve through `vals` (uniformly
+/// spaced cells across `rect`, value = dBFS via `y_of`). For the segment
+/// Pi..Pi+1 the Bézier control points are Pi + (Pi+1−Pi−1)/6 and
+/// Pi+1 − (Pi+2−Pi)/6 (endpoint tangents clamp by duplicating the end
+/// point) — C1-continuous by construction, so consecutive cubic shapes
+/// chain into ONE curve. Colour per segment from `color_at` (the average
+/// dB of the segment's endpoints — the trace gradient stays the shared
+/// [`spec_color`] rule). Allocation-free: pure per-segment f32 math, each
+/// shape pushed straight into the painter (pinned by
+/// `v163_paint_path_never_allocates`).
+fn bezier_curve(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    vals: &[f32],
+    width: f32,
+    color_at: fn(f32, f32) -> Color32,
+    y_of: &dyn Fn(f32) -> f32,
+) {
+    let n = vals.len();
+    if n < 2 {
+        return;
+    }
+    let sw = rect.width() / n as f32;
+    // Cell centers: the curve passes THROUGH (x_i, y_of(vals[i])).
+    for i in 0..n - 1 {
+        let (i0, i3) = (i.saturating_sub(1), (i + 2).min(n - 1));
+        let px = |k: usize| rect.min.x + (k as f32 + 0.5) * sw;
+        let py = |k: usize| y_of(vals[k].max(-120.0));
+        let (p0, p1) = (egui::pos2(px(i0), py(i0)), egui::pos2(px(i), py(i)));
+        let (p2, p3) = (egui::pos2(px(i + 1), py(i + 1)), egui::pos2(px(i3), py(i3)));
+        let c1 = p1 + (p2 - p0) * (1.0 / 6.0);
+        let c2 = p2 - (p3 - p1) * (1.0 / 6.0);
+        p.add(egui::Shape::CubicBezier(
+            egui::epaint::CubicBezierShape::from_points_stroke(
+                [p1, c1, c2, p2],
+                false,
+                Color32::TRANSPARENT,
+                egui::Stroke::new(width, color_at(vals[i], vals[i + 1])),
+            ),
+        ));
     }
 }
 
@@ -31294,7 +31456,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 ui,
                 &app.sett_filter,
                 "GUI",
-                "gui scale zoom interface tracks panel visible dock float layout theme light dark latency record latency_ms",
+                "gui scale zoom interface tracks panel visible dock float layout theme light dark latency record latency_ms spectrum smooth line curve",
             ) {
                 any = true;
             ui.horizontal(|ui| {
@@ -31372,6 +31534,24 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 .weak()
                 .small(),
             );
+            // v163 (card t_5cf0f288): the master spectrum trace mode. The
+            // MASTER OUT panel carries the same toggle inline directly
+            // above the spectrum (the mode belongs to the view; the panel
+            // is where you see it) — this row is the searchable home
+            // SETTINGS requires; both route through the ONE
+            // App::set_spectrum_line seam (state + save + echo).
+            let mut spec_on = app.spectrum_line;
+            if ui
+                .checkbox(&mut spec_on, "smooth spectrum line")
+                .on_hover_text(
+                    "Master spectrum trace: off (default) draws points per \
+                     display cell; on draws one continuous smooth curve \
+                     (Catmull-Rom) through the same data.",
+                )
+                .changed()
+            {
+                app.set_spectrum_line(spec_on);
+            }
             // v30-batch-2: one-click layout moves. "Dock all" snaps every
             // visible window back into the standard edge slots (the state
             // this app opens with); "Float all" undocks everything into
@@ -63166,7 +63346,9 @@ mod tests {
                 buf.push(v);
             }
             mm.feed(&buf);
-            mm.spectrum.refresh(0.0);
+            // v163: refresh_display = refresh + the equal-per-octave
+            // projection BOTH trace modes now paint from (one pipeline).
+            mm.refresh_display(0.0);
             let ctx = egui::Context::default();
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -63176,7 +63358,7 @@ mod tests {
                 time: Some(test_time()),
                 ..Default::default()
             };
-            let mut out = ctx.run_ui(raw, |ui| paint_spectrum(ui, Some(&mm), rect));
+            let mut out = ctx.run_ui(raw, |ui| paint_spectrum(ui, Some(&mm), rect, false));
             let mut tops: Vec<(f32, f32)> = Vec::new();
             for cs in &out.shapes {
                 if let egui::epaint::Shape::Mesh(m) = &cs.shape {
@@ -63212,6 +63394,389 @@ mod tests {
             );
             out.textures_delta.clear();
         }
+    }
+
+    // ---- v163 (card t_5cf0f288): spectrum trace-mode toggle -----------
+    //
+    // Default POINTS vs LINE mode (Catmull-Rom smooth curve), one seam
+    // (App::set_spectrum_line) behind the SETTINGS row AND the inline
+    // words above the panel, one display projection shared by BOTH modes
+    // (MasterMeter::refresh_display), allocation-free paint path.
+
+    /// Two loud tones (100 Hz + 8 kHz) on the floor of silence, so the
+    /// curve has real curvature at both ends of the sweep.
+    fn v163_two_tone_meter() -> crate::meter::MasterMeter {
+        use crate::meter::{MasterMeter, FFT_WINDOW};
+        let mut mm = MasterMeter::new(48_000);
+        let mut buf: Vec<f32> = Vec::with_capacity(FFT_WINDOW * 2);
+        for i in 0..FFT_WINDOW {
+            let t = i as f32 / 48_000.0;
+            let v = 0.08 * (2.0 * std::f32::consts::PI * 100.0 * t).sin()
+                + 0.08 * (2.0 * std::f32::consts::PI * 8_000.0 * t).sin();
+            buf.push(v);
+            buf.push(v);
+        }
+        mm.feed(&buf);
+        mm.refresh_display(0.0);
+        mm
+    }
+
+    /// R1: SETTINGS carries the toggle, default stays POINTS, the flip
+    /// round-trips through config (fresh App = reload) in BOTH
+    /// polarities, and every flip echoes into the status line (goal 1).
+    #[test]
+    fn v163_settings_toggle_persists() {
+        let mut app = headless_app("v163cfg");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.spectrum_line, "default stays POINTS (spec-2 card)");
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "smooth spectrum line")
+            .expect("v163 settings row paints in the GUI section");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.spectrum_line, "settings checkbox flips line mode ON");
+        assert!(
+            app.status.contains("spectrum trace: smooth line"),
+            "flip must echo: {}",
+            app.status
+        );
+        let b = App::new(Backend::start());
+        assert!(b.spectrum_line, "line mode round-trips config across reload");
+        // Same row toggles back; the false polarity persists too (a serde
+        // default must not shadow a saved true — nor vice versa).
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "smooth spectrum line").expect("row still there");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.spectrum_line, "same row toggles back to points");
+        assert!(
+            app.status.contains("spectrum trace: points"),
+            "flip must echo: {}",
+            app.status
+        );
+        let c = App::new(Backend::start());
+        assert!(!c.spectrum_line, "points round-trips too");
+    }
+
+    /// R2: LINE mode paints ONE continuous smooth curve: exactly
+    /// npts-1 cubic segments for the trace AND the same count for the
+    /// peak hold, chained end-to-start (no breaks), passing THROUGH the
+    /// shared projection at every probed cell — and its interiors
+    /// deviate from the chord midpoints (a Catmull-Rom curve, not a
+    /// straight polyline: the sabotage "emit line segments" zeroes this
+    /// deviation).
+    #[test]
+    fn v163_line_mode_smooth_curve() {
+        let npts = crate::meter::DISPLAY_POINTS;
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(400.0, 140.0));
+        let mm = v163_two_tone_meter();
+        assert_eq!(mm.disp_db.len(), npts, "projection filled by refresh_display");
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| paint_spectrum(ui, Some(&mm), rect, true));
+        let mut trace: Vec<[[f32; 2]; 4]> = Vec::new();
+        let mut npk = 0usize;
+        for cs in &out.shapes {
+            if let egui::epaint::Shape::CubicBezier(cb) = &cs.shape {
+                let pts: [[f32; 2]; 4] =
+                    cb.points.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>().try_into().unwrap();
+                if (cb.stroke.width - 1.6).abs() < 1e-6 {
+                    trace.push(pts);
+                } else if (cb.stroke.width - 1.0).abs() < 1e-6 {
+                    npk += 1;
+                }
+            }
+        }
+        out.textures_delta.clear();
+        assert_eq!(trace.len(), npts - 1, "one cubic segment per adjacent cell pair");
+        assert_eq!(npk, npts - 1, "peak hold is ONE continuous pale line too");
+        for (i, w) in trace.windows(2).enumerate() {
+            assert!(
+                (w[0][3][0] - w[1][0][0]).abs() < 1e-4
+                    && (w[0][3][1] - w[1][0][1]).abs() < 1e-4,
+                "curve break after segment {i}"
+            );
+        }
+        let sw = rect.width() / npts as f32;
+        let xc = |i: usize| rect.min.x + (i as f32 + 0.5) * sw;
+        let yc = |db: f32| rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height();
+        let mut loud = 0usize;
+        for (i, &d) in mm.disp_db.iter().enumerate() {
+            if d > mm.disp_db[loud] {
+                loud = i;
+            }
+        }
+        for &i in [0usize, 511, loud, npts - 2].iter() {
+            let s = trace[i];
+            assert!((s[0][0] - xc(i)).abs() < 1e-3, "seg {i} starts at its cell center x");
+            assert!(
+                (s[0][1] - yc(mm.disp_db[i])).abs() < 0.01,
+                "seg {i} passes through the point (y of the SAME db data)"
+            );
+        }
+        let last = trace[npts - 2][3];
+        assert!(
+            (last[0] - xc(npts - 1)).abs() < 1e-3
+                && (last[1] - yc(mm.disp_db[npts - 1])).abs() < 0.01,
+            "curve ends on the last data point"
+        );
+        let mut max_dev = 0.0f32;
+        for s in &trace {
+            let mid = (s[0][1] + 3.0 * (s[1][1] + s[2][1]) + s[3][1]) / 8.0;
+            let chord = (s[0][1] + s[3][1]) * 0.5;
+            max_dev = max_dev.max((mid - chord).abs());
+        }
+        assert!(
+            max_dev > 0.2,
+            "line mode must be SMOOTH (cubic interiors deviate from chords): {max_dev}"
+        );
+    }
+
+    /// R3: BOTH modes paint from the identical data pipeline: same
+    /// meter, same frame budget — the points bar top of every loud cell
+    /// and the line curve's knot of that cell sit on the SAME y the
+    /// shared `disp_db` projection implies, and the bar color IS the
+    /// shared spec_color rule (so neither mode can quietly re-read a
+    /// different vector).
+    #[test]
+    fn v163_both_modes_same_data() {
+        let npts = crate::meter::DISPLAY_POINTS;
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(400.0, 140.0));
+        let mm = v163_two_tone_meter();
+        let ctx = egui::Context::default();
+        // RawInput is not Copy — mint one per pass.
+        let mk_raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        // POINTS pass: collect bar TOP corner y's per shared cell edge
+        // (skip the txt-grey axis labels and the pale peak caps by
+        // colour; skip bottom corners by y). NOTE: bar edges are SHARED
+        // — cell c-1's right top corner sits at cell c's left edge to
+        // the exact bit (sw = 25/64 is binary-exact), so each edge
+        // legitimately carries TWO bar tops: cell c-1's and cell c's.
+        // Rigor = the recorded set must be exactly that pair (no third
+        // source) and must CONTAIN this cell's own top.
+        let mut out_p = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(&mm), rect, false));
+        let sw = rect.width() / npts as f32;
+        let mut bar_ys: Vec<Vec<f32>> = vec![Vec::new(); npts];
+        for cs in &out_p.shapes {
+            if let egui::epaint::Shape::Mesh(m) = &cs.shape {
+                for v in &m.vertices {
+                    let (r0, g0, b0, a0) = v.color.to_tuple();
+                    // Skip: pale peak caps, axis-label text, panel bg.
+                    // (Bar colors come from spec_color — never gray —
+                    // so these skips cannot eat the trace.)
+                    let gray = (r0 as i16 - g0 as i16).abs() <= 6
+                        && (g0 as i16 - b0 as i16).abs() <= 6
+                        && r0 >= 200;
+                    if a0 <= 100 || gray || (r0 == 120 && g0 == 120 && b0 == 128) || (r0 == 24 && g0 == 24 && b0 == 29)
+                        || v.pos.y > rect.max.y - 0.5
+                    {
+                        continue;
+                    }
+                    let c = ((v.pos.x - rect.min.x) / sw).floor() as i64;
+                    if c < 0 || c >= npts as i64 {
+                        continue;
+                    }
+                    // Corner exactly on a cell boundary (left edge of c).
+                    let left_edge = rect.min.x + c as f32 * sw;
+                    if (v.pos.x - left_edge).abs() > 0.05 {
+                        continue;
+                    }
+                    bar_ys[c as usize].push(v.pos.y);
+                }
+            }
+        }
+        out_p.textures_delta.clear();
+        // LINE pass on the SAME mm (paint only READS — one pipeline).
+        let mut out_l = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(&mm), rect, true));
+        let mut trace: Vec<[[f32; 2]; 4]> = Vec::new();
+        for cs in &out_l.shapes {
+            if let egui::epaint::Shape::CubicBezier(cb) = &cs.shape {
+                if (cb.stroke.width - 1.6).abs() < 1e-6 {
+                    trace.push(cb.points.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>().try_into().unwrap());
+                }
+            }
+        }
+        out_l.textures_delta.clear();
+        let yc = |db: f32| rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height();
+        let mut probed = 0usize;
+        for c in 0..npts {
+            if mm.disp_db[c] < -100.0 {
+                continue;
+            }
+            let want = yc(mm.disp_db[c]);
+            let ys = &bar_ys[c];
+            assert!(
+                ys.iter().any(|y| (y - want).abs() < 0.01),
+                "points bar top must be y_of(disp_db[{c}]): {ys:?} must contain {want}"
+            );
+            // Rigor: every y on this edge is this cell's top or the left
+            // neighbour's — a third source (stale/foreign mesh) fails.
+            let prev = if c > 0 { yc(mm.disp_db[c - 1]) } else { want };
+            assert!(
+                ys.iter().all(|y| (y - want).abs() < 0.01 || (y - prev).abs() < 0.01),
+                "cell edge {c} carries only neighbour bar tops: {ys:?} vs {want}/{prev}"
+            );
+            if c < npts - 1 {
+                let knot = trace[c][0];
+                assert!(
+                    (knot[1] - want).abs() < 0.01,
+                    "line knot at cell {c} must ride the SAME y: {} vs {want}",
+                    knot[1]
+                );
+            }
+            probed += 1;
+        }
+        assert!(probed >= 3, "two-tone fixture painted enough loud cells: {probed}");
+    }
+
+    /// R4 (source scan): the whole paint path — grid, both trace
+    /// painters, and the shared Catmull-Rom core — stays allocation-free
+    /// per frame (scratch lives in MasterMeter, labels are const strs).
+    /// Plus the seams audit: set_spectrum_line has EXACTLY the inline
+    /// pair + the settings row as callers, and only seam/reload write
+    /// the flag.
+    #[test]
+    fn v163_paint_path_never_allocates() {
+        let src = include_str!("ui.rs");
+        let cut = src.find("\nmod tests").expect("column-0 tests boundary");
+        let prod = &src[..cut];
+        let grab = |a: &str, b: &str| -> String {
+            let i = prod.find(a).unwrap_or_else(|| panic!("anchor a {a:?}"));
+            let j = i + prod[i..].find(b).unwrap_or_else(|| panic!("anchor b {b:?}")).max(1);
+            prod[i..j].to_string()
+        };
+        let bodies = [
+            grab("fn paint_spectrum(", "fn spec_color("),
+            grab("fn paint_trace_points(", "/// v163 (card t_5cf0f288) LINE mode"),
+            grab("fn paint_trace_line(", "/// v163: stroke one Catmull-Rom"),
+            grab("fn bezier_curve(", "\n// v44 R4:"),
+        ];
+        for (idx, body) in bodies.iter().enumerate() {
+            for needle in ["vec![", "Vec::new", "to_vec", ".collect(", "format!(", "to_string"] {
+                assert!(!body.contains(needle), "paint body #{idx} allocates: found {needle}");
+            }
+        }
+        let ps = &bodies[0];
+        assert!(
+            ps.contains("&m.disp_db")
+                && ps.contains("paint_trace_line(p")
+                && ps.contains("paint_trace_points(p"),
+            "dispatch must paint BOTH modes from the shared projection"
+        );
+        assert_eq!(
+            prod.matches("ms.refresh_display(2.5);").count(),
+            1,
+            "the pump drives the one projection call"
+        );
+        assert!(
+            !prod.contains("ms.spectrum.refresh(2.5);"),
+            "stale per-frame spectrum.refresh must not come back"
+        );
+        // meter.rs warm path: refresh_display is pure calls into
+        // capacity-keeping resample_log.
+        let msrc = include_str!("meter.rs");
+        let i = msrc.find("pub fn refresh_display(").expect("refresh_display");
+        let j = i + msrc[i..].find("\n    /// Feed a drained").expect("method end");
+        let rd = &msrc[i..j];
+        for needle in ["vec![", "Vec::new", "to_vec", ".collect(", "format!(", "to_string"] {
+            assert!(!rd.contains(needle), "refresh_display allocates: {needle}");
+        }
+        // Seam audit: exactly 3 callers (inline points, inline line,
+        // settings) and exactly 2 raw writes (seam + hot-reload apply).
+        assert_eq!(
+            prod.matches("set_spectrum_line(").count()
+                - prod.matches("fn set_spectrum_line(").count(),
+            3,
+            "inline pair + settings row are the ONLY callers"
+        );
+        assert_eq!(
+            prod.matches(".spectrum_line = ").count(),
+            2,
+            "only the seam and the reload-apply write the flag"
+        );
+    }
+
+    /// R5 + R6: the MASTER OUT panel carries the inline "points | line"
+    /// word pair; clicking it flips the ONE seam (state + persistence +
+    /// echo), and the SETTINGS checkbox — sharing that seam — reflects
+    /// the change (toggling it back proves there is one state, not two).
+    /// Both affordances hover-explain (goal 1).
+    #[test]
+    fn v163_inline_toggle_flips_seam() {
+        let mut app = headless_app("v163inl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = true;
+        // dyn_reg is LAZY: the slot registers only once a frame draws
+        // the open master (v49 pattern) — read it after, not before.
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mi =
+            app.dyn_wins.iter().position(|w| w.kind == DynKind::Master).expect("master registered");
+        let mwin = 4 + mi;
+        app.side_wins.dock[0] = [1, 1, 1];
+        app.dyn_wins[mi].dock = [1, 1, 2];
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.dock_rects[mwin][3] > 0.0, "master docked and sized");
+        let p_line = label_center(&mut app, &ctx, "line").expect("inline line word paints");
+        let p_pts = label_center(&mut app, &ctx, "points").expect("inline points word paints");
+        // Goal 1: the inline affordances explain themselves.
+        let tips = hover_until_tip(&mut app, &ctx, p_line, &["continuous smooth curve"]);
+        assert!(
+            tips.iter().any(|t| t.contains("continuous smooth curve")),
+            "inline line word must hover-explain"
+        );
+        let tips = hover_until_tip(&mut app, &ctx, p_pts, &["separate points"]);
+        assert!(
+            tips.iter().any(|t| t.contains("separate points")),
+            "inline points word must hover-explain"
+        );
+        // Flip ON inline.
+        click_pt(&mut app, &ctx, p_line);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.spectrum_line, "inline word flips line mode");
+        assert!(
+            app.status.contains("spectrum trace: smooth line"),
+            "inline flip must echo: {}",
+            app.status
+        );
+        // SETTINGS (same seam) reflects + can flip back: one state.
+        app.show_settings = true;
+        frame(&mut app, &ctx, vec![]);
+        let p_row = label_center(&mut app, &ctx, "smooth spectrum line")
+            .expect("settings row present while inline is ON");
+        click_pt(&mut app, &ctx, p_row);
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.spectrum_line, "settings row acts on the SAME state");
+        assert!(app.status.contains("spectrum trace: points"), "echo: {}", app.status);
+        // Back ON through the seam, reload — persistence via the INLINE
+        // entry point too (either entry point persists identically).
+        click_pt(&mut app, &ctx, p_line);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.spectrum_line, "inline word flips line mode again");
+        let b = App::new(Backend::start());
+        assert!(b.spectrum_line, "the inline flip persisted");
     }
 
     /// Polarity B: re-pumping at the SAME rate must not churn the meter

@@ -98,6 +98,7 @@ pub const LIVE: &[&str] = &[
     "drum",
     "show_drums",
     "show_master",
+    "spectrum_line",
     "sc_send",
     "sc_recv_gain",
     "editor_probe",

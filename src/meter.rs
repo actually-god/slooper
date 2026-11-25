@@ -594,6 +594,16 @@ pub struct MasterMeter {
     /// the UI compares this against the live backend rate and REPLACES
     /// the meter when they differ (live reconnect / hot-swap).
     pub sr: u32,
+    /// v163 (card t_5cf0f288): the equal-per-octave DISPLAY projection
+    /// (`Spectrum::resample_log` onto `DISPLAY_POINTS` cells), computed
+    /// ONCE per UI frame by [`MasterMeter::refresh_display`] and read by
+    /// BOTH spectrum trace modes — so the modes paint from one identical
+    /// data source and the paint path allocates nothing (the old
+    /// per-frame scratch vecs lived in `paint_spectrum` itself).
+    /// Empty until the first refresh_display call.
+    pub disp_db: Vec<f32>,
+    /// v163: peak-hold companion of [`disp_db`](Self::disp_db).
+    pub disp_pk: Vec<f32>,
 }
 
 impl MasterMeter {
@@ -608,7 +618,24 @@ impl MasterMeter {
             clip: false,
             frames_fed: 0,
             sr,
+            disp_db: Vec::new(),
+            disp_pk: Vec::new(),
         }
+    }
+
+    /// v163: the UI pump's per-frame display update — refresh the bin
+    /// magnitudes AND project them onto the equal-per-octave display
+    /// grid that BOTH trace modes paint from. Allocation-free on the
+    /// warm path (resample_log keeps the two vectors' capacities).
+    pub fn refresh_display(&mut self, decay_db: f32) {
+        self.spectrum.refresh(decay_db);
+        self.spectrum.resample_log(
+            DISPLAY_POINTS,
+            SPEC_F_MIN,
+            SPEC_F_MAX,
+            &mut self.disp_db,
+            &mut self.disp_pk,
+        );
     }
 
     /// Feed a drained interleaved stereo chunk (any length).
