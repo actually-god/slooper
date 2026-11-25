@@ -63549,7 +63549,8 @@ mod tests {
         let rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(400.0, 140.0));
         let mm = v163_two_tone_meter();
         let ctx = egui::Context::default();
-        let raw = egui::RawInput {
+        // RawInput is not Copy — mint one per pass.
+        let mk_raw = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1440.0, 853.0),
@@ -63560,7 +63561,7 @@ mod tests {
         // POINTS pass: collect bar TOP corners (skip the txt-grey axis
         // labels and the pale peak caps by colour; skip bottom corners
         // by y). Left corners only: cell corners sit sw apart.
-        let mut out_p = ctx.run_ui(raw, |ui| paint_spectrum(ui, Some(&mm), rect, false));
+        let mut out_p = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(&mm), rect, false));
         let sw = rect.width() / npts as f32;
         let mut bar_tops: Vec<Option<f32>> = vec![None; npts];
         for cs in &out_p.shapes {
@@ -63591,7 +63592,7 @@ mod tests {
         }
         out_p.textures_delta.clear();
         // LINE pass on the SAME mm (paint only READS — one pipeline).
-        let mut out_l = ctx.run_ui(raw, |ui| paint_spectrum(ui, Some(&mm), rect, true));
+        let mut out_l = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(&mm), rect, true));
         let mut trace: Vec<[[f32; 2]; 4]> = Vec::new();
         for cs in &out_l.shapes {
             if let egui::epaint::Shape::CubicBezier(cb) = &cs.shape {

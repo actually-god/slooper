@@ -6,6 +6,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ## [Unreleased]
 
+### Added
+
+- **The master spectrum can draw as one smooth line.** A
+  "smooth spectrum line" toggle in SETTINGS — plus `points` / `line`
+  words right above the panel in MASTER OUT — switches the trace from
+  separate points to ONE continuous curve (Catmull-Rom through the
+  same points, peak hold included; no polyline kinks). Both modes read
+  one shared display pipeline; the choice is remembered across
+  restarts, and points stay the default.
+
 ### Changed
 
 - **The master spectrum reads evenly now.** The analyzer window doubled
