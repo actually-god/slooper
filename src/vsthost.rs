@@ -6355,6 +6355,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// t_e8e831b2 docs-drift pin: the scan-folder lists in docs/PLUGINS.md
+    /// mirror the hard-coded defaults in `default_vst_dirs()` /
+    /// `windows_vst_dirs()`. Change a default folder or the
+    /// VST_PATH/CLAP_PATH contract here and this pin fails — update the
+    /// doc in the same PR (docs-drift doctrine, t_4910331d). Pure file
+    /// read: no env, no scan, no dlopen — quick tier, same verdict on
+    /// both OSes (the doc is one language).
+    #[test]
+    fn docs_plugins_md_covers_scan_folder_table() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/PLUGINS.md"
+        ))
+        .expect("docs/PLUGINS.md readable from a test");
+        for needle in [
+            // Linux VST defaults (Installing plugins section). The
+            // trailing-backtick needles keep `~/.vst` from being
+            // substring-satisfied by `~/.vst3`.
+            "`~/.vst`",
+            "`~/.vst3`",
+            "/usr/lib/vst",
+            "/usr/local/lib/vst",
+            "$VST_PATH",
+            // Linux CLAP defaults (CLAP plugins section).
+            "`~/.clap`",
+            "/usr/lib/clap",
+            "/usr/local/lib/clap",
+            "$CLAP_PATH",
+            // Windows CLAP SDK dirs (native scan section).
+            "%COMMONPROGRAMFILES%\\CLAP",
+            "%LOCALAPPDATA%\\CLAP",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "PLUGINS.md no longer documents {needle:?} — \
+                 update the scan-folder lists with the code change"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn w6_windows_yabridge_heuristics_inert() {

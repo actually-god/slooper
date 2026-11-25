@@ -2,7 +2,7 @@
 
 Slooper hosts two kinds of plugin: **scripted synth plugins** (plain Rust
 files in `synths/`, compiled on first load into `~/.local/share/slooper/synths`)
-and **binary VST2/VST3 plugins** loaded from `vst_dirs`.
+and **binary VST2/VST3/CLAP plugins** loaded from the scan folders.
 
 ## VST loading
 
@@ -74,6 +74,68 @@ scanned, in order:
 Editors are real Win32 child/top-level windows — dock-into-slooper,
 detach, DPI behaviour and the editor crash guard work as documented in
 [INSTALL.md](INSTALL.md)'s Windows smoke checklist (items 5–8).
+
+## Scripted synths
+
+The other half of the plugin system: a synth is one plain Rust file.
+On first run slooper seeds `~/.local/share/slooper/synths` with the ABI
+contract file (`synth_api.rs`) and the bundled scripts (`piano.rs`,
+`drums.rs`, `pad.rs`, `tri_osc.rs`, `fm.rs`, `pluck.rs`, `granular.rs`,
+`additive.rs`, `sampler.rs`); stock copies update in place on app
+updates (the overwritten copy keeps a `.bak`), files you name yourself
+are never touched. Each new or changed file is compiled with rustc on
+load — custom synths, like custom effects, need rustc installed.
+
+To write one: copy a bundled script in that folder, rename it, edit.
+Your script `include!`s `synth_api.rs` and implements the entry points;
+the bundled `piano.rs` / `sampler.rs` are the reference
+implementations. The realtime rule is the effect rule — the render
+callback must stay allocation-free. Step-by-step: the wiki's
+[Writing Plugins](https://github.com/actually-god/slooper/wiki/Writing-Plugins)
+page; the effect-script twin of this guide is
+[EFFECT-SUITE.md](EFFECT-SUITE.md).
+
+## CLAP plugins
+
+`.clap` files are scanned like everything else — no separate setup.
+Linux scan folders: `~/.clap`, `/usr/lib/clap`, `/usr/local/lib/clap`,
+plus anything in `$CLAP_PATH` (`:`-separated list). Windows scans the
+SDK folders `%COMMONPROGRAMFILES%\CLAP` and `%LOCALAPPDATA%\CLAP`, and
+there `CLAP_PATH` is `;`-separated (see the Windows section above). A
+`.clap` file may contain several plugins; each is its own picker entry,
+and a binding id carries the plugin id: `clap:/path/to/file.clap#com.vendor.plug`.
+
+- **Instrument or effect is the plugin's own declaration**: anything
+  advertising `instrument` / `note-effect` can bind to a track's synth
+  slot and is played by that track's MIDI clips; the rest load into
+  effect chains beside VSTs and scripted effects.
+- **The editor is the automatic parameter sliders.** CLAP's GUI
+  extension wants a native window per plugin instead of VST's
+  reparenting, and slooper does not host those windows — the slider
+  window works like the editor of a GUI-less VST3 instrument, live in
+  both directions.
+- **Presets:** the CLAP v1 ABI has no factory program list. When a
+  plugin loads a preset on its own (from its internal browser), slooper
+  notices and persists the plugin-side state with the project; the
+  parameters window also offers **load preset…** — a file picker that
+  commands the plugin to load a preset file.
+
+## Presets
+
+Two preset worlds:
+
+- **Scripted effects** share **one JSON file format** — flat files in
+  `<effects folder>/user presets/` named `{plugin stem}-{preset name}.json`,
+  values in each parameter's native units. The built-in presets are
+  ordinary files in that folder (delete its `.factory-seeded` marker to
+  bring back factory presets you deleted); hand-written files appear in
+  the plugin's list with no restart. The full format spec, load
+  semantics and recovery flow are user reference, so they live in
+  [USAGE.md → Presets](USAGE.md#presets).
+- **Binary plugins** keep their patches in the project file: VST2/VST3
+  program picks re-apply on load (the program picker lists the
+  plugin's own factory programs), and CLAP behaves as in the section
+  above.
 
 ## v19.1 Wine bridge guard: a dead Wine can no longer kill the app
 

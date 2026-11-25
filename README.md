@@ -133,9 +133,9 @@ troubleshooting: **[docs/INSTALL.md](docs/INSTALL.md)**.
 | Doc | Contents |
 | --- | --- |
 | [docs/INSTALL.md](docs/INSTALL.md) | install & audio-server setup, Linux + Windows |
-| [docs/USAGE.md](docs/USAGE.md) | walkthrough + reference: recording, piano roll, quantize, shortcuts, MIDI control |
+| [docs/USAGE.md](docs/USAGE.md) | walkthrough + reference: recording, piano roll, quantize, shortcuts, MIDI control, effect presets |
 | [docs/MCP.md](docs/MCP.md) | driving slooper from an AI agent over MCP — enable flow, token, bridge, tool reference |
-| [docs/PLUGINS.md](docs/PLUGINS.md) | scripted synths, VST/CLAP hosting, presets |
+| [docs/PLUGINS.md](docs/PLUGINS.md) | binary plugin hosting (VST2/VST3/CLAP): scan folders, editors, plugin patches; scripted-synth authoring |
 | [docs/EFFECT-SUITE.md](docs/EFFECT-SUITE.md) | the 23 bundled effects, and writing your own |
 | [docs/SIDECHAIN.md](docs/SIDECHAIN.md) | sidechain routing |
 | [docs/SAMPLER-PITCH.md](docs/SAMPLER-PITCH.md) | per-note pitch curves — the drawn-on-note interaction and engine design |
