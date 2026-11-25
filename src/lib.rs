@@ -45,6 +45,8 @@ pub mod quantize;
 pub mod sample_edit;
 pub mod samples808;
 pub mod synth;
+/// v164: arbitrary N-EDO tuning (single primitive + live atomics).
+pub mod tune;
 /// The synth-script ABI contract. v149 single-source policy: the ONE copy
 /// lives in synths/ (the same file include_str!'d into the binary and seeded
 /// into user folders) — do not move it back to a src/ twin.
