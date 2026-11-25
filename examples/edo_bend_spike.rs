@@ -65,17 +65,17 @@ fn run_case(
         all.extend_from_slice(&out);
     }
     let mut ev: Vec<(usize, [u8; 3])> = Vec::new();
-    if let Some(v) = pre_bend {
-        ev.push((0, [0xE0, (v & 0x7F) as u8, (v >> 7) as u8]));
-    }
+    // Normalize the wheel state a PREVIOUS case may have left parked:
+    // send center (8192) when this case has no pre-bend, so `control` and
+    // `post_bend` start from the wheel's zero, not the last case's value.
+    let pre = pre_bend.unwrap_or(8192);
+    ev.push((0, [0xE0, (pre & 0x7F) as u8, (pre >> 7) as u8]));
     ev.push((8, [0x90, note, 110]));
     let n_blocks = 48;
     for b in 0..n_blocks {
         ev.clear();
         if b == 0 {
-            if let Some(v) = pre_bend {
-                ev.push((0, [0xE0, (v & 0x7F) as u8, (v >> 7) as u8]));
-            }
+            ev.push((0, [0xE0, (pre & 0x7F) as u8, (pre >> 7) as u8]));
             ev.push((8, [0x90, note, 110]));
         }
         if let Some((v, at)) = post_bend {
@@ -86,14 +86,20 @@ fn run_case(
         entry.process_with_midi(&sil, &mut out, &ev);
         all.extend_from_slice(&out);
     }
-    // Measure L channel.
+    // Measure L channel. TWO windows: early (right after onset+latency —
+    // catches PRE-note latching) and tail (last third — catches glide that
+    // arrives after onset). A pre-latched case reads equal early+tail.
     let l: Vec<f32> = all.chunks(2).map(|c| c[0]).collect();
-    let hz = zc_hz(&l, 0.25);
+    let early = zc_hz(&l, 0.25);
+    let tstart = 0.25 + (l.len() as f64 / SR - 0.25) * 0.66;
+    let l2: Vec<f32> = l[(tstart * SR) as usize..].to_vec();
+    let tail = zc_hz(&l2, 0.0);
     let peak = l.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    match hz {
-        Some(h) => println!("DIAG {name}: hz={h:.2} peak_dbfs={:.1}", 20.0 * peak.log10()),
-        None => println!("DIAG {name}: SILENT peak_dbfs={:.1}", 20.0 * (peak.max(1e-12)).log10()),
-    }
+    let f = |h: Option<f64>| match h {
+        Some(h) => format!("{h:.2}"),
+        None => "SILENT".to_string(),
+    };
+    println!("DIAG {name}: early_hz={} tail_hz={} peak_dbfs={:.1}", f(early), f(tail), 20.0 * peak.max(1e-12).log10());
     std::thread::sleep(std::time::Duration::from_millis(120));
 }
 
@@ -133,14 +139,25 @@ fn main() {
         std::process::exit(2);
     };
     entry.set_bend_range(range);
-    // raw for +cents at the announced range: full wheel = ±range st.
-    let raw = (8192.0 + cents / range as f64 * 8191.0).round() as u16;
-    let raw_neg = (8192.0 - cents / range as f64 * 8191.0).round() as u16;
-    println!("SPIKE {path:?} cents={cents} range={range} note={note} expect_ratio={:.5}", 2f64.powf(cents / 1200.0));
+    // ROLL-SPACE law (midipat ±12 st full scale): the vsthost queue()
+    // choke point rescales this into the announced ±range channel scale,
+    // exactly like every real engine feed. (The first spike version
+    // pre-divided by `range` here — double scaling + u16 wrap = garbage.)
+    let st = cents / 100.0;
+    let raw = slooper::midipat::st_to_bend(st as f32);
+    let raw_neg = slooper::midipat::st_to_bend(-st as f32);
+    println!(
+        "SPIKE {path:?} cents={cents} range={range} note={note} raw={raw} raw_neg={raw_neg} expect_ratio={:.5}",
+        2f64.powf(cents / 1200.0)
+    );
+    println!("DIAG entry bend_range={} drops_before={}", entry.bend_range(), entry.midi_drops());
     run_case(entry, "control", note, None, None);
+    println!("DIAG drops_after_control={}", entry.midi_drops());
     run_case(entry, "pre_bend", note, Some(raw), None);
+    println!("DIAG drops_after_pre_bend={}", entry.midi_drops());
     run_case(entry, "pre_bend_neg", note, Some(raw_neg), None);
     run_case(entry, "post_bend", note, None, Some((raw, 4)));
+    println!("DIAG drops_final={}", entry.midi_drops());
     entry.all_notes_off();
     std::mem::forget(entry_arc.clone());
     println!("SPIKE DONE");
