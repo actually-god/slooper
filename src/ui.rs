@@ -9873,10 +9873,16 @@ impl App {
                 // App::set_spectrum_line, so state/save/echo cannot
                 // drift between the two affordances).
                 ui.vertical(|ui| {
+                    let y0 = ui.cursor().min.y;
                     self.spec_trace_row(ui);
-                    // v49 R2: fill the room the panel got (the row above
-                    // took its slice from available_height already).
-                    let h = ui.available_height().max(60.0).max(meter_h);
+                    let row_h = ui.cursor().min.y - y0;
+                    // v49 R2 trap (kept from main): INSIDE the horizontal
+                    // row available_height() COLLAPSES to the tallest
+                    // control column — the panel height comes from body_h,
+                    // measured BEFORE the row. Subtract only the row's
+                    // consumed height so the panel still GROWS with the
+                    // dock 1:1 (v49 pin) without overflowing the floor.
+                    let h = (body_h - row_h).max(meter_h).max(60.0);
                     let (r2, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width().max(150.0), h),
                         Sense::hover(),
