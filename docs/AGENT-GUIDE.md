@@ -424,6 +424,11 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
    de-brand batches, style fixes, or "conciseness" passes (the conciseness
    doctrine does not apply inside the block). If a docs change would otherwise
    touch it, leave the block byte-identical and put the diff anywhere else.
+   Enforced in CI by pin `readme::tests::v159_readme_human_header_immutable`
+   (`src/readme.rs` + golden copy `src/readme_human_header.golden.md`): an
+   edit, move, or duplicated fence turns the suite red. If the pin is ever
+   red, revert the block — never regenerate the golden without maintainer
+   sign-off.
 12. **Chrome colors come from `kit.rs`** (v54): the accent/edge/text tokens
    are the single authority — never hand-write an accent RGB in a painter
    (the ~20 chrome paint sites once drifted into two near-identical blues).

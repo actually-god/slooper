@@ -229,6 +229,16 @@ throughout.
   (`v144_*`) un-comments the skeleton, compiles it and loads it through
   the real effect loader, so the skeleton cannot quietly drift stale the
   way the v1-only docs did.
+- **The AGENT-LOCKED README header now has a CI tripwire (v159).** The
+  maintainer's hand-written block at the top of `README.md` (AGENT-GUIDE
+  invariant #11) used to enforce nothing: an agent that "polished" it
+  could merge silently. A quick-tier pin
+  (`readme::tests::v159_readme_human_header_immutable`) now asserts the
+  block starts at README offset 0, carries its two fence markers exactly
+  once, and matches a committed golden copy byte-for-byte — any edit,
+  reword, move, or duplicated marker turns CI red. Sabotage-proven on
+  both polarities (content edit, duplicated marker, shifted block,
+  swapped fences). (t_b0616ef0)
 
 ### Fixed
 

@@ -141,6 +141,11 @@ pub fn test_real_home() -> String {
     .clone()
 }
 
+/// Doc-lock for the AGENT-LOCKED README human header (v159, t_b0616ef0):
+/// the block must stay byte-identical to its committed golden copy.
+#[cfg(test)]
+mod readme;
+
 /// Repo-hygiene pins (vNN series). These walk the checkout on disk — keep
 /// them cheap: bounded dirs, nothing inside `target/` or `.git/`.
 #[cfg(test)]
