@@ -25505,8 +25505,9 @@ fn paint_stereo_meters(
 fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rect: egui::Rect) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, Color32::from_rgb(24, 24, 29));
+    let (f_min, f_max) = (crate::meter::SPEC_F_MIN, crate::meter::SPEC_F_MAX);
     let x_of = |f: f32| -> f32 {
-        rect.min.x + (f.ln() - 30.0f32.ln()) / (20000.0f32 / 30.0).ln() * rect.width()
+        rect.min.x + (f.ln() - f_min.ln()) / (f_max / f_min).ln() * rect.width()
     };
     let y_of = |db: f32| -> f32 { rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height() };
     let grid = Color32::from_rgb(58, 58, 66);
@@ -25566,34 +25567,28 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
         }
         Some(m) => {
             let sp = &m.spectrum;
-            let ncols = (rect.width() as usize).max(1);
-            let mut coldb: Vec<f32> = vec![-240.0; ncols];
-            let mut colpk: Vec<f32> = vec![-240.0; ncols];
-            for bin in 1..sp.n_bins() {
-                let f = sp.bin_hz(bin);
-                if f < 30.0 || f > 20000.0 {
-                    continue;
-                }
-                let x = x_of(f);
-                if x < rect.min.x || x >= rect.max.x {
-                    continue;
-                }
-                let c = ((x - rect.min.x) as usize).min(ncols - 1);
-                let db = sp.db[bin].max(-120.0);
-                if db > coldb[c] {
-                    coldb[c] = db;
-                }
-                let pk = sp.peak_db[bin].max(-120.0);
-                if pk > colpk[c] {
-                    colpk[c] = pk;
-                }
-            }
+            // v162 R2/R3: equal-per-octave display. The 8192 analyzer
+            // bins are projected by `Spectrum::resample_log` onto
+            // DISPLAY_POINTS log-spaced cells; because the axis is log,
+            // every cell occupies EXACTLY rect.width()/npts px, so the
+            // displayed points are uniformly spread across the whole
+            // sweep (pre-v162 bins sat at linear-Hz x positions: crowded
+            // in the high band, sparse in the low band). Full-resolution
+            // data stays behind the mapping (max-hold per cell +
+            // nearest-bin fallback — see resample_log's doc).
+            let npts = crate::meter::DISPLAY_POINTS;
+            let mut coldb: Vec<f32> = vec![-240.0; npts];
+            let mut colpk: Vec<f32> = vec![-240.0; npts];
+            sp.resample_log(npts, f_min, f_max, &mut coldb, &mut colpk);
             let mut mesh = egui::epaint::Mesh::default();
-            for (c, &db) in coldb.iter().enumerate() {
+            let slot_w = rect.width() / npts as f32;
+            for c in 0..npts {
+                let db = coldb[c];
                 if db < -118.0 {
                     continue;
                 }
-                let x = rect.min.x + c as f32;
+                let x = rect.min.x + c as f32 * slot_w;
+                let x1 = rect.min.x + (c + 1) as f32 * slot_w;
                 let t = ((db + 120.0) / 120.0).clamp(0.0, 1.0);
                 let (a, b, tc) = if t < 0.5 {
                     ((46.0, 130.0, 120.0), (70.0, 220.0, 200.0), t * 2.0)
@@ -25607,7 +25602,7 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
                 );
                 let y = y_of(db);
                 mesh.add_colored_rect(
-                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + 1.0, rect.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x1, rect.max.y)),
                     colr,
                 );
                 let pk = colpk[c];
@@ -25617,7 +25612,7 @@ fn paint_spectrum(ui: &mut egui::Ui, ms: Option<&crate::meter::MasterMeter>, rec
                         mesh.add_colored_rect(
                             egui::Rect::from_min_max(
                                 egui::pos2(x, yc - 1.2),
-                                egui::pos2(x + 1.0, yc),
+                                egui::pos2(x1, yc),
                             ),
                             Color32::from_rgb(220, 220, 220),
                         );
@@ -63126,7 +63121,7 @@ mod tests {
                 .expect("first known rate creates the meter");
             assert_eq!(ms.sr, 48_000, "meter must record its construction rate");
             assert!(
-                (ms.spectrum.bin_hz(1) - 48_000.0 / 8192.0).abs() < 1e-3,
+                (ms.spectrum.bin_hz(1) - 48_000.0 / crate::meter::FFT_WINDOW as f32).abs() < 1e-3,
                 "spectrum axis must derive from the construction rate: {}",
                 ms.spectrum.bin_hz(1)
             );
@@ -63142,10 +63137,81 @@ mod tests {
         assert_eq!(ms.frames_fed, 0, "replaced meter is a FRESH instance");
         assert!(!ms.clip, "stale clip latch must not survive the replace");
         assert!(
-            (ms.spectrum.bin_hz(1) - 44_100.0 / 8192.0).abs() < 1e-3,
+            (ms.spectrum.bin_hz(1) - 44_100.0 / crate::meter::FFT_WINDOW as f32).abs() < 1e-3,
             "spectrum axis must relabel at the new rate: {}",
             ms.spectrum.bin_hz(1)
         );
+    }
+
+    /// v162 (card t_7b6ab154) paint pin: a sine fed through the real
+    /// `MasterMeter` must make the spectrum mesh draw its trace at the
+    /// log-x position of that frequency. Drives the actual
+    /// `paint_spectrum` viewer and reads mesh vertices — the loudest
+    /// rect's top row identifies the tone column (axis-label text is
+    /// filtered out by its `txt` colour). Low AND high tone: the
+    /// resampled grid's cell index maps 1:1 onto a uniform x slot, so a
+    /// mis-mapped sweep lands these asserts outside ±12 px.
+    #[test]
+    fn v162_spectrum_paints_tone_at_log_x() {
+        use crate::meter::{MasterMeter, FFT_WINDOW, SPEC_F_MAX, SPEC_F_MIN};
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(400.0, 140.0));
+        let ln_span = (SPEC_F_MAX / SPEC_F_MIN).ln();
+        let x_want = |f: f32| 400.0 * (f / SPEC_F_MIN).ln() / ln_span;
+        for freq in [100.0f32, 8_000.0] {
+            let mut mm = MasterMeter::new(48_000);
+            let mut buf: Vec<f32> = Vec::with_capacity(FFT_WINDOW * 2);
+            for i in 0..FFT_WINDOW {
+                let v = 0.1 * (2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0).sin();
+                buf.push(v);
+                buf.push(v);
+            }
+            mm.feed(&buf);
+            mm.spectrum.refresh(0.0);
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| paint_spectrum(ui, Some(&mm), rect));
+            let mut tops: Vec<(f32, f32)> = Vec::new();
+            for cs in &out.shapes {
+                if let egui::epaint::Shape::Mesh(m) = &cs.shape {
+                    for v in &m.vertices {
+                        let (r0, g0, b0, a0) = v.color.to_tuple();
+                        // Axis/label text sits at the txt colour (120,120,128);
+                        // the trace gradient and peak caps are far from it.
+                        if a0 > 100
+                            && (r0 as i16 - 120).abs() <= 12
+                            && (g0 as i16 - 120).abs() <= 12
+                            && (b0 as i16 - 128).abs() <= 12
+                        {
+                            continue;
+                        }
+                        tops.push((v.pos.x, v.pos.y));
+                    }
+                }
+            }
+            let Some(&(_, min_y)) = tops.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+                panic!("spectrum painted no trace for {freq} Hz");
+            };
+            let band: Vec<f32> = tops
+                .iter()
+                .filter(|(_, y)| *y < min_y + 3.0)
+                .map(|(x, _)| *x)
+                .collect();
+            let lo = band.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = band.iter().cloned().fold(f32::MIN, f32::max);
+            let want = x_want(freq);
+            assert!(
+                lo > want - 12.0 && hi < want + 12.0,
+                "{freq} Hz trace x [{lo:.1},{hi:.1}] want ≈ {want:.1}"
+            );
+            out.textures_delta.clear();
+        }
     }
 
     /// Polarity B: re-pumping at the SAME rate must not churn the meter

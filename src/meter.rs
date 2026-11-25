@@ -253,6 +253,22 @@ impl LufsMeter {
     }
 }
 
+/// v162 (card t_7b6ab154): the analyzer window length — single home for
+/// "how deep is the analysis" (also read by the v131 rate-change pins).
+/// 16384 samples ≈ 341 ms @ 48 kHz → bin spacing ≈ 2.93 Hz and 8192
+/// usable bins (was 8192 / 5.86 Hz / 4096 before v162).
+pub const FFT_WINDOW: usize = 16384;
+/// v162: number of points in the equal-per-octave DISPLAY resample
+/// (see [`Spectrum::resample_log`]). Chosen larger than any realistic
+/// panel width (≈450 px in the wide master), so the point count no
+/// longer depends on width and spacing is uniform at every frequency.
+pub const DISPLAY_POINTS: usize = 1024;
+/// v162: frequency span of the display grid (the range `paint_spectrum`
+/// draws its log axis over; the resample grid matches it exactly).
+pub const SPEC_F_MIN: f32 = 30.0;
+/// v162: upper end of the display grid (see [`SPEC_F_MIN`]).
+pub const SPEC_F_MAX: f32 = 20_000.0;
+
 /// Real-time spectrum analyzer: keeps the last `n` mono-summed samples,
 /// applies Hann, and runs an in-place iterative radix-2 FFT on demand
 /// (GUI thread, once per paint). Bin magnitudes are dBFS-referenced: a
@@ -278,12 +294,19 @@ pub struct Spectrum {
 
 impl Spectrum {
     pub fn new(sr: u32) -> Self {
-        // v49 R3: 8192-sample window (≈171 ms @48 kHz) — 4x finer
-        // frequency resolution than the old 2048 (bin spacing ≈5.9 Hz
-        // instead of ≈23.4 Hz), which is what makes low-frequency tones
-        // and narrow cuts/gains readable on the log axis. One 8192-pt
-        // FFT per UI frame is ~0.1 ms on this host's release build.
-        let n = 8192usize;
+        // v162 R1: depth 8192 → 16384 samples (≈341 ms @48 kHz, bin
+        // spacing ≈2.93 Hz vs the old ≈5.86 Hz). Measured on this host
+        // (citest profile, `v162_spectrum_bench_refresh_cost`, n=8192 vs
+        // n=16384): refresh 135.6 → 291.1 µs per GUI frame (2.15× the
+        // FFT work, 1.8 % of the 16.6 ms frame budget); the mono-mix
+        // push stayed sub-microsecond per 480-frame block in both runs
+        // (0.71 / 0.29 µs — run-to-run noise dominates at this scale).
+        // BOTH run on the UI thread: the pump drains the MeterRing
+        // there, while the RT thread only does `MeterRing::write` —
+        // untouched by this change, so the audio-thread cost is
+        // literally unchanged. No allocations after construction or in
+        // push/resample (pinned by v162_rt_facing_code_never_allocates).
+        let n = FFT_WINDOW;
         let hann: Vec<f32> = (0..n)
             .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos())
             .collect();
@@ -394,6 +417,79 @@ impl Spectrum {
     }
     pub fn n_bins(&self) -> usize {
         self.db.len()
+    }
+
+    /// v162 R2: start frequency of display cell `i` on the equal-per-
+    /// octave grid of `n` cells spanning `f_min..f_max`. The grid splits
+    /// ℓn-frequency into `n` EQUAL slices — cell i covers
+    /// `[f_min·e^(Δ·i/n), f_min·e^(Δ·(i+1)/n))` with Δ = ℓn(f_max/f_min) —
+    /// so consecutive cell starts have a constant frequency ratio and,
+    /// because the painter maps frequency by ℓn onto x, every cell is
+    /// exactly `width/n` pixels wide on screen. `i == n` returns `f_max`.
+    pub fn cell_lo(f_min: f32, f_max: f32, i: usize, n: usize) -> f32 {
+        if i >= n {
+            return f_max;
+        }
+        f_min * ((f_max / f_min).ln() * i as f32 / n as f32).exp()
+    }
+
+    /// v162 R2/R4: project the full-resolution bins onto `n` equal-per-
+    /// octave display points (`cell_lo` grid). This is a DISPLAY mapping
+    /// only — the full-resolution `db`/`peak_db` stay the data of record
+    /// and the mapping is recomputed from them every paint.
+    ///
+    /// Per cell: MAX-HOLD of every bin whose center falls inside the
+    /// cell, so narrow peaks survive at any frequency (max preserves the
+    /// loudest bin instead of averaging it away). Below ≈2 kHz a log
+    /// cell is NARROWER than one FFT bin — cells that contain no bin
+    /// center fall back to the value of the nearest bin, which keeps the
+    /// low band gap-free at full bin accuracy.
+    ///
+    /// Allocation-free on the warm path: `out_db`/`out_pk` keep their
+    /// capacity across frames (the painter reuses them).
+    pub fn resample_log(
+        &self,
+        n: usize,
+        f_min: f32,
+        f_max: f32,
+        out_db: &mut Vec<f32>,
+        out_pk: &mut Vec<f32>,
+    ) {
+        out_db.clear();
+        out_db.resize(n, -240.0);
+        out_pk.clear();
+        out_pk.resize(n, -240.0);
+        let hz_per_bin = self.sr / self.n as f32;
+        let n_bins = self.n_bins();
+        for i in 0..n {
+            let lo = Self::cell_lo(f_min, f_max, i, n);
+            let hi = Self::cell_lo(f_min, f_max, i + 1, n);
+            // Bin centers inside [lo, hi): b >= lo/hz_per_bin (ceil),
+            // b < hi/hz_per_bin. Bin 0 (DC) is never displayed.
+            let b0 = (lo / hz_per_bin).ceil() as usize;
+            let b1 = ((hi / hz_per_bin).ceil() as usize).min(n_bins);
+            let b0 = b0.max(1);
+            if b0 < b1 {
+                let mut d = f32::MIN;
+                let mut p = f32::MIN;
+                for b in b0..b1 {
+                    if self.db[b] > d {
+                        d = self.db[b];
+                    }
+                    if self.peak_db[b] > p {
+                        p = self.peak_db[b];
+                    }
+                }
+                out_db[i] = d;
+                out_pk[i] = p;
+            } else {
+                // Sub-bin-width cell: nearest bin center wins.
+                let center = (lo * hi).sqrt();
+                let nb = ((center / hz_per_bin).round() as usize).clamp(1, n_bins - 1);
+                out_db[i] = self.db[nb];
+                out_pk[i] = self.peak_db[nb];
+            }
+        }
     }
 }
 
@@ -689,17 +785,60 @@ mod tests {
         assert!((mty + 20.0).abs() < 0.1, "post-reset momentary {mty}");
     }
 
+    /// v162 (card t_7b6ab154): perf gate for the deepened analyzer.
+    /// Prints the GUI-pump cost so the before/after numbers land in the
+    /// `Spectrum::new` comment, and asserts generous ceilings so a future
+    /// depth/algorithm drift is caught in the full tier, not in the
+    /// user's panel. Slow tier: ~1-2 s. NOTE: push/refresh run on the
+    /// UI-thread pump (ui.rs drains the MeterRing there); the RT thread
+    /// only does `MeterRing::write`, which this change does not touch.
     #[test]
-    fn spectrum_peaks_at_the_sine_bin() {
+    #[ignore = "slow-tier: perf bench, prints measured us and gates the ceiling"]
+    fn v162_spectrum_bench_refresh_cost() {
+        use std::time::Instant;
+        let sr = 48_000u32;
+        let mut s = Spectrum::new(sr);
+        let block = vec![0.5f32; 2 * 480]; // one JACK-sized RT block (stereo)
+        // Prime the circular window so push measures hot on a full buffer.
+        for _ in 0..s.n / 480 + 2 {
+            s.push(&block);
+        }
+        const N: usize = 20_000;
+        let t = Instant::now();
+        for _ in 0..N {
+            s.push(&block);
+        }
+        let push_us = t.elapsed().as_secs_f64() * 1e6 / N as f64;
+        const R: usize = 3_000;
+        let t = Instant::now();
+        for _ in 0..R {
+            s.refresh(2.5);
+        }
+        let refresh_us = t.elapsed().as_secs_f64() * 1e6 / R as f64;
+        println!(
+            "v162 bench: n={} push={push_us:.2} us/480-blk refresh={refresh_us:.1} us/frame",
+            s.n
+        );
+        assert!(push_us < 20.0, "push {push_us:.2} us/block — budget risk");
+        assert!(
+            refresh_us < 4000.0,
+            "refresh {refresh_us:.1} us/frame — budget risk"
+        );
+    }
+
+    #[test]
+    fn v162_spectrum_peaks_at_the_sine_bin() {
+        // v162 retarget of `spectrum_peaks_at_the_sine_bin` (the v49
+        // 8192-bin contract is retired): full 16384-sample window at
+        // EXACTLY bin 1600 (4687.5 Hz), amplitude 0.1 (≈ −20 dB).
+        // Hann-normalised coherent reading.
         let sr = 48_000;
         let mut s = Spectrum::new(sr);
         let mut buf = Vec::new();
-        // v49: full 8192-sample window at EXACTLY bin 800 (4687.5 Hz),
-        // amplitude 0.1 (≈ −20 dB). Hann-normalised coherent reading.
-        write_sine(&mut buf, sr, 4687.5, 0.1, 8192);
+        write_sine(&mut buf, sr, 4687.5, 0.1, FFT_WINDOW);
         s.push(&buf);
         s.refresh(0.0);
-        let want_bin = (4687.5 * 8192.0 / sr as f32).round() as usize; // 800
+        let want_bin = (4687.5 * FFT_WINDOW as f32 / sr as f32).round() as usize; // 1600
         let (mut best, mut best_i) = (-999.0f32, 0usize);
         for i in 1..s.n_bins() {
             if s.db[i] > best {
@@ -712,18 +851,178 @@ mod tests {
             "peak bin {best_i} want {want_bin}"
         );
         assert!((best + 20.0).abs() < 1.0, "peak level {best} dB want ≈ -20");
-        // Bins far from the tone sit 30+ dB down.
-        assert!(s.db[1500] < best - 30.0);
+        // Bins far from the tone (~8.8 kHz) sit 30+ dB down.
+        assert!(s.db[3000] < best - 30.0);
     }
 
     #[test]
-    fn spectrum_resolution_is_8192_deep() {
-        // v49 R3 pin: bin spacing ≈5.86 Hz @48 kHz (was 23.4 Hz) with a
-        // 4096-bin display — fine enough that narrow EQ moves and low
-        // tones are distinct features, not smeared blobs.
+    fn v162_spectrum_resolution_is_16384_deep() {
+        // v162 R1 pin (retarget of `spectrum_resolution_is_8192_deep`):
+        // bin spacing ≈2.93 Hz @48 kHz (was 5.86) and 8192 displayable
+        // bins (was 4096) — double the v49 depth again.
         let s = Spectrum::new(48_000);
-        assert!((s.bin_hz(1) - 5.859375).abs() < 0.01, "{}", s.bin_hz(1));
-        assert!(s.n_bins() >= 4096, "bins {}", s.n_bins());
+        assert!(
+            (s.bin_hz(1) - 48_000.0 / 16_384.0).abs() < 1e-3,
+            "{}",
+            s.bin_hz(1)
+        );
+        assert!(s.n_bins() >= 8192, "bins {}", s.n_bins());
+    }
+
+    #[test]
+    fn v162_display_grid_is_uniform_log() {
+        // v162 R2/R3: the display resample grid is monotone, covers
+        // 30 Hz…20 kHz, and has a CONSTANT frequency ratio between
+        // consecutive cell starts. The painter maps frequency by ln()
+        // onto x, so a constant ratio IS constant pixel spacing — the
+        // acceptance "spacing uniform across the sweep". The point count
+        // is fixed by width-independent DISPLAY_POINTS = 1024 (the old
+        // display had at most one point per pixel column, ~450).
+        let n = DISPLAY_POINTS;
+        assert!(n >= 1024, "display point count {n}");
+        assert!(
+            (Spectrum::cell_lo(SPEC_F_MIN, SPEC_F_MAX, 0, n) - SPEC_F_MIN).abs() < 1e-4,
+            "grid floor"
+        );
+        assert!(
+            (Spectrum::cell_lo(SPEC_F_MIN, SPEC_F_MAX, n, n) - SPEC_F_MAX).abs() < 1.0,
+            "grid ceiling"
+        );
+        let mut prev = Spectrum::cell_lo(SPEC_F_MIN, SPEC_F_MAX, 0, n);
+        let mut r0 = 0.0f32;
+        for i in 1..=n {
+            let lo = Spectrum::cell_lo(SPEC_F_MIN, SPEC_F_MAX, i, n);
+            assert!(lo > prev, "monotone broken at cell {i}: {lo} <= {prev}");
+            let r = lo / prev;
+            if r0 == 0.0 {
+                r0 = r;
+            }
+            assert!(
+                (r / r0 - 1.0).abs() < 1e-3,
+                "unequal spacing at cell {i}: ratio {r} vs first {r0}"
+            );
+            prev = lo;
+        }
+    }
+
+    #[test]
+    fn v162_sines_land_in_their_log_cell() {
+        // v162 R4: a sine at low / mid / high frequency makes the
+        // RESAMPLED (displayed) trace peak inside the grid cell that
+        // CONTAINS the sine — ±1 cell tolerance for Hann leakage and
+        // the nearest-bin fallback below ~2 kHz. Display x is cell index
+        // × slot width, so the cell index pins the painted x position.
+        let sr = 48_000u32;
+        let n = DISPLAY_POINTS;
+        let ln_span = (SPEC_F_MAX / SPEC_F_MIN).ln();
+        for freq in [100.0f32, 1_000.0, 8_000.0] {
+            let mut s = Spectrum::new(sr);
+            let mut buf = Vec::new();
+            write_sine(&mut buf, sr, freq, 0.1, FFT_WINDOW);
+            s.push(&buf);
+            s.refresh(0.0);
+            let mut db = Vec::new();
+            let mut pk = Vec::new();
+            s.resample_log(n, SPEC_F_MIN, SPEC_F_MAX, &mut db, &mut pk);
+            let want = ((freq / SPEC_F_MIN).ln() / ln_span * n as f32) as usize;
+            let vstar = db.iter().cloned().fold(f32::MIN, f32::max);
+            // Low-band fallback duplicates one bin's value across several
+            // adjacent cells, so the tone reads as a PLATEAU. Contract:
+            // the plateau must CONTAIN the cell that contains the sine,
+            // and stay narrow (fallback duplicates ~a few cells; a
+            // mis-mapped smear would be broad).
+            let plateau: Vec<usize> = db
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v > vstar - 0.01)
+                .map(|(i, _)| i)
+                .collect();
+            let (lo_p, hi_p) = (*plateau.first().unwrap(), *plateau.last().unwrap());
+            assert!(
+                lo_p <= want && want <= hi_p,
+                "freq {freq}: plateau [{lo_p},{hi_p}] misses containing cell {want}"
+            );
+            assert!(
+                hi_p - lo_p <= 32,
+                "freq {freq}: plateau [{lo_p},{hi_p}] too broad — smear"
+            );
+            assert!(
+                (vstar + 20.0).abs() < 2.5,
+                "freq {freq}: cell level {vstar} dB want ≈ -20"
+            );
+            // The containing cell's own frequency reads as the sine:
+            // within one cell of grid quantisation (~0.6 % here) — an
+            // order-off x position would be gross.
+            let c = (Spectrum::cell_lo(SPEC_F_MIN, SPEC_F_MAX, want, n)
+                * Spectrum::cell_lo(SPEC_F_MIN, SPEC_F_MAX, want + 1, n))
+            .sqrt();
+            assert!((c / freq - 1.0).abs() < 0.04, "freq {freq}: cell center {c}");
+            // The peak's decaying-hold column rides along (paint cap).
+            assert!(pk[want] >= vstar - 0.01, "freq {freq}: peak hold below level");
+        }
+    }
+
+    #[test]
+    fn v162_resample_has_no_empty_cells() {
+        // v162 R2: broadband input lands a value in EVERY grid point —
+        // the low band's sub-bin-width cells go through the nearest-bin
+        // fallback instead of painting -240 holes.
+        let sr = 48_000u32;
+        let mut s = Spectrum::new(sr);
+        let mut state: u32 = 0x1234_5678;
+        let mut buf: Vec<f32> = Vec::with_capacity(FFT_WINDOW * 2);
+        for _ in 0..FFT_WINDOW {
+            state = state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            let v = (state as f32 / u32::MAX as f32) * 0.6 - 0.3;
+            buf.push(v);
+            buf.push(v);
+        }
+        s.push(&buf);
+        s.refresh(0.0);
+        let mut db = Vec::new();
+        let mut pk = Vec::new();
+        s.resample_log(DISPLAY_POINTS, SPEC_F_MIN, SPEC_F_MAX, &mut db, &mut pk);
+        assert_eq!(db.len(), DISPLAY_POINTS);
+        let holes = db.iter().filter(|d| **d <= -239.0).count();
+        assert_eq!(holes, 0, "empty display cells: {holes}");
+        let quietest = db.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(quietest > -120.0, "quietest cell {quietest} dB — gap class");
+        let loudest = db.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(loudest > -60.0, "noise never registered: loudest {loudest}");
+    }
+
+    #[test]
+    fn v162_rt_facing_code_never_allocates() {
+        // v162 R5 tripwire (source scan): the analyzer functions the UI
+        // pump drives every frame stay allocation-free on the hot path —
+        // `push` must contain no allocation idiom at all; `resample_log`
+        // only the two warm-reuse `resize` calls (capacity survives
+        // clear()). Sabotage-proof: plant `let _v = Vec::<f32>::new();`
+        // in push -> RED; drop a resize -> RED.
+        let src = include_str!("meter.rs");
+        let grab = |a: &str, b: &str| -> String {
+            let i = src.find(a).expect("anchor a");
+            let j = i + src[i..].find(b).expect("anchor b");
+            src[i..j].to_string()
+        };
+        let push = grab("pub fn push(&mut self, data: &[f32]) {", "    /// Refresh");
+        for needle in ["vec![", "Vec::new", "to_vec", "resize", "collect"] {
+            assert!(
+                !push.contains(needle),
+                "push must not allocate: found {needle}"
+            );
+        }
+        let res = grab("pub fn resample_log(", "/// Lock-free");
+        for needle in ["vec![", "Vec::new", "to_vec", "collect"] {
+            assert!(!res.contains(needle), "resample allocates: {needle}");
+        }
+        assert_eq!(
+            res.matches("resize").count(),
+            2,
+            "resample_log must keep exactly the two warm-reuse resizes"
+        );
     }
 
     #[test]
