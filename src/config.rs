@@ -768,6 +768,13 @@ pub struct Config {
     /// own their scroll even when docked — the mixer becomes its own view.
     #[serde(default = "default_true")]
     pub mixer_follow_tracks: bool,
+    /// v163 (card t_5cf0f288): master spectrum trace mode. False
+    /// (default) = the point/bars rendering per display cell; true =
+    /// ONE continuous smooth curve (Catmull-Rom through the same cells).
+    /// The MASTER OUT panel carries an inline toggle; both entry points
+    /// ride App::set_spectrum_line (one seam: state + save + echo).
+    #[serde(default)]
+    pub spectrum_line: bool,
     #[serde(default = "default_true")]
     pub show_midi: bool,
     /// v30 R4: the project-value-bindings window now belongs to the MAIN
@@ -920,6 +927,7 @@ impl Default for Config {
             show_rack: true,
             show_mixer: true,
             mixer_follow_tracks: true,
+            spectrum_line: false,
             show_midi: true,
             show_binds: true,
             side_wins: SideWins::default(),
