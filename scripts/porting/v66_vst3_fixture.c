@@ -164,6 +164,7 @@ struct Fixture {
     int32_t mo_legacy, mo_cc, mo_bend, mo_at, mo_pc, mo_native;
     int32_t mo_num, mo_ch, mo_val, mo_val2;
     int32_t mo_cc_sum, mo_bend_lsb, mo_bend_msb;
+    int32_t mo_rpn_msb, mo_rpn_active; /* learned RPN0 (CC101/100 then CC6) */
     Slot comp;        /* FUnknown / IPluginBase / IComponent */
     Slot ap;          /* IAudioProcessor */
     Slot ec;          /* IEditController */

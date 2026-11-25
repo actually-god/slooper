@@ -1,40 +1,48 @@
-# SLOOPER PATCHES — vendor/vst3-host (vendored from vst3-host 0.10.0)
+# SLOOPER PATCH — vst3-host 0.10.0 (vendored)
 
-Vendored verbatim from crates.io `vst3-host` 0.10.0, then patched in-tree
-(same doctrine as `vendor/vst2`). Purpose: fix a silent, user-audible MIDI
-drop affecting every raw-MIDI VST3 plugin (kanban card t_8d4e7e7a).
+Upstream: https://github.com/HelgeSverre/rust-vst3-host/ v0.10.0
+Vendored: 2026-11-25, card t_8d4e7e7a (v165), for slooper.
+Patched file: `src/internal/plugin_impl.rs` (search `SLOOPER PATCH` — 5 sites).
 
-## Patch v1 — `src/internal/plugin_impl.rs`, `send_midi_event_at`
+## Bug (upstream)
 
-**Bug:** the arms for `ControlChange`, `PitchBend`, `ChannelAftertouch`, and
-`ProgramChange` delivered ONLY through the mapped-parameter route
-(`queue_mapped_midi_controller` → `send_midi_controller_at`), which queues a
-parameter change for each IMidiMapping entry matching the controller. A
-plugin that declares no mapping (typical: monosynths that parse raw bytes
-from the input EventList — Nekobi, JS80P, ADLplug-class) got `Ok(())` and
-NO event: the message never reached `input_events`, no error, no counter.
-Hosts therefore receive "worked fine" return values while pitch bend, CC,
-RPN0 (bend range), channel AT, and program change are all silently lost.
-Measured on slooper's wire: ±1200¢ wheel into Nekobi/JS80P produced
-byte-identical audio with and without bend.
+`send_midi_event_at` validated host→plugin deliveries of
+`PitchBend`/`ControlChange`/`ProgramChange`/`ChannelAftertouch` against
+"Legacy MIDI CC events are plugin output only" and dropped them. The
+runner swallows the error, so hosted VST3 plugins silently never see
+pitch bend, CC (incl. RPN0 bend-range announcements), channel
+aftertouch, or program change — only note on/off, poly AT and params.
+The raw `kLegacyMIDICCOutEvent` conversion machinery already existed on
+the output side; only input validation blocked it.
 
-**Fix:** keep the mapped route byte-identical when a mapping exists; when
-the controller is unmapped, write the raw `kLegacyMIDICCOutEvent` form into
-the same `input_events` list used by NoteOn/NoteOff/PolyAT
-(`controlNumber` = the crate's/SDK's own controller constants: 128 channel
-pressure, 129 pitch bend with LSB in `value` + MSB in `value2`, 130 program
-change, else the CC number itself). The VST3 input EventList uses
-kLegacyMIDICCOutEvent as the carrier for raw MIDI bytes host→plugin — this
-is what raw-MIDI plugins parse (and what this crate itself already PARSES
-in the plugin→host direction, `event_to_midi`, and what
-`com_implementations::plugin_event_to_raw` already builds).
+## Patch (law: raw always; mapped params additionally when advertised)
 
-Deliberately NOT done: double-delivery for mapped controllers (a plugin
-that maps keeps the parameter route ONLY — zero behavior change there),
-and no relaxation of `validate_plugin_event`'s LegacyMidiCcOut rejection
-(that blocks the `send_plugin_event` route; untouched to keep the diff
-minimal — noted in the upstream issue).
+All four arms now ALWAYS queue the raw legacy-MIDI event into
+`input_events` (`controlNumber` 0..=127 = CC, 128 = channel AT,
+129 = pitch bend (14-bit, `value`/`value2`), 130 = program change) —
+exactly the VST3 `LegacyMidiData` contract — and *additionally* keep
+the crate's IMidiMapping mapped-parameter route where a mapping exists.
+Same-value double delivery is idempotent and matches mature hosts.
 
-Upstream: issue filed at https://github.com/HelgeSverre/rust-vst3-host
-(v165 lane) with the same analysis. Re-sync by diffing against a fresh
-0.10.x unpack before dropping this directory.
+Why "always raw" is load-bearing, not belt-and-suspenders padding:
+DPF-wrapped plugins (Nekobi, Vitalium, …) advertise IMidiMapping onto
+DISPLAY/automation params whose own wrapper `appendEvent()` rejects
+`kLegacyMIDICCOutEvent`-derived… rather: whose parameter decode path is
+the plugin's own ABI; a mapping-gated route that *skips* raw delivery
+silently drops bend for raw-consuming plugins, while a mapping-gated
+route that *only* sends params silently drops it for DPF plugins whose
+mapping ids don't land on consumable internal params. Observed on both
+this host's DPF (Nekobi) and bespoke-wrapper (js80p) plugins.
+
+## slooper-side re-sync checklist
+
+- Keep the arm comments (they are the proof the fixture pins cite).
+- `scripts/porting/v66_vst3_fixture.c` is the acceptance observer for
+  this patch: its state stream exposes per-kind raw-event counts.
+- Pins: `v165_vst3_*` in `src/vsthost.rs`; audio arbiter:
+  `cargo run --release --example v165_bend_probe -- ~/.vst3/"Surge XT.vst3" V3`
+  (pre_bend vs pre_bend_neg Hz must straddle center at 2^(2·cents/1200)).
+- On rebase to a newer upstream, re-check the validator's
+  `validate_midi_event` for LegacyMidiCcOut input policy first; if
+  upstream fixed it properly, upstream the raw-always law as a feature
+  request instead of patching.

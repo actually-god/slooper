@@ -7740,7 +7740,7 @@ mod tests {
         // very same 16383 wire value -> LSB 127, MSB 127.
         assert_eq!((blsb, bmsb), (127, 127), "14-bit bend bytes");
         assert_eq!(at, 1, "channel pressure must arrive as raw controlNumber 128");
-        assert_eq!(pc, 0, "no program change was sent (and the fixture's IUnitInfo route never goes raw)");
+        assert_eq!(pc, 0, "no program change was sent in this block");
         assert_eq!(native, 2, "note-on/off ride native events — unaffected control");
         assert_eq!(
             (num, ch, val, val2),
@@ -7750,10 +7750,11 @@ mod tests {
         assert_eq!(e.midi_drops(), 0, "delivery must stay drop-free");
     }
 
-    /// The patch must NOT touch the mapped-parameter route: on THIS
-    /// fixture the IUnitInfo program-change cache is alive, so a program
-    /// change still travels as a PARAMETER (library program moves) and
-    /// explicitly NOT as raw bytes (observer pc stays 0).
+    /// Patch v2 law: mapped-parameter routes STAY (library program moves
+    /// via the IUnitInfo param mirror on this fixture) AND the raw legacy
+    /// byte is delivered too — DPF-class plugins advertise mappings onto
+    /// display-only params and consume PC only from raw events. Double
+    /// delivery is same-value/idempotent.
     #[test]
     fn v165_vst3_program_change_keeps_the_parameter_route() {
         let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
@@ -7770,7 +7771,7 @@ mod tests {
         let Some([_legacy, _cc, _bend, _at, pc, _native, ..]) = v165_midi_state(&save) else {
             panic!("observer block must parse (state stream = {save:?})");
         };
-        assert_eq!(pc, 0, "mapped route must NOT double-deliver as raw bytes");
+        assert_eq!(pc, 1, "the raw program-change byte is delivered ALONGSIDE the mapped route");
     }
 
     /// Append-only contract of the extended state stream: the legacy

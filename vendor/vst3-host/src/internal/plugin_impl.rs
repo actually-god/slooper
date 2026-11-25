@@ -2990,18 +2990,27 @@ impl PluginInternal for PluginImpl {
                     // queued). Fall through to raw kLegacyMIDICCOutEvent
                     // bytes — the accepted VST3 input-event carrier for
                     // raw MIDI, which raw-MIDI plugins parse directly.
+                    // SLOOPER PATCH v2: run the mapped-parameter route
+                    // when one exists (automation-visible), then ALWAYS
+                    // fall through to the raw bytes. DPF-wrapped plugins
+                    // advertise MIDI mappings onto DISPLAY-ONLY params and
+                    // consume actual MIDI exclusively from raw input
+                    // events (their wrapper asserts on the param write),
+                    // so mapping-gated delivery silently drops for them.
+                    // Same-value double delivery is idempotent — this is
+                    // what mature VST3 hosts send.
                     self.service_control_thread_caches();
                     if self
                         .midi_mapping_cache
                         .get(0, channel.as_index() as i16, controller as u16)
                         .is_some()
                     {
-                        return self.queue_mapped_midi_controller(
+                        self.queue_mapped_midi_controller(
                             channel,
                             controller as u16,
                             value as f64 / 127.0,
                             sample_offset,
-                        );
+                        )?;
                     }
                     vst_event.r#type = kLegacyMIDICCOutEvent as u16;
                     vst_event.__field0.midiCCOut = LegacyMIDICCOutEvent {
@@ -3021,12 +3030,12 @@ impl PluginInternal for PluginImpl {
                         .get(0, channel.as_index() as i16, ControllerNumbers_::kPitchBend as u16)
                         .is_some()
                     {
-                        return self.queue_mapped_midi_controller(
+                        self.queue_mapped_midi_controller(
                             channel,
                             ControllerNumbers_::kPitchBend as u16,
                             value as f64 / 16_383.0,
                             sample_offset,
-                        );
+                        )?;
                     }
                     vst_event.r#type = kLegacyMIDICCOutEvent as u16;
                     vst_event.__field0.midiCCOut = LegacyMIDICCOutEvent {
@@ -3045,12 +3054,12 @@ impl PluginInternal for PluginImpl {
                         .get(0, channel.as_index() as i16, ControllerNumbers_::kAfterTouch as u16)
                         .is_some()
                     {
-                        return self.queue_mapped_midi_controller(
+                        self.queue_mapped_midi_controller(
                             channel,
                             ControllerNumbers_::kAfterTouch as u16,
                             pressure as f64 / 127.0,
                             sample_offset,
-                        );
+                        )?;
                     }
                     vst_event.r#type = kLegacyMIDICCOutEvent as u16;
                     vst_event.__field0.midiCCOut = LegacyMIDICCOutEvent {
@@ -3083,12 +3092,15 @@ impl PluginInternal for PluginImpl {
                         .get(0, channel.as_index() as i16, controller)
                         .is_some()
                     {
-                        return self.queue_mapped_midi_controller(
+                        // SLOOPER PATCH v2: queue the mapped route, then
+                        // STILL fall through to the raw byte (DPF-class
+                        // plugins map programmatically but consume raw).
+                        self.queue_mapped_midi_controller(
                             channel,
                             controller,
                             program as f64 / 127.0,
                             sample_offset,
-                        );
+                        )?;
                     }
 
                     // Otherwise use the root unit's IUnitInfo program-change parameter. A MIDI
@@ -3108,12 +3120,11 @@ impl PluginInternal for PluginImpl {
                                 sample_offset,
                             )?;
                         }
-                        return Ok(());
                     }
-                    // SLOOPER PATCH v1 (v165): no IMidiMapping and no
-                    // IUnitInfo program list — the old code answered
-                    // Ok(()) and the event vanished. Raw legacy bytes
-                    // (controlNumber 130 = program change) instead.
+                    // SLOOPER PATCH v2 (v165): ALWAYS also deliver the
+                    // raw legacy byte (controlNumber 130) so raw-MIDI
+                    // plugins get program changes; the param/unit routes
+                    // above stay for hosts that mirror them.
                     vst_event.r#type = kLegacyMIDICCOutEvent as u16;
                     vst_event.__field0.midiCCOut = LegacyMIDICCOutEvent {
                         controlNumber: ControllerNumbers_::kCtrlProgramChange as u8,
