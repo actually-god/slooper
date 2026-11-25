@@ -26,8 +26,8 @@ application, either make a PR or an issue in Github.
    this is CorridorKey.
 2. The environmental and economic effects of data centers should be
    personally avoided when possible.
-3. AI is the ultimate extension of algorithmic coding assistance, just as
-   probability is the ultimate extension of logic.
+3. It's silly to avoid AI as a tool when performing repetitive, deterministic,
+   and boring tasks.
 
 With these in mind, this project:
 
