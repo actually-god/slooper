@@ -6,6 +6,17 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ## [Unreleased]
 
+### Changed
+
+- **The master spectrum reads evenly now.** The analyzer window doubled
+  to 16384 samples (bin spacing ≈2.9 Hz @ 48 kHz, 8192 bins), and the
+  displayed trace is projected onto 1024 equal-per-octave points, so
+  the points spread uniformly across the sweep instead of crowding into
+  the high band and going sparse at the low band. Narrow peaks survive
+  the projection at full resolution (per-cell max-hold, nearest-bin
+  fallback below 2 kHz), and the added analysis stays off the audio
+  thread entirely (measured: 291 µs per UI frame, zero RT-thread change).
+
 ### Fixed
 
 - **The MPE settings tooltip now matches what ships.** It told users
