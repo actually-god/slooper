@@ -64407,7 +64407,7 @@ mod tests {
     }
 
     #[test]
-    fn v166_roll_root_A_reattaches_labels() {
+    fn v166_roll_root_key_reattaches_labels() {
         // Surface half of R4: moving the root to A4 moves the anchor grid
         // with it — key 69 reads its standard name, 70 reads relative.
         let (mut app, ctx) = v166_open_roll("v166rollA");
@@ -64489,7 +64489,7 @@ mod tests {
         let ui_src = include_str!("ui.rs");
         let midi_src = include_str!("midi.rs");
         let tune_src = include_str!("tune.rs");
-        let table = concat!("\"C\", \"C#\", \"D\", \"D#\"");
+        let table = concat!("\"C\", \"C#\"", ", \"D\", \"D#\"");
         assert_eq!(
             tune_src.matches(table).count(),
             1,
@@ -64497,7 +64497,7 @@ mod tests {
         );
         assert!(!midi_src.contains(table), "no table fork in midi.rs");
         assert!(!ui_src.contains(table), "no table fork in ui.rs");
-        let cfmt = concat!("format!(\"C{");
+        let cfmt = concat!("format!", "(\"C{");
         assert!(!ui_src.contains(cfmt), "inline C-octave formatting is gone");
         let fork = concat!("edo_note", "_name");
         assert!(!ui_src.contains(fork), "the v164 settings fork is removed");

@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn v166_root_A_reanchors() {
+    fn v166_root_reanchors_naming() {
         // The root choice moves the anchor grid: the same physical key is
         // an anchor under root A but an intermediate under root C.
         let l = label(24, 69, 69);

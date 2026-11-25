@@ -716,7 +716,7 @@ mod tests {
         // Sabotage polarity: re-forking the table in THIS file turns the
         // count RED (concat! split keeps the pin's own text away from
         // the assembled needle — source-pin doctrine).
-        let table = concat!("\"C\", \"C#\", \"D\", \"D#\"");
+        let table = concat!("\"C\", \"C#\"", ", \"D\", \"D#\"");
         assert!(
             !src.contains(table),
             "the note-name table has exactly one home: tune.rs"
