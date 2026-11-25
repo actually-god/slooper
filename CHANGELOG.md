@@ -4,13 +4,13 @@ All notable changes to slooper are documented here, newest first.
 Versions are the git tags (`v<X.Y.Z>`); builds live on
 [the releases page](https://github.com/actually-god/slooper/releases).
 
-## [0.24.0] — unreleased
+## [0.24.0] — 2026-11-24
 
 The **expression release**: pitch curves you draw right on the notes,
 per-note pressure (poly-AT) reaching every instrument, sidechain
 send/receive levels, and an optional MCP server an agent can drive the
 app through — on top of a sampler-workflow, recovery and copy-correctness
-pass. 329 commits since 0.23.0, CI-green on Linux **and** Windows
+pass. 349 commits since 0.23.0, CI-green on Linux **and** Windows
 throughout.
 
 ### Added
@@ -239,6 +239,21 @@ throughout.
   reword, move, or duplicated marker turns CI red. Sabotage-proven on
   both polarities (content edit, duplicated marker, shifted block,
   swapped fences). (t_b0616ef0)
+- **`docs/PLUGINS.md` now delivers the coverage it promises.** Three new
+  sections — scripted synths (seed/update rules, rustc-on-load), CLAP
+  plugins (scan folders, `clap:#plugin-id` addressing, slider-only
+  editors, preset echo), and Presets (one JSON format, pointing at the
+  canonical USAGE.md section) — every claim verified against the live
+  source first, and the README doc-table rows trimmed to truth. A
+  quick-tier pin holds the doc's scan-folder table against both
+  platforms' real folder lists (t_e8e831b2).
+- **The repo carries no committed scratch and a cleaner history.** Four
+  stray `.log` files that had been committed at the repo root are gone,
+  with a root-scoped `/*.log` rule closing that class of accident
+  (t_d617bc67); and the public history was rewritten to strip a
+  third-party co-author trailer from every commit — all branches and
+  tags sit on the rewritten lineage, so contributor lanes rebase from
+  now on, never merging the old lineage (t_9574190d).
 
 ### Fixed
 
@@ -253,6 +268,16 @@ throughout.
   single-source mapper as playback: bends reach the plugin as bends and
   pressure as pressure, note/CC/channel-pressure bytes unchanged
   (pinned by `v158_*`).
+- **The Delay effect no longer thumps when it starts.** On a fresh
+  Delay instance the read tap extrapolated *past* the write head for
+  the first delay-time of playback — and again whenever a time-slew
+  lifted the delay above what the ring held: the extrapolation ran to
+  ~−25000×, rode the wet gain into the ±4 output clamp, and left an
+  audible startup thump on hard-panned or wide input while poisoning
+  the feedback ring for everything after. The tap now answers silence
+  until the head has actually written what it asks for — the pattern
+  the flanger's read has always used (pin
+  `v157_delay_fresh_head_read_is_silent`, t_0c6df534).
 - **The MCP server no longer restart-storms when its port is 0.** With
   the port field set to **0** — the documented "pick any free port"
   mode — the frame loop compared the *configured* port against the
@@ -262,6 +287,13 @@ throughout.
   and no client could ever complete a request. The bind now stays put
   while the config reads 0, and port edits — 0→fixed or fixed→0 —
   still apply live, each rebinding exactly once.
+- **CLAP plugin logs follow the real severity table (v155).** The host's
+  CLAP log callback assumed the draft ABI's severity order, which is
+  backwards from what the shipped clap header defines: every plugin's
+  DEBUG chatter printed unconditionally while FATAL complaints were the
+  ones hidden behind an env var. WARNING-and-above — and unknown
+  severities, fail-loud — now always print; DEBUG/INFO chatter moves
+  behind `SLOOPER_CLAP_LOG` (pins `v155_*`, t_8d1fe8c3).
 - **A hosted CLAP instrument no longer mallocs on every audio block.** The
   CLAP backend destroyed its event-staging buffer at the end of every block
   and grew a fresh one the next — one malloc/free pair roughly every 12 ms
