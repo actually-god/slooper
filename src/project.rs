@@ -161,6 +161,15 @@ pub struct Project {
     /// absent entries take the app default (±2). See config.rs twin.
     #[serde(default)]
     pub track_bend_ranges: Vec<u8>,
+    /// v164 (card t_0c73850c): program EDO (divisions per octave, clamp
+    /// [1,128], default 12) + root note (MIDI 0..=127, default C4 = 60).
+    /// Per-project on top of the Settings default: loading a project
+    /// re-publishes the tuning, saving writes what the app currently
+    /// plays. See config.rs twin.
+    #[serde(default = "crate::config::default_edo_n_pub")]
+    pub edo_n: u32,
+    #[serde(default = "crate::config::default_edo_root_pub")]
+    pub edo_root: u8,
     /// v29 R7: MIDI bindings to values (mixer / plugin controls) —
     /// per-project, managed from the automation manager's bindings rack.
     #[serde(default)]
@@ -360,6 +369,8 @@ mod tests {
             track_synth_states: vec![],
             track_synth_programs: vec![],
             track_bend_ranges: vec![],
+            edo_n: crate::tune::EDO_DEFAULT_N,
+            edo_root: crate::tune::EDO_DEFAULT_ROOT,
 
             value_binds: Vec::new(),
             drum: None,
@@ -570,6 +581,8 @@ mod tests {
             track_synth_states: Vec::new(),
             track_synth_programs: Vec::new(),
             track_bend_ranges: Vec::new(),
+            edo_n: crate::tune::EDO_DEFAULT_N,
+            edo_root: crate::tune::EDO_DEFAULT_ROOT,
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
@@ -633,6 +646,8 @@ mod tests {
             track_synth_states: Vec::new(),
             track_synth_programs: vec![-1, 4],
             track_bend_ranges: vec![0, 5],
+            edo_n: 19,
+            edo_root: 62,
             value_binds: Vec::new(),
             drum: None,
             drum_kits: Vec::new(),
@@ -740,5 +755,40 @@ mod tests {
         assert_eq!(sanitize_name("../../etc/passwd"), "-..-etc-passwd");
         assert_eq!(sanitize_name("  trim me.  "), "trim me");
         assert_eq!(sanitize_name("   "), "project");
+    }
+
+    /// v164 (card t_0c73850c): the tuning survives the project file, and
+    /// a pre-v164 file (keys stripped) loads the standard defaults.
+    #[test]
+    fn v164_edo_persist_project_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "v164proj-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("edo.slooper");
+        let mut pr = sample();
+        pr.edo_n = 19;
+        pr.edo_root = 62;
+        save(&p, &pr).expect("save");
+        let back = load(&p).expect("load");
+        assert_eq!((back.edo_n, back.edo_root), (19, 62), "EDO round-trip");
+        let s = serde_json::to_string(&pr).unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&s).unwrap();
+        j.as_object_mut().unwrap().remove("edo_n");
+        j.as_object_mut().unwrap().remove("edo_root");
+        let older = dir.join("older.slooper");
+        std::fs::write(&older, j.to_string()).unwrap();
+        let legacy = load(&older).expect("pre-v164 file loads");
+        assert_eq!(
+            (legacy.edo_n, legacy.edo_root),
+            (crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT),
+            "legacy project defaults to standard tuning"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

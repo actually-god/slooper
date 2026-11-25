@@ -2077,6 +2077,12 @@ pub struct App {
     /// never reports its RPN0 — mirrored to Config/Project and pushed to
     /// every bound entry (bind, rebuild, picker row).
     track_bend_range: Vec<u8>,
+    /// v164 (card t_0c73850c): the app's EDO tuning — divisions per
+    /// octave (clamped [1,128]) + root note (MIDI 0..=127). The Settings
+    /// widgets edit these, every change republishes `crate::tune` (the
+    /// runtime truth), and both persist to Config AND the saved project.
+    edo_n: u32,
+    edo_root: u8,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -2249,6 +2255,11 @@ impl App {
         // v34 R10: export-status channel for the off-thread render.
         let (__se_tx, __se_rx) = std::sync::mpsc::channel();
         let cfg = Config::load();
+        // v164 (card t_0c73850c): publish the saved EDO tuning into the
+        // live atomic before anything can read it — the engine feeds, the
+        // script host callback and the Settings widgets all read this ONE
+        // runtime truth (clamped by tune::set).
+        crate::tune::set(cfg.edo_n, cfg.edo_root);
         // Effects framework: open (creating/seeding when needed) the folder
         // and compile+load every script; chains rebuild once the engine
         // sample rate is known (Evt::Ready).
@@ -2729,6 +2740,8 @@ impl App {
                     )
                 })
                 .collect(),
+            edo_n: cfg.edo_n.clamp(crate::tune::EDO_MIN, crate::tune::EDO_MAX),
+            edo_root: cfg.edo_root,
             auto_press_pt: None,
             auto_click_pt: None,
             export_fmt: 0,
@@ -6634,6 +6647,8 @@ impl App {
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
             track_bend_ranges: self.track_bend_range.clone(),
+            edo_n: self.edo_n,
+            edo_root: self.edo_root,
         }
     }
 
@@ -6860,6 +6875,16 @@ impl App {
                         )
                     })
                     .collect();
+            }
+            // v164 (card t_0c73850c): the tuning keys republish the live
+            // atomic (MCP/apply path = same one truth as the widgets).
+            "edo_n" => {
+                self.edo_n = cfg.edo_n.clamp(crate::tune::EDO_MIN, crate::tune::EDO_MAX);
+                crate::tune::set(self.edo_n, self.edo_root);
+            }
+            "edo_root" => {
+                self.edo_root = cfg.edo_root;
+                crate::tune::set(self.edo_n, self.edo_root);
             }
             "n_tracks" => {
                 self.n_tracks = cfg.n_tracks.clamp(1, 16);
@@ -17768,6 +17793,8 @@ impl App {
                 .collect(),
             track_synth_programs: self.synth_programs_for_save(),
             track_bend_ranges: self.track_bend_range.clone(),
+            edo_n: self.edo_n,
+            edo_root: self.edo_root,
             value_binds: self.value_binds.clone(),
             drum: Some(self.drum.to_save()),
             drum_kits: self.kits_for_save(),
@@ -18116,6 +18143,12 @@ impl App {
                 .copied()
                 .unwrap_or(crate::vsthost::DEFAULT_BEND_RANGE);
         }
+        // v164 (card t_0c73850c): the project's EDO tuning re-publishes
+        // live — the app copy follows and the atomic is republished so
+        // engine feeds, script callbacks and widgets agree at once.
+        self.edo_n = pr.edo_n.clamp(crate::tune::EDO_MIN, crate::tune::EDO_MAX);
+        self.edo_root = pr.edo_root;
+        crate::tune::set(self.edo_n, self.edo_root);
         if sel.instruments || sel.synth_setup {
             self.rebuild_all_synths();
         }
@@ -32023,6 +32056,79 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     .small(),
                 );
             }
+            // ---- TUNING (v164 card t_0c73850c): the EDO scale ----
+            if settings_sect(
+                ui,
+                &app.sett_filter,
+                "Tuning",
+                "tuning edo microtonal divisions octave root scale",
+            ) {
+                any = true;
+                let n_before = app.edo_n;
+                let root_before = app.edo_root;
+                ui.horizontal(|ui| {
+                    ui.label("octave divisions (EDO):");
+                    ui.add(
+                        egui::DragValue::new(&mut app.edo_n)
+                            .range(1..=128)
+                            .speed(1),
+                    );
+                    ui.label(format!("(1 step = {:.2} cents)", 1200.0 / app.edo_n.max(1) as f64));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("root note:");
+                    egui::ComboBox::from_id_salt("edo_root_pick")
+                        .selected_text(edo_note_name(app.edo_root))
+                        .show_ui(ui, |ui| {
+                            for k in (0..=127).step_by(1) {
+                                if ui
+                                    .selectable_value(&mut app.edo_root, k, edo_note_name(k))
+                                    .clicked()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    ui.label(
+                        RichText::new(
+                            "the key the ladder starts on; it sounds its \
+                             exact pitch and the steps fan out from it",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                });
+                if app.edo_n == 12 {
+                    ui.label(
+                        RichText::new(
+                            "12-EDO = standard keyboard tuning (the default)",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "every key is one {}-EDO step: {} keys span \
+                             one octave",
+                            app.edo_n, app.edo_n
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+                if app.edo_n != n_before || app.edo_root != root_before {
+                    app.edo_n = app.edo_n.clamp(crate::tune::EDO_MIN, crate::tune::EDO_MAX);
+                    crate::tune::set(app.edo_n, app.edo_root);
+                    app.save_config();
+                    app.status = format!(
+                        "tuning: {}-EDO, root {} ({:.2} cents/step) \u{2014} saved",
+                        app.edo_n,
+                        edo_note_name(app.edo_root),
+                        1200.0 / app.edo_n.max(1) as f64
+                    );
+                }
+            }
             if !any {
                 // v43 R5: an explicit dead end — a query that hits nothing
                 // must say so, not paint an empty panel.
@@ -32076,9 +32182,19 @@ fn settings_sect(ui: &mut egui::Ui, filt: &str, title: &str, keys: &str) -> bool
     hit
 }
 
+/// v164 (card t_0c73850c): MIDI note number -> ASCII note name (C4 = 60).
+/// Plain letters + '#' only: the default fonts carry no flat/accident
+/// glyphs beyond the proven-safe set, and the name rides widgets.
+fn edo_note_name(n: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
+}
+
 /// The settings category chips: (label, query). Each query must hit its
 /// section through `settings_sect` — heading or keywords.
-const SETTINGS_CHIPS: [(&str, &str); 8] = [
+const SETTINGS_CHIPS: [(&str, &str); 9] = [
     ("GUI", "gui"),
     ("monitoring", "monitoring"),
     ("preview", "preview"),
@@ -32087,6 +32203,7 @@ const SETTINGS_CHIPS: [(&str, &str); 8] = [
     ("MIDI keys", "midi"),
     ("ports", "ports"),
     ("automation", "automation"),
+    ("tuning", "tuning"),
 ];
 
 /// First-save (or Save As) name prompt.
@@ -63518,4 +63635,54 @@ mod tests {
         );
     }
 
+    // ---- v164 (card t_0c73850c): the EDO tuning seams ----
+
+    #[test]
+    fn v164_settings_tuning_section_paints() {
+        // The section is reachable through the filter (heading keywords)
+        // and hides with it; the default state names the standard scale.
+        let mut app = headless_app("v164tunsect");
+        let ctx = egui::Context::default();
+        app.show_settings = true;
+        app.sett_filter = "tuning".into();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "Tuning").is_some(),
+            "TUNING heading paints under its filter"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "octave divisions (EDO):").is_some(),
+            "the N widget paints"
+        );
+        assert!(
+            galley_at(&mut app, &ctx, "12-EDO = standard keyboard tuning (the default)").is_some(),
+            "default state explains itself"
+        );
+        app.sett_filter = "zzqtuning".into();
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "octave divisions (EDO):").is_none(),
+            "filtered out completely"
+        );
+    }
+
+    #[test]
+    fn v164_mcp_apply_republishes_tune_atomic() {
+        // The MCP/apply seam is the SAME truth as the widgets: applying an
+        // edo_n/edo_root update moves BOTH the app copy and the live
+        // atomic the RT + script callbacks read.
+        let mut app = headless_app("v164tunmcp");
+        let back = crate::tune::get();
+        let mut cfg = app.config_snapshot();
+        cfg.edo_n = 24;
+        cfg.edo_root = 62;
+        app.mcp_apply_setting("edo_n", &cfg).expect("edo_n is live-listed");
+        app.mcp_apply_setting("edo_root", &cfg).expect("edo_root is live-listed");
+        assert_eq!((app.edo_n, app.edo_root), (24, 62));
+        assert_eq!(crate::tune::get(), (24, 62), "atomic republished");
+        cfg.edo_n = 999;
+        app.mcp_apply_setting("edo_n", &cfg).unwrap();
+        assert_eq!(crate::tune::get().0, crate::tune::EDO_MAX, "clamp via set");
+        crate::tune::set(back.0, back.1);
+    }
 }

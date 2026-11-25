@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // additive.rs — harmonic partial bank with two morphable spectra.
 //
 // The additive/harmonic synth family lives in one skeleton — a bank
@@ -139,7 +139,9 @@ fn profile_at(k: usize, tilt: f64, odd: f64) -> f32 {
     (rolloff * (0.25 + 0.75 * oddw.min(2.0))) as f32
 }
 
-extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable for the tuning callback.
+    unsafe { SLOOPER_HOST = host; }
     let sr = if sr > 1.0 { sr } else { 48000.0 };
     let s = Box::new(Add {
         sr,
@@ -189,7 +191,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     v.note = note;
     v.held = true;
     v.stage = Stage::Attack;
-    v.freq = 440.0 * (2.0f64).powf((note as f64 - 69.0) / 12.0);
+    v.freq = 440.0 * (2.0f64).powf((slooper_vnote(note) - 69.0) / 12.0);
     v.vel = (vel.max(1) as f64 / 127.0).powf(0.6);
     v.press = 0.0;
     // Random start phases: stacked sines at phase 0 sum to a huge transient.

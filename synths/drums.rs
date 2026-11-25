@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // drums.rs — an analog-style drum kit driven straight from MIDI notes.
 //
 // Every note is one drum, synthesized from oscillators + filtered noise
@@ -188,14 +188,16 @@ fn kit_map(note: u8) -> (u8, f64) {
         51 => (RIDE, 36.0),
         // Pitched tom fallback: f0 follows the note, quarter-register.
         _ => {
-            let f = (440.0 * (2.0f64).powf((note as f64 - 60.0 - 24.0) / 12.0))
+            let f = (440.0 * (2.0f64).powf((slooper_vnote(note) - 60.0 - 24.0) / 12.0))
                 .clamp(55.0, 400.0);
             (TOM, f)
         }
     }
 }
 
-extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable for the tuning callback.
+    unsafe { SLOOPER_HOST = host; }
     let s = Box::new(Drums {
         sr: if sr > 1.0 { sr } else { 48000.0 },
         voices: [Voice::DEAD; VOICES],

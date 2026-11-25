@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // pad.rs — a slow, warm analog-style pad.
 //
 // Per voice: three sine partials (fundamental, a detuned twin for the
@@ -74,7 +74,9 @@ impl Voice {
     };
 }
 
-extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable for the tuning callback.
+    unsafe { SLOOPER_HOST = host; }
     let s = Box::new(Pad {
         sr: if sr > 1.0 { sr } else { 48000.0 },
         voices: [Voice::DEAD; VOICES],
@@ -118,7 +120,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     let mut v = Voice::DEAD;
     v.alive = true;
     v.note = note;
-    v.freq = 440.0 * (2.0f64).powf((note as f64 - 69.0) / 12.0);
+    v.freq = 440.0 * (2.0f64).powf((slooper_vnote(note) - 69.0) / 12.0);
     v.vel = (vel.max(1) as f64 / 127.0).powf(0.8);
     v.press = 0.0;
     v.stage = Stage::Attack;

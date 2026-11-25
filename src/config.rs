@@ -750,6 +750,19 @@ pub struct Config {
     /// bends are rescaled to it on delivery.
     #[serde(default)]
     pub track_bend_ranges: Vec<u8>,
+    /// v164 (card t_0c73850c): equal divisions of the octave (EDO) for
+    /// the whole program — every MIDI key advances ONE EDO step, so N=24
+    /// means two physical octaves of keys span one sounded octave.
+    /// Clamp [1,128] (1 = octave drone, 128 ≈ 9.4 ¢); 12 = standard
+    /// tuning, bit-identical to the pre-EDO engine at any root. Runtime
+    /// truth is the `tune` atomic; this is persistence (Settings ▸ Tuning).
+    #[serde(default = "default_edo_n")]
+    pub edo_n: u32,
+    /// v164: the EDO ladder's ROOT note — full MIDI note number 0..=127,
+    /// default C4 = 60 ("root C"). The root key sounds its exact 12-EDO
+    /// pitch and the ladder fans out from it; inert at N = 12.
+    #[serde(default = "default_edo_root")]
+    pub edo_root: u8,
     /// Number of tracks the program exposes (clamped 1..=16). Per-track
     /// levels and bindings are kept for ALL 16 slots regardless, so raising
     /// the count again restores everything that was configured while a
@@ -917,6 +930,8 @@ impl Default for Config {
             track_synth_states: Vec::new(),
             track_synth_programs: Vec::new(),
             track_bend_ranges: Vec::new(),
+            edo_n: crate::tune::EDO_DEFAULT_N,
+            edo_root: crate::tune::EDO_DEFAULT_ROOT,
             show_rack: true,
             show_mixer: true,
             mixer_follow_tracks: true,
@@ -976,6 +991,24 @@ fn default_preview_secs() -> f32 {
 /// Track-count default: the historical fixed 16 tracks.
 fn default_n_tracks() -> usize {
     16
+}
+
+/// v164: standard 12-EDO default (see the Config field docs).
+fn default_edo_n() -> u32 {
+    crate::tune::EDO_DEFAULT_N
+}
+
+/// v164: root C4 = MIDI 60 (see the Config field docs).
+fn default_edo_root() -> u8 {
+    crate::tune::EDO_DEFAULT_ROOT
+}
+
+/// v164: serde-default shims so the Project twin shares ONE default.
+pub fn default_edo_n_pub() -> u32 {
+    crate::tune::EDO_DEFAULT_N
+}
+pub fn default_edo_root_pub() -> u8 {
+    crate::tune::EDO_DEFAULT_ROOT
 }
 
 /// Convert a pre-0.3 MIDI-linear fader (0 = silence, 127 = 0 dB, plain
@@ -1559,6 +1592,8 @@ mod tests {
             track_synth_states: vec![],
             track_synth_programs: vec![],
             track_bend_ranges: vec![],
+            edo_n: crate::tune::EDO_DEFAULT_N,
+            edo_root: crate::tune::EDO_DEFAULT_ROOT,
             vst_dirs: vec!["/tmp/vst".into()],
             track_vst: vec![
                 None,
@@ -1972,6 +2007,28 @@ mod tests {
             back.track_bend_ranges,
             vec![0, 5, 12],
             "explicit 0 (off) survives byte-exact"
+        );
+    }
+
+    // v164 (card t_0c73850c): the tuning pair round-trips through the
+    // serialized Config, and a pre-v164 file (keys stripped) defaults to
+    // standard 12-EDO / root C4 — old files keep loading bit-identically.
+    #[test]
+    fn v164_config_edo_roundtrip_and_legacy_default() {
+        let mut cfg = Config::default();
+        cfg.edo_n = 53;
+        cfg.edo_root = 69;
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert_eq!((back.edo_n, back.edo_root), (53, 69));
+        let mut j: serde_json::Value = serde_json::from_str(&s).unwrap();
+        j.as_object_mut().unwrap().remove("edo_n");
+        j.as_object_mut().unwrap().remove("edo_root");
+        let legacy: Config = serde_json::from_str(&j.to_string()).unwrap();
+        assert_eq!(
+            (legacy.edo_n, legacy.edo_root),
+            (crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT),
+            "pre-v164 file defaults to standard tuning"
         );
     }
 }

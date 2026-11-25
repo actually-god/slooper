@@ -87,6 +87,9 @@ fn lcg(s: &mut u32) -> f64 {
 }
 
 extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable (this synth maps notes to buffer
+    // positions, not pitch, so the tuning callback stays unused here).
+    unsafe { SLOOPER_HOST = host; }
     let s = Box::new(Granular {
         sr: if sr > 1.0 { sr } else { 48000.0 },
         host,

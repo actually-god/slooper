@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 8
+// slooper-synth-version: 9
 // pluck.rs — Karplus-Strong plucked strings.
 //
 // Physical-modeled string instruments reduce to the classic extended
@@ -62,7 +62,9 @@ fn lerp(buf: &[f32], pos: f64) -> f64 {
     buf[i0] as f64 * (1.0 - f) + buf[i1] as f64 * f
 }
 
-extern "C" fn create(sr: f64, _host: *const SynthHostV1) -> *mut core::ffi::c_void {
+extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_void {
+    // v164: capture the host vtable for the tuning callback.
+    unsafe { SLOOPER_HOST = host; }
     let voices = (0..VOICES)
         .map(|_| Voice {
             alive: false,
@@ -108,7 +110,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
     let sr = p.sr;
     let amp = (vel.max(1) as f64 / 127.0).powf(0.6);
     let f = 440.0f64
-        * (2.0f64).powf((note as f64 - 69.0 + p.bend_st) / 12.0); // v100: glide lane
+        * (2.0f64).powf((slooper_vnote(note) - 69.0 + p.bend_st) / 12.0); // v100: glide lane
     let idx = p.next;
     p.next = (p.next + 1) % VOICES;
     let v = &mut p.voices[idx];

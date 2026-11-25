@@ -57,7 +57,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
 /// `v12_seed_stale_stamp_updates_despite_version_skew`), so it lives only
 /// for the tests that assert the shipped scripts stay stamped.
 #[cfg(test)]
-const BUNDLED_VERSION: &str = "8";
+const BUNDLED_VERSION: &str = "9";
 
 /// Default synths folder (overridable with `SLOOPER_SYNTHS_DIR` for tests).
 pub fn default_dir() -> PathBuf {
@@ -189,11 +189,18 @@ extern "C" fn host_load_asset(id: u32, out: *mut SynthAssetV1) -> u8 {
     1
 }
 
+/// v164 (card t_0c73850c): host trampoline for the live N-EDO tuning —
+/// lock-free read of the process-wide atomic (see [`crate::tune`]).
+extern "C" fn host_tune_key(note: u8) -> f64 {
+    crate::tune::tune_key(note)
+}
+
 /// The host vtable handed to every synth `create`.
 pub static HOST: SynthHostV1 = SynthHostV1 {
     abi: SLOOPER_SYNTH_ABI,
     load_asset: host_load_asset,
     load_map: host_load_map,
+    tune_key: host_tune_key,
 };
 
 /// v51: hard cap of one track's multi-sample key map (the GUI enforces it
@@ -3178,4 +3185,22 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         );
     }
 
+    // v164 (card t_0c73850c): the script-facing host callback answers at
+    // the LIVE tuning, and the default tuning is bit-exact pre-v164 math.
+    #[test]
+    fn v164_host_tune_key_tracks_atomic() {
+        let back = crate::tune::get();
+        crate::tune::set(12, 60);
+        for k in [0u8, 36, 60, 69, 90, 127] {
+            assert_eq!(
+                host_tune_key(k).to_bits(),
+                (k as f64 - 69.0).to_bits(),
+                "N=12 host_tune_key({k}) drifted from the old literal"
+            );
+        }
+        crate::tune::set(24, 60);
+        assert_eq!(host_tune_key(61), -8.5); // root C4 ladder
+        assert_eq!(host_tune_key(84), 3.0); // one EDO octave = +12 st
+        crate::tune::set(back.0, back.1);
+    }
 }
